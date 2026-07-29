@@ -221,14 +221,17 @@ async fn probe_dns_server(iface: &OutboundInterface) -> io::Result<Vec<Ipv4Addr>
 
     let xid = msg.xid();
     tokio::spawn(async move {
-        let mut buf = vec![0u8; 576];
+        let mut buf = vec![0u8; 1500];
 
         let get_response = async move {
             loop {
-                let (n_read, _) = r
-                    .recv_from(&mut buf)
-                    .await
-                    .expect("failed to receive DHCP offer");
+                let (n_read, _) = match r.recv_from(&mut buf).await {
+                    Ok(res) => res,
+                    Err(e) => {
+                        debug!("failed to receive DHCP offer: {e}");
+                        return vec![];
+                    }
+                };
 
                 // fucking deep if-else hell
                 if let Ok(reply) = dhcproto::v4::Message::from_bytes(&buf[..n_read])

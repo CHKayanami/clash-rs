@@ -35,9 +35,8 @@ use uuid::Uuid;
 use crate::{
     app::{
         dispatcher::{
-            BoxedInstrumentedDatagram, BoxedInstrumentedStream,
-            InstrumentedDatagram, InstrumentedDatagramWrapper, InstrumentedStream,
-            InstrumentedStreamWrapper,
+            BoxedChainedDatagram, BoxedChainedStream, ChainedDatagram,
+            ChainedDatagramWrapper, ChainedStream, ChainedStreamWrapper,
         },
         dns::ThreadSafeDNSResolver,
     },
@@ -133,7 +132,7 @@ impl OutboundHandler for Handler {
         &self,
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
-    ) -> std::io::Result<BoxedInstrumentedStream> {
+    ) -> std::io::Result<BoxedChainedStream> {
         self.do_connect_stream(sess, resolver).await.map_err(|e| {
             tracing::error!("{:?}", e);
             std::io::Error::other(e.to_string())
@@ -144,7 +143,7 @@ impl OutboundHandler for Handler {
         &self,
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
-    ) -> std::io::Result<BoxedInstrumentedDatagram> {
+    ) -> std::io::Result<BoxedChainedDatagram> {
         self.do_connect_datagram(sess, resolver).await.map_err(|e| {
             tracing::error!("{:?}", e);
             std::io::Error::other(e.to_string())
@@ -337,11 +336,11 @@ impl Handler {
         &self,
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
-    ) -> Result<BoxedInstrumentedStream> {
+    ) -> Result<BoxedChainedStream> {
         let conn = self.get_conn(&resolver, sess).await?;
         let dest = sess.destination.clone().into_tuic();
         let tuic_tcp = conn.connect_tcp(dest).await?;
-        let s = InstrumentedStreamWrapper::new(tuic_tcp);
+        let s = ChainedStreamWrapper::new(tuic_tcp);
         s.append_to_chain(self.name()).await;
         Ok(Box::new(s))
     }
@@ -350,11 +349,11 @@ impl Handler {
         &self,
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
-    ) -> Result<BoxedInstrumentedDatagram> {
+    ) -> Result<BoxedChainedDatagram> {
         let conn = self.get_conn(&resolver, sess).await?;
         let assos_id = self.next_assoc_id.fetch_add(1, Ordering::SeqCst);
         let quic_udp = TuicDatagramOutbound::new(assos_id, conn, sess.source.into());
-        let s = InstrumentedDatagramWrapper::new(quic_udp);
+        let s = ChainedDatagramWrapper::new(quic_udp);
         s.append_to_chain(self.name()).await;
         Ok(Box::new(s))
     }
@@ -389,7 +388,7 @@ impl TuicDatagramOutbound {
             while let Some(next_send) = send_rx.recv().await {
                 let res = conn
                     .outgoing_udp(
-                        next_send.data.into(),
+                        next_send.data,
                         next_send.dst_addr.into_tuic(),
                         assoc_id,
                     )
@@ -513,6 +512,7 @@ mod tests {
         let resolver = Arc::new(NoopResolver);
 
         let session = Session {
+            id: 0,
             network: crate::session::Network::Tcp,
             typ: crate::session::Type::Socks5,
             source: "127.0.0.1:54321".parse()?,
@@ -522,6 +522,7 @@ mod tests {
             iface: None,
             country: None,
             asn: None,
+            process_name: None,
             traffic_stats: None,
             inbound_user: None,
         };
@@ -568,6 +569,7 @@ mod tests {
         let resolver = Arc::new(NoopResolver);
 
         let session = Session {
+            id: 0,
             network: crate::session::Network::Tcp,
             typ: crate::session::Type::Socks5,
             source: "127.0.0.1:54321".parse()?,
@@ -577,6 +579,7 @@ mod tests {
             iface: None,
             country: None,
             asn: None,
+            process_name: None,
             traffic_stats: None,
             inbound_user: None,
         };
@@ -633,6 +636,7 @@ mod tests {
         let resolver = ipv6_resolver();
 
         let session = Session {
+            id: 1,
             network: crate::session::Network::Tcp,
             typ: crate::session::Type::Socks5,
             source: "[::1]:54321".parse()?,
@@ -642,6 +646,7 @@ mod tests {
             iface: None,
             country: None,
             asn: None,
+            process_name: None,
             traffic_stats: None,
             inbound_user: None,
         };
@@ -689,6 +694,7 @@ mod tests {
         let resolver = ipv6_resolver();
 
         let session = Session {
+            id: 2,
             network: crate::session::Network::Tcp,
             typ: crate::session::Type::Socks5,
             source: "127.0.0.1:54321".parse()?,
@@ -698,6 +704,7 @@ mod tests {
             iface: None,
             country: None,
             asn: None,
+            process_name: None,
             traffic_stats: None,
             inbound_user: None,
         };

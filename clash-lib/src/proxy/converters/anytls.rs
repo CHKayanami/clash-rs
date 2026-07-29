@@ -25,10 +25,7 @@ impl TryFrom<&OutboundAnytls> for Handler {
     fn try_from(s: &OutboundAnytls) -> Result<Self, Self::Error> {
         let skip_cert_verify = s.skip_cert_verify.unwrap_or_default();
         if skip_cert_verify {
-            warn!(
-                "skipping TLS cert verification for {}",
-                s.common_opts.server
-            );
+            warn!("skip_cert_verify is set to true for {}", s.common_opts.name);
         }
         if s.fingerprint.is_some() || s.client_fingerprint.is_some() {
             warn!(
@@ -36,15 +33,8 @@ impl TryFrom<&OutboundAnytls> for Handler {
                 s.common_opts.name
             );
         }
-        if s.idle_session_check_interval.is_some()
-            || s.idle_session_timeout.is_some()
-            || s.min_idle_session.is_some()
-        {
-            warn!(
-                "anytls idle-session fields are parsed but not applied yet for {}",
-                s.common_opts.name
-            );
-        }
+        let default_pool = crate::proxy::anytls::pool::SessionPoolConfig::default();
+
         Ok(Handler::new(HandlerOptions {
             name: s.common_opts.name.to_owned(),
             common_opts: HandlerCommonOptions {
@@ -55,6 +45,22 @@ impl TryFrom<&OutboundAnytls> for Handler {
             port: s.common_opts.port,
             password: s.password.clone(),
             udp: s.udp.unwrap_or_default(),
+            pool_config: crate::proxy::anytls::pool::SessionPoolConfig {
+                min_connections: s.min_idle_session.map(|v| v as usize).unwrap_or(1),
+                max_connections: s.max_connections.unwrap_or(16),
+                // Fall back to the pool default rather than 1: pinning it to a
+                // single stream per session meant every connection dialled its
+                // own TLS handshake and AnyTLS never multiplexed.
+                max_streams_per_connection: s
+                    .max_streams
+                    .unwrap_or(default_pool.max_streams_per_connection),
+                idle_timeout: std::time::Duration::from_secs(
+                    s.idle_session_timeout.unwrap_or(60),
+                ),
+                idle_session_check_interval: std::time::Duration::from_secs(
+                    s.idle_session_check_interval.unwrap_or(30),
+                ),
+            },
             tls: {
                 let client = TlsClient::new(
                     skip_cert_verify,

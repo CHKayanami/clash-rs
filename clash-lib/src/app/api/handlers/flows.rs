@@ -213,7 +213,7 @@ async fn build_flow_records(
 
     // Active connections — use active_connections_snapshot so session_holder
     // is preserved (snapshot() materialises a reduced view that drops it).
-    let active = mgr.active_connections_snapshot().await;
+    let active = mgr.active_connections_snapshot();
     for info in &active {
         let chains = info.proxy_chain_holder.snapshot().await;
         merge_info!(info, chains, true);
@@ -221,7 +221,7 @@ async fn build_flow_records(
 
     // Closed connections (ring buffer).
     if include_closed {
-        let closed = mgr.closed_flows_snapshot().await;
+        let closed = mgr.closed_flows_snapshot();
         for info in &closed {
             let chains = info.proxy_chain_holder.snapshot().await;
             merge_info!(info, chains, false);

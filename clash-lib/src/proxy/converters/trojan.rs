@@ -27,10 +27,7 @@ impl TryFrom<&OutboundTrojan> for Handler {
     fn try_from(s: &OutboundTrojan) -> Result<Self, Self::Error> {
         let skip_cert_verify = s.skip_cert_verify.unwrap_or_default();
         if skip_cert_verify {
-            warn!(
-                "skipping TLS cert verification for {}",
-                s.common_opts.server
-            );
+            warn!("skip_cert_verify is set to true for {}", s.common_opts.name);
         }
 
         let h = Handler::new(HandlerOptions {
@@ -41,7 +38,7 @@ impl TryFrom<&OutboundTrojan> for Handler {
             },
             server: s.common_opts.server.to_owned(),
             port: s.common_opts.port,
-            password: s.password.clone(),
+            password: s.password.to_owned(),
             udp: s.udp.unwrap_or_default(),
             tls: {
                 let client = TlsClient::new(

@@ -8,6 +8,10 @@ use std::sync::Arc;
 #[cfg(test)]
 use mockall::automock;
 
+use hickory_proto::{
+    op::{Message},
+};
+pub mod collector;
 pub mod config;
 mod dhcp;
 mod dns_client;
@@ -18,7 +22,8 @@ pub mod resolver;
 mod rule_dispatch;
 mod runtime;
 mod server;
-
+use crate::app::router::Router;
+pub use collector::{DnsCollector, ThreadSafeDnsCollector};
 pub use config::{Config, EdnsClientSubnet};
 
 pub use filters::PendingMmdb;
@@ -58,6 +63,7 @@ pub trait ClashResolver: Sync + Send {
         host: &str,
         enhanced: bool,
     ) -> anyhow::Result<Option<std::net::IpAddr>>;
+    async fn exchange_all(&self, req: &Message) -> anyhow::Result<Message>;
     async fn resolve_v4(
         &self,
         host: &str,
@@ -78,6 +84,8 @@ pub trait ClashResolver: Sync + Send {
     async fn reverse_lookup(&self, ip: std::net::IpAddr) -> Option<String>;
     async fn is_fake_ip(&self, ip: std::net::IpAddr) -> bool;
     fn fake_ip_enabled(&self) -> bool;
+
+    async fn after_router_inited(&self,r: Arc<Router>);
 
     fn ipv6(&self) -> bool;
     fn set_ipv6(&self, enable: bool);

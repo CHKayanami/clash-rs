@@ -4,15 +4,31 @@ use std::{
     task::{Context, Poll},
 };
 
-use bytes::{BufMut, BytesMut};
+use bytes::{Buf, BufMut, BytesMut};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tracing::{debug, error};
 
-use crate::{proxy::AnyStream, session::SocksAddr};
+use crate::{
+    common::io::{ReadExactBase, ReadExt},
+    proxy::AnyStream,
+    session::SocksAddr,
+};
 
 const VLESS_VERSION: u8 = 0;
-const VLESS_COMMAND_TCP: u8 = 1;
-const VLESS_COMMAND_UDP: u8 = 2;
+
+/// Largest partial ClientHello we will hold before sending the handshake
+/// anyway: a maximum-size TLS record (16384) plus its 5-byte header.
+const MAX_BUFFERED_CLIENT_HELLO: usize = 5 + 16384;
+pub(crate) const VLESS_COMMAND_TCP: u8 = 1;
+pub(crate) const VLESS_COMMAND_UDP: u8 = 2;
+pub(crate) const VLESS_COMMAND_MUX: u8 = 3;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResponseState {
+    WaitingHeader,
+    WaitingPayload(usize),
+    Done,
+}
 
 pub struct VlessStream {
     inner: AnyStream,
@@ -21,17 +37,25 @@ pub struct VlessStream {
     response_received: bool,
     uuid: uuid::Uuid,
     destination: SocksAddr,
-    is_udp: bool,
-    flow: Option<String>,
+    command: u8,
+    addon_bytes: Option<Vec<u8>>,
+    response_buf: BytesMut,
+    read_pos: usize,
+    response_state: ResponseState,
+    write_buf: BytesMut,
+    first_write_len: usize,
+    pending_first_payload: BytesMut,
 }
+
+impl crate::proxy::ProxyStream for VlessStream {}
 
 impl VlessStream {
     pub fn new(
         stream: AnyStream,
         uuid: &str,
         destination: &SocksAddr,
-        is_udp: bool,
-        flow: Option<String>,
+        command: u8,
+        flow: Option<&str>,
     ) -> io::Result<Self> {
         let uuid = uuid::Uuid::parse_str(uuid).map_err(|_| {
             io::Error::new(io::ErrorKind::InvalidInput, "invalid UUID format")
@@ -46,13 +70,26 @@ impl VlessStream {
             response_received: false,
             uuid,
             destination: destination.clone(),
-            is_udp,
-            flow,
+            command,
+            addon_bytes: flow.map(build_addon_bytes),
+            response_buf: BytesMut::with_capacity(64),
+            read_pos: 0,
+            response_state: ResponseState::WaitingHeader,
+            write_buf: BytesMut::new(),
+            first_write_len: 0,
+            pending_first_payload: BytesMut::new(),
         })
     }
 
-    fn build_handshake_header(&self) -> BytesMut {
-        let mut buf = BytesMut::new();
+    fn build_handshake_header(&self, payload_len: usize) -> BytesMut {
+        let estimated_len = 1
+            + 16
+            + 1
+            + self.addon_bytes.as_ref().map_or(0, |a| a.len())
+            + 1
+            + 64
+            + payload_len;
+        let mut buf = BytesMut::with_capacity(estimated_len);
 
         // VLESS request header:
         // Version (1 byte) + UUID (16 bytes) + Addon length (1 byte)
@@ -61,157 +98,242 @@ impl VlessStream {
         buf.put_u8(VLESS_VERSION);
         buf.put_slice(self.uuid.as_bytes());
 
-        if let Some(ref flow) = self.flow {
-            let addon = build_addon_bytes(flow);
+        if let Some(ref addon) = self.addon_bytes {
             buf.put_u8(addon.len() as u8);
-            buf.extend_from_slice(&addon);
+            buf.extend_from_slice(addon);
         } else {
             buf.put_u8(0); // No addon
         }
 
-        if self.is_udp {
-            buf.put_u8(VLESS_COMMAND_UDP);
-        } else {
-            buf.put_u8(VLESS_COMMAND_TCP);
-        }
+        buf.put_u8(self.command);
 
-        self.destination.write_to_buf_vmess(&mut buf);
+        if self.command != VLESS_COMMAND_MUX {
+            self.destination.write_to_buf_vmess(&mut buf);
+        }
         buf
     }
 
-    async fn send_handshake_with_data(&mut self, data: &[u8]) -> io::Result<usize> {
+    /// Drive the buffered request header (plus its first payload) out to the
+    /// wire, marking the handshake sent once it has fully drained.
+    ///
+    /// Shared by the write, flush and read paths so that no matter which one
+    /// first observes a pending handshake, `handshake_sent` ends up set. It
+    /// used to be possible to send the header from `poll_flush` and leave the
+    /// flag false, which both re-sent the whole header on the next write and
+    /// leaked the server's response header to the caller as payload.
+    fn poll_send_pending_handshake(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<io::Result<()>> {
         if self.handshake_sent {
-            return Ok(0);
+            return Poll::Ready(Ok(()));
         }
 
-        debug!(
-            "VLESS handshake starting for destination: {}",
-            self.destination
-        );
+        if self.write_buf.is_empty() {
+            if self.pending_first_payload.is_empty() {
+                // Nothing buffered yet — the handshake goes out with the first
+                // write.
+                return Poll::Ready(Ok(()));
+            }
+            let payload = std::mem::take(&mut self.pending_first_payload);
+            let mut header = self.build_handshake_header(payload.len());
+            header.put_slice(&payload);
+            self.write_buf = header;
+        }
 
-        let mut buf = self.build_handshake_header();
-        buf.put_slice(data);
-
-        // Send handshake + first data
-        tokio::io::AsyncWriteExt::write_all(&mut self.inner, &buf)
-            .await
-            .map_err(|e| {
-                error!("Failed to send VLESS handshake: {}", e);
-                e
-            })?;
+        let Self {
+            inner, write_buf, ..
+        } = self;
+        while !write_buf.is_empty() {
+            let n =
+                futures::ready!(Pin::new(&mut *inner).poll_write(cx, write_buf))?;
+            if n == 0 {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "failed to write VLESS handshake",
+                )));
+            }
+            write_buf.advance(n);
+        }
 
         self.handshake_sent = true;
-        debug!("VLESS handshake sent with {} bytes of data", data.len());
-
-        Ok(data.len())
+        debug!("VLESS handshake sent");
+        Poll::Ready(Ok(()))
     }
+}
 
-    async fn receive_response(&mut self) -> io::Result<()> {
-        if self.response_received {
-            return Ok(());
-        }
+impl ReadExactBase for VlessStream {
+    type I = AnyStream;
 
-        debug!("VLESS waiting for response");
-
-        // Read response (VLESS response is just version + additional info length +
-        // additional info)
-        let mut response = [0u8; 2];
-        tokio::io::AsyncReadExt::read_exact(&mut self.inner, &mut response)
-            .await
-            .map_err(|e| {
-                error!("Failed to read VLESS response: {}", e);
-                e
-            })?;
-
-        if response[0] != VLESS_VERSION {
-            error!("Invalid VLESS response version: {}", response[0]);
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("invalid VLESS response version: {}", response[0]),
-            ));
-        }
-
-        let additional_info_len = response[1];
-
-        if additional_info_len > 0 {
-            let mut additional_info = vec![0u8; additional_info_len as usize];
-            tokio::io::AsyncReadExt::read_exact(
-                &mut self.inner,
-                &mut additional_info,
-            )
-            .await
-            .map_err(|e| {
-                error!("Failed to read VLESS additional info: {}", e);
-                e
-            })?;
-            debug!(
-                "VLESS additional info received: {} bytes: {:02x?}",
-                additional_info_len,
-                &additional_info[..additional_info_len.min(32) as usize],
-            );
-        }
-
-        self.response_received = true;
-        self.handshake_done = true;
-        debug!("VLESS handshake completed successfully");
-
-        Ok(())
+    fn decompose(&mut self) -> (&mut Self::I, &mut BytesMut, &mut usize) {
+        (&mut self.inner, &mut self.response_buf, &mut self.read_pos)
     }
 }
 
 impl AsyncRead for VlessStream {
     fn poll_read(
-        mut self: Pin<&mut Self>,
+        self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+
+        // A payload buffered while waiting for the rest of a TLS ClientHello
+        // must not sit here forever: a client that writes a partial record and
+        // then waits for a reply would otherwise deadlock, since nothing has
+        // been sent to the server yet.
+        futures::ready!(this.poll_send_pending_handshake(cx))?;
+
         // Must receive response before reading
-        if self.handshake_sent && !self.response_received {
-            let fut = self.receive_response();
-            tokio::pin!(fut);
-            match fut.poll(cx) {
-                Poll::Ready(Ok(())) => {}
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Pending => return Poll::Pending,
+        if this.handshake_sent && !this.response_received {
+            loop {
+                match this.response_state {
+                    ResponseState::WaitingHeader => {
+                        futures::ready!(this.poll_read_exact(cx, 2))?;
+                        let version = this.response_buf[0];
+                        if version != VLESS_VERSION {
+                            error!("Invalid VLESS response version: {}", version);
+                            return Poll::Ready(Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                format!(
+                                    "invalid VLESS response version: {}",
+                                    version
+                                ),
+                            )));
+                        }
+                        let additional_info_len = this.response_buf[1] as usize;
+                        if additional_info_len > 0 {
+                            this.response_state =
+                                ResponseState::WaitingPayload(additional_info_len);
+                        } else {
+                            this.response_state = ResponseState::Done;
+                            this.response_received = true;
+                            this.handshake_done = true;
+                            this.response_buf = BytesMut::new();
+                            debug!("VLESS handshake completed successfully");
+                            break;
+                        }
+                    }
+                    ResponseState::WaitingPayload(len) => {
+                        futures::ready!(this.poll_read_exact(cx, len))?;
+                        debug!(
+                            "VLESS additional info received: {} bytes: {:02x?}",
+                            len,
+                            &this.response_buf[..len.min(32)],
+                        );
+                        this.response_state = ResponseState::Done;
+                        this.response_received = true;
+                        this.handshake_done = true;
+                        this.response_buf = BytesMut::new();
+                        debug!("VLESS handshake completed successfully");
+                        break;
+                    }
+                    ResponseState::Done => {
+                        break;
+                    }
+                }
             }
         }
 
-        Pin::new(&mut self.inner).poll_read(cx, buf)
+        Pin::new(&mut this.inner).poll_read(cx, buf)
     }
 }
 
 impl AsyncWrite for VlessStream {
     fn poll_write(
-        mut self: Pin<&mut Self>,
+        self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<Result<usize, io::Error>> {
+        let this = self.get_mut();
+
         // Send handshake with first write
-        if !self.handshake_sent {
-            let fut = self.send_handshake_with_data(buf);
-            tokio::pin!(fut);
-            match fut.poll(cx) {
-                Poll::Ready(Ok(n)) => return Poll::Ready(Ok(n)),
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Pending => return Poll::Pending,
+        if !this.handshake_sent {
+            if this.write_buf.is_empty() {
+                this.pending_first_payload.extend_from_slice(buf);
+
+                // Check if this payload starts with TLS ClientHello record header (0x16, 0x03)
+                let is_tls = this.pending_first_payload.len() >= 5
+                    && this.pending_first_payload[0] == 0x16
+                    && this.pending_first_payload[1] == 0x03;
+
+                let expected_tls_len = if is_tls {
+                    5 + u16::from_be_bytes([
+                        this.pending_first_payload[3],
+                        this.pending_first_payload[4],
+                    ]) as usize
+                } else {
+                    0
+                };
+
+                // If it's a TLS ClientHello and we haven't received the full
+                // record yet, buffer the chunk and return Ok(buf.len()) to
+                // consume it from inbound. The ceiling is a whole maximum-size
+                // TLS record including its 5-byte header — using 16384 alone
+                // excluded the largest legal ClientHellos.
+                if is_tls
+                    && this.pending_first_payload.len() < expected_tls_len
+                    && expected_tls_len <= MAX_BUFFERED_CLIENT_HELLO
+                {
+                    debug!(
+                        "VLESS buffering partial TLS ClientHello ({}/{} bytes) for destination: {}",
+                        this.pending_first_payload.len(),
+                        expected_tls_len,
+                        this.destination
+                    );
+                    return Poll::Ready(Ok(buf.len()));
+                }
+
+                debug!(
+                    "VLESS handshake starting for destination: {}",
+                    this.destination
+                );
+                let payload = std::mem::take(&mut this.pending_first_payload);
+                let mut header = this.build_handshake_header(payload.len());
+                header.put_slice(&payload);
+                this.write_buf = header;
+                this.first_write_len = buf.len();
             }
+
+            while !this.write_buf.is_empty() {
+                let n = futures::ready!(
+                    Pin::new(&mut this.inner).poll_write(cx, &this.write_buf)
+                )?;
+                if n == 0 {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "failed to write VLESS handshake",
+                    )));
+                }
+                this.write_buf.advance(n);
+            }
+
+            this.handshake_sent = true;
+            debug!(
+                "VLESS handshake sent with {} bytes of data",
+                this.first_write_len
+            );
+            return Poll::Ready(Ok(this.first_write_len));
         }
 
-        Pin::new(&mut self.inner).poll_write(cx, buf)
+        Pin::new(&mut this.inner).poll_write(cx, buf)
     }
 
     fn poll_flush(
-        mut self: Pin<&mut Self>,
+        self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Result<(), io::Error>> {
-        Pin::new(&mut self.inner).poll_flush(cx)
+        let this = self.get_mut();
+        futures::ready!(this.poll_send_pending_handshake(cx))?;
+        Pin::new(&mut this.inner).poll_flush(cx)
     }
 
     fn poll_shutdown(
-        mut self: Pin<&mut Self>,
+        self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Result<(), io::Error>> {
-        Pin::new(&mut self.inner).poll_shutdown(cx)
+        let this = self.get_mut();
+        Pin::new(&mut this.inner).poll_shutdown(cx)
     }
 }
 
@@ -266,11 +388,11 @@ mod tests {
             dummy_stream(),
             "5415d8e0-df92-3655-afa4-b79de66413f5",
             &tcp_dest(),
-            false,
+            VLESS_COMMAND_TCP,
             None,
         )
         .unwrap();
-        let hdr = s.build_handshake_header();
+        let hdr = s.build_handshake_header(0);
         // byte 17 (0-indexed) is the addon-length byte
         assert_eq!(hdr[17], 0); // no addon
     }
@@ -282,11 +404,11 @@ mod tests {
             dummy_stream(),
             "5415d8e0-df92-3655-afa4-b79de66413f5",
             &tcp_dest(),
-            false,
-            Some(flow.to_string()),
+            VLESS_COMMAND_TCP,
+            Some(flow),
         )
         .unwrap();
-        let hdr = s.build_handshake_header();
+        let hdr = s.build_handshake_header(0);
         let addon_len = hdr[17] as usize;
         assert_eq!(addon_len, 2 + flow.len()); // 18
         let addon = &hdr[18..18 + addon_len];
@@ -299,10 +421,64 @@ mod tests {
 
     #[test]
     fn test_new_invalid_uuid() {
-        let result =
-            VlessStream::new(dummy_stream(), "not-a-uuid", &tcp_dest(), false, None);
+        let result = VlessStream::new(
+            dummy_stream(),
+            "not-a-uuid",
+            &tcp_dest(),
+            VLESS_COMMAND_TCP,
+            None,
+        );
         assert!(result.is_err());
     }
-}
 
-impl crate::proxy::ProxyStream for VlessStream {}
+    #[tokio::test]
+    async fn test_handshake_flow_success() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (client_raw, mut server_raw) = tokio::io::duplex(1024);
+        let mut client = VlessStream::new(
+            Box::new(client_raw),
+            "5415d8e0-df92-3655-afa4-b79de66413f5",
+            &tcp_dest(),
+            VLESS_COMMAND_TCP,
+            None,
+        )
+        .unwrap();
+
+        // 1. Client writes first data
+        let test_data = b"hello world";
+        let handle = tokio::spawn(async move {
+            client.write_all(test_data).await.unwrap();
+            client.flush().await.unwrap();
+
+            // Try reading after writing
+            let mut read_buf = vec![0u8; 10];
+            let n = client.read(&mut read_buf).await.unwrap();
+            assert_eq!(&read_buf[..n], b"response12");
+        });
+
+        // 2. Server reads handshake request
+        let mut req_buf = vec![0u8; 1024];
+        let n = server_raw.read(&mut req_buf).await.unwrap();
+        // VLESS header is at least 1 + 16 + 1 + 1 + 2 + 1 + 4 = 26 bytes. Plus "hello world" (11 bytes) = 37 bytes.
+        assert!(n >= 37);
+        assert_eq!(&req_buf[n - 11..n], b"hello world");
+
+        // 3. Server writes response in chunks
+        // Response version (0x00), additional info len (0x04)
+        server_raw.write_all(&[0x00]).await.unwrap();
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+        server_raw.write_all(&[0x04]).await.unwrap();
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+        // additional info (4 bytes)
+        server_raw
+            .write_all(&[0x01, 0x02, 0x03, 0x04])
+            .await
+            .unwrap();
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+        // actual response data
+        server_raw.write_all(b"response12").await.unwrap();
+
+        handle.await.unwrap();
+    }
+}

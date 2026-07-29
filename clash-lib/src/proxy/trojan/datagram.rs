@@ -367,7 +367,7 @@ impl Stream for OutboundDatagramTrojan {
                             let data = read_buf.split_to(len);
 
                             return Poll::Ready(Some(UdpPacket {
-                                data: data.to_vec(),
+                                data: data.freeze(),
                                 src_addr: remote_addr.clone(),
                                 dst_addr: addr,
                                 inbound_user: None,

@@ -1,15 +1,13 @@
 use std::{io, sync::Arc};
 
 use async_trait::async_trait;
-use futures::stream::{self, StreamExt};
 use tracing::debug;
 
 use crate::{
     app::{
         dispatcher::{
-            BoxedInstrumentedDatagram, BoxedInstrumentedStream,
-            InstrumentedDatagram, InstrumentedDatagramWrapper, InstrumentedStream,
-            InstrumentedStreamWrapper,
+            BoxedChainedDatagram, BoxedChainedStream, ChainedDatagram,
+            ChainedDatagramWrapper, ChainedStream, ChainedStreamWrapper,
         },
         dns::ThreadSafeDNSResolver,
         remote_content_manager::providers::proxy_provider::ArcProxyProvider,
@@ -73,32 +71,37 @@ impl OutboundHandler for Handler {
     }
 
     async fn support_udp(&self) -> bool {
-        for proxy in self.get_proxies(false).await {
-            match proxy.support_connector().await {
-                ConnectorType::All => return true,
-                ConnectorType::None | ConnectorType::Tcp => (),
-            }
-            if !proxy.support_udp().await {
+        // Mirror `connect_datagram`: every hop but the last carries the
+        // datagram as a connector, and the last one dials it. Returning true on
+        // the *first* hop advertising `ConnectorType::All` skipped every hop
+        // after it.
+        let proxies = self.get_proxies(false).await;
+        let Some((last, rest)) = proxies.split_last() else {
+            return false;
+        };
+        for proxy in rest {
+            if !matches!(proxy.support_connector().await, ConnectorType::All) {
                 return false;
             }
         }
-        true
+        last.support_udp().await
     }
 
     async fn connect_stream(
         &self,
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
-    ) -> io::Result<BoxedInstrumentedStream> {
-        let proxies: Vec<AnyOutboundHandler> =
-            stream::iter(self.get_proxies(true).await).collect().await;
+    ) -> io::Result<BoxedChainedStream> {
+        let proxies = self.get_proxies(true).await;
 
         match proxies.len() {
             0 => Err(new_io_error("no proxy available")),
             1 => {
                 let proxy = proxies[0].clone();
                 debug!("tcp relay `{}` via proxy `{}`", self.name(), proxy.name());
-                proxy.connect_stream(sess, resolver).await
+                let s = proxy.connect_stream(sess, resolver).await?;
+                s.append_to_chain(self.name()).await;
+                Ok(s)
             }
             _ => {
                 let mut connector: Box<dyn RemoteConnector> =
@@ -123,7 +126,7 @@ impl OutboundHandler for Handler {
                     )
                     .await?;
 
-                let chained = InstrumentedStreamWrapper::new(s);
+                let chained = ChainedStreamWrapper::new(s);
                 chained.append_to_chain(self.name()).await;
                 Ok(Box::new(chained))
             }
@@ -134,16 +137,17 @@ impl OutboundHandler for Handler {
         &self,
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
-    ) -> io::Result<BoxedInstrumentedDatagram> {
-        let proxies: Vec<AnyOutboundHandler> =
-            stream::iter(self.get_proxies(true).await).collect().await;
+    ) -> io::Result<BoxedChainedDatagram> {
+        let proxies = self.get_proxies(true).await;
 
         match proxies.len() {
             0 => Err(new_io_error("no proxy available")),
             1 => {
                 let proxy = proxies[0].clone();
                 debug!("udp relay `{}` via proxy `{}`", self.name(), proxy.name());
-                proxy.connect_datagram(sess, resolver).await
+                let d = proxy.connect_datagram(sess, resolver).await?;
+                d.append_to_chain(self.name()).await;
+                Ok(d)
             }
             _ => {
                 let mut connector: Box<dyn RemoteConnector> =
@@ -168,7 +172,7 @@ impl OutboundHandler for Handler {
                     )
                     .await?;
 
-                let chained = InstrumentedDatagramWrapper::new(d);
+                let chained = ChainedDatagramWrapper::new(d);
                 chained.append_to_chain(self.name()).await;
                 Ok(Box::new(chained))
             }
@@ -190,6 +194,9 @@ impl GroupProxyAPIResponse for Handler {
         Handler::get_proxies(self, false).await
     }
 
+    /// A relay is the whole chain; naming any one hop as "active" would
+    /// misreport it. See the note on the load balancer's implementation for the
+    /// dispatcher behaviour this opts out of.
     async fn get_active_proxy(&self) -> Option<AnyOutboundHandler> {
         None
     }

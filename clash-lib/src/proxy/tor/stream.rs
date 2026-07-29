@@ -19,6 +19,8 @@ impl StreamWrapper {
     }
 }
 
+impl crate::proxy::ProxyStream for StreamWrapper {}
+
 impl AsyncRead for StreamWrapper {
     fn poll_read(
         self: Pin<&mut Self>,
@@ -64,5 +66,3 @@ impl AsyncWrite for StreamWrapper {
         }
     }
 }
-
-impl crate::proxy::ProxyStream for StreamWrapper {}

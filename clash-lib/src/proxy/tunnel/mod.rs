@@ -1,7 +1,7 @@
 use crate::{
     app::dispatcher::Dispatcher,
     common::errors::new_io_error,
-    proxy::utils::{ToCanonical, try_create_dualstack_tcplistener},
+    proxy::utils::try_create_dualstack_tcplistener,
     session::{Network, Session, SocksAddr, Type},
 };
 use async_trait::async_trait;
@@ -16,15 +16,17 @@ use std::{
     task::{Context, Poll},
 };
 use tokio::{io::ReadBuf, net::UdpSocket};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use super::{
-    datagram::UdpPacket, inbound::InboundHandlerTrait, utils::apply_tcp_options,
+    datagram::UdpPacket,
+    inbound::{InboundHandlerTrait, accept_tcp},
 };
 
 #[derive(Clone)]
 pub struct TunnelInbound {
     listen: SocketAddr,
+    allow_lan: bool,
     dispatcher: Arc<Dispatcher>,
     network: Vec<String>,
     target: SocksAddr,
@@ -33,13 +35,14 @@ pub struct TunnelInbound {
 
 impl Drop for TunnelInbound {
     fn drop(&mut self) {
-        warn!("Tunnel inbound listener on {} stopped", self.listen);
+        debug!("Tunnel inbound listener on {} stopped", self.listen);
     }
 }
 
 impl TunnelInbound {
     pub fn new(
         addr: SocketAddr,
+        allow_lan: bool,
         dispatcher: Arc<Dispatcher>,
         network: Vec<String>,
         target: String,
@@ -47,6 +50,7 @@ impl TunnelInbound {
     ) -> crate::Result<Self> {
         Ok(Self {
             listen: addr,
+            allow_lan,
             dispatcher,
             network,
             target: SocksAddr::from_str(&target)?,
@@ -76,15 +80,25 @@ impl InboundHandlerTrait for TunnelInbound {
         let listener = try_create_dualstack_tcplistener(self.listen)?;
 
         loop {
-            let (socket, src_addr) = listener.accept().await?;
+            let (socket, peer_addr) = match listener.accept().await {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!("[Tunnel-TCP] accept error: {e}");
+                    continue;
+                }
+            };
 
-            apply_tcp_options(&socket)?;
+            let Some(src_addr) =
+                accept_tcp(&socket, peer_addr, self.allow_lan, "[Tunnel-TCP]")
+            else {
+                continue;
+            };
 
             let dispatcher = self.dispatcher.clone();
             let sess = Session {
                 network: Network::Tcp,
                 typ: Type::Tunnel,
-                source: src_addr.to_canonical(),
+                source: src_addr,
                 destination: self.target.clone(),
                 so_mark: self.fw_mark,
                 ..Default::default()
@@ -113,10 +127,15 @@ impl InboundHandlerTrait for TunnelInbound {
         };
         let inbound = UdpSession::new(socket, self.target.clone());
 
-        _ = self
+        // Bind the close handle to the listener's lifetime. Dropping it here
+        // would signal the dispatcher to tear down the relay tasks it just
+        // spawned, killing this inbound before it forwards a single packet.
+        let _closer = self
             .dispatcher
             .dispatch_datagram(sess, Box::new(inbound))
             .await;
+
+        std::future::pending::<()>().await;
         Ok(())
     }
 }
@@ -126,7 +145,7 @@ struct UdpSession {
     pub socket: UdpSocket,
     pub dst_addr: SocksAddr,
     pub read_buf: Vec<u8>,
-    pub send_buf: Option<(Vec<u8>, SocketAddr)>,
+    pub send_buf: Option<(bytes::Bytes, SocketAddr)>,
 }
 
 impl UdpSession {
@@ -226,11 +245,10 @@ impl Stream for UdpSession {
         let socket = &this.socket;
         this.read_buf.resize(this.read_buf.capacity(), 0);
         let mut buf = ReadBuf::new(&mut this.read_buf);
-        dbg!(buf.initialized().len());
         buf.clear();
         match socket.poll_recv_from(cx, &mut buf) {
             Poll::Ready(Ok(src_addr)) => {
-                let data = buf.filled().to_vec();
+                let data = bytes::Bytes::copy_from_slice(buf.filled());
                 let dst_addr = this.dst_addr.clone();
                 let src_addr = SocksAddr::from(src_addr);
                 Poll::Ready(Some(UdpPacket {

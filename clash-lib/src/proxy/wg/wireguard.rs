@@ -136,7 +136,7 @@ impl WireguardTunnel {
             .lock()
             .await
             .send(UdpPacket {
-                data: packet.to_vec(),
+                data: bytes::Bytes::copy_from_slice(packet),
                 src_addr: SocksAddr::any_ipv4(),
                 dst_addr: self.endpoint.into(),
                 inbound_user: None,
@@ -212,7 +212,7 @@ impl WireguardTunnel {
         let mut send_buf = vec![0u8; 65535];
 
         loop {
-            let mut item = match self
+            let item = match self
                 .rx
                 .lock()
                 .await
@@ -230,17 +230,19 @@ impl WireguardTunnel {
             };
 
             let mut peer = self.peer.lock().await;
-            let data = &mut item.data;
+            let mut data = item.data;
             if data.len() > 3 {
-                data[1] = 0;
-                data[2] = 0;
-                data[3] = 0;
+                let mut data_mut = bytes::BytesMut::from(data);
+                data_mut[1] = 0;
+                data_mut[2] = 0;
+                data_mut[3] = 0;
+                data = data_mut.freeze();
             }
 
             let _ = trace_span!("wg_decapsulate", endpoint = %self.endpoint, size = data.len())
                 .entered();
 
-            match peer.decapsulate(None, data, &mut send_buf) {
+            match peer.decapsulate(None, &data, &mut send_buf) {
                 TunnResult::Done => {}
                 TunnResult::Err(e) => {
                     error!("failed to decapsulate packet: {e:?}");

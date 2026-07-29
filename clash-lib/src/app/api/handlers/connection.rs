@@ -92,7 +92,7 @@ async fn close_connection(
     Path(id): Path<uuid::Uuid>,
 ) -> impl IntoResponse {
     let mgr = state.statistics_manager;
-    mgr.close(id).await;
+    mgr.close(id);
     format!("connection {id} closed").into_response()
 }
 
@@ -100,6 +100,6 @@ async fn close_all_connection(
     State(state): State<ConnectionState>,
 ) -> impl IntoResponse {
     let mgr = state.statistics_manager;
-    mgr.close_all().await;
+    mgr.close_all();
     "all connections closed".into_response()
 }

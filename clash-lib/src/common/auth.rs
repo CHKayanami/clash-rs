@@ -33,10 +33,25 @@ impl PlainAuthenticator {
     }
 }
 
+/// Compare two byte strings without an early exit on the first difference.
+///
+/// The length is still observable — that is inherent to comparing a
+/// variable-length secret — but the contents are not.
+pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
 impl Authenticator for PlainAuthenticator {
     fn authenticate(&self, username: &str, password: &str) -> bool {
         match self.store.get(username) {
-            Some(p) => p == password,
+            Some(p) => constant_time_eq(p.as_bytes(), password.as_bytes()),
             None => false,
         }
     }

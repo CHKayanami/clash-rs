@@ -138,6 +138,13 @@ impl DomainSet {
         get_bit(&self.leaves, node_id as isize)
     }
 
+    /// Number of keys in the set. Each key terminates at exactly one node, and
+    /// each such node sets one bit in `leaves`.
+    #[allow(clippy::len_without_is_empty)]
+    pub fn len(&self) -> usize {
+        self.leaves.iter().map(|x| x.count_ones() as usize).sum()
+    }
+
     #[cfg(test)]
     pub fn traverse<F>(&self, mut f: F)
     where

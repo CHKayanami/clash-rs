@@ -7,14 +7,15 @@ homepage = { workspace = true }
 authors = { workspace = true }
 
 [features]
-default = ["standard", "aws-lc-rs", "dashboard"]
-standard = ["shadowsocks", "tuic", "ssh", "shadowquic", "wireguard", "tailscale", "clash-lib/zero_copy", "tproxy", "tun", "redir"]
+default = ["minimal"]
+standard = ["tun", "ssh", "shadowquic", "wireguard", "tailscale", "clash-lib/zero_copy", "tproxy", "redir"]
+minimal = ["dashboard","aws-lc-rs", "shadowsocks", "tuic", "clash-lib/zero_copy", "tproxy", "redir"]
 
 plus = ["standard", "onion"]
 perf = ["plus", "jemallocator"]
 
 android = ["shadowsocks", "tuic", "aws-lc-rs", "wireguard", "clash-lib/zero_copy", "tproxy"] # Android build failed with libc
-bsd = ["shadowsocks", "tuic", "ring", "clash-lib/zero_copy", "tun"]  # enable tun via FIB multi-table routing
+bsd = ["shadowsocks", "tuic", "ring", "clash-lib/zero_copy"] # BSD build failed with aws-lc-rs, and cross compile also fail with missing headers for tun->route_manager
 
 shadowsocks = ["clash-lib/shadowsocks"]
 ssh = ["clash-lib/ssh"]
@@ -32,6 +33,7 @@ dashboard = ["clash-lib/dashboard"]
 dhat-heap = ["dep:dhat"]
 telemetry = ["clash-lib/telemetry"]
 jemallocator = ["dep:tikv-jemallocator"]
+mimalloc = ["dep:mimalloc"]
 
 aws-lc-rs = ["dep:aws-lc-rs", "clash-lib/aws-lc-rs"]
 ring = ["clash-lib/ring"]
@@ -44,9 +46,12 @@ clash-lib = { path = "../clash-lib", default-features = false }
 
 dhat = { version = "0.3", optional = true }
 tikv-jemallocator = { version = "0.7", optional = true }
+mimalloc = { version = "0.1", optional = true }
 
 sentry = { version = "0.48", default-features = false, features = ["backtrace", "contexts", "panic", "reqwest", "rustls"] }
 human-panic = "2.0"
 
-
 aws-lc-rs = { version = "1.16", optional = true, default-features = false }
+
+
+

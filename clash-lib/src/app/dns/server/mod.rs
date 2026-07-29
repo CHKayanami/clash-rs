@@ -10,7 +10,7 @@ use super::ThreadSafeDNSResolver;
 mod handler;
 pub use handler::exchange_with_resolver;
 
-static DEFAULT_DNS_SERVER_TTL: u32 = 60;
+// static DEFAULT_DNS_SERVER_TTL: u32 = 60;
 
 struct DnsMessageExchanger {
     resolver: ThreadSafeDNSResolver,

@@ -97,30 +97,62 @@ impl Router {
         &self,
         sess: &mut Session,
     ) -> (&str, Option<&Box<dyn RuleMatcher>>) {
+        // whether a DNS lookup has been *attempted* for this session — not
+        // whether it succeeded. A domain that fails to resolve must not be
+        // retried once per remaining IP rule.
         let mut sess_resolved = false;
+        let mut process_resolved = false;
+
+        // Pre-loop GeoIP/ASN resolution: if the session already has an IP address,
+        // populate its geo metadata once to avoid repeated MaxMind lookups inside the rule loop.
+        if let Some(ip) = sess.resolved_ip.or(sess.destination.ip()) {
+            Self::populate_geo_for_ip(
+                ip,
+                &self.country_mmdb,
+                &self.asn_mmdb,
+                sess,
+            );
+        }
 
         for r in self.rules.iter() {
             // Resolve IP when needed
             if sess.destination.is_domain()
                 && r.should_resolve_ip()
                 && !sess_resolved
-                && let Ok(Some(ip)) = self
+            {
+                sess_resolved = true;
+
+                if let Ok(Some(ip)) = self
                     .dns_resolver
                     .resolve(sess.destination.domain().unwrap(), false)
                     .await
-            {
-                sess.resolved_ip = Some(ip);
-                sess_resolved = true;
+                {
+                    sess.resolved_ip = Some(ip);
+                    // Populate geo metadata exactly once for the newly resolved IP
+                    Self::populate_geo_for_ip(
+                        ip,
+                        &self.country_mmdb,
+                        &self.asn_mmdb,
+                        sess,
+                    );
+                }
             }
 
-            // Lookup geo information with guard clause
-            if let Some(ip) = sess.resolved_ip.or(sess.destination.ip()) {
-                Self::populate_geo_for_ip(
-                    ip,
-                    &self.country_mmdb,
-                    &self.asn_mmdb,
-                    sess,
-                );
+            // Resolve the owning process when needed. The lookup walks the OS
+            // socket table and blocks, so it runs on the blocking pool, and at
+            // most once per session no matter how many process rules follow.
+            if r.should_resolve_process() && !process_resolved {
+                process_resolved = true;
+
+                let probe = sess.clone();
+                sess.process_name = tokio::task::spawn_blocking(move || {
+                    rules::process::find_process_name(&probe)
+                })
+                .await
+                .unwrap_or_else(|e| {
+                    trace!("process name lookup failed: {}", e);
+                    None
+                });
             }
 
             if r.apply(sess) {
@@ -235,15 +267,11 @@ impl Router {
 
                     // Default to yaml if not specified
                     let format = file.format.unwrap_or_default();
-                    // `interval` is optional for file providers: content is
-                    // loaded at startup and live-reloaded via an OS file
-                    // watcher, so polling is only an occasional fallback.
-                    let interval = file.interval.map(Duration::from_secs);
                     let provider = RuleProviderImpl::new(
                         name.clone(),
                         file.behavior,
                         format,
-                        interval,
+                        Some(Duration::from_secs(file.interval.unwrap_or_default())),
                         Some(Arc::new(vehicle)),
                         mmdb.clone(),
                         geodata.clone(),
@@ -359,15 +387,25 @@ pub fn map_rule_type(
         RuleType::GeoSite {
             target,
             country_code,
-        } => {
-            let res = rules::geodata::GeoSiteMatcher::new(
-                country_code,
-                target,
-                geodata.as_ref(),
-            )
-            .unwrap();
-            Box::new(res) as _
-        }
+        } => match rules::geodata::GeoSiteMatcher::new(
+            country_code.clone(),
+            target,
+            geodata.as_ref(),
+        ) {
+            Ok(res) => Box::new(res) as _,
+            // a missing geosite.dat or a typo'd code used to abort the whole
+            // process here; degrade the way a broken composite rule does
+            Err(e) => {
+                error!(
+                    "failed to create GEOSITE rule for {}: {}. Using REJECT as \
+                     fallback.",
+                    country_code, e
+                );
+                Box::new(Final {
+                    target: "REJECT".to_string(),
+                })
+            }
+        },
         RuleType::SRCPort { target, port } => Box::new(rules::port::Port {
             port,
             target,

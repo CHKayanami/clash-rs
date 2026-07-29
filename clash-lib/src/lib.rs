@@ -87,6 +87,7 @@ pub struct Options {
     /// from the dashboard. Set this when starting from a file; leave `None`
     /// for string/inline configs (e.g. FFI).
     pub config_path: Option<String>,
+    pub dns_collect_file: Option<String>,
 }
 
 pub enum TokioRuntime {
@@ -136,7 +137,7 @@ pub struct GlobalState {
     #[cfg(feature = "tun")]
     tunnel_runner: ArcRunner,
     dns_listener: ArcRunner,
-    reload_tx: mpsc::Sender<(Config, oneshot::Sender<()>)>,
+    reload_tx: mpsc::Sender<(Config, oneshot::Sender<std::result::Result<(), String>>)>,
     cwd: String,
     /// Path to the config file used at startup. Used by the dashboard "Reload"
     /// button which sends an empty path to mean "reload current config".
@@ -144,7 +145,16 @@ pub struct GlobalState {
 }
 
 pub fn start_scaffold(opts: Options) -> Result<()> {
-    let rt = match opts.rt.as_ref().unwrap_or(&TokioRuntime::MultiThread) {
+    let Options {
+        config,
+        cwd,
+        rt,
+        log_file,
+        config_path,
+        dns_collect_file,
+    } = opts;
+
+    let rt = match rt.unwrap_or(TokioRuntime::MultiThread) {
         TokioRuntime::MultiThread => tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()?,
@@ -152,15 +162,15 @@ pub fn start_scaffold(opts: Options) -> Result<()> {
             .enable_all()
             .build()?,
     };
-    let config_path = opts.config_path.or_else(|| {
-        if let Config::File(ref p) = opts.config {
+    let config_path = config_path.or_else(|| {
+        if let Config::File(p) = &config {
             Some(p.clone())
         } else {
             None
         }
     });
-    let config: InternalConfig = opts.config.try_parse()?;
-    let cwd = opts.cwd.unwrap_or_else(|| ".".to_string());
+    let config: InternalConfig = config.try_parse()?;
+    let cwd = cwd.unwrap_or_else(|| ".".to_string());
     let (log_tx, _) = broadcast::channel(100);
 
     let log_collector = app::logging::EventCollector::new(vec![log_tx.clone()]);
@@ -169,7 +179,7 @@ pub fn start_scaffold(opts: Options) -> Result<()> {
         config.general.log_level,
         log_collector,
         &cwd,
-        opts.log_file,
+        log_file,
     );
 
     let shutdown_token = tokio_util::sync::CancellationToken::new();
@@ -178,7 +188,7 @@ pub fn start_scaffold(opts: Options) -> Result<()> {
         token_guard.push(shutdown_token.clone());
     }
     rt.block_on(async {
-        match start(config, cwd, config_path, log_tx, shutdown_token).await {
+        match start(config, cwd, config_path, dns_collect_file, log_tx, shutdown_token).await {
             Err(e) => {
                 eprintln!("start error: {e}");
                 Err(e)
@@ -198,16 +208,25 @@ pub fn start_scaffold_instance(
     std::thread::JoinHandle<()>,
     tokio_util::sync::CancellationToken,
 )> {
-    let config_path = opts.config_path.or_else(|| {
-        if let Config::File(ref p) = opts.config {
+    let Options {
+        config,
+        cwd,
+        rt,
+        log_file: _,
+        config_path,
+        dns_collect_file,
+    } = opts;
+
+    let config_path = config_path.or_else(|| {
+        if let Config::File(p) = &config {
             Some(p.clone())
         } else {
             None
         }
     });
-    let config: InternalConfig = opts.config.try_parse()?;
-    let cwd = opts.cwd.unwrap_or_else(|| ".".to_string());
-    let rt_kind = opts.rt.unwrap_or(TokioRuntime::MultiThread);
+    let config: InternalConfig = config.try_parse()?;
+    let cwd = cwd.unwrap_or_else(|| ".".to_string());
+    let rt_kind = rt.unwrap_or(TokioRuntime::MultiThread);
 
     let token = tokio_util::sync::CancellationToken::new();
     let token_clone = token.clone();
@@ -226,7 +245,7 @@ pub fn start_scaffold_instance(
         let (log_tx, _) = tokio::sync::broadcast::channel(100);
 
         if let Err(e) =
-            rt.block_on(start(config, cwd, config_path, log_tx, token_clone))
+            rt.block_on(start(config, cwd, config_path, dns_collect_file, log_tx, token_clone))
         {
             eprintln!("Clash instance error: {}", e);
         }
@@ -271,18 +290,19 @@ pub async fn start(
     config: InternalConfig,
     cwd: String,
     config_path: Option<String>,
+    dns_collect_file: Option<String>,
     log_tx: broadcast::Sender<LogEvent>,
     shutdown_token: tokio_util::sync::CancellationToken,
 ) -> Result<()> {
     setup_default_crypto_provider();
 
-    let cwd = PathBuf::from(cwd);
+    let cwd_path = PathBuf::from(cwd.clone());
 
     // things we need to clone before consuming config
     let controller_cfg = config.general.controller.clone();
     let log_level = config.general.log_level;
 
-    let components = create_components(cwd.clone(), config).await?;
+    let mut components = create_components(cwd_path.clone(), config, None, dns_collect_file.clone()).await?;
 
     let (reload_tx, mut reload_rx) = mpsc::channel(1);
 
@@ -292,7 +312,7 @@ pub async fn start(
         tunnel_runner: components.tun_runner.clone(),
         dns_listener: components.dns_listener.clone(),
         reload_tx,
-        cwd: cwd.to_string_lossy().to_string(),
+        cwd: cwd.clone(),
         config_path,
     }));
 
@@ -307,7 +327,7 @@ pub async fn start(
         components.statistics_manager.clone(),
         components.cache_store.clone(),
         components.router.clone(),
-        cwd.to_string_lossy().to_string(),
+        cwd.clone(),
         Some(shutdown_token.child_token()),
         components.dns_listen.clone(),
         components.dns_enabled,
@@ -328,67 +348,91 @@ pub async fn start(
 
     components.start_all();
 
-    let cwd_clone = cwd.clone();
-
-    let reload_token = shutdown_token.child_token();
+    let cwd_clone = cwd.clone();    let reload_token = shutdown_token.child_token();
+    let shutdown_token_clone = shutdown_token.clone();
     tokio::spawn(async move {
         // Listen for config reload signal and reload config
-        while let Some((config, done)) = reload_rx.recv().await {
-            info!("reloading config");
-            let config = match config.try_parse() {
-                Ok(c) => c,
-                Err(e) => {
-                    error!("failed to reload config: {}", e);
-                    continue;
+        loop {
+            tokio::select! {
+                res = reload_rx.recv() => {
+                    match res {
+                        Some((config, done)) => {
+                            info!("reloading config");
+                            let config = match config.try_parse() {
+                                Ok(c) => c,
+                                Err(e) => {
+                                    error!("failed to reload config: {}", e);
+                                    let _ = done.send(Err(e.to_string()));
+                                    continue;
+                                }
+                            };
+
+                            let controller_cfg = config.general.controller.clone();
+
+                            let new_components = match create_components(PathBuf::from(&cwd_clone), config, Some(&components), dns_collect_file.clone()).await {
+                                Ok(nc) => nc,
+                                Err(e) => {
+                                    error!("failed to reload config: {}", e);
+                                    let _ = done.send(Err(e.to_string()));
+                                    continue;
+                                }
+                            };
+
+                            let _ = done.send(Ok(()));
+
+                            components.stop_all();
+                            new_components.start_all();
+
+                            // TODO: every reload is causing the API server to restart, we should
+                            // make the API server reloadable instead of restarting it.
+                            // maybe adding APIs to replace components
+                            // and only recreate the listeners when necessary (e.g. when the listen
+                            // address or port is changed)
+                            let new_api_listener: ArcRunner = Arc::new(app::api::ApiRunner::new(
+                                controller_cfg,
+                                log_tx.clone(),
+                                new_components.inbound_manager.clone(),
+                                new_components.dispatcher.clone(),
+                                global_state.clone(),
+                                new_components.dns_resolver.clone(),
+                                new_components.outbound_manager.clone(),
+                                new_components.statistics_manager.clone(),
+                                new_components.cache_store.clone(),
+                                new_components.router.clone(),
+                                cwd_clone.clone(),
+                                Some(reload_token.child_token()),
+                                new_components.dns_listen.clone(),
+                                new_components.dns_enabled,
+                            ));
+                            let mut g = global_state.lock().await;
+
+                            #[cfg(feature = "tun")]
+                            {
+                                g.tunnel_runner = new_components.tun_runner.clone();
+                            }
+                            g.dns_listener = new_components.dns_listener.clone();
+
+                            api_listener.shutdown();
+                            // Wait for the old API server to fully stop before starting the new
+                            // one, to avoid EADDRINUSE on the same port.
+                            api_listener.join().await.ok();
+                            new_api_listener.run_async();
+                            api_listener = new_api_listener;
+                            components = new_components;
+                        }
+                        None => {
+                            break;
+                        }
+                    }
                 }
-            };
-
-            let controller_cfg = config.general.controller.clone();
-
-            let new_components =
-                create_components(cwd_clone.clone(), config).await?;
-
-            let _ = done.send(());
-
-            components.stop_all();
-            new_components.start_all();
-
-            // TODO: every reload is causing the API server to restart, we should
-            // make the API server reloadable instead of restarting it.
-            // maybe adding APIs to replace components
-            // and only recreate the listeners when necessary (e.g. when the listen
-            // address or port is changed)
-            let new_api_listener: ArcRunner = Arc::new(app::api::ApiRunner::new(
-                controller_cfg,
-                log_tx.clone(),
-                new_components.inbound_manager.clone(),
-                new_components.dispatcher.clone(),
-                global_state.clone(),
-                new_components.dns_resolver.clone(),
-                new_components.outbound_manager.clone(),
-                new_components.statistics_manager.clone(),
-                new_components.cache_store.clone(),
-                new_components.router.clone(),
-                cwd_clone.to_string_lossy().to_string(),
-                Some(reload_token.child_token()),
-                new_components.dns_listen.clone(),
-                new_components.dns_enabled,
-            ));
-            let mut g = global_state.lock().await;
-
-            #[cfg(feature = "tun")]
-            {
-                g.tunnel_runner = new_components.tun_runner.clone();
+                _ = shutdown_token_clone.cancelled() => {
+                    break;
+                }
             }
-            g.dns_listener = new_components.dns_listener.clone();
-
-            api_listener.shutdown();
-            // Wait for the old API server to fully stop before starting the new
-            // one, to avoid EADDRINUSE on the same port.
-            api_listener.join().await.ok();
-            new_api_listener.run_async();
-            api_listener = new_api_listener;
         }
+        components.stop_all();
+        api_listener.shutdown();
+        api_listener.join().await.ok();
         Ok::<(), Error>(())
     });
 
@@ -413,6 +457,13 @@ struct RuntimeComponents {
     inbound_manager: Arc<InboundManager>,
     dns_listen: DNSListenAddr,
     dns_enabled: bool,
+
+    country_mmdb: Option<MmdbLookup>,
+    country_mmdb_path: Option<PathBuf>,
+    asn_mmdb: Option<MmdbLookup>,
+    asn_mmdb_path: Option<PathBuf>,
+    geodata: Option<GeoDataLookup>,
+    geosite_path: Option<PathBuf>,
 }
 
 impl RuntimeComponents {
@@ -434,6 +485,8 @@ impl RuntimeComponents {
 async fn create_components(
     cwd: PathBuf,
     config: InternalConfig,
+    old_components: Option<&RuntimeComponents>,
+    dns_collect_file: Option<String>,
 ) -> Result<RuntimeComponents> {
     if config.tun.enable {
         debug!("tun enabled, initializing default outbound interface");
@@ -441,10 +494,11 @@ async fn create_components(
     }
 
     let cancellation_token = tokio_util::sync::CancellationToken::new();
+    let cwd_str = cwd.to_string_lossy().to_string();
 
     debug!("initializing cache store");
     let cache_store = profile::ThreadSafeCacheFile::new(
-        cwd.join("cache.db").as_path().to_str().unwrap(),
+        &cwd.join("cache.db").to_string_lossy(),
         config.profile.store_selected,
     );
 
@@ -466,11 +520,7 @@ async fn create_components(
             .collect(),
     );
 
-    // Create a shared outbound registry seeded with plain outbounds.
-    // After OutboundManager is initialized it will be extended with all
-    // handlers (plain + proxy groups + provider proxies), so DNS clients
-    // and the HTTP client can use any of them for bootstrap traffic.
-    let outbound_registry = Arc::new(tokio::sync::RwLock::new(
+    let outbound_registry = Arc::new(parking_lot::RwLock::new(
         plain_outbounds
             .iter()
             .map(|x| (x.name().to_string(), x.clone()))
@@ -481,10 +531,6 @@ async fn create_components(
         new_http_client(system_resolver.clone(), Some(outbound_registry.clone()))
             .map_err(|x| Error::DNSError(x.to_string()))?;
 
-    // Download the dashboard if both `external-ui` and `external-ui-url` are
-    // configured and the directory is absent or empty. This is done here so
-    // it can use the proxy-aware HTTP client (plain outbound handlers are
-    // already loaded into the registry at this point).
     if let (Some(ui_path), Some(download_url)) = (
         &config.general.controller.external_ui,
         &config.general.controller.external_ui_download_url,
@@ -497,30 +543,44 @@ async fn create_components(
     }
 
     debug!("initializing dns resolver");
-    // Clone the dns.listen for the DNS Server later before we consume the config
-    // TODO: we should separate the DNS resolver and DNS server config here
     let dns_listen = config.dns.listen.clone();
     let dns_enable = config.dns.enable;
 
-    // Extract the country MMDB file/url config early so they can be consumed
-    // here, while the actual MMDB loading happens after OutboundManager (like
-    // geodata and asn_mmdb) so it benefits from the fully-populated outbound
-    // registry when downloading the file.
     let country_mmdb_file = config.general.mmdb;
     let country_mmdb_download_url = config.general.mmdb_download_url;
 
-    // Create a shared pending handle that the DNS resolver's GeoIPFilter holds.
-    // It starts empty and is populated once the MMDB is loaded below.
     let pending_country_mmdb: Option<dns::PendingMmdb> = country_mmdb_file
         .as_ref()
         .map(|_| Arc::new(OnceLock::new()));
 
-    // When `dns.respect-rules` is true, share a `RuleDispatch` between the
-    // resolver and the (later-built) router + outbound manager. The DNS
-    // runtime provider consults the OnceLocks at dial time and falls back to
-    // DIRECT until they are populated.
     let rule_dispatch: Option<Arc<dns::RuleDispatch>> = if config.dns.respect_rules {
         Some(dns::RuleDispatch::new())
+    } else {
+        None
+    };
+
+    let dns_collector = if let Some(file_str) = &dns_collect_file {
+        let path = PathBuf::from(file_str);
+        let resolved_path = if path.is_relative() {
+            cwd.join(path)
+        } else {
+            path
+        };
+        if resolved_path.exists() {
+            match dns::DnsCollector::new(resolved_path) {
+                Ok(collector) => Some(collector),
+                Err(e) => {
+                    warn!("failed to initialize DNS collector: {e}");
+                    None
+                }
+            }
+        } else {
+            debug!(
+                "DNS collect file {:?} does not exist, DNS statistics collection disabled",
+                resolved_path
+            );
+            None
+        }
     } else {
         None
     };
@@ -531,6 +591,7 @@ async fn create_components(
         pending_country_mmdb.clone(),
         outbound_registry.clone(),
         rule_dispatch.clone(),
+        dns_collector,
     )
     .await;
 
@@ -550,7 +611,7 @@ async fn create_components(
             config.proxy_names,
             dns_resolver.clone(),
             cache_store.clone(),
-            cwd.to_string_lossy().to_string(),
+            cwd_str.clone(),
             config.general.routing_mask,
             outbound_registry.clone(),
         )
@@ -567,20 +628,25 @@ async fn create_components(
     }
 
     debug!("initializing mmdb");
-    let country_mmdb = if let Some(ref mmdb_file) = country_mmdb_file {
-        let mmdb = Arc::new(
-            mmdb::Mmdb::new(
-                cwd.join(mmdb_file),
-                country_mmdb_download_url
-                    .unwrap_or(DEFAULT_COUNTRY_MMDB_DOWNLOAD_URL.to_string()),
-                client.clone(),
-            )
-            .await?,
-        ) as MmdbLookup;
-        // Populate the shared handle so the DNS resolver's GeoIPFilter can use
-        // it. Any inflight DNS fallback-IP filtering that ran before this point
-        // will have been permissive (MMDB absent = pass-through), which is the
-        // safe default during startup.
+    let country_mmdb_path = country_mmdb_file.as_ref().map(|f| cwd.join(f));
+    let country_mmdb = if let Some(ref mmdb_path) = country_mmdb_path {
+        let mmdb = if let Some(old) = old_components
+            && old.country_mmdb_path.as_ref() == Some(mmdb_path)
+            && let Some(ref old_mmdb) = old.country_mmdb
+        {
+            debug!("reusing country mmdb from {:?}", mmdb_path);
+            old_mmdb.clone()
+        } else {
+            Arc::new(
+                mmdb::Mmdb::new(
+                    mmdb_path.clone(),
+                    country_mmdb_download_url
+                        .unwrap_or(DEFAULT_COUNTRY_MMDB_DOWNLOAD_URL.to_string()),
+                    client.clone(),
+                )
+                .await?,
+            ) as MmdbLookup
+        };
         if let Some(pending) = &pending_country_mmdb
             && pending.set(mmdb.clone()).is_err()
         {
@@ -596,36 +662,56 @@ async fn create_components(
     };
 
     debug!("initializing geosite");
-    let geodata = if let Some(geosite_file) = config.general.geosite {
-        Some(Arc::new(
-            geodata::GeoData::new(
-                cwd.join(&geosite_file),
-                config
-                    .general
-                    .geosite_download_url
-                    .unwrap_or(DEFAULT_GEOSITE_DOWNLOAD_URL.to_string()),
-                client.clone(),
-            )
-            .await?,
-        ) as GeoDataLookup)
+    let geosite_path = config.general.geosite.as_ref().map(|f| cwd.join(f));
+    let geodata = if let Some(ref path) = geosite_path {
+        let gd = if let Some(old) = old_components
+            && old.geosite_path.as_ref() == Some(path)
+            && let Some(ref old_geodata) = old.geodata
+        {
+            debug!("reusing geosite from {:?}", path);
+            old_geodata.clone()
+        } else {
+            Arc::new(
+                geodata::GeoData::new(
+                    path.clone(),
+                    config
+                        .general
+                        .geosite_download_url
+                        .unwrap_or(DEFAULT_GEOSITE_DOWNLOAD_URL.to_string()),
+                    client.clone(),
+                )
+                .await?,
+            ) as GeoDataLookup
+        };
+        Some(gd)
     } else {
         debug!("geosite not set, skipping");
         None
     };
 
     debug!("initializing country asn mmdb");
-    let asn_mmdb = if let Some(asn_mmdb_name) = config.general.asn_mmdb {
-        Some(Arc::new(
-            mmdb::Mmdb::new(
-                cwd.join(&asn_mmdb_name),
-                config
-                    .general
-                    .asn_mmdb_download_url
-                    .unwrap_or(DEFAULT_ASN_MMDB_DOWNLOAD_URL.to_string()),
-                client.clone(),
-            )
-            .await?,
-        ) as MmdbLookup)
+    let asn_mmdb_path = config.general.asn_mmdb.as_ref().map(|f| cwd.join(f));
+    let asn_mmdb = if let Some(ref path) = asn_mmdb_path {
+        let mmdb = if let Some(old) = old_components
+            && old.asn_mmdb_path.as_ref() == Some(path)
+            && let Some(ref old_asn_mmdb) = old.asn_mmdb
+        {
+            debug!("reusing asn mmdb from {:?}", path);
+            old_asn_mmdb.clone()
+        } else {
+            Arc::new(
+                mmdb::Mmdb::new(
+                    path.clone(),
+                    config
+                        .general
+                        .asn_mmdb_download_url
+                        .unwrap_or(DEFAULT_ASN_MMDB_DOWNLOAD_URL.to_string()),
+                    client.clone(),
+                )
+                .await?,
+            ) as MmdbLookup
+        };
+        Some(mmdb)
     } else {
         debug!("ASN mmdb not found and not configured for download, skipping");
         None
@@ -637,10 +723,10 @@ async fn create_components(
             config.rules,
             config.rule_providers,
             dns_resolver.clone(),
-            country_mmdb,
-            asn_mmdb,
-            geodata,
-            cwd.to_string_lossy().to_string(),
+            country_mmdb.clone(),
+            asn_mmdb.clone(),
+            geodata.clone(),
+            cwd_str.clone(),
         )
         .await,
     );
@@ -653,6 +739,8 @@ async fn create_components(
              indicates a double-initialization bug"
         );
     }
+
+    dns_resolver.after_router_inited(router.clone()).await;
 
     let statistics_manager = StatisticsManager::new();
 
@@ -683,7 +771,7 @@ async fn create_components(
         debug!("loading inbound providers");
         inbound_manager
             .load_inbound_providers(
-                cwd.to_string_lossy().to_string(),
+                cwd_str.clone(),
                 config.inbound_providers,
                 dns_resolver.clone(),
             )
@@ -723,6 +811,12 @@ async fn create_components(
         dns_listener,
         dns_listen,
         dns_enabled: dns_enable,
+        country_mmdb,
+        country_mmdb_path,
+        asn_mmdb,
+        asn_mmdb_path,
+        geodata,
+        geosite_path,
     })
 }
 
@@ -758,6 +852,7 @@ mod tests {
                 rt: None,
                 log_file: None,
                 config_path: None,
+                dns_collect_file: None,
             })
             .unwrap()
         });

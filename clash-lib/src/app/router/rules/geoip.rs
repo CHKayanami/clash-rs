@@ -19,13 +19,21 @@ impl std::fmt::Display for GeoIP {
 
 impl RuleMatcher for GeoIP {
     fn apply(&self, sess: &Session) -> bool {
+        // `Router::match_route` already looked this IP up in the same country
+        // mmdb and cached the result on the session — reuse it instead of
+        // paying for another lookup per GEOIP rule.
+        if let Some(country) = &sess.country {
+            return country.eq_ignore_ascii_case(&self.country_code);
+        }
+
         let ip = sess.resolved_ip.or(sess.destination.ip());
 
         if let Some(ip) = ip {
             if let Some(mmdb) = &self.mmdb {
                 // Check if the IP matches the country code
-                mmdb.lookup_country(ip)
-                    .is_ok_and(|country| country.country_code == self.country_code)
+                mmdb.lookup_country(ip).is_ok_and(|country| {
+                    country.country_code.eq_ignore_ascii_case(&self.country_code)
+                })
             } else {
                 warn!(
                     "GeoIP lookup failed: MMDB not available. Maybe config.mmdb is \

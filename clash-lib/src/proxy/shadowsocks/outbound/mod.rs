@@ -9,9 +9,8 @@ use self::{
 use crate::{
     app::{
         dispatcher::{
-            BoxedInstrumentedDatagram, BoxedInstrumentedStream,
-            InstrumentedDatagram, InstrumentedDatagramWrapper, InstrumentedStream,
-            InstrumentedStreamWrapper,
+            BoxedChainedDatagram, BoxedChainedStream, ChainedDatagram,
+            ChainedDatagramWrapper, ChainedStream, ChainedStreamWrapper,
         },
         dns::ThreadSafeDNSResolver,
     },
@@ -50,6 +49,9 @@ pub struct Handler {
     opts: HandlerOptions,
     ctx: Arc<shadowsocks::context::Context>,
     connector: tokio::sync::RwLock<Option<Arc<dyn RemoteConnector>>>,
+    /// Built lazily and reused: `ServerConfig::new` re-derives the key from the
+    /// password, and this used to run on every single connection.
+    cfg: std::sync::OnceLock<ServerConfig>,
 }
 
 impl_default_connector!(Handler);
@@ -68,6 +70,7 @@ impl Handler {
             opts,
             ctx: Context::new_shared(ServerType::Local),
             connector: tokio::sync::RwLock::new(None),
+            cfg: std::sync::OnceLock::new(),
         }
     }
 
@@ -87,20 +90,24 @@ impl Handler {
         let stream = ProxyClientStream::from_stream(
             self.ctx.clone(),
             stream,
-            &cfg,
+            cfg,
             (sess.destination.host(), sess.destination.port()),
         );
 
         Ok(Box::new(ShadowSocksStream(stream)))
     }
 
-    fn server_config(&self) -> Result<ServerConfig, io::Error> {
-        ServerConfig::new(
+    fn server_config(&self) -> Result<&ServerConfig, io::Error> {
+        if let Some(cfg) = self.cfg.get() {
+            return Ok(cfg);
+        }
+        let cfg = ServerConfig::new(
             (self.opts.server.to_owned(), self.opts.port),
             self.opts.password.to_owned(),
             map_cipher(self.opts.cipher.as_str())?,
         )
-        .map_err(|e| new_io_error(e.to_string()))
+        .map_err(|e| new_io_error(e.to_string()))?;
+        Ok(self.cfg.get_or_init(|| cfg))
     }
 }
 
@@ -126,7 +133,7 @@ impl OutboundHandler for Handler {
         &self,
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
-    ) -> io::Result<BoxedInstrumentedStream> {
+    ) -> io::Result<BoxedChainedStream> {
         let dialer = self.connector.read().await;
 
         if let Some(dialer) = dialer.as_ref() {
@@ -138,7 +145,7 @@ impl OutboundHandler for Handler {
             resolver,
             dialer
                 .as_ref()
-                .unwrap_or(&GLOBAL_DIRECT_CONNECTOR.clone())
+                .unwrap_or(&*GLOBAL_DIRECT_CONNECTOR)
                 .as_ref(),
         )
         .await
@@ -148,7 +155,7 @@ impl OutboundHandler for Handler {
         &self,
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
-    ) -> io::Result<BoxedInstrumentedDatagram> {
+    ) -> io::Result<BoxedChainedDatagram> {
         let dialer = self.connector.read().await;
 
         if let Some(dialer) = dialer.as_ref() {
@@ -160,7 +167,7 @@ impl OutboundHandler for Handler {
             resolver,
             dialer
                 .as_ref()
-                .unwrap_or(&GLOBAL_DIRECT_CONNECTOR.clone())
+                .unwrap_or(&*GLOBAL_DIRECT_CONNECTOR)
                 .as_ref(),
         )
         .await
@@ -175,12 +182,13 @@ impl OutboundHandler for Handler {
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
         connector: &dyn RemoteConnector,
-    ) -> io::Result<BoxedInstrumentedStream> {
+    ) -> io::Result<BoxedChainedStream> {
         let stream = connector
             .connect_stream(
                 resolver.clone(),
                 self.opts.server.as_str(),
                 self.opts.port,
+                self.opts.common_opts.tfo,
                 sess.iface.as_ref(),
                 #[cfg(target_os = "linux")]
                 sess.so_mark,
@@ -188,7 +196,7 @@ impl OutboundHandler for Handler {
             .await?;
 
         let s = self.proxy_stream(stream, sess, resolver).await?;
-        let chained = InstrumentedStreamWrapper::new(s);
+        let chained = ChainedStreamWrapper::new(s);
         chained.append_to_chain(self.name()).await;
         Ok(Box::new(chained))
     }
@@ -198,27 +206,16 @@ impl OutboundHandler for Handler {
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
         connector: &dyn RemoteConnector,
-    ) -> io::Result<BoxedInstrumentedDatagram> {
+    ) -> io::Result<BoxedChainedDatagram> {
         let cfg = self.server_config()?;
 
-        let socket = connector
-            .connect_datagram(
-                resolver.clone(),
-                None,
-                (self.opts.server.clone(), self.opts.port).try_into()?,
-                sess.iface.as_ref(),
-                #[cfg(target_os = "linux")]
-                sess.so_mark,
-            )
-            .await?;
-
-        let socket = ProxySocket::from_socket(
-            UdpSocketType::Client,
-            self.ctx.clone(),
-            &cfg,
-            ShadowsocksUdpIo::new(socket),
-        );
-        let server_addr = resolver
+        // Resolve up front and dial the concrete address. `connect_datagram`
+        // only uses the destination as a socket-family hint, and a domain
+        // carries none — so an AAAA-only server used to get an AF_INET socket
+        // that could never send to the v6 address resolved below. Resolving
+        // once also guarantees the socket and `remote_addr` agree when the
+        // server has several A/AAAA records.
+        let server_ip = resolver
             .resolve(&self.opts.server, false)
             .await
             .map_err(|x| {
@@ -231,11 +228,27 @@ impl OutboundHandler for Handler {
                 "failed to resolve {}",
                 self.opts.server
             )))?;
-        let d = OutboundDatagramShadowsocks::new(
-            socket,
-            (server_addr, self.opts.port).into(),
+        let server_addr = std::net::SocketAddr::new(server_ip, self.opts.port);
+
+        let socket = connector
+            .connect_datagram(
+                resolver.clone(),
+                None,
+                server_addr.into(),
+                sess.iface.as_ref(),
+                #[cfg(target_os = "linux")]
+                sess.so_mark,
+            )
+            .await?;
+
+        let socket = ProxySocket::from_socket(
+            UdpSocketType::Client,
+            self.ctx.clone(),
+            cfg,
+            ShadowsocksUdpIo::new(socket),
         );
-        let d = InstrumentedDatagramWrapper::new(d);
+        let d = OutboundDatagramShadowsocks::new(socket, server_addr);
+        let d = ChainedDatagramWrapper::new(d);
         d.append_to_chain(self.name()).await;
         Ok(Box::new(d))
     }
@@ -421,7 +434,7 @@ mod tests {
             port: shadow_tls_port,
             password: PASSWORD.to_owned(),
             cipher: CIPHER.to_owned(),
-            plugin: Some(TransportLayer::ShadowTls(client)),
+            plugin: Some(Box::new(client)),
             udp: false,
         };
         let handler: Arc<dyn OutboundHandler> = Arc::new(Handler::new(opts));
@@ -480,11 +493,9 @@ mod tests {
         let host = "www.bing.com".to_owned();
         let plugin = match mode {
             SimpleOBFSMode::Http => {
-                TransportLayer::SimpleObfsHttp(SimpleObfsHttp::new(host, ss_port))
+                Box::new(SimpleObfsHttp::new(host, ss_port)) as _
             }
-            SimpleOBFSMode::Tls => {
-                TransportLayer::SimpleObfsTls(SimpleObfsTLS::new(host))
-            }
+            SimpleOBFSMode::Tls => Box::new(SimpleObfsTLS::new(host)) as _,
         };
         let opts = HandlerOptions {
             name: "test-obfs".to_owned(),
@@ -538,7 +549,7 @@ mod tests {
             port: ss_port,
             password: PASSWORD.to_owned(),
             cipher: CIPHER.to_owned(),
-            plugin: Some(TransportLayer::V2rayWs(plugin)),
+            plugin: Some(Box::new(plugin)),
             udp: false,
         };
 

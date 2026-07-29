@@ -1,15 +1,17 @@
 use std::io;
-
+use std::sync::Arc;
 use async_trait::async_trait;
 use hickory_proto::op;
 
 use crate::{
     app::{
-        dispatcher::{BoxedInstrumentedDatagram, BoxedInstrumentedStream},
+        dispatcher::{BoxedChainedDatagram, BoxedChainedStream},
         dns::{ClashResolver, ResolverKind, ThreadSafeDNSResolver},
+        router::Router
     },
     proxy::{ConnectorType, DialWithConnector, OutboundHandler, OutboundType},
     session::Session,
+    
 };
 
 pub struct NoopResolver;
@@ -23,6 +25,8 @@ impl ClashResolver for NoopResolver {
     ) -> anyhow::Result<Option<std::net::IpAddr>> {
         Ok(None)
     }
+
+
 
     async fn resolve_v4(
         &self,
@@ -49,6 +53,10 @@ impl ClashResolver for NoopResolver {
         Err(anyhow::anyhow!("unsupported"))
     }
 
+    /// Used for DNS Server
+    async fn exchange_all(&self, _message: &op::Message) -> anyhow::Result<op::Message> {
+        Err(anyhow::anyhow!("unsupported"))
+    }
     /// Only used for look up fake IP
     async fn reverse_lookup(&self, _ip: std::net::IpAddr) -> Option<String> {
         None
@@ -67,6 +75,10 @@ impl ClashResolver for NoopResolver {
     }
 
     fn set_ipv6(&self, _enable: bool) {}
+
+    async fn after_router_inited(&self,_r: Arc<Router>){
+
+    }
 
     fn kind(&self) -> ResolverKind {
         ResolverKind::Clash
@@ -103,7 +115,7 @@ impl OutboundHandler for NoopOutboundHandler {
         &self,
         _sess: &Session,
         _resolver: ThreadSafeDNSResolver,
-    ) -> io::Result<BoxedInstrumentedStream> {
+    ) -> io::Result<BoxedChainedStream> {
         Err(io::Error::other("noop"))
     }
 
@@ -111,7 +123,7 @@ impl OutboundHandler for NoopOutboundHandler {
         &self,
         _sess: &Session,
         _resolver: ThreadSafeDNSResolver,
-    ) -> io::Result<BoxedInstrumentedDatagram> {
+    ) -> io::Result<BoxedChainedDatagram> {
         Err(io::Error::other("noop"))
     }
 

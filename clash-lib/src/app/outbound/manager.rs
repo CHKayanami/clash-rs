@@ -136,7 +136,7 @@ impl OutboundManager {
         // Using `clone()` + `*reg = ...` ensures stale entries from previous
         // initialisation rounds (e.g. across hot reloads) are removed.
         {
-            let mut reg = m.registry.write().await;
+            let mut reg = m.registry.write();
             *reg = handlers
                 .iter()
                 .map(|(k, v)| {
@@ -150,10 +150,9 @@ impl OutboundManager {
     }
 
     /// Look up a handler by name. Returns `None` when the name is not
-    /// registered.  The registry is read under a shared lock, so this method
-    /// is `async` — callers must `.await` the result.
-    pub async fn get_outbound(&self, name: &str) -> Option<AnyOutboundHandler> {
-        self.registry.read().await.get(name).cloned()
+    /// registered.  The registry is read under a shared lock.
+    pub fn get_outbound(&self, name: &str) -> Option<AnyOutboundHandler> {
+        self.registry.read().get(name).cloned()
     }
 
     /// this doesn't populate history/liveness information
@@ -177,7 +176,6 @@ impl OutboundManager {
         let handlers: Vec<(String, AnyOutboundHandler)> = self
             .registry
             .read()
-            .await
             .iter()
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
@@ -673,6 +671,7 @@ impl OutboundManager {
                                     icon: proto.icon.clone(),
                                     url: proto.url.clone(),
                                     connector: None,
+                                    tfo: false,
                                 },
                             },
                             providers,
@@ -704,6 +703,7 @@ impl OutboundManager {
                                 icon: proto.icon.clone(),
                                 url: Some(proto.url.clone()),
                                 connector: None,
+                                tfo: false,
                             },
                             ..Default::default()
                         },
@@ -741,6 +741,7 @@ impl OutboundManager {
                                     icon: proto.icon.clone(),
                                     url: Some(proto.url.clone()),
                                     connector: None,
+                                    tfo: false,
                                 },
                                 ..Default::default()
                             },
@@ -776,6 +777,7 @@ impl OutboundManager {
                                     icon: proto.icon.clone(),
                                     url: Some(proto.url.clone()),
                                     connector: None,
+                                    tfo: false,
                                 },
                                 ..Default::default()
                             },
@@ -813,6 +815,7 @@ impl OutboundManager {
                                 icon: proto.icon.clone(),
                                 url: proto.url.clone(),
                                 connector: None,
+                                tfo: false,
                             },
                         },
                         providers,
@@ -843,22 +846,27 @@ impl OutboundManager {
 
                     handlers.insert(
                         proto.name.clone(),
-                        Arc::new(smart::Handler::new_with_cache(
-                            smart::HandlerOptions {
-                                name: proto.name.clone(),
-                                common_opts: crate::proxy::HandlerCommonOptions {
-                                    icon: proto.icon.clone(),
-                                    url: proto.url.clone(),
-                                    connector: None,
+                        Arc::new(
+                            smart::Handler::new_with_cache(
+                                smart::HandlerOptions {
+                                    name: proto.name.clone(),
+                                    common_opts:
+                                        crate::proxy::HandlerCommonOptions {
+                                            icon: proto.icon.clone(),
+                                            url: proto.url.clone(),
+                                            connector: None,
+                                            tfo: false,
+                                        },
+                                    udp: proto.udp.unwrap_or(true),
+                                    max_retries: proto.max_retries,
+                                    bandwidth_weight: proto.bandwidth_weight,
                                 },
-                                udp: proto.udp.unwrap_or(true),
-                                max_retries: proto.max_retries,
-                                bandwidth_weight: proto.bandwidth_weight,
-                            },
-                            providers,
-                            proxy_manager.clone(),
-                            cache_store.clone(),
-                        )),
+                                providers,
+                                proxy_manager.clone(),
+                                cache_store.clone(),
+                            )
+                            .await,
+                        ),
                     );
                 }
             }

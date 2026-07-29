@@ -7,9 +7,8 @@ use super::{
 use crate::{
     app::{
         dispatcher::{
-            BoxedInstrumentedDatagram, BoxedInstrumentedStream,
-            InstrumentedDatagram, InstrumentedDatagramWrapper, InstrumentedStream,
-            InstrumentedStreamWrapper,
+            BoxedChainedDatagram, BoxedChainedStream, ChainedDatagram,
+            ChainedDatagramWrapper, ChainedStream, ChainedStreamWrapper,
         },
         dns::ThreadSafeDNSResolver,
     },
@@ -44,15 +43,15 @@ pub struct Handler {
     connector: tokio::sync::RwLock<Option<Arc<dyn RemoteConnector>>>,
 }
 
+impl_default_connector!(Handler);
+
 impl std::fmt::Debug for Handler {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Vmess")
+        f.debug_struct("VMess")
             .field("name", &self.opts.name)
             .finish()
     }
 }
-
-impl_default_connector!(Handler);
 
 impl Handler {
     pub fn new(opts: HandlerOptions) -> Self {
@@ -116,7 +115,7 @@ impl OutboundHandler for Handler {
         &self,
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
-    ) -> io::Result<BoxedInstrumentedStream> {
+    ) -> io::Result<BoxedChainedStream> {
         let dialer = self.connector.read().await;
 
         if let Some(dialer) = dialer.as_ref() {
@@ -128,7 +127,7 @@ impl OutboundHandler for Handler {
             resolver,
             dialer
                 .as_ref()
-                .unwrap_or(&GLOBAL_DIRECT_CONNECTOR.clone())
+                .unwrap_or(&*GLOBAL_DIRECT_CONNECTOR)
                 .as_ref(),
         )
         .await
@@ -138,7 +137,7 @@ impl OutboundHandler for Handler {
         &self,
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
-    ) -> io::Result<BoxedInstrumentedDatagram> {
+    ) -> io::Result<BoxedChainedDatagram> {
         let dialer = self.connector.read().await;
 
         if let Some(dialer) = dialer.as_ref() {
@@ -150,7 +149,7 @@ impl OutboundHandler for Handler {
             resolver,
             dialer
                 .as_ref()
-                .unwrap_or(&GLOBAL_DIRECT_CONNECTOR.clone())
+                .unwrap_or(&*GLOBAL_DIRECT_CONNECTOR)
                 .as_ref(),
         )
         .await
@@ -165,12 +164,13 @@ impl OutboundHandler for Handler {
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
         connector: &dyn RemoteConnector,
-    ) -> io::Result<BoxedInstrumentedStream> {
+    ) -> io::Result<BoxedChainedStream> {
         let stream = connector
             .connect_stream(
                 resolver,
                 self.opts.server.as_str(),
                 self.opts.port,
+                self.opts.common_opts.tfo,
                 sess.iface.as_ref(),
                 #[cfg(target_os = "linux")]
                 sess.so_mark,
@@ -178,7 +178,7 @@ impl OutboundHandler for Handler {
             .await?;
 
         let s = self.inner_proxy_stream(stream, sess, false).await?;
-        let chained = InstrumentedStreamWrapper::new(s);
+        let chained = ChainedStreamWrapper::new(s);
         chained.append_to_chain(self.name()).await;
         Ok(Box::new(chained))
     }
@@ -188,12 +188,13 @@ impl OutboundHandler for Handler {
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
         connector: &dyn RemoteConnector,
-    ) -> io::Result<BoxedInstrumentedDatagram> {
+    ) -> io::Result<BoxedChainedDatagram> {
         let stream = connector
             .connect_stream(
                 resolver,
                 self.opts.server.as_str(),
                 self.opts.port,
+                self.opts.common_opts.tfo,
                 sess.iface.as_ref(),
                 #[cfg(target_os = "linux")]
                 sess.so_mark,
@@ -204,7 +205,7 @@ impl OutboundHandler for Handler {
 
         let d = OutboundDatagramVmess::new(stream, sess.destination.clone());
 
-        let chained = InstrumentedDatagramWrapper::new(d);
+        let chained = ChainedDatagramWrapper::new(d);
         chained.append_to_chain(self.name()).await;
         Ok(Box::new(chained))
     }
@@ -240,7 +241,7 @@ mod tests {
     use super::*;
     use crate::{
         proxy::{
-            transport::{GrpcClient, H2Client, TlsClient, TransportLayer, WsClient},
+            transport::{GrpcClient, H2Client, TlsClient, WsClient},
             utils::test_utils::{
                 Suite,
                 config_helper::test_config_base_dir,

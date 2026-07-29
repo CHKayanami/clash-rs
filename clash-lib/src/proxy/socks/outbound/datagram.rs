@@ -69,7 +69,7 @@ impl Sink<UdpPacket> for Socks5Datagram {
         );
         let pin = self.get_mut();
         pin.inner
-            .start_send_unpin(((item.data.into(), item.dst_addr), remote))
+            .start_send_unpin(((item.data, item.dst_addr), remote))
     }
 
     fn poll_flush(
@@ -104,7 +104,7 @@ impl Stream for Socks5Datagram {
                     UdpPacket {
                         src_addr: src,
                         dst_addr: SocksAddr::Ip(dst),
-                        data: data.into(),
+                        data: data.freeze(),
                         inbound_user: None,
                     }
                 }
@@ -113,7 +113,7 @@ impl Stream for Socks5Datagram {
                     UdpPacket {
                         src_addr: SocksAddr::any_ipv4(),
                         dst_addr: SocksAddr::any_ipv4(),
-                        data: Vec::new(),
+                        data: bytes::Bytes::new(),
                         inbound_user: None,
                     }
                 }

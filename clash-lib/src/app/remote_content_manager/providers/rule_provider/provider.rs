@@ -1,16 +1,10 @@
-use std::{
-    collections::HashMap,
-    fmt::Display,
-    net::{IpAddr, Ipv4Addr},
-    sync::Arc,
-    time::Duration,
-};
+use std::{collections::HashMap, fmt::Display, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use erased_serde::Serialize as ESerialize;
 use futures::future::BoxFuture;
 use serde::{Deserialize, Serialize};
-use tracing::{debug, trace, warn};
+use tracing::{debug, trace};
 
 use super::cidr_trie::CidrTrie;
 use crate::{
@@ -86,11 +80,52 @@ struct Inner {
     content: RuleContent,
 }
 
+/// Invoked after a [`RuleProvider`]'s contents are replaced. See
+/// [`RuleProvider::on_change`]. `Arc` rather than `Box` so the subscriber list
+/// can be cloned out before dispatch, keeping the lock un-held while callbacks
+/// run.
+pub type RuleSetChangeCallback = Arc<dyn Fn() + Send + Sync + 'static>;
+
+/// Clone the subscriber list out before dispatching so the lock is not held
+/// while callbacks run — a callback that registered another one would otherwise
+/// deadlock on the non-reentrant `RwLock`.
+fn notify_subscribers(
+    subscribers: &std::sync::RwLock<Vec<RuleSetChangeCallback>>,
+) {
+    let callbacks = match subscribers.read() {
+        Ok(guard) => guard.clone(),
+        Err(_) => return,
+    };
+    for cb in callbacks {
+        cb();
+    }
+}
+
 #[async_trait]
 pub trait RuleProvider: Provider {
     fn search(&self, sess: &Session) -> bool;
     fn behavior(&self) -> RuleSetBehavior;
     fn format(&self) -> RuleSetFormat;
+    /// Whether matching against this provider needs the destination domain to
+    /// be resolved to an IP first. Always true for IPCIDR providers; for
+    /// classical ones it depends on the rules currently loaded.
+    fn should_resolve_ip(&self) -> bool;
+    /// Whether matching needs [`Session::process_name`] populated. Only
+    /// classical providers can carry PROCESS-NAME/PROCESS-PATH rules.
+    fn should_resolve_process(&self) -> bool;
+    /// Number of entries currently loaded, for the `/rules` API.
+    fn count(&self) -> usize;
+    /// Register `cb` to run right after this provider's contents are replaced,
+    /// by either a periodic refresh or a manual update. Callers that memoize
+    /// [`RuleProvider::search`] results use this to drop their caches instead of
+    /// serving verdicts computed against rules that no longer exist (see
+    /// `FakeDns::should_skip`).
+    ///
+    /// Callbacks run synchronously on the updating task, so they must be cheap
+    /// and must not block. They are invoked after the content lock is released,
+    /// so calling back into the provider is safe. Registrations are never
+    /// removed — callbacks are expected to live as long as the process.
+    fn on_change(&self, cb: RuleSetChangeCallback);
     /// Returns up to `limit` rules as strings. Only Classical providers return
     /// non-empty results; Domain/IPCIDR data structures don't support
     /// enumeration.
@@ -110,10 +145,12 @@ type RuleParser =
 pub struct RuleProviderImpl {
     name: String,
     fetcher: Option<Fetcher<RuleUpdater, RuleParser>>,
-    inner: Arc<tokio::sync::RwLock<Inner>>,
+    inner: Arc<std::sync::RwLock<Inner>>,
     behavior: RuleSetBehavior,
     format: RuleSetFormat,
     inline_rules: Option<Vec<String>>,
+    /// Notified on every content swap. See [`RuleProvider::on_change`].
+    subscribers: Arc<std::sync::RwLock<Vec<RuleSetChangeCallback>>>,
 
     mmdb: Option<MmdbLookup>,
     geodata: Option<GeoDataLookup>,
@@ -132,7 +169,7 @@ impl RuleProviderImpl {
         geodata: Option<GeoDataLookup>,
         inline_rules: Option<Vec<String>>,
     ) -> Self {
-        let inner = Arc::new(tokio::sync::RwLock::new(Inner {
+        let inner = Arc::new(std::sync::RwLock::new(Inner {
             content: match behavior {
                 RuleSetBehavior::Domain => {
                     RuleContent::Domain(succinct_set::DomainSet::default())
@@ -145,16 +182,25 @@ impl RuleProviderImpl {
         }));
 
         let inner_clone = inner.clone();
+        let subscribers: Arc<std::sync::RwLock<Vec<RuleSetChangeCallback>>> =
+            Arc::new(std::sync::RwLock::new(Vec::new()));
+        let subscribers_clone = subscribers.clone();
 
         let n = name.clone();
         let updater: RuleUpdater =
             Box::new(move |input: RuleContent| -> BoxFuture<'static, ()> {
                 let n = n.clone(); // Clone name for the async block
-                let inner: Arc<tokio::sync::RwLock<Inner>> = inner_clone.clone();
+                let inner: Arc<std::sync::RwLock<Inner>> = inner_clone.clone();
+                let subscribers = subscribers_clone.clone();
                 Box::pin(async move {
-                    let mut inner = inner.write().await;
-                    trace!("updated rules for provider: {}", n);
-                    inner.content = input;
+                    {
+                        let mut inner = inner.write().unwrap();
+                        trace!("updated rules for provider: {}", n);
+                        inner.content = input;
+                    }
+                    // Notify only after the content lock is released, so a
+                    // callback that reads the provider back cannot deadlock.
+                    notify_subscribers(&subscribers);
                 })
             });
 
@@ -239,18 +285,19 @@ impl RuleProviderImpl {
                 }
             });
 
-        // A file/http vehicle always gets a fetcher so its content loads at
-        // startup, regardless of `interval` (file providers also live-reload
-        // via the watcher). Only inline providers (no vehicle) have none.
-        let fetcher = vehicle.map(|vehicle| {
-            Fetcher::new(
+        let fetcher = if let Some(interval) = interval
+            && let Some(vehicle) = vehicle
+        {
+            Some(Fetcher::new(
                 name.clone(),
-                interval.unwrap_or_default(),
+                interval,
                 vehicle,
                 parser,
                 Some(updater),
-            )
-        });
+            ))
+        } else {
+            None
+        };
 
         Self {
             name,
@@ -259,6 +306,7 @@ impl RuleProviderImpl {
             behavior,
             format,
             inline_rules,
+            subscribers,
 
             mmdb,
             geodata,
@@ -269,27 +317,22 @@ impl RuleProviderImpl {
 #[async_trait]
 impl RuleProvider for RuleProviderImpl {
     fn search(&self, sess: &Session) -> bool {
-        let inner = self.inner.try_read();
-
-        match inner {
-            Ok(inner) => match &inner.content {
-                RuleContent::Domain(set) => set.has(&sess.destination.host()),
-                RuleContent::Ipcidr(trie) => trie.contains(
-                    sess.destination
-                        .ip()
-                        .unwrap_or(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0))),
-                ),
-                RuleContent::Classical(rules) => {
-                    for rule in rules.iter() {
-                        if rule.apply(sess) {
-                            return true;
-                        }
+        let inner = self.inner.read().unwrap();
+        match &inner.content {
+            RuleContent::Domain(set) => set.has(&sess.destination.host()),
+            // mirror the standalone IP-CIDR rule: prefer the locally resolved
+            // IP, and never fall back to a placeholder address — doing so made
+            // every domain connection match a provider containing 0.0.0.0/8.
+            RuleContent::Ipcidr(trie) => sess
+                .resolved_ip
+                .or(sess.destination.ip())
+                .is_some_and(|ip| trie.contains(ip)),
+            RuleContent::Classical(rules) => {
+                for rule in rules.iter() {
+                    if rule.apply(sess) {
+                        return true;
                     }
-                    false
                 }
-            },
-            Err(_) => {
-                debug!("rule provider {} is busy", self.name());
                 false
             }
         }
@@ -303,8 +346,49 @@ impl RuleProvider for RuleProviderImpl {
         self.format
     }
 
+    fn should_resolve_ip(&self) -> bool {
+        match self.behavior {
+            RuleSetBehavior::Domain => false,
+            RuleSetBehavior::Ipcidr => true,
+            RuleSetBehavior::Classical => {
+                let inner = self.inner.read().unwrap();
+                match &inner.content {
+                    RuleContent::Classical(rules) => {
+                        rules.iter().any(|r| r.should_resolve_ip())
+                    }
+                    _ => false,
+                }
+            }
+        }
+    }
+
+    fn should_resolve_process(&self) -> bool {
+        let inner = self.inner.read().unwrap();
+        match &inner.content {
+            RuleContent::Classical(rules) => {
+                rules.iter().any(|r| r.should_resolve_process())
+            }
+            _ => false,
+        }
+    }
+
+    fn count(&self) -> usize {
+        let inner = self.inner.read().unwrap();
+        match &inner.content {
+            RuleContent::Domain(set) => set.len(),
+            RuleContent::Ipcidr(trie) => trie.len(),
+            RuleContent::Classical(rules) => rules.len(),
+        }
+    }
+
+    fn on_change(&self, cb: RuleSetChangeCallback) {
+        if let Ok(mut subscribers) = self.subscribers.write() {
+            subscribers.push(cb);
+        }
+    }
+
     async fn list_rules(&self, limit: usize) -> Vec<String> {
-        let inner = self.inner.read().await;
+        let inner = self.inner.read().unwrap();
         match &inner.content {
             RuleContent::Classical(rules) => rules
                 .iter()
@@ -343,17 +427,6 @@ impl Provider for RuleProviderImpl {
             if let Some(updater) = fetcher.on_update.as_ref() {
                 updater(ele).await; // Directly pass RuleContent
             }
-            // Auto-watch local file providers. Best-effort: watcher setup can
-            // fail (inotify limits, unsupported filesystems), so log and keep
-            // serving the loaded rules instead of failing init.
-            if let Err(e) = fetcher.start_watch().await {
-                warn!(
-                    "rule provider '{}': live file watching unavailable, falling \
-                     back to interval polling: {}",
-                    self.name(),
-                    e
-                );
-            }
         } else {
             trace!("initializing inline rule provider {}", self.name());
             let rules = make_rules(
@@ -365,8 +438,11 @@ impl Provider for RuleProviderImpl {
 
             match rules {
                 Ok(content) => {
-                    let mut inner = self.inner.write().await;
-                    inner.content = content;
+                    {
+                        let mut inner = self.inner.write().unwrap();
+                        inner.content = content;
+                    }
+                    notify_subscribers(&self.subscribers);
                 }
                 Err(e) => {
                     return Err(std::io::Error::new(
@@ -566,91 +642,5 @@ mod tests {
             destination: SocksAddr::Domain("test.google.com".to_owned(), 443),
             ..Default::default()
         }));
-    }
-
-    /// A local `type: file` provider is watched automatically (no config flag)
-    /// and live-reloads on disk change.
-    ///
-    /// Linux-only: inotify delivers events promptly, whereas macOS (FSEvents)
-    /// and Windows (ReadDirectoryChangesW) coalesce them with multi-second
-    /// latency — fine for the real feature, but too flaky for a bounded test.
-    /// The watcher code is platform-agnostic; only this timing check is gated.
-    #[cfg(target_os = "linux")]
-    #[tokio::test]
-    async fn test_file_provider_watch() {
-        let mock_mmdb = MockMmdbLookupTrait::new();
-        let mock_geodata = MockGeoDataLookupTrait::new();
-
-        // Write initial content to a temporary file.  Using `NamedTempFile`
-        // ensures the file is removed even if the test panics.
-        let mut tmp = tempfile::NamedTempFile::new().unwrap();
-        use std::io::{Seek as _, Write as _};
-        write!(tmp, "payload:\n  - twitter.com\n").unwrap();
-        tmp.flush().unwrap();
-
-        // Use the real file vehicle so that notify can watch the actual path.
-        let vehicle = Arc::new(
-            crate::app::remote_content_manager::providers::file_vehicle::Vehicle::new(
-                tmp.path().to_str().unwrap(),
-            ),
-        );
-
-        let provider = Arc::new(RuleProviderImpl::new(
-            "watch-test".to_string(),
-            RuleSetBehavior::Domain,
-            RuleSetFormat::Yaml,
-            None, // no polling interval — rely purely on file watching
-            Some(vehicle),
-            Some(Arc::new(mock_mmdb)),
-            Some(Arc::new(mock_geodata)),
-            None,
-        ));
-
-        assert_ok!(provider.initialize().await);
-
-        // Initial content: twitter.com should match.
-        let sess_twitter = Session {
-            destination: SocksAddr::Domain("twitter.com".to_owned(), 443),
-            ..Default::default()
-        };
-        assert!(
-            provider.search(&sess_twitter),
-            "twitter.com should match after initial load"
-        );
-        // google.com should NOT match yet.
-        let sess_google = Session {
-            destination: SocksAddr::Domain("google.com".to_owned(), 443),
-            ..Default::default()
-        };
-        assert!(
-            !provider.search(&sess_google),
-            "google.com should NOT match before file update"
-        );
-
-        // Re-write on each iteration: this defeats the watcher-registration
-        // race (the watch is set up asynchronously by `initialize()`) and keeps
-        // nudging slow/coalescing backends until the reload is observed.
-        let deadline =
-            tokio::time::Instant::now() + std::time::Duration::from_secs(15);
-        loop {
-            tmp.as_file_mut().set_len(0).expect("truncate tmp file");
-            tmp.as_file_mut().seek(std::io::SeekFrom::Start(0)).unwrap();
-            write!(tmp.as_file_mut(), "payload:\n  - google.com\n").unwrap();
-            tmp.as_file_mut().sync_all().unwrap();
-
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-            if provider.search(&sess_google) {
-                break;
-            }
-            if tokio::time::Instant::now() >= deadline {
-                panic!("provider did not reload within 15 s after file change");
-            }
-        }
-
-        // And the old rule is gone after the reload.
-        assert!(
-            !provider.search(&sess_twitter),
-            "twitter.com should NOT match after file update"
-        );
     }
 }

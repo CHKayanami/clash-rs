@@ -44,6 +44,8 @@ pub struct HTTPObfs {
     read_buf: BytesMut,
 }
 
+impl crate::proxy::ProxyStream for HTTPObfs {}
+
 /// Drain `this.write_buf[this.write_pos..]` into the inner stream, advancing
 /// `this.write_pos` with each partial write.  Returns `Poll::Ready(Ok(()))`
 /// once all bytes have been sent.
@@ -255,5 +257,3 @@ impl From<HTTPObfs> for AnyStream {
         Box::new(obfs)
     }
 }
-
-impl crate::proxy::ProxyStream for HTTPObfs {}

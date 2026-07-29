@@ -386,7 +386,6 @@ pub enum Type {
     Tunnel,
     Shadowsocks,
     Anytls,
-    Hysteria2,
     Ignore,
 }
 
@@ -399,8 +398,18 @@ impl Display for Network {
     }
 }
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(10_000_000);
+
+pub fn generate_session_id() -> u64 {
+    NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed)
+}
+
 #[derive(Serialize)]
 pub struct Session {
+    /// Unique trace ID for the session request lifecycle.
+    pub id: u64,
     /// The network type, representing either TCP or UDP.
     pub network: Network,
     /// The type of the inbound connection.
@@ -419,6 +428,10 @@ pub struct Session {
     pub country: Option<String>,
     /// ASN org name from ASN mmdb. Only for display.
     pub asn: Option<String>,
+    /// The local process that owns this connection, resolved lazily by
+    /// `Router::match_route` and only when a PROCESS-NAME/PROCESS-PATH rule is
+    /// actually reached. `None` means "not looked up yet or lookup failed".
+    pub process_name: Option<String>,
     /// Traffic statistics for intelligent proxy selection
     pub traffic_stats: Option<crate::app::remote_content_manager::TrafficStats>,
     /// Authenticated user name from SS2022 EIH (FAC user_id as string).
@@ -430,6 +443,7 @@ pub struct Session {
 impl Session {
     pub fn as_map(&self) -> HashMap<String, Box<dyn ESerialize + Send + Sync>> {
         let mut rv = HashMap::new();
+        rv.insert("id".to_string(), Box::new(self.id) as _);
         rv.insert("network".to_string(), Box::new(self.network) as _);
         rv.insert("type".to_string(), Box::new(self.typ) as _);
         rv.insert("sourceIP".to_string(), Box::new(self.source.ip()) as _);
@@ -466,6 +480,7 @@ impl Session {
 impl Default for Session {
     fn default() -> Self {
         Self {
+            id: generate_session_id(),
             network: Network::Tcp,
             typ: Type::Http,
             source: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 0),
@@ -475,6 +490,7 @@ impl Default for Session {
             iface: None,
             country: None,
             asn: None,
+            process_name: None,
             traffic_stats: None,
             inbound_user: None,
         }
@@ -486,13 +502,13 @@ impl Display for Session {
         match self.resolved_ip {
             Some(ip) => write!(
                 f,
-                "[{}] {} -> {}[{}]",
-                self.network, self.source, self.destination, ip
+                "[#{}] [{}] {} -> {}[{}]",
+                self.id, self.network, self.source, self.destination, ip
             ),
             None => write!(
                 f,
-                "[{}] {} -> {}",
-                self.network, self.source, self.destination,
+                "[#{}] [{}] {} -> {}",
+                self.id, self.network, self.source, self.destination,
             ),
         }
     }
@@ -501,6 +517,7 @@ impl Display for Session {
 impl Debug for Session {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Session")
+            .field("id", &self.id)
             .field("network", &self.network)
             .field("source", &self.source)
             .field("destination", &self.destination)
@@ -515,15 +532,17 @@ impl Debug for Session {
 impl Clone for Session {
     fn clone(&self) -> Self {
         Self {
+            id: self.id,
             network: self.network,
             typ: self.typ,
             source: self.source,
             destination: self.destination.clone(),
             resolved_ip: self.resolved_ip,
             so_mark: self.so_mark,
-            iface: self.iface.as_ref().cloned(),
+            iface: self.iface.clone(),
             country: self.country.clone(),
             asn: self.asn.clone(),
+            process_name: self.process_name.clone(),
             traffic_stats: self.traffic_stats.clone(),
             inbound_user: self.inbound_user.clone(),
         }
@@ -541,3 +560,19 @@ fn invalid_atyp() -> io::Error {
 fn insuff_bytes() -> io::Error {
     io::Error::other("insufficient bytes")
 }
+
+#[test]
+fn test_session_id() {
+    let s1 = Session::default();
+    let s2 = Session::default();
+
+    assert!(s1.id >= 10_000_000);
+    assert_eq!(s2.id, s1.id + 1);
+
+    let s1_cloned = s1.clone();
+    assert_eq!(s1_cloned.id, s1.id);
+
+    let display_str = s1.to_string();
+    assert!(display_str.contains(&format!("[#{}]", s1.id)));
+}
+

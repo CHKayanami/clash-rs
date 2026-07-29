@@ -43,9 +43,9 @@ export function Connections() {
     return (
       !q ||
       (conn.metadata.host || '').toLowerCase().includes(q) ||
+      (conn.metadata.sourceIP || '').toLowerCase().includes(q) ||
       conn.rule.toLowerCase().includes(q) ||
-      conn.chains?.join(' ').toLowerCase().includes(q) ||
-      (conn.metadata.asn || '').toLowerCase().includes(q)
+      conn.chains?.join(' ').toLowerCase().includes(q)
     );
   });
 
@@ -115,8 +115,8 @@ export function Connections() {
         <Search size={15} className="absolute left-3.5 top-1/2 -translate-y-1/2" style={{ color: 'var(--color-text-tertiary)' }} />
         <input
           type="text"
-          aria-label="Filter connections by host, rule, or chain"
-          placeholder="Filter by host, rule, chain…"
+          aria-label="Filter connections by host, source IP, rule, or chain"
+          placeholder="Filter by host, source IP, rule, chain…"
           value={search}
           onChange={(e) => setSearch(e.target.value)}
           className="w-full pl-10 pr-4 py-2.5 rounded-xl text-[15px] focus:outline-none transition-shadow"
@@ -135,7 +135,7 @@ export function Connections() {
           <thead>
             <tr style={{ borderBottom: '1px solid var(--color-separator)' }}>
               <th className="text-left px-4 py-3 text-[11px] font-semibold uppercase tracking-[0.06em] w-52" style={{ color: 'var(--color-text-secondary)' }}>Host</th>
-              <th className="text-left px-4 py-3 text-[11px] font-semibold uppercase tracking-[0.06em] w-32" style={{ color: 'var(--color-text-secondary)' }}>ASN</th>
+              <th className="text-left px-4 py-3 text-[11px] font-semibold uppercase tracking-[0.06em] w-36" style={{ color: 'var(--color-text-secondary)' }}>Source</th>
               <th className="text-left px-4 py-3 text-[11px] font-semibold uppercase tracking-[0.06em] w-24" style={{ color: 'var(--color-text-secondary)' }}>Network</th>
               <th className="text-left px-4 py-3 text-[11px] font-semibold uppercase tracking-[0.06em] w-32" style={{ color: 'var(--color-text-secondary)' }}>Rule</th>
               <th className="text-left px-4 py-3 text-[11px] font-semibold uppercase tracking-[0.06em] w-36" style={{ color: 'var(--color-text-secondary)' }}>Chain</th>
@@ -153,48 +153,55 @@ export function Connections() {
                 </td>
               </tr>
             ) : (
-              filtered.map((conn: Connection) => (
-                <tr
-                  key={conn.id}
-                  className="group transition-colors"
-                  style={{ borderBottom: '1px solid var(--color-separator-subtle)' }}
-                >
-                  <td className="px-4 py-3">
-                    <div className="text-[15px] font-medium truncate" style={{ color: 'var(--color-text-primary)' }}>
-                      {conn.metadata.host || conn.metadata.destinationIP}
-                      {conn.metadata.destinationPort && `:${conn.metadata.destinationPort}`}
-                    </div>
-                    {conn.metadata.process && (
-                      <div className="text-[11px] truncate" style={{ color: 'var(--color-text-tertiary)' }}>{conn.metadata.process}</div>
-                    )}
-                  </td>
-                  <td className="px-4 py-3 text-[12px] truncate" style={{ color: '#0071e3' }}>
-                    {conn.metadata.asn || '—'}
-                  </td>
-                  <td className="px-4 py-3 font-mono whitespace-nowrap text-[13px]" style={{ color: 'var(--color-text-tertiary)' }}>
-                    {conn.metadata.network}/{conn.metadata.type}
-                  </td>
-                  <td className="px-4 py-3 text-[13px] truncate" style={{ color: 'var(--color-text-secondary)' }}>
-                    {conn.rule}{conn.rulePayload && ` (${conn.rulePayload})`}
-                  </td>
-                  <td className="px-4 py-3 text-[13px] truncate" style={{ color: 'var(--color-text-tertiary)' }}>
-                    {conn.chains?.join(' → ')}
-                  </td>
-                  <td className="px-4 py-3 text-right text-[13px] font-mono" style={{ color: '#0071e3' }}>{formatBytes(conn.upload)}</td>
-                  <td className="px-4 py-3 text-right text-[13px] font-mono" style={{ color: '#34c759' }}>{formatBytes(conn.download)}</td>
-                  <td className="px-4 py-3 text-right text-[13px] font-mono" style={{ color: 'var(--color-text-tertiary)' }}>{formatDuration(conn.start)}</td>
-                  <td className="px-4 py-3">
-                    <button
-                      onClick={() => closeOneMutation.mutate(conn.id)}
-                      aria-label={`Close connection to ${conn.metadata.host || conn.id}`}
-                      className="p-1 rounded-lg opacity-0 group-hover:opacity-100 transition-opacity"
-                      style={{ color: '#ff3b30' }}
-                    >
-                      <X size={13} />
-                    </button>
-                  </td>
-                </tr>
-              ))
+              filtered.map((conn: Connection) => {
+                const src = conn.metadata.sourceIP
+                  ? (conn.metadata.sourcePort && conn.metadata.sourcePort !== '0'
+                      ? `${conn.metadata.sourceIP}:${conn.metadata.sourcePort}`
+                      : conn.metadata.sourceIP)
+                  : '—';
+                return (
+                  <tr
+                    key={conn.id}
+                    className="group transition-colors"
+                    style={{ borderBottom: '1px solid var(--color-separator-subtle)' }}
+                  >
+                    <td className="px-4 py-3">
+                      <div className="text-[15px] font-medium truncate" style={{ color: 'var(--color-text-primary)' }}>
+                        {conn.metadata.host || conn.metadata.destinationIP}
+                        {conn.metadata.destinationPort && `:${conn.metadata.destinationPort}`}
+                      </div>
+                      {conn.metadata.process && (
+                        <div className="text-[11px] truncate" style={{ color: 'var(--color-text-tertiary)' }}>{conn.metadata.process}</div>
+                      )}
+                    </td>
+                    <td className="px-4 py-3 font-mono text-[13px] truncate" style={{ color: 'var(--color-text-secondary)' }}>
+                      {src}
+                    </td>
+                    <td className="px-4 py-3 font-mono whitespace-nowrap text-[13px]" style={{ color: 'var(--color-text-tertiary)' }}>
+                      {conn.metadata.network}/{conn.metadata.type}
+                    </td>
+                    <td className="px-4 py-3 text-[13px] truncate" style={{ color: 'var(--color-text-secondary)' }}>
+                      {conn.rule}{conn.rulePayload && ` (${conn.rulePayload})`}
+                    </td>
+                    <td className="px-4 py-3 text-[13px] truncate" style={{ color: 'var(--color-text-tertiary)' }}>
+                      {conn.chains?.join(' → ')}
+                    </td>
+                    <td className="px-4 py-3 text-right text-[13px] font-mono" style={{ color: '#0071e3' }}>{formatBytes(conn.upload)}</td>
+                    <td className="px-4 py-3 text-right text-[13px] font-mono" style={{ color: '#34c759' }}>{formatBytes(conn.download)}</td>
+                    <td className="px-4 py-3 text-right text-[13px] font-mono" style={{ color: 'var(--color-text-tertiary)' }}>{formatDuration(conn.start)}</td>
+                    <td className="px-4 py-3">
+                      <button
+                        onClick={() => closeOneMutation.mutate(conn.id)}
+                        aria-label={`Close connection to ${conn.metadata.host || conn.id}`}
+                        className="p-1 rounded-lg opacity-0 group-hover:opacity-100 transition-opacity"
+                        style={{ color: '#ff3b30' }}
+                      >
+                        <X size={13} />
+                      </button>
+                    </td>
+                  </tr>
+                );
+              })
             )}
           </tbody>
         </table>

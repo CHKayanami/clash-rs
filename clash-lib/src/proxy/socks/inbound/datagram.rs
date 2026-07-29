@@ -2,7 +2,7 @@ use crate::{proxy::datagram::UdpPacket, session::SocksAddr};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use futures::{Sink, SinkExt, Stream, StreamExt};
 use std::{
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     pin::Pin,
     task::{Context, Poll},
 };
@@ -10,6 +10,7 @@ use tokio_util::{
     codec::{Decoder, Encoder},
     udp::UdpFramed,
 };
+use tracing::{debug, trace};
 
 // +----+------+------+----------+----------+----------+
 // |RSV | FRAG | ATYP | DST.ADDR | DST.PORT |   DATA   |
@@ -51,6 +52,12 @@ impl Decoder for Socks5UDPCodec {
     type Error = std::io::Error;
     type Item = (SocksAddr, BytesMut);
 
+    /// A malformed datagram is dropped, never surfaced as an error.
+    ///
+    /// `UdpFramed` propagates a decoder error without clearing its read buffer,
+    /// so returning `Err` here would either kill the association or, if the
+    /// caller tried to recover, re-decode the same bad bytes forever. Returning
+    /// `Ok(None)` makes `UdpFramed` discard the datagram and read the next one.
     fn decode(
         &mut self,
         src: &mut BytesMut,
@@ -60,11 +67,21 @@ impl Decoder for Socks5UDPCodec {
         }
 
         if src[2] != 0 {
-            return Err(std::io::Error::other("unsupported FRAG"));
+            trace!(
+                "dropping socks5 udp packet with unsupported FRAG {}",
+                src[2]
+            );
+            return Ok(None);
         }
 
         src.advance(3);
-        let addr = SocksAddr::peek_read(src)?;
+        let addr = match SocksAddr::peek_read(src) {
+            Ok(addr) => addr,
+            Err(e) => {
+                trace!("dropping socks5 udp packet with bad address: {e}");
+                return Ok(None);
+            }
+        };
         src.advance(addr.size());
         let packet = std::mem::take(src);
         Ok(Some((addr, packet)))
@@ -73,6 +90,10 @@ impl Decoder for Socks5UDPCodec {
 
 pub struct InboundUdp<I> {
     inner: I,
+    /// Only datagrams from this address are relayed. A UDP association belongs
+    /// to the client that opened it; the relay socket is otherwise reachable by
+    /// any host that can route to us.
+    allowed_src: IpAddr,
 }
 
 impl<I> InboundUdp<I>
@@ -80,8 +101,13 @@ where
     I: Stream + Unpin,
     I: Sink<((Bytes, SocksAddr), SocketAddr)>,
 {
-    pub fn new(inner: I) -> Self {
-        Self { inner }
+    pub fn new(inner: I, allowed_src: IpAddr) -> Self {
+        Self {
+            inner,
+            // compared against canonicalized peer addresses, so normalize the
+            // v4-mapped-v6 form once here
+            allowed_src: allowed_src.to_canonical(),
+        }
     }
 }
 
@@ -100,20 +126,35 @@ impl Stream for InboundUdp<UdpFramed<Socks5UDPCodec>> {
     ) -> Poll<Option<Self::Item>> {
         let pin = self.get_mut();
 
-        match pin.inner.poll_next_unpin(cx) {
-            Poll::Ready(item) => match item {
-                None => Poll::Ready(None),
-                Some(item) => match item {
-                    Ok(((dst, pkt), src)) => Poll::Ready(Some(UdpPacket {
-                        data: pkt.to_vec(),
+        // Datagrams from anyone other than the client that opened the
+        // association are dropped, not fatal — skipping one always consumes it,
+        // so the loop makes progress.
+        loop {
+            match std::task::ready!(pin.inner.poll_next_unpin(cx)) {
+                None => return Poll::Ready(None),
+                Some(Ok(((dst, pkt), src))) => {
+                    if src.ip().to_canonical() != pin.allowed_src {
+                        debug!(
+                            "dropping socks5 udp packet from unexpected source \
+                             {src}; association belongs to {}",
+                            pin.allowed_src
+                        );
+                        continue;
+                    }
+                    return Poll::Ready(Some(UdpPacket {
+                        data: pkt.freeze(),
                         src_addr: SocksAddr::Ip(src),
                         dst_addr: dst,
                         inbound_user: None,
-                    })),
-                    Err(_) => Poll::Ready(None),
-                },
-            },
-            Poll::Pending => Poll::Pending,
+                    }));
+                }
+                // decode never errors (see `Socks5UDPCodec::decode`), so this is
+                // a socket-level failure — end the association
+                Some(Err(e)) => {
+                    debug!("socks5 udp association read error: {e}");
+                    return Poll::Ready(None);
+                }
+            }
         }
     }
 }
@@ -132,7 +173,7 @@ impl Sink<UdpPacket> for InboundUdp<UdpFramed<Socks5UDPCodec>> {
     fn start_send(self: Pin<&mut Self>, item: UdpPacket) -> Result<(), Self::Error> {
         let pin = self.get_mut();
         pin.inner.start_send_unpin((
-            (item.data.into(), item.src_addr),
+            (item.data, item.src_addr),
             item.dst_addr.must_into_socket_addr(),
         ))
     }

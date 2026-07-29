@@ -1,10 +1,14 @@
+use crate::app::remote_content_manager::providers::rule_provider::ThreadSafeRuleProvider;
+use crate::session::{Session, SocksAddr};
+use crate::{Error, common::trie};
+use std::collections::HashMap;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::{net, sync::Arc};
 
-use crate::{Error, common::trie};
-
 use async_trait::async_trait;
-use byteorder::{BigEndian, ByteOrder};
-use tokio::sync::RwLock;
+use portable_atomic::AtomicU128;
+use tracing::debug;
 
 mod file_store;
 mod mem_store;
@@ -13,151 +17,359 @@ pub use file_store::FileStore;
 pub use mem_store::InMemStore;
 
 pub struct Opts {
-    pub ipnet: ipnet::IpNet,
+    pub ipnet: ipnet::Ipv4Net,
+    pub ipnet6: ipnet::Ipv6Net,
     pub skipped_hostnames: Option<trie::StringTrie<bool>>,
+    pub ruleset_names: Option<Vec<String>>,
     pub store: Box<dyn Store>,
 }
 
 #[async_trait]
 pub trait Store: Sync + Send {
-    async fn get_by_host(&mut self, host: &str) -> Option<net::IpAddr>;
-    async fn pub_by_host(&mut self, host: &str, ip: net::IpAddr);
-    async fn get_by_ip(&mut self, ip: net::IpAddr) -> Option<String>;
-    async fn put_by_ip(&mut self, ip: net::IpAddr, host: &str);
-    async fn del_by_ip(&mut self, ip: net::IpAddr);
-    async fn exist(&mut self, ip: net::IpAddr) -> bool;
-    async fn copy_to(&self, store: &mut Box<dyn Store>);
+    async fn get_by_host(&self, host: &str) -> Option<net::IpAddr>;
+    async fn get_v6_by_host(&self, host: &str) -> Option<net::IpAddr>;
+
+    async fn put_by_host(&self, host: &str, ip: net::IpAddr);
+    async fn get_by_ip(&self, ip: net::IpAddr) -> Option<String>;
+    async fn put_by_ip(&self, ip: net::IpAddr, host: &str);
+    async fn del_by_ip(&self, ip: net::IpAddr);
+    async fn exist(&self, ip: net::IpAddr) -> bool;
+    async fn copy_to(&self, store: &dyn Store);
 }
 
-pub type ThreadSafeFakeDns = Arc<RwLock<FakeDns>>;
+pub type ThreadSafeFakeDns = Arc<FakeDns>;
+
+pub struct FakePoolV4 {
+    pub min: u32,
+    pub max: u32,
+    pub offset: AtomicU32,
+}
+
+pub struct FakePoolV6 {
+    pub prefix: [u8; 16],
+    pub prefix_len: u8,
+    pub min_host: u128,
+    pub max_host: u128,
+    pub offset: AtomicU128,
+}
 
 pub struct FakeDns {
-    max: u32,
-    min: u32,
-    #[allow(dead_code)]
-    gateway: u32,
-    offset: u32,
+    v4_pool: Option<FakePoolV4>,
+    v6_pool: Option<FakePoolV6>,
     skipped_hostnames: Option<trie::StringTrie<bool>>,
-    ipnet: ipnet::IpNet,
+    ruleset_names: Option<Vec<String>>,
+    rule_provider: std::sync::OnceLock<Vec<ThreadSafeRuleProvider>>,
     store: Box<dyn Store>,
+    /// Memoized `should_skip` verdicts. Covers both static `fake-ip-filter`
+    /// entries and `rule-set:` matches; cleared wholesale whenever one of the
+    /// bound rule-sets reloads (see [`FakeDns::add_rule_set`]).
+    skip_cache: moka::sync::Cache<String, bool>,
 }
 
 impl FakeDns {
     pub fn new(opt: Opts) -> Result<Self, Error> {
-        let ip = match opt.ipnet.network() {
-            net::IpAddr::V4(ip) => ip,
-            _ => unreachable!("fakeip range must be valid ipv4 subnet"),
-        };
-        let min = Self::ip_to_uint(&ip) + 2;
+        // /31 and /32 leave no usable host addresses: `total` would underflow
+        // and `pool_size` in `get()` would end up zero, panicking on `% 0`.
+        // /0 would overflow the shift. Reject both up front.
         let prefix_len = opt.ipnet.prefix_len();
-        let max_prefix_len = opt.ipnet.max_prefix_len();
-        debug_assert_eq!(max_prefix_len, 32, "v4 subnet");
-        let total = (1 << (max_prefix_len - prefix_len)) - 2;
+        if prefix_len > 30 {
+            return Err(Error::InvalidConfig(format!(
+                "fake ip range {} is too small, need /30 or wider",
+                opt.ipnet
+            )));
+        }
+        let host_bits = 32 - prefix_len;
+        let total: u32 = if host_bits >= 32 {
+            u32::MAX - 2
+        } else {
+            (1u32 << host_bits) - 2
+        };
+        let min = u32::from(opt.ipnet.network()).saturating_add(2);
+        let v4_pool = Some(FakePoolV4 {
+            min,
+            max: min.saturating_add(total - 1),
+            offset: AtomicU32::new(0),
+        });
 
-        let max = min + total - 1;
+        // Same reasoning as above: /127 and /128 make `max_host` underflow.
+        let prefix_len6 = opt.ipnet6.prefix_len();
+        if prefix_len6 > 126 {
+            return Err(Error::InvalidConfig(format!(
+                "fake ipv6 range {} is too small, need /126 or wider",
+                opt.ipnet6
+            )));
+        }
+        let host_bits = 128 - prefix_len6;
+        let max_host = if host_bits >= 128 {
+            u128::MAX - 2
+        } else {
+            (1u128 << host_bits) - 2
+        };
+        let v6_pool = Some(FakePoolV6 {
+            prefix: opt.ipnet6.network().octets(),
+            prefix_len: prefix_len6,
+            min_host: 1,
+            max_host,
+            offset: AtomicU128::new(0),
+        });
 
         Ok(Self {
-            max,
-            min,
-            gateway: min - 1,
-            offset: 0,
+            v4_pool,
+            v6_pool,
             skipped_hostnames: opt.skipped_hostnames,
-            ipnet: opt.ipnet,
+            rule_provider: std::sync::OnceLock::new(),
+            ruleset_names: opt.ruleset_names,
             store: opt.store,
+            skip_cache: moka::sync::Cache::builder().max_capacity(1000).build(),
         })
     }
 
-    pub async fn lookup(&mut self, host: &str) -> net::IpAddr {
+    pub async fn lookup(&self, host: &str) -> net::IpAddr {
         if let Some(ip) = self.store.get_by_host(host).await {
             return ip;
         }
 
         let ip = self.get(host).await;
-        self.store.pub_by_host(host, ip).await;
+        self.store.put_by_host(host, ip).await;
         ip
     }
 
-    pub async fn reverse_lookup(&mut self, ip: net::IpAddr) -> Option<String> {
-        if !ip.is_ipv4() {
-            None
-        } else {
-            self.store.get_by_ip(ip).await
+    pub async fn lookupv6(&self, host: &str) -> net::IpAddr {
+        if let Some(ip) = self.store.get_v6_by_host(host).await {
+            return ip;
+        }
+
+        let ip = self.getv6(host).await;
+        self.store.put_by_host(host, ip).await;
+        ip
+    }
+
+    pub async fn reverse_lookup(&self, ip: net::IpAddr) -> Option<String> {
+        self.store.get_by_ip(ip).await
+    }
+
+    pub async fn add_rule_set(
+        &self,
+        rp_map: &HashMap<String, ThreadSafeRuleProvider>,
+    ) {
+        if let Some(names) = &self.ruleset_names {
+            let mut providers = Vec::new();
+            for name in names {
+                if let Some(rp) = rp_map.get(name) {
+                    providers.push(rp.clone());
+                }
+            }
+            // Subscribe before publishing the providers, so no query can be
+            // served from a cache that isn't wired for invalidation yet.
+            //
+            // `moka` cache handles are cheap to clone and share one backing
+            // store, so the callback carries a handle rather than a
+            // back-reference to `FakeDns` — no reference cycle, and nothing
+            // here keeps the resolver alive.
+            for rp in &providers {
+                let cache = self.skip_cache.clone();
+                let name = rp.name().to_owned();
+                rp.on_change(Arc::new(move || {
+                    debug!(
+                        "rule-set {} reloaded, clearing fake-ip skip cache",
+                        name
+                    );
+                    cache.invalidate_all();
+                }));
+            }
+
+            let _ = self.rule_provider.set(providers);
+            // Verdicts computed before the rule-sets were bound assumed there
+            // were none; drop them.
+            self.skip_cache.invalidate_all();
         }
     }
 
     pub fn should_skip(&self, domain: &str) -> bool {
-        match &self.skipped_hostnames {
-            None => false,
-            Some(host) => host.search(domain).is_some(),
+        if let Some(cached) = self.skip_cache.get(domain) {
+            return cached;
         }
+
+        let verdict = self.compute_should_skip(domain);
+        self.skip_cache.insert(domain.to_owned(), verdict);
+        verdict
+    }
+
+    /// Uncached `should_skip`. Every exit here must be invalidated by something
+    /// — the static trie is fixed for the process lifetime, and rule-set
+    /// matches are covered by the `on_change` subscription installed in
+    /// [`FakeDns::add_rule_set`].
+    fn compute_should_skip(&self, domain: &str) -> bool {
+        // 1. Static `fake-ip-filter` entries.
+        if let Some(host) = &self.skipped_hostnames
+            && host.search(domain).is_some()
+        {
+            return true;
+        }
+
+        // 2. `rule-set:` entries.
+        if let Some(rps) = self.rule_provider.get() {
+            let sess = Session {
+                destination: SocksAddr::Domain(domain.to_owned(), 443),
+                ..Default::default()
+            };
+            return rps.iter().any(|rp| rp.search(&sess));
+        }
+
+        false
     }
 
     #[allow(dead_code)]
-    pub async fn exist(&mut self, ip: net::IpAddr) -> bool {
-        if !ip.is_ipv4() {
-            false
+    pub async fn exist(&self, ip: net::IpAddr) -> bool {
+        self.store.exist(ip).await
+    }
+
+    pub async fn is_fake_ip(&self, ip: net::IpAddr) -> bool {
+        match ip {
+            IpAddr::V4(v4) => {
+                if v4.is_broadcast() || v4.is_multicast() {
+                    return false;
+                }
+                // 检查 v4 存储和网段
+                if let Some(pool) = &self.v4_pool {
+                    let u = u32::from(v4);
+                    if u < pool.min || u > pool.max {
+                        return false;
+                    }
+                } else {
+                    return false;
+                }
+            }
+            IpAddr::V6(v6) => {
+                if v6.is_multicast() {
+                    return false;
+                }
+                // Mirror the v4 arm: reject anything outside the configured
+                // pool before paying for a store lookup.
+                match &self.v6_pool {
+                    Some(pool) => {
+                        let u = u128::from(v6);
+                        let mask = Self::v6_prefix_mask(pool.prefix_len);
+                        if u & mask
+                            != u128::from_be_bytes(pool.prefix) & mask
+                        {
+                            return false;
+                        }
+                        let host_id = u & !mask;
+                        if host_id < pool.min_host || host_id > pool.max_host {
+                            return false;
+                        }
+                    }
+                    None => return false,
+                }
+            }
+        }
+        self.store.exist(ip).await
+    }
+
+    #[allow(dead_code)]
+    pub async fn copy_from(&self, src: &Self) {
+        src.store.copy_to(&*self.store).await;
+    }
+
+    async fn get(&self, host: &str) -> net::IpAddr {
+        let mut allocated_v4 = None;
+        if let Some(pool) = &self.v4_pool {
+            let pool_size = pool.max - pool.min + 1;
+            let mut current_try = 0;
+            loop {
+                let candidate_offset = pool
+                    .offset
+                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |val| {
+                        Some((val + 1) % pool_size)
+                    })
+                    .unwrap();
+                let ip = Ipv4Addr::from(pool.min + candidate_offset);
+                let ip_addr = IpAddr::V4(ip);
+                if current_try >= pool_size {
+                    self.store.del_by_ip(ip_addr).await;
+                    allocated_v4 = Some(ip);
+                    break;
+                }
+                if !self.store.exist(ip_addr).await {
+                    allocated_v4 = Some(ip);
+                    break;
+                }
+                current_try += 1;
+            }
+        }
+
+        if let Some(v4) = allocated_v4 {
+            let ip = IpAddr::V4(v4);
+            self.store.put_by_ip(ip, host).await;
+            ip
         } else {
-            self.store.exist(ip).await
+            panic!("IPv4 subnet not configured");
         }
     }
 
-    pub async fn is_fake_ip(&mut self, ip: net::IpAddr) -> bool {
-        let net::IpAddr::V4(v4) = ip else {
-            return false;
-        };
-        // Broadcast and multicast addresses are never allocated as fake IPs.
-        if v4.is_broadcast() || v4.is_multicast() {
-            return false;
-        }
-        // Only IPs that are both within the fake-IP range *and* have actually
-        // been allocated in the store should be treated as fake IPs.  This
-        // prevents directed-broadcast addresses (e.g. 198.18.0.255 for the
-        // /24 TUN subnet) that fall inside the wider fake-IP /16 range from
-        // triggering a failed reverse-lookup in the dispatcher.
-        self.ipnet.contains(&ip) && self.store.exist(ip).await
-    }
-
-    #[allow(dead_code)]
-    pub fn gateway(&self) -> net::Ipv4Addr {
-        net::Ipv4Addr::from(self.gateway)
-    }
-
-    #[allow(dead_code)]
-    pub fn ipnet(&self) -> ipnet::IpNet {
-        self.ipnet
-    }
-
-    #[allow(dead_code)]
-    pub async fn copy_from(&mut self, src: &Self) {
-        src.store.copy_to(&mut self.store).await;
-    }
-
-    async fn get(&mut self, host: &str) -> net::IpAddr {
-        let current = self.offset;
-
+    /// ----------------------------------------
+    /// 2. 仅分配/查询 IPv6 Fake IP (应对 AAAA 记录)
+    /// ----------------------------------------
+    pub async fn getv6(&self, host: &str) -> IpAddr {
+        let pool = self.v6_pool.as_ref().unwrap();
+        let pool_size = pool.max_host - pool.min_host + 1;
+        let mut current_try = 0;
+        let allocated_ip;
         loop {
-            self.offset = (self.offset + 1) % (self.max - self.min);
+            let candidate_offset = pool
+                .offset
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |val| {
+                    Some((val + 1) % pool_size)
+                })
+                .unwrap();
+            let ip = Self::assemble_ipv6(
+                &pool.prefix,
+                pool.prefix_len,
+                pool.min_host + candidate_offset,
+            );
+            let ip_addr = IpAddr::V6(ip);
 
-            if self.offset == current {
-                self.offset = (self.offset + 1) % (self.max - self.min);
-                let ip = net::Ipv4Addr::from(self.min + self.offset - 1);
-                self.store.del_by_ip(std::net::IpAddr::V4(ip)).await;
+            if current_try >= pool_size {
+                // 撞圈，淘汰最老的一个
+                self.store.del_by_ip(ip_addr).await;
+                allocated_ip = Some(ip);
                 break;
             }
-
-            let ip = net::Ipv4Addr::from(self.min + self.offset - 1);
-            if !self.store.exist(std::net::IpAddr::V4(ip)).await {
+            if !self.store.exist(ip_addr).await {
+                allocated_ip = Some(ip);
                 break;
             }
+            current_try += 1;
         }
 
-        let ip = net::Ipv4Addr::from(self.min + self.offset - 1);
-        self.store.put_by_ip(std::net::IpAddr::V4(ip), host).await;
-        std::net::IpAddr::V4(ip)
+        // 3. 写入存储
+        if let Some(ip) = allocated_ip {
+            let ip_addr = IpAddr::V6(ip);
+            self.store.put_by_ip(ip_addr, host).await;
+            ip_addr
+        } else {
+            panic!("IPv6 subnet not configured");
+        }
     }
 
-    fn ip_to_uint(ip: &net::Ipv4Addr) -> u32 {
-        BigEndian::read_u32(&ip.octets())
+    /// Network mask for an IPv6 prefix length. `u128::MAX << 128` would be an
+    /// overflowing shift, so `/0` is special-cased.
+    fn v6_prefix_mask(prefix_len: u8) -> u128 {
+        if prefix_len == 0 {
+            0
+        } else {
+            u128::MAX << (128 - prefix_len)
+        }
+    }
+
+    // 辅助函数：IPv6 拼接
+    fn assemble_ipv6(prefix: &[u8; 16], prefix_len: u8, host_id: u128) -> Ipv6Addr {
+        let mut ip_u128 = u128::from_be_bytes(*prefix);
+        let mask = Self::v6_prefix_mask(prefix_len);
+        ip_u128 &= mask;
+        ip_u128 |= host_id & !mask;
+        Ipv6Addr::from(ip_u128)
     }
 }
 
@@ -167,15 +379,22 @@ mod tests {
 
     use crate::{app::dns::fakeip::mem_store::InMemStore, common::trie};
 
-    use super::{FakeDns, Opts};
+    use super::{FakeDns, Opts, Store};
 
     #[tokio::test]
     async fn test_inmem_basic() {
         let ipnet = "192.168.0.0/29".parse::<ipnet::IpNet>().unwrap();
         let store = Box::new(InMemStore::new(10));
-        let mut pool = FakeDns::new(Opts {
-            ipnet,
+        let pool = FakeDns::new(Opts {
+            ipnet: match ipnet {
+                ipnet::IpNet::V4(v4) => v4,
+                _ => panic!(),
+            },
+            ipnet6: "fdfe:5a70:6451:982b::/64"
+                .parse::<ipnet::Ipv6Net>()
+                .unwrap(),
             skipped_hostnames: None,
+            ruleset_names: None,
             store,
         })
         .unwrap();
@@ -193,8 +412,6 @@ mod tests {
         assert_eq!(last, net::IpAddr::from([192, 168, 0, 3]));
         assert!(bar.is_some());
         assert_eq!(bar, Some("bar.com".into()));
-        assert_eq!(pool.gateway(), net::IpAddr::from([192, 168, 0, 1]));
-        assert_eq!(pool.ipnet().to_string(), ipnet.to_string());
         assert!(pool.exist(net::IpAddr::from([192, 168, 0, 3])).await);
         assert!(!pool.exist(net::IpAddr::from([192, 168, 0, 4])).await);
         assert!(!pool.exist("::1".parse().unwrap()).await);
@@ -205,9 +422,16 @@ mod tests {
         let store = Box::new(InMemStore::new(10));
 
         let ipnet = "192.168.0.0/29".parse::<ipnet::IpNet>().unwrap();
-        let mut pool = FakeDns::new(Opts {
-            ipnet,
+        let pool = FakeDns::new(Opts {
+            ipnet: match ipnet {
+                ipnet::IpNet::V4(v4) => v4,
+                _ => panic!(),
+            },
+            ipnet6: "fdfe:5a70:6451:982b::/64"
+                .parse::<ipnet::Ipv6Net>()
+                .unwrap(),
             skipped_hostnames: None,
+            ruleset_names: None,
             store,
         })
         .unwrap();
@@ -215,7 +439,7 @@ mod tests {
         let foo = pool.lookup("foo.com").await;
         let bar = pool.lookup("bar.com").await;
 
-        for i in 0..3 {
+        for i in 0..4 {
             pool.lookup(&format!("{}.com", i)).await;
         }
 
@@ -234,12 +458,28 @@ mod tests {
         tree.insert("example.com", Arc::new(false));
 
         let pool = FakeDns::new(Opts {
-            ipnet,
+            ipnet: match ipnet {
+                ipnet::IpNet::V4(v4) => v4,
+                _ => panic!(),
+            },
+            ipnet6: "fdfe:5a70:6451:982b::/64"
+                .parse::<ipnet::Ipv6Net>()
+                .unwrap(),
             skipped_hostnames: Some(tree),
+            ruleset_names: None,
             store,
         })
         .unwrap();
 
+        assert!(pool.should_skip("example.com"));
+        // Repeated lookups must be stable.
+        assert!(pool.should_skip("example.com"));
+
+        assert!(!pool.should_skip("foo.com"));
+        assert!(!pool.should_skip("foo.com"));
+
+        // Binding an empty rule-set map must not change static verdicts.
+        pool.add_rule_set(&std::collections::HashMap::new()).await;
         assert!(pool.should_skip("example.com"));
         assert!(!pool.should_skip("foo.com"));
     }
@@ -249,9 +489,16 @@ mod tests {
         let store = Box::new(InMemStore::new(2));
 
         let ipnet = "192.168.0.0/24".parse::<ipnet::IpNet>().unwrap();
-        let mut pool = FakeDns::new(Opts {
-            ipnet,
+        let pool = FakeDns::new(Opts {
+            ipnet: match ipnet {
+                ipnet::IpNet::V4(v4) => v4,
+                _ => panic!(),
+            },
+            ipnet6: "fdfe:5a70:6451:982b::/64"
+                .parse::<ipnet::Ipv6Net>()
+                .unwrap(),
             skipped_hostnames: None,
+            ruleset_names: None,
             store,
         })
         .unwrap();
@@ -271,9 +518,16 @@ mod tests {
         let store = Box::new(InMemStore::new(2));
 
         let ipnet = "192.168.0.0/24".parse::<ipnet::IpNet>().unwrap();
-        let mut pool = FakeDns::new(Opts {
-            ipnet,
+        let pool = FakeDns::new(Opts {
+            ipnet: match ipnet {
+                ipnet::IpNet::V4(v4) => v4,
+                _ => panic!(),
+            },
+            ipnet6: "fdfe:5a70:6451:982b::/64"
+                .parse::<ipnet::Ipv6Net>()
+                .unwrap(),
             skipped_hostnames: None,
+            ruleset_names: None,
             store,
         })
         .unwrap();
@@ -285,9 +539,16 @@ mod tests {
 
         let store = Box::new(InMemStore::new(2));
 
-        let mut new_pool = FakeDns::new(Opts {
-            ipnet,
+        let new_pool = FakeDns::new(Opts {
+            ipnet: match ipnet {
+                ipnet::IpNet::V4(v4) => v4,
+                _ => panic!(),
+            },
+            ipnet6: "fdfe:5a70:6451:982b::/64"
+                .parse::<ipnet::Ipv6Net>()
+                .unwrap(),
             skipped_hostnames: None,
+            ruleset_names: None,
             store,
         })
         .unwrap();
@@ -302,14 +563,17 @@ mod tests {
     async fn test_is_fake_ip_excludes_broadcast_and_unallocated() {
         let store = Box::new(InMemStore::new(10));
 
-        // Use 198.18.0.0/16 (the default fake-ip-range) to mirror the real
-        // production setup described in the bug report, where the TUN gateway
-        // is 198.18.0.1/24 and its subnet broadcast 198.18.0.255 fell inside
-        // the wider /16 fake-ip range.
         let ipnet = "198.18.0.0/16".parse::<ipnet::IpNet>().unwrap();
-        let mut pool = FakeDns::new(Opts {
-            ipnet,
+        let pool = FakeDns::new(Opts {
+            ipnet: match ipnet {
+                ipnet::IpNet::V4(v4) => v4,
+                _ => panic!(),
+            },
+            ipnet6: "fdfe:5a70:6451:982b::/64"
+                .parse::<ipnet::Ipv6Net>()
+                .unwrap(),
             skipped_hostnames: None,
+            ruleset_names: None,
             store,
         })
         .unwrap();
@@ -349,5 +613,113 @@ mod tests {
             !pool.is_fake_ip(unallocated).await,
             "unallocated in-range IP must not be treated as a fake IP"
         );
+    }
+
+    #[tokio::test]
+    async fn test_file_store_basic() {
+        use crate::app::dns::fakeip::file_store::FileStore;
+        use crate::app::profile::ThreadSafeCacheFile;
+        use tempfile::tempdir;
+
+        let temp_dir = tempdir().unwrap();
+        let cache_path = temp_dir.path().join("test_cache.db");
+        let cache_store =
+            ThreadSafeCacheFile::new(cache_path.to_str().unwrap(), true);
+
+        let ipnet = "192.168.0.0/29".parse::<ipnet::IpNet>().unwrap();
+        let store = Box::new(FileStore::new(cache_store.clone()));
+        let pool = FakeDns::new(Opts {
+            ipnet: match ipnet {
+                ipnet::IpNet::V4(v4) => v4,
+                _ => panic!(),
+            },
+            ipnet6: "fdfe:5a70:6451:982b::/64"
+                .parse::<ipnet::Ipv6Net>()
+                .unwrap(),
+            skipped_hostnames: None,
+            ruleset_names: None,
+            store,
+        })
+        .unwrap();
+
+        // 1. Resolve host and get IPv4
+        let first = pool.lookup("foo.com").await;
+        // 2. Resolve host and get IPv6
+        let first_v6 = pool.lookupv6("foo.com").await;
+
+        assert_eq!(first, net::IpAddr::from([192, 168, 0, 2]));
+        assert!(first_v6.is_ipv6());
+
+        // 3. Query back
+        let ip_v4 = pool.store.get_by_host("foo.com").await;
+        let ip_v6 = pool.store.get_v6_by_host("foo.com").await;
+
+        assert_eq!(ip_v4, Some(first));
+        assert_eq!(ip_v6, Some(first_v6));
+
+        // 4. Reverse lookups should return original host
+        assert_eq!(
+            pool.reverse_lookup(first).await,
+            Some("foo.com".to_string())
+        );
+        assert_eq!(
+            pool.reverse_lookup(first_v6).await,
+            Some("foo.com".to_string())
+        );
+
+        // 5. Test existence
+        assert!(pool.exist(first).await);
+        assert!(pool.exist(first_v6).await);
+
+        // 6. Test delete
+        pool.store.del_by_ip(first).await;
+        assert!(!pool.exist(first).await);
+        assert!(pool.exist(first_v6).await);
+
+        // v4 lookup should be None now
+        assert_eq!(pool.store.get_by_host("foo.com").await, None);
+        // v6 lookup should still be there
+        assert_eq!(pool.store.get_v6_by_host("foo.com").await, Some(first_v6));
+    }
+
+    #[tokio::test]
+    async fn test_file_store_fallback() {
+        use crate::app::dns::fakeip::file_store::FileStore;
+        use crate::app::profile::ThreadSafeCacheFile;
+        use tempfile::tempdir;
+
+        let temp_dir = tempdir().unwrap();
+        let cache_path = temp_dir.path().join("test_cache_fallback.db");
+        let cache_store =
+            ThreadSafeCacheFile::new(cache_path.to_str().unwrap(), true);
+
+        // Manually write old format to the cache store (no suffix)
+        let host = "old-style.com";
+        let ip_v4_str = "192.168.0.2";
+        let ip_v6_str = "fdfe:5a70:6451:982b::2";
+
+        // Insert directly using cache_store set_host_to_ip
+        cache_store.set_host_to_ip(host, ip_v4_str).await;
+
+        let store = FileStore::new(cache_store.clone());
+
+        // Test fallback lookup v4
+        let res_v4 = store.get_by_host(host).await;
+        assert_eq!(res_v4, Some(ip_v4_str.parse().unwrap()));
+
+        // Lookup v6 for old-style.com should be None because the stored IP is v4
+        let res_v6 = store.get_v6_by_host(host).await;
+        assert_eq!(res_v6, None);
+
+        // Now change it to store IPv6 in the old format
+        cache_store.set_host_to_ip(host, ip_v6_str).await;
+
+        // Test fallback lookup v6
+        let res_v6_new = store.get_v6_by_host(host).await;
+        assert_eq!(res_v6_new, Some(ip_v6_str.parse().unwrap()));
+
+        // Lookup v4 should now be None
+        let res_v4_new = store.get_by_host(host).await;
+        assert_eq!(res_v4_new, None);
     }
 }

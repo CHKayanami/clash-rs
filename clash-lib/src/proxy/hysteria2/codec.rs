@@ -8,6 +8,19 @@ use tokio_util::codec::{Decoder, Encoder};
 
 pub struct Hy2TcpCodec;
 
+/// Ceiling on the server's status message. Lengths arrive as a QUIC varint, so
+/// without a bound a server can name any size up to 2^62 and have us allocate
+/// it sight unseen.
+const MAX_RESP_MSG_LEN: usize = 8 * 1024;
+
+/// Ceiling on the server's random padding, per the same reasoning. Hysteria
+/// itself pads with a few hundred bytes.
+const MAX_RESP_PADDING_LEN: u64 = 64 * 1024;
+
+/// Longest address string we will accept in a UDP packet header. A `SocksAddr`
+/// domain is at most 255 bytes plus `:65535`.
+const MAX_ADDR_LEN: usize = 256 + 6;
+
 /// ### format
 ///
 /// ```text
@@ -23,148 +36,83 @@ pub struct Hy2TcpResp {
     pub msg: String,
 }
 
-impl Hy2TcpResp {
-    /// A success response (status `0x00`, empty message).
-    pub fn ok() -> Self {
-        Self {
-            status: 0x00,
-            msg: String::new(),
+pub async fn read_hy2_resp<R: tokio::io::AsyncRead + Unpin>(
+    reader: &mut R,
+) -> std::io::Result<Hy2TcpResp> {
+    use tokio::io::AsyncReadExt;
+    let status = reader.read_u8().await?;
+
+    let msg_len = read_varint(reader).await?;
+    if msg_len > MAX_RESP_MSG_LEN as u64 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "hysteria2 response message too long: {} > {}",
+                msg_len, MAX_RESP_MSG_LEN
+            ),
+        ));
+    }
+    let mut msg_buf = vec![0u8; msg_len as usize];
+    if msg_len > 0 {
+        reader.read_exact(&mut msg_buf).await?;
+    }
+    let msg = String::from_utf8(msg_buf)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+
+    let padding_len = read_varint(reader).await?;
+    if padding_len > MAX_RESP_PADDING_LEN {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "hysteria2 response padding too long: {} > {}",
+                padding_len, MAX_RESP_PADDING_LEN
+            ),
+        ));
+    }
+    if padding_len > 0 {
+        // discard in bounded chunks rather than allocating the whole run
+        let mut remaining = padding_len;
+        let mut pad_buf = [0u8; 1024];
+        while remaining > 0 {
+            let take = remaining.min(pad_buf.len() as u64) as usize;
+            reader.read_exact(&mut pad_buf[..take]).await?;
+            remaining -= take as u64;
         }
     }
+
+    Ok(Hy2TcpResp { status, msg })
 }
 
-/// Server-side codec for reading TCP relay requests from the client.
-///
-/// ### Client → Server format
-///
-/// ```text
-/// [varint] Request ID (must be 0x401)
-/// [varint] Address length
-/// [bytes]  Address string "host:port"
-/// [varint] Padding length
-/// [bytes]  Random padding (skipped)
-/// ```
-pub struct Hy2TcpReqCodec;
-
-/// Upper bound on the client-supplied address length. A `host:port` string is
-/// at most a 253-byte DNS name plus a port, so 512 is generous.
-const MAX_ADDR_LEN: usize = 512;
-/// Upper bound on the client-supplied padding length. Hysteria2 padding is a
-/// few hundred bytes; cap well above that but far below a DoS-worthy size.
-const MAX_PADDING_LEN: usize = 64 * 1024;
-
-/// Parsed TCP relay request from the client.
-pub struct Hy2TcpReq {
-    pub addr: SocksAddr,
-}
-
-impl Decoder for Hy2TcpReqCodec {
-    type Error = std::io::Error;
-    type Item = Hy2TcpReq;
-
-    fn decode(
-        &mut self,
-        src: &mut BytesMut,
-    ) -> Result<Option<Self::Item>, Self::Error> {
-        if src.is_empty() {
-            return Ok(None);
+async fn read_varint<R: tokio::io::AsyncRead + Unpin>(
+    reader: &mut R,
+) -> std::io::Result<u64> {
+    use tokio::io::AsyncReadExt;
+    let b0 = reader.read_u8().await?;
+    let tag = b0 >> 6;
+    let first_byte_val = (b0 & 0x3f) as u64;
+    match tag {
+        0b00 => Ok(first_byte_val),
+        0b01 => {
+            let b1 = reader.read_u8().await? as u64;
+            Ok((first_byte_val << 8) | b1)
         }
-        let mut tmp = src.clone();
-        // A `VarInt::decode` error here means the buffer does not yet hold the
-        // full varint (quinn's only decode error is `UnexpectedEnd`). Since the
-        // request may arrive split across QUIC reads — especially given the up
-        // to 512 bytes of trailing padding — treat that as "need more bytes"
-        // (`Ok(None)`) rather than a fatal protocol error that drops the stream.
-        // Request ID
-        let Ok(req_id) = VarInt::decode(&mut tmp) else {
-            return Ok(None);
-        };
-        const EXPECTED_REQ_ID: u64 = 0x401;
-        if req_id.into_inner() != EXPECTED_REQ_ID {
-            return Err(std::io::Error::new(
-                ErrorKind::InvalidData,
-                format!(
-                    "unexpected hysteria2 TCP request ID: {:#x}",
-                    req_id.into_inner()
-                ),
-            ));
+        0b10 => {
+            let mut buf = [0u8; 3];
+            reader.read_exact(&mut buf).await?;
+            let val =
+                ((buf[0] as u64) << 16) | ((buf[1] as u64) << 8) | (buf[2] as u64);
+            Ok((first_byte_val << 24) | val)
         }
-        // Address length + bytes
-        let Ok(addr_len) = VarInt::decode(&mut tmp) else {
-            return Ok(None);
-        };
-        let addr_len = addr_len.into_inner() as usize;
-        // Bound the peer-controlled length so a bogus varint can't make us
-        // buffer unboundedly (memory DoS). A `host:port` string fits easily.
-        if addr_len > MAX_ADDR_LEN {
-            return Err(std::io::Error::new(
-                ErrorKind::InvalidData,
-                "hysteria2 TCP request: address length too large",
-            ));
+        0b11 => {
+            let mut buf = [0u8; 7];
+            reader.read_exact(&mut buf).await?;
+            let mut val = 0u64;
+            for b in buf {
+                val = (val << 8) | (b as u64);
+            }
+            Ok((first_byte_val << 56) | val)
         }
-        if tmp.remaining() < addr_len {
-            return Ok(None);
-        }
-        let addr_bytes: Vec<u8> = tmp.split_to(addr_len).into();
-        // Padding length + bytes
-        let Ok(padding_len) = VarInt::decode(&mut tmp) else {
-            return Ok(None);
-        };
-        let padding_len = padding_len.into_inner() as usize;
-        if padding_len > MAX_PADDING_LEN {
-            return Err(std::io::Error::new(
-                ErrorKind::InvalidData,
-                "hysteria2 TCP request: padding length too large",
-            ));
-        }
-        if tmp.remaining() < padding_len {
-            return Ok(None);
-        }
-        tmp.advance(padding_len);
-
-        // Commit: advance src by amount consumed
-        let consumed = src.remaining() - tmp.remaining();
-        src.advance(consumed);
-
-        let addr = to_socksaddr(&addr_bytes)?;
-        Ok(Some(Hy2TcpReq { addr }))
-    }
-}
-
-/// Encodes a server TCP response.
-///
-/// ### Server → Client format
-///
-/// ```text
-/// [uint8]  Status (0x00 = OK, 0x01 = Error)
-/// [varint] Message length
-/// [bytes]  Message string
-/// [varint] Padding length
-/// [bytes]  Random padding
-/// ```
-pub struct Hy2TcpRespEncoder;
-
-impl Encoder<Hy2TcpResp> for Hy2TcpRespEncoder {
-    type Error = std::io::Error;
-
-    fn encode(
-        &mut self,
-        item: Hy2TcpResp,
-        buf: &mut BytesMut,
-    ) -> Result<(), Self::Error> {
-        let pad = padding(64..=512);
-        let msg_bytes = item.msg.into_bytes();
-        let msg_var = VarInt::from_u32(msg_bytes.len() as u32);
-        let pad_var = VarInt::from_u32(pad.len() as u32);
-        buf.reserve(
-            1 + var_size(msg_var) + msg_bytes.len() + var_size(pad_var) + pad.len(),
-        );
-        buf.put_u8(item.status);
-        msg_var.encode(buf);
-        buf.put_slice(&msg_bytes);
-        pad_var.encode(buf);
-        buf.put_slice(&pad);
-        Ok(())
+        _ => unreachable!(),
     }
 }
 
@@ -176,32 +124,75 @@ impl Decoder for Hy2TcpCodec {
         &mut self,
         src: &mut BytesMut,
     ) -> Result<Option<Self::Item>, Self::Error> {
-        if !src.has_remaining() {
-            return Err(ErrorKind::UnexpectedEof.into());
+        if src.is_empty() {
+            return Ok(None);
         }
+
+        // Peek over a borrowed slice — `src.clone()` deep-copied the whole
+        // buffer on every call just to answer "is the frame complete yet?".
+        let mut peek: &[u8] = &src[..];
+
+        if !peek.has_remaining() {
+            return Ok(None);
+        }
+        let _status = peek.get_u8();
+
+        let Ok(msg_len_var) = VarInt::decode(&mut peek) else {
+            return Ok(None);
+        };
+        let msg_len = msg_len_var.into_inner();
+        if msg_len > MAX_RESP_MSG_LEN as u64 {
+            return Err(std::io::Error::new(
+                ErrorKind::InvalidData,
+                format!(
+                    "hysteria2 response message too long: {} > {}",
+                    msg_len, MAX_RESP_MSG_LEN
+                ),
+            ));
+        }
+        let msg_len = msg_len as usize;
+
+        if peek.remaining() < msg_len {
+            return Ok(None);
+        }
+        peek.advance(msg_len);
+
+        let Ok(padding_len_var) = VarInt::decode(&mut peek) else {
+            return Ok(None);
+        };
+        let padding_len = padding_len_var.into_inner();
+        if padding_len > MAX_RESP_PADDING_LEN {
+            return Err(std::io::Error::new(
+                ErrorKind::InvalidData,
+                format!(
+                    "hysteria2 response padding too long: {} > {}",
+                    padding_len, MAX_RESP_PADDING_LEN
+                ),
+            ));
+        }
+        let padding_len = padding_len as usize;
+
+        if peek.remaining() < padding_len {
+            return Ok(None);
+        }
+
+        // The peek above proved every field is present, so the destructive
+        // pass below cannot run off the end.
         let status = src.get_u8();
         let msg_len = VarInt::decode(src)
             .map_err(|_| ErrorKind::InvalidData)?
             .into_inner() as usize;
 
-        if src.remaining() < msg_len {
-            return Err(ErrorKind::UnexpectedEof.into());
-        }
-
-        let msg: Vec<u8> = src.split_to(msg_len).into();
-        let msg: String = String::from_utf8(msg)
+        let msg_bytes = src.split_to(msg_len);
+        let msg = String::from_utf8(msg_bytes.to_vec())
             .map_err(|e| std::io::Error::new(ErrorKind::InvalidData, e))?;
 
         let padding_len = VarInt::decode(src)
-            .map_err(|_| ErrorKind::UnexpectedEof)?
+            .map_err(|_| ErrorKind::InvalidData)?
             .into_inner() as usize;
-
-        if src.remaining() < padding_len {
-            return Err(ErrorKind::UnexpectedEof.into());
-        }
         src.advance(padding_len);
 
-        Ok(Hy2TcpResp { status, msg }.into())
+        Ok(Some(Hy2TcpResp { status, msg }))
     }
 }
 
@@ -282,7 +273,7 @@ pub struct HysUdpPacket {
     pub frag_id: u8,
     pub frag_count: u8,
     pub addr: SocksAddr,
-    pub data: Vec<u8>,
+    pub data: Bytes,
 }
 
 impl std::fmt::Debug for HysUdpPacket {
@@ -308,17 +299,19 @@ impl HysUdpPacket {
         let pkt_id = buf.get_u16();
         let frag_id = buf.get_u8();
         let frag_count = buf.get_u8();
-        let addr_len =
-            VarInt::decode(buf).map_err(|_| anyhow!(""))?.into_inner() as usize;
-        // `addr_len` is attacker-controlled; guard against an oversized value
-        // so `split_to` cannot panic on a malformed datagram.
-        if buf.remaining() < addr_len {
+        let addr_len = VarInt::decode(buf)
+            .map_err(|_| anyhow!("malformed address length"))?
+            .into_inner();
+        // `split_to` panics past the end, and the length is server-controlled.
+        if addr_len > MAX_ADDR_LEN as u64 || addr_len > buf.remaining() as u64 {
             return Err(anyhow!(
-                "hysteria2 udp packet: address length out of bounds"
+                "invalid address length {} (remaining {})",
+                addr_len,
+                buf.remaining()
             ));
         }
-        let addr: Vec<u8> = buf.split_to(addr_len).into();
-        let data = buf.split().to_vec();
+        let addr: Vec<u8> = buf.split_to(addr_len as usize).into();
+        let data = buf.split().freeze();
         Ok(Self {
             session_id,
             pkt_id,
@@ -338,6 +331,11 @@ fn to_socksaddr(bytes: &[u8]) -> std::io::Result<SocksAddr> {
         )
     })?;
 
+    // Literal addresses (including the bracketed `[::1]:443` form) parse here.
+    if let Ok(sock_addr) = std::net::SocketAddr::from_str(addr_str) {
+        return Ok(SocksAddr::Ip(sock_addr));
+    }
+
     // Split the string at ':' to get host and port
     let (host, port_str) = addr_str.rsplit_once(':').ok_or_else(|| {
         std::io::Error::new(
@@ -351,13 +349,16 @@ fn to_socksaddr(bytes: &[u8]) -> std::io::Result<SocksAddr> {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "Invalid port number")
     })?;
 
-    // Try parsing as SocketAddr first
-    if let Ok(sock_addr) = std::net::SocketAddr::from_str(addr_str) {
-        Ok(SocksAddr::Ip(sock_addr))
-    } else {
-        // If not a valid IP address, treat as domain
-        Ok(SocksAddr::Domain(host.to_string(), port))
+    // A host still holding a colon is an unbracketed IPv6 literal that failed
+    // to parse above; calling it a domain would silently produce nonsense.
+    if host.is_empty() || host.contains(':') {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Malformed address host",
+        ));
     }
+
+    Ok(SocksAddr::Domain(host.to_string(), port))
 }
 
 /// Iterator over fragments of a packet
@@ -386,20 +387,39 @@ where
         addr: SocksAddr,
         max_pkt_size: usize,
         payload: P,
-    ) -> Self {
+    ) -> anyhow::Result<Self> {
         let addr = addr.to_string().into_bytes();
         let addr_var = VarInt::from_u32(addr.len() as u32);
 
         let fixed_size = 4 + 2 + 1 + 1 + addr.len() + var_size(addr_var);
-        // `max_pkt_size` comes from the peer-advertised max datagram size and
-        // `fixed_size` grows with the (attacker-influenced) address length.
-        // Clamp to at least 1 so the `div_ceil` below can neither underflow nor
-        // divide by zero when the header does not fit the advertised datagram.
-        let max_data_size = max_pkt_size.saturating_sub(fixed_size).max(1);
-        // TODO: report warning when frag_total > u8::MAX
-        let frag_total = payload.as_ref().len().div_ceil(max_data_size) as u8;
+        // A long destination plus a small configured `udp_mtu` made this
+        // subtraction underflow.
+        let Some(max_data_size) =
+            max_pkt_size.checked_sub(fixed_size).filter(|n| *n > 0)
+        else {
+            return Err(anyhow!(
+                "hysteria2 udp mtu {} too small for a {}-byte header",
+                max_pkt_size,
+                fixed_size
+            ));
+        };
 
-        Self {
+        // `frag_total` is a single byte on the wire. Truncating it turned an
+        // oversized packet into either silence (256 fragments -> 0) or, worse,
+        // one fragment claiming to be the whole packet (257 -> 1), which the
+        // peer's defragmenter accepted as complete but truncated data.
+        let frag_total = payload.as_ref().len().div_ceil(max_data_size);
+        if frag_total > u8::MAX as usize {
+            return Err(anyhow!(
+                "hysteria2 udp packet needs {} fragments, exceeding the {} the \
+                 protocol allows",
+                frag_total,
+                u8::MAX
+            ));
+        }
+        let frag_total = frag_total as u8;
+
+        Ok(Self {
             session_id,
             pkt_id,
             addr: (addr, addr_var),
@@ -410,7 +430,7 @@ where
             max_pkt_size,
             fixed_size,
             _marker: std::marker::PhantomData,
-        }
+        })
     }
 }
 
@@ -422,8 +442,7 @@ where
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.next_frag_id < self.frag_total {
-            let max_payload_size =
-                self.max_pkt_size.saturating_sub(self.fixed_size).max(1);
+            let max_payload_size = self.max_pkt_size - self.fixed_size;
             let next_frag_end = (self.next_frag_start + max_payload_size)
                 .min(self.payload.as_ref().len());
             let payload =
@@ -499,11 +518,12 @@ impl Defragger {
                 let frags = std::mem::take(&mut self.frags);
                 let mut iters = frags.into_iter().map(|x| x.unwrap());
                 let mut pkt0 = iters.next().unwrap();
-                pkt0.frag_count = 1;
-                pkt0.frag_id = 0;
+                let mut data_buf = BytesMut::new();
+                data_buf.extend_from_slice(&pkt0.data);
                 for pkt in iters {
-                    pkt0.data.extend_from_slice(&pkt.data);
+                    data_buf.extend_from_slice(&pkt.data);
                 }
+                pkt0.data = data_buf.freeze();
                 return Some(pkt0);
             }
         }
@@ -536,85 +556,4 @@ fn test_decode_addr() {
     let addr_bytes = addr.to_string().into_bytes();
     let decoded_addr = to_socksaddr(&addr_bytes).unwrap();
     assert_eq!(addr, decoded_addr);
-}
-
-#[test]
-fn udp_decode_oversized_addr_len_does_not_panic() {
-    // header (session_id, pkt_id, frag_id, frag_count) + a varint addr_len of
-    // 63 (single-byte varint) but no address bytes following. Must return Err,
-    // not panic in `split_to`.
-    let mut buf = BytesMut::new();
-    buf.put_u32(1); // session_id
-    buf.put_u16(1); // pkt_id
-    buf.put_u8(0); // frag_id
-    buf.put_u8(1); // frag_count
-    buf.put_u8(63); // varint addr_len = 63, but zero address bytes follow
-    let err = HysUdpPacket::decode(&mut buf);
-    assert!(err.is_err(), "oversized addr_len must be a decode error");
-}
-
-#[test]
-fn tcp_req_codec_waits_for_partial_frame() {
-    // A truncated request (only the first byte of the 2-byte request-ID varint)
-    // must yield Ok(None) so the framed reader waits for more bytes, rather
-    // than erroring and dropping the stream.
-    let mut req = BytesMut::new();
-    const REQ_ID: VarInt = VarInt::from_u32(0x401);
-    REQ_ID.encode(&mut req);
-    // keep only the first byte of the (2-byte) request-id varint
-    let mut partial = BytesMut::from(&req[..1]);
-    let out = Hy2TcpReqCodec.decode(&mut partial).unwrap();
-    assert!(out.is_none(), "partial frame should decode to None");
-}
-
-/// Encode a Hy2 TCP request frame (as the client does) for decoder tests.
-#[cfg(test)]
-fn encode_tcp_req(addr: &str, padding_len: usize) -> BytesMut {
-    let mut buf = BytesMut::new();
-    VarInt::from_u32(0x401).encode(&mut buf);
-    VarInt::from_u32(addr.len() as u32).encode(&mut buf);
-    buf.put_slice(addr.as_bytes());
-    VarInt::from_u32(padding_len as u32).encode(&mut buf);
-    buf.put_slice(&vec![0u8; padding_len]);
-    buf
-}
-
-#[test]
-fn tcp_req_codec_decodes_full_frame() {
-    let mut buf = encode_tcp_req("example.com:443", 16);
-    let req = Hy2TcpReqCodec
-        .decode(&mut buf)
-        .unwrap()
-        .expect("a full frame should decode");
-    assert_eq!(req.addr, SocksAddr::Domain("example.com".into(), 443));
-    assert!(buf.is_empty(), "the whole frame should be consumed");
-}
-
-#[test]
-fn tcp_req_codec_rejects_oversized_lengths() {
-    // addr_len far beyond MAX_ADDR_LEN must be a hard error, not unbounded
-    // buffering.
-    let mut buf = BytesMut::new();
-    VarInt::from_u32(0x401).encode(&mut buf);
-    VarInt::from_u32(1_000_000).encode(&mut buf); // addr_len ≫ MAX_ADDR_LEN
-    assert!(Hy2TcpReqCodec.decode(&mut buf).is_err());
-
-    // padding_len far beyond MAX_PADDING_LEN must likewise be rejected.
-    let mut buf = BytesMut::new();
-    VarInt::from_u32(0x401).encode(&mut buf);
-    VarInt::from_u32(3).encode(&mut buf);
-    buf.put_slice(b"a:1");
-    VarInt::from_u32(10_000_000).encode(&mut buf); // padding_len ≫ MAX_PADDING_LEN
-    assert!(Hy2TcpReqCodec.decode(&mut buf).is_err());
-}
-
-#[test]
-fn tcp_resp_encode_decode_roundtrip() {
-    let mut buf = BytesMut::new();
-    Hy2TcpRespEncoder
-        .encode(Hy2TcpResp::ok(), &mut buf)
-        .unwrap();
-    let resp = Hy2TcpCodec.decode(&mut buf).unwrap().unwrap();
-    assert_eq!(resp.status, 0x00);
-    assert!(resp.msg.is_empty());
 }

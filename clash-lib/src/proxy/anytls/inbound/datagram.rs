@@ -14,6 +14,8 @@ use crate::{
     session::SocksAddr,
 };
 
+/// A length-prefixed packet cannot exceed what its `u16` header can express,
+/// so reads are inherently bounded; this caps the *write* side.
 pub(super) const MAX_PACKET_LENGTH: usize = u16::MAX as usize;
 
 /// Wraps the post-AnyTLS-handshake TLS stream for UDP-over-TCP v2.
@@ -174,18 +176,11 @@ impl Stream for InboundDatagramAnytls {
                             // Zero-length packet — valid empty datagram, return
                             // immediately.
                             return Poll::Ready(Some(UdpPacket {
-                                data: Vec::new(),
+                                data: bytes::Bytes::new(),
                                 src_addr: this.peer_addr.clone(),
                                 dst_addr: this.peer_addr.clone(),
                                 inbound_user: None,
                             }));
-                        }
-                        if packet_len > MAX_PACKET_LENGTH {
-                            debug!(
-                                "invalid anytls inbound udp packet length: {}",
-                                packet_len
-                            );
-                            return Poll::Ready(None);
                         }
                         this.packet_len = Some(packet_len);
                         this.packet_buf.clear();
@@ -225,7 +220,7 @@ impl Stream for InboundDatagramAnytls {
                 unsafe { this.packet_buf.advance_mut(n) };
 
                 if this.packet_buf.len() == packet_len {
-                    let data = this.packet_buf.split_to(packet_len).to_vec();
+                    let data = this.packet_buf.split_to(packet_len).freeze();
                     this.packet_len = None;
                     return Poll::Ready(Some(UdpPacket {
                         data,
@@ -252,7 +247,7 @@ mod tests {
     fn make_packet(data: Vec<u8>) -> UdpPacket {
         let addr = make_peer_addr();
         UdpPacket {
-            data,
+            data: bytes::Bytes::from(data),
             src_addr: addr.clone(),
             dst_addr: addr,
             inbound_user: None,
@@ -282,7 +277,7 @@ mod tests {
         drop(client_side);
 
         let pkt = datagram.next().await.expect("expected one packet");
-        assert_eq!(pkt.data, b"hello");
+        assert_eq!(pkt.data.as_ref(), b"hello");
         assert_eq!(pkt.src_addr, peer_addr);
         assert_eq!(pkt.dst_addr, peer_addr);
         assert!(pkt.inbound_user.is_none());
@@ -327,10 +322,10 @@ mod tests {
         drop(client_side);
 
         let pkt1 = datagram.next().await.expect("expected first packet");
-        assert_eq!(pkt1.data, b"first");
+        assert_eq!(pkt1.data.as_ref(), b"first");
 
         let pkt2 = datagram.next().await.expect("expected second packet");
-        assert_eq!(pkt2.data, b"second");
+        assert_eq!(pkt2.data.as_ref(), b"second");
 
         assert!(
             datagram.next().await.is_none(),

@@ -15,11 +15,22 @@ use tokio::{io::ReadBuf, net::UdpSocket, task::JoinHandle};
 
 const UDP_DOMAIN_MAP_TTL: Duration = Duration::from_secs(60);
 
+/// How many consecutive receive failures to tolerate before giving up on the
+/// association, so a permanently broken socket cannot spin this loop.
+const MAX_CONSECUTIVE_RECV_ERRORS: usize = 32;
+
+/// Only sweep `ip_to_logical` for expiry once it has grown past this. Sweeping
+/// on every send made a client talking to N destinations pay O(N) per packet.
+const UDP_DOMAIN_MAP_SWEEP_THRESHOLD: usize = 64;
+
 #[must_use = "sinks do nothing unless polled"]
 // TODO: maybe we should use abstract datagram IO interface instead of the
 // Stream + Sink trait
 pub struct OutboundDatagramImpl {
     inner: UdpSocket,
+    /// Cached at construction: `local_addr()` is a syscall and the family
+    /// cannot change, but it was being queried twice for every packet sent.
+    local_is_ipv6: bool,
     resolver: ThreadSafeDNSResolver,
     flushed: bool,
     pkt: Option<UdpPacket>,
@@ -30,17 +41,22 @@ pub struct OutboundDatagramImpl {
     /// In-flight DNS resolution task for the current queued packet.
     /// Using a JoinHandle (Send + Sync) rather than a raw BoxFuture so that
     /// OutboundDatagramImpl satisfies the Sync bound required by
-    /// InstrumentedDatagram. The task is spawned once and awaited across polls
-    /// — no query restarts.
+    /// ChainedDatagram. The task is spawned once and awaited across polls —
+    /// no query restarts.
     pending_dns: Option<JoinHandle<io::Result<SocketAddr>>>,
     /// Resolved IP for the current queued packet; reused across poll_send_to
     /// retries so we never re-poll an already-completed DNS task.
     resolved_dst: Option<SocketAddr>,
+    consecutive_recv_errors: usize,
 }
 
 impl OutboundDatagramImpl {
     pub fn new(udp: UdpSocket, resolver: ThreadSafeDNSResolver) -> Self {
         Self {
+            local_is_ipv6: udp
+                .local_addr()
+                .map(|addr| addr.is_ipv6())
+                .unwrap_or(false),
             inner: udp,
             resolver,
             flushed: true,
@@ -49,6 +65,7 @@ impl OutboundDatagramImpl {
             ip_to_logical: HashMap::new(),
             pending_dns: None,
             resolved_dst: None,
+            consecutive_recv_errors: 0,
         }
     }
 }
@@ -91,6 +108,7 @@ impl Sink<UdpPacket> for OutboundDatagramImpl {
 
         let Self {
             ref mut inner,
+            local_is_ipv6,
             ref mut pkt,
             ref resolver,
             ref mut ip_to_logical,
@@ -115,7 +133,7 @@ impl Sink<UdpPacket> for OutboundDatagramImpl {
                     // Already resolved on a prior poll; skip DNS entirely.
                     addr
                 } else {
-                    let is_ipv6 = inner.local_addr()?.is_ipv6();
+                    let is_ipv6 = local_is_ipv6;
                     let handle = pending_dns.get_or_insert_with(|| {
                         let resolver = resolver.clone();
                         let domain = domain.clone();
@@ -168,7 +186,7 @@ impl Sink<UdpPacket> for OutboundDatagramImpl {
         // destinations to be expressed as IPv4-mapped IPv6 addresses
         // (::ffff:x.x.x.x). Tokio's poll_send_to does not do this automatically
         // and will return EINVAL otherwise.
-        let send_dst = match (inner.local_addr()?.is_ipv6(), dst) {
+        let send_dst = match (local_is_ipv6, dst) {
             (true, SocketAddr::V4(v4)) => {
                 SocketAddr::V6(std::net::SocketAddrV6::new(
                     v4.ip().to_ipv6_mapped(),
@@ -180,11 +198,13 @@ impl Sink<UdpPacket> for OutboundDatagramImpl {
             _ => dst,
         };
 
-        let n = ready!(inner.poll_send_to(cx, p.data.as_slice(), send_dst))?;
+        let n = ready!(inner.poll_send_to(cx, p.data.as_ref(), send_dst))?;
 
         let now = Instant::now();
-        ip_to_logical
-            .retain(|_, (_, ts)| now.duration_since(*ts) < UDP_DOMAIN_MAP_TTL);
+        if ip_to_logical.len() > UDP_DOMAIN_MAP_SWEEP_THRESHOLD {
+            ip_to_logical
+                .retain(|_, (_, ts)| now.duration_since(*ts) < UDP_DOMAIN_MAP_TTL);
+        }
         ip_to_logical.insert(dst, (p.dst_addr.clone(), now));
         // Save length before clearing pkt (NLL ends p's borrow after this).
         let data_len = p.data.len();
@@ -221,39 +241,62 @@ impl Stream for OutboundDatagramImpl {
             ref mut inner,
             ref mut recv_buf,
             ref ip_to_logical,
+            ref mut consecutive_recv_errors,
             ..
         } = *self;
-        let mut buf = ReadBuf::new(recv_buf.as_mut_slice());
-        match ready!(inner.poll_recv_from(cx, &mut buf)) {
-            Ok(src) => {
-                let data = buf.filled().to_vec();
-                // On dual-stack (AF_INET6) sockets the OS returns IPv4
-                // sender addresses in IPv4-mapped form (::ffff:x.x.x.x).
-                // Canonicalize back to plain IPv4 so that ip_to_logical
-                // lookups succeed and the returned src_addr matches what the
-                // caller (e.g. a DNS client) expects.
-                let src = match src {
-                    SocketAddr::V6(v6) => {
-                        if let Some(v4) = v6.ip().to_ipv4_mapped() {
-                            SocketAddr::from((v4, v6.port()))
-                        } else {
-                            src
+
+        loop {
+            let mut buf = ReadBuf::new(recv_buf.as_mut_slice());
+            match ready!(inner.poll_recv_from(cx, &mut buf)) {
+                Ok(src) => {
+                    *consecutive_recv_errors = 0;
+                    let data = bytes::Bytes::copy_from_slice(buf.filled());
+                    // On dual-stack (AF_INET6) sockets the OS returns IPv4
+                    // sender addresses in IPv4-mapped form (::ffff:x.x.x.x).
+                    // Canonicalize back to plain IPv4 so that ip_to_logical
+                    // lookups succeed and the returned src_addr matches what the
+                    // caller (e.g. a DNS client) expects.
+                    let src = match src {
+                        SocketAddr::V6(v6) => {
+                            if let Some(v4) = v6.ip().to_ipv4_mapped() {
+                                SocketAddr::from((v4, v6.port()))
+                            } else {
+                                src
+                            }
                         }
+                        _ => src,
+                    };
+                    let src_addr = ip_to_logical
+                        .get(&src)
+                        .map(|(logical, _)| logical.clone())
+                        .unwrap_or_else(|| src.into());
+                    return Poll::Ready(Some(UdpPacket {
+                        data,
+                        src_addr,
+                        // Overwritten by the dispatcher with the originating
+                        // client address on the reply path.
+                        dst_addr: SocksAddr::any_ipv4(),
+                        ..Default::default()
+                    }));
+                }
+                // A UDP socket reports plenty of transient failures — an inbound
+                // ICMP port-unreachable for an earlier packet surfaces here as
+                // ECONNREFUSED. Ending the stream on the first one tore down the
+                // whole association, and this is the DIRECT path.
+                Err(e) => {
+                    *consecutive_recv_errors += 1;
+                    if *consecutive_recv_errors >= MAX_CONSECUTIVE_RECV_ERRORS {
+                        tracing::warn!(
+                            "direct udp recv failed {} times in a row, ending \
+                         association: {}",
+                            consecutive_recv_errors,
+                            e
+                        );
+                        return Poll::Ready(None);
                     }
-                    _ => src,
-                };
-                let src_addr = ip_to_logical
-                    .get(&src)
-                    .map(|(logical, _)| logical.clone())
-                    .unwrap_or_else(|| src.into());
-                Poll::Ready(Some(UdpPacket {
-                    data,
-                    src_addr,
-                    dst_addr: SocksAddr::any_ipv4(),
-                    ..Default::default()
-                }))
+                    tracing::debug!("direct udp recv error (continuing): {}", e);
+                }
             }
-            Err(_) => Poll::Ready(None),
         }
     }
 }
@@ -301,7 +344,7 @@ mod tests {
         let dst = SocksAddr::Domain("echo.test".to_owned(), echo_port);
         datagram
             .send(UdpPacket {
-                data: b"hello".to_vec(),
+                data: bytes::Bytes::from_static(b"hello"),
                 dst_addr: dst.clone(),
                 ..Default::default()
             })
@@ -314,7 +357,7 @@ mod tests {
             .expect("stream ended");
 
         assert_eq!(pkt.src_addr, dst, "src_addr must be restored to the domain");
-        assert_eq!(pkt.data, b"hello");
+        assert_eq!(pkt.data.as_ref(), b"hello");
     }
 
     /// A single outbound socket sends to **two** different domain destinations
@@ -331,7 +374,7 @@ mod tests {
         // One socket, two destinations — 1→N.
         datagram
             .send(UdpPacket {
-                data: b"to-a".to_vec(),
+                data: bytes::Bytes::from_static(b"to-a"),
                 dst_addr: dst_a.clone(),
                 ..Default::default()
             })
@@ -339,7 +382,7 @@ mod tests {
             .unwrap();
         datagram
             .send(UdpPacket {
-                data: b"to-b".to_vec(),
+                data: bytes::Bytes::from_static(b"to-b"),
                 dst_addr: dst_b.clone(),
                 ..Default::default()
             })
@@ -389,7 +432,7 @@ mod tests {
         // First send: DNS fails — must return Err, not panic.
         let result = datagram
             .send(UdpPacket {
-                data: b"hello".to_vec(),
+                data: bytes::Bytes::from_static(b"hello"),
                 dst_addr: dst.clone(),
                 ..Default::default()
             })
@@ -399,7 +442,7 @@ mod tests {
         // Second send (same destination): DNS succeeds — must NOT panic.
         datagram
             .send(UdpPacket {
-                data: b"hello again".to_vec(),
+                data: bytes::Bytes::from_static(b"hello again"),
                 dst_addr: dst.clone(),
                 ..Default::default()
             })
@@ -426,7 +469,7 @@ mod tests {
         let dst = SocksAddr::Domain("echo.test".to_owned(), echo_port);
         datagram
             .send(UdpPacket {
-                data: b"establish".to_vec(),
+                data: bytes::Bytes::from_static(b"establish"),
                 dst_addr: dst.clone(),
                 ..Default::default()
             })
@@ -456,7 +499,7 @@ mod tests {
             .expect("stream ended");
 
         // Full-cone: the packet is delivered (not dropped).
-        assert_eq!(pkt.data, b"unsolicited");
+        assert_eq!(pkt.data.as_ref(), b"unsolicited");
         // src_addr is the raw IP because the sender is not in ip_to_logical.
         assert_eq!(pkt.src_addr, SocksAddr::Ip(third_party_addr));
     }

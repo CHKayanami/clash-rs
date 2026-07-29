@@ -3,5 +3,6 @@ mod mrs;
 mod provider;
 
 pub use provider::{
-    RuleProviderImpl, RuleSetBehavior, RuleSetFormat, ThreadSafeRuleProvider,
+    RuleProviderImpl, RuleSetBehavior, RuleSetChangeCallback, RuleSetFormat,
+    ThreadSafeRuleProvider,
 };

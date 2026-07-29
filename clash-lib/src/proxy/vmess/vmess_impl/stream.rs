@@ -55,6 +55,8 @@ pub struct VmessStream<S> {
     write_buf: BytesMut,
 }
 
+impl<S: crate::proxy::ProxyStream> crate::proxy::ProxyStream for VmessStream<S> {}
+
 impl<S> Debug for VmessStream<S> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("VmessStream")
@@ -573,9 +575,4 @@ fn hash_timestamp(timestamp: u64) -> [u8; 16] {
     hasher.update(timestamp.to_be_bytes());
     hasher.update(timestamp.to_be_bytes());
     hasher.finalize().into()
-}
-
-impl<S> crate::proxy::ProxyStream for VmessStream<S> where
-    S: AsyncRead + AsyncWrite + Unpin + Send
-{
 }

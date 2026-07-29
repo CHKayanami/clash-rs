@@ -1,5 +1,5 @@
 use crate::{
-    app::router::rules::RuleMatcher,
+    app::router::rules::{RuleMatcher, ends_with_ignore_ascii_case},
     session::{Session, SocksAddr},
 };
 
@@ -20,8 +20,15 @@ impl RuleMatcher for DomainSuffix {
         match &sess.destination {
             SocksAddr::Ip(_) => false,
             SocksAddr::Domain(domain, _) => {
-                domain.ends_with((String::from(".") + self.suffix.as_str()).as_str())
-                    || domain == &self.suffix
+                if domain.eq_ignore_ascii_case(&self.suffix) {
+                    true
+                } else if domain.len() > self.suffix.len() {
+                    let index = domain.len() - self.suffix.len() - 1;
+                    domain.as_bytes()[index] == b'.'
+                        && ends_with_ignore_ascii_case(domain, &self.suffix)
+                } else {
+                    false
+                }
             }
         }
     }

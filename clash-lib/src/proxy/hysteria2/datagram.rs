@@ -11,8 +11,8 @@ use crate::{
 };
 
 use super::{
+    HysteriaConnection,
     codec::{Defragger, HysUdpPacket},
-    outbound::HysteriaConnection,
 };
 
 pub struct UdpSession {
@@ -48,7 +48,7 @@ impl HysteriaDatagramOutbound {
         let (send_tx, send_rx) = tokio::sync::mpsc::channel::<UdpPacket>(32);
         let (recv_tx, recv_rx) = tokio::sync::mpsc::channel::<UdpPacket>(32);
         let udp_sessions = conn.udp_sessions.clone();
-        udp_sessions.lock().await.insert(
+        udp_sessions.lock().insert(
             session_id,
             UdpSession {
                 incoming: recv_tx,
@@ -70,7 +70,8 @@ impl HysteriaDatagramOutbound {
             while let Some(next_send) = send_rx.recv().await {
                 let pkt_id =
                     next_pkt_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let pkt_id = (pkt_id % u16::MAX as u32) as u16;
+                // wrap over the full 16-bit range; `% u16::MAX` skipped 65535
+                let pkt_id = pkt_id as u16;
                 tracing::trace!(
                     "HysteriaDatagramOutbound: sending packet for session {}, \
                      pkt_id={}, dst={:?}",
@@ -79,7 +80,7 @@ impl HysteriaDatagramOutbound {
                     next_send.dst_addr
                 );
                 if let Err(e) = conn.send_packet(
-                    next_send.data.into(),
+                    next_send.data,
                     next_send.dst_addr,
                     session_id,
                     pkt_id,
@@ -95,7 +96,7 @@ impl HysteriaDatagramOutbound {
             tracing::info!(
                 "[udp] [dissociate] closing UDP session [{session_id:#06x}]"
             );
-            let entry = udp_sessions.lock().await.remove(&session_id);
+            let entry = udp_sessions.lock().remove(&session_id);
             debug_assert!(entry.is_some());
             anyhow::Ok(())
         });

@@ -162,7 +162,7 @@ impl Stream for OutboundDatagramVmess {
 
         match rv {
             Ok(()) => Poll::Ready(Some(UdpPacket {
-                data: buf.filled().to_vec(),
+                data: bytes::Bytes::copy_from_slice(buf.filled()),
                 src_addr: remote_addr.clone(),
                 dst_addr: SocksAddr::any_ipv4(),
                 inbound_user: None,

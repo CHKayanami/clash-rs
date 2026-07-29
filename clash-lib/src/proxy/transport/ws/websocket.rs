@@ -15,6 +15,8 @@ pub struct WebsocketConn {
     read_buffer: BytesMut,
 }
 
+impl crate::proxy::ProxyStream for WebsocketConn {}
+
 impl Debug for WebsocketConn {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("WebsocketConn")
@@ -121,5 +123,3 @@ impl AsyncWrite for WebsocketConn {
         pin.poll_close(cx).map_err(map_io_error)
     }
 }
-
-impl crate::proxy::ProxyStream for WebsocketConn {}

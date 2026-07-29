@@ -42,6 +42,18 @@ impl RuleMatcher for RuleSet {
         self.target.as_str()
     }
 
+    fn should_resolve_ip(&self) -> bool {
+        self.rule_provider.should_resolve_ip()
+    }
+
+    fn should_resolve_process(&self) -> bool {
+        self.rule_provider.should_resolve_process()
+    }
+
+    fn size(&self) -> u16 {
+        self.rule_provider.count().try_into().unwrap_or(u16::MAX)
+    }
+
     fn payload(&self) -> String {
         self.rule_set.clone()
     }

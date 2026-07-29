@@ -1,8 +1,9 @@
 use super::platform::must_bind_socket_on_interface;
-use crate::app::net::OutboundInterface;
+use crate::{app::net::OutboundInterface, proxy::AnyStream};
 
 use futures::io;
-use socket2::TcpKeepalive;
+use socket2::{TcpKeepalive,Socket,Domain,Protocol,Type};
+
 use std::{
     net::{Ipv4Addr, Ipv6Addr, SocketAddr},
     time::Duration,
@@ -11,6 +12,7 @@ use tokio::{
     net::{TcpListener, TcpSocket, TcpStream, UdpSocket},
     time::timeout,
 };
+use tokio_tfo::TfoStream;
 use tracing::{debug, error, instrument, trace};
 
 pub fn apply_tcp_options(s: &TcpStream) -> std::io::Result<()> {
@@ -39,38 +41,27 @@ pub fn apply_tcp_options(s: &TcpStream) -> std::io::Result<()> {
     s.set_nodelay(true)
 }
 
-#[instrument(skip(so_mark))]
-pub async fn new_tcp_stream(
+/// Create and configure a `TcpSocket` with interface binding, keepalive, and
+/// nodelay. The returned socket is ready to call `.connect()` on.
+pub fn prepare_tcp_socket(
     endpoint: SocketAddr,
     iface: Option<&OutboundInterface>,
     #[cfg(target_os = "linux")] so_mark: Option<u32>,
-) -> std::io::Result<TcpStream> {
-    let (socket, family) = match endpoint {
-        SocketAddr::V4(_) => (
-            socket2::Socket::new(
-                socket2::Domain::IPV4,
-                socket2::Type::STREAM,
-                None,
-            )?,
-            socket2::Domain::IPV4,
-        ),
-        SocketAddr::V6(_) => (
-            socket2::Socket::new(
-                socket2::Domain::IPV6,
-                socket2::Type::STREAM,
-                None,
-            )?,
-            socket2::Domain::IPV6,
-        ),
+) -> std::io::Result<TcpSocket> {
+    let (domain, protocol) = match endpoint {
+        SocketAddr::V4(_) => (Domain::IPV4, Protocol::TCP),
+        SocketAddr::V6(_) => (Domain::IPV6, Protocol::TCP),
     };
-    debug!("created tcp socket");
 
+    let socket = Socket::new(domain, Type::STREAM, Some(protocol))?;
+    debug!("created tcp socket for {}", endpoint);
+
+    // 接口绑定与策略路由
     if !cfg!(target_os = "android")
         && let Some(iface) = iface
         && !endpoint.ip().is_loopback()
     {
-        must_bind_socket_on_interface(&socket, iface, family)?;
-        trace!("tcp socket bound to interface: {socket:?}");
+        must_bind_socket_on_interface(&socket, iface, domain)?;
     }
 
     #[cfg(not(target_os = "android"))]
@@ -79,15 +70,50 @@ pub async fn new_tcp_stream(
         socket.set_mark(so_mark)?;
     }
 
-    socket.set_keepalive(true)?;
+    // 高性能保活参数
+    let keepalive = TcpKeepalive::new()
+        .with_time(Duration::from_secs(30))
+        .with_interval(Duration::from_secs(5))
+        .with_retries(3);
+
+    socket.set_tcp_keepalive(&keepalive)?;
     socket.set_tcp_nodelay(true)?;
     socket.set_nonblocking(true)?;
 
-    timeout(
-        Duration::from_secs(10),
-        TcpSocket::from_std_stream(socket.into()).connect(endpoint),
-    )
-    .await?
+    Ok(TcpSocket::from_std_stream(socket.into()))
+}
+
+#[instrument(skip(so_mark))]
+pub async fn new_tcp_stream(
+    endpoint: SocketAddr,
+    iface: Option<&OutboundInterface>,
+    tfo: bool,
+    #[cfg(target_os = "linux")] so_mark: Option<u32>,
+) -> std::io::Result<AnyStream> {
+    let tokio_socket = prepare_tcp_socket(
+        endpoint,
+        iface,
+        #[cfg(target_os = "linux")]
+        so_mark,
+    )?;
+
+    if tfo {
+        trace!("[TCP Outbound] Initiating TCP Fast Open (TFO) to {}", endpoint);
+
+        match timeout(Duration::from_secs(10), TfoStream::connect_with_socket(tokio_socket, endpoint)).await {
+            Ok(Ok(tfo_stream)) => Ok(Box::new(tfo_stream)),
+            Ok(Err(e)) => Err(e),
+            Err(_) => Err(io::Error::new(io::ErrorKind::TimedOut, "TFO connection timed out")),
+        }
+    } else {
+        trace!("[TCP Outbound] Initiating standard TCP connection to {}", endpoint);
+
+        match timeout(Duration::from_secs(10), tokio_socket.connect(endpoint)).await {
+            Ok(Ok(tcp_stream)) => Ok(Box::new(tcp_stream)),
+            Ok(Err(e)) => Err(e),
+            Err(_) => Err(io::Error::new(io::ErrorKind::TimedOut, "standard tcp connection timed out")),
+        }
+    }
 }
 
 #[instrument(skip(so_mark))]

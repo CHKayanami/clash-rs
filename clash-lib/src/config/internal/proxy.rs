@@ -1,4 +1,4 @@
-use crate::{Error, common::utils::default_bool_true, config::utils};
+use crate::{Error, common::utils::{default_bool_true}, config::utils};
 use serde::{Deserialize, de::value::MapDeserializer};
 use serde_yaml::Value;
 #[cfg(feature = "shadowquic")]
@@ -170,6 +170,8 @@ pub struct CommonConfigOptions {
     pub name: String,
     pub server: String,
     pub port: u16,
+    #[serde(default)]
+    pub tfo: bool,
     /// this can be a proxy name or a group name
     /// can't be a name in a proxy provider
     /// only applies to raw proxy, i.e. applying this to a proxy group does
@@ -261,12 +263,11 @@ pub struct OutboundAnytls {
     /// Parsed for config compatibility; currently not applied by the runtime.
     pub client_fingerprint: Option<String>,
     pub udp: Option<bool>,
-    /// Parsed for config compatibility; currently not applied by the runtime.
     pub idle_session_check_interval: Option<u64>,
-    /// Parsed for config compatibility; currently not applied by the runtime.
     pub idle_session_timeout: Option<u64>,
-    /// Parsed for config compatibility; currently not applied by the runtime.
     pub min_idle_session: Option<u64>,
+    pub max_connections: Option<usize>,
+    pub max_streams: Option<usize>,
     /// File path or inline PEM client certificate for mTLS.
     /// Must be set together with `tls-key`.
     pub tls_cert: Option<String>,

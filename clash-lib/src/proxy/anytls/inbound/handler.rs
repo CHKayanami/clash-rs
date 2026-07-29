@@ -101,7 +101,7 @@ async fn do_handshake(
         return None;
     }
 
-    let inbound_user = match user_map.get(&hash_buf) {
+    let inbound_user = match super::user::lookup_user(&user_map, &hash_buf) {
         Some(name) => {
             if name.is_empty() {
                 None
@@ -144,7 +144,21 @@ async fn do_handshake(
     let mut stream_id: Option<u32> = None;
     let destination: SocksAddr;
 
+    /// Frames an authenticated client may send before SYN + PSH. SETTINGS and
+    /// WASTE are legitimately skipped, but nothing else bounded the loop — only
+    /// the outer handshake timeout.
+    const MAX_HANDSHAKE_FRAMES: usize = 64;
+    let mut frames_seen = 0usize;
+
     'handshake: loop {
+        frames_seen += 1;
+        if frames_seen > MAX_HANDSHAKE_FRAMES {
+            warn!(
+                "anytls inbound: {src_addr} sent {MAX_HANDSHAKE_FRAMES} frames                  without completing the handshake"
+            );
+            return None;
+        }
+
         let (cmd, sid, data) = match read_frame(&mut tls_stream).await {
             Ok(f) => f,
             Err(e) => {
@@ -413,7 +427,14 @@ async fn handle_udp_session(
         ..Default::default()
     };
 
-    let _ = dispatcher.dispatch_datagram(sess, Box::new(datagram)).await;
+    let closer = dispatcher.dispatch_datagram(sess, Box::new(datagram)).await;
+
+    // Hold the close handle for the life of the UoT session. Dropping it
+    // immediately (`let _ = ...`) left the dispatcher's relay tasks with no way
+    // to be torn down, so they lingered until the UDP idle sweep noticed. Tasks
+    // A and B above cancel this token when the anytls stream dies.
+    cancel_c.cancelled().await;
+    let _ = closer.send(0);
 }
 
 /// Handle a plain TCP relay session (the common case).
@@ -799,7 +820,9 @@ mod tests {
         if tls.read_exact(&mut hash_buf).await.is_err() {
             return;
         }
-        if user_map.contains_key(&hash_buf) {
+        if crate::proxy::anytls::inbound::user::lookup_user(&user_map, &hash_buf)
+            .is_some()
+        {
             return; // authenticated — not testing this path
         }
         if let Some(addr) = fallback {

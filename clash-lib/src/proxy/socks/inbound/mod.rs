@@ -5,8 +5,8 @@ use crate::{
     Dispatcher,
     common::auth::ThreadSafeAuthenticator,
     proxy::{
-        inbound::InboundHandlerTrait,
-        utils::{ToCanonical, apply_tcp_options, try_create_dualstack_tcplistener},
+        inbound::{InboundHandlerTrait, accept_tcp},
+        utils::try_create_dualstack_tcplistener,
     },
     session::{Network, Session, Type},
 };
@@ -14,7 +14,7 @@ use crate::{
 use async_trait::async_trait;
 use std::{net::SocketAddr, sync::Arc};
 pub use stream::handle_tcp;
-use tracing::warn;
+use tracing::{debug, warn};
 
 use crate::common::errors::new_io_error;
 pub use datagram::Socks5UDPCodec;
@@ -29,7 +29,7 @@ pub struct SocksInbound {
 
 impl Drop for SocksInbound {
     fn drop(&mut self) {
-        warn!("SOCKS5 inbound listener on {} stopped", self.addr);
+        debug!("SOCKS5 inbound listener on {} stopped", self.addr);
     }
 }
 
@@ -65,20 +65,23 @@ impl InboundHandlerTrait for SocksInbound {
         let listener = try_create_dualstack_tcplistener(self.addr)?;
 
         loop {
-            let (socket, _) = listener.accept().await?;
-            let src_addr = socket.peer_addr()?.to_canonical();
-            if !self.allow_lan
-                && src_addr.ip() != socket.local_addr()?.ip().to_canonical()
-            {
-                warn!("Connection from {} is not allowed", src_addr);
+            let (socket, peer_addr) = match listener.accept().await {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!("socks inbound accept error: {e}");
+                    continue;
+                }
+            };
+            let Some(src_addr) =
+                accept_tcp(&socket, peer_addr, self.allow_lan, "socks inbound")
+            else {
                 continue;
-            }
-            apply_tcp_options(&socket)?;
+            };
 
             let mut sess = Session {
                 network: Network::Tcp,
                 typ: Type::Socks5,
-                source: socket.peer_addr()?.to_canonical(),
+                source: src_addr,
                 so_mark: self.fw_mark,
 
                 ..Default::default()

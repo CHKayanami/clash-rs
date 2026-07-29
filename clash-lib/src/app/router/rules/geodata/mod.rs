@@ -45,6 +45,8 @@ pub struct GeoSiteMatcher {
     pub country_code: String,
     pub target: String,
     pub matcher: Box<dyn DomainGroupMatcher>,
+    /// number of domain entries backing `matcher`, for the `/rules` API
+    count: usize,
 }
 
 impl GeoSiteMatcher {
@@ -72,12 +74,14 @@ impl GeoSiteMatcher {
             .filter(|domain| attr_matcher.matches(domain))
             .collect::<Vec<_>>();
 
+        let count = domains.len();
         let matcher_group: Box<dyn DomainGroupMatcher> =
             Box::new(SuccinctMatcherGroup::try_new(domains, not)?);
         Ok(Self {
             country_code,
             target,
             matcher: matcher_group,
+            count,
         })
     }
 }
@@ -93,13 +97,23 @@ impl RuleMatcher for GeoSiteMatcher {
         match &sess.destination {
             crate::session::SocksAddr::Ip(_) => false,
             crate::session::SocksAddr::Domain(domain, _) => {
-                self.matcher.apply(domain.as_str())
+                // geosite entries are lowercase and the backing trie compares
+                // byte-wise, so normalize the (client-supplied) host first
+                if domain.bytes().any(|b| b.is_ascii_uppercase()) {
+                    self.matcher.apply(&domain.to_ascii_lowercase())
+                } else {
+                    self.matcher.apply(domain.as_str())
+                }
             }
         }
     }
 
     fn target(&self) -> &str {
         self.target.as_str()
+    }
+
+    fn size(&self) -> u16 {
+        self.count.try_into().unwrap_or(u16::MAX)
     }
 
     fn payload(&self) -> String {

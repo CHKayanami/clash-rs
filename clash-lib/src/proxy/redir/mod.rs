@@ -56,20 +56,41 @@ impl InboundHandlerTrait for RedirInbound {
         let listener = try_create_dualstack_tcplistener(self.addr)?;
 
         loop {
-            let (socket, _) = listener.accept().await?;
-            let src_addr = socket.peer_addr()?.to_canonical();
+            let (socket, peer_addr) = match listener.accept().await {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!("redir inbound accept error: {e}");
+                    continue;
+                }
+            };
+            let src_addr = peer_addr.to_canonical();
 
-            if !self.allow_lan
-                && src_addr.ip() != socket.local_addr()?.ip().to_canonical()
-            {
+            let local_ip = match socket.local_addr() {
+                Ok(addr) => addr.ip().to_canonical(),
+                Err(e) => {
+                    warn!("redir failed to get local address for {src_addr}: {e}");
+                    continue;
+                }
+            };
+
+            if !self.allow_lan && src_addr.ip() != local_ip {
                 warn!("Connection from {} is not allowed", src_addr);
                 continue;
             }
 
-            apply_tcp_options(&socket)?;
+            if let Err(e) = apply_tcp_options(&socket) {
+                warn!("redir failed to apply tcp options for {src_addr}: {e}");
+                continue;
+            }
 
             // get redirect traffic original destination
-            let orig_dst = get_original_destination_addr(&socket)?.to_canonical();
+            let orig_dst = match get_original_destination_addr(&socket) {
+                Ok(addr) => addr.to_canonical(),
+                Err(e) => {
+                    warn!("redir failed to get original destination for {src_addr}: {e}");
+                    continue;
+                }
+            };
 
             let sess = Session {
                 network: Network::Tcp,

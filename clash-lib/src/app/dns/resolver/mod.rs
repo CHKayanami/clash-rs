@@ -27,11 +27,12 @@ pub async fn new(
     mmdb: Option<PendingMmdb>,
     outbounds: OutboundHandlerRegistry,
     rule_dispatch: Option<Arc<RuleDispatch>>,
+    collector: Option<super::ThreadSafeDnsCollector>,
 ) -> ThreadSafeDNSResolver {
     if cfg.enable {
         match store {
             Some(store) => Arc::new(
-                EnhancedResolver::new(cfg, store, mmdb, outbounds, rule_dispatch)
+                EnhancedResolver::new(cfg, store, mmdb, outbounds, rule_dispatch, collector)
                     .await,
             ),
             _ => print_and_exit!("enhanced resolver requires cache store"),

@@ -38,6 +38,41 @@ impl RuleExpression {
             RuleExpression::Not(expr) => !expr.evaluate(sess),
         }
     }
+
+    /// True if any leaf in the tree needs the destination resolved to an IP.
+    /// Without this a composite wrapping GEOIP/IP-CIDR never matches a domain
+    /// destination, because the router only resolves for rules that ask.
+    fn should_resolve_ip(&self) -> bool {
+        match self {
+            RuleExpression::Rule(matcher) => matcher.should_resolve_ip(),
+            RuleExpression::And(exprs) | RuleExpression::Or(exprs) => {
+                exprs.iter().any(|e| e.should_resolve_ip())
+            }
+            RuleExpression::Not(expr) => expr.should_resolve_ip(),
+        }
+    }
+
+    /// True if any leaf in the tree needs the owning process resolved.
+    fn should_resolve_process(&self) -> bool {
+        match self {
+            RuleExpression::Rule(matcher) => matcher.should_resolve_process(),
+            RuleExpression::And(exprs) | RuleExpression::Or(exprs) => {
+                exprs.iter().any(|e| e.should_resolve_process())
+            }
+            RuleExpression::Not(expr) => expr.should_resolve_process(),
+        }
+    }
+
+    /// Number of leaf rules in the tree.
+    fn leaf_count(&self) -> usize {
+        match self {
+            RuleExpression::Rule(_) => 1,
+            RuleExpression::And(exprs) | RuleExpression::Or(exprs) => {
+                exprs.iter().map(|e| e.leaf_count()).sum()
+            }
+            RuleExpression::Not(expr) => expr.leaf_count(),
+        }
+    }
 }
 
 pub struct CompositeRule {
@@ -250,10 +285,41 @@ impl CompositeRule {
             );
         }
 
-        // It's a leaf rule - parse as RuleType
-        let rule = RuleType::new(rule_type, rest, "", None)?;
+        // It's a leaf rule - parse as RuleType.
+        //
+        // `rest` may carry trailing parameters, e.g. (IP-CIDR,10.0.0.0/8,no-resolve).
+        // Only split those off, so payloads that legitimately contain commas
+        // (DOMAIN-REGEX, most obviously) survive intact.
+        let (payload, params) = split_trailing_params(rest);
+        let rule = RuleType::new(rule_type, payload, "", params)?;
         let matcher = map_rule_type(rule, mmdb, geodata, rule_provider_registry);
         Ok(RuleExpression::Rule(matcher))
+    }
+}
+
+/// Known trailing modifiers a leaf rule may carry after its payload.
+const RULE_PARAMS: &[&str] = &["no-resolve"];
+
+/// Peel recognised trailing `,param` tokens off the end of a rule body,
+/// returning the payload and the params (in source order).
+fn split_trailing_params(rest: &str) -> (&str, Option<Vec<&str>>) {
+    let mut payload = rest.trim();
+    let mut params = Vec::new();
+
+    while let Some(comma) = payload.rfind(',') {
+        let candidate = payload[comma + 1..].trim();
+        if !RULE_PARAMS.contains(&candidate) {
+            break;
+        }
+        params.push(candidate);
+        payload = payload[..comma].trim_end();
+    }
+
+    params.reverse();
+    if params.is_empty() {
+        (payload, None)
+    } else {
+        (payload, Some(params))
     }
 }
 
@@ -286,6 +352,18 @@ impl RuleMatcher for CompositeRule {
 
     fn target(&self) -> &str {
         &self.target
+    }
+
+    fn should_resolve_ip(&self) -> bool {
+        self.expression.should_resolve_ip()
+    }
+
+    fn should_resolve_process(&self) -> bool {
+        self.expression.should_resolve_process()
+    }
+
+    fn size(&self) -> u16 {
+        self.expression.leaf_count().try_into().unwrap_or(u16::MAX)
     }
 
     fn payload(&self) -> String {

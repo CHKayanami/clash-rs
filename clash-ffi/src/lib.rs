@@ -33,6 +33,7 @@ pub unsafe extern "C" fn clash_start(
             rt,
             log_file: Some(log_str),
             config_path: None,
+            dns_collect_file: None,
         };
 
         match start_scaffold(options) {

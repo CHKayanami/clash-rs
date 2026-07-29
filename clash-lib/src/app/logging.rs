@@ -19,7 +19,7 @@ use tracing_opentelemetry::OpenTelemetryLayer;
 #[cfg(target_os = "ios")]
 use tracing_oslog::OsLogger;
 use tracing_subscriber::{
-    EnvFilter, Layer, filter::filter_fn, fmt::time::LocalTime, prelude::*,
+    EnvFilter, Layer, filter::filter_fn, prelude::*,
 };
 
 impl From<LogLevel> for LevelFilter {
@@ -139,7 +139,7 @@ fn setup_logging_inner(
         } else {
             format!("{cwd}/{log_file}")
         };
-        let writer = std::fs::File::options().append(true).open(log_path)?;
+        let writer: std::fs::File = std::fs::File::options().create(true).append(true).open(log_path)?;
         let (non_blocking, guard) =
             tracing_appender::non_blocking::NonBlockingBuilder::default()
                 .buffered_lines_limit(16_000)
@@ -216,9 +216,15 @@ fn setup_logging_inner(
             && !metadata.target().contains("runtime")
     });
 
-    let timer = LocalTime::new(time::macros::format_description!(
-        "[year repr:last_two]-[month]-[day] [hour]:[minute]:[second]:[subsecond]"
-    ));
+    let format = time::macros::format_description!(
+        "[year repr:last_two]-[month]-[day] [hour]:[minute]:[second].[subsecond digits:3]"
+    );
+
+    // 💡 2. 手动创建东八区的 Offset（+8 小时）
+    let offset = time::UtcOffset::from_hms(8, 0, 0).unwrap();
+    // 💡 这样即使在没有任何时区配置的裸 OpenWrt 固件上运行也绝对不会 Panic
+    let timer = tracing_subscriber::fmt::time::OffsetTime::new(offset, format);
+  
 
     let log_to_file_layer = appender.map(|x| {
         tracing_subscriber::fmt::Layer::new()

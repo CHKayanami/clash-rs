@@ -6,15 +6,15 @@ use crate::{
     Dispatcher,
     common::{auth::ThreadSafeAuthenticator, errors::new_io_error},
     proxy::{
-        inbound::InboundHandlerTrait,
-        utils::{ToCanonical, apply_tcp_options, try_create_dualstack_tcplistener},
+        inbound::{InboundHandlerTrait, accept_tcp},
+        utils::try_create_dualstack_tcplistener,
     },
 };
 use async_trait::async_trait;
 use hyper_util::rt::TokioIo;
 pub use proxy::handle as handle_http;
 use std::{net::SocketAddr, sync::Arc};
-use tracing::warn;
+use tracing::{debug, warn};
 
 #[derive(Clone)]
 pub struct HttpInbound {
@@ -27,7 +27,7 @@ pub struct HttpInbound {
 
 impl Drop for HttpInbound {
     fn drop(&mut self) {
-        warn!("HTTP inbound listener on {} stopped", self.addr);
+        debug!("HTTP inbound listener on {} stopped", self.addr);
     }
 }
 
@@ -63,17 +63,18 @@ impl InboundHandlerTrait for HttpInbound {
         let listener = try_create_dualstack_tcplistener(self.addr)?;
 
         loop {
-            let (socket, _) = listener.accept().await?;
-            let src_addr = socket.peer_addr()?.to_canonical();
-
-            if !self.allow_lan
-                && src_addr.ip() != socket.local_addr()?.ip().to_canonical()
-            {
-                warn!("Connection from {} is not allowed", src_addr);
+            let (socket, peer_addr) = match listener.accept().await {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!("http inbound accept error: {e}");
+                    continue;
+                }
+            };
+            let Some(src_addr) =
+                accept_tcp(&socket, peer_addr, self.allow_lan, "http inbound")
+            else {
                 continue;
-            }
-
-            apply_tcp_options(&socket)?;
+            };
 
             let dispatcher = self.dispatcher.clone();
             let author = self.authenticator.clone();

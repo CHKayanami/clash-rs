@@ -212,7 +212,7 @@ impl Stream for OutboundDatagramAnytls {
                 unsafe { this.packet_buf.advance_mut(n) };
 
                 if this.packet_buf.len() == packet_len {
-                    let data = this.packet_buf.split_to(packet_len).to_vec();
+                    let data = this.packet_buf.split_to(packet_len).freeze();
                     this.packet_len = None;
                     return Poll::Ready(Some(UdpPacket {
                         data,

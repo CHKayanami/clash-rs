@@ -37,6 +37,25 @@ pub fn build_user_map(
     Arc::new(map)
 }
 
+/// Look up a user by password hash without leaking where the comparison failed.
+///
+/// The 32 bytes the client sends *are* the credential, and `HashMap::get`
+/// compares them with an early exit — a timing oracle on the secret. Every
+/// entry is compared, with no break on a hit, so the work done is independent
+/// of both whether and where a match occurred.
+pub fn lookup_user<'a>(
+    map: &'a HashMap<[u8; 32], String>,
+    hash: &[u8; 32],
+) -> Option<&'a String> {
+    let mut found = None;
+    for (candidate, name) in map.iter() {
+        if crate::common::auth::constant_time_eq(candidate, hash) {
+            found = Some(name);
+        }
+    }
+    found
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

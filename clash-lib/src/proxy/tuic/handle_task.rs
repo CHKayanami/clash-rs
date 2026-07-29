@@ -134,7 +134,7 @@ impl TuicConnection {
                     Address::SocketAddress(socket) => ClashSocksAddr::Ip(socket),
                 };
                 if let Err(err) = session
-                    .send(UdpPacket::new(data.into(), remote_addr, local_addr))
+                    .send(UdpPacket::new(data, remote_addr, local_addr))
                     .await
                 {
                     tracing::error!(

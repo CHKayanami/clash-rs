@@ -168,7 +168,7 @@ impl DeviceManager {
             msg.metadata.recursion_desired = true;
 
             let pkt = UdpPacket::new(
-                msg.to_vec().unwrap(),
+                msg.to_vec().unwrap().into(),
                 SocksAddr::any_ipv4(),
                 server.into(),
             );
@@ -455,7 +455,7 @@ impl DeviceManager {
                                 let socket = sockets.get_mut::<udp::Socket>(*handle);
                                 if socket.can_recv() {
                                     match socket.recv() {
-                                        Ok((data, md)) if !data.is_empty() => match sender.try_send(UdpPacket::new(data.into(), crate::session::SocksAddr::Ip(SocketAddr::new(md.endpoint.addr.into(), md.endpoint.port)), SocksAddr::any_ipv4())) {
+                                         Ok((data, md)) if !data.is_empty() => match sender.try_send(UdpPacket::new(bytes::Bytes::copy_from_slice(data), crate::session::SocksAddr::Ip(SocketAddr::new(md.endpoint.addr.into(), md.endpoint.port)), SocksAddr::any_ipv4())) {
                                             Ok(_) => {}
                                             Err(_) => {
                                                 trace!("socket {} closed from remote(?), aboring connection", handle);

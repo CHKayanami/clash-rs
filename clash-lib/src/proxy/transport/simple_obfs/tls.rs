@@ -75,6 +75,8 @@ pub struct TLSObfs {
     read_state: ReadState,
 }
 
+impl crate::proxy::ProxyStream for TLSObfs {}
+
 impl AsyncWrite for TLSObfs {
     fn poll_write(
         self: Pin<&mut Self>,
@@ -361,5 +363,3 @@ impl From<TLSObfs> for AnyStream {
         Box::new(obfs)
     }
 }
-
-impl crate::proxy::ProxyStream for TLSObfs {}

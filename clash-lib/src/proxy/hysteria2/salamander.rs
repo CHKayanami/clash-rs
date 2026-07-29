@@ -39,19 +39,28 @@ impl SalamanderObfs {
         });
     }
 
-    fn encrypt(&self, data: &mut [u8]) -> Bytes {
+    fn encrypt_contents(&self, data: &[u8]) -> Bytes {
         let salt: [u8; 8] = rand::random::<[u8; 8]>();
 
         let mut res = BytesMut::with_capacity(8 + data.len());
         res.put_slice(&salt);
-        self.obfs(&salt, data);
         res.put_slice(data);
+        self.obfs(&salt, &mut res[8..]);
 
         res.freeze()
     }
 
     fn decrypt(&self, data: &mut [u8]) {
-        assert!(data.len() > 8, "data len must > 8");
+        // Callers already screen out short datagrams; return rather than panic
+        // if one ever slips through, since this sits on the receive path.
+        if data.len() <= 8 {
+            debug_assert!(
+                false,
+                "salamander decrypt called with {} bytes",
+                data.len()
+            );
+            return;
+        }
 
         let (salt, data) = data.split_at_mut(8);
         self.obfs(salt, data);
@@ -91,8 +100,7 @@ impl AsyncUdpSocket for Salamander {
 
     fn try_send(&self, transmit: &Transmit) -> std::io::Result<()> {
         let mut v = transmit.to_owned();
-        // TODO: encrypt in place
-        let x = self.obfs.encrypt(&mut v.contents.to_vec());
+        let x = self.obfs.encrypt_contents(&v.contents);
         v.contents = &x;
         self.inner.try_send(&v)
     }
@@ -264,8 +272,8 @@ fn test_skip() {
 #[test]
 fn test_obfs() {
     let obfs = SalamanderObfs::new(b"obfs".to_vec());
-    let mut data = b"hhh".to_vec();
-    let x = obfs.encrypt(&mut data);
+    let data = b"hhh";
+    let x = obfs.encrypt_contents(data);
     let mut x = x.to_vec();
 
     let res = &mut IoSliceMut::new(&mut x);

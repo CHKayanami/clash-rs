@@ -10,8 +10,8 @@ use super::{new_tcp_stream, new_udp_socket};
 use crate::{
     app::{
         dispatcher::{
-            InstrumentedDatagram, InstrumentedDatagramWrapper, InstrumentedStream,
-            InstrumentedStreamWrapper,
+            ChainedDatagram, ChainedDatagramWrapper, ChainedStream,
+            ChainedStreamWrapper,
         },
         dns::ThreadSafeDNSResolver,
         net::OutboundInterface,
@@ -32,6 +32,7 @@ pub trait RemoteConnector: Send + Sync + Debug {
         resolver: ThreadSafeDNSResolver,
         address: &str,
         port: u16,
+        tfo: bool,
         iface: Option<&OutboundInterface>,
         #[cfg(target_os = "linux")] packet_mark: Option<u32>,
     ) -> std::io::Result<AnyStream>;
@@ -69,6 +70,7 @@ impl RemoteConnector for DirectConnector {
         resolver: ThreadSafeDNSResolver,
         address: &str,
         port: u16,
+        tfo: bool,
         iface: Option<&OutboundInterface>,
         #[cfg(target_os = "linux")] so_mark: Option<u32>,
     ) -> std::io::Result<AnyStream> {
@@ -81,6 +83,7 @@ impl RemoteConnector for DirectConnector {
         new_tcp_stream(
             (dial_addr, port).into(),
             iface,
+            tfo,
             #[cfg(target_os = "linux")]
             so_mark,
         )
@@ -108,7 +111,7 @@ impl RemoteConnector for DirectConnector {
         .await
         .map(|x| OutboundDatagramImpl::new(x, resolver))?;
 
-        let dgram = InstrumentedDatagramWrapper::new(dgram);
+        let dgram = ChainedDatagramWrapper::new(dgram);
         Ok(Box::new(dgram))
     }
 }
@@ -143,6 +146,7 @@ impl RemoteConnector for ProxyConnector {
         resolver: ThreadSafeDNSResolver,
         address: &str,
         port: u16,
+        _tfo: bool,
         iface: Option<&OutboundInterface>,
         #[cfg(target_os = "linux")] so_mark: Option<u32>,
     ) -> std::io::Result<AnyStream> {
@@ -168,7 +172,7 @@ impl RemoteConnector for ProxyConnector {
             .connect_stream_with_connector(&sess, resolver, self.connector.as_ref())
             .await?;
 
-        let stream = InstrumentedStreamWrapper::new(s);
+        let stream = ChainedStreamWrapper::new(s);
         stream.append_to_chain(self.proxy.name()).await;
         Ok(Box::new(stream))
     }
@@ -199,7 +203,7 @@ impl RemoteConnector for ProxyConnector {
             )
             .await?;
 
-        let stream = InstrumentedDatagramWrapper::new(s);
+        let stream = ChainedDatagramWrapper::new(s);
         stream.append_to_chain(self.proxy.name()).await;
         Ok(Box::new(stream))
     }

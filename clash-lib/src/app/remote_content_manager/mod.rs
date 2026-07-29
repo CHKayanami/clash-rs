@@ -13,20 +13,20 @@ use crate::{
 use anyhow::Context;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
+use dashmap::DashMap;
 use futures::{FutureExt, StreamExt, stream::FuturesOrdered};
 use http_body_util::Empty;
 use hyper::Request;
 use hyper_util::rt::TokioIo;
 use serde::Serialize;
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::VecDeque,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
     time::Duration,
 };
-use tokio::sync::RwLock;
 use tracing::{debug, instrument, trace, warn};
 
 pub mod healthcheck;
@@ -89,16 +89,24 @@ pub struct DelayHistory {
     delay: Duration,
 }
 
-#[derive(Default)]
 struct ProxyState {
     alive: AtomicBool,
-    delay_history: VecDeque<DelayHistory>,
+    delay_history: parking_lot::RwLock<VecDeque<DelayHistory>>,
+}
+
+impl ProxyState {
+    fn new() -> Self {
+        Self {
+            alive: AtomicBool::new(true),
+            delay_history: parking_lot::RwLock::new(VecDeque::new()),
+        }
+    }
 }
 
 /// ProxyManager is the latency registry.
 #[derive(Clone)]
 pub struct ProxyManager {
-    proxy_state: Arc<RwLock<HashMap<String, ProxyState>>>,
+    proxy_state: Arc<DashMap<String, Arc<ProxyState>>>,
     dns_resolver: ThreadSafeDNSResolver,
     /// Firewall Mark for url test
     fw_mark: Option<u32>,
@@ -116,7 +124,7 @@ impl ProxyManager {
     pub fn new(dns_resolver: ThreadSafeDNSResolver, fw_mark: Option<u32>) -> Self {
         Self {
             dns_resolver,
-            proxy_state: Default::default(),
+            proxy_state: Arc::new(DashMap::new()),
             fw_mark,
         }
     }
@@ -160,8 +168,6 @@ impl ProxyManager {
 
     pub async fn alive(&self, name: &str) -> bool {
         self.proxy_state
-            .read()
-            .await
             .get(name)
             .map(|x| x.alive.load(Ordering::Relaxed))
             .unwrap_or(true) // if not found, assume it's alive
@@ -172,14 +178,11 @@ impl ProxyManager {
         name: &str,
     ) -> (bool, Option<Duration>) {
         self.proxy_state
-            .read()
-            .await
             .get(name)
             .map_or((true, None), |state| {
-                (
-                    state.alive.load(Ordering::Relaxed),
-                    state.delay_history.back().map(|history| history.delay),
-                )
+                let alive = state.alive.load(Ordering::Relaxed);
+                let delay = state.delay_history.read().back().map(|history| history.delay);
+                (alive, delay)
             })
     }
 
@@ -189,13 +192,17 @@ impl ProxyManager {
         alive: bool,
         history: Option<DelayHistory>,
     ) {
-        let mut state = self.proxy_state.write().await;
-        let entry = state.entry(name.to_owned()).or_default();
-        entry.alive.store(alive, Ordering::Relaxed);
+        let entry = self
+            .proxy_state
+            .entry(name.to_owned())
+            .or_insert_with(|| Arc::new(ProxyState::new()));
+        let state = entry.value();
+        state.alive.store(alive, Ordering::Relaxed);
         if let Some(ins) = history {
-            entry.delay_history.push_back(ins);
-            if entry.delay_history.len() > 10 {
-                entry.delay_history.pop_front();
+            let mut history_lock = state.delay_history.write();
+            history_lock.push_back(ins);
+            if history_lock.len() > 10 {
+                history_lock.pop_front();
             }
         }
     }
@@ -220,12 +227,9 @@ impl ProxyManager {
 
     pub async fn delay_history(&self, name: &str) -> Vec<DelayHistory> {
         self.proxy_state
-            .read()
-            .await
             .get(name)
-            .map(|x| x.delay_history.clone())
+            .map(|x| x.delay_history.read().clone().into())
             .unwrap_or_default()
-            .into()
     }
 
     pub async fn last_delay(&self, name: &str) -> Option<Duration> {
@@ -1038,11 +1042,11 @@ impl ProxyManager {
 mod tests {
     use crate::{
         app::{
-            dispatcher::InstrumentedStreamWrapper, dns::MockClashResolver,
+            dispatcher::ChainedStreamWrapper, dns::MockClashResolver,
             remote_content_manager,
         },
         config::internal::proxy::PROXY_DIRECT,
-        proxy::{direct, mocks::MockDummyOutboundHandler},
+        proxy::{ProxyStream, direct, mocks::MockDummyOutboundHandler},
         tests::initialize,
     };
     use futures::TryFutureExt;
@@ -1105,6 +1109,7 @@ mod tests {
         assert_eq!(manager.delay_history(PROXY_DIRECT).await.len(), 10);
     }
 
+    impl ProxyStream for tokio_test::io::Mock {}
     #[tokio::test]
     async fn test_proxy_manager_timeout() {
         initialize();
@@ -1122,7 +1127,7 @@ mod tests {
             .expect_name()
             .return_const(PROXY_DIRECT.to_owned());
         mock_handler.expect_connect_stream().returning(|_, _| {
-            Ok(Box::new(InstrumentedStreamWrapper::new(
+            Ok(Box::new(ChainedStreamWrapper::new(
                 tokio_test::io::Builder::new()
                     .wait(Duration::from_secs(10))
                     .build(),

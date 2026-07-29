@@ -50,6 +50,8 @@ pub struct ProxyTlsStream<S> {
     pub fake_request: bool,
 }
 
+impl<S: crate::proxy::ProxyStream> crate::proxy::ProxyStream for ProxyTlsStream<S> {}
+
 impl<S> ProxyTlsStream<S> {
     pub fn new(raw: S, password: &str) -> Self {
         Self {
@@ -256,6 +258,8 @@ pub struct VerifiedStream<S> {
     pub write_buf: BytesMut,
     pub write_state: WriteState,
 }
+
+impl<S: crate::proxy::ProxyStream> crate::proxy::ProxyStream for VerifiedStream<S> {}
 
 impl<S> VerifiedStream<S> {
     pub(crate) fn new(
@@ -464,9 +468,4 @@ fn verify_appdata(
         hmac.update(&hmac_real);
     }
     data[0..HMAC_SIZE] == hmac_real
-}
-
-impl<S> crate::proxy::ProxyStream for VerifiedStream<S> where
-    S: AsyncRead + AsyncWrite + Unpin + Send
-{
 }

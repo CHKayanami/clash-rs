@@ -4,6 +4,8 @@ use std::{
 };
 
 use crate::common::{mmdb::MmdbLookup, trie};
+use crate::app::remote_content_manager::providers::rule_provider::ThreadSafeRuleProvider;
+use crate::session::{Session, SocksAddr};
 
 pub trait FallbackIPFilter: Sync + Send {
     fn apply(&self, ip: &net::IpAddr) -> bool;
@@ -73,5 +75,60 @@ impl DomainFilter {
 impl FallbackDomainFilter for DomainFilter {
     fn apply(&self, domain: &str) -> bool {
         self.0.search(domain).is_some()
+    }
+}
+
+pub struct BlackDomainFilter {
+    domains: trie::StringTrie<Option<String>>,
+    ruleset_names: Vec<String>,
+    rule_providers: OnceLock<Vec<ThreadSafeRuleProvider>>,
+}
+
+impl BlackDomainFilter {
+    pub fn new(domains_or_rulesets: Vec<&str>) -> Self {
+        let mut domains = trie::StringTrie::new();
+        let mut ruleset_names = Vec::new();
+
+        for item in domains_or_rulesets {
+            if item.starts_with("rule-set:") {
+                ruleset_names.push(item.replace("rule-set:", ""));
+            } else {
+                domains.insert(item, Arc::new(None));
+            }
+        }
+
+        Self {
+            domains,
+            ruleset_names,
+            rule_providers: OnceLock::new(),
+        }
+    }
+
+    pub fn apply(&self, domain: &str) -> bool {
+        if self.domains.search(domain).is_some() {
+            return true;
+        }
+
+        if let Some(rps) = self.rule_providers.get() {
+            let sess = Session {
+                destination: SocksAddr::Domain(domain.to_owned(), 443),
+                ..Default::default()
+            };
+            return rps.iter().any(|rp| rp.search(&sess));
+        }
+
+        false
+    }
+
+    pub fn add_rule_set(&self, rp_map: &std::collections::HashMap<String, ThreadSafeRuleProvider>) {
+        if !self.ruleset_names.is_empty() {
+            let mut providers = Vec::new();
+            for name in &self.ruleset_names {
+                if let Some(rp) = rp_map.get(name) {
+                    providers.push(rp.clone());
+                }
+            }
+            let _ = self.rule_providers.set(providers);
+        }
     }
 }

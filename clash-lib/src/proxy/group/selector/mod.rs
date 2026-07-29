@@ -1,15 +1,13 @@
-use std::{
-    io,
-    sync::{Arc, atomic::AtomicU16},
-};
+use std::{io, sync::Arc};
 
 use async_trait::async_trait;
+use parking_lot::RwLock;
 use tracing::warn;
 
 use crate::{
     Error,
     app::{
-        dispatcher::{BoxedInstrumentedDatagram, BoxedInstrumentedStream},
+        dispatcher::{BoxedChainedDatagram, BoxedChainedStream},
         dns::ThreadSafeDNSResolver,
         remote_content_manager::providers::proxy_provider::ArcProxyProvider,
     },
@@ -42,7 +40,10 @@ pub struct HandlerOptions {
 pub struct Handler {
     opts: HandlerOptions,
     providers: Vec<ArcProxyProvider>,
-    current_selected_index: Arc<AtomicU16>,
+    /// The chosen proxy's *name*. Storing a position instead meant a provider
+    /// refresh that reordered or resized the member list silently moved the
+    /// user's selection to whatever proxy now sat at that index.
+    current_selected: Arc<RwLock<Option<String>>>,
 }
 
 impl std::fmt::Debug for Handler {
@@ -59,40 +60,39 @@ impl Handler {
         providers: Vec<ArcProxyProvider>,
         selected: Option<String>,
     ) -> Self {
-        let proxies = match providers.first() {
-            Some(provider) => provider.proxies().await,
-            None => Vec::new(),
-        };
+        // Resolve against every provider, the same set `selected_proxy` reads.
+        // Consulting only `providers.first()` restored the wrong proxy for a
+        // group backed by more than one provider.
+        let proxies = get_proxies_from_providers(&providers, false).await;
+        let current_selected = selected
+            .filter(|s| proxies.iter().any(|p| p.name() == s))
+            .or_else(|| proxies.first().map(|p| p.name().to_owned()));
 
         Self {
             opts,
             providers,
-            current_selected_index: AtomicU16::new(
-                selected
-                    .and_then(|s| proxies.iter().position(|p| p.name() == s))
-                    .unwrap_or(0) as u16,
-            )
-            .into(),
+            current_selected: Arc::new(RwLock::new(current_selected)),
         }
     }
 
     async fn selected_proxy(&self, touch: bool) -> Option<AnyOutboundHandler> {
         let proxies = get_proxies_from_providers(&self.providers, touch).await;
-        let current_fastest_index = self
-            .current_selected_index
-            .load(std::sync::atomic::Ordering::Relaxed);
-        for (idx, proxy) in proxies.iter().enumerate() {
-            if idx == current_fastest_index as usize {
+        let selected = self.current_selected.read().clone();
+
+        if let Some(name) = selected.as_deref() {
+            if let Some(proxy) = proxies.iter().find(|p| p.name() == name) {
                 return Some(proxy.clone());
             }
+            // The provider no longer offers it — say which one went missing
+            // rather than the `<unknown>` the old lookup could only ever print.
+            warn!(
+                "`{}` selected proxy `{}` not found, falling back to the first \
+                 member",
+                self.name(),
+                name
+            );
         }
-        let proxy_name = proxies
-            .get(current_fastest_index as usize)
-            .map(|p| p.name())
-            .unwrap_or("<unknown>");
-        warn!("selected proxy `{}` not found", proxy_name);
-        // in the case the selected proxy is not found(stale cache), return the
-        // first one
+
         proxies.first().cloned()
     }
 }
@@ -102,10 +102,7 @@ impl SelectorControl for Handler {
     async fn select(&self, name: &str) -> Result<(), Error> {
         let proxies = get_proxies_from_providers(&self.providers, false).await;
         if proxies.iter().any(|x| x.name() == name) {
-            self.current_selected_index.store(
-                proxies.iter().position(|p| p.name() == name).unwrap() as u16,
-                std::sync::atomic::Ordering::Relaxed,
-            );
+            *self.current_selected.write() = Some(name.to_owned());
             Ok(())
         } else {
             Err(Error::Operation(format!("proxy {name} not found")))
@@ -114,14 +111,8 @@ impl SelectorControl for Handler {
 
     #[cfg(test)]
     async fn current(&self) -> String {
-        let proxies = get_proxies_from_providers(&self.providers, false).await;
-
-        proxies
-            .get(
-                self.current_selected_index
-                    .load(std::sync::atomic::Ordering::Relaxed)
-                    as usize,
-            )
+        self.selected_proxy(false)
+            .await
             .map(|p| p.name().to_owned())
             .unwrap_or_else(|| "<none>".to_owned())
     }
@@ -153,7 +144,7 @@ impl OutboundHandler for Handler {
         &self,
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
-    ) -> io::Result<BoxedInstrumentedStream> {
+    ) -> io::Result<BoxedChainedStream> {
         let selected = self.selected_proxy(true).await.ok_or_else(|| {
             io::Error::other(format!("no proxy found for {}", self.name()))
         })?;
@@ -168,7 +159,7 @@ impl OutboundHandler for Handler {
         &self,
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
-    ) -> io::Result<BoxedInstrumentedDatagram> {
+    ) -> io::Result<BoxedChainedDatagram> {
         let selected = self.selected_proxy(true).await.ok_or_else(|| {
             io::Error::other(format!("no proxy found for {}", self.name()))
         })?;
@@ -188,7 +179,7 @@ impl OutboundHandler for Handler {
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
         connector: &dyn RemoteConnector,
-    ) -> io::Result<BoxedInstrumentedStream> {
+    ) -> io::Result<BoxedChainedStream> {
         let s = self
             .selected_proxy(true)
             .await
@@ -207,14 +198,18 @@ impl OutboundHandler for Handler {
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
         connector: &dyn RemoteConnector,
-    ) -> io::Result<BoxedInstrumentedDatagram> {
-        self.selected_proxy(true)
+    ) -> io::Result<BoxedChainedDatagram> {
+        let d = self
+            .selected_proxy(true)
             .await
             .ok_or_else(|| {
                 io::Error::other(format!("no proxy found for {}", self.name()))
             })?
             .connect_datagram_with_connector(sess, resolver, connector)
-            .await
+            .await?;
+
+        d.append_to_chain(self.name()).await;
+        Ok(d)
     }
 
     fn try_as_group_handler(&self) -> Option<&dyn GroupProxyAPIResponse> {

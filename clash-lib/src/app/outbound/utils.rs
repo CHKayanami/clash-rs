@@ -1,7 +1,4 @@
-use std::{
-    cell::RefCell,
-    collections::{HashMap, VecDeque},
-};
+use std::collections::{HashMap, VecDeque};
 
 use crate::{Error, config::internal::proxy::OutboundGroupProtocol};
 
@@ -9,163 +6,86 @@ use crate::{Error, config::internal::proxy::OutboundGroupProtocol};
 pub fn proxy_groups_dag_sort(
     groups: &mut [OutboundGroupProtocol],
 ) -> Result<(), Error> {
-    struct Node {
-        in_degree: i32,
-
-        // could be either group/proxy
-        proto: Option<OutboundGroupProtocol>,
-
-        outdegree: i32,
-
-        from: Vec<String>,
-    }
-
-    let mut graph: HashMap<String, RefCell<Node>> = HashMap::new();
-
-    for group in groups.iter() {
-        let group_name = group.name().to_owned();
-
-        let node = graph.get(&group_name);
-
-        if let Some(node) = node {
-            if node.borrow().proto.is_some() {
-                return Err(Error::InvalidConfig(format!(
-                    "duplicate proxy group name: {group_name}"
-                )));
-            } else {
-                node.borrow_mut().proto = Some(group.clone());
-            }
-        } else {
-            graph.insert(
-                group_name.clone(),
-                RefCell::new(Node {
-                    in_degree: 0,
-                    proto: Some(group.clone()),
-                    outdegree: 0,
-                    from: vec![],
-                }),
-            );
-        }
-
-        if let Some(proxies) = group.proxies() {
-            for proxy in proxies {
-                if let Some(node) = graph.get(proxy) {
-                    node.borrow_mut().in_degree += 1;
-                } else {
-                    graph.insert(
-                        proxy.clone(),
-                        RefCell::new(Node {
-                            in_degree: 1,
-                            proto: None,
-                            outdegree: 0,
-                            from: vec![],
-                        }),
-                    );
-                }
-            }
-        }
-    }
-
-    let mut index = 0;
-    let mut queue = VecDeque::new();
-
-    for (name, node) in graph.iter() {
-        if node.borrow_mut().in_degree == 0 {
-            queue.push_back(name.clone());
-        }
-    }
-
-    let group_len = groups.len();
-
-    while !queue.is_empty() {
-        let name = queue.pop_front().unwrap().to_owned();
-        let node = graph
-            .get(&name)
-            .unwrap_or_else(|| panic!("node {name} not found"));
-
-        if node.borrow().proto.is_some() {
-            index += 1;
-            groups[group_len - index] = node.borrow_mut().proto.take().unwrap();
-            if groups[group_len - index].proxies().is_none() {
-                graph.remove(&name);
-                continue;
-            }
-
-            for proxy in groups[group_len - index].proxies().unwrap() {
-                let node = graph.get(proxy.as_str()).unwrap();
-                node.borrow_mut().in_degree -= 1;
-                if node.borrow().in_degree == 0 {
-                    queue.push_back(proxy.clone());
-                }
-            }
-        }
-
-        graph.remove(&name);
-    }
-
-    if graph.is_empty() {
+    let n = groups.len();
+    if n <= 1 {
         return Ok(());
     }
 
-    for (name, node) in graph.iter() {
-        if node.borrow().proto.is_none() {
-            continue;
-        }
-
-        if node.borrow().proto.as_ref().unwrap().proxies().is_none() {
-            continue;
-        }
-
-        let proxies = node
-            .borrow()
-            .proto
-            .as_ref()
-            .unwrap()
-            .proxies()
-            .unwrap()
-            .clone();
-
-        for proxy in proxies.iter() {
-            node.borrow_mut().outdegree += 1;
-            graph
-                .get(proxy)
-                .unwrap()
-                .borrow_mut()
-                .from
-                .push(name.to_owned());
+    let mut name_to_idx = HashMap::with_capacity(n);
+    for (idx, group) in groups.iter().enumerate() {
+        let name = group.name();
+        if name_to_idx.insert(name, idx).is_some() {
+            return Err(Error::InvalidConfig(format!(
+                "duplicate proxy group name: {name}"
+            )));
         }
     }
 
-    let mut queue = vec![];
-    for (name, node) in graph.iter() {
-        if node.borrow_mut().outdegree == 0 {
-            queue.push(name.to_owned());
-        }
-    }
+    // adj[i] stores the indices of groups that depend on group i.
+    // j depends on i => i -> j
+    let mut adj = vec![Vec::new(); n];
+    let mut in_degree = vec![0; n];
 
-    while !queue.is_empty() {
-        let name = queue.first().unwrap().to_owned();
-        let node = graph.get(&name).unwrap();
-
-        let parents = node.borrow().from.clone();
-
-        for parent in parents {
-            graph.get(parent.as_str()).unwrap().borrow_mut().outdegree -= 1;
-            if graph.get(parent.as_str()).unwrap().borrow_mut().outdegree == 0 {
-                queue.push(parent);
+    for (j, group) in groups.iter().enumerate() {
+        if let Some(proxies) = group.proxies() {
+            for proxy in proxies {
+                if let Some(&i) = name_to_idx.get(proxy.as_str()) {
+                    adj[i].push(j);
+                    in_degree[j] += 1;
+                }
             }
         }
-
-        graph.remove(&name);
-
-        queue.remove(0);
     }
 
-    let looped_groups: Vec<String> = graph.keys().map(|s| s.to_owned()).collect();
+    let mut queue = VecDeque::new();
+    for i in 0..n {
+        if in_degree[i] == 0 {
+            queue.push_back(i);
+        }
+    }
 
-    Err(Error::InvalidConfig(format!(
-        "loop detected in proxy groups: {looped_groups:?}"
-    )))
+    let mut order = Vec::with_capacity(n);
+    while let Some(u) = queue.pop_front() {
+        order.push(u);
+        for &v in &adj[u] {
+            in_degree[v] -= 1;
+            if in_degree[v] == 0 {
+                queue.push_back(v);
+            }
+        }
+    }
+
+    if order.len() < n {
+        let mut looped_groups = Vec::new();
+        for i in 0..n {
+            if in_degree[i] > 0 {
+                looped_groups.push(groups[i].name().to_owned());
+            }
+        }
+        return Err(Error::InvalidConfig(format!(
+            "loop detected in proxy groups: {looped_groups:?}"
+        )));
+    }
+
+    // pos[i] represents the final sorted position where groups[i] should go.
+    // Since our dependency edges flow from child (dependency) to parent, Kahn's algorithm
+    // naturally outputs child groups first. Thus the natural order of Kahn's output is
+    // the correct target sequence.
+    let mut pos = vec![0; n];
+    for (k, &orig_idx) in order.iter().enumerate() {
+        pos[orig_idx] = k;
+    }
+
+    // Inplace permutation sorting cycle (O(N) swaps, O(1) extra space for elements, 0 clones)
+    for i in 0..n {
+        while pos[i] != i {
+            let next_idx = pos[i];
+            groups.swap(i, next_idx);
+            pos.swap(i, next_idx);
+        }
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]

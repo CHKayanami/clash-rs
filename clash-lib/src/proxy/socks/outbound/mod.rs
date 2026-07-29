@@ -4,9 +4,8 @@ use super::socks5::{client_handshake, socks_command};
 use crate::{
     app::{
         dispatcher::{
-            BoxedInstrumentedDatagram, BoxedInstrumentedStream,
-            InstrumentedDatagram, InstrumentedDatagramWrapper, InstrumentedStream,
-            InstrumentedStreamWrapper,
+            BoxedChainedDatagram, BoxedChainedStream, ChainedDatagram,
+            ChainedDatagramWrapper, ChainedStream, ChainedStreamWrapper,
         },
         dns::ThreadSafeDNSResolver,
     },
@@ -165,7 +164,7 @@ impl OutboundHandler for Handler {
         &self,
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
-    ) -> std::io::Result<BoxedInstrumentedStream> {
+    ) -> std::io::Result<BoxedChainedStream> {
         let dialer = self.connector.read().await;
 
         if let Some(dialer) = dialer.as_ref() {
@@ -177,7 +176,7 @@ impl OutboundHandler for Handler {
             resolver,
             dialer
                 .as_ref()
-                .unwrap_or(&GLOBAL_DIRECT_CONNECTOR.clone())
+                .unwrap_or(&*GLOBAL_DIRECT_CONNECTOR)
                 .as_ref(),
         )
         .await
@@ -189,7 +188,7 @@ impl OutboundHandler for Handler {
         &self,
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
-    ) -> std::io::Result<BoxedInstrumentedDatagram> {
+    ) -> std::io::Result<BoxedChainedDatagram> {
         let dialer = self.connector.read().await;
 
         if let Some(dialer) = dialer.as_ref() {
@@ -201,7 +200,7 @@ impl OutboundHandler for Handler {
             resolver,
             dialer
                 .as_ref()
-                .unwrap_or(&GLOBAL_DIRECT_CONNECTOR.clone())
+                .unwrap_or(&*GLOBAL_DIRECT_CONNECTOR)
                 .as_ref(),
         )
         .await
@@ -216,12 +215,13 @@ impl OutboundHandler for Handler {
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
         connector: &dyn RemoteConnector,
-    ) -> std::io::Result<BoxedInstrumentedStream> {
+    ) -> std::io::Result<BoxedChainedStream> {
         let s = connector
             .connect_stream(
                 resolver,
                 self.opts.server.as_str(),
                 self.opts.port,
+                self.opts.common_opts.tfo,
                 sess.iface.as_ref(),
                 #[cfg(target_os = "linux")]
                 sess.so_mark,
@@ -230,7 +230,7 @@ impl OutboundHandler for Handler {
 
         let s = self.inner_connect_stream(s, sess).await?;
 
-        let s = InstrumentedStreamWrapper::new(s);
+        let s = ChainedStreamWrapper::new(s);
         s.append_to_chain(self.name()).await;
         Ok(Box::new(s))
     }
@@ -240,12 +240,13 @@ impl OutboundHandler for Handler {
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
         connector: &dyn RemoteConnector,
-    ) -> std::io::Result<BoxedInstrumentedDatagram> {
+    ) -> std::io::Result<BoxedChainedDatagram> {
         let s = connector
             .connect_stream(
                 resolver.clone(),
                 self.opts.server.as_str(),
                 self.opts.port,
+                self.opts.common_opts.tfo,
                 sess.iface.as_ref(),
                 #[cfg(target_os = "linux")]
                 sess.so_mark,
@@ -254,7 +255,7 @@ impl OutboundHandler for Handler {
 
         let d = self.inner_connect_datagram(s, sess, resolver).await?;
 
-        let d = InstrumentedDatagramWrapper::new(d);
+        let d = ChainedDatagramWrapper::new(d);
         d.append_to_chain(self.name()).await;
         Ok(Box::new(d))
     }

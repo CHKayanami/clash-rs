@@ -37,6 +37,7 @@ async fn integration_test() {
             rt: None,
             log_file: None,
             config_path: None,
+            dns_collect_file: None,
         })
         .expect("Failed to start server");
     });
@@ -48,6 +49,7 @@ async fn integration_test() {
             rt: None,
             log_file: None,
             config_path: None,
+            dns_collect_file: None,
         })
         .expect("Failed to start client");
     });
@@ -144,6 +146,7 @@ async fn integration_test_anytls() {
             rt: None,
             log_file: None,
             config_path: None,
+            dns_collect_file: None,
         },
         vec![8902, 9092],
     )
@@ -156,6 +159,7 @@ async fn integration_test_anytls() {
             rt: None,
             log_file: None,
             config_path: None,
+            dns_collect_file: None,
         },
         vec![8998, 9095],
     )
@@ -231,6 +235,7 @@ async fn integration_test_anytls_udp() {
             rt: None,
             log_file: None,
             config_path: None,
+            dns_collect_file: None,
         },
         vec![8902, 9092],
     )
@@ -243,6 +248,7 @@ async fn integration_test_anytls_udp() {
             rt: None,
             log_file: None,
             config_path: None,
+            dns_collect_file: None,
         },
         vec![8998, 9095],
     )
@@ -328,6 +334,7 @@ fn start_direct_udp_clash() {
             rt: None,
             log_file: None,
             config_path: None,
+            dns_collect_file: None,
         })
         .expect("Failed to start direct-UDP clash instance");
     });

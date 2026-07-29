@@ -6,6 +6,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use crate::proxy::AnyStream;
 
 pub struct ShadowSocksStream(pub ProxyClientStream<AnyStream>);
+impl crate::proxy::ProxyStream for ShadowSocksStream {}
 impl Debug for ShadowSocksStream {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_tuple("ShadowSocksStream").finish()
@@ -45,5 +46,3 @@ impl AsyncWrite for ShadowSocksStream {
         Pin::new(&mut self.get_mut().0).poll_shutdown(cx)
     }
 }
-
-impl crate::proxy::ProxyStream for ShadowSocksStream {}

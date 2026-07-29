@@ -84,6 +84,8 @@ pub struct Http2Stream {
     buffer: BytesMut,
 }
 
+impl crate::proxy::ProxyStream for Http2Stream {}
+
 impl Debug for Http2Stream {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Http2Stream")
@@ -194,5 +196,3 @@ impl AsyncWrite for Http2Stream {
         ))
     }
 }
-
-impl crate::proxy::ProxyStream for Http2Stream {}

@@ -9,7 +9,7 @@ use tracing::debug;
 use self::helpers::{StrategyFn, strategy_consistent_hashring, strategy_rr};
 use crate::{
     app::{
-        dispatcher::{BoxedInstrumentedDatagram, BoxedInstrumentedStream},
+        dispatcher::{BoxedChainedDatagram, BoxedChainedStream},
         dns::ThreadSafeDNSResolver,
         remote_content_manager::{
             ProxyManager, providers::proxy_provider::ArcProxyProvider,
@@ -77,6 +77,27 @@ impl Handler {
     async fn get_proxies(&self, touch: bool) -> Vec<AnyOutboundHandler> {
         get_proxies_from_providers(&self.providers, touch).await
     }
+
+    /// Run the configured strategy over the group's current members.
+    ///
+    /// The strategy future is built under the lock and awaited *outside* it.
+    /// Awaiting while holding the guard serialized every concurrent connection
+    /// through this group, and the sticky-session strategy awaits liveness
+    /// checks and an LRU lock of its own.
+    async fn pick(&self, sess: &Session) -> io::Result<AnyOutboundHandler> {
+        let proxies = self.get_proxies(false).await;
+        if proxies.is_empty() {
+            return Err(io::Error::other(format!(
+                "no proxy available for {}",
+                self.name()
+            )));
+        }
+        let fut = {
+            let mut inner = self.inner.lock().await;
+            (inner.strategy_fn)(proxies, sess)
+        };
+        fut.await
+    }
 }
 
 impl DialWithConnector for Handler {}
@@ -104,9 +125,8 @@ impl OutboundHandler for Handler {
         &self,
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
-    ) -> io::Result<BoxedInstrumentedStream> {
-        let proxies = self.get_proxies(false).await;
-        let proxy = (self.inner.lock().await.strategy_fn)(proxies, sess).await?;
+    ) -> io::Result<BoxedChainedStream> {
+        let proxy = self.pick(sess).await?;
         debug!("{} use proxy {}", self.name(), proxy.name());
 
         let s = proxy.connect_stream(sess, resolver).await?;
@@ -121,9 +141,8 @@ impl OutboundHandler for Handler {
         &self,
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
-    ) -> io::Result<BoxedInstrumentedDatagram> {
-        let proxies = self.get_proxies(false).await;
-        let proxy = (self.inner.lock().await.strategy_fn)(proxies, sess).await?;
+    ) -> io::Result<BoxedChainedDatagram> {
+        let proxy = self.pick(sess).await?;
         debug!("{} use proxy {}", self.name(), proxy.name());
 
         let s = proxy.connect_datagram(sess, resolver).await?;
@@ -142,13 +161,15 @@ impl OutboundHandler for Handler {
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
         connector: &dyn RemoteConnector,
-    ) -> io::Result<BoxedInstrumentedStream> {
-        let proxies = self.get_proxies(false).await;
-        let proxy = (self.inner.lock().await.strategy_fn)(proxies, sess).await?;
+    ) -> io::Result<BoxedChainedStream> {
+        let proxy = self.pick(sess).await?;
         debug!("{} use proxy {}", self.name(), proxy.name());
-        proxy
+        let s = proxy
             .connect_stream_with_connector(sess, resolver, connector)
-            .await
+            .await?;
+
+        s.append_to_chain(self.name()).await;
+        Ok(s)
     }
 
     fn try_as_group_handler(&self) -> Option<&dyn GroupProxyAPIResponse> {
@@ -162,6 +183,13 @@ impl GroupProxyAPIResponse for Handler {
         Handler::get_proxies(self, false).await
     }
 
+    /// A load balancer has no single active member — the strategy picks per
+    /// connection — so there is nothing honest to report here.
+    ///
+    /// Note this also opts the group out of the dispatcher's group-aware UDP
+    /// NAT re-keying and REJECT short-circuit (`dispatcher_impl.rs`), which key
+    /// off the active proxy. Rejected traffic still fails at `connect_*`; it
+    /// just is not short-circuited before the channel is set up.
     async fn get_active_proxy(&self) -> Option<AnyOutboundHandler> {
         None
     }

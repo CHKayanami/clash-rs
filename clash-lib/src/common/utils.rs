@@ -12,8 +12,6 @@ use rand::distr::uniform::{SampleRange, SampleUniform};
 use sha2::Digest;
 use std::{
     collections::HashMap,
-    fmt::Write,
-    num::ParseIntError,
     path::Path,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -32,19 +30,12 @@ pub fn rand_fill(buf: &mut [u8]) {
 }
 
 #[allow(dead_code)]
-pub fn decode_hex(s: &str) -> Result<Vec<u8>, ParseIntError> {
-    (0..s.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&s[i..i + 2], 16))
-        .collect()
+pub fn decode_hex(s: &str) -> Result<Vec<u8>, hex::FromHexError> {
+    hex::decode(s)
 }
 
 pub fn encode_hex(bytes: &[u8]) -> String {
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for &b in bytes {
-        write!(&mut s, "{b:02x}").unwrap();
-    }
-    s
+    hex::encode(bytes)
 }
 
 pub fn sha256(bytes: &[u8]) -> Vec<u8> {
@@ -78,6 +69,7 @@ pub fn current_timestamp_secs() -> u64 {
 pub fn default_bool_true() -> bool {
     true
 }
+
 
 pub fn serialize_duration<S>(
     duration: &std::time::Duration,
@@ -132,10 +124,11 @@ where
     // Strip URI fragment before parsing: HTTP clients must not include fragments
     // in request-target URIs (RFC 7230 §5.3), and hyper::Uri rejects them.
     let url_no_fragment = url.rsplit_once('#').map(|x| x.0).unwrap_or(url);
-    let url = url_no_fragment.parse::<hyper::Uri>()?;
+    let parsed_url = url::Url::parse(url_no_fragment)?;
+    let uri = parsed_url.as_str().parse::<hyper::Uri>()?;
     let mut req = http::Request::builder()
         .header(http::header::USER_AGENT, DEFAULT_USER_AGENT)
-        .uri(&url)
+        .uri(&uri)
         .method(http::Method::GET)
         .body(Empty::<bytes::Bytes>::new())?;
     req.extensions_mut().insert(req_ext.clone());
@@ -143,22 +136,24 @@ where
     let res = http_client.request(req).await?;
 
     if res.status().is_redirection() {
-        let redirected = res
+        let redirected_str = res
             .headers()
             .get("Location")
             .ok_or(new_io_error(
                 format!("failed to download from {url}").as_str(),
             ))?
             .to_str()?;
-        debug!("redirected to {redirected}");
+        debug!("redirected to {redirected_str}");
         if max_redirects == 0 {
             return Err(Error::InvalidConfig(
                 "too many redirects, max redirects reached".to_string(),
             )
             .into());
         }
+        let redirected_url = parsed_url.join(redirected_str)?;
+        let redirected = redirected_url.to_string();
         return download_with_ext(
-            redirected,
+            &redirected,
             path,
             http_client,
             req_ext,

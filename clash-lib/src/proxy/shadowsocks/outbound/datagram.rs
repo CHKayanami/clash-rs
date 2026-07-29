@@ -2,7 +2,7 @@ use std::{
     io,
     net::SocketAddr,
     pin::Pin,
-    sync::Mutex,
+    sync::atomic::{AtomicUsize, Ordering},
     task::{Context, Poll},
 };
 
@@ -11,6 +11,7 @@ use futures::{
     Sink, SinkExt, Stream, StreamExt, ready,
     stream::{SplitSink, SplitStream},
 };
+use parking_lot::Mutex;
 use shadowsocks::{
     ProxySocket,
     relay::udprelay::{
@@ -28,6 +29,12 @@ use crate::{
 
 /// OutboundDatagram wrapper for shadowsocks socket, that takes ShadowsocksUdpIo
 /// as underlying I/O
+/// How many consecutive receive failures to tolerate before giving up on the
+/// association. A decrypt failure means one bad datagram — from a replay, a
+/// stale key, or anything else that can reach the socket — and must not end the
+/// session, but a permanently broken socket still has to terminate.
+const MAX_CONSECUTIVE_RECV_ERRORS: usize = 32;
+
 pub struct OutboundDatagramShadowsocks<S> {
     inner: ProxySocket<S>,
     /// The SS server addr
@@ -38,7 +45,8 @@ pub struct OutboundDatagramShadowsocks<S> {
     pkt: Option<UdpPacket>,
 
     // for Stream
-    buf: Vec<u8>,
+    buf: BytesMut,
+    consecutive_recv_errors: usize,
 
     ss_control: UdpSocketControlData,
 }
@@ -53,7 +61,8 @@ impl<S> OutboundDatagramShadowsocks<S> {
             flushed: true,
             pkt: None,
             remote_addr,
-            buf: vec![0u8; 65535],
+            buf: BytesMut::with_capacity(65535),
+            consecutive_recv_errors: 0,
 
             ss_control,
         }
@@ -173,36 +182,74 @@ where
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Self::Item>> {
-        let &mut Self {
-            ref mut buf,
-            ref inner,
-            ..
-        } = self.get_mut();
+        let me = self.get_mut();
 
-        let mut buf = ReadBuf::new(buf);
+        loop {
+            if me.buf.capacity() < 65535 {
+                me.buf.reserve(65535 - me.buf.capacity());
+            }
 
-        let rv = ready!(inner.poll_recv(cx, &mut buf));
-        debug!("recv udp packet from remote ss server: {:?}", rv);
+            let mut read_buf = ReadBuf::uninit(me.buf.spare_capacity_mut());
 
-        match rv {
-            Ok((n, src, ..)) => Poll::Ready(Some(UdpPacket {
-                data: buf.filled()[..n].to_vec(),
-                src_addr: match src {
-                    shadowsocks::relay::Address::SocketAddress(a) => a.into(),
-                    _ => SocksAddr::any_ipv4(),
-                },
-                dst_addr: SocksAddr::any_ipv4(),
-                inbound_user: None,
-            })),
-            Err(_) => Poll::Ready(None),
+            let rv = ready!(me.inner.poll_recv(cx, &mut read_buf));
+            debug!("recv udp packet from remote ss server: {:?}", rv);
+
+            match rv {
+                Ok((n, src, ..)) => {
+                    me.consecutive_recv_errors = 0;
+                    unsafe {
+                        me.buf.set_len(n);
+                    }
+                    let data = me.buf.split_to(n).freeze();
+                    return Poll::Ready(Some(UdpPacket {
+                        data,
+                        src_addr: match src {
+                            shadowsocks::relay::Address::SocketAddress(a) => {
+                                a.into()
+                            }
+                            shadowsocks::relay::Address::DomainNameAddress(
+                                domain,
+                                port,
+                            ) => SocksAddr::Domain(domain, port),
+                        },
+                        // overwritten by the dispatcher with the original client
+                        // address on the reply path
+                        dst_addr: SocksAddr::any_ipv4(),
+                        inbound_user: None,
+                    }));
+                }
+                // A single undecryptable datagram used to end the whole
+                // association: the dispatcher drives this stream with
+                // `while let Some(..)`, so `None` tears down the relay task.
+                // Drop the packet and keep the session alive instead.
+                Err(e) => {
+                    me.consecutive_recv_errors += 1;
+                    if me.consecutive_recv_errors >= MAX_CONSECUTIVE_RECV_ERRORS {
+                        error!(
+                            "shadowsocks udp recv failed {} times in a row, \
+                             ending association: {}",
+                            me.consecutive_recv_errors, e
+                        );
+                        return Poll::Ready(None);
+                    }
+                    debug!("dropping undecryptable shadowsocks udp packet: {}", e);
+                }
+            }
         }
     }
 }
 
+/// Sentinel for `queued_len`: nothing is currently held by the sink.
+const NOTHING_QUEUED: usize = usize::MAX;
+
 /// Shadowsocks UDP I/O that ProxySocket required
 pub(crate) struct ShadowsocksUdpIo {
     w: Mutex<SplitSink<AnyOutboundDatagram, UdpPacket>>,
-    r: Mutex<(SplitStream<AnyOutboundDatagram>, BytesMut)>,
+    r: Mutex<SplitStream<AnyOutboundDatagram>>,
+    /// Length of the datagram handed to the sink but not yet flushed, or
+    /// [`NOTHING_QUEUED`]. Used to tell a legitimate re-poll of the same packet
+    /// apart from a caller that moved on to a different one.
+    queued_len: AtomicUsize,
 }
 
 impl ShadowsocksUdpIo {
@@ -210,7 +257,8 @@ impl ShadowsocksUdpIo {
         let (w, r) = inner.split();
         Self {
             w: Mutex::new(w),
-            r: Mutex::new((r, BytesMut::new())),
+            r: Mutex::new(r),
+            queued_len: AtomicUsize::new(NOTHING_QUEUED),
         }
     }
 }
@@ -226,25 +274,49 @@ impl DatagramSend for ShadowsocksUdpIo {
         buf: &[u8],
         target: std::net::SocketAddr,
     ) -> Poll<io::Result<usize>> {
-        let mut w = self.w.lock().unwrap();
-        match w.start_send_unpin(UdpPacket {
-            data: buf.to_vec(),
-            src_addr: SocksAddr::any_ipv4(),
-            dst_addr: target.into(),
-            inbound_user: None,
-        }) {
-            Ok(_) => {}
-            Err(e) => return Poll::Ready(Err(new_io_error(e.to_string()))),
+        let mut w = self.w.lock();
+
+        // A `Pending` flush leaves the packet with the sink, and the caller is
+        // expected to re-poll with the same data. If it comes back with a
+        // *different* datagram instead, flush what we already hold rather than
+        // skipping `start_send` and reporting success for a packet we never
+        // queued.
+        let queued = self.queued_len.load(Ordering::Relaxed);
+        if queued != NOTHING_QUEUED && queued != buf.len() {
+            ready!(w.poll_flush_unpin(cx))
+                .map_err(|e| new_io_error(e.to_string()))?;
+            self.queued_len.store(NOTHING_QUEUED, Ordering::Relaxed);
         }
+
+        if self.queued_len.load(Ordering::Relaxed) == NOTHING_QUEUED {
+            match w.start_send_unpin(UdpPacket {
+                data: bytes::Bytes::copy_from_slice(buf),
+                src_addr: SocksAddr::any_ipv4(),
+                dst_addr: target.into(),
+                inbound_user: None,
+            }) {
+                Ok(_) => {
+                    self.queued_len.store(buf.len(), Ordering::Relaxed);
+                }
+                Err(e) => return Poll::Ready(Err(new_io_error(e.to_string()))),
+            }
+        }
+
         match w.poll_flush_unpin(cx) {
-            Poll::Ready(Ok(())) => Poll::Ready(Ok(buf.len())),
-            Poll::Ready(Err(e)) => Poll::Ready(Err(new_io_error(e.to_string()))),
+            Poll::Ready(Ok(())) => {
+                self.queued_len.store(NOTHING_QUEUED, Ordering::Relaxed);
+                Poll::Ready(Ok(buf.len()))
+            }
+            Poll::Ready(Err(e)) => {
+                self.queued_len.store(NOTHING_QUEUED, Ordering::Relaxed);
+                Poll::Ready(Err(new_io_error(e.to_string())))
+            }
             Poll::Pending => Poll::Pending,
         }
     }
 
     fn poll_send_ready(&self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        let mut w = self.w.lock().unwrap();
+        let mut w = self.w.lock();
         w.poll_ready_unpin(cx)
             .map_err(|e| new_io_error(e.to_string()))
     }
@@ -256,28 +328,33 @@ impl DatagramReceive for ShadowsocksUdpIo {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        let mut g = self.r.lock().unwrap();
-        let (r, remained) = &mut *g;
+        let mut r = self.r.lock();
 
-        if !remained.is_empty() {
-            let to_consume = buf.remaining().min(remained.len());
-            let consume = remained.split_to(to_consume);
-            buf.put_slice(&consume);
-            Poll::Ready(Ok(()))
-        } else {
-            match r.poll_next_unpin(cx) {
-                Poll::Ready(Some(pkt)) => {
-                    let to_consume = buf.remaining().min(pkt.data.len());
-                    let consume = pkt.data[..to_consume].to_vec();
-                    buf.put_slice(&consume);
-                    if to_consume < pkt.data.len() {
-                        remained.extend_from_slice(&pkt.data[to_consume..]);
-                    }
-                    Poll::Ready(Ok(()))
+        match r.poll_next_unpin(cx) {
+            Poll::Ready(Some(pkt)) => {
+                // Datagram boundaries are significant: the remainder of an
+                // oversized packet is not a new packet. Carrying it over to the
+                // next call made the tail get decrypted as its own AEAD frame,
+                // so truncate and drop it the way a real UDP socket would.
+                let to_consume = buf.remaining().min(pkt.data.len());
+                if to_consume < pkt.data.len() {
+                    error!(
+                        "shadowsocks udp datagram of {} bytes truncated to {}",
+                        pkt.data.len(),
+                        to_consume
+                    );
                 }
-                Poll::Pending => Poll::Pending,
-                Poll::Ready(None) => Poll::Ready(Ok(())),
+                buf.put_slice(&pkt.data[..to_consume]);
+                Poll::Ready(Ok(()))
             }
+            Poll::Pending => Poll::Pending,
+            // Reporting a zero-length read here looks like an empty datagram,
+            // which fails to decrypt and takes the association down anyway —
+            // and leaves the caller free to re-poll an ended stream forever.
+            Poll::Ready(None) => Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "shadowsocks udp transport closed",
+            ))),
         }
     }
 

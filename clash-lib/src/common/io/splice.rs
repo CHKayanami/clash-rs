@@ -287,6 +287,7 @@ where
         cx: &mut Context<'_>,
         r: &mut R,
         w: &mut W,
+        last_active: &mut tokio::time::Instant,
     ) -> Poll<Result<u64>> {
         loop {
             // If our buffer is empty, then we need to read some data to
@@ -296,7 +297,9 @@ where
                 self.cap = 0;
 
                 match self.poll_fill_buf(cx, r) {
-                    Poll::Ready(Ok(_)) => (),
+                    Poll::Ready(Ok(_)) => {
+                        *last_active = tokio::time::Instant::now();
+                    }
                     Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
                     Poll::Pending => {
                         // Try flushing when the reader has no progress to avoid
@@ -326,6 +329,7 @@ where
                     self.pos += size;
                     self.amt += size as u64;
                     self.need_flush = true;
+                    *last_active = tokio::time::Instant::now();
                 }
             }
 
@@ -382,6 +386,7 @@ where
     A: Stream + Unpin,
     B: Stream + Unpin,
 {
+    let idle_timeout_duration = Duration::from_secs(180);
     CopyBidirectional::new(
         a,
         b,
@@ -389,6 +394,7 @@ where
         CopyBuffer::new(Pipe::new()?),
         a_to_b_timeout_duration,
         b_to_a_timeout_duration,
+        idle_timeout_duration,
         write_tracker,
         read_tracker,
     )
@@ -434,6 +440,9 @@ struct CopyBidirectional<'a, A, B> {
     b_to_a_delay: Option<Pin<Box<tokio::time::Sleep>>>,
     a_to_b_timeout_duration: Duration,
     b_to_a_timeout_duration: Duration,
+    idle_timeout: Pin<Box<tokio::time::Sleep>>,
+    idle_timeout_duration: Duration,
+    last_active: tokio::time::Instant,
     write_tracker: std::sync::Arc<dyn TrackCopy + Send + Sync>,
     read_tracker: std::sync::Arc<dyn TrackCopy + Send + Sync>,
 }
@@ -447,6 +456,7 @@ impl<'a, A, B> CopyBidirectional<'a, A, B> {
         b_to_a_buffer: CopyBuffer<B, A>,
         a_to_b_timeout_duration: Duration,
         b_to_a_timeout_duration: Duration,
+        idle_timeout_duration: Duration,
         write_tracker: std::sync::Arc<dyn TrackCopy + Send + Sync>,
         read_tracker: std::sync::Arc<dyn TrackCopy + Send + Sync>,
     ) -> Self
@@ -465,6 +475,9 @@ impl<'a, A, B> CopyBidirectional<'a, A, B> {
             b_to_a_delay: None,
             a_to_b_timeout_duration,
             b_to_a_timeout_duration,
+            idle_timeout: Box::pin(tokio::time::sleep(idle_timeout_duration)),
+            idle_timeout_duration,
+            last_active: tokio::time::Instant::now(),
             write_tracker,
             read_tracker,
         }
@@ -490,21 +503,44 @@ where
             b_to_a_delay,
             a_to_b_timeout_duration,
             b_to_a_timeout_duration,
+            idle_timeout,
+            idle_timeout_duration,
+            last_active,
             write_tracker,
             read_tracker,
         } = &mut *self;
 
+        // Check idle timeout
+        let deadline = *last_active + *idle_timeout_duration;
+        if tokio::time::Instant::now() >= deadline {
+            return Poll::Ready(Err(CopyBidirectionalError::Other(
+                Error::new(
+                    ErrorKind::TimedOut,
+                    "connection idle timeout",
+                ),
+            )));
+        }
+
+        if idle_timeout.deadline() != deadline {
+            idle_timeout.as_mut().reset(deadline);
+        }
+        let _ = idle_timeout.as_mut().poll(cx);
+
         loop {
             match a_to_b {
                 TransferState::Running(buf) => {
-                    let res = buf.poll_copy(cx, *a, *b);
+                    let prev_amt = buf.amount_transferred();
+                    let res = buf.poll_copy(cx, *a, *b, last_active);
+                    let delta = buf.amount_transferred() - prev_amt;
+                    if delta > 0 {
+                        write_tracker.track(delta as _);
+                    }
                     match res {
                         Poll::Ready(Ok(count)) => {
                             *a_to_b = TransferState::ShuttingDown(count);
                             continue;
                         }
                         Poll::Ready(Err(err)) => {
-                            write_tracker.track(buf.amount_transferred() as _);
                             return Poll::Ready(Err(err));
                         }
                         Poll::Pending => {
@@ -527,7 +563,6 @@ where
                     match res {
                         Poll::Ready(Ok(())) => {
                             *a_to_b_count += *count;
-                            write_tracker.track(*count as _);
                             *a_to_b = TransferState::Done;
                             b_to_a_delay.replace(Box::pin(tokio::time::sleep(
                                 *b_to_a_timeout_duration,
@@ -547,18 +582,18 @@ where
 
             match b_to_a {
                 TransferState::Running(buf) => {
-                    let res = buf.poll_copy(cx, *b, *a);
+                    let prev_amt = buf.amount_transferred();
+                    let res = buf.poll_copy(cx, *b, *a, last_active);
+                    let delta = buf.amount_transferred() - prev_amt;
+                    if delta > 0 {
+                        read_tracker.track(delta as _);
+                    }
                     match res {
                         Poll::Ready(Ok(count)) => {
                             *b_to_a = TransferState::ShuttingDown(count);
                             continue;
                         }
-                        // crucial for down/up load counting
-                        // the copy & write are done by kernel
-                        // we still need to track the amount of data when error
-                        // occurs such as broken pipe
                         Poll::Ready(Err(err)) => {
-                            read_tracker.track(buf.amount_transferred() as _);
                             return Poll::Ready(Err(err));
                         }
                         Poll::Pending => {
@@ -581,7 +616,6 @@ where
                     match res {
                         Poll::Ready(Ok(())) => {
                             *b_to_a_count += *count;
-                            read_tracker.track(*count as _);
                             *b_to_a = TransferState::Done;
                             a_to_b_delay.replace(Box::pin(tokio::time::sleep(
                                 *a_to_b_timeout_duration,

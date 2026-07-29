@@ -5,7 +5,7 @@
 /// XTLS-Vision: after both sides exchange `CMD_PADDING_DIRECT`, they bypass the
 /// outer Reality-TLS layer and communicate over the raw TCP socket.
 use std::{
-    io::{self, Read},
+    io,
     pin::Pin,
     sync::{
         Arc,
@@ -14,13 +14,11 @@ use std::{
     task::{Context, Poll},
 };
 
-use bytes::{Buf, BufMut, BytesMut};
+use bytes::{Buf, BytesMut};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tracing::debug;
 
-use crate::proxy::AnyStream;
-
-pub type RealityTlsStream = tokio_rustls::client::TlsStream<AnyStream>;
+pub type RealityTlsStream = super::reality::stream::RealityTlsStream;
 
 /// Options passed to `VisionStream` when XTLS-splice mode is active.
 ///
@@ -47,6 +45,8 @@ pub struct SplicableTlsStream {
     write_spliced: bool,
 }
 
+impl crate::proxy::ProxyStream for SplicableTlsStream {}
+
 impl SplicableTlsStream {
     pub fn new(
         tls: RealityTlsStream,
@@ -68,13 +68,23 @@ impl SplicableTlsStream {
     fn activate_read_splice(&mut self) {
         debug!("SplicableTlsStream: activating read splice (bypassing Reality TLS)");
         let (_, conn) = self.tls.get_mut();
-        let mut tmp = [0u8; 4096];
-        loop {
-            match conn.reader().read(&mut tmp) {
-                Ok(0) => break,
-                Ok(n) => self.leftover.put_slice(&tmp[..n]),
-                Err(_) => break,
-            }
+
+        // Deliberately no `process_new_packets()` here. Every complete Reality
+        // record received before this point was already processed by the
+        // `poll_read` that produced the bytes Vision used to decide to splice,
+        // so what is left in the ciphertext buffer is post-transition raw data.
+        // Trying to decrypt it would now be a hard authentication failure —
+        // and swallowing that error with `let _ =` hid real faults besides.
+        let plaintext = conn.drain_plaintext_read_buf();
+        if !plaintext.is_empty() {
+            self.leftover.extend_from_slice(&plaintext);
+        }
+
+        // Raw TCP payload the server sent after CMD_PADDING_DIRECT that landed
+        // in the TLS read buffer before the flag was observed.
+        let remaining = conn.drain_ciphertext_read_buf();
+        if !remaining.is_empty() {
+            self.leftover.extend_from_slice(&remaining);
         }
         self.read_spliced = true;
     }
@@ -127,7 +137,13 @@ impl AsyncWrite for SplicableTlsStream {
         let this = self.get_mut();
 
         if !this.write_spliced && this.write_flag.load(Ordering::Acquire) {
-            this.activate_write_splice();
+            match Pin::new(&mut this.tls).poll_flush(cx) {
+                Poll::Ready(Ok(())) => {
+                    this.activate_write_splice();
+                }
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => return Poll::Pending,
+            }
         }
 
         if this.write_spliced {
@@ -165,5 +181,3 @@ impl AsyncWrite for SplicableTlsStream {
         }
     }
 }
-
-impl crate::proxy::ProxyStream for SplicableTlsStream {}

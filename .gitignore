@@ -44,3 +44,7 @@ benchmark-comment.md
 !bench/baseline-*.json
 __pycache__/
 .claude
+
+# Local build script
+build.sh
+

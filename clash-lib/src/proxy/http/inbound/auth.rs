@@ -10,11 +10,18 @@ use crate::common::{auth::ThreadSafeAuthenticator, errors::map_io_error};
 fn parse_basic_proxy_authorization(
     req: &Request<hyper::body::Incoming>,
 ) -> Option<&str> {
-    req.headers()
-        .get(hyper::header::PROXY_AUTHORIZATION)
-        .map(|v| v.to_str().unwrap_or_default())
-        .map(|v| v.strip_prefix("Basic "))
-        .and_then(|v| v)
+    let value = req
+        .headers()
+        .get(hyper::header::PROXY_AUTHORIZATION)?
+        .to_str()
+        .ok()?;
+
+    // RFC 9110 §11.1: the auth-scheme token is case-insensitive
+    let (scheme, credentials) = value.split_once(' ')?;
+    if !scheme.eq_ignore_ascii_case("basic") {
+        return None;
+    }
+    Some(credentials.trim_start())
 }
 
 fn decode_basic_proxy_authorization(cred: &str) -> Option<(String, String)> {

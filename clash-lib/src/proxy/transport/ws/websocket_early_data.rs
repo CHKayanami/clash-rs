@@ -40,6 +40,8 @@ pub struct WebsocketEarlyDataConn {
     early_data_flushed: bool,
 }
 
+impl crate::proxy::ProxyStream for WebsocketEarlyDataConn {}
+
 impl Debug for WebsocketEarlyDataConn {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("WebsocketEarlyDataConn")
@@ -211,5 +213,3 @@ impl AsyncWrite for WebsocketEarlyDataConn {
         }
     }
 }
-
-impl crate::proxy::ProxyStream for WebsocketEarlyDataConn {}

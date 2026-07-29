@@ -119,6 +119,8 @@ pub struct GrpcStream {
     payload_len: usize,
 }
 
+impl crate::proxy::ProxyStream for GrpcStream {}
+
 impl Debug for GrpcStream {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("GrpcStream")
@@ -304,5 +306,3 @@ impl AsyncWrite for GrpcStream {
             .map(|_| Ok(()))
     }
 }
-
-impl crate::proxy::ProxyStream for GrpcStream {}

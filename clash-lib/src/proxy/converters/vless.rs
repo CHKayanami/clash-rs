@@ -38,6 +38,18 @@ impl TryFrom<&OutboundVless> for Handler {
             );
         }
 
+        if let Some(flow) = s.flow.as_deref() {
+            if flow == "xtls-rprx-vision"
+                && !s.tls.unwrap_or_default()
+                && s.reality_opts.is_none()
+            {
+                return Err(Error::InvalidConfig(format!(
+                    "flow '{}' requires TLS or Reality to be enabled for {}",
+                    flow, s.common_opts.name
+                )));
+            }
+        }
+
         let tls: Option<TransportLayer> = if let Some(ref reality_opts) =
             s.reality_opts
         {
@@ -56,9 +68,7 @@ impl TryFrom<&OutboundVless> for Handler {
                 .clone()
                 .unwrap_or_else(|| s.common_opts.server.clone());
 
-            Some(TransportLayer::Reality(RealityClient::new(
-                sni, pk_bytes, short_id,
-            )))
+            Some(TransportLayer::Reality(RealityClient::new(sni, pk_bytes, short_id)))
         } else {
             // vless without reality
             match s.tls.unwrap_or_default() {
@@ -102,6 +112,7 @@ impl TryFrom<&OutboundVless> for Handler {
             name: s.common_opts.name.to_owned(),
             common_opts: HandlerCommonOptions {
                 connector: s.common_opts.connect_via.clone(),
+                tfo: s.common_opts.tfo,
                 ..Default::default()
             },
             server: s.common_opts.server.to_owned(),
@@ -169,6 +180,7 @@ mod tests {
 
     #[test]
     fn test_vless_network_tcp() {
+        crate::tests::initialize();
         // Test that network: tcp is accepted and results in successful parsing
         let config = OutboundVless {
             common_opts: CommonConfigOptions {
@@ -198,6 +210,7 @@ mod tests {
 
     #[test]
     fn test_vless_network_none() {
+        crate::tests::initialize();
         // Test that omitting network field also results in successful parsing
         let config = OutboundVless {
             common_opts: CommonConfigOptions {
@@ -227,6 +240,7 @@ mod tests {
 
     #[test]
     fn test_vless_network_invalid() {
+        crate::tests::initialize();
         // Test that invalid network types are rejected
         let config = OutboundVless {
             common_opts: CommonConfigOptions {
@@ -257,5 +271,107 @@ mod tests {
             err.to_string().contains("unsupported network"),
             "Error should mention unsupported network"
         );
+    }
+
+    #[test]
+    fn test_vless_flow_without_tls_or_reality() {
+        crate::tests::initialize();
+        // Test that flow: xtls-rprx-vision is rejected without TLS or Reality
+        let config = OutboundVless {
+            common_opts: CommonConfigOptions {
+                name: "test-flow-invalid".to_string(),
+                server: "example.com".to_string(),
+                port: 443,
+                ..Default::default()
+            },
+            uuid: "test-uuid".to_string(),
+            tls: Some(false),
+            reality_opts: None,
+            flow: Some("xtls-rprx-vision".to_string()),
+            ..Default::default()
+        };
+
+        let handler = Handler::try_from(&config);
+        assert!(
+            handler.is_err(),
+            "VLess handler with flow but without TLS/Reality should fail"
+        );
+        let err = handler.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("requires TLS or Reality to be enabled"),
+            "Error should mention flow requirements"
+        );
+    }
+
+    #[test]
+    fn test_vless_flow_with_tls() {
+        crate::tests::initialize();
+        // Test that flow: xtls-rprx-vision is accepted with TLS enabled
+        let config = OutboundVless {
+            common_opts: CommonConfigOptions {
+                name: "test-flow-tls".to_string(),
+                server: "example.com".to_string(),
+                port: 443,
+                ..Default::default()
+            },
+            uuid: "test-uuid".to_string(),
+            tls: Some(true),
+            reality_opts: None,
+            flow: Some("xtls-rprx-vision".to_string()),
+            ..Default::default()
+        };
+
+        let handler = Handler::try_from(&config);
+        assert!(
+            handler.is_ok(),
+            "VLess handler with flow and TLS should parse successfully"
+        );
+    }
+
+    #[test]
+    fn test_vless_flow_with_reality() {
+        crate::tests::initialize();
+        use crate::config::internal::proxy::RealityOpt;
+
+        // Test that flow: xtls-rprx-vision is accepted with Reality enabled (even if tls is false/None)
+        let config = OutboundVless {
+            common_opts: CommonConfigOptions {
+                name: "test-flow-reality".to_string(),
+                server: "example.com".to_string(),
+                port: 443,
+                ..Default::default()
+            },
+            uuid: "test-uuid".to_string(),
+            tls: Some(false),
+            reality_opts: Some(RealityOpt {
+                public_key: "abc".to_string(), // public key format isn't fully validated here since TryInto base64-decodes it
+                short_id: "1234".to_string(),
+            }),
+            flow: Some("xtls-rprx-vision".to_string()),
+            ..Default::default()
+        };
+
+        // Note: decode_base64_public_key might fail on "abc" so TryFrom might fail with base64 error,
+        // but it should pass the flow validation phase first. Let's provide a valid base64 key just in case.
+        let mut config = config;
+        config.reality_opts.as_mut().unwrap().public_key =
+            "qpUtN9F_H6pQ4lF5Fp9G1G5eFm5eFm5eFm5eFm5eFm4=".to_string(); // valid base64
+        config.reality_opts.as_mut().unwrap().short_id =
+            "0123456789abcdef".to_string(); // hex format
+
+        let handler = Handler::try_from(&config);
+        // We just want to check it passed the flow check. Depending on base64 decoding, it might succeed or fail on PK parsing.
+        // Let's assert that it doesn't fail with the "flow requires TLS or Reality" error.
+        match handler {
+            Ok(_) => {}
+            Err(e) => {
+                assert!(
+                    !e.to_string()
+                        .contains("requires TLS or Reality to be enabled"),
+                    "Should not fail flow validation"
+                );
+            }
+        }
     }
 }

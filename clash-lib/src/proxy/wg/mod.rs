@@ -7,9 +7,8 @@ use crate::{
     Error,
     app::{
         dispatcher::{
-            BoxedInstrumentedDatagram, BoxedInstrumentedStream,
-            InstrumentedDatagram, InstrumentedDatagramWrapper, InstrumentedStream,
-            InstrumentedStreamWrapper,
+            BoxedChainedDatagram, BoxedChainedStream, ChainedDatagram,
+            ChainedDatagramWrapper, ChainedStream, ChainedStreamWrapper,
         },
         dns::ThreadSafeDNSResolver,
     },
@@ -245,7 +244,7 @@ impl OutboundHandler for Handler {
         &self,
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
-    ) -> io::Result<BoxedInstrumentedStream> {
+    ) -> io::Result<BoxedChainedStream> {
         let inner = self
             .initialize_inner(resolver.clone(), sess)
             .await
@@ -282,7 +281,7 @@ impl OutboundHandler for Handler {
         let remote = (ip, sess.destination.port()).into();
 
         let socket = inner.device_manager.new_tcp_socket(remote).await;
-        let chained = InstrumentedStreamWrapper::new(socket);
+        let chained = ChainedStreamWrapper::new(socket);
         chained.append_to_chain(self.name()).await;
         Ok(Box::new(chained))
     }
@@ -292,14 +291,14 @@ impl OutboundHandler for Handler {
         &self,
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
-    ) -> io::Result<BoxedInstrumentedDatagram> {
+    ) -> io::Result<BoxedChainedDatagram> {
         let inner = self
             .initialize_inner(resolver, sess)
             .await
             .map_err(map_io_error)?;
 
         let socket = inner.device_manager.new_udp_socket().await;
-        let chained = InstrumentedDatagramWrapper::new(socket);
+        let chained = ChainedDatagramWrapper::new(socket);
         chained.append_to_chain(self.name()).await;
         Ok(Box::new(chained))
     }

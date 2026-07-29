@@ -2,7 +2,6 @@
 use std::future::Future;
 use std::{
     io,
-    mem::MaybeUninit,
     pin::Pin,
     task::{Context, Poll},
     time::Duration,
@@ -17,7 +16,7 @@ mod splice;
 #[cfg(all(target_os = "linux", feature = "zero_copy"))]
 pub use splice::zero_copy_bidirectional;
 
-use crate::{app::dispatcher::BoxedInstrumentedStream, proxy::ProxyStream};
+use crate::{app::dispatcher::TrackedStream, proxy::ClientStream};
 
 #[derive(Debug)]
 pub enum CopyBidirectionalError {
@@ -105,8 +104,7 @@ impl CopyBuffer {
         cx: &mut Context<'_>,
         mut reader: Pin<&mut R>,
         mut writer: Pin<&mut W>,
-        mut idle_timeout: Option<&mut Pin<Box<tokio::time::Sleep>>>,
-        idle_timeout_duration: Option<Duration>,
+        mut last_active: Option<&mut tokio::time::Instant>,
     ) -> Poll<io::Result<u64>>
     where
         R: AsyncRead + ?Sized,
@@ -141,13 +139,8 @@ impl CopyBuffer {
                 } else {
                     self.pos = 0;
                     self.cap = n;
-                    // Reset idle timeout on successful read
-                    if let (Some(timeout), Some(duration)) =
-                        (idle_timeout.as_mut(), idle_timeout_duration)
-                    {
-                        timeout
-                            .as_mut()
-                            .reset(tokio::time::Instant::now() + duration);
+                    if let Some(last_active) = last_active.as_mut() {
+                        **last_active = tokio::time::Instant::now();
                     }
                 }
             }
@@ -166,13 +159,8 @@ impl CopyBuffer {
                     self.pos += i;
                     self.amt += i as u64;
                     self.need_flush = true;
-                    // Reset idle timeout on successful write
-                    if let (Some(timeout), Some(duration)) =
-                        (idle_timeout.as_mut(), idle_timeout_duration)
-                    {
-                        timeout
-                            .as_mut()
-                            .reset(tokio::time::Instant::now() + duration);
+                    if let Some(last_active) = last_active.as_mut() {
+                        **last_active = tokio::time::Instant::now();
                     }
                 }
             }
@@ -214,6 +202,7 @@ struct CopyBidirectional<'a, A: ?Sized, B: ?Sized> {
     b_to_a_timeout_duration: Duration,
     idle_timeout: Pin<Box<tokio::time::Sleep>>,
     idle_timeout_duration: Duration,
+    last_active: tokio::time::Instant,
 }
 
 impl<A, B> Future for CopyBidirectional<'_, A, B>
@@ -238,30 +227,26 @@ where
             b_to_a_timeout_duration,
             idle_timeout,
             idle_timeout_duration,
+            last_active,
         } = &mut *self;
 
         let mut a = Pin::new(a);
         let mut b = Pin::new(b);
 
-        // Check idle timeout - if expired, force both directions to shutdown
-        if idle_timeout.as_mut().poll(cx).is_ready() {
-            if !matches!(a_to_b, TransferState::Done) {
-                let count = match a_to_b {
-                    TransferState::Running(buf) => buf.amount_transferred(),
-                    TransferState::ShuttingDown(count) => *count,
-                    TransferState::Done => 0,
-                };
-                *a_to_b = TransferState::ShuttingDown(count);
-            }
-            if !matches!(b_to_a, TransferState::Done) {
-                let count = match b_to_a {
-                    TransferState::Running(buf) => buf.amount_transferred(),
-                    TransferState::ShuttingDown(count) => *count,
-                    TransferState::Done => 0,
-                };
-                *b_to_a = TransferState::ShuttingDown(count);
-            }
+        // Check idle timeout
+        let deadline = *last_active + *idle_timeout_duration;
+        if tokio::time::Instant::now() >= deadline {
+            return Poll::Ready(Err(CopyBidirectionalError::Other(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "connection idle timeout",
+            ))));
         }
+
+        // Align sleep timer deadline with last active change to avoid frequency reset bugs
+        if idle_timeout.deadline() != deadline {
+            idle_timeout.as_mut().reset(deadline);
+        }
+        let _ = idle_timeout.as_mut().poll(cx);
 
         loop {
             match a_to_b {
@@ -270,8 +255,7 @@ where
                         cx,
                         a.as_mut(),
                         b.as_mut(),
-                        Some(idle_timeout),
-                        Some(*idle_timeout_duration),
+                        Some(last_active),
                     );
                     match res {
                         Poll::Ready(Ok(count)) => {
@@ -326,8 +310,7 @@ where
                         cx,
                         b.as_mut(),
                         a.as_mut(),
-                        Some(idle_timeout),
-                        Some(*idle_timeout_duration),
+                        Some(last_active),
                     );
                     match res {
                         Poll::Ready(Ok(count)) => {
@@ -387,32 +370,30 @@ where
 }
 
 pub async fn copy_bidirectional(
-    mut a: Box<dyn ProxyStream>,
-    mut b: BoxedInstrumentedStream,
+    mut a: Box<dyn ClientStream>,
+    mut b: TrackedStream,
     size: usize,
     a_to_b_timeout_duration: Duration,
     b_to_a_timeout_duration: Duration,
 ) -> Result<(u64, u64), CopyBidirectionalError> {
+    use tokio::io::AsyncWriteExt;
+
     // zero copy is only available on linux
     #[cfg(all(target_os = "linux", feature = "zero_copy"))]
-    {
+    let res = {
         // for zero copy, we need to track the download and upload amount with the
         // assistance of the tracker it's somehow ugly, but i could not
         // figure out a better way
-        let trackers = b.trackers();
-        // for socks5 & http listener, a is a raw TcpStream
+        let (r_tracker, w_tracker) = b.trackers();
         let a_raw = a.underlying_socket();
-        // for direct outbound handler **without further chains**, b is a chained
-        // stream wrapper over tcpstream
         let b_raw = b.underlying_socket();
-        match (a_raw, b_raw, trackers) {
-            // zero copy is only available when both streams are raw TcpStream and
-            // tracking is installed
-            (Some(a), Some(b), Some((r_tracker, w_tracker))) => {
+        match (a_raw, b_raw) {
+            // zero copy is only available when both streams are raw TcpStream
+            (Some(a), Some(b_stream)) => {
                 tracing::trace!("using zero copy for bidirectional copy");
                 zero_copy_bidirectional(
                     a,
-                    b,
+                    b_stream,
                     r_tracker,
                     w_tracker,
                     a_to_b_timeout_duration,
@@ -431,9 +412,9 @@ pub async fn copy_bidirectional(
                 .await
             }
         }
-    }
+    };
     #[cfg(not(all(target_os = "linux", feature = "zero_copy")))]
-    {
+    let res = {
         copy_buf_bidirectional_with_timeout(
             &mut a,
             &mut b,
@@ -442,7 +423,12 @@ pub async fn copy_bidirectional(
             b_to_a_timeout_duration,
         )
         .await
-    }
+    };
+
+    let _ = a.shutdown().await;
+    let _ = b.shutdown().await;
+
+    res
 }
 
 pub async fn copy_buf_bidirectional_with_timeout<A, B>(
@@ -456,7 +442,7 @@ where
     A: AsyncRead + AsyncWrite + Unpin + ?Sized,
     B: AsyncRead + AsyncWrite + Unpin + ?Sized,
 {
-    let idle_timeout_duration = Duration::from_secs(60);
+    let idle_timeout_duration = Duration::from_secs(180);
     CopyBidirectional {
         a,
         b,
@@ -470,6 +456,7 @@ where
         b_to_a_timeout_duration,
         idle_timeout: Box::pin(tokio::time::sleep(idle_timeout_duration)),
         idle_timeout_duration,
+        last_active: tokio::time::Instant::now(),
     }
     .await
 }
@@ -496,28 +483,21 @@ impl<T: ReadExactBase> ReadExt for T {
         size: usize,
     ) -> Poll<std::io::Result<()>> {
         let (raw, read_buf, read_pos) = self.decompose();
-        read_buf.reserve(size);
-        // # safety: read_buf has reserved `size`
-        unsafe { read_buf.set_len(size) }
+        if read_buf.len() < size {
+            read_buf.resize(size, 0);
+        }
         loop {
             if *read_pos < size {
-                // # safety: read_pos<size==read_buf.len(), and
-                // read_buf[0..read_pos] is initialized
-                let dst = unsafe {
-                    &mut *((&mut read_buf[*read_pos..size]) as *mut _
-                        as *mut [MaybeUninit<u8>])
-                };
-                let mut buf = ReadBuf::uninit(dst);
-                let ptr = buf.filled().as_ptr();
+                let mut buf = ReadBuf::new(&mut read_buf[*read_pos..size]);
                 ready!(Pin::new(&mut *raw).poll_read(cx, &mut buf))?;
-                assert_eq!(ptr, buf.filled().as_ptr());
-                if buf.filled().is_empty() {
+                let read = buf.filled().len();
+                if read == 0 {
                     return Poll::Ready(Err(std::io::Error::new(
                         std::io::ErrorKind::UnexpectedEof,
                         "unexpected eof",
                     )));
                 }
-                *read_pos += buf.filled().len();
+                *read_pos += read;
             } else {
                 assert!(*read_pos == size);
                 *read_pos = 0;

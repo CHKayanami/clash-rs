@@ -3,11 +3,13 @@ use std::sync::atomic::AtomicBool;
 use crate::{
     Error,
     app::dns::{ClashResolver, ResolverKind, parse_ip_literal},
+    app::router::Router,
 };
 use async_trait::async_trait;
 use rand::seq::IteratorRandom;
 use tracing::{debug, warn};
-
+use std::sync::Arc;
+use hickory_proto::op::Message;
 pub struct SystemResolver {
     ipv6: AtomicBool,
 }
@@ -50,6 +52,10 @@ impl ClashResolver for SystemResolver {
             })
             .collect::<Vec<_>>();
         Ok(response.into_iter().choose(&mut rand::rng()))
+    }
+
+    async fn exchange_all(&self, _req: &Message) -> anyhow::Result<Message>{
+        Err(anyhow::anyhow!("exchange_all is not implemented yet"))
     }
 
     async fn resolve_v4(
@@ -121,6 +127,10 @@ impl ClashResolver for SystemResolver {
 
     async fn reverse_lookup(&self, _: std::net::IpAddr) -> Option<String> {
         None
+    }
+
+    async fn after_router_inited(&self, _: Arc<Router>) {
+        
     }
 }
 

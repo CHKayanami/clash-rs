@@ -24,10 +24,7 @@ impl TryFrom<&OutboundVmess> for Handler {
     fn try_from(s: &OutboundVmess) -> Result<Self, Self::Error> {
         let skip_cert_verify = s.skip_cert_verify.unwrap_or_default();
         if skip_cert_verify {
-            warn!(
-                "skipping TLS cert verification for {}",
-                s.common_opts.server
-            );
+            warn!("skip_cert_verify is set to true for {}", s.common_opts.name);
         }
 
         let h = Handler::new(HandlerOptions {

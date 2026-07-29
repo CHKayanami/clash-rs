@@ -101,7 +101,6 @@ impl HttpClient {
             if let Some(registry) = &self.outbounds {
                 registry
                     .read()
-                    .await
                     .get(&name)
                     .cloned()
                     .unwrap_or_else(make_direct)

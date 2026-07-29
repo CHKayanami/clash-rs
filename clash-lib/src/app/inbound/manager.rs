@@ -1,6 +1,6 @@
 use futures::future::BoxFuture;
 use serde::{Deserialize, Serialize};
-use tokio::{sync::RwLock, task::JoinHandle};
+use tokio::task::JoinHandle;
 
 use crate::{
     app::{
@@ -26,6 +26,7 @@ use std::{
     sync::Arc,
     time::Duration,
 };
+use parking_lot::RwLock;
 
 /// Per-listener handle entry: the spawned task plus an optional channel to
 /// push user-list updates without restarting the listener.
@@ -203,10 +204,10 @@ impl InboundManager {
                 let provider_name = provider_name.clone();
 
                 Box::pin(async move {
-                    let mut provider_handles_guard = provider_handles.write().await;
-                    let mut old_handles = provider_handles_guard
-                        .remove(&provider_name)
-                        .unwrap_or_default();
+                    let mut old_handles = {
+                        let mut guard = provider_handles.write();
+                        guard.remove(&provider_name).unwrap_or_default()
+                    };
 
                     // Partition new_opts: reuse or user-update existing listeners,
                     // collect truly new opts that need a fresh listener.
@@ -237,16 +238,6 @@ impl InboundManager {
                                 info!(
                                     "inbound provider {provider_name}: anytls user \
                                      list updated in place ({} users)",
-                                    users.len()
-                                );
-                            }
-                            if let (InboundOpts::Hysteria2 { users, .. }, Some(tx)) =
-                                (&opts, &entry.users_tx)
-                                && tx.send(users.clone()).is_ok()
-                            {
-                                info!(
-                                    "inbound provider {provider_name}: hysteria2 \
-                                     user list updated in place ({} users)",
                                     users.len()
                                 );
                             }
@@ -285,32 +276,35 @@ impl InboundManager {
                              '{listener_name}'"
                         );
 
-                        // For Shadowsocks, AnyTLS, and Hysteria2, create a watch
-                        // channel so future user-list updates can be pushed
-                        // without a restart.
+                        // For Shadowsocks and AnyTLS, create a watch channel so
+                        // future user-list updates can be pushed without a restart.
                         #[cfg(feature = "shadowsocks")]
-                        let (users_rx, users_tx) = match &opts {
-                            InboundOpts::Shadowsocks { users, .. }
-                            | InboundOpts::Anytls { users, .. }
-                            | InboundOpts::Hysteria2 { users, .. } => {
+                        let (users_rx, users_tx) =
+                            if let InboundOpts::Shadowsocks { users, .. } = &opts {
                                 let (tx, rx) =
                                     tokio::sync::watch::channel(users.clone());
                                 (Some(rx), Some(tx))
-                            }
-                            _ => (None, None),
-                        };
+                            } else if let InboundOpts::Anytls { users, .. } = &opts {
+                                let (tx, rx) =
+                                    tokio::sync::watch::channel(users.clone());
+                                (Some(rx), Some(tx))
+                            } else {
+                                (None, None)
+                            };
                         #[cfg(not(feature = "shadowsocks"))]
-                        let (users_rx, users_tx) = match &opts {
-                            InboundOpts::Anytls { users, .. }
-                            | InboundOpts::Hysteria2 { users, .. } => {
-                                let (tx, rx) =
-                                    tokio::sync::watch::channel(users.clone());
-                                (Some(rx), Some(tx))
-                            }
-                            _ => (
+                        let (users_rx, users_tx) = if let InboundOpts::Anytls {
+                            users,
+                            ..
+                        } = &opts
+                        {
+                            let (tx, rx) =
+                                tokio::sync::watch::channel(users.clone());
+                            (Some(rx), Some(tx))
+                        } else {
+                            (
                                 None::<tokio::sync::watch::Receiver<Vec<InboundUser>>>,
                                 None,
-                            ),
+                            )
                         };
 
                         let handle = build_network_listeners(
@@ -335,7 +329,10 @@ impl InboundManager {
                             .insert(opts, ProviderHandleEntry { handle, users_tx });
                     }
 
-                    provider_handles_guard.insert(provider_name, new_handles);
+                    {
+                        let mut guard = provider_handles.write();
+                        guard.insert(provider_name, new_handles);
+                    }
                 }) as BoxFuture<'static, ()>
             };
 
@@ -352,7 +349,6 @@ impl InboundManager {
                             );
                             self.inbound_providers
                                 .write()
-                                .await
                                 .insert(name, provider);
                         }
                         Err(e) => {
@@ -373,31 +369,31 @@ impl InboundManager {
         inbound_handlers: Arc<RwLock<HashMap<InboundOpts, StaticHandleEntry>>>,
         cancellation_token: tokio_util::sync::CancellationToken,
     ) {
-        for (opts, entry) in inbound_handlers.write().await.iter_mut() {
+        for (opts, entry) in inbound_handlers.write().iter_mut() {
             let cancellation_token = cancellation_token.clone();
             let name = opts.common_opts().name.clone();
 
-            // For AnyTLS, Hysteria2 (and Shadowsocks), create a watch channel so
-            // user-list updates can be pushed without a full restart.
+            // For AnyTLS (and Shadowsocks), create a watch channel so user-list
+            // updates can be pushed without a full restart.
             #[cfg(feature = "shadowsocks")]
-            let (users_rx, users_tx) = match opts {
-                InboundOpts::Shadowsocks { users, .. }
-                | InboundOpts::Anytls { users, .. }
-                | InboundOpts::Hysteria2 { users, .. } => {
+            let (users_rx, users_tx) =
+                if let InboundOpts::Shadowsocks { users, .. } = opts {
                     let (tx, rx) = tokio::sync::watch::channel(users.clone());
                     (Some(rx), Some(tx))
-                }
-                _ => (None, None),
-            };
+                } else if let InboundOpts::Anytls { users, .. } = opts {
+                    let (tx, rx) = tokio::sync::watch::channel(users.clone());
+                    (Some(rx), Some(tx))
+                } else {
+                    (None, None)
+                };
             #[cfg(not(feature = "shadowsocks"))]
-            let (users_rx, users_tx) = match opts {
-                InboundOpts::Anytls { users, .. }
-                | InboundOpts::Hysteria2 { users, .. } => {
+            let (users_rx, users_tx) =
+                if let InboundOpts::Anytls { users, .. } = opts {
                     let (tx, rx) = tokio::sync::watch::channel(users.clone());
                     (Some(rx), Some(tx))
-                }
-                _ => (None::<tokio::sync::watch::Receiver<Vec<InboundUser>>>, None),
-            };
+                } else {
+                    (None::<tokio::sync::watch::Receiver<Vec<InboundUser>>>, None)
+                };
 
             entry.users_tx = users_tx;
             entry.handle = build_network_listeners(
@@ -422,59 +418,87 @@ impl InboundManager {
     }
 
     async fn stop_all_listeners(&self) {
-        for (opt, entry) in self.inbound_handlers.write().await.iter_mut() {
-            if let Some(handler) = entry.handle.take() {
-                warn!("Shutting down inbound handler: {}", opt.common_opts().name);
-                handler.abort();
-            }
-        }
-        for handles in self.provider_handles.write().await.values_mut() {
-            for (opt, entry) in handles.iter_mut() {
+        let mut handles = Vec::new();
+        {
+            let mut guard = self.inbound_handlers.write();
+            for (opt, entry) in guard.iter_mut() {
                 if let Some(h) = entry.handle.take() {
-                    warn!(
-                        "Shutting down provider inbound handler: {}",
-                        opt.common_opts().name
-                    );
-                    h.abort();
+                    warn!("Shutting down inbound handler: {}", opt.common_opts().name);
+                    handles.push(h);
                 }
             }
+        }
+        for h in handles {
+            h.abort();
+        }
+
+        let mut provider_handles = Vec::new();
+        {
+            let mut guard = self.provider_handles.write();
+            for handles in guard.values_mut() {
+                for (opt, entry) in handles.iter_mut() {
+                    if let Some(h) = entry.handle.take() {
+                        warn!(
+                            "Shutting down provider inbound handler: {}",
+                            opt.common_opts().name
+                        );
+                        provider_handles.push(h);
+                    }
+                }
+            }
+        }
+        for h in provider_handles {
+            h.abort();
         }
     }
 
     #[allow(dead_code)]
     async fn join_all_listeners(&self) -> Result<(), crate::Error> {
         let mut last_join_error = None;
-        for (opt, entry) in self.inbound_handlers.write().await.iter_mut() {
-            if let Some(handler) = entry.handle.take() {
-                warn!("Shutting down inbound handler: {}", opt.common_opts().name);
-                handler.await.unwrap_or_else(|e| {
-                    warn!(
-                        "Inbound handler {} shutdown with error: {}",
-                        opt.common_opts().name,
-                        e
-                    );
-                    last_join_error = Some(e);
-                });
-            }
-        }
-        for handles in self.provider_handles.write().await.values_mut() {
-            for (opt, entry) in handles.iter_mut() {
+        let mut handles = Vec::new();
+        {
+            let mut guard = self.inbound_handlers.write();
+            for (opt, entry) in guard.iter_mut() {
                 if let Some(h) = entry.handle.take() {
-                    warn!(
-                        "Shutting down provider inbound handler: {}",
-                        opt.common_opts().name
-                    );
-                    h.await.unwrap_or_else(|e| {
-                        warn!(
-                            "Provider inbound handler {} shutdown with error: {}",
-                            opt.common_opts().name,
-                            e
-                        );
-                        last_join_error = Some(e);
-                    });
+                    handles.push((opt.common_opts().name.clone(), h));
                 }
             }
         }
+        for (name, h) in handles {
+            warn!("Shutting down inbound handler: {}", name);
+            h.await.unwrap_or_else(|e| {
+                warn!(
+                    "Inbound handler {} shutdown with error: {}",
+                    name,
+                    e
+                );
+                last_join_error = Some(e);
+            });
+        }
+
+        let mut provider_handles = Vec::new();
+        {
+            let mut guard = self.provider_handles.write();
+            for handles in guard.values_mut() {
+                for (opt, entry) in handles.iter_mut() {
+                    if let Some(h) = entry.handle.take() {
+                        provider_handles.push((opt.common_opts().name.clone(), h));
+                    }
+                }
+            }
+        }
+        for (name, h) in provider_handles {
+            warn!("Shutting down provider inbound handler: {}", name);
+            h.await.unwrap_or_else(|e| {
+                warn!(
+                    "Provider inbound handler {} shutdown with error: {}",
+                    name,
+                    e
+                );
+                last_join_error = Some(e);
+            });
+        }
+
         last_join_error
             .map(|e| Err(std::io::Error::other(e).into()))
             .unwrap_or(Ok(()))
@@ -500,7 +524,7 @@ impl InboundManager {
 
     pub async fn get_ports(&self) -> Ports {
         let mut ports = Ports::default();
-        let guard = self.inbound_handlers.read().await;
+        let guard = self.inbound_handlers.read();
         for opts in guard.keys() {
             match &opts {
                 InboundOpts::Http { common_opts } => {
@@ -527,7 +551,7 @@ impl InboundManager {
     }
 
     pub async fn get_allow_lan(&self) -> bool {
-        let guard = self.inbound_handlers.read().await;
+        let guard = self.inbound_handlers.read();
         if let Some((opts, _)) = guard.iter().next() {
             opts.common_opts().allow_lan
         } else {
@@ -536,7 +560,7 @@ impl InboundManager {
     }
 
     pub async fn set_allow_lan(&self, allow_lan: bool) {
-        let mut guard = self.inbound_handlers.write().await;
+        let mut guard = self.inbound_handlers.write();
         let new_map = guard
             .drain()
             .map(|(mut opts, entry)| {
@@ -548,7 +572,7 @@ impl InboundManager {
     }
 
     pub async fn get_bind_address(&self) -> BindAddress {
-        let guard = self.inbound_handlers.read().await;
+        let guard = self.inbound_handlers.read();
         if let Some((opts, _)) = guard.iter().next() {
             opts.common_opts().listen
         } else {
@@ -560,7 +584,6 @@ impl InboundManager {
         let mut result: Vec<InboundEndpoint> = self
             .inbound_handlers
             .read()
-            .await
             .iter()
             .map(|(opts, entry)| {
                 let common = opts.common_opts();
@@ -574,7 +597,7 @@ impl InboundManager {
             })
             .collect();
 
-        for handles in self.provider_handles.read().await.values() {
+        for handles in self.provider_handles.read().values() {
             for (opts, entry) in handles {
                 let common = opts.common_opts();
                 let active = entry.handle.as_ref().is_some_and(|h| !h.is_finished());
@@ -591,7 +614,7 @@ impl InboundManager {
     }
 
     pub async fn set_bind_address(&self, bind_address: BindAddress) {
-        let mut guard = self.inbound_handlers.write().await;
+        let mut guard = self.inbound_handlers.write();
         let new_map = guard
             .drain()
             .map(|(mut opts, entry)| {
@@ -604,30 +627,30 @@ impl InboundManager {
 
     // returns true if any listener ports were changed (i.e. a restart is needed)
     pub async fn change_ports(&self, ports: Ports) -> bool {
-        let mut guard = self.inbound_handlers.write().await;
+        let mut guard = self.inbound_handlers.write();
 
         let listeners: HashMap<InboundOpts, StaticHandleEntry> = guard
             .extract_if(|opts, _| match &opts {
                 InboundOpts::Http { common_opts } => {
-                    ports.port.is_some() && Some(common_opts.port) == ports.port
+                    ports.port.is_some() && Some(common_opts.port) != ports.port
                 }
                 InboundOpts::Socks { common_opts, .. } => {
                     ports.socks_port.is_some()
-                        && Some(common_opts.port) == ports.socks_port
+                        && Some(common_opts.port) != ports.socks_port
                 }
                 InboundOpts::Mixed { common_opts, .. } => {
                     ports.mixed_port.is_some()
-                        && Some(common_opts.port) == ports.mixed_port
+                        && Some(common_opts.port) != ports.mixed_port
                 }
                 #[cfg(feature = "tproxy")]
                 InboundOpts::TProxy { common_opts, .. } => {
                     ports.tproxy_port.is_some()
-                        && Some(common_opts.port) == ports.tproxy_port
+                        && Some(common_opts.port) != ports.tproxy_port
                 }
                 #[cfg(feature = "redir")]
                 InboundOpts::Redir { common_opts } => {
                     ports.redir_port.is_some()
-                        && Some(common_opts.port) == ports.redir_port
+                        && Some(common_opts.port) != ports.redir_port
                 }
                 _ => false,
             })

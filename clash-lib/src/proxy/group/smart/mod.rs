@@ -14,7 +14,7 @@ use tracing::{debug, info};
 
 use crate::{
     app::{
-        dispatcher::{BoxedInstrumentedDatagram, BoxedInstrumentedStream},
+        dispatcher::{BoxedChainedDatagram, BoxedChainedStream},
         dns::ThreadSafeDNSResolver,
         remote_content_manager::{
             ProxyManager, providers::proxy_provider::ArcProxyProvider,
@@ -107,7 +107,14 @@ impl std::fmt::Debug for Handler {
 
 impl Handler {
     /// Create a new smart proxy group handler with persistence support
-    pub fn new_with_cache(
+    /// Load persisted stats and build the handler.
+    ///
+    /// This used to be a sync fn that spawned an OS thread, stood up a second
+    /// Tokio runtime inside it just to `block_on` the cache read, and then
+    /// blocked the calling thread on a rendezvous channel — all while running
+    /// on a Tokio worker, with three `expect`s on the way. Every caller is
+    /// already async, so the read just happens here.
+    pub async fn new_with_cache(
         opts: HandlerOptions,
         providers: Vec<ArcProxyProvider>,
         proxy_manager: ProxyManager,
@@ -115,39 +122,19 @@ impl Handler {
     ) -> Self {
         let group_name = opts.name.clone();
 
-        let thread_group_name = group_name.clone();
-        let thread_cache_store = cache_store.clone();
+        info!("{} attempting to load smart stats from cache", group_name);
+        let stored_data: Option<state::SmartStateData> =
+            cache_store.get_smart_stats(&group_name).await;
 
-        let (tx, rx) = std::sync::mpsc::sync_channel(0);
-
-        std::thread::spawn(move || {
-            let rt =
-                tokio::runtime::Runtime::new().expect("Failed to create runtime");
-            let state = rt.block_on(async {
-                info!(
-                    "{} attempting to load smart stats from cache",
-                    thread_group_name
-                );
-                let stored_data: Option<state::SmartStateData> =
-                    thread_cache_store.get_smart_stats(&thread_group_name).await;
-
-                if stored_data.is_some() {
-                    info!(
-                        "{} successfully loaded smart stats from cache",
-                        thread_group_name
-                    );
-                } else {
-                    info!(
-                        "{} no smart stats found in cache, initializing new state",
-                        thread_group_name
-                    );
-                }
-                SmartState::new_with_imported_data(stored_data)
-            });
-
-            tx.send(state).expect("Failed to send smart state");
-        });
-        let smart_state = rx.recv().expect("Failed to receive smart state");
+        if stored_data.is_some() {
+            info!("{} successfully loaded smart stats from cache", group_name);
+        } else {
+            info!(
+                "{} no smart stats found in cache, initializing new state",
+                group_name
+            );
+        }
+        let smart_state = SmartState::new_with_imported_data(stored_data);
 
         let handler = Self {
             opts,
@@ -453,7 +440,7 @@ impl Handler {
         &self,
         sess: &Session,
         resolver: &ThreadSafeDNSResolver,
-    ) -> io::Result<BoxedInstrumentedStream> {
+    ) -> io::Result<BoxedChainedStream> {
         let site = sess.destination.host();
         let dest_ip = sess.destination.ip().map(|ip| ip.to_string());
         let mut tried = HashSet::new();
@@ -662,7 +649,7 @@ impl OutboundHandler for Handler {
         &self,
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
-    ) -> io::Result<BoxedInstrumentedStream> {
+    ) -> io::Result<BoxedChainedStream> {
         debug!("{} starting smart proxy selection", self.name());
         match self.adaptive_retry(sess, &resolver).await {
             Ok(stream) => {
@@ -687,7 +674,7 @@ impl OutboundHandler for Handler {
         &self,
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
-    ) -> io::Result<BoxedInstrumentedDatagram> {
+    ) -> io::Result<BoxedChainedDatagram> {
         // For UDP we use the best proxy without retries for simplicity
         if let Some(proxy) = self.pick_smart(sess).await {
             debug!("{} use proxy {} (smart)", self.name(), proxy.name());
@@ -710,7 +697,7 @@ impl OutboundHandler for Handler {
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
         connector: &dyn RemoteConnector,
-    ) -> io::Result<BoxedInstrumentedStream> {
+    ) -> io::Result<BoxedChainedStream> {
         if let Some(proxy) = self.pick_smart(sess).await {
             debug!("{} use proxy {} (smart)", self.name(), proxy.name());
             proxy
@@ -842,7 +829,8 @@ mod tests {
             vec![thread_safe_provider],
             proxy_manager,
             cache_store,
-        );
+        )
+        .await;
         let any_smart_handler: AnyOutboundHandler = Arc::new(smart_handler_instance);
 
         run_test_suites_and_cleanup(any_smart_handler, docker_runner, Suite::all())

@@ -11,7 +11,7 @@ pub struct DomainRegex {
 
 impl std::fmt::Display for DomainRegex {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{} suffix {}", self.target, self.regex)
+        write!(f, "{} regex {}", self.target, self.regex)
     }
 }
 

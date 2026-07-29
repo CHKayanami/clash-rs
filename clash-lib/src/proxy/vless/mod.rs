@@ -1,4 +1,7 @@
-use self::{stream::VlessStream, vision::VisionStream};
+use self::{
+    stream::{VlessStream, VLESS_COMMAND_MUX, VLESS_COMMAND_TCP, VLESS_COMMAND_UDP},
+    vision::VisionStream,
+};
 use super::{
     AnyStream, ConnectorType, DialWithConnector, HandlerCommonOptions,
     OutboundHandler, OutboundType, PlainProxyAPIResponse,
@@ -8,9 +11,8 @@ use super::{
 use crate::{
     app::{
         dispatcher::{
-            BoxedInstrumentedDatagram, BoxedInstrumentedStream,
-            InstrumentedDatagram, InstrumentedDatagramWrapper, InstrumentedStream,
-            InstrumentedStreamWrapper,
+            BoxedChainedDatagram, BoxedChainedStream, ChainedDatagram,
+            ChainedDatagramWrapper, ChainedStream, ChainedStreamWrapper,
         },
         dns::ThreadSafeDNSResolver,
     },
@@ -26,6 +28,7 @@ use tracing::debug;
 mod datagram;
 mod stream;
 mod vision;
+pub mod xudp;
 
 pub struct HandlerOptions {
     pub name: String,
@@ -66,12 +69,22 @@ impl Handler {
         &self,
         s: AnyStream,
         sess: &Session,
-        is_udp: bool,
+        command: u8,
     ) -> io::Result<AnyStream> {
-        let (s, vision_opts) = if let Some(tls) = self.opts.tls.as_ref() {
-            tls.wrap_spliced(s).await?
+        let is_udp = command == VLESS_COMMAND_UDP || command == VLESS_COMMAND_MUX;
+
+        let (s, vision_opts) = if !is_udp {
+            if let Some(tls) = self.opts.tls.as_ref() {
+                tls.wrap_spliced(s).await?
+            } else {
+                (s, None)
+            }
         } else {
-            (s, None)
+            if let Some(tls) = self.opts.tls.as_ref() {
+                (tls.wrap(s).await?, None)
+            } else {
+                (s, None)
+            }
         };
 
         let s = if let Some(transport) = self.opts.transport.as_ref() {
@@ -80,18 +93,23 @@ impl Handler {
             s
         };
 
+        let flow = match self.opts.flow.as_deref() {
+            Some("xtls-rprx-vision") => Some("xtls-rprx-vision"),
+            _ => None,
+        };
+
         let vless_stream = VlessStream::new(
             s,
             &self.opts.uuid,
             &sess.destination,
-            is_udp,
-            self.opts.flow.clone(),
+            command,
+            flow,
         )?;
 
-        if self.opts.flow.as_deref() == Some("xtls-rprx-vision") {
+        if flow == Some("xtls-rprx-vision") {
             Ok(Box::new(VisionStream::new(
                 Box::new(vless_stream),
-                self.opts.uuid.clone(),
+                &self.opts.uuid,
                 vision_opts,
             )?))
         } else {
@@ -122,7 +140,7 @@ impl OutboundHandler for Handler {
         &self,
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
-    ) -> io::Result<BoxedInstrumentedStream> {
+    ) -> io::Result<BoxedChainedStream> {
         let dialer = self.connector.read().await;
 
         if let Some(dialer) = dialer.as_ref() {
@@ -134,7 +152,7 @@ impl OutboundHandler for Handler {
             resolver,
             dialer
                 .as_ref()
-                .unwrap_or(&GLOBAL_DIRECT_CONNECTOR.clone())
+                .unwrap_or(&*GLOBAL_DIRECT_CONNECTOR)
                 .as_ref(),
         )
         .await
@@ -144,7 +162,7 @@ impl OutboundHandler for Handler {
         &self,
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
-    ) -> io::Result<BoxedInstrumentedDatagram> {
+    ) -> io::Result<BoxedChainedDatagram> {
         let dialer = self.connector.read().await;
 
         if let Some(dialer) = dialer.as_ref() {
@@ -156,7 +174,7 @@ impl OutboundHandler for Handler {
             resolver,
             dialer
                 .as_ref()
-                .unwrap_or(&GLOBAL_DIRECT_CONNECTOR.clone())
+                .unwrap_or(&*GLOBAL_DIRECT_CONNECTOR)
                 .as_ref(),
         )
         .await
@@ -171,20 +189,21 @@ impl OutboundHandler for Handler {
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
         connector: &dyn RemoteConnector,
-    ) -> io::Result<BoxedInstrumentedStream> {
+    ) -> io::Result<BoxedChainedStream> {
         let stream = connector
             .connect_stream(
                 resolver,
                 self.opts.server.as_str(),
                 self.opts.port,
+                self.opts.common_opts.tfo,
                 sess.iface.as_ref(),
                 #[cfg(target_os = "linux")]
                 sess.so_mark,
             )
             .await?;
 
-        let s = self.inner_proxy_stream(stream, sess, false).await?;
-        let chained = InstrumentedStreamWrapper::new(s);
+        let s = self.inner_proxy_stream(stream, sess, VLESS_COMMAND_TCP).await?;
+        let chained = ChainedStreamWrapper::new(s);
         chained.append_to_chain(self.name()).await;
         Ok(Box::new(chained))
     }
@@ -194,22 +213,23 @@ impl OutboundHandler for Handler {
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
         connector: &dyn RemoteConnector,
-    ) -> io::Result<BoxedInstrumentedDatagram> {
+    ) -> io::Result<BoxedChainedDatagram> {
         let stream = connector
             .connect_stream(
                 resolver,
                 self.opts.server.as_str(),
                 self.opts.port,
+                self.opts.common_opts.tfo,
                 sess.iface.as_ref(),
                 #[cfg(target_os = "linux")]
                 sess.so_mark,
             )
             .await?;
 
-        let stream = self.inner_proxy_stream(stream, sess, true).await?;
-        let d = OutboundDatagramVless::new(stream, sess.destination.clone());
+        let stream = self.inner_proxy_stream(stream, sess, VLESS_COMMAND_MUX).await?;
+        let d = OutboundDatagramVless::new(stream, sess.destination.clone(), true);
 
-        let chained = InstrumentedDatagramWrapper::new(d);
+        let chained = ChainedDatagramWrapper::new(d);
         chained.append_to_chain(self.name()).await;
         Ok(Box::new(chained))
     }
@@ -240,7 +260,7 @@ mod tests {
     use super::*;
     use crate::{
         proxy::{
-            transport::{TlsClient, TransportLayer, WsClient},
+            transport::{TlsClient, WsClient},
             utils::test_utils::{
                 Suite,
                 docker_utils::{

@@ -6,7 +6,7 @@ use mockall::mock;
 use super::{AnyOutboundHandler, DialWithConnector, OutboundHandler, OutboundType};
 use crate::{
     app::{
-        dispatcher::{BoxedInstrumentedDatagram, BoxedInstrumentedStream},
+        dispatcher::{BoxedChainedDatagram, BoxedChainedStream},
         dns::ThreadSafeDNSResolver,
         remote_content_manager::providers::{
             Provider, ProviderType, ProviderVehicleType,
@@ -60,7 +60,7 @@ mock! {
             &self,
             sess: &Session,
             resolver: ThreadSafeDNSResolver,
-        ) -> io::Result<BoxedInstrumentedStream>;
+        ) -> io::Result<BoxedChainedStream>;
 
 
         /// connect to remote target via UDP
@@ -68,7 +68,7 @@ mock! {
             &self,
             sess: &Session,
             resolver: ThreadSafeDNSResolver,
-        ) -> io::Result<BoxedInstrumentedDatagram>;
+        ) -> io::Result<BoxedChainedDatagram>;
 
         /// relay related
         async fn support_connector(&self) -> crate::proxy::ConnectorType;

@@ -6,8 +6,8 @@ use async_trait::async_trait;
 use crate::{
     app::{
         dispatcher::{
-            BoxedInstrumentedDatagram, BoxedInstrumentedStream, InstrumentedStream,
-            InstrumentedStreamWrapper,
+            BoxedChainedDatagram, BoxedChainedStream, ChainedStream,
+            ChainedStreamWrapper,
         },
         dns::ThreadSafeDNSResolver,
     },
@@ -31,7 +31,7 @@ pub struct HandlerOptions {
 pub struct Handler {
     opts: HandlerOptions,
 
-    client: std::sync::Arc<arti_client::TorClient<tor_rtcompat::PreferredRuntime>>,
+    client: arti_client::TorClient<tor_rtcompat::PreferredRuntime>,
 }
 
 impl std::fmt::Debug for Handler {
@@ -73,7 +73,7 @@ impl OutboundHandler for Handler {
         &self,
         sess: &Session,
         _resolver: ThreadSafeDNSResolver,
-    ) -> std::io::Result<BoxedInstrumentedStream> {
+    ) -> std::io::Result<BoxedChainedStream> {
         let s = self
             .client
             .connect_with_prefs(
@@ -89,7 +89,7 @@ impl OutboundHandler for Handler {
             )
             .await
             .map_err(|x| new_io_error(x.to_string()))?;
-        let s = InstrumentedStreamWrapper::new(StreamWrapper::new(s));
+        let s = ChainedStreamWrapper::new(StreamWrapper::new(s));
         s.append_to_chain(self.name()).await;
         Ok(Box::new(s))
     }
@@ -98,7 +98,7 @@ impl OutboundHandler for Handler {
         &self,
         _sess: &Session,
         _resolver: ThreadSafeDNSResolver,
-    ) -> std::io::Result<BoxedInstrumentedDatagram> {
+    ) -> std::io::Result<BoxedChainedDatagram> {
         Err(new_io_error("Tor outbound handler does not support UDP"))
     }
 

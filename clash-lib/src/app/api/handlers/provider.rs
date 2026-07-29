@@ -331,25 +331,31 @@ async fn match_rule_provider(
             .into_response();
     };
 
-    let destination = match SocksAddr::from_str(&q.target) {
-        Ok(addr) => addr,
-        Err(_) => {
-            return (StatusCode::BAD_REQUEST, "invalid target").into_response();
+    let mut target = q.target.trim().to_owned();
+
+    // 智能判定：如果既不是合法的标准 SocketAddr（带端口），也不是合法的纯 IP（不带端口）
+    if target.parse::<std::net::SocketAddr>().is_err() {
+        if let Ok(ipv4) = target.parse::<std::net::Ipv4Addr>() {
+            // 纯 IPv4，手动补全默认端口
+            target = format!("{}:443", ipv4);
+        } else if let Ok(ipv6) = target.parse::<std::net::Ipv6Addr>() {
+            // 纯 IPv6，必须加中括号并补全端口
+            target = format!("[{}]:443", ipv6);
+        } else if !target.contains(':') {
+            // 纯域名（如 google.com），补全端口
+            target.push_str(":443");
         }
-    };
+    }
+
+    // 此时经过洗礼的 target，100% 带有合法端口且格式正确
+    let destination = SocksAddr::from_str(&target).unwrap();
 
     let sess = Session {
         network: Network::Tcp,
         typ: Type::Http,
         source: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
         destination,
-        resolved_ip: None,
-        so_mark: None,
-        iface: None,
-        asn: None,
-        country: None,
-        traffic_stats: None,
-        inbound_user: None,
+        ..Default::default()
     };
 
     axum::response::Json(MatchResponse {

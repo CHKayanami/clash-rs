@@ -34,6 +34,11 @@ impl CidrTrie {
         }
     }
 
+    #[allow(clippy::len_without_is_empty)]
+    pub fn len(&self) -> usize {
+        self.v4.len() + self.v6.len()
+    }
+
     pub fn contains(&self, ip: IpAddr) -> bool {
         match ip {
             IpAddr::V4(v4) => self.v4.longest_match(v4).is_some(),

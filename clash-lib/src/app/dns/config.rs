@@ -59,8 +59,11 @@ pub struct Config {
     pub enhance_mode: DNSMode,
     pub default_nameserver: Vec<NameServer>,
     pub proxy_server_nameserver: Option<Vec<NameServer>>,
-    pub fake_ip_range: ipnet::IpNet,
+    pub direct_nameserver: Option<Vec<NameServer>>,
+    pub fake_ip_range: ipnet::Ipv4Net,
+    pub fake_ip_range6: ipnet::Ipv6Net,
     pub fake_ip_filter: Vec<String>,
+    pub black_filter: Vec<String>,
     pub store_fake_ip: bool,
     pub store_smart_stats: bool,
     pub hosts: Option<trie::StringTrie<IpAddr>>,
@@ -185,13 +188,13 @@ impl Config {
         let mut policy = HashMap::new();
 
         for (domain, server) in policy_map {
-            let nameservers =
-                Config::parse_nameserver(std::slice::from_ref(server))?;
+            let nameservers = Config::parse_nameserver(&[server.to_owned()])?;
 
             let (_, valid) = trie::valid_and_split_domain(domain);
             if !valid {
                 return Err(Error::InvalidConfig(format!(
-                    "DNS ResolverRule invalid domain: {domain}"
+                    "DNS ResolverRule invalid domain: {}",
+                    &domain
                 )));
             }
             policy.insert(domain.into(), nameservers[0].clone());
@@ -329,6 +332,18 @@ impl TryFrom<&crate::config::def::Config> for Config {
             None
         };
 
+        let direct_nameserver = if !dc.direct_nameserver.is_empty() {
+            let ns = Config::parse_nameserver(&dc.direct_nameserver)?;
+            if ns.is_empty() {
+                return Err(Error::InvalidConfig(String::from(
+                    "direct-nameserver has no usable entries (all skipped)",
+                )));
+            }
+            Some(ns)
+        } else {
+            None
+        };
+
         let edns_client_subnet = dc
             .edns_client_subnet
             .as_ref()
@@ -428,14 +443,23 @@ impl TryFrom<&crate::config::def::Config> for Config {
             enhance_mode: dc.enhanced_mode.clone(),
             default_nameserver,
             proxy_server_nameserver,
-            fake_ip_range: dc.fake_ip_range.parse::<ipnet::IpNet>().map_err(
-                |_| Error::InvalidConfig(String::from("invalid fake ip range")),
+            direct_nameserver,
+            fake_ip_range: dc.fake_ip_range.parse::<ipnet::Ipv4Net>().map_err(
+                |_| Error::InvalidConfig(String::from("invalid fake ipv4 range")),
+            )?,
+            fake_ip_range6: dc.fake_ip_range6.parse::<ipnet::Ipv6Net>().map_err(
+                |_| Error::InvalidConfig(String::from("invalid fake ipv6 range")),
             )?,
             fake_ip_filter: dc.fake_ip_filter.clone(),
+            black_filter: dc.black_filter.clone(),
             store_fake_ip: c.profile.store_fake_ip,
             store_smart_stats: c.profile.store_smart_stats,
             hosts: if dc.use_hosts && !c.hosts.is_empty() {
-                Config::parse_hosts(&c.hosts).ok()
+                // Fail the config instead of silently discarding the whole
+                // hosts table because one entry has a malformed IP.
+                Some(Config::parse_hosts(&c.hosts).map_err(|e| {
+                    Error::InvalidConfig(format!("invalid `hosts` entry: {e}"))
+                })?)
             } else {
                 let mut tree = trie::StringTrie::new();
                 tree.insert(

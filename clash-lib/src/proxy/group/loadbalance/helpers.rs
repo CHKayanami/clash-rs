@@ -55,11 +55,21 @@ fn jump_hash(key: u64, buckets: i32) -> i32 {
 }
 
 pub fn strategy_rr() -> StrategyFn {
-    let mut index = 0;
+    let mut index = 0usize;
     Box::new(move |proxies: Vec<AnyOutboundHandler>, _: &Session| {
         let len = proxies.len();
-        index = (index + 1) % len;
-        Box::pin(futures::future::ok(proxies[index].clone()))
+        // `% len` on an empty group panicked. A group whose provider fetched an
+        // empty (or failed) subscription reaches here with nothing to pick.
+        if len == 0 {
+            return Box::pin(futures::future::err(std::io::Error::other(
+                "no proxy found",
+            )));
+        }
+        // Read then advance, so the first call uses the first proxy rather
+        // than skipping it.
+        let picked = index % len;
+        index = picked.wrapping_add(1);
+        Box::pin(futures::future::ok(proxies[picked].clone()))
     })
 }
 

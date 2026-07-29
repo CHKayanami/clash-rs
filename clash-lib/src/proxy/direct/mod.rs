@@ -5,18 +5,16 @@ pub(crate) mod datagram;
 use crate::{
     app::{
         dispatcher::{
-            BoxedInstrumentedDatagram, BoxedInstrumentedStream,
-            InstrumentedDatagram, InstrumentedDatagramWrapper, InstrumentedStream,
-            InstrumentedStreamWrapper,
+            BoxedChainedDatagram, BoxedChainedStream, ChainedDatagram,
+            ChainedDatagramWrapper, ChainedStream, ChainedStreamWrapper,
         },
         dns::ThreadSafeDNSResolver,
     },
     common::errors::map_io_error,
-    config::internal::proxy::PROXY_DIRECT,
     proxy::{
         OutboundHandler,
         direct::datagram::OutboundDatagramImpl,
-        utils::{new_dual_stack_udp_socket, new_tcp_stream},
+        utils::{new_dual_stack_udp_socket, prepare_tcp_socket},
     },
     session::Session,
 };
@@ -47,14 +45,46 @@ impl Handler {
             name: name.to_owned(),
         }
     }
+
+    /// Open one TCP connection to `endpoint`, honouring the session's interface
+    /// and firewall mark.
+    async fn dial(
+        sess: &Session,
+        endpoint: std::net::SocketAddr,
+    ) -> std::io::Result<tokio::net::TcpStream> {
+        let socket = prepare_tcp_socket(
+            endpoint,
+            sess.iface.as_ref(),
+            #[cfg(target_os = "linux")]
+            sess.so_mark,
+        )?;
+
+        tokio::time::timeout(CONNECT_TIMEOUT, socket.connect(endpoint))
+            .await
+            .map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "tcp connection timed out",
+                )
+            })?
+    }
 }
 
 impl DialWithConnector for Handler {}
 
+/// How long a direct TCP connect may take before being abandoned.
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 #[async_trait]
 impl OutboundHandler for Handler {
+    /// The configured name, not the literal `DIRECT`.
+    ///
+    /// Returning the constant meant every `type: direct` proxy in a config
+    /// reported the same name, and callers key off this: `ProxyManager`
+    /// liveness records, the dispatcher's UDP NAT entries, and the connection
+    /// chain all collapsed distinct direct proxies onto one identity.
     fn name(&self) -> &str {
-        PROXY_DIRECT
+        &self.name
     }
 
     fn proto(&self) -> OutboundType {
@@ -69,22 +99,64 @@ impl OutboundHandler for Handler {
         &self,
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
-    ) -> std::io::Result<BoxedInstrumentedStream> {
+    ) -> std::io::Result<BoxedChainedStream> {
+        let host = sess.destination.host();
+        let port = sess.destination.port();
+
         let remote_ip = resolver
-            .resolve(sess.destination.host().as_str(), false)
+            .resolve(host.as_str(), false)
             .map_err(map_io_error)
             .await?
             .ok_or_else(|| std::io::Error::other("no dns result"))?;
 
-        let s = new_tcp_stream(
-            (remote_ip, sess.destination.port()).into(),
-            sess.iface.as_ref(),
-            #[cfg(target_os = "linux")]
-            sess.so_mark,
-        )
-        .await?;
+        let first_err = match Self::dial(sess, (remote_ip, port).into()).await {
+            Ok(stream) => {
+                let s = ChainedStreamWrapper::new(stream);
+                s.append_to_chain(self.name()).await;
+                return Ok(Box::new(s));
+            }
+            Err(e) => e,
+        };
 
-        let s = InstrumentedStreamWrapper::new(s);
+        // `resolve` hands back a single address, so a host that is reachable
+        // over one family but not the other (a broken IPv6 path being the
+        // common case) failed outright. Retry once against the other family
+        // before giving up. Only meaningful for names — an IP literal resolves
+        // to itself.
+        let fallback_ip = if sess.destination.is_domain() {
+            if remote_ip.is_ipv6() {
+                resolver
+                    .resolve_v4(host.as_str(), false)
+                    .await
+                    .ok()
+                    .flatten()
+                    .map(std::net::IpAddr::from)
+            } else {
+                resolver
+                    .resolve_v6(host.as_str(), false)
+                    .await
+                    .ok()
+                    .flatten()
+                    .map(std::net::IpAddr::from)
+            }
+        } else {
+            None
+        };
+
+        let Some(fallback_ip) = fallback_ip.filter(|ip| *ip != remote_ip) else {
+            return Err(first_err);
+        };
+
+        tracing::debug!(
+            "direct connect to {remote_ip} failed ({first_err}), retrying \
+             {host} via {fallback_ip}"
+        );
+
+        let tcp_stream = Self::dial(sess, (fallback_ip, port).into())
+            .await
+            .map_err(|_| first_err)?;
+
+        let s = ChainedStreamWrapper::new(tcp_stream);
         s.append_to_chain(self.name()).await;
         Ok(Box::new(s))
     }
@@ -93,7 +165,7 @@ impl OutboundHandler for Handler {
         &self,
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
-    ) -> std::io::Result<BoxedInstrumentedDatagram> {
+    ) -> std::io::Result<BoxedChainedDatagram> {
         // The outbound socket is shared across ALL destinations from the same
         // client (keyed by src_addr only in the dispatcher). Use a dual-stack
         // socket so one socket can send to both IPv4 and IPv6 destinations
@@ -103,9 +175,8 @@ impl OutboundHandler for Handler {
             #[cfg(target_os = "linux")]
             sess.so_mark,
         )?;
-        let d = InstrumentedDatagramWrapper::new(OutboundDatagramImpl::new(
-            udp, resolver,
-        ));
+        let d =
+            ChainedDatagramWrapper::new(OutboundDatagramImpl::new(udp, resolver));
         d.append_to_chain(self.name()).await;
         Ok(Box::new(d))
     }
@@ -119,18 +190,19 @@ impl OutboundHandler for Handler {
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
         connector: &dyn RemoteConnector,
-    ) -> std::io::Result<BoxedInstrumentedStream> {
+    ) -> std::io::Result<BoxedChainedStream> {
         let s = connector
             .connect_stream(
                 resolver,
                 sess.destination.host().as_str(),
                 sess.destination.port(),
+                false,
                 sess.iface.as_ref(),
                 #[cfg(target_os = "linux")]
                 sess.so_mark,
             )
             .await?;
-        let s = InstrumentedStreamWrapper::new(s);
+        let s = ChainedStreamWrapper::new(s);
         s.append_to_chain(self.name()).await;
         Ok(Box::new(s))
     }
@@ -140,7 +212,7 @@ impl OutboundHandler for Handler {
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
         connector: &dyn RemoteConnector,
-    ) -> std::io::Result<BoxedInstrumentedDatagram> {
+    ) -> std::io::Result<BoxedChainedDatagram> {
         let d = connector
             .connect_datagram(
                 resolver,
@@ -151,7 +223,7 @@ impl OutboundHandler for Handler {
                 sess.so_mark,
             )
             .await?;
-        let d = InstrumentedDatagramWrapper::new(d);
+        let d = ChainedDatagramWrapper::new(d);
         d.append_to_chain(self.name()).await;
         Ok(Box::new(d))
     }
@@ -225,7 +297,7 @@ mod tests {
             .expect("connect_datagram failed");
 
         d.send(UdpPacket {
-            data: b"hello-v4".to_vec(),
+            data: bytes::Bytes::from_static(b"hello-v4"),
             dst_addr: SocksAddr::Ip(echo),
             ..Default::default()
         })
@@ -236,7 +308,7 @@ mod tests {
             .await
             .expect("timed out")
             .expect("stream ended");
-        assert_eq!(pkt.data, b"hello-v4");
+        assert_eq!(pkt.data.as_ref(), b"hello-v4");
     }
 
     /// Same path but sending to two different IPv4 destinations via the same
@@ -261,7 +333,7 @@ mod tests {
 
         for (dst, payload) in [(echo_a, b"to-a" as &[u8]), (echo_b, b"to-b")] {
             d.send(UdpPacket {
-                data: payload.to_vec(),
+                data: bytes::Bytes::copy_from_slice(payload),
                 dst_addr: SocksAddr::Ip(dst),
                 ..Default::default()
             })
@@ -277,8 +349,8 @@ mod tests {
                 .expect("stream ended");
             received.insert(pkt.data);
         }
-        assert!(received.contains(b"to-a".as_ref()));
-        assert!(received.contains(b"to-b".as_ref()));
+        assert!(received.contains(&bytes::Bytes::from_static(b"to-a")));
+        assert!(received.contains(&bytes::Bytes::from_static(b"to-b")));
     }
 
     /// IPv6 round-trip — skipped when the host has no IPv6 loopback.
@@ -305,7 +377,7 @@ mod tests {
             .expect("connect_datagram failed");
 
         d.send(UdpPacket {
-            data: b"hello-v6".to_vec(),
+            data: bytes::Bytes::from_static(b"hello-v6"),
             dst_addr: SocksAddr::Ip(echo),
             ..Default::default()
         })
@@ -316,6 +388,6 @@ mod tests {
             .await
             .expect("timed out")
             .expect("stream ended");
-        assert_eq!(pkt.data, b"hello-v6");
+        assert_eq!(pkt.data.as_ref(), b"hello-v6");
     }
 }

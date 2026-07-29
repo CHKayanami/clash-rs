@@ -71,7 +71,7 @@ pub fn routes(
 }
 
 async fn get_configs(State(state): State<ConfigState>) -> impl IntoResponse {
-    let run_mode = state.dispatcher.get_mode().await;
+    let run_mode = state.dispatcher.get_mode();
     let log_level = {
         let global_state = state.global_state.lock().await;
         global_state.log_level
@@ -200,7 +200,12 @@ async fn update_configs(
     let (done, wait) = tokio::sync::oneshot::channel();
     match reload_tx.send((cfg, done)).await {
         Ok(_) => match wait.await {
-            Ok(_) => StatusCode::NO_CONTENT.into_response(),
+            Ok(Ok(_)) => StatusCode::NO_CONTENT.into_response(),
+            Ok(Err(e)) => (
+                StatusCode::BAD_REQUEST,
+                format!("config reload failed: {e}"),
+            )
+                .into_response(),
             Err(_) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "config reload did not complete",
@@ -308,7 +313,7 @@ async fn patch_configs(
     // Apply mode change before restarting listeners so that new connections
     // established after the restart immediately use the updated mode.
     if let Some(mode) = payload.mode {
-        state.dispatcher.set_mode(mode).await;
+        state.dispatcher.set_mode(mode);
     }
 
     if need_restart {

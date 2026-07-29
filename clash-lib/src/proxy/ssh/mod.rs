@@ -19,8 +19,8 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use crate::{
     app::{
         dispatcher::{
-            BoxedInstrumentedDatagram, BoxedInstrumentedStream, InstrumentedStream,
-            InstrumentedStreamWrapper,
+            BoxedChainedDatagram, BoxedChainedStream, ChainedStream,
+            ChainedStreamWrapper,
         },
         dns::ThreadSafeDNSResolver,
     },
@@ -31,13 +31,15 @@ use crate::{
 
 use super::{
     ConnectorType, DialWithConnector, HandlerCommonOptions, OutboundHandler,
-    OutboundType, PlainProxyAPIResponse, utils::RemoteConnector,
+    OutboundType, PlainProxyAPIResponse, ProxyStream, utils::RemoteConnector,
 };
 
 /// Wrapper for `ChannelStream` for `Debug` trait
 struct ChannelStreamWrapper {
     inner: ChannelStream<Msg>,
 }
+
+impl ProxyStream for ChannelStreamWrapper {}
 
 impl std::fmt::Debug for ChannelStreamWrapper {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -168,7 +170,7 @@ impl OutboundHandler for Handler {
         &self,
         sess: &Session,
         _resolver: ThreadSafeDNSResolver,
-    ) -> io::Result<BoxedInstrumentedStream> {
+    ) -> io::Result<BoxedChainedStream> {
         // key exchange algorithms
         let kex = Cow::Borrowed(KEX_ALGORITHMS);
         // host key algorithms
@@ -216,10 +218,11 @@ impl OutboundHandler for Handler {
             )
             .await
             .map_err(io::Error::other)?;
-        let s: crate::proxy::AnyStream = Box::new(ChannelStreamWrapper {
+        let s = Box::new(ChannelStreamWrapper {
             inner: channel.into_stream(),
         });
-        let chained = InstrumentedStreamWrapper::new(s);
+        let chained: ChainedStreamWrapper<Box<dyn ProxyStream + Sync>> =
+            ChainedStreamWrapper::new(s);
         chained.append_to_chain(self.name()).await;
         Ok(Box::new(chained))
     }
@@ -229,7 +232,7 @@ impl OutboundHandler for Handler {
         &self,
         _sess: &Session,
         _resolver: ThreadSafeDNSResolver,
-    ) -> std::io::Result<BoxedInstrumentedDatagram> {
+    ) -> std::io::Result<BoxedChainedDatagram> {
         Err(new_io_error("ssh udp is not implemented yet"))
     }
 
@@ -869,5 +872,3 @@ rules:
         result
     }
 }
-
-impl crate::proxy::ProxyStream for ChannelStreamWrapper {}

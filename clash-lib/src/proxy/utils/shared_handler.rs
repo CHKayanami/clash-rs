@@ -1,12 +1,12 @@
 use std::{collections::HashMap, fmt, io, sync::Arc};
+use parking_lot::RwLock;
 
 use async_trait::async_trait;
-use tokio::sync::RwLock;
 use tracing::warn;
 
 use crate::{
     app::{
-        dispatcher::{BoxedInstrumentedDatagram, BoxedInstrumentedStream},
+        dispatcher::{BoxedChainedDatagram, BoxedChainedStream},
         dns::ThreadSafeDNSResolver,
     },
     config::internal::proxy::PROXY_DIRECT,
@@ -50,8 +50,8 @@ impl SharedOutboundHandler {
         Self { name, registry }
     }
 
-    async fn get_inner(&self) -> AnyOutboundHandler {
-        match self.registry.read().await.get(&self.name).cloned() {
+    fn get_inner(&self) -> AnyOutboundHandler {
+        match self.registry.read().get(&self.name).cloned() {
             Some(h) => h,
             None => {
                 // Only warn when the proxy name is not the well-known DIRECT
@@ -68,6 +68,7 @@ impl SharedOutboundHandler {
         }
     }
 }
+
 
 impl fmt::Debug for SharedOutboundHandler {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -93,29 +94,28 @@ impl OutboundHandler for SharedOutboundHandler {
     }
 
     async fn support_udp(&self) -> bool {
-        self.get_inner().await.support_udp().await
+        self.get_inner().support_udp().await
     }
 
     async fn connect_stream(
         &self,
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
-    ) -> io::Result<BoxedInstrumentedStream> {
-        self.get_inner().await.connect_stream(sess, resolver).await
+    ) -> io::Result<BoxedChainedStream> {
+        self.get_inner().connect_stream(sess, resolver).await
     }
 
     async fn connect_datagram(
         &self,
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
-    ) -> io::Result<BoxedInstrumentedDatagram> {
+    ) -> io::Result<BoxedChainedDatagram> {
         self.get_inner()
-            .await
             .connect_datagram(sess, resolver)
             .await
     }
 
     async fn support_connector(&self) -> ConnectorType {
-        self.get_inner().await.support_connector().await
+        self.get_inner().support_connector().await
     }
 }

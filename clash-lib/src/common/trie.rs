@@ -94,7 +94,7 @@ impl<T> StringTrie<T> {
             return None;
         }
 
-        if let Some(n) = Self::search_inner(&self.root, parts)
+        if let Some(n) = Self::search_inner(&self.root, &parts)
             && n.data.is_some()
         {
             return Some(n);
@@ -165,20 +165,20 @@ impl<T> StringTrie<T> {
         node.data = Some(data);
     }
 
-    fn search_inner<'a>(node: &'a Node<T>, parts: Vec<&str>) -> Option<&'a Node<T>> {
+    fn search_inner<'a>(node: &'a Node<T>, parts: &[&str]) -> Option<&'a Node<T>> {
         if parts.is_empty() {
             return Some(node);
         }
 
-        if let Some(c) = node.get_child(parts.last().unwrap().to_owned())
-            && let Some(n) = Self::search_inner(c, parts[0..parts.len() - 1].into())
+        if let Some(c) = node.get_child(*parts.last().unwrap())
+            && let Some(n) = Self::search_inner(c, &parts[0..parts.len() - 1])
             && n.data.is_some()
         {
             return Some(n);
         }
 
         if let Some(c) = node.get_child(WILDCARD)
-            && let Some(n) = Self::search_inner(c, parts[0..parts.len() - 1].into())
+            && let Some(n) = Self::search_inner(c, &parts[0..parts.len() - 1])
             && n.data.is_some()
         {
             return Some(n);

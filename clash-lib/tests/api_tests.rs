@@ -27,6 +27,7 @@ fn start_unique_client() -> (ClashInstance, u16) {
             rt: None,
             log_file: None,
             config_path: None,
+            dns_collect_file: None,
         },
         (port_base..port_base + CLIENT_PORT_BLOCK).collect(),
     )
@@ -77,6 +78,7 @@ async fn test_wildcard_cors_returns_any_origin_header() {
             rt: None,
             log_file: None,
             config_path: None,
+            dns_collect_file: None,
         },
         (port_base..port_base + CLIENT_PORT_BLOCK).collect(),
     )
@@ -121,6 +123,7 @@ async fn test_config_reload_via_payload() {
             rt: None,
             log_file: None,
             config_path: None,
+            dns_collect_file: None,
         },
         (port_base..port_base + CLIENT_PORT_BLOCK).collect(),
     )
@@ -291,6 +294,7 @@ async fn test_config_reload_via_empty_path_uses_stored_config_path() {
             rt: None,
             log_file: None,
             config_path: Some(config_file),
+            dns_collect_file: None,
         },
         (port_base..port_base + CLIENT_PORT_BLOCK).collect(),
     )
@@ -352,6 +356,7 @@ async fn test_connections_returns_proxy_chain_names() {
             rt: None,
             log_file: None,
             config_path: None,
+            dns_collect_file: None,
         },
         vec![server_base, server_base + 1],
     )
@@ -365,6 +370,7 @@ async fn test_connections_returns_proxy_chain_names() {
             rt: None,
             log_file: None,
             config_path: None,
+            dns_collect_file: None,
         },
         (client_base..client_base + CLIENT_PORT_BLOCK).collect(),
     )
@@ -765,6 +771,7 @@ async fn test_user_stats_endpoint_empty_on_no_traffic() {
             rt: None,
             log_file: None,
             config_path: None,
+            dns_collect_file: None,
         },
         vec![server_base, server_base + 1],
     )

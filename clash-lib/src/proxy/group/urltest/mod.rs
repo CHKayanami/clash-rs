@@ -1,11 +1,11 @@
-use std::{io, sync::atomic::AtomicU16, time::Duration};
+use std::{io, time::Duration};
 
 use async_trait::async_trait;
 use tracing::trace;
 
 use crate::{
     app::{
-        dispatcher::{BoxedInstrumentedDatagram, BoxedInstrumentedStream},
+        dispatcher::{BoxedChainedDatagram, BoxedChainedStream},
         dns::ThreadSafeDNSResolver,
         remote_content_manager::{
             ProxyManager, providers::proxy_provider::ArcProxyProvider,
@@ -33,7 +33,10 @@ pub struct Handler {
 
     providers: Vec<ArcProxyProvider>,
     proxy_manager: ProxyManager,
-    fastest_proxy_index: AtomicU16,
+    /// Name of the proxy the tolerance hysteresis is currently sticky to.
+    /// Tracking a list position instead silently retargeted the selection
+    /// whenever a provider refresh reordered the members.
+    current_fastest: parking_lot::RwLock<Option<String>>,
 }
 
 impl std::fmt::Debug for Handler {
@@ -56,7 +59,7 @@ impl Handler {
             tolerance,
             providers,
             proxy_manager,
-            fastest_proxy_index: AtomicU16::new(0),
+            current_fastest: parking_lot::RwLock::new(None),
         }
     }
 
@@ -64,7 +67,17 @@ impl Handler {
         get_proxies_from_providers(&self.providers, touch).await
     }
 
-    async fn fastest(&self, touch: bool) -> Option<AnyOutboundHandler> {
+    /// Pick the proxy to use.
+    ///
+    /// `commit` records the outcome as the new sticky choice. Read-only callers
+    /// (the API, capability probes) pass `false` — previously every one of them
+    /// rewrote the sticky state, so merely polling `/proxies` could change
+    /// which proxy the group routed through.
+    async fn fastest(
+        &self,
+        touch: bool,
+        commit: bool,
+    ) -> Option<AnyOutboundHandler> {
         let proxy_manager = self.proxy_manager.clone();
 
         let proxies = self.get_proxies(touch).await;
@@ -72,19 +85,16 @@ impl Handler {
             return None;
         }
 
-        let current_fastest_index = std::cmp::min(
-            self.fastest_proxy_index
-                .load(std::sync::atomic::Ordering::Relaxed),
-            proxies.len() as u16 - 1,
-        ) as usize;
+        let current_name = self.current_fastest.read().clone();
 
-        let mut fastest = None;
+        let mut fastest: Option<(usize, Duration)> = None;
         let mut current_alive = false;
         let mut current_delay = Duration::MAX;
         for (index, proxy) in proxies.iter().enumerate() {
+            let is_current = current_name.as_deref() == Some(proxy.name());
             let (alive, delay) =
                 proxy_manager.alive_and_last_delay(proxy.name()).await;
-            if index == current_fastest_index {
+            if is_current {
                 current_alive = alive;
             }
             if !alive {
@@ -92,7 +102,7 @@ impl Handler {
             }
 
             let delay = delay.unwrap_or(Duration::MAX);
-            if index == current_fastest_index {
+            if is_current {
                 current_delay = delay;
             }
             if match fastest {
@@ -111,16 +121,26 @@ impl Handler {
         let switch_threshold = fastest_delay
             .checked_add(tolerance)
             .unwrap_or(Duration::MAX);
-        let selected_index = if !current_alive || current_delay > switch_threshold {
-            fastest_index
-        } else {
-            current_fastest_index
+
+        let current_index = current_name
+            .as_deref()
+            .and_then(|name| proxies.iter().position(|p| p.name() == name));
+
+        let selected_index = match current_index {
+            // Stick with the current pick while it is alive and within
+            // tolerance of the best.
+            Some(index) if current_alive && current_delay <= switch_threshold => {
+                index
+            }
+            _ => fastest_index,
         };
 
-        self.fastest_proxy_index
-            .store(selected_index as u16, std::sync::atomic::Ordering::Relaxed);
-
         let selected = &proxies[selected_index];
+
+        if commit {
+            *self.current_fastest.write() = Some(selected.name().to_owned());
+        }
+
         let selected_delay = if selected_index == fastest_index {
             fastest_delay
         } else {
@@ -157,7 +177,7 @@ impl OutboundHandler for Handler {
         if self.opts.udp {
             return true;
         }
-        match self.fastest(false).await {
+        match self.fastest(false, false).await {
             Some(fastest) => fastest.support_udp().await,
             None => false,
         }
@@ -168,8 +188,8 @@ impl OutboundHandler for Handler {
         &self,
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
-    ) -> io::Result<BoxedInstrumentedStream> {
-        let fastest = self.fastest(false).await.ok_or_else(|| {
+    ) -> io::Result<BoxedChainedStream> {
+        let fastest = self.fastest(true, true).await.ok_or_else(|| {
             io::Error::other(format!("no proxy found for {}", self.name()))
         })?;
         let s = fastest.connect_stream(sess, resolver).await?;
@@ -184,8 +204,8 @@ impl OutboundHandler for Handler {
         &self,
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
-    ) -> io::Result<BoxedInstrumentedDatagram> {
-        let fastest = self.fastest(false).await.ok_or_else(|| {
+    ) -> io::Result<BoxedChainedDatagram> {
+        let fastest = self.fastest(true, true).await.ok_or_else(|| {
             io::Error::other(format!("no proxy found for {}", self.name()))
         })?;
         let d = fastest.connect_datagram(sess, resolver).await?;
@@ -196,7 +216,7 @@ impl OutboundHandler for Handler {
     }
 
     async fn support_connector(&self) -> ConnectorType {
-        match self.fastest(false).await {
+        match self.fastest(false, false).await {
             Some(fastest) => fastest.support_connector().await,
             None => ConnectorType::Tcp,
         }
@@ -207,9 +227,9 @@ impl OutboundHandler for Handler {
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
         connector: &dyn RemoteConnector,
-    ) -> io::Result<BoxedInstrumentedStream> {
+    ) -> io::Result<BoxedChainedStream> {
         let s = self
-            .fastest(true)
+            .fastest(true, true)
             .await
             .ok_or_else(|| {
                 io::Error::other(format!("no proxy found for {}", self.name()))
@@ -226,14 +246,18 @@ impl OutboundHandler for Handler {
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
         connector: &dyn RemoteConnector,
-    ) -> io::Result<BoxedInstrumentedDatagram> {
-        self.fastest(true)
+    ) -> io::Result<BoxedChainedDatagram> {
+        let d = self
+            .fastest(true, true)
             .await
             .ok_or_else(|| {
                 io::Error::other(format!("no proxy found for {}", self.name()))
             })?
             .connect_datagram_with_connector(sess, resolver, connector)
-            .await
+            .await?;
+
+        d.append_to_chain(self.name()).await;
+        Ok(d)
     }
 
     fn try_as_group_handler(&self) -> Option<&dyn GroupProxyAPIResponse> {
@@ -248,7 +272,7 @@ impl GroupProxyAPIResponse for Handler {
     }
 
     async fn get_active_proxy(&self) -> Option<AnyOutboundHandler> {
-        self.fastest(false).await
+        self.fastest(false, false).await
     }
 
     fn get_latency_test_url(&self) -> Option<String> {

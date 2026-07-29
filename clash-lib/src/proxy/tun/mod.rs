@@ -62,6 +62,7 @@ mod tests {
                 rt: None,
                 log_file: Some(log_file_clone),
                 config_path: None,
+                dns_collect_file: None,
             })
             .unwrap()
         });
@@ -134,6 +135,7 @@ mod tests {
                 rt: None,
                 log_file: Some(log_file_clone),
                 config_path: None,
+                dns_collect_file: None,
             })
             .unwrap()
         });
