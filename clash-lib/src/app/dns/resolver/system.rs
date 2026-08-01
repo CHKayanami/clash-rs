@@ -6,10 +6,10 @@ use crate::{
     app::router::Router,
 };
 use async_trait::async_trait;
-use rand::seq::IteratorRandom;
-use tracing::{debug, warn};
-use std::sync::Arc;
 use hickory_proto::op::Message;
+use rand::seq::IteratorRandom;
+use std::sync::Arc;
+use tracing::{debug, warn};
 pub struct SystemResolver {
     ipv6: AtomicBool,
 }
@@ -54,7 +54,7 @@ impl ClashResolver for SystemResolver {
         Ok(response.into_iter().choose(&mut rand::rng()))
     }
 
-    async fn exchange_all(&self, _req: &Message) -> anyhow::Result<Message>{
+    async fn exchange_all(&self, _req: &Message) -> anyhow::Result<Message> {
         Err(anyhow::anyhow!("exchange_all is not implemented yet"))
     }
 
@@ -129,9 +129,7 @@ impl ClashResolver for SystemResolver {
         None
     }
 
-    async fn after_router_inited(&self, _: Arc<Router>) {
-        
-    }
+    async fn after_router_inited(&self, _: Arc<Router>) {}
 }
 
 #[cfg(test)]

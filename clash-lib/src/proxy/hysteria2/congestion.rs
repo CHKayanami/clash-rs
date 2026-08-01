@@ -87,9 +87,13 @@ impl Controller for Brutal {
             if self.rtt == 0 {
                 return 10240;
             }
-            let ack_rate = if self.ack_rate <= 0.001 { 1.0 } else { self.ack_rate };
-            ((self.bps * self.rtt * CONGESTION_WINDOW_MULTIPLIER) as f64
-                / ack_rate) as u64
+            let ack_rate = if self.ack_rate <= 0.001 {
+                1.0
+            } else {
+                self.ack_rate
+            };
+            ((self.bps * self.rtt * CONGESTION_WINDOW_MULTIPLIER) as f64 / ack_rate)
+                as u64
         } else {
             0
         }
@@ -195,14 +199,24 @@ impl DynController {
     }
 }
 
-pub fn try_set_brutal_controller(session: &quinn::Connection, effective_up_bps: u64) {
+pub fn try_set_brutal_controller(
+    session: &quinn::Connection,
+    effective_up_bps: u64,
+) {
     if effective_up_bps > 0 {
-        match session.congestion_state().into_any().downcast::<DynController>() {
+        match session
+            .congestion_state()
+            .into_any()
+            .downcast::<DynController>()
+        {
             Ok(dyn_controller) => {
-                dyn_controller.set_controller(Box::new(Brutal::new(effective_up_bps)));
+                dyn_controller
+                    .set_controller(Box::new(Brutal::new(effective_up_bps)));
             }
             Err(_) => {
-                tracing::trace!("congestion controller is not set or not DynController");
+                tracing::trace!(
+                    "congestion controller is not set or not DynController"
+                );
             }
         }
     }

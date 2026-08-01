@@ -117,8 +117,14 @@ impl<T: ProxyStream + ?Sized> ProxyStream for Box<T> {
     }
 }
 
-impl<S: AsyncRead + AsyncWrite + Send + Sync + Unpin> ProxyStream for tokio_rustls::client::TlsStream<S> {}
-impl<S: AsyncRead + AsyncWrite + Send + Sync + Unpin> ProxyStream for tokio_rustls::server::TlsStream<S> {}
+impl<S: AsyncRead + AsyncWrite + Send + Sync + Unpin> ProxyStream
+    for tokio_rustls::client::TlsStream<S>
+{
+}
+impl<S: AsyncRead + AsyncWrite + Send + Sync + Unpin> ProxyStream
+    for tokio_rustls::server::TlsStream<S>
+{
+}
 
 pub trait ClientStream: ProxyStream {}
 impl<T: ProxyStream> ClientStream for T {}

@@ -575,4 +575,3 @@ fn test_session_id() {
     let display_str = s1.to_string();
     assert!(display_str.contains(&format!("[#{}]", s1.id)));
 }
-

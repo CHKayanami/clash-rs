@@ -513,12 +513,10 @@ where
         // Check idle timeout
         let deadline = *last_active + *idle_timeout_duration;
         if tokio::time::Instant::now() >= deadline {
-            return Poll::Ready(Err(CopyBidirectionalError::Other(
-                Error::new(
-                    ErrorKind::TimedOut,
-                    "connection idle timeout",
-                ),
-            )));
+            return Poll::Ready(Err(CopyBidirectionalError::Other(Error::new(
+                ErrorKind::TimedOut,
+                "connection idle timeout",
+            ))));
         }
 
         if idle_timeout.deadline() != deadline {

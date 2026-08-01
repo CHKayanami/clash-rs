@@ -106,12 +106,7 @@ impl Router {
         // Pre-loop GeoIP/ASN resolution: if the session already has an IP address,
         // populate its geo metadata once to avoid repeated MaxMind lookups inside the rule loop.
         if let Some(ip) = sess.resolved_ip.or(sess.destination.ip()) {
-            Self::populate_geo_for_ip(
-                ip,
-                &self.country_mmdb,
-                &self.asn_mmdb,
-                sess,
-            );
+            Self::populate_geo_for_ip(ip, &self.country_mmdb, &self.asn_mmdb, sess);
         }
 
         for r in self.rules.iter() {

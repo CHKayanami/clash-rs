@@ -89,9 +89,7 @@ pub type RuleSetChangeCallback = Arc<dyn Fn() + Send + Sync + 'static>;
 /// Clone the subscriber list out before dispatching so the lock is not held
 /// while callbacks run — a callback that registered another one would otherwise
 /// deadlock on the non-reentrant `RwLock`.
-fn notify_subscribers(
-    subscribers: &std::sync::RwLock<Vec<RuleSetChangeCallback>>,
-) {
+fn notify_subscribers(subscribers: &std::sync::RwLock<Vec<RuleSetChangeCallback>>) {
     let callbacks = match subscribers.read() {
         Ok(guard) => guard.clone(),
         Err(_) => return,

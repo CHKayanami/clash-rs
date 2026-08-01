@@ -32,8 +32,15 @@ pub async fn new(
     if cfg.enable {
         match store {
             Some(store) => Arc::new(
-                EnhancedResolver::new(cfg, store, mmdb, outbounds, rule_dispatch, collector)
-                    .await,
+                EnhancedResolver::new(
+                    cfg,
+                    store,
+                    mmdb,
+                    outbounds,
+                    rule_dispatch,
+                    collector,
+                )
+                .await,
             ),
             _ => print_and_exit!("enhanced resolver requires cache store"),
         }

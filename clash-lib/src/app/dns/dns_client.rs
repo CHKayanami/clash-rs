@@ -7,8 +7,8 @@ use std::{
     time::Duration,
 };
 
-use tracing::{trace};
 use async_trait::async_trait;
+use tracing::trace;
 
 use hickory_net::{
     DnsHandle, client, h2::HttpsClientStream, tcp::TcpClientStream,
@@ -565,19 +565,30 @@ impl Client for DnsClient {
 
     #[instrument(skip(msg), level = "trace")]
     async fn exchange(&self, msg: &Message) -> anyhow::Result<Message> {
-    // 💡 状态判定：检查是否需要进行初始化或自愈重建
+        // 💡 状态判定：检查是否需要进行初始化或自愈重建
         let need_initialize = {
             let inner = self.inner.read().await;
-            inner.c.is_none() || inner.bg_handle.as_ref().is_none_or(|bg| bg.is_finished())
+            inner.c.is_none()
+                || inner.bg_handle.as_ref().is_none_or(|bg| bg.is_finished())
         };
 
         if need_initialize {
             let mut inner = self.inner.write().await;
             // Double check lock 保证高并发下只有一个协程触发重建
-            if inner.c.is_none() || inner.bg_handle.as_ref().is_none_or(|bg| bg.is_finished()) {
-                if inner.c.is_some() && inner.bg_handle.as_ref().map(|bg| bg.is_finished()).unwrap_or(false) {
-                    warn!("dns client background task is finished, likely connection closed, restarting a new one");
-                    
+            if inner.c.is_none()
+                || inner.bg_handle.as_ref().is_none_or(|bg| bg.is_finished())
+            {
+                if inner.c.is_some()
+                    && inner
+                        .bg_handle
+                        .as_ref()
+                        .map(|bg| bg.is_finished())
+                        .unwrap_or(false)
+                {
+                    warn!(
+                        "dns client background task is finished, likely connection closed, restarting a new one"
+                    );
+
                     // 💡 优化 2：在重建前，强制对旧驱动进行主动熔断清理，防止孤儿任务常驻
                     if let Some(old_bg) = inner.bg_handle.take() {
                         old_bg.abort();
@@ -631,8 +642,8 @@ async fn dns_stream_builder(
     cfg: &DnsConfig,
     rule_dispatch: Option<Arc<RuleDispatch>>,
 ) -> Result<(client::Client<DnsRuntimeProvider>, JoinHandle<()>), Error> {
- let dns_resolver = Arc::new(dns::SystemResolver::new(false)?);
-    
+    let dns_resolver = Arc::new(dns::SystemResolver::new(false)?);
+
     match cfg {
         DnsConfig::Udp(addr, iface, proxy, fw_mark) => {
             let stream = UdpClientStream::builder(
@@ -649,12 +660,14 @@ async fn dns_stream_builder(
             .build();
 
             let (x, y) = client::Client::<DnsRuntimeProvider>::from_sender(stream);
-            
+
             // 💡 规范化：为后台驱动注入追踪性日志，防止孤儿协程静默挂起
             let bg_task = tokio::spawn(async move {
                 trace!("[DNS Driver] DNS background loop started");
                 y.await; // 💡 它的返回值就是 ()，直接在这里挂起运行
-                warn!("[DNS Driver] DNS background loop exited (likely connection closed or link rotated)");
+                warn!(
+                    "[DNS Driver] DNS background loop exited (likely connection closed or link rotated)"
+                );
             });
             Ok((x, bg_task))
         }
@@ -675,16 +688,18 @@ async fn dns_stream_builder(
                 ),
             );
 
-            let stream = stream_future
-                .await
-                .map_err(|x| Error::DNSError(format!("TCP stream connection failed: {}", x)))?;
-            
+            let stream = stream_future.await.map_err(|x| {
+                Error::DNSError(format!("TCP stream connection failed: {}", x))
+            })?;
+
             let (x, y) = client::Client::<DnsRuntimeProvider>::new(stream, sender);
-            
+
             let bg_task = tokio::spawn(async move {
                 trace!("[DNS Driver] DNS background loop started");
                 y.await; // 💡 它的返回值就是 ()，直接在这里挂起运行
-                warn!("[DNS Driver] DNS background loop exited (likely connection closed or link rotated)");
+                warn!(
+                    "[DNS Driver] DNS background loop exited (likely connection closed or link rotated)"
+                );
             });
             Ok((x, bg_task))
         }
@@ -700,9 +715,11 @@ async fn dns_stream_builder(
             let host = host.clone();
             let iface = iface.clone();
 
-            let server_name = ServerName::try_from(host.to_string())
-                .map_err(|e| Error::DNSError(format!("Invalid DoT hostname: {}", e)))?;
-                
+            let server_name =
+                ServerName::try_from(host.to_string()).map_err(|e| {
+                    Error::DNSError(format!("Invalid DoT hostname: {}", e))
+                })?;
+
             let (stream_future, sender) = tls_client_connect(
                 addr,
                 server_name,
@@ -716,20 +733,22 @@ async fn dns_stream_builder(
                 ),
             );
 
-            let stream = stream_future
-                .await
-                .map_err(|x| Error::DNSError(format!("DoT TLS handshake failed: {}", x)))?;
-            
+            let stream = stream_future.await.map_err(|x| {
+                Error::DNSError(format!("DoT TLS handshake failed: {}", x))
+            })?;
+
             let (x, y) = client::Client::<DnsRuntimeProvider>::with_timeout(
                 stream,
                 sender,
                 Duration::from_secs(5),
             );
-            
+
             let bg_task = tokio::spawn(async move {
                 trace!("[DNS Driver] DNS background loop started");
                 y.await; // 💡 它的返回值就是 ()，直接在这里挂起运行
-                warn!("[DNS Driver] DNS background loop exited (likely connection closed or link rotated)");
+                warn!(
+                    "[DNS Driver] DNS background loop exited (likely connection closed or link rotated)"
+                );
             });
             Ok((x, bg_task))
         }
@@ -751,7 +770,7 @@ async fn dns_stream_builder(
                     tls::NoHostnameTlsVerifier::new(),
                 ));
             }
-            
+
             let stream = HttpsClientStream::builder(
                 Arc::new(tls_config),
                 DnsRuntimeProvider::new(
@@ -767,14 +786,15 @@ async fn dns_stream_builder(
             .map_err(|x| Error::DNSError(format!("DoH connection failed: {}", x)))?;
 
             let (x, y) = client::Client::<DnsRuntimeProvider>::from_sender(stream);
-            
+
             let bg_task = tokio::spawn(async move {
                 trace!("[DNS Driver] DNS background loop started");
                 y.await; // 💡 它的返回值就是 ()，直接在这里挂起运行
-                warn!("[DNS Driver] DNS background loop exited (likely connection closed or link rotated)");
+                warn!(
+                    "[DNS Driver] DNS background loop exited (likely connection closed or link rotated)"
+                );
             });
             Ok((x, bg_task))
         }
     }
-    
 }

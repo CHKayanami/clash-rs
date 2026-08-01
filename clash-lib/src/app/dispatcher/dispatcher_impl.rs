@@ -24,7 +24,7 @@ use std::{
     net::SocketAddr,
     sync::{
         Arc, RwLock,
-        atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -283,8 +283,10 @@ impl Dispatcher {
 
         let s = sess.clone();
         let ss = sess.clone();
-        let t1 = tokio::spawn(async move {
-            while let Some(mut packet) = local_r.next().await {
+        let current_span = tracing::Span::current();
+        let t1 = tokio::spawn(
+            async move {
+                while let Some(mut packet) = local_r.next().await {
                 let mut sess = sess.clone();
 
                 // Canonicalize IPv4-mapped IPv6 addresses (e.g. SS2022 on a
@@ -581,37 +583,47 @@ impl Dispatcher {
             }
 
             trace!("UDP session local -> remote finished for {}", ss);
-        });
+        }.instrument(current_span.clone()));
 
         let ss = s.clone();
-        let t2 = tokio::spawn(async move {
-            while let Some(packet) = remote_receiver_r.recv().await {
-                match local_w.send(packet).await {
-                    Ok(_) => {}
-                    Err(err) => {
-                        error!("failed to send packet to local: {}", err);
+        let t2 = tokio::spawn(
+            async move {
+                while let Some(packet) = remote_receiver_r.recv().await {
+                    match local_w.send(packet).await {
+                        Ok(_) => {}
+                        Err(err) => {
+                            error!("failed to send packet to local: {}", err);
+                        }
                     }
                 }
+                trace!("UDP session remote -> local finished for {}", ss);
             }
-            trace!("UDP session remote -> local finished for {}", ss);
-        });
+            .instrument(current_span.clone()),
+        );
 
         let (close_sender, close_receiver) = tokio::sync::oneshot::channel::<u8>();
 
-        tokio::spawn(async move {
-            // Either outcome means the caller is done with this session: `Ok`
-            // is an explicit close, `Err` means the sender was dropped without
-            // one. Both must tear the relay tasks down — returning early on
-            // `Err` used to leak them until the idle sweep noticed.
-            match close_receiver.await {
-                Ok(_) => trace!("UDP close signal for {} received", s),
-                Err(_) => {
-                    debug!("UDP close sender for {} dropped, closing session", s)
+        tokio::spawn(
+            async move {
+                // Either outcome means the caller is done with this session:
+                // `Ok` is an explicit close, `Err` means the sender was
+                // dropped without one. Both must tear the relay tasks down —
+                // returning early on `Err` used to leak them until the idle
+                // sweep noticed.
+                match close_receiver.await {
+                    Ok(_) => trace!("UDP close signal for {} received", s),
+                    Err(_) => {
+                        debug!(
+                            "UDP close sender for {} dropped, closing session",
+                            s
+                        )
+                    }
                 }
+                t1.abort();
+                t2.abort();
             }
-            t1.abort();
-            t2.abort();
-        });
+            .instrument(current_span),
+        );
 
         close_sender
     }
@@ -851,8 +863,7 @@ impl TimeoutUdpSessionManager {
 
                 // Update coarse clock every tick (~1 s resolution)
                 let elapsed = start.elapsed().as_secs();
-                coarse_now_cloned
-                    .store(elapsed, Ordering::Relaxed);
+                coarse_now_cloned.store(elapsed, Ordering::Relaxed);
 
                 tick_count += 1;
 
@@ -875,8 +886,7 @@ impl TimeoutUdpSessionManager {
                         trace!("udp session finished: {:?}", k);
                         return false;
                     }
-                    let last =
-                        val.last_active.load(Ordering::Relaxed);
+                    let last = val.last_active.load(Ordering::Relaxed);
                     let is_alive = now.saturating_sub(last) < timeout_secs;
                     if !is_alive {
                         expired_count += 1;

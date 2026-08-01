@@ -1,4 +1,4 @@
-use crate::{Error, common::utils::{default_bool_true}, config::utils};
+use crate::{Error, common::utils::default_bool_true, config::utils};
 use serde::{Deserialize, de::value::MapDeserializer};
 use serde_yaml::Value;
 #[cfg(feature = "shadowquic")]

@@ -2,7 +2,7 @@ use super::platform::must_bind_socket_on_interface;
 use crate::{app::net::OutboundInterface, proxy::AnyStream};
 
 use futures::io;
-use socket2::{TcpKeepalive,Socket,Domain,Protocol,Type};
+use socket2::{Domain, Protocol, Socket, TcpKeepalive, Type};
 
 use std::{
     net::{Ipv4Addr, Ipv6Addr, SocketAddr},
@@ -98,20 +98,38 @@ pub async fn new_tcp_stream(
     )?;
 
     if tfo {
-        trace!("[TCP Outbound] Initiating TCP Fast Open (TFO) to {}", endpoint);
+        trace!(
+            "[TCP Outbound] Initiating TCP Fast Open (TFO) to {}",
+            endpoint
+        );
 
-        match timeout(Duration::from_secs(10), TfoStream::connect_with_socket(tokio_socket, endpoint)).await {
+        match timeout(
+            Duration::from_secs(10),
+            TfoStream::connect_with_socket(tokio_socket, endpoint),
+        )
+        .await
+        {
             Ok(Ok(tfo_stream)) => Ok(Box::new(tfo_stream)),
             Ok(Err(e)) => Err(e),
-            Err(_) => Err(io::Error::new(io::ErrorKind::TimedOut, "TFO connection timed out")),
+            Err(_) => Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "TFO connection timed out",
+            )),
         }
     } else {
-        trace!("[TCP Outbound] Initiating standard TCP connection to {}", endpoint);
+        trace!(
+            "[TCP Outbound] Initiating standard TCP connection to {}",
+            endpoint
+        );
 
-        match timeout(Duration::from_secs(10), tokio_socket.connect(endpoint)).await {
+        match timeout(Duration::from_secs(10), tokio_socket.connect(endpoint)).await
+        {
             Ok(Ok(tcp_stream)) => Ok(Box::new(tcp_stream)),
             Ok(Err(e)) => Err(e),
-            Err(_) => Err(io::Error::new(io::ErrorKind::TimedOut, "standard tcp connection timed out")),
+            Err(_) => Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "standard tcp connection timed out",
+            )),
         }
     }
 }

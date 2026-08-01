@@ -3,8 +3,8 @@ use std::{
     sync::{Arc, OnceLock},
 };
 
-use crate::common::{mmdb::MmdbLookup, trie};
 use crate::app::remote_content_manager::providers::rule_provider::ThreadSafeRuleProvider;
+use crate::common::{mmdb::MmdbLookup, trie};
 use crate::session::{Session, SocksAddr};
 
 pub trait FallbackIPFilter: Sync + Send {
@@ -120,7 +120,10 @@ impl BlackDomainFilter {
         false
     }
 
-    pub fn add_rule_set(&self, rp_map: &std::collections::HashMap<String, ThreadSafeRuleProvider>) {
+    pub fn add_rule_set(
+        &self,
+        rp_map: &std::collections::HashMap<String, ThreadSafeRuleProvider>,
+    ) {
         if !self.ruleset_names.is_empty() {
             let mut providers = Vec::new();
             for name in &self.ruleset_names {

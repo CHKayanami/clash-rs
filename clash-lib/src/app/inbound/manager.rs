@@ -21,12 +21,12 @@ use crate::{
     },
     runner::Runner,
 };
+use parking_lot::RwLock;
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
     time::Duration,
 };
-use parking_lot::RwLock;
 
 /// Per-listener handle entry: the spawned task plus an optional channel to
 /// push user-list updates without restarting the listener.
@@ -347,9 +347,7 @@ impl InboundManager {
                                  listeners)",
                                 initial_opts.len()
                             );
-                            self.inbound_providers
-                                .write()
-                                .insert(name, provider);
+                            self.inbound_providers.write().insert(name, provider);
                         }
                         Err(e) => {
                             error!(provider = %name, "inbound provider init failed: {e}");
@@ -423,7 +421,10 @@ impl InboundManager {
             let mut guard = self.inbound_handlers.write();
             for (opt, entry) in guard.iter_mut() {
                 if let Some(h) = entry.handle.take() {
-                    warn!("Shutting down inbound handler: {}", opt.common_opts().name);
+                    warn!(
+                        "Shutting down inbound handler: {}",
+                        opt.common_opts().name
+                    );
                     handles.push(h);
                 }
             }
@@ -467,11 +468,7 @@ impl InboundManager {
         for (name, h) in handles {
             warn!("Shutting down inbound handler: {}", name);
             h.await.unwrap_or_else(|e| {
-                warn!(
-                    "Inbound handler {} shutdown with error: {}",
-                    name,
-                    e
-                );
+                warn!("Inbound handler {} shutdown with error: {}", name, e);
                 last_join_error = Some(e);
             });
         }
@@ -492,8 +489,7 @@ impl InboundManager {
             h.await.unwrap_or_else(|e| {
                 warn!(
                     "Provider inbound handler {} shutdown with error: {}",
-                    name,
-                    e
+                    name, e
                 );
                 last_join_error = Some(e);
             });

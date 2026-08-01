@@ -66,10 +66,14 @@ impl XudpCodec {
                     let header_data = buf.split_to(header_len);
 
                     if header_len < 4 {
-                        return Err(Error::new(ErrorKind::InvalidData, "XUDP header too short"));
+                        return Err(Error::new(
+                            ErrorKind::InvalidData,
+                            "XUDP header too short",
+                        ));
                     }
 
-                    let session_id = u16::from_be_bytes([header_data[0], header_data[1]]);
+                    let session_id =
+                        u16::from_be_bytes([header_data[0], header_data[1]]);
                     let status = SessionStatus::try_from(header_data[2])?;
                     let option = header_data[3];
 
@@ -94,7 +98,9 @@ impl XudpCodec {
                             status,
                             session_id,
                         };
-                    } else if status == SessionStatus::End || status == SessionStatus::KeepAlive {
+                    } else if status == SessionStatus::End
+                        || status == SessionStatus::KeepAlive
+                    {
                         self.read_state = XudpCodecReadState::WaitingPayloadLen {
                             option,
                             status,
@@ -102,7 +108,11 @@ impl XudpCodec {
                         };
                     }
                 }
-                XudpCodecReadState::WaitingPayloadLen { option, status, session_id } => {
+                XudpCodecReadState::WaitingPayloadLen {
+                    option,
+                    status,
+                    session_id,
+                } => {
                     let opt = *option;
                     let stat = *status;
                     let sid = *session_id;
@@ -147,7 +157,11 @@ impl XudpCodec {
                     }
 
                     let payload = buf.split_to(p_len).freeze();
-                    let packet = UdpPacket::new(payload, src_addr.clone(), SocksAddr::any_ipv4());
+                    let packet = UdpPacket::new(
+                        payload,
+                        src_addr.clone(),
+                        SocksAddr::any_ipv4(),
+                    );
 
                     if stat == SessionStatus::End {
                         self.session_to_destination.remove(&sid);
@@ -164,7 +178,9 @@ impl XudpCodec {
     }
 }
 
-fn read_addr_port_vmess_sync(buf: &mut std::io::Cursor<&[u8]>) -> io::Result<SocksAddr> {
+fn read_addr_port_vmess_sync(
+    buf: &mut std::io::Cursor<&[u8]>,
+) -> io::Result<SocksAddr> {
     if buf.remaining() < 3 {
         return Err(Error::new(ErrorKind::UnexpectedEof, "too short"));
     }
@@ -173,7 +189,10 @@ fn read_addr_port_vmess_sync(buf: &mut std::io::Cursor<&[u8]>) -> io::Result<Soc
     match atyp {
         0x01 => {
             if buf.remaining() < 4 {
-                return Err(Error::new(ErrorKind::UnexpectedEof, "too short for ipv4"));
+                return Err(Error::new(
+                    ErrorKind::UnexpectedEof,
+                    "too short for ipv4",
+                ));
             }
             let mut ip = [0u8; 4];
             buf.copy_to_slice(&mut ip);
@@ -184,7 +203,10 @@ fn read_addr_port_vmess_sync(buf: &mut std::io::Cursor<&[u8]>) -> io::Result<Soc
         }
         0x03 => {
             if buf.remaining() < 16 {
-                return Err(Error::new(ErrorKind::UnexpectedEof, "too short for ipv6"));
+                return Err(Error::new(
+                    ErrorKind::UnexpectedEof,
+                    "too short for ipv6",
+                ));
             }
             let mut ip = [0u8; 16];
             buf.copy_to_slice(&mut ip);
@@ -195,11 +217,17 @@ fn read_addr_port_vmess_sync(buf: &mut std::io::Cursor<&[u8]>) -> io::Result<Soc
         }
         0x02 => {
             if buf.remaining() < 1 {
-                return Err(Error::new(ErrorKind::UnexpectedEof, "too short for domain len"));
+                return Err(Error::new(
+                    ErrorKind::UnexpectedEof,
+                    "too short for domain len",
+                ));
             }
             let len = buf.get_u8() as usize;
             if buf.remaining() < len {
-                return Err(Error::new(ErrorKind::UnexpectedEof, "too short for domain name"));
+                return Err(Error::new(
+                    ErrorKind::UnexpectedEof,
+                    "too short for domain name",
+                ));
             }
             let mut domain = vec![0u8; len];
             buf.copy_to_slice(&mut domain);
@@ -207,6 +235,9 @@ fn read_addr_port_vmess_sync(buf: &mut std::io::Cursor<&[u8]>) -> io::Result<Soc
                 .map_err(|e| Error::new(ErrorKind::InvalidData, e.to_string()))?;
             Ok(SocksAddr::Domain(domain_str, port))
         }
-        _ => Err(Error::new(ErrorKind::InvalidData, format!("unknown atyp 0x{:02x}", atyp))),
+        _ => Err(Error::new(
+            ErrorKind::InvalidData,
+            format!("unknown atyp 0x{:02x}", atyp),
+        )),
     }
 }

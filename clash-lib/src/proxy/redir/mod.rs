@@ -87,7 +87,9 @@ impl InboundHandlerTrait for RedirInbound {
             let orig_dst = match get_original_destination_addr(&socket) {
                 Ok(addr) => addr.to_canonical(),
                 Err(e) => {
-                    warn!("redir failed to get original destination for {src_addr}: {e}");
+                    warn!(
+                        "redir failed to get original destination for {src_addr}: {e}"
+                    );
                     continue;
                 }
             };

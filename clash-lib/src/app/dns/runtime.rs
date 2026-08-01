@@ -179,13 +179,19 @@ impl DnsUdpSocket for DnsProxyUdpSocket {
 
         let packet = match ready!(inner.poll_next_unpin(cx)) {
             Some(p) => p,
-            None => return Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, "dns proxy outbound is closed"))),
+            None => {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "dns proxy outbound is closed",
+                )));
+            }
         };
 
         let len = packet.data.len().min(buf.len());
         buf[..len].copy_from_slice(&packet.data[0..len]);
-        
-        let src_addr = packet.src_addr
+
+        let src_addr = packet
+            .src_addr
             .try_into_socket_addr()
             .expect("packet source addr can't be a domain for dns proxy");
 

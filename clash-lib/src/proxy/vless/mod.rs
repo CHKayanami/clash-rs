@@ -1,5 +1,5 @@
 use self::{
-    stream::{VlessStream, VLESS_COMMAND_MUX, VLESS_COMMAND_TCP, VLESS_COMMAND_UDP},
+    stream::{VLESS_COMMAND_MUX, VLESS_COMMAND_TCP, VLESS_COMMAND_UDP, VlessStream},
     vision::VisionStream,
 };
 use super::{
@@ -98,13 +98,8 @@ impl Handler {
             _ => None,
         };
 
-        let vless_stream = VlessStream::new(
-            s,
-            &self.opts.uuid,
-            &sess.destination,
-            command,
-            flow,
-        )?;
+        let vless_stream =
+            VlessStream::new(s, &self.opts.uuid, &sess.destination, command, flow)?;
 
         if flow == Some("xtls-rprx-vision") {
             Ok(Box::new(VisionStream::new(
@@ -202,7 +197,9 @@ impl OutboundHandler for Handler {
             )
             .await?;
 
-        let s = self.inner_proxy_stream(stream, sess, VLESS_COMMAND_TCP).await?;
+        let s = self
+            .inner_proxy_stream(stream, sess, VLESS_COMMAND_TCP)
+            .await?;
         let chained = ChainedStreamWrapper::new(s);
         chained.append_to_chain(self.name()).await;
         Ok(Box::new(chained))
@@ -226,7 +223,9 @@ impl OutboundHandler for Handler {
             )
             .await?;
 
-        let stream = self.inner_proxy_stream(stream, sess, VLESS_COMMAND_MUX).await?;
+        let stream = self
+            .inner_proxy_stream(stream, sess, VLESS_COMMAND_MUX)
+            .await?;
         let d = OutboundDatagramVless::new(stream, sess.destination.clone(), true);
 
         let chained = ChainedDatagramWrapper::new(d);

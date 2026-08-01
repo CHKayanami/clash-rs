@@ -250,9 +250,7 @@ impl FakeDns {
                     Some(pool) => {
                         let u = u128::from(v6);
                         let mask = Self::v6_prefix_mask(pool.prefix_len);
-                        if u & mask
-                            != u128::from_be_bytes(pool.prefix) & mask
-                        {
+                        if u & mask != u128::from_be_bytes(pool.prefix) & mask {
                             return false;
                         }
                         let host_id = u & !mask;

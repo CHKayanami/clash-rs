@@ -8,9 +8,7 @@ use std::sync::Arc;
 #[cfg(test)]
 use mockall::automock;
 
-use hickory_proto::{
-    op::{Message},
-};
+use hickory_proto::op::Message;
 pub mod collector;
 pub mod config;
 mod dhcp;
@@ -85,7 +83,7 @@ pub trait ClashResolver: Sync + Send {
     async fn is_fake_ip(&self, ip: std::net::IpAddr) -> bool;
     fn fake_ip_enabled(&self) -> bool;
 
-    async fn after_router_inited(&self,r: Arc<Router>);
+    async fn after_router_inited(&self, r: Arc<Router>);
 
     fn ipv6(&self) -> bool;
     fn set_ipv6(&self, enable: bool);

@@ -18,9 +18,7 @@ use tracing_log::LogTracer;
 use tracing_opentelemetry::OpenTelemetryLayer;
 #[cfg(target_os = "ios")]
 use tracing_oslog::OsLogger;
-use tracing_subscriber::{
-    EnvFilter, Layer, filter::filter_fn, prelude::*,
-};
+use tracing_subscriber::{EnvFilter, Layer, filter::filter_fn, prelude::*};
 
 impl From<LogLevel> for LevelFilter {
     fn from(level: LogLevel) -> Self {
@@ -43,6 +41,134 @@ pub struct LogEvent {
     pub msg: String,
 }
 
+pub struct TraceIdExtension(pub u64);
+
+struct TraceIdVisitor(Option<u64>);
+
+impl tracing::field::Visit for TraceIdVisitor {
+    fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+        if field.name() == "trace_id" {
+            self.0 = Some(value);
+        }
+    }
+
+    fn record_i64(&mut self, field: &tracing::field::Field, value: i64) {
+        if field.name() == "trace_id" && value >= 0 {
+            self.0 = Some(value as u64);
+        }
+    }
+
+    fn record_debug(
+        &mut self,
+        field: &tracing::field::Field,
+        value: &dyn std::fmt::Debug,
+    ) {
+        if field.name() == "trace_id" {
+            let s = format!("{value:?}");
+            if let Ok(val) = s.parse::<u64>() {
+                self.0 = Some(val);
+            }
+        }
+    }
+}
+
+pub struct TraceIdLayer;
+
+impl<S> Layer<S> for TraceIdLayer
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+{
+    fn on_new_span(
+        &self,
+        attrs: &tracing::span::Attributes<'_>,
+        id: &tracing::span::Id,
+        ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        let mut visitor = TraceIdVisitor(None);
+        attrs.record(&mut visitor);
+        if let Some(trace_id) = visitor.0 {
+            if let Some(span) = ctx.span(id) {
+                span.extensions_mut().insert(TraceIdExtension(trace_id));
+            }
+        }
+    }
+
+    fn on_record(
+        &self,
+        id: &tracing::span::Id,
+        values: &tracing::span::Record<'_>,
+        ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        let mut visitor = TraceIdVisitor(None);
+        values.record(&mut visitor);
+        if let Some(trace_id) = visitor.0 {
+            if let Some(span) = ctx.span(id) {
+                span.extensions_mut().insert(TraceIdExtension(trace_id));
+            }
+        }
+    }
+}
+
+pub fn find_trace_id<S>(
+    ctx: &tracing_subscriber::layer::Context<'_, S>,
+    event: &tracing::Event<'_>,
+) -> Option<u64>
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+{
+    let current = ctx.event_span(event)?;
+    for span in current.scope() {
+        if let Some(ext) = span.extensions().get::<TraceIdExtension>() {
+            return Some(ext.0);
+        }
+    }
+    None
+}
+
+use tracing_subscriber::fmt::{
+    FmtContext, FormatEvent, FormatFields, format::Writer,
+};
+
+#[derive(Default)]
+pub struct TraceIdEventFormatter<F = tracing_subscriber::fmt::format::Format> {
+    inner: F,
+}
+
+impl<F> TraceIdEventFormatter<F> {
+    pub fn new(inner: F) -> Self {
+        Self { inner }
+    }
+}
+
+impl<S, N, F> FormatEvent<S, N> for TraceIdEventFormatter<F>
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+    N: for<'a> FormatFields<'a> + 'static,
+    F: FormatEvent<S, N>,
+{
+    fn format_event(
+        &self,
+        ctx: &FmtContext<'_, S, N>,
+        mut writer: Writer<'_>,
+        event: &tracing::Event<'_>,
+    ) -> std::fmt::Result {
+        let mut trace_id = None;
+        if let Some(current_span) = ctx.lookup_current() {
+            for span in current_span.scope() {
+                if let Some(ext) = span.extensions().get::<TraceIdExtension>() {
+                    trace_id = Some(ext.0);
+                    break;
+                }
+            }
+        }
+
+        if let Some(id) = trace_id {
+            write!(writer, "[#{id}] ")?;
+        }
+        self.inner.format_event(ctx, writer, event)
+    }
+}
+
 pub struct EventCollector(Vec<Sender<LogEvent>>);
 
 impl EventCollector {
@@ -53,14 +179,17 @@ impl EventCollector {
 
 impl<S> Layer<S> for EventCollector
 where
-    S: tracing::Subscriber,
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
 {
     fn on_event(
         &self,
         event: &tracing::Event<'_>,
-        _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ctx: tracing_subscriber::layer::Context<'_, S>,
     ) {
         let mut strs = vec![];
+        if let Some(trace_id) = find_trace_id(&ctx, event) {
+            strs.push(format!("[#{trace_id}]"));
+        }
         event.record(&mut EventVisitor(&mut strs));
 
         let event = LogEvent {
@@ -139,7 +268,10 @@ fn setup_logging_inner(
         } else {
             format!("{cwd}/{log_file}")
         };
-        let writer: std::fs::File = std::fs::File::options().create(true).append(true).open(log_path)?;
+        let writer: std::fs::File = std::fs::File::options()
+            .create(true)
+            .append(true)
+            .open(log_path)?;
         let (non_blocking, guard) =
             tracing_appender::non_blocking::NonBlockingBuilder::default()
                 .buffered_lines_limit(16_000)
@@ -197,7 +329,7 @@ fn setup_logging_inner(
     #[cfg(feature = "telemetry")]
     let tracer = tracer_provider.tracer("tracing-otel-subscriber");
 
-    let subscriber = tracing_subscriber::registry();
+    let subscriber = tracing_subscriber::registry().with(TraceIdLayer);
 
     // Collect and expose data about the Tokio runtime (tasks, threads, resources,
     // etc.) — gated on tokio_unstable because console_subscriber panics at
@@ -224,28 +356,33 @@ fn setup_logging_inner(
     let offset = time::UtcOffset::from_hms(8, 0, 0).unwrap();
     // 💡 这样即使在没有任何时区配置的裸 OpenWrt 固件上运行也绝对不会 Panic
     let timer = tracing_subscriber::fmt::time::OffsetTime::new(offset, format);
-  
 
     let log_to_file_layer = appender.map(|x| {
         tracing_subscriber::fmt::Layer::new()
-            .with_timer(timer.clone())
-            .with_ansi(false)
-            .compact()
-            .with_file(true)
-            .with_line_number(true)
-            .with_level(true)
+            .event_format(TraceIdEventFormatter::new(
+                tracing_subscriber::fmt::format()
+                    .compact()
+                    .with_timer(timer.clone())
+                    .with_ansi(false)
+                    .with_file(true)
+                    .with_line_number(true)
+                    .with_level(true),
+            ))
             .with_writer(x)
             .with_filter(exclude.clone())
     });
     let log_stdout_layer = tracing_subscriber::fmt::Layer::new()
-        .with_timer(timer)
-        .with_ansi(std::io::stdout().is_terminal())
-        .compact()
-        .with_target(cfg!(debug_assertions))
-        .with_file(true)
-        .with_line_number(true)
-        .with_level(true)
-        .with_thread_ids(cfg!(debug_assertions))
+        .event_format(TraceIdEventFormatter::new(
+            tracing_subscriber::fmt::format()
+                .compact()
+                .with_timer(timer)
+                .with_ansi(std::io::stdout().is_terminal())
+                .with_target(cfg!(debug_assertions))
+                .with_file(true)
+                .with_line_number(true)
+                .with_level(true)
+                .with_thread_ids(cfg!(debug_assertions)),
+        ))
         .with_writer(std::io::stdout)
         .with_filter(exclude.clone());
 
@@ -380,5 +517,26 @@ mod tests {
         assert!(event.msg.contains("answer=42"));
         assert!(event.msg.contains("kind=demo"));
         assert!(event.msg.contains("success=true"));
+    }
+
+    #[test]
+    fn collector_automatically_includes_trace_id() {
+        use super::TraceIdLayer;
+
+        let (tx, mut rx) = broadcast::channel(1);
+        let collector = EventCollector::new(vec![tx]);
+        let subscriber = registry().with(TraceIdLayer).with(collector);
+
+        tracing::subscriber::with_default(subscriber, || {
+            let span = tracing::info_span!("request", trace_id = 10000000u64);
+            let _guard = span.enter();
+            tracing::info!("inner request log message");
+        });
+
+        let event = rx.try_recv().expect("expected collected log event");
+
+        assert!(matches!(event.level, LogLevel::Info));
+        assert!(event.msg.contains("[#10000000]"));
+        assert!(event.msg.contains("inner request log message"));
     }
 }

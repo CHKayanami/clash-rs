@@ -51,13 +51,12 @@ impl TryFrom<&OutboundShadowsocks> for Handler {
                             ))?
                             .try_into()?;
                         let plugin = match opt.mode {
-                            SimpleOBFSMode::Http => TransportLayer::SimpleObfsHttp(SimpleObfsHttp::new(
-                                opt.host,
-                                s.common_opts.port,
-                            )),
-                            SimpleOBFSMode::Tls => {
-                                TransportLayer::SimpleObfsTls(SimpleObfsTLS::new(opt.host))
-                            }
+                            SimpleOBFSMode::Http => TransportLayer::SimpleObfsHttp(
+                                SimpleObfsHttp::new(opt.host, s.common_opts.port),
+                            ),
+                            SimpleOBFSMode::Tls => TransportLayer::SimpleObfsTls(
+                                SimpleObfsTLS::new(opt.host),
+                            ),
                         };
                         Some(plugin)
                     }
@@ -66,7 +65,8 @@ impl TryFrom<&OutboundShadowsocks> for Handler {
                             .plugin_opts
                             .clone()
                             .ok_or(Error::InvalidConfig(
-                                "plugin_opts is required for plugin v2ray-plugin".to_owned(),
+                                "plugin_opts is required for plugin v2ray-plugin"
+                                    .to_owned(),
                             ))?
                             .try_into()?;
                         // TODO: support more transport options, replace it with
@@ -79,7 +79,8 @@ impl TryFrom<&OutboundShadowsocks> for Handler {
                             .plugin_opts
                             .clone()
                             .ok_or(Error::InvalidConfig(
-                                "plugin_opts is required for plugin shadow-tls".to_owned(),
+                                "plugin_opts is required for plugin shadow-tls"
+                                    .to_owned(),
                             ))?
                             .try_into()?;
                         Some(TransportLayer::ShadowTls(plugin))

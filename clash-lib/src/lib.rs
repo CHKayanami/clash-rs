@@ -137,7 +137,8 @@ pub struct GlobalState {
     #[cfg(feature = "tun")]
     tunnel_runner: ArcRunner,
     dns_listener: ArcRunner,
-    reload_tx: mpsc::Sender<(Config, oneshot::Sender<std::result::Result<(), String>>)>,
+    reload_tx:
+        mpsc::Sender<(Config, oneshot::Sender<std::result::Result<(), String>>)>,
     cwd: String,
     /// Path to the config file used at startup. Used by the dashboard "Reload"
     /// button which sends an empty path to mean "reload current config".
@@ -188,7 +189,16 @@ pub fn start_scaffold(opts: Options) -> Result<()> {
         token_guard.push(shutdown_token.clone());
     }
     rt.block_on(async {
-        match start(config, cwd, config_path, dns_collect_file, log_tx, shutdown_token).await {
+        match start(
+            config,
+            cwd,
+            config_path,
+            dns_collect_file,
+            log_tx,
+            shutdown_token,
+        )
+        .await
+        {
             Err(e) => {
                 eprintln!("start error: {e}");
                 Err(e)
@@ -244,9 +254,14 @@ pub fn start_scaffold_instance(
 
         let (log_tx, _) = tokio::sync::broadcast::channel(100);
 
-        if let Err(e) =
-            rt.block_on(start(config, cwd, config_path, dns_collect_file, log_tx, token_clone))
-        {
+        if let Err(e) = rt.block_on(start(
+            config,
+            cwd,
+            config_path,
+            dns_collect_file,
+            log_tx,
+            token_clone,
+        )) {
             eprintln!("Clash instance error: {}", e);
         }
     });
@@ -302,7 +317,9 @@ pub async fn start(
     let controller_cfg = config.general.controller.clone();
     let log_level = config.general.log_level;
 
-    let mut components = create_components(cwd_path.clone(), config, None, dns_collect_file.clone()).await?;
+    let mut components =
+        create_components(cwd_path.clone(), config, None, dns_collect_file.clone())
+            .await?;
 
     let (reload_tx, mut reload_rx) = mpsc::channel(1);
 
@@ -348,7 +365,8 @@ pub async fn start(
 
     components.start_all();
 
-    let cwd_clone = cwd.clone();    let reload_token = shutdown_token.child_token();
+    let cwd_clone = cwd.clone();
+    let reload_token = shutdown_token.child_token();
     let shutdown_token_clone = shutdown_token.clone();
     tokio::spawn(async move {
         // Listen for config reload signal and reload config

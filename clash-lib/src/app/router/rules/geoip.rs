@@ -32,7 +32,9 @@ impl RuleMatcher for GeoIP {
             if let Some(mmdb) = &self.mmdb {
                 // Check if the IP matches the country code
                 mmdb.lookup_country(ip).is_ok_and(|country| {
-                    country.country_code.eq_ignore_ascii_case(&self.country_code)
+                    country
+                        .country_code
+                        .eq_ignore_ascii_case(&self.country_code)
                 })
             } else {
                 warn!(

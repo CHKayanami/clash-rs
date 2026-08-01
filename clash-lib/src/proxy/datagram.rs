@@ -48,7 +48,11 @@ impl Display for UdpPacket {
 }
 
 impl UdpPacket {
-    pub fn new(data: bytes::Bytes, src_addr: SocksAddr, dst_addr: SocksAddr) -> Self {
+    pub fn new(
+        data: bytes::Bytes,
+        src_addr: SocksAddr,
+        dst_addr: SocksAddr,
+    ) -> Self {
         Self {
             data,
             src_addr,
@@ -122,7 +126,10 @@ impl Sink<UdpPacket> for ChannelDatagram {
         }
     }
 
-    fn start_send(mut self: Pin<&mut Self>, item: UdpPacket) -> Result<(), Self::Error> {
+    fn start_send(
+        mut self: Pin<&mut Self>,
+        item: UdpPacket,
+    ) -> Result<(), Self::Error> {
         self.pkt = Some(item);
         Ok(())
     }
@@ -147,8 +154,10 @@ impl Sink<UdpPacket> for ChannelDatagram {
         }
     }
 
-    fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+    fn poll_close(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), Self::Error>> {
         self.poll_flush(cx)
     }
 }
-

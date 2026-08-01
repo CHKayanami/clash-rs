@@ -115,5 +115,3 @@ mod tests {
         assert_eq!(store.get_v6_by_host(host).await, Some(ip_v6));
     }
 }
-
-

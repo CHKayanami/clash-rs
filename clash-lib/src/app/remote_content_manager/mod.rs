@@ -177,13 +177,15 @@ impl ProxyManager {
         &self,
         name: &str,
     ) -> (bool, Option<Duration>) {
-        self.proxy_state
-            .get(name)
-            .map_or((true, None), |state| {
-                let alive = state.alive.load(Ordering::Relaxed);
-                let delay = state.delay_history.read().back().map(|history| history.delay);
-                (alive, delay)
-            })
+        self.proxy_state.get(name).map_or((true, None), |state| {
+            let alive = state.alive.load(Ordering::Relaxed);
+            let delay = state
+                .delay_history
+                .read()
+                .back()
+                .map(|history| history.delay);
+            (alive, delay)
+        })
     }
 
     pub async fn report_alive(

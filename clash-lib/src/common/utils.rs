@@ -70,7 +70,6 @@ pub fn default_bool_true() -> bool {
     true
 }
 
-
 pub fn serialize_duration<S>(
     duration: &std::time::Duration,
     serializer: S,

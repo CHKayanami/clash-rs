@@ -236,10 +236,12 @@ where
         // Check idle timeout
         let deadline = *last_active + *idle_timeout_duration;
         if tokio::time::Instant::now() >= deadline {
-            return Poll::Ready(Err(CopyBidirectionalError::Other(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "connection idle timeout",
-            ))));
+            return Poll::Ready(Err(CopyBidirectionalError::Other(
+                std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "connection idle timeout",
+                ),
+            )));
         }
 
         // Align sleep timer deadline with last active change to avoid frequency reset bugs
@@ -251,12 +253,8 @@ where
         loop {
             match a_to_b {
                 TransferState::Running(buf) => {
-                    let res = buf.poll_copy(
-                        cx,
-                        a.as_mut(),
-                        b.as_mut(),
-                        Some(last_active),
-                    );
+                    let res =
+                        buf.poll_copy(cx, a.as_mut(), b.as_mut(), Some(last_active));
                     match res {
                         Poll::Ready(Ok(count)) => {
                             *a_to_b = TransferState::ShuttingDown(count);
@@ -306,12 +304,8 @@ where
 
             match b_to_a {
                 TransferState::Running(buf) => {
-                    let res = buf.poll_copy(
-                        cx,
-                        b.as_mut(),
-                        a.as_mut(),
-                        Some(last_active),
-                    );
+                    let res =
+                        buf.poll_copy(cx, b.as_mut(), a.as_mut(), Some(last_active));
                     match res {
                         Poll::Ready(Ok(count)) => {
                             *b_to_a = TransferState::ShuttingDown(count);

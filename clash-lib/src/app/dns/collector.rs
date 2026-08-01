@@ -48,7 +48,11 @@ impl DnsCollector {
         }
 
         let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
-        if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&file_path) {
+        if let Ok(mut file) = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&file_path)
+        {
             let _ = writeln!(file, "# {}", now);
             let _ = file.flush();
         }
@@ -81,7 +85,9 @@ impl DnsCollector {
 
     pub fn record(&self, domain: &str, is_fake_ip: bool) {
         let domain_clean = domain.trim().trim_end_matches('.').to_lowercase();
-        if domain_clean.is_empty() || domain_clean.parse::<std::net::IpAddr>().is_ok() {
+        if domain_clean.is_empty()
+            || domain_clean.parse::<std::net::IpAddr>().is_ok()
+        {
             return;
         }
 
@@ -94,7 +100,9 @@ impl DnsCollector {
         let mut seen = self.seen.write();
         if seen.insert(domain_clean.clone()) {
             let kind = if is_fake_ip { "fakeip" } else { "realip" };
-            self.pending_writes.lock().push((domain_clean, kind.to_string()));
+            self.pending_writes
+                .lock()
+                .push((domain_clean, kind.to_string()));
             self.has_new.store(true, Ordering::Release);
         }
     }
@@ -121,7 +129,10 @@ impl DnsCollector {
                 Ok(mut file) => {
                     for (domain, kind) in to_write {
                         if let Err(e) = writeln!(file, "{} {}", domain, kind) {
-                            error!("Failed to write to DNS collect file {:?}: {}", path, e);
+                            error!(
+                                "Failed to write to DNS collect file {:?}: {}",
+                                path, e
+                            );
                         }
                     }
                     if let Err(e) = file.flush() {
@@ -185,7 +196,8 @@ mod tests {
         let temp_file = NamedTempFile::new().unwrap();
         let file_path = temp_file.path().to_path_buf();
 
-        std::fs::write(&file_path, "existing.com realip\nanother.org fakeip\n").unwrap();
+        std::fs::write(&file_path, "existing.com realip\nanother.org fakeip\n")
+            .unwrap();
 
         let collector = DnsCollector::new(file_path.clone()).unwrap();
         assert_eq!(collector.seen_count(), 2);

@@ -224,7 +224,8 @@ impl Manager {
     }
 
     pub fn close_all(&self) {
-        let keys: Vec<uuid::Uuid> = self.connections.iter().map(|r| *r.key()).collect();
+        let keys: Vec<uuid::Uuid> =
+            self.connections.iter().map(|r| *r.key()).collect();
         for key in keys {
             self.close(key);
         }
@@ -253,7 +254,8 @@ impl Manager {
     }
 
     pub async fn snapshot(&self) -> Snapshot {
-        let conns_data: Vec<(Arc<TrackerInfo>, ProxyChain)> = self.connections
+        let conns_data: Vec<(Arc<TrackerInfo>, ProxyChain)> = self
+            .connections
             .iter()
             .map(|r| {
                 let (tracked, _) = r.value();

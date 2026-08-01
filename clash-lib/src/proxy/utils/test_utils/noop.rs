@@ -1,17 +1,16 @@
-use std::io;
-use std::sync::Arc;
 use async_trait::async_trait;
 use hickory_proto::op;
+use std::io;
+use std::sync::Arc;
 
 use crate::{
     app::{
         dispatcher::{BoxedChainedDatagram, BoxedChainedStream},
         dns::{ClashResolver, ResolverKind, ThreadSafeDNSResolver},
-        router::Router
+        router::Router,
     },
     proxy::{ConnectorType, DialWithConnector, OutboundHandler, OutboundType},
     session::Session,
-    
 };
 
 pub struct NoopResolver;
@@ -25,8 +24,6 @@ impl ClashResolver for NoopResolver {
     ) -> anyhow::Result<Option<std::net::IpAddr>> {
         Ok(None)
     }
-
-
 
     async fn resolve_v4(
         &self,
@@ -54,7 +51,10 @@ impl ClashResolver for NoopResolver {
     }
 
     /// Used for DNS Server
-    async fn exchange_all(&self, _message: &op::Message) -> anyhow::Result<op::Message> {
+    async fn exchange_all(
+        &self,
+        _message: &op::Message,
+    ) -> anyhow::Result<op::Message> {
         Err(anyhow::anyhow!("unsupported"))
     }
     /// Only used for look up fake IP
@@ -76,9 +76,7 @@ impl ClashResolver for NoopResolver {
 
     fn set_ipv6(&self, _enable: bool) {}
 
-    async fn after_router_inited(&self,_r: Arc<Router>){
-
-    }
+    async fn after_router_inited(&self, _r: Arc<Router>) {}
 
     fn kind(&self) -> ResolverKind {
         ResolverKind::Clash

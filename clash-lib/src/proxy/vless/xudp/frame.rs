@@ -62,7 +62,11 @@ pub struct XudpFrame {
 }
 
 impl XudpFrame {
-    pub fn encode_payload(&self, payload: &[u8], buf: &mut BytesMut) -> io::Result<()> {
+    pub fn encode_payload(
+        &self,
+        payload: &[u8],
+        buf: &mut BytesMut,
+    ) -> io::Result<()> {
         let frame_len_pos = buf.len();
         buf.put_u16(0); // placeholder for frame length
 
@@ -78,7 +82,8 @@ impl XudpFrame {
         }
 
         let frame_len = buf.len() - header_start;
-        buf[frame_len_pos..frame_len_pos + 2].copy_from_slice(&(frame_len as u16).to_be_bytes());
+        buf[frame_len_pos..frame_len_pos + 2]
+            .copy_from_slice(&(frame_len as u16).to_be_bytes());
 
         buf.put_u16(payload.len() as u16);
         buf.put_slice(payload);

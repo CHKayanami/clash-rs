@@ -1,5 +1,5 @@
-use std::{collections::HashMap, fmt, io, sync::Arc};
 use parking_lot::RwLock;
+use std::{collections::HashMap, fmt, io, sync::Arc};
 
 use async_trait::async_trait;
 use tracing::warn;
@@ -69,7 +69,6 @@ impl SharedOutboundHandler {
     }
 }
 
-
 impl fmt::Debug for SharedOutboundHandler {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "SharedOutboundHandler({})", self.name)
@@ -110,9 +109,7 @@ impl OutboundHandler for SharedOutboundHandler {
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
     ) -> io::Result<BoxedChainedDatagram> {
-        self.get_inner()
-            .connect_datagram(sess, resolver)
-            .await
+        self.get_inner().connect_datagram(sess, resolver).await
     }
 
     async fn support_connector(&self) -> ConnectorType {
