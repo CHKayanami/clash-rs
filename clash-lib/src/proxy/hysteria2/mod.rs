@@ -777,6 +777,17 @@ impl AsyncRead for HystStream {
     }
 }
 
+fn is_normal_write_closure(e: &quinn::WriteError) -> bool {
+    match e {
+        quinn::WriteError::Stopped(code) => code.into_inner() == 0,
+        quinn::WriteError::ConnectionLost(quinn::ConnectionError::ApplicationClosed(app)) => {
+            app.error_code.into_inner() == 0
+        }
+        quinn::WriteError::ConnectionLost(quinn::ConnectionError::LocallyClosed) => true,
+        _ => false,
+    }
+}
+
 impl AsyncWrite for HystStream {
     fn poll_write(
         self: Pin<&mut Self>,
@@ -786,7 +797,11 @@ impl AsyncWrite for HystStream {
         Pin::new(&mut self.get_mut().send)
             .poll_write(cx, buf)
             .map_err(|e| {
-                tracing::error!("hysteria2 write error: {}", e);
+                if is_normal_write_closure(&e) {
+                    tracing::debug!("hysteria2 write closed: {}", e);
+                } else {
+                    tracing::error!("hysteria2 write error: {}", e);
+                }
                 e.into()
             })
     }
@@ -803,6 +818,20 @@ impl AsyncWrite for HystStream {
         cx: &mut Context<'_>,
     ) -> Poll<std::io::Result<()>> {
         Pin::new(&mut self.get_mut().send).poll_shutdown(cx)
+    }
+}
+
+#[cfg(test)]
+mod unit_tests {
+    use super::*;
+
+    #[test]
+    fn test_is_normal_write_closure() {
+        let err = quinn::WriteError::Stopped(quinn::VarInt::from_u32(0));
+        assert!(is_normal_write_closure(&err));
+
+        let err_nonzero = quinn::WriteError::Stopped(quinn::VarInt::from_u32(1));
+        assert!(!is_normal_write_closure(&err_nonzero));
     }
 }
 
