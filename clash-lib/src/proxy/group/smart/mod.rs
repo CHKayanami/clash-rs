@@ -146,14 +146,15 @@ impl Handler {
         // Set up periodic persistence for smart_stats
         let cache_store_clone = cache_store;
         let group_name_clone = group_name;
-        let state_clone = Arc::clone(&handler.smart_state);
+        let weak_state = Arc::downgrade(&handler.smart_state);
 
         tokio::spawn(async move {
             let mut interval =
                 tokio::time::interval(tokio::time::Duration::from_secs(30));
             loop {
                 interval.tick().await;
-                let state_guard = state_clone.lock().await;
+                let Some(state) = weak_state.upgrade() else { break; };
+                let state_guard = state.lock().await;
                 let data_to_save = state_guard.export_data();
                 drop(state_guard);
 

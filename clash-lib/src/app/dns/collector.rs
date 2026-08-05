@@ -70,13 +70,17 @@ impl DnsCollector {
             has_new: AtomicBool::new(false),
         });
 
-        let collector_clone = collector.clone();
+        let weak_collector = Arc::downgrade(&collector);
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(300));
             interval.tick().await;
             loop {
                 interval.tick().await;
-                collector_clone.flush_if_needed().await;
+                if let Some(collector) = weak_collector.upgrade() {
+                    collector.flush_if_needed().await;
+                } else {
+                    break;
+                }
             }
         });
 

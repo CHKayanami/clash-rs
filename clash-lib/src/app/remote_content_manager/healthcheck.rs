@@ -10,7 +10,15 @@ use super::ProxyManager;
 struct HealthCheckInner {
     last_check: Instant,
     proxies: Vec<AnyOutboundHandler>,
-    task_handle: Option<Arc<tokio::task::JoinHandle<()>>>,
+    task_handle: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl Drop for HealthCheckInner {
+    fn drop(&mut self) {
+        if let Some(handle) = self.task_handle.take() {
+            handle.abort();
+        }
+    }
 }
 
 pub struct HealthCheck {
@@ -51,7 +59,7 @@ impl HealthCheck {
         let pm = proxy_manager.clone();
         tokio::spawn(async move { pm.check(&proxies, &url, None).await });
 
-        let inner = self.inner.clone();
+        let weak_inner = Arc::downgrade(&self.inner);
         let proxy_manager = self.proxy_manager.clone();
         let url = self.url.clone();
         let task_handle = tokio::spawn(async move {
@@ -60,6 +68,7 @@ impl HealthCheck {
             loop {
                 tokio::select! {
                     _ = ticker.tick() => {
+                        let Some(inner) = weak_inner.upgrade() else { break; };
                         debug!("healthcheck ticking: {}, lazy: {}", url, lazy);
                         let now = tokio::time::Instant::now();
                         let last_check = inner.read().last_check;
@@ -73,7 +82,7 @@ impl HealthCheck {
             }
         });
 
-        self.inner.write().task_handle = Some(Arc::new(task_handle));
+        self.inner.write().task_handle = Some(task_handle);
     }
 
     pub async fn touch(&self) {

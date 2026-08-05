@@ -21,6 +21,14 @@ struct Inner {
     thread_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
+impl Drop for Inner {
+    fn drop(&mut self) {
+        if let Some(handle) = self.thread_handle.take() {
+            handle.abort();
+        }
+    }
+}
+
 pub struct Fetcher<U, P> {
     name: String,
     interval: Duration,
@@ -191,7 +199,7 @@ where
         immediately_update: bool,
         mut ticker: tokio::time::Interval,
     ) {
-        let inner = self.inner.clone();
+        let weak_inner = Arc::downgrade(&self.inner);
         let vehicle = self.vehicle.clone();
         let parser = self.parser.clone();
         let on_update = self.on_update.clone();
@@ -200,7 +208,9 @@ where
 
         let thread_handle = Some(tokio::spawn(async move {
             loop {
-                let inner = inner.clone();
+                let Some(inner) = weak_inner.upgrade() else {
+                    break;
+                };
                 let vehicle = vehicle.clone();
                 let parser = parser.clone();
                 let name = name.clone();
