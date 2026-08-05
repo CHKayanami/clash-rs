@@ -1,13 +1,11 @@
 use std::{
     io::Cursor,
-    sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use futures::future::BoxFuture;
 use murmur3::murmur3_32;
 use public_suffix::{DEFAULT_PROVIDER, EffectiveTLDProvider};
-use tokio::sync::Mutex;
 
 use crate::{
     app::remote_content_manager::ProxyManager, proxy::AnyOutboundHandler,
@@ -103,12 +101,10 @@ const CACHE_UPDATE: usize = 2;
 pub fn strategy_sticky_session(proxy_manager: ProxyManager) -> StrategyFn {
     let max_retry = 5;
     // 10 minutes, 1024 entries
-    let lru_cache: lru_time_cache::LruCache<u64, usize> =
-        lru_time_cache::LruCache::with_expiry_duration_and_capacity(
-            std::time::Duration::from_secs(60 * 10),
-            1024,
-        );
-    let lru_cache = Arc::new(Mutex::new(lru_cache));
+    let lru_cache: moka::sync::Cache<u64, usize> = moka::sync::Cache::builder()
+        .max_capacity(1024)
+        .time_to_live(std::time::Duration::from_secs(60 * 10))
+        .build();
     Box::new(move |proxies, sess| {
         let key_str = get_key_src_and_dst(sess);
         let key = murmur3_32(&mut Cursor::new(&key_str), 0).unwrap() as u64;
@@ -123,8 +119,8 @@ pub fn strategy_sticky_session(proxy_manager: ProxyManager) -> StrategyFn {
 
         Box::pin(async move {
             let buckets = proxies.len() as i32;
-            let (start_index, hit) = match lru_cache_clone.lock().await.get(&key) {
-                Some(&index) => {
+            let (start_index, hit) = match lru_cache_clone.get(&key) {
+                Some(index) => {
                     #[cfg(test)]
                     {
                         TEST_LRU_STATE
@@ -147,7 +143,7 @@ pub fn strategy_sticky_session(proxy_manager: ProxyManager) -> StrategyFn {
                     //   1. the index is not the same as the start_index
                     //   2. the start_index is not fetched from the cache
                     if index != start_index || !hit {
-                        lru_cache_clone.lock().await.insert(key, index);
+                        lru_cache_clone.insert(key, index);
                         #[cfg(test)]
                         {
                             TEST_LRU_STATE.store(
@@ -163,7 +159,7 @@ pub fn strategy_sticky_session(proxy_manager: ProxyManager) -> StrategyFn {
                 index = jump_hash(key + timestamp(), buckets) as usize;
             }
             // TODO: if we should just remove the key from the cache?
-            lru_cache_clone.lock().await.insert(key, 0);
+            lru_cache_clone.insert(key, 0);
             #[cfg(test)]
             {
                 TEST_LRU_STATE

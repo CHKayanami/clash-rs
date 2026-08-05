@@ -40,9 +40,7 @@ onion = ["dep:arti-client", "dep:tor-rtcompat", "arti-client/onion-service-clien
 shadowquic = ["dep:shadowquic", "shadowquic?/shadowquic-quinn"]
 wireguard = ["dep:boringtun", "dep:smoltcp"]
 tailscale = ["dep:tailscale"]
-tproxy = [
-    "dep:etherparse",
-]
+tproxy = []
 tun = [
     "dep:tun-rs",
     "dep:watfaq-netstack",
@@ -102,7 +100,6 @@ bytes = "1"
 ipnet = "2"
 regex = "1"
 byteorder = "1"
-lru_time_cache = "0.11"
 moka = { version = "0.12", features = ["future"] }
 uuid = { version = "1", features = ["v4", "v5", "fast-rng", "macro-diagnostics", "serde"] }
 network-interface = { version = "2" }
@@ -217,7 +214,6 @@ tailscale = { version = "0.4.0", optional = true }
 aws-lc-rs = { version = "1", default-features = false, optional = true }
 
 # tproxy
-etherparse = {version = "0.21", optional = true }
 tempfile = "3.27"
 
 [dev-dependencies]
