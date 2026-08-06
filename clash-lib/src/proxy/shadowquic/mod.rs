@@ -34,6 +34,12 @@ use crate::app::dispatcher::ChainedStream;
 type SQConn = shadowquic::squic::SQConn<<EndClient as QuicClient>::C>;
 pub type HandlerOptions = config::ShadowQuicClientCfg;
 
+impl<S, R> crate::proxy::ProxyStream for shadowquic::squic::inbound::Unsplit<S, R>
+where
+    S: tokio::io::AsyncWrite + Send + Unpin,
+    R: tokio::io::AsyncRead + Send + Unpin,
+{}
+
 pub struct Handler {
     name: String,
     opts: HandlerOptions,

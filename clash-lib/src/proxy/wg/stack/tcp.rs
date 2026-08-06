@@ -26,6 +26,8 @@ impl SocketPair {
     }
 }
 
+impl crate::proxy::ProxyStream for SocketPair {}
+
 impl AsyncRead for SocketPair {
     fn poll_read(
         mut self: std::pin::Pin<&mut Self>,

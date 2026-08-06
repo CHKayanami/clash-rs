@@ -28,6 +28,8 @@ use super::{
     PlainProxyAPIResponse,
 };
 
+impl crate::proxy::ProxyStream for tailscale::netstack::TcpStream {}
+
 const TAILSCALE_CLIENT_NAME: &str = "clash-rs";
 const TAILSCALE_STATE_FILE_NAME: &str = "tailscale_state.json";
 
