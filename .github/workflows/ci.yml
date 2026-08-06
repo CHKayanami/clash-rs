@@ -1,11 +1,6 @@
 name: CI
 
 on:
-  push:
-    tags: ["v*"]
-    branches: ["master"]
-  pull_request:
-    branches: ["master"]
   workflow_dispatch:
 
 concurrency:

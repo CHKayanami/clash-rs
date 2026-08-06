@@ -1,12 +1,6 @@
 name: Proxy Throughput Tests
 
 on:
-  pull_request:
-    branches: ["master"]
-    paths:
-      - "clash-lib/src/proxy/**"
-      - "clash-lib/src/app/**"
-      - ".github/workflows/proxy-throughput.yml"
   workflow_dispatch:
 
 permissions:

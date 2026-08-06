@@ -1,14 +1,7 @@
 name: TUN Throughput Benchmark
 
 on:
-  pull_request:
-    branches: ["master"]
-    paths:
-      - 'clash-lib/src/proxy/tun/**'
-      - 'clash-netstack/**'
-      - 'bench/**'
-      - '.github/workflows/benchmark.yml'
-  workflow_dispatch:  # Allow manual trigger via GitHub UI
+  workflow_dispatch:
 
 permissions:
   contents: read

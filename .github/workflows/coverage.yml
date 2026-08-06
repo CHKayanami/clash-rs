@@ -1,11 +1,7 @@
 name: Coverage
 
 on:
-  push:
-    tags: ["v*"]
-    branches: ["master"]
-  pull_request:
-    branches: ["master"]
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
