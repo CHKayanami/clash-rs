@@ -34,7 +34,7 @@ jobs:
   build:
     name: Build (${{ matrix.target }})
     needs: prepare-release
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
@@ -44,46 +44,64 @@ jobs:
             binary-name: clash-rs
             archive-ext: tar.gz
             features: plus
+            os: ubuntu-latest
+            use-zigbuild: true
           - target: x86_64-unknown-linux-musl
             archive-name: clash-rs-x86_64-unknown-linux-musl
             binary-name: clash-rs
             archive-ext: tar.gz
             features: plus,mimalloc
+            os: ubuntu-latest
+            use-zigbuild: true
           - target: aarch64-unknown-linux-gnu
             archive-name: clash-rs-aarch64-unknown-linux-gnu
             binary-name: clash-rs
             archive-ext: tar.gz
             features: plus
+            os: ubuntu-latest
+            use-zigbuild: true
           - target: aarch64-unknown-linux-musl
             archive-name: clash-rs-aarch64-unknown-linux-musl
             binary-name: clash-rs
             archive-ext: tar.gz
             features: plus,mimalloc
+            os: ubuntu-latest
+            use-zigbuild: true
           - target: armv7-unknown-linux-gnueabihf
             archive-name: clash-rs-armv7-unknown-linux-gnueabihf
             binary-name: clash-rs
             archive-ext: tar.gz
             features: plus
+            os: ubuntu-latest
+            use-zigbuild: true
           - target: x86_64-apple-darwin
             archive-name: clash-rs-x86_64-apple-darwin
             binary-name: clash-rs
             archive-ext: tar.gz
             features: plus
+            os: macos-latest
+            use-zigbuild: false
           - target: aarch64-apple-darwin
             archive-name: clash-rs-aarch64-apple-darwin
             binary-name: clash-rs
             archive-ext: tar.gz
             features: plus
+            os: macos-latest
+            use-zigbuild: false
           - target: x86_64-pc-windows-gnu
             archive-name: clash-rs-x86_64-pc-windows-gnu
             binary-name: clash-rs.exe
             archive-ext: zip
             features: plus
+            os: ubuntu-latest
+            use-zigbuild: true
           - target: aarch64-pc-windows-gnullvm
             archive-name: clash-rs-aarch64-pc-windows-gnullvm
             binary-name: clash-rs.exe
             archive-ext: zip
             features: plus
+            os: ubuntu-latest
+            use-zigbuild: true
 
     steps:
       - name: Checkout
@@ -96,10 +114,16 @@ jobs:
           cache: "npm"
           cache-dependency-path: "clash-dashboard/package-lock.json"
 
-      - name: Install System Dependencies
+      - name: Install System Dependencies (Linux)
+        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y cmake libclang-dev protobuf-compiler zip
+
+      - name: Install System Dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install protobuf cmake
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -107,14 +131,22 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Setup Zig
+        if: matrix.use-zigbuild
         uses: goto-bus-stop/setup-zig@v2
 
       - name: Install cargo-zigbuild
+        if: matrix.use-zigbuild
         uses: taiki-e/install-action@cargo-zigbuild
 
       - name: Build with cargo-zigbuild
+        if: matrix.use-zigbuild
         run: |
           cargo zigbuild --release --target ${{ matrix.target }} -F ${{ matrix.features }} -p clash-rs
+
+      - name: Build with cargo (macOS native)
+        if: "!matrix.use-zigbuild"
+        run: |
+          cargo build --release --target ${{ matrix.target }} -F ${{ matrix.features }} -p clash-rs
 
       - name: Package Binary
         shell: bash
