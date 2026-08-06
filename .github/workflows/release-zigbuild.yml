@@ -1,0 +1,174 @@
+name: Release (cargo-zigbuild)
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  prepare-release:
+    name: Prepare Release Tag
+    runs-on: ubuntu-latest
+    outputs:
+      tag_name: ${{ steps.gen_tag.outputs.tag_name }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Generate Release Tag
+        id: gen_tag
+        run: |
+          if [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            TAG="${GITHUB_REF#refs/tags/}"
+          else
+            TIMESTAMP=$(date -u +'%Y%m%d%H%M')
+            SHORT_SHA=$(git rev-parse --short HEAD)
+            TAG="${TIMESTAMP}-${SHORT_SHA}"
+          fi
+          echo "tag_name=${TAG}" >> $GITHUB_OUTPUT
+          echo "Release tag: ${TAG}"
+
+  build:
+    name: Build (${{ matrix.target }})
+    needs: prepare-release
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            archive-name: clash-rs-x86_64-unknown-linux-gnu
+            binary-name: clash-rs
+            archive-ext: tar.gz
+            features: plus
+          - target: x86_64-unknown-linux-musl
+            archive-name: clash-rs-x86_64-unknown-linux-musl
+            binary-name: clash-rs
+            archive-ext: tar.gz
+            features: plus,mimalloc
+          - target: aarch64-unknown-linux-gnu
+            archive-name: clash-rs-aarch64-unknown-linux-gnu
+            binary-name: clash-rs
+            archive-ext: tar.gz
+            features: plus
+          - target: aarch64-unknown-linux-musl
+            archive-name: clash-rs-aarch64-unknown-linux-musl
+            binary-name: clash-rs
+            archive-ext: tar.gz
+            features: plus,mimalloc
+          - target: armv7-unknown-linux-gnueabihf
+            archive-name: clash-rs-armv7-unknown-linux-gnueabihf
+            binary-name: clash-rs
+            archive-ext: tar.gz
+            features: plus
+          - target: x86_64-apple-darwin
+            archive-name: clash-rs-x86_64-apple-darwin
+            binary-name: clash-rs
+            archive-ext: tar.gz
+            features: plus
+          - target: aarch64-apple-darwin
+            archive-name: clash-rs-aarch64-apple-darwin
+            binary-name: clash-rs
+            archive-ext: tar.gz
+            features: plus
+          - target: x86_64-pc-windows-gnu
+            archive-name: clash-rs-x86_64-pc-windows-gnu
+            binary-name: clash-rs.exe
+            archive-ext: zip
+            features: plus
+          - target: aarch64-pc-windows-gnullvm
+            archive-name: clash-rs-aarch64-pc-windows-gnullvm
+            binary-name: clash-rs.exe
+            archive-ext: zip
+            features: plus
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: "clash-dashboard/package-lock.json"
+
+      - name: Install System Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake libclang-dev protobuf-compiler zip
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Setup Zig
+        uses: goto-bus-stop/setup-zig@v2
+
+      - name: Install cargo-zigbuild
+        uses: taiki-e/install-action@cargo-zigbuild
+
+      - name: Build with cargo-zigbuild
+        run: |
+          cargo zigbuild --release --target ${{ matrix.target }} -F ${{ matrix.features }} -p clash-rs
+
+      - name: Package Binary
+        shell: bash
+        run: |
+          TAG="${{ needs.prepare-release.outputs.tag_name }}"
+          PKG_NAME="${{ matrix.archive-name }}-${TAG}"
+          STAGING_DIR="dist/${PKG_NAME}"
+          mkdir -p "${STAGING_DIR}"
+
+          BIN_PATH="target/${{ matrix.target }}/release/${{ matrix.binary-name }}"
+          cp "${BIN_PATH}" "${STAGING_DIR}/"
+          cp README.md "${STAGING_DIR}/" 2>/dev/null || true
+          cp LICENSE "${STAGING_DIR}/" 2>/dev/null || true
+
+          cd dist
+          if [ "${{ matrix.archive-ext }}" = "zip" ]; then
+            zip -r "${PKG_NAME}.zip" "${PKG_NAME}"
+          else
+            tar -czvf "${PKG_NAME}.tar.gz" "${PKG_NAME}"
+          fi
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.archive-name }}
+          path: dist/*.${{ matrix.archive-ext }}
+          retention-days: 1
+
+  publish-release:
+    name: Create GitHub Release
+    needs: [prepare-release, build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Organize release assets
+        run: |
+          mkdir -p release_assets
+          find artifacts -type f \( -name "*.tar.gz" -o -name "*.zip" \) -exec cp {} release_assets/ \;
+          ls -la release_assets/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.prepare-release.outputs.tag_name }}
+          name: Release ${{ needs.prepare-release.outputs.tag_name }}
+          files: release_assets/*
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
