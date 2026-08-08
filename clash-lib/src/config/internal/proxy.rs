@@ -585,6 +585,30 @@ impl OutboundGroupProtocol {
             OutboundGroupProtocol::Select(g) => g.proxies.as_ref(),
         }
     }
+
+    /// Returns the proxy providers used in the group, if any.
+    pub fn use_provider(&self) -> Option<&Vec<String>> {
+        match &self {
+            OutboundGroupProtocol::Relay(g) => g.use_provider.as_ref(),
+            OutboundGroupProtocol::UrlTest(g) => g.use_provider.as_ref(),
+            OutboundGroupProtocol::Fallback(g) => g.use_provider.as_ref(),
+            OutboundGroupProtocol::LoadBalance(g) => g.use_provider.as_ref(),
+            OutboundGroupProtocol::Smart(g) => g.use_provider.as_ref(),
+            OutboundGroupProtocol::Select(g) => g.use_provider.as_ref(),
+        }
+    }
+
+    /// Returns whether include-all is set for the group.
+    pub fn include_all(&self) -> Option<bool> {
+        match &self {
+            OutboundGroupProtocol::Relay(g) => g.include_all,
+            OutboundGroupProtocol::UrlTest(g) => g.include_all,
+            OutboundGroupProtocol::Fallback(g) => g.include_all,
+            OutboundGroupProtocol::LoadBalance(g) => g.include_all,
+            OutboundGroupProtocol::Smart(g) => g.include_all,
+            OutboundGroupProtocol::Select(g) => g.include_all,
+        }
+    }
 }
 
 impl Display for OutboundGroupProtocol {
@@ -606,6 +630,8 @@ pub struct OutboundGroupRelay {
     pub proxies: Option<Vec<String>>,
     #[serde(rename = "use")]
     pub use_provider: Option<Vec<String>>,
+    #[serde(rename = "include-all")]
+    pub include_all: Option<bool>,
     pub icon: Option<String>,
     pub url: Option<String>,
 }
@@ -617,6 +643,8 @@ pub struct OutboundGroupUrlTest {
     pub proxies: Option<Vec<String>>,
     #[serde(rename = "use")]
     pub use_provider: Option<Vec<String>>,
+    #[serde(rename = "include-all")]
+    pub include_all: Option<bool>,
 
     pub url: String,
     #[serde(deserialize_with = "utils::deserialize_u64")]
@@ -632,6 +660,8 @@ pub struct OutboundGroupFallback {
     pub proxies: Option<Vec<String>>,
     #[serde(rename = "use")]
     pub use_provider: Option<Vec<String>>,
+    #[serde(rename = "include-all")]
+    pub include_all: Option<bool>,
 
     pub url: String,
     #[serde(deserialize_with = "utils::deserialize_u64")]
@@ -647,6 +677,8 @@ pub struct OutboundGroupLoadBalance {
     pub proxies: Option<Vec<String>>,
     #[serde(rename = "use")]
     pub use_provider: Option<Vec<String>>,
+    #[serde(rename = "include-all")]
+    pub include_all: Option<bool>,
 
     pub url: String,
     #[serde(deserialize_with = "utils::deserialize_u64")]
@@ -675,6 +707,8 @@ pub struct OutboundGroupSmart {
     pub udp: Option<bool>,
     #[serde(rename = "use")]
     pub use_provider: Option<Vec<String>>,
+    #[serde(rename = "include-all")]
+    pub include_all: Option<bool>,
 
     pub lazy: Option<bool>,
     pub icon: Option<String>,
@@ -702,6 +736,8 @@ pub struct OutboundGroupSelect {
     pub proxies: Option<Vec<String>>,
     #[serde(rename = "use")]
     pub use_provider: Option<Vec<String>>,
+    #[serde(rename = "include-all")]
+    pub include_all: Option<bool>,
     pub udp: Option<bool>,
 
     pub url: Option<String>,
@@ -931,3 +967,26 @@ mod anytls_tests {
         assert_eq!(config.min_idle_session, Some(2));
     }
 }
+
+#[cfg(test)]
+mod proxy_group_tests {
+    use super::OutboundGroupProtocol;
+
+    #[test]
+    fn test_proxy_group_include_all_deserialize() {
+        let yaml = r#"
+            name: Auto Group
+            type: url-test
+            include-all: true
+            url: http://www.gstatic.com/generate_204
+            interval: 300
+        "#;
+
+        let group: OutboundGroupProtocol =
+            serde_yaml::from_str(yaml).expect("should parse url-test with include-all");
+
+        assert_eq!(group.name(), "Auto Group");
+        assert_eq!(group.include_all(), Some(true));
+    }
+}
+

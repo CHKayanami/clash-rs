@@ -474,8 +474,13 @@ impl OutboundManager {
             (name, h)
         }));
 
-        self.load_group_outbounds(handlers, outbound_groups, cache_store.clone())
-            .await?;
+        self.load_group_outbounds(
+            handlers,
+            outbound_groups,
+            &proxy_names,
+            cache_store.clone(),
+        )
+        .await?;
 
         // insert GLOBAL
         let mut g = vec![];
@@ -539,6 +544,7 @@ impl OutboundManager {
         &mut self,
         handlers: &mut HashMap<String, AnyOutboundHandler>,
         outbound_groups: Vec<OutboundGroupProtocol>,
+        proxy_names: &[String],
         cache_store: ThreadSafeCacheFile,
     ) -> Result<(), Error> {
         // Sort outbound groups to ensure dependencies are resolved
@@ -554,23 +560,37 @@ impl OutboundManager {
         /// directly — the caller checks for emptiness.
         #[allow(clippy::too_many_arguments)]
         fn build_group_providers(
-            name: &str,
-            proxies: &Option<Vec<String>>,
-            use_provider: &Option<Vec<String>>,
+            group: &OutboundGroupProtocol,
             interval: u64,
             lazy: bool,
             handlers: &HashMap<String, AnyOutboundHandler>,
+            proxy_names: &[String],
             proxy_manager: &ProxyManager,
             provider_registry: &mut HashMap<String, ArcProxyProvider>,
         ) -> Result<Vec<ArcProxyProvider>, Error> {
+            let name = group.name();
             let mut providers: Vec<ArcProxyProvider> = vec![];
+            let include_all = group.include_all().unwrap_or(false);
 
-            if let Some(proxies) = proxies
-                && !proxies.is_empty()
-            {
+            let mut group_proxies = group.proxies().cloned().unwrap_or_default();
+            if include_all {
+                for p_name in proxy_names {
+                    if p_name != name
+                        && p_name != PROXY_DIRECT
+                        && p_name != PROXY_REJECT
+                        && !group_proxies.contains(p_name)
+                        && let Some(h) = handlers.get(p_name)
+                        && h.try_as_group_handler().is_none()
+                    {
+                        group_proxies.push(p_name.clone());
+                    }
+                }
+            }
+
+            if !group_proxies.is_empty() {
                 let pd = make_provider_from_proxies(
                     name,
-                    proxies,
+                    &group_proxies,
                     interval,
                     lazy,
                     handlers,
@@ -580,16 +600,26 @@ impl OutboundManager {
                 providers.push(pd);
             }
 
-            if let Some(provider_names) = use_provider {
-                for provider_name in provider_names {
-                    let provider = provider_registry
-                        .get(provider_name)
-                        .unwrap_or_else(|| {
-                            print_and_exit!("provider {} not found", provider_name);
-                        })
-                        .clone();
-                    providers.push(provider);
+            let mut group_providers = group.use_provider().cloned().unwrap_or_default();
+            if include_all {
+                for provider_name in provider_registry.keys() {
+                    if provider_name != RESERVED_PROVIDER_NAME
+                        && provider_name != name
+                        && !group_providers.contains(provider_name)
+                    {
+                        group_providers.push(provider_name.clone());
+                    }
                 }
+            }
+
+            for provider_name in &group_providers {
+                let provider = provider_registry
+                    .get(provider_name)
+                    .unwrap_or_else(|| {
+                        print_and_exit!("provider {} not found", provider_name);
+                    })
+                    .clone();
+                providers.push(provider);
             }
 
             Ok(providers)
@@ -646,12 +676,11 @@ impl OutboundManager {
             match outbound_group {
                 OutboundGroupProtocol::Relay(proto) => {
                     let providers = build_group_providers(
-                        &proto.name,
-                        &proto.proxies,
-                        &proto.use_provider,
+                        outbound_group,
                         0,
                         true,
                         handlers,
+                        proxy_names,
                         proxy_manager,
                         provider_registry,
                     )?;
@@ -680,12 +709,11 @@ impl OutboundManager {
                 }
                 OutboundGroupProtocol::UrlTest(proto) => {
                     let providers = build_group_providers(
-                        &proto.name,
-                        &proto.proxies,
-                        &proto.use_provider,
+                        outbound_group,
                         proto.interval,
                         proto.lazy.unwrap_or_default(),
                         handlers,
+                        proxy_names,
                         proxy_manager,
                         provider_registry,
                     )?;
@@ -716,12 +744,11 @@ impl OutboundManager {
                 }
                 OutboundGroupProtocol::Fallback(proto) => {
                     let providers = build_group_providers(
-                        &proto.name,
-                        &proto.proxies,
-                        &proto.use_provider,
+                        outbound_group,
                         proto.interval,
                         proto.lazy.unwrap_or_default(),
                         handlers,
+                        proxy_names,
                         proxy_manager,
                         provider_registry,
                     )?;
@@ -752,12 +779,11 @@ impl OutboundManager {
                 }
                 OutboundGroupProtocol::LoadBalance(proto) => {
                     let providers = build_group_providers(
-                        &proto.name,
-                        &proto.proxies,
-                        &proto.use_provider,
+                        outbound_group,
                         proto.interval,
                         proto.lazy.unwrap_or_default(),
                         handlers,
+                        proxy_names,
                         proxy_manager,
                         provider_registry,
                     )?;
@@ -788,12 +814,11 @@ impl OutboundManager {
                 }
                 OutboundGroupProtocol::Select(proto) => {
                     let providers = build_group_providers(
-                        &proto.name,
-                        &proto.proxies,
-                        &proto.use_provider,
+                        outbound_group,
                         0,
                         true,
                         handlers,
+                        proxy_names,
                         proxy_manager,
                         provider_registry,
                     )?;
@@ -828,12 +853,11 @@ impl OutboundManager {
                 }
                 OutboundGroupProtocol::Smart(proto) => {
                     let providers = build_group_providers(
-                        &proto.name,
-                        &proto.proxies,
-                        &proto.use_provider,
+                        outbound_group,
                         0,
                         proto.lazy.unwrap_or_default(),
                         handlers,
+                        proxy_names,
                         proxy_manager,
                         provider_registry,
                     )?;
