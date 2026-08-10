@@ -311,6 +311,41 @@ pub async fn start(
 ) -> Result<()> {
     setup_default_crypto_provider();
 
+    let os = match env!("CLASH_TARGET_OS") {
+        "macos" => "darwin",
+        other => other,
+    };
+    let arch = match env!("CLASH_TARGET_ARCH") {
+        "x86_64" => "amd64",
+        "aarch64" => "arm64",
+        "x86" | "i686" => "386",
+        other => other,
+    };
+    let target = env!("CLASH_TARGET_TRIPLE");
+    let author = env!("CLASH_FORK_AUTHOR");
+    let features = option_env!("CLASH_FEATURES").unwrap_or("");
+    let features_str = if features.is_empty() { "none" } else { features };
+    if target.is_empty() {
+        info!(
+            "starting clash-rs {} (fork by {}) {}/{} features: {}",
+            env!("CLASH_VERSION_OVERRIDE"),
+            author,
+            os,
+            arch,
+            features_str
+        );
+    } else {
+        info!(
+            "starting clash-rs {} (fork by {}) {}/{} ({}) features: {}",
+            env!("CLASH_VERSION_OVERRIDE"),
+            author,
+            os,
+            arch,
+            target,
+            features_str
+        );
+    }
+
     let cwd_path = PathBuf::from(cwd.clone());
 
     // things we need to clone before consuming config

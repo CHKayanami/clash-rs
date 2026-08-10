@@ -242,11 +242,12 @@ pub struct GrpcOpt {
     pub grpc_service_name: Option<String>,
 }
 
-#[derive(serde::Serialize, serde::Deserialize, Debug, Default)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Default, Clone)]
 #[serde(rename_all = "kebab-case")]
 pub struct RealityOpt {
     pub public_key: String,
-    pub short_id: String,
+    #[serde(default, alias = "short_id")]
+    pub short_id: Option<String>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Default)]

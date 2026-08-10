@@ -24,82 +24,160 @@ jobs:
           if [[ "${{ github.ref }}" == refs/tags/* ]]; then
             TAG="${GITHUB_REF#refs/tags/}"
           else
-            TIMESTAMP=$(date -u +'%Y%m%d%H%M')
-            SHORT_SHA=$(git rev-parse --short HEAD)
-            TAG="${TIMESTAMP}-${SHORT_SHA}"
+            TAG="latest"
           fi
           echo "tag_name=${TAG}" >> $GITHUB_OUTPUT
           echo "Release tag: ${TAG}"
 
   build:
-    name: Build (${{ matrix.target }})
+    name: Build (${{ matrix.archive-name }})
     needs: prepare-release
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         include:
+          # x86_64-unknown-linux-gnu
           - target: x86_64-unknown-linux-gnu
-            archive-name: clash-rs-x86_64-unknown-linux-gnu
+            archive-name: clash-rs-standard-x86_64-unknown-linux-gnu
             binary-name: clash-rs
             archive-ext: tar.gz
-            features: plus
+            features: standard
+            os: ubuntu-latest
+            use-zigbuild: true
+          - target: x86_64-unknown-linux-gnu
+            archive-name: clash-rs-minimal-x86_64-unknown-linux-gnu
+            binary-name: clash-rs
+            archive-ext: tar.gz
+            features: minimal
+            os: ubuntu-latest
+            use-zigbuild: true
+
+          # x86_64-unknown-linux-musl
+          - target: x86_64-unknown-linux-musl
+            archive-name: clash-rs-standard-x86_64-unknown-linux-musl
+            binary-name: clash-rs
+            archive-ext: tar.gz
+            features: standard,mimalloc
             os: ubuntu-latest
             use-zigbuild: true
           - target: x86_64-unknown-linux-musl
-            archive-name: clash-rs-x86_64-unknown-linux-musl
+            archive-name: clash-rs-minimal-x86_64-unknown-linux-musl
             binary-name: clash-rs
             archive-ext: tar.gz
-            features: plus,mimalloc
+            features: minimal,mimalloc
+            os: ubuntu-latest
+            use-zigbuild: true
+
+          # aarch64-unknown-linux-gnu
+          - target: aarch64-unknown-linux-gnu
+            archive-name: clash-rs-standard-aarch64-unknown-linux-gnu
+            binary-name: clash-rs
+            archive-ext: tar.gz
+            features: standard
             os: ubuntu-latest
             use-zigbuild: true
           - target: aarch64-unknown-linux-gnu
-            archive-name: clash-rs-aarch64-unknown-linux-gnu
+            archive-name: clash-rs-minimal-aarch64-unknown-linux-gnu
             binary-name: clash-rs
             archive-ext: tar.gz
-            features: plus
+            features: minimal
+            os: ubuntu-latest
+            use-zigbuild: true
+
+          # aarch64-unknown-linux-musl
+          - target: aarch64-unknown-linux-musl
+            archive-name: clash-rs-standard-aarch64-unknown-linux-musl
+            binary-name: clash-rs
+            archive-ext: tar.gz
+            features: standard,mimalloc
             os: ubuntu-latest
             use-zigbuild: true
           - target: aarch64-unknown-linux-musl
-            archive-name: clash-rs-aarch64-unknown-linux-musl
+            archive-name: clash-rs-minimal-aarch64-unknown-linux-musl
             binary-name: clash-rs
             archive-ext: tar.gz
-            features: plus,mimalloc
+            features: minimal,mimalloc
+            os: ubuntu-latest
+            use-zigbuild: true
+
+          # armv7-unknown-linux-gnueabihf
+          - target: armv7-unknown-linux-gnueabihf
+            archive-name: clash-rs-standard-armv7-unknown-linux-gnueabihf
+            binary-name: clash-rs
+            archive-ext: tar.gz
+            features: standard
             os: ubuntu-latest
             use-zigbuild: true
           - target: armv7-unknown-linux-gnueabihf
-            archive-name: clash-rs-armv7-unknown-linux-gnueabihf
+            archive-name: clash-rs-minimal-armv7-unknown-linux-gnueabihf
             binary-name: clash-rs
             archive-ext: tar.gz
-            features: plus
+            features: minimal
             os: ubuntu-latest
             use-zigbuild: true
+
+          # x86_64-apple-darwin
           - target: x86_64-apple-darwin
-            archive-name: clash-rs-x86_64-apple-darwin
+            archive-name: clash-rs-standard-x86_64-apple-darwin
             binary-name: clash-rs
             archive-ext: tar.gz
-            features: plus
+            features: standard
+            os: macos-latest
+            use-zigbuild: false
+          - target: x86_64-apple-darwin
+            archive-name: clash-rs-minimal-x86_64-apple-darwin
+            binary-name: clash-rs
+            archive-ext: tar.gz
+            features: minimal
+            os: macos-latest
+            use-zigbuild: false
+
+          # aarch64-apple-darwin
+          - target: aarch64-apple-darwin
+            archive-name: clash-rs-standard-aarch64-apple-darwin
+            binary-name: clash-rs
+            archive-ext: tar.gz
+            features: standard
             os: macos-latest
             use-zigbuild: false
           - target: aarch64-apple-darwin
-            archive-name: clash-rs-aarch64-apple-darwin
+            archive-name: clash-rs-minimal-aarch64-apple-darwin
             binary-name: clash-rs
             archive-ext: tar.gz
-            features: plus
+            features: minimal
             os: macos-latest
             use-zigbuild: false
+
+          # x86_64-pc-windows-gnu
           - target: x86_64-pc-windows-gnu
-            archive-name: clash-rs-x86_64-pc-windows-gnu
+            archive-name: clash-rs-standard-x86_64-pc-windows-gnu
             binary-name: clash-rs.exe
             archive-ext: zip
-            features: plus
+            features: standard
+            os: ubuntu-latest
+            use-zigbuild: true
+          - target: x86_64-pc-windows-gnu
+            archive-name: clash-rs-minimal-x86_64-pc-windows-gnu
+            binary-name: clash-rs.exe
+            archive-ext: zip
+            features: minimal
+            os: ubuntu-latest
+            use-zigbuild: true
+
+          # aarch64-pc-windows-gnullvm
+          - target: aarch64-pc-windows-gnullvm
+            archive-name: clash-rs-standard-aarch64-pc-windows-gnullvm
+            binary-name: clash-rs.exe
+            archive-ext: zip
+            features: standard
             os: ubuntu-latest
             use-zigbuild: true
           - target: aarch64-pc-windows-gnullvm
-            archive-name: clash-rs-aarch64-pc-windows-gnullvm
+            archive-name: clash-rs-minimal-aarch64-pc-windows-gnullvm
             binary-name: clash-rs.exe
             archive-ext: zip
-            features: plus
+            features: minimal
             os: ubuntu-latest
             use-zigbuild: true
 
@@ -151,8 +229,7 @@ jobs:
       - name: Package Binary
         shell: bash
         run: |
-          TAG="${{ needs.prepare-release.outputs.tag_name }}"
-          PKG_NAME="${{ matrix.archive-name }}-${TAG}"
+          PKG_NAME="${{ matrix.archive-name }}"
           STAGING_DIR="dist/${PKG_NAME}"
           mkdir -p "${STAGING_DIR}"
 

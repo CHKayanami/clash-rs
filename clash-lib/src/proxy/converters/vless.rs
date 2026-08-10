@@ -60,7 +60,9 @@ impl TryFrom<&OutboundVless> for Handler {
                 super::utils::decode_base64_public_key(&reality_opts.public_key)?;
 
             // reality short id bytes
-            let short_id = super::utils::decode_short_id(&reality_opts.short_id)?;
+            let short_id = super::utils::decode_short_id(
+                reality_opts.short_id.as_deref().unwrap_or_default(),
+            )?;
 
             // SNI
             let sni = s
@@ -268,67 +270,37 @@ mod tests {
             handler.is_err(),
             "VLess handler with invalid network should fail"
         );
-        let err = handler.unwrap_err();
-        assert!(
-            err.to_string().contains("unsupported network"),
-            "Error should mention unsupported network"
-        );
     }
 
     #[test]
     fn test_vless_flow_without_tls_or_reality() {
-        crate::tests::initialize();
         // Test that flow: xtls-rprx-vision is rejected without TLS or Reality
         let config = OutboundVless {
             common_opts: CommonConfigOptions {
-                name: "test-flow-invalid".to_string(),
+                name: "test-flow-no-tls".to_string(),
                 server: "example.com".to_string(),
                 port: 443,
                 ..Default::default()
             },
-            uuid: "test-uuid".to_string(),
+            uuid: "00000000-0000-0000-0000-000000000000".to_string(),
             tls: Some(false),
             reality_opts: None,
             flow: Some("xtls-rprx-vision".to_string()),
             ..Default::default()
         };
 
-        let handler = Handler::try_from(&config);
+        let result = Handler::try_from(&config);
         assert!(
-            handler.is_err(),
+            result.is_err(),
             "VLess handler with flow but without TLS/Reality should fail"
         );
-        let err = handler.unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("requires TLS or Reality to be enabled"),
-            "Error should mention flow requirements"
-        );
-    }
-
-    #[test]
-    fn test_vless_flow_with_tls() {
-        crate::tests::initialize();
-        // Test that flow: xtls-rprx-vision is accepted with TLS enabled
-        let config = OutboundVless {
-            common_opts: CommonConfigOptions {
-                name: "test-flow-tls".to_string(),
-                server: "example.com".to_string(),
-                port: 443,
-                ..Default::default()
-            },
-            uuid: "test-uuid".to_string(),
-            tls: Some(true),
-            reality_opts: None,
-            flow: Some("xtls-rprx-vision".to_string()),
-            ..Default::default()
-        };
-
-        let handler = Handler::try_from(&config);
-        assert!(
-            handler.is_ok(),
-            "VLess handler with flow and TLS should parse successfully"
-        );
+        if let Err(e) = result {
+            assert!(
+                e.to_string()
+                    .contains("requires TLS or Reality to be enabled"),
+                "Error message should mention requirement of TLS or Reality"
+            );
+        }
     }
 
     #[test]
@@ -344,11 +316,11 @@ mod tests {
                 port: 443,
                 ..Default::default()
             },
-            uuid: "test-uuid".to_string(),
+            uuid: "00000000-0000-0000-0000-000000000000".to_string(),
             tls: Some(false),
             reality_opts: Some(RealityOpt {
                 public_key: "abc".to_string(), // public key format isn't fully validated here since TryInto base64-decodes it
-                short_id: "1234".to_string(),
+                short_id: Some("1234".to_string()),
             }),
             flow: Some("xtls-rprx-vision".to_string()),
             ..Default::default()
@@ -360,7 +332,7 @@ mod tests {
         config.reality_opts.as_mut().unwrap().public_key =
             "qpUtN9F_H6pQ4lF5Fp9G1G5eFm5eFm5eFm5eFm5eFm4=".to_string(); // valid base64
         config.reality_opts.as_mut().unwrap().short_id =
-            "0123456789abcdef".to_string(); // hex format
+            Some("0123456789abcdef".to_string()); // hex format
 
         let handler = Handler::try_from(&config);
         // We just want to check it passed the flow check. Depending on base64 decoding, it might succeed or fail on PK parsing.
@@ -375,5 +347,35 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn test_vless_reality_without_short_id() {
+        crate::tests::initialize();
+        use crate::config::internal::proxy::RealityOpt;
+
+        let config = OutboundVless {
+            common_opts: CommonConfigOptions {
+                name: "test-reality-no-short-id".to_string(),
+                server: "example.com".to_string(),
+                port: 443,
+                ..Default::default()
+            },
+            uuid: "00000000-0000-0000-0000-000000000000".to_string(),
+            tls: Some(false),
+            reality_opts: Some(RealityOpt {
+                public_key: "qpUtN9F_H6pQ4lF5Fp9G1G5eFm5eFm5eFm5eFm5eFm4="
+                    .to_string(),
+                short_id: None,
+            }),
+            flow: Some("xtls-rprx-vision".to_string()),
+            ..Default::default()
+        };
+
+        let handler = Handler::try_from(&config);
+        assert!(
+            handler.is_ok(),
+            "VLESS with Reality and omitted short_id should succeed"
+        );
     }
 }

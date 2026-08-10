@@ -2,6 +2,7 @@
 #![cfg_attr(not(version("1.88.0")), feature(let_chains))]
 
 fn main() {
+    println!("cargo:rerun-if-changed=build.rs");
     // Watch both CLASH_* and GitHub-provided env vars so rebuilds trigger correctly
     let vars = ["CLASH_GIT_REF", "CLASH_GIT_SHA", "GITHUB_REF", "GITHUB_SHA"];
     for var in vars {
@@ -29,4 +30,20 @@ fn main() {
         env!("CARGO_PKG_VERSION").into()
     };
     println!("cargo:rustc-env=CLASH_VERSION_OVERRIDE={version}");
+
+    let target = std::env::var("TARGET").unwrap_or_default();
+    let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    let target_arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
+
+    println!("cargo:rustc-env=CLASH_TARGET_TRIPLE={target}");
+    println!("cargo:rustc-env=CLASH_TARGET_OS={target_os}");
+    println!("cargo:rustc-env=CLASH_TARGET_ARCH={target_arch}");
+    println!("cargo:rustc-env=CLASH_FORK_AUTHOR=ala");
+
+    let features = std::env::var("CARGO_CFG_FEATURE").unwrap_or_default();
+    let mut feature_list: Vec<&str> = features.split(',').filter(|s| !s.is_empty()).collect();
+    feature_list.sort();
+    let features_str = feature_list.join(", ");
+    println!("cargo:rustc-env=CLASH_FEATURES={features_str}");
 }
+

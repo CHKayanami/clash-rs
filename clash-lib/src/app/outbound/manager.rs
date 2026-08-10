@@ -36,7 +36,7 @@ use crate::{
     },
     print_and_exit,
     proxy::{
-        AnyOutboundHandler, anytls,
+        AnyOutboundHandler, OutboundType, anytls,
         direct::{self},
         fallback,
         group::smart,
@@ -578,9 +578,11 @@ impl OutboundManager {
                     if p_name != name
                         && p_name != PROXY_DIRECT
                         && p_name != PROXY_REJECT
+                        && !p_name.eq_ignore_ascii_case("reject")
                         && !group_proxies.contains(p_name)
                         && let Some(h) = handlers.get(p_name)
                         && h.try_as_group_handler().is_none()
+                        && !matches!(h.proto(), OutboundType::Reject)
                     {
                         group_proxies.push(p_name.clone());
                     }
@@ -600,12 +602,18 @@ impl OutboundManager {
                 providers.push(pd);
             }
 
-            let mut group_providers = group.use_provider().cloned().unwrap_or_default();
+            let mut group_providers =
+                group.use_provider().cloned().unwrap_or_default();
             if include_all {
-                for provider_name in provider_registry.keys() {
+                for (provider_name, provider) in provider_registry.iter() {
                     if provider_name != RESERVED_PROVIDER_NAME
                         && provider_name != name
                         && !group_providers.contains(provider_name)
+                        && matches!(
+                            provider.vehicle_type(),
+                            ProviderVehicleType::Http
+                                | ProviderVehicleType::File
+                        )
                     {
                         group_providers.push(provider_name.clone());
                     }
