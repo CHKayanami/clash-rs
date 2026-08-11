@@ -117,6 +117,65 @@ jobs:
             os: ubuntu-latest
             use-zigbuild: true
 
+          # armv7-unknown-linux-musleabihf
+          - target: armv7-unknown-linux-musleabihf
+            archive-name: clash-rs-standard-armv7-unknown-linux-musleabihf
+            binary-name: clash-rs
+            archive-ext: tar.gz
+            features: standard,mimalloc
+            os: ubuntu-latest
+            use-zigbuild: true
+          - target: armv7-unknown-linux-musleabihf
+            archive-name: clash-rs-minimal-armv7-unknown-linux-musleabihf
+            binary-name: clash-rs
+            archive-ext: tar.gz
+            features: minimal,mimalloc
+            os: ubuntu-latest
+            use-zigbuild: true
+
+          # mipsel-unknown-linux-musl
+          - target: mipsel-unknown-linux-musl
+            archive-name: clash-rs-standard-mipsel-unknown-linux-musl
+            binary-name: clash-rs
+            archive-ext: tar.gz
+            features: standard
+            os: ubuntu-latest
+            use-zigbuild: true
+          - target: mipsel-unknown-linux-musl
+            archive-name: clash-rs-minimal-mipsel-unknown-linux-musl
+            binary-name: clash-rs
+            archive-ext: tar.gz
+            features: minimal
+            os: ubuntu-latest
+            use-zigbuild: true
+
+          # mips-unknown-linux-musl
+          - target: mips-unknown-linux-musl
+            archive-name: clash-rs-minimal-mips-unknown-linux-musl
+            binary-name: clash-rs
+            archive-ext: tar.gz
+            features: minimal
+            os: ubuntu-latest
+            use-zigbuild: true
+
+          # riscv64gc-unknown-linux-musl
+          - target: riscv64gc-unknown-linux-musl
+            archive-name: clash-rs-minimal-riscv64gc-unknown-linux-musl
+            binary-name: clash-rs
+            archive-ext: tar.gz
+            features: minimal
+            os: ubuntu-latest
+            use-zigbuild: true
+
+          # i686-unknown-linux-musl
+          - target: i686-unknown-linux-musl
+            archive-name: clash-rs-minimal-i686-unknown-linux-musl
+            binary-name: clash-rs
+            archive-ext: tar.gz
+            features: minimal
+            os: ubuntu-latest
+            use-zigbuild: true
+
           # x86_64-apple-darwin
           - target: x86_64-apple-darwin
             archive-name: clash-rs-standard-x86_64-apple-darwin
