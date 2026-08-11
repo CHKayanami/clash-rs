@@ -133,31 +133,6 @@ jobs:
             os: ubuntu-latest
             use-zigbuild: true
 
-          # mipsel-unknown-linux-musl
-          - target: mipsel-unknown-linux-musl
-            archive-name: clash-rs-standard-mipsel-unknown-linux-musl
-            binary-name: clash-rs
-            archive-ext: tar.gz
-            features: standard
-            os: ubuntu-latest
-            use-zigbuild: true
-          - target: mipsel-unknown-linux-musl
-            archive-name: clash-rs-minimal-mipsel-unknown-linux-musl
-            binary-name: clash-rs
-            archive-ext: tar.gz
-            features: minimal
-            os: ubuntu-latest
-            use-zigbuild: true
-
-          # mips-unknown-linux-musl
-          - target: mips-unknown-linux-musl
-            archive-name: clash-rs-minimal-mips-unknown-linux-musl
-            binary-name: clash-rs
-            archive-ext: tar.gz
-            features: minimal
-            os: ubuntu-latest
-            use-zigbuild: true
-
           # riscv64gc-unknown-linux-musl
           - target: riscv64gc-unknown-linux-musl
             archive-name: clash-rs-minimal-riscv64gc-unknown-linux-musl
