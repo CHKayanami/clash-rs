@@ -99,7 +99,7 @@ jobs:
             features: standard,mimalloc
             os: ubuntu-latest
             use-zigbuild: true
-            opt-level: "3"
+            opt-level: "s"
           - target: aarch64-unknown-linux-musl
             archive-name: clash-rs-minimal-aarch64-unknown-linux-musl
             binary-name: clash-rs
@@ -107,7 +107,7 @@ jobs:
             features: minimal,mimalloc
             os: ubuntu-latest
             use-zigbuild: true
-            opt-level: "3"
+            opt-level: "s"
 
           # armv7-unknown-linux-gnueabihf
           - target: armv7-unknown-linux-gnueabihf
