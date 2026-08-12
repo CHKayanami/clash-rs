@@ -186,9 +186,11 @@ impl InboundHandlerTrait for TproxyInbound {
 /// Maximum number of cached `IP_TRANSPARENT` UDP sockets.
 ///
 /// TPROXY source addresses are typically LAN device IPs with varying ports;
-/// 128 entries comfortably cover the active sessions of a home/small-office
-/// gateway without excessive fd consumption.
-const TRANSPARENT_SOCKET_CACHE_CAPACITY: u64 = 128;
+/// 1024 entries comfortably cover active sessions without excessive fd consumption.
+const TRANSPARENT_SOCKET_CACHE_CAPACITY: u64 = 1024;
+
+/// Capacity for UDP packet dispatch channel between TPROXY listener and dispatcher.
+const UDP_CHANNEL_CAPACITY: usize = 1024;
 
 /// How long an idle cached socket stays alive before eviction.
 const TRANSPARENT_SOCKET_TTL: Duration = Duration::from_secs(60);
@@ -274,10 +276,10 @@ async fn handle_inbound_datagram(
     dispatcher: Arc<Dispatcher>,
 ) -> std::io::Result<()> {
     // dispatcher <-> tproxy communications
-    let (l_tx, l_rx) = tokio::sync::mpsc::channel(256);
+    let (l_tx, l_rx) = tokio::sync::mpsc::channel(UDP_CHANNEL_CAPACITY);
 
     // forward packets from tproxy to dispatcher
-    let (d_tx, d_rx) = tokio::sync::mpsc::channel(256);
+    let (d_tx, d_rx) = tokio::sync::mpsc::channel(UDP_CHANNEL_CAPACITY);
 
     // for dispatcher - the dispatcher would receive packets from this channel,
     // which is from the stack and send back packets to this channel, which is
