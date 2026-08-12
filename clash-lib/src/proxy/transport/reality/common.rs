@@ -28,6 +28,9 @@ pub const KEY_UPDATE_REQUESTED: u8 = 1;
 // Maximum TLS 1.3 ciphertext payload size (16,640 bytes)
 pub const MAX_TLS_CIPHERTEXT_LEN: usize = 16384 + 256;
 
+/// Maximum plaintext payload size for a single TLS 1.3 record (16,384 bytes)
+pub const MAX_TLS_PLAINTEXT_LEN: usize = 16384;
+
 // TLS record header size
 pub const TLS_RECORD_HEADER_SIZE: usize = 5;
 
@@ -38,6 +41,7 @@ pub const TLS_MAX_RECORD_SIZE: usize =
 pub const CIPHERTEXT_READ_BUF_CAPACITY: usize = TLS_MAX_RECORD_SIZE * 2;
 pub const PLAINTEXT_READ_BUF_CAPACITY: usize = TLS_MAX_RECORD_SIZE * 2;
 
+/// Combined limit for queued plaintext and ciphertext (matches rustls DEFAULT_BUFFER_LIMIT)
 pub const OUTGOING_BUFFER_LIMIT: usize = 64 * 1024;
 
 /// Strip TLS 1.3 content type trailer and optional padding from decrypted plaintext.

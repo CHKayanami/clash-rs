@@ -19,8 +19,8 @@ use super::common::{
     HANDSHAKE_TYPE_CERTIFICATE, HANDSHAKE_TYPE_CERTIFICATE_VERIFY,
     HANDSHAKE_TYPE_FINISHED, HANDSHAKE_TYPE_KEY_UPDATE, HANDSHAKE_TYPE_SERVER_HELLO,
     KEY_UPDATE_NOT_REQUESTED, KEY_UPDATE_REQUESTED, MAX_TLS_CIPHERTEXT_LEN,
-    OUTGOING_BUFFER_LIMIT, PLAINTEXT_READ_BUF_CAPACITY, TLS_MAX_RECORD_SIZE,
-    TLS_RECORD_HEADER_SIZE,
+    MAX_TLS_PLAINTEXT_LEN, OUTGOING_BUFFER_LIMIT, PLAINTEXT_READ_BUF_CAPACITY,
+    TLS_MAX_RECORD_SIZE, TLS_RECORD_HEADER_SIZE,
 };
 use super::tls13_keys::{
     compute_finished_verify_data, derive_application_secrets, derive_handshake_keys,
@@ -30,6 +30,21 @@ use super::tls13_messages::{
     DEFAULT_ALPN_PROTOCOLS, construct_client_hello, construct_finished,
     write_record_header,
 };
+
+// Matches the maximum handshake size accepted by Xray's REALITY implementation.
+const MAX_HANDSHAKE_PLAINTEXT: usize = 4 * MAX_TLS_PLAINTEXT_LEN;
+
+fn append_handshake_plaintext(accumulated: &mut Vec<u8>, plaintext: &[u8]) -> io::Result<usize> {
+    let previous_len = accumulated.len();
+    if previous_len.saturating_add(plaintext.len()) > MAX_HANDSHAKE_PLAINTEXT {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "REALITY handshake exceeds maximum size",
+        ));
+    }
+    accumulated.extend_from_slice(plaintext);
+    Ok(previous_len)
+}
 
 #[derive(Clone)]
 pub struct RealityClientConfig {
@@ -110,9 +125,9 @@ impl RealityClientConnection {
             ciphertext_read_buf: BytesMut::with_capacity(
                 CIPHERTEXT_READ_BUF_CAPACITY,
             ),
-            ciphertext_write_buf: Vec::with_capacity(OUTGOING_BUFFER_LIMIT),
+            ciphertext_write_buf: Vec::new(),
             plaintext_read_buf: BytesMut::with_capacity(PLAINTEXT_READ_BUF_CAPACITY),
-            plaintext_write_buf: Vec::with_capacity(OUTGOING_BUFFER_LIMIT),
+            plaintext_write_buf: Vec::new(),
             client_app_secret: None,
             server_app_secret: None,
             received_close_notify: false,
@@ -642,8 +657,8 @@ impl RealityClientConnection {
 
         handshake_seq += 1;
 
-        let prev_accumulated_len = accumulated_plaintext.len();
-        accumulated_plaintext.extend_from_slice(&plaintext);
+        let prev_accumulated_len =
+            append_handshake_plaintext(&mut accumulated_plaintext, &plaintext)?;
 
         let mut offset = prev_accumulated_len;
         while offset < accumulated_plaintext.len() && messages_found < 4 {
@@ -1108,13 +1123,19 @@ impl RealityClientConnection {
         self.ciphertext_read_buf.split().freeze()
     }
 
-    /// Accept at most [`OUTGOING_BUFFER_LIMIT`] bytes per call and report how
-    /// many were taken, so a caller that never drains cannot grow this buffer
-    /// without bound.
+    /// Accept at most [`OUTGOING_BUFFER_LIMIT`] total bytes (plaintext + pending ciphertext)
+    /// per call and report how many were taken, so a caller that never drains cannot grow
+    /// these buffers without bound.
     pub fn write_plaintext(&mut self, buf: &[u8]) -> io::Result<usize> {
-        let n = buf.len().min(OUTGOING_BUFFER_LIMIT);
-        self.plaintext_write_buf.extend_from_slice(&buf[..n]);
-        Ok(n)
+        let pending_bytes = self
+            .ciphertext_write_buf
+            .len()
+            .saturating_add(self.plaintext_write_buf.len());
+        let accepted = buf
+            .len()
+            .min(OUTGOING_BUFFER_LIMIT.saturating_sub(pending_bytes));
+        self.plaintext_write_buf.extend_from_slice(&buf[..accepted]);
+        Ok(accepted)
     }
 
     pub fn write_tls(&mut self, wr: &mut dyn Write) -> io::Result<usize> {
@@ -1280,5 +1301,40 @@ mod tests {
             conn.handshake_state,
             HandshakeState::ProcessingHandshake { .. }
         ));
+    }
+
+    #[test]
+    fn handshake_plaintext_is_bounded() {
+        let mut accumulated = vec![0; MAX_HANDSHAKE_PLAINTEXT];
+
+        let error = append_handshake_plaintext(&mut accumulated, &[0]).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(accumulated.len(), MAX_HANDSHAKE_PLAINTEXT);
+    }
+
+    #[test]
+    fn write_plaintext_counts_pending_ciphertext() {
+        let server_priv =
+            agreement::PrivateKey::from_private_key(&agreement::X25519, &[7u8; 32])
+                .unwrap();
+        let server_pub_bytes = server_priv.compute_public_key().unwrap();
+        let mut public_key = [0u8; 32];
+        public_key.copy_from_slice(server_pub_bytes.as_ref());
+
+        let config = RealityClientConfig {
+            public_key,
+            short_id: [0u8; 8],
+            server_name: "example.com".to_string(),
+            cipher_suites: vec![CipherSuite::AES_128_GCM_SHA256],
+        };
+        let mut conn = RealityClientConnection::new(config).unwrap();
+
+        // Artificially populate ciphertext_write_buf to near limit
+        conn.ciphertext_write_buf = vec![0u8; OUTGOING_BUFFER_LIMIT - 3];
+
+        assert_eq!(conn.write_plaintext(b"hello").unwrap(), 3);
+        assert_eq!(conn.write_plaintext(b"world").unwrap(), 0);
+        assert_eq!(conn.plaintext_write_buf.as_slice(), b"hel");
     }
 }
