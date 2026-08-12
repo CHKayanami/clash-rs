@@ -5,7 +5,7 @@ use axum::{
     response::IntoResponse,
 };
 
-use tracing::warn;
+use tracing::{debug, warn};
 
 use crate::app::api::AppState;
 
@@ -29,7 +29,7 @@ pub async fn handle(
             };
 
             if let Err(e) = socket.send(Message::Text(res_str.into())).await {
-                warn!("ws send error: {}", e);
+                debug!("ws send error: {}", e);
                 break;
             }
         }

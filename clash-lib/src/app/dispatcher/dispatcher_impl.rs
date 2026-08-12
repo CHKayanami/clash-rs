@@ -166,7 +166,9 @@ impl Dispatcher {
                         ) => match err.kind() {
                             std::io::ErrorKind::UnexpectedEof
                             | std::io::ErrorKind::ConnectionReset
-                            | std::io::ErrorKind::BrokenPipe => {
+                            | std::io::ErrorKind::BrokenPipe
+                            | std::io::ErrorKind::TimedOut
+                            | std::io::ErrorKind::NotConnected => {
                                 debug!(
                                     "connection {} closed with error {} by local",
                                     sess, err
@@ -184,7 +186,9 @@ impl Dispatcher {
                         ) => match err.kind() {
                             std::io::ErrorKind::UnexpectedEof
                             | std::io::ErrorKind::ConnectionReset
-                            | std::io::ErrorKind::BrokenPipe => {
+                            | std::io::ErrorKind::BrokenPipe
+                            | std::io::ErrorKind::TimedOut
+                            | std::io::ErrorKind::NotConnected => {
                                 debug!(
                                     "connection {} closed with error {} by remote",
                                     sess, err
@@ -201,7 +205,9 @@ impl Dispatcher {
                             match err.kind() {
                                 std::io::ErrorKind::UnexpectedEof
                                 | std::io::ErrorKind::ConnectionReset
-                                | std::io::ErrorKind::BrokenPipe => {
+                                | std::io::ErrorKind::BrokenPipe
+                                | std::io::ErrorKind::TimedOut
+                                | std::io::ErrorKind::NotConnected => {
                                     debug!(
                                         "connection {} closed with error {}",
                                         sess, err

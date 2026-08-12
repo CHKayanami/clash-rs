@@ -153,7 +153,7 @@ pub async fn log(
             };
 
             if let Err(e) = socket.send(Message::Text(res.into())).await {
-                warn!("ws send error: {}", e);
+                debug!("ws send error: {}", e);
                 break;
             }
         }
