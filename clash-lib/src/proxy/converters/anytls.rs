@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use tracing::warn;
 
 use crate::{
@@ -6,6 +7,7 @@ use crate::{
         HandlerCommonOptions,
         anytls::{Handler, HandlerOptions},
         transport::{TlsClient, TransportLayer},
+        utils::RemoteConnector,
     },
 };
 
@@ -19,23 +21,24 @@ impl TryFrom<OutboundAnytls> for Handler {
     }
 }
 
-impl TryFrom<&OutboundAnytls> for Handler {
-    type Error = crate::Error;
+pub fn build_handler(
+    s: &OutboundAnytls,
+    connector: Option<Arc<dyn RemoteConnector>>,
+) -> Result<Handler, crate::Error> {
+    let skip_cert_verify = s.skip_cert_verify.unwrap_or_default();
+    if skip_cert_verify {
+        warn!("skip_cert_verify is set to true for {}", s.common_opts.name);
+    }
+    if s.fingerprint.is_some() || s.client_fingerprint.is_some() {
+        warn!(
+            "anytls fingerprint fields are parsed but not applied yet for {}",
+            s.common_opts.name
+        );
+    }
+    let default_pool = crate::proxy::anytls::pool::SessionPoolConfig::default();
 
-    fn try_from(s: &OutboundAnytls) -> Result<Self, Self::Error> {
-        let skip_cert_verify = s.skip_cert_verify.unwrap_or_default();
-        if skip_cert_verify {
-            warn!("skip_cert_verify is set to true for {}", s.common_opts.name);
-        }
-        if s.fingerprint.is_some() || s.client_fingerprint.is_some() {
-            warn!(
-                "anytls fingerprint fields are parsed but not applied yet for {}",
-                s.common_opts.name
-            );
-        }
-        let default_pool = crate::proxy::anytls::pool::SessionPoolConfig::default();
-
-        Ok(Handler::new(HandlerOptions {
+    Ok(Handler::new(
+        HandlerOptions {
             name: s.common_opts.name.to_owned(),
             common_opts: HandlerCommonOptions {
                 connector: s.common_opts.connect_via.clone(),
@@ -77,6 +80,15 @@ impl TryFrom<&OutboundAnytls> for Handler {
                 Some(TransportLayer::Tls(client))
             },
             transport: None,
-        }))
+        },
+        connector,
+    ))
+}
+
+impl TryFrom<&OutboundAnytls> for Handler {
+    type Error = crate::Error;
+
+    fn try_from(s: &OutboundAnytls) -> Result<Self, Self::Error> {
+        build_handler(s, None)
     }
 }

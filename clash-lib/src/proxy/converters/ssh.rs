@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use russh::keys::{EcdsaCurve, HashAlg};
 use totp_rs::{Rfc6238, Secret, TOTP};
 
@@ -6,6 +7,7 @@ use crate::{
     proxy::{
         HandlerCommonOptions,
         ssh::{Handler, HandlerOptions},
+        utils::RemoteConnector,
     },
 };
 
@@ -48,71 +50,69 @@ fn str_to_algo(value: &str) -> Option<russh::keys::Algorithm> {
     }
 }
 
-impl TryFrom<&OutboundSsh> for Handler {
-    type Error = crate::Error;
-
-    fn try_from(s: &OutboundSsh) -> Result<Self, Self::Error> {
-        let host_key_algorithms = s.host_key_algorithms.clone().map(|algos| {
-            algos
-                .iter()
-                .filter_map(|s| str_to_algo(s))
-                .collect::<Vec<_>>()
+pub fn build_handler(
+    s: &OutboundSsh,
+    connector: Option<Arc<dyn RemoteConnector>>,
+) -> Result<Handler, crate::Error> {
+    let host_key_algorithms = s.host_key_algorithms.clone().map(|algos| {
+        algos
+            .iter()
+            .filter_map(|s| str_to_algo(s))
+            .collect::<Vec<_>>()
+    });
+    let totp: Option<Result<TOTP, crate::Error>> =
+        s.totp_opt.clone().map(|t| match t {
+            crate::config::internal::proxy::TotpOption::OtpAuth(secret) => {
+                let rfc6238 = Rfc6238::with_defaults(
+                    Secret::Encoded(secret).to_bytes().map_err(|e| {
+                        crate::Error::InvalidConfig(format!(
+                            "ssh totp, invalid secret {e:?}"
+                        ))
+                    })?,
+                )
+                .map_err(|e| {
+                    crate::Error::InvalidConfig(format!(
+                        "ssh totp, invalid totp: {e}"
+                    ))
+                })?;
+                TOTP::from_rfc6238(rfc6238).map_err(|e| {
+                    crate::Error::InvalidConfig(format!(
+                        "ssh totp, invalid totp: {e}"
+                    ))
+                })
+            }
+            crate::config::internal::proxy::TotpOption::Common(Totp {
+                algorithm,
+                digits,
+                screw,
+                step,
+                secret,
+            }) => TOTP::new(
+                algorithm,
+                digits,
+                screw,
+                step,
+                Secret::Encoded(secret).to_bytes().map_err(|e| {
+                    crate::Error::InvalidConfig(format!(
+                        "ssh totp, invalid secret {e:?}"
+                    ))
+                })?,
+            )
+            .map_err(|e| {
+                crate::Error::InvalidConfig(format!(
+                    "ssh totp, invalid totp: {e}"
+                ))
+            }),
         });
-        let totp: Option<Result<TOTP, Self::Error>> =
-            s.totp_opt.clone().map(|t| match t {
-                crate::config::internal::proxy::TotpOption::OtpAuth(secret) => {
-                    let rfc6238 = Rfc6238::with_defaults(
-                        Secret::Encoded(secret).to_bytes().map_err(|e| {
-                            crate::Error::InvalidConfig(format!(
-                                "ssh totp, invalid secret {e:?}"
-                            ))
-                        })?,
-                    )
-                    .map_err(|e| {
-                        crate::Error::InvalidConfig(format!(
-                            "ssh totp, invalid totp: {e}"
-                        ))
-                    })?;
-                    TOTP::from_rfc6238(rfc6238).map_err(|e| {
-                        crate::Error::InvalidConfig(format!(
-                            "ssh totp, invalid totp: {e}"
-                        ))
-                    })
-                }
-                crate::config::internal::proxy::TotpOption::Common(common_opt) => {
-                    let Totp {
-                        secret,
-                        screw,
-                        step,
-                        digits,
-                        algorithm,
-                    } = common_opt;
-                    TOTP::new(
-                        algorithm,
-                        digits,
-                        screw,
-                        step,
-                        Secret::Encoded(secret).to_bytes().map_err(|e| {
-                            crate::Error::InvalidConfig(format!(
-                                "ssh totp, invalid secret {e:?}"
-                            ))
-                        })?,
-                    )
-                    .map_err(|e| {
-                        crate::Error::InvalidConfig(format!(
-                            "ssh totp, invalid totp: {e}"
-                        ))
-                    })
-                }
-            });
 
-        let totp = match totp {
-            Some(Ok(t)) => Some(t),
-            Some(Err(e)) => return Err(e),
-            None => None,
-        };
+    let totp = match totp {
+        Some(Ok(t)) => Some(t),
+        Some(Err(e)) => return Err(e),
+        None => None,
+    };
 
-        let h = Handler::new(HandlerOptions {
+    let h = Handler::new(
+        HandlerOptions {
             name: s.common_opts.name.to_owned(),
             common_opts: HandlerCommonOptions {
                 connector: s.common_opts.connect_via.clone(),
@@ -127,8 +127,17 @@ impl TryFrom<&OutboundSsh> for Handler {
             host_key: s.host_key.clone(),
             host_key_algorithms,
             totp,
-        });
+        },
+        connector,
+    );
 
-        Ok(h)
+    Ok(h)
+}
+
+impl TryFrom<&OutboundSsh> for Handler {
+    type Error = crate::Error;
+
+    fn try_from(s: &OutboundSsh) -> Result<Self, Self::Error> {
+        build_handler(s, None)
     }
 }

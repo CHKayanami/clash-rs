@@ -44,7 +44,7 @@ pub struct HandlerOptions {
 
 pub struct Handler {
     opts: HandlerOptions,
-    connector: tokio::sync::RwLock<Option<Arc<dyn RemoteConnector>>>,
+    connector: Option<Arc<dyn RemoteConnector>>,
 }
 
 impl std::fmt::Debug for Handler {
@@ -58,11 +58,8 @@ impl std::fmt::Debug for Handler {
 impl_default_connector!(Handler);
 
 impl Handler {
-    pub fn new(opts: HandlerOptions) -> Self {
-        Self {
-            opts,
-            connector: Default::default(),
-        }
+    pub fn new(opts: HandlerOptions, connector: Option<Arc<dyn RemoteConnector>>) -> Self {
+        Self { opts, connector }
     }
 
     async fn inner_proxy_stream(
@@ -136,21 +133,18 @@ impl OutboundHandler for Handler {
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
     ) -> io::Result<BoxedChainedStream> {
-        let dialer = self.connector.read().await;
-
-        if let Some(dialer) = dialer.as_ref() {
+        if let Some(dialer) = self.connector.as_ref() {
             debug!("{:?} is connecting via {:?}", self, dialer);
+            self.connect_stream_with_connector(sess, resolver, dialer.as_ref())
+                .await
+        } else {
+            self.connect_stream_with_connector(
+                sess,
+                resolver,
+                &**GLOBAL_DIRECT_CONNECTOR,
+            )
+            .await
         }
-
-        self.connect_stream_with_connector(
-            sess,
-            resolver,
-            dialer
-                .as_ref()
-                .unwrap_or(&*GLOBAL_DIRECT_CONNECTOR)
-                .as_ref(),
-        )
-        .await
     }
 
     async fn connect_datagram(
@@ -158,21 +152,18 @@ impl OutboundHandler for Handler {
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
     ) -> io::Result<BoxedChainedDatagram> {
-        let dialer = self.connector.read().await;
-
-        if let Some(dialer) = dialer.as_ref() {
+        if let Some(dialer) = self.connector.as_ref() {
             debug!("{:?} is connecting via {:?}", self, dialer);
+            self.connect_datagram_with_connector(sess, resolver, dialer.as_ref())
+                .await
+        } else {
+            self.connect_datagram_with_connector(
+                sess,
+                resolver,
+                &**GLOBAL_DIRECT_CONNECTOR,
+            )
+            .await
         }
-
-        self.connect_datagram_with_connector(
-            sess,
-            resolver,
-            dialer
-                .as_ref()
-                .unwrap_or(&*GLOBAL_DIRECT_CONNECTOR)
-                .as_ref(),
-        )
-        .await
     }
 
     async fn support_connector(&self) -> ConnectorType {
@@ -408,7 +399,7 @@ mod tests {
             transport: Some(TransportLayer::Ws(ws_client)),
             flow: None,
         };
-        let handler = Arc::new(Handler::new(opts));
+        let handler = Arc::new(Handler::new(opts, None));
 
         run_test_suites_and_cleanup(handler, runner, Suite::all()).await
     }

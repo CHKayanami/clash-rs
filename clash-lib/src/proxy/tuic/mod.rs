@@ -424,12 +424,9 @@ mod tests {
 
     use super::{test_utils::TuicServerProcess, *};
     use crate::{
-        proxy::utils::{
-            GLOBAL_DIRECT_CONNECTOR,
-            test_utils::{
-                echo::{TcpEchoConfig, TcpEchoServer},
-                noop::NoopResolver,
-            },
+        proxy::utils::test_utils::{
+            echo::{TcpEchoConfig, TcpEchoServer},
+            noop::NoopResolver,
         },
         session::Session,
     };
@@ -505,9 +502,6 @@ mod tests {
 
         let opts = gen_options(port)?;
         let handler = Arc::new(Handler::new(opts));
-        handler
-            .register_connector(GLOBAL_DIRECT_CONNECTOR.clone())
-            .await;
 
         let resolver = Arc::new(NoopResolver);
 
@@ -562,9 +556,6 @@ mod tests {
         opts.password = "wrong_password".into();
 
         let handler = Arc::new(Handler::new(opts));
-        handler
-            .register_connector(GLOBAL_DIRECT_CONNECTOR.clone())
-            .await;
 
         let resolver = Arc::new(NoopResolver);
 
@@ -629,9 +620,6 @@ mod tests {
 
         let opts = gen_options_v6(port)?;
         let handler = Arc::new(Handler::new(opts));
-        handler
-            .register_connector(GLOBAL_DIRECT_CONNECTOR.clone())
-            .await;
 
         let resolver = ipv6_resolver();
 
@@ -687,9 +675,6 @@ mod tests {
 
         let opts = gen_options(port)?;
         let handler = Arc::new(Handler::new(opts));
-        handler
-            .register_connector(GLOBAL_DIRECT_CONNECTOR.clone())
-            .await;
 
         let resolver = ipv6_resolver();
 

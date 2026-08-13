@@ -292,10 +292,6 @@ pub trait DialWithConnector {
     fn support_dialer(&self) -> Option<&str> {
         None
     }
-
-    /// register a dialer for the outbound handler
-    /// this must be called before the outbound handler is used
-    async fn register_connector(&self, _: Arc<dyn RemoteConnector>) {}
 }
 
 /// Plain outbound implements this trait to serialize itself for rest API

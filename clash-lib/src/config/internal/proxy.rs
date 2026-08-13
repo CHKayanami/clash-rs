@@ -117,6 +117,48 @@ impl OutboundProxyProtocol {
             OutboundProxyProtocol::Tailscale(ts) => &ts.name,
         }
     }
+
+    pub fn dialer_proxy(&self) -> Option<&str> {
+        match &self {
+            OutboundProxyProtocol::Direct(_) | OutboundProxyProtocol::Reject(_) => None,
+            #[cfg(feature = "shadowsocks")]
+            OutboundProxyProtocol::Ss(ss) => ss.common_opts.connect_via.as_deref(),
+            OutboundProxyProtocol::Socks5(socks5) => {
+                socks5.common_opts.connect_via.as_deref()
+            }
+            OutboundProxyProtocol::Anytls(anytls) => {
+                anytls.common_opts.connect_via.as_deref()
+            }
+            OutboundProxyProtocol::Trojan(trojan) => {
+                trojan.common_opts.connect_via.as_deref()
+            }
+            OutboundProxyProtocol::Vmess(vmess) => {
+                vmess.common_opts.connect_via.as_deref()
+            }
+            OutboundProxyProtocol::Vless(vless) => {
+                vless.common_opts.connect_via.as_deref()
+            }
+            #[cfg(feature = "wireguard")]
+            OutboundProxyProtocol::Wireguard(wireguard) => {
+                wireguard.common_opts.connect_via.as_deref()
+            }
+            #[cfg(feature = "onion")]
+            OutboundProxyProtocol::Tor(_) => None,
+            #[cfg(feature = "tuic")]
+            OutboundProxyProtocol::Tuic(tuic) => {
+                tuic.common_opts.connect_via.as_deref()
+            }
+            OutboundProxyProtocol::Hysteria2(_) => None,
+            #[cfg(feature = "ssh")]
+            OutboundProxyProtocol::Ssh(ssh) => ssh.common_opts.connect_via.as_deref(),
+            #[cfg(feature = "shadowquic")]
+            OutboundProxyProtocol::ShadowQuic(sq) => {
+                sq.common_opts.connect_via.as_deref()
+            }
+            #[cfg(feature = "tailscale")]
+            OutboundProxyProtocol::Tailscale(_) => None,
+        }
+    }
 }
 
 impl TryFrom<HashMap<String, Value>> for OutboundProxyProtocol {

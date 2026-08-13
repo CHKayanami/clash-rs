@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc};
 
 use crate::{
     Error,
@@ -10,6 +10,7 @@ use crate::{
             Shadowtls, SimpleOBFSMode, SimpleOBFSOption, SimpleObfsHttp,
             SimpleObfsTLS, TransportLayer, V2RayOBFSOption, V2rayWsClient,
         },
+        utils::RemoteConnector,
     },
 };
 
@@ -21,11 +22,12 @@ impl TryFrom<OutboundShadowsocks> for Handler {
     }
 }
 
-impl TryFrom<&OutboundShadowsocks> for Handler {
-    type Error = crate::Error;
-
-    fn try_from(s: &OutboundShadowsocks) -> Result<Self, Self::Error> {
-        let h = Handler::new(HandlerOptions {
+pub fn build_handler(
+    s: &OutboundShadowsocks,
+    connector: Option<Arc<dyn RemoteConnector>>,
+) -> Result<Handler, crate::Error> {
+    let h = Handler::new(
+        HandlerOptions {
             name: s.common_opts.name.to_owned(),
             common_opts: HandlerCommonOptions {
                 connector: s.common_opts.connect_via.clone(),
@@ -95,8 +97,17 @@ impl TryFrom<&OutboundShadowsocks> for Handler {
             },
             udp: s.udp,
             uot: s.udp_over_tcp,
-        });
-        Ok(h)
+        },
+        connector,
+    );
+    Ok(h)
+}
+
+impl TryFrom<&OutboundShadowsocks> for Handler {
+    type Error = crate::Error;
+
+    fn try_from(s: &OutboundShadowsocks) -> Result<Self, Self::Error> {
+        build_handler(s, None)
     }
 }
 

@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use tracing::warn;
 
 const DEFAULT_ALPN: [&str; 2] = ["h2", "http/1.1"];
@@ -10,6 +11,7 @@ use crate::{
         HandlerCommonOptions,
         transport::{GrpcClient, TlsClient, TransportLayer, WsClient},
         trojan::{Handler, HandlerOptions},
+        utils::RemoteConnector,
     },
 };
 
@@ -21,16 +23,17 @@ impl TryFrom<OutboundTrojan> for Handler {
     }
 }
 
-impl TryFrom<&OutboundTrojan> for Handler {
-    type Error = crate::Error;
+pub fn build_handler(
+    s: &OutboundTrojan,
+    connector: Option<Arc<dyn RemoteConnector>>,
+) -> Result<Handler, crate::Error> {
+    let skip_cert_verify = s.skip_cert_verify.unwrap_or_default();
+    if skip_cert_verify {
+        warn!("skip_cert_verify is set to true for {}", s.common_opts.name);
+    }
 
-    fn try_from(s: &OutboundTrojan) -> Result<Self, Self::Error> {
-        let skip_cert_verify = s.skip_cert_verify.unwrap_or_default();
-        if skip_cert_verify {
-            warn!("skip_cert_verify is set to true for {}", s.common_opts.name);
-        }
-
-        let h = Handler::new(HandlerOptions {
+    let h = Handler::new(
+        HandlerOptions {
             name: s.common_opts.name.to_owned(),
             common_opts: HandlerCommonOptions {
                 connector: s.common_opts.connect_via.clone(),
@@ -100,7 +103,16 @@ impl TryFrom<&OutboundTrojan> for Handler {
                     ))),
                 })
                 .transpose()?,
-        });
-        Ok(h)
+        },
+        connector,
+    );
+    Ok(h)
+}
+
+impl TryFrom<&OutboundTrojan> for Handler {
+    type Error = crate::Error;
+
+    fn try_from(s: &OutboundTrojan) -> Result<Self, Self::Error> {
+        build_handler(s, None)
     }
 }

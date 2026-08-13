@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use ipnet::IpNet;
 
 use crate::{
@@ -5,6 +6,7 @@ use crate::{
     config::internal::proxy::OutboundWireguard,
     proxy::{
         HandlerCommonOptions,
+        utils::RemoteConnector,
         wg::{Handler, HandlerOptions},
     },
 };
@@ -17,10 +19,10 @@ impl TryFrom<OutboundWireguard> for Handler {
     }
 }
 
-impl TryFrom<&OutboundWireguard> for Handler {
-    type Error = crate::Error;
-
-    fn try_from(s: &OutboundWireguard) -> Result<Self, Self::Error> {
+pub fn build_handler(
+    s: &OutboundWireguard,
+    connector: Option<Arc<dyn RemoteConnector>>,
+) -> Result<Handler, crate::Error> {
         let h = Handler::new(HandlerOptions {
             name: s.common_opts.name.to_owned(),
             common_opts: HandlerCommonOptions {
@@ -73,7 +75,16 @@ impl TryFrom<&OutboundWireguard> for Handler {
             udp: s.udp.unwrap_or_default(),
             allowed_ips: s.allowed_ips.as_ref().map(|x| x.to_owned()),
             reserved_bits: s.reserved_bits.as_ref().map(|x| x.to_owned()),
-        });
-        Ok(h)
+        },
+        connector,
+    );
+    Ok(h)
+}
+
+impl TryFrom<&OutboundWireguard> for Handler {
+    type Error = crate::Error;
+
+    fn try_from(s: &OutboundWireguard) -> Result<Self, Self::Error> {
+        build_handler(s, None)
     }
 }

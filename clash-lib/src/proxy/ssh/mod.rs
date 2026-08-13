@@ -114,17 +114,15 @@ pub struct HandlerOptions {
 pub struct Handler {
     opts: HandlerOptions,
 
-    connector: tokio::sync::RwLock<Option<Arc<dyn RemoteConnector>>>,
+    #[allow(dead_code)]
+    connector: Option<Arc<dyn RemoteConnector>>,
 }
 
 impl_default_connector!(Handler);
 
 impl Handler {
-    pub fn new(opts: HandlerOptions) -> Self {
-        Self {
-            opts,
-            connector: tokio::sync::RwLock::new(None),
-        }
+    pub fn new(opts: HandlerOptions, connector: Option<Arc<dyn RemoteConnector>>) -> Self {
+        Self { opts, connector }
     }
 }
 
@@ -485,7 +483,7 @@ mod tests {
             ]),
             totp: None,
         };
-        let handler: Arc<dyn OutboundHandler> = Arc::new(Handler::new(opts));
+        let handler: Arc<dyn OutboundHandler> = Arc::new(Handler::new(opts, None));
 
         run_test_suites_and_cleanup(handler, container, Suite::tcp_tests()).await
     }

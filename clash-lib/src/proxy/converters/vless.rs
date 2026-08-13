@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use crate::{
     Error,
     config::internal::proxy::OutboundVless,
@@ -6,6 +8,7 @@ use crate::{
         transport::{
             GrpcClient, H2Client, RealityClient, TlsClient, TransportLayer, WsClient,
         },
+        utils::RemoteConnector,
         vless::{Handler, HandlerOptions},
     },
 };
@@ -19,10 +22,10 @@ impl TryFrom<OutboundVless> for Handler {
     }
 }
 
-impl TryFrom<&OutboundVless> for Handler {
-    type Error = crate::Error;
-
-    fn try_from(s: &OutboundVless) -> Result<Self, Self::Error> {
+pub fn build_handler(
+    s: &OutboundVless,
+    connector: Option<Arc<dyn RemoteConnector>>,
+) -> Result<Handler, crate::Error> {
         let skip_cert_verify = s.skip_cert_verify.unwrap_or_default();
         if skip_cert_verify {
             warn!(
@@ -173,7 +176,16 @@ impl TryFrom<&OutboundVless> for Handler {
                 .flatten(),
             tls,
             flow: s.flow.clone(),
-        }))
+        },
+        connector,
+    ))
+}
+
+impl TryFrom<&OutboundVless> for Handler {
+    type Error = crate::Error;
+
+    fn try_from(s: &OutboundVless) -> Result<Self, Self::Error> {
+        build_handler(s, None)
     }
 }
 

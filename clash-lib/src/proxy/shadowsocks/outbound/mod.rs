@@ -15,12 +15,11 @@ use crate::{
         dns::ThreadSafeDNSResolver,
     },
     common::errors::new_io_error,
-    impl_default_connector,
     proxy::{
         AnyStream, ConnectorType, DialWithConnector, HandlerCommonOptions,
         OutboundHandler, OutboundType, PlainProxyAPIResponse,
         shadowsocks::map_cipher, transport::TransportLayer,
-        utils::{GLOBAL_DIRECT_CONNECTOR, RemoteConnector},
+        utils::{GLOBAL_DIRECT_CONNECTOR, RemoteConnector, new_udp_socket},
     },
     session::{Session, SocksAddr},
 };
@@ -49,13 +48,18 @@ pub struct HandlerOptions {
 pub struct Handler {
     opts: HandlerOptions,
     ctx: Arc<shadowsocks::context::Context>,
-    connector: tokio::sync::RwLock<Option<Arc<dyn RemoteConnector>>>,
+    connector: Option<Arc<dyn RemoteConnector>>,
     /// Built lazily and reused: `ServerConfig::new` re-derives the key from the
     /// password, and this used to run on every single connection.
     cfg: std::sync::OnceLock<ServerConfig>,
 }
 
-impl_default_connector!(Handler);
+#[async_trait]
+impl DialWithConnector for Handler {
+    fn support_dialer(&self) -> Option<&str> {
+        self.opts.common_opts.connector.as_deref()
+    }
+}
 
 impl Debug for Handler {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -66,11 +70,11 @@ impl Debug for Handler {
 }
 
 impl Handler {
-    pub fn new(opts: HandlerOptions) -> Self {
+    pub fn new(opts: HandlerOptions, connector: Option<Arc<dyn RemoteConnector>>) -> Self {
         Self {
             opts,
             ctx: Context::new_shared(ServerType::Local),
-            connector: tokio::sync::RwLock::new(None),
+            connector,
             cfg: std::sync::OnceLock::new(),
         }
     }
@@ -110,6 +114,50 @@ impl Handler {
         .map_err(|e| new_io_error(e.to_string()))?;
         Ok(self.cfg.get_or_init(|| cfg))
     }
+
+    async fn connect_datagram_direct(
+        &self,
+        sess: &Session,
+        resolver: ThreadSafeDNSResolver,
+    ) -> io::Result<BoxedChainedDatagram> {
+        let cfg = self.server_config()?;
+
+        let server_ip = resolver
+            .resolve(&self.opts.server, false)
+            .await
+            .map_err(|x| {
+                new_io_error(format!(
+                    "failed to resolve {}: {}",
+                    self.opts.server, x
+                ))
+            })?
+            .ok_or(new_io_error(format!(
+                "failed to resolve {}",
+                self.opts.server
+            )))?;
+        let server_addr = std::net::SocketAddr::new(server_ip, self.opts.port);
+
+        let socket = new_udp_socket(
+            None,
+            sess.iface.as_ref(),
+            #[cfg(target_os = "linux")]
+            sess.so_mark,
+            Some(server_addr),
+        )
+        .await?;
+
+        let socket: ProxySocket<shadowsocks::net::UdpSocket> =
+            ProxySocket::from_socket(
+                UdpSocketType::Client,
+                self.ctx.clone(),
+                cfg,
+                socket.into(),
+            );
+        let d = OutboundDatagramShadowsocks::new(socket, server_addr);
+        let d = ChainedDatagramWrapper::new(d);
+        d.append_to_chain(self.name()).await;
+        Ok(Box::new(d))
+    }
 }
 
 #[async_trait]
@@ -135,21 +183,18 @@ impl OutboundHandler for Handler {
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
     ) -> io::Result<BoxedChainedStream> {
-        let dialer = self.connector.read().await;
-
-        if let Some(dialer) = dialer.as_ref() {
+        if let Some(dialer) = self.connector.as_ref() {
             debug!("{:?} is connecting via {:?}", self, dialer);
+            self.connect_stream_with_connector(sess, resolver, dialer.as_ref())
+                .await
+        } else {
+            self.connect_stream_with_connector(
+                sess,
+                resolver,
+                &**GLOBAL_DIRECT_CONNECTOR,
+            )
+            .await
         }
-
-        self.connect_stream_with_connector(
-            sess,
-            resolver,
-            dialer
-                .as_ref()
-                .unwrap_or(&*GLOBAL_DIRECT_CONNECTOR)
-                .as_ref(),
-        )
-        .await
     }
 
     async fn connect_datagram(
@@ -157,21 +202,20 @@ impl OutboundHandler for Handler {
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
     ) -> io::Result<BoxedChainedDatagram> {
-        let dialer = self.connector.read().await;
-
-        if let Some(dialer) = dialer.as_ref() {
+        if let Some(dialer) = self.connector.as_ref() {
             debug!("{:?} is connecting via {:?}", self, dialer);
+            self.connect_datagram_with_connector(sess, resolver, dialer.as_ref())
+                .await
+        } else if self.opts.uot {
+            self.connect_datagram_with_connector(
+                sess,
+                resolver,
+                &**GLOBAL_DIRECT_CONNECTOR,
+            )
+            .await
+        } else {
+            self.connect_datagram_direct(sess, resolver).await
         }
-
-        self.connect_datagram_with_connector(
-            sess,
-            resolver,
-            dialer
-                .as_ref()
-                .unwrap_or(&*GLOBAL_DIRECT_CONNECTOR)
-                .as_ref(),
-        )
-        .await
     }
 
     async fn support_connector(&self) -> ConnectorType {
@@ -408,10 +452,10 @@ mod tests {
             uot: false,
         };
 
-        let handler = Arc::new(Handler::new(opts));
-        handler
-            .register_connector(GLOBAL_DIRECT_CONNECTOR.clone())
-            .await;
+        let handler = Arc::new(Handler::new(
+            opts,
+            Some(GLOBAL_DIRECT_CONNECTOR.clone()),
+        ));
         run_test_suites_and_cleanup(handler, container, Suite::all()).await
     }
 
@@ -478,7 +522,7 @@ mod tests {
             udp: false,
             uot: false,
         };
-        let handler: Arc<dyn OutboundHandler> = Arc::new(Handler::new(opts));
+        let handler: Arc<dyn OutboundHandler> = Arc::new(Handler::new(opts, None));
         // we need to store all the runners in a container, to make sure all of
         // them can be destroyed after the test
         let mut chained = MultiDockerTestRunner::default();
@@ -550,7 +594,7 @@ mod tests {
             uot: false,
         };
 
-        let handler: Arc<dyn OutboundHandler> = Arc::new(Handler::new(opts));
+        let handler: Arc<dyn OutboundHandler> = Arc::new(Handler::new(opts, None));
         let mut chained = MultiDockerTestRunner::default();
         chained.add_with_runner(container1);
         chained.add_with_runner(container2);
@@ -596,7 +640,7 @@ mod tests {
             uot: false,
         };
 
-        let handler: Arc<dyn OutboundHandler> = Arc::new(Handler::new(opts));
+        let handler: Arc<dyn OutboundHandler> = Arc::new(Handler::new(opts, None));
         run_test_suites_and_cleanup(handler, container, Suite::tcp_tests()).await
     }
 

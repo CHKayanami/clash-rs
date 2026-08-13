@@ -281,7 +281,6 @@ mod tests {
     async fn test_hysteria2_client_live_connection() {
         crate::tests::initialize();
         use crate::app::dns::ThreadSafeDNSResolver;
-        use crate::proxy::{DialWithConnector, utils::GLOBAL_DIRECT_CONNECTOR};
         use crate::session::{Session, SocksAddr};
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -290,9 +289,6 @@ mod tests {
             Handler::try_from_url(url_str)
                 .expect("failed to parse and create hysteria2 handler"),
         );
-        handler
-            .register_connector(GLOBAL_DIRECT_CONNECTOR.clone())
-            .await;
 
         let sess = Session {
             destination: SocksAddr::Domain("www.baidu.com".to_string(), 80),
@@ -341,7 +337,6 @@ mod tests {
         crate::tests::initialize();
         use crate::app::dns::ThreadSafeDNSResolver;
         use crate::common::tls::{DefaultTlsVerifier, build_tls_client_config};
-        use crate::proxy::{DialWithConnector, utils::GLOBAL_DIRECT_CONNECTOR};
         use crate::session::{Session, SocksAddr};
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -350,9 +345,6 @@ mod tests {
             Handler::try_from_url(url_str)
                 .expect("failed to parse and create hysteria2 handler"),
         );
-        handler
-            .register_connector(GLOBAL_DIRECT_CONNECTOR.clone())
-            .await;
 
         let sess = Session {
             destination: SocksAddr::Domain("www.baidu.com".to_string(), 443),

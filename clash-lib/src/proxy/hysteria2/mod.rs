@@ -953,9 +953,6 @@ mod tests {
         let handler = Arc::new(
             Handler::new(opts).expect("failed to create hysteria2 handler"),
         );
-        handler
-            .register_connector(GLOBAL_DIRECT_CONNECTOR.clone())
-            .await;
         run_test_suites_and_cleanup(handler, container, Suite::all()).await
     }
 }

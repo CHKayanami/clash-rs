@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use tracing::warn;
 
 use crate::{
@@ -6,6 +7,7 @@ use crate::{
     proxy::{
         HandlerCommonOptions,
         transport::{GrpcClient, H2Client, TlsClient, TransportLayer, WsClient},
+        utils::RemoteConnector,
         vmess::{Handler, HandlerOptions},
     },
 };
@@ -18,16 +20,17 @@ impl TryFrom<OutboundVmess> for Handler {
     }
 }
 
-impl TryFrom<&OutboundVmess> for Handler {
-    type Error = crate::Error;
+pub fn build_handler(
+    s: &OutboundVmess,
+    connector: Option<Arc<dyn RemoteConnector>>,
+) -> Result<Handler, crate::Error> {
+    let skip_cert_verify = s.skip_cert_verify.unwrap_or_default();
+    if skip_cert_verify {
+        warn!("skip_cert_verify is set to true for {}", s.common_opts.name);
+    }
 
-    fn try_from(s: &OutboundVmess) -> Result<Self, Self::Error> {
-        let skip_cert_verify = s.skip_cert_verify.unwrap_or_default();
-        if skip_cert_verify {
-            warn!("skip_cert_verify is set to true for {}", s.common_opts.name);
-        }
-
-        let h = Handler::new(HandlerOptions {
+    let h = Handler::new(
+        HandlerOptions {
             name: s.common_opts.name.to_owned(),
             common_opts: HandlerCommonOptions {
                 connector: s.common_opts.connect_via.clone(),
@@ -95,7 +98,7 @@ impl TryFrom<&OutboundVmess> for Handler {
                                 x.headers.clone().and_then(|x| {
                                     let h = x.get("Host");
                                     h.cloned()
-                                })
+                                    })
                             })
                             .unwrap_or(s.common_opts.server.to_owned()),
                     ),
@@ -118,7 +121,16 @@ impl TryFrom<&OutboundVmess> for Handler {
             } else {
                 None
             },
-        });
-        Ok(h)
+        },
+        connector,
+    );
+    Ok(h)
+}
+
+impl TryFrom<&OutboundVmess> for Handler {
+    type Error = crate::Error;
+
+    fn try_from(s: &OutboundVmess) -> Result<Self, Self::Error> {
+        build_handler(s, None)
     }
 }

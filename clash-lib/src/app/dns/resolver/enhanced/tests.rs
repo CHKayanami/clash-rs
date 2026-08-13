@@ -422,16 +422,19 @@ fn make_outbound_registry(
     let mut map = std::collections::HashMap::new();
     for (name, server) in entries {
         let h: Arc<dyn crate::proxy::OutboundHandler> =
-            Arc::new(SocksHandler::new(SocksHandlerOptions {
-                name: name.to_string(),
-                common_opts: HandlerCommonOptions::default(),
-                server: server.to_string(),
-                port: 1080,
-                user: None,
-                password: None,
-                udp: false,
-                tls_client: None,
-            }));
+            Arc::new(SocksHandler::new(
+                SocksHandlerOptions {
+                    name: name.to_string(),
+                    common_opts: HandlerCommonOptions::default(),
+                    server: server.to_string(),
+                    port: 1080,
+                    user: None,
+                    password: None,
+                    udp: false,
+                    tls_client: None,
+                },
+                None,
+            ));
         map.insert(name.to_string(), h);
     }
     Arc::new(parking_lot::RwLock::new(map))

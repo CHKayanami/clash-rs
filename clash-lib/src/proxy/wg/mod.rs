@@ -66,7 +66,7 @@ pub struct Handler {
     opts: HandlerOptions,
     inner: OnceCell<Inner>,
 
-    connector: tokio::sync::RwLock<Option<Arc<dyn RemoteConnector>>>,
+    connector: Option<Arc<dyn RemoteConnector>>,
 }
 
 impl std::fmt::Debug for Handler {
@@ -80,12 +80,11 @@ impl std::fmt::Debug for Handler {
 impl_default_connector!(Handler);
 
 impl Handler {
-    pub fn new(opts: HandlerOptions) -> Self {
+    pub fn new(opts: HandlerOptions, connector: Option<Arc<dyn RemoteConnector>>) -> Self {
         Self {
             opts,
             inner: OnceCell::new(),
-
-            connector: Default::default(),
+            connector,
         }
     }
 
@@ -163,7 +162,7 @@ impl Handler {
                     recv_pair.0,
                     send_pair.1,
                     resolver.clone(),
-                    self.connector.read().await.as_ref().cloned(),
+                    self.connector.clone(),
                     sess,
                 )
                 .await
@@ -402,10 +401,10 @@ mod tests {
             allowed_ips: Some(vec!["0.0.0.0/0".to_owned()]),
             reserved_bits: None,
         };
-        let handler = Arc::new(Handler::new(opts));
-        handler
-            .register_connector(GLOBAL_DIRECT_CONNECTOR.clone())
-            .await;
+        let handler = Arc::new(Handler::new(
+            opts,
+            Some(GLOBAL_DIRECT_CONNECTOR.clone()),
+        ));
 
         // cannot run the ping pong test, since the wireguard server is running
         // on bridge network mode and the `net.ipv4.conf.all.

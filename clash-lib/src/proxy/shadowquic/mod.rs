@@ -346,9 +346,6 @@ log-level: "trace"
         let opts = gen_options(container_ip, host_port, false)?;
 
         let handler = Arc::new(Handler::new("test-shadowquic".into(), opts));
-        handler
-            .register_connector(GLOBAL_DIRECT_CONNECTOR.clone())
-            .await;
         run_test_suites_and_cleanup(handler, container, Suite::all()).await
     }
     #[tokio::test]
@@ -363,9 +360,6 @@ log-level: "trace"
         opts.over_stream = true;
 
         let handler = Arc::new(Handler::new("test-shadowquic".into(), opts));
-        handler
-            .register_connector(GLOBAL_DIRECT_CONNECTOR.clone())
-            .await;
         run_test_suites_and_cleanup(handler, container, Suite::all()).await
     }
 }

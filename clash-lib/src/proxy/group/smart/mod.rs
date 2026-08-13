@@ -791,7 +791,7 @@ mod tests {
             udp: true,
         };
         let ss_handler: AnyOutboundHandler =
-            Arc::new(crate::proxy::shadowsocks::outbound::Handler::new(ss_opts))
+            Arc::new(crate::proxy::shadowsocks::outbound::Handler::new(ss_opts, None))
                 as _;
 
         let mut provider = MockDummyProxyProvider::new();
