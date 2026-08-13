@@ -2,7 +2,7 @@ use super::{
     dns::ThreadSafeDNSResolver,
     remote_content_manager::providers::{
         file_vehicle, http_vehicle,
-        rule_provider::{RuleProviderImpl, ThreadSafeRuleProvider},
+        rule_provider::RuleProviderImpl,
     },
 };
 use crate::{
@@ -26,6 +26,8 @@ mod rules;
 
 use crate::common::{geodata::GeoDataLookup, mmdb::MmdbLookup};
 pub use rules::RuleMatcher;
+pub use rules::geodata::GeoSiteMatcher;
+pub use super::remote_content_manager::providers::rule_provider::ThreadSafeRuleProvider;
 
 pub struct Router {
     rules: Vec<Box<dyn RuleMatcher>>,
@@ -33,6 +35,7 @@ pub struct Router {
 
     country_mmdb: Option<MmdbLookup>,
     asn_mmdb: Option<MmdbLookup>,
+    geodata: Option<GeoDataLookup>,
     rule_providers: HashMap<String, ThreadSafeRuleProvider>,
 }
 
@@ -84,12 +87,17 @@ impl Router {
 
             country_mmdb,
             asn_mmdb,
+            geodata,
             rule_providers: rule_provider_registry,
         }
     }
 
     pub fn get_rule_providers(&self) -> &HashMap<String, ThreadSafeRuleProvider> {
         &self.rule_providers
+    }
+
+    pub fn geodata(&self) -> Option<&GeoDataLookup> {
+        self.geodata.as_ref()
     }
 
     /// this mutates the session, attaching resolved IP and ASN

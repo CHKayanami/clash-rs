@@ -1,6 +1,5 @@
-use crate::app::remote_content_manager::providers::rule_provider::ThreadSafeRuleProvider;
-use crate::session::{Session, SocksAddr};
-use crate::{Error, common::trie};
+use crate::Error;
+use crate::app::router::ThreadSafeRuleProvider;
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -19,8 +18,7 @@ pub use mem_store::InMemStore;
 pub struct Opts {
     pub ipnet: ipnet::Ipv4Net,
     pub ipnet6: ipnet::Ipv6Net,
-    pub skipped_hostnames: Option<trie::StringTrie<bool>>,
-    pub ruleset_names: Option<Vec<String>>,
+    pub domain_filter: Option<crate::app::dns::filters::DomainFilter>,
     pub store: Box<dyn Store>,
 }
 
@@ -56,9 +54,7 @@ pub struct FakePoolV6 {
 pub struct FakeDns {
     v4_pool: Option<FakePoolV4>,
     v6_pool: Option<FakePoolV6>,
-    skipped_hostnames: Option<trie::StringTrie<bool>>,
-    ruleset_names: Option<Vec<String>>,
-    rule_provider: std::sync::OnceLock<Vec<ThreadSafeRuleProvider>>,
+    domain_filter: Option<crate::app::dns::filters::DomainFilter>,
     store: Box<dyn Store>,
     /// Memoized `should_skip` verdicts. Covers both static `fake-ip-filter`
     /// entries and `rule-set:` matches; cleared wholesale whenever one of the
@@ -116,9 +112,7 @@ impl FakeDns {
         Ok(Self {
             v4_pool,
             v6_pool,
-            skipped_hostnames: opt.skipped_hostnames,
-            rule_provider: std::sync::OnceLock::new(),
-            ruleset_names: opt.ruleset_names,
+            domain_filter: opt.domain_filter,
             store: opt.store,
             skip_cache: moka::sync::Cache::builder().max_capacity(1000).build(),
         })
@@ -152,36 +146,31 @@ impl FakeDns {
         &self,
         rp_map: &HashMap<String, ThreadSafeRuleProvider>,
     ) {
-        if let Some(names) = &self.ruleset_names {
-            let mut providers = Vec::new();
-            for name in names {
-                if let Some(rp) = rp_map.get(name) {
-                    providers.push(rp.clone());
+        if let Some(filter) = &self.domain_filter {
+            if let Some(providers) = filter.add_rule_set(rp_map) {
+                // Subscribe before publishing the providers, so no query can be
+                // served from a cache that isn't wired for invalidation yet.
+                //
+                // `moka` cache handles are cheap to clone and share one backing
+                // store, so the callback carries a handle rather than a
+                // back-reference to `FakeDns` — no reference cycle, and nothing
+                // here keeps the resolver alive.
+                for rp in providers {
+                    let cache = self.skip_cache.clone();
+                    let name = rp.name().to_owned();
+                    rp.on_change(Arc::new(move || {
+                        debug!(
+                            "rule-set {} reloaded, clearing fake-ip skip cache",
+                            name
+                        );
+                        cache.invalidate_all();
+                    }));
                 }
-            }
-            // Subscribe before publishing the providers, so no query can be
-            // served from a cache that isn't wired for invalidation yet.
-            //
-            // `moka` cache handles are cheap to clone and share one backing
-            // store, so the callback carries a handle rather than a
-            // back-reference to `FakeDns` — no reference cycle, and nothing
-            // here keeps the resolver alive.
-            for rp in &providers {
-                let cache = self.skip_cache.clone();
-                let name = rp.name().to_owned();
-                rp.on_change(Arc::new(move || {
-                    debug!(
-                        "rule-set {} reloaded, clearing fake-ip skip cache",
-                        name
-                    );
-                    cache.invalidate_all();
-                }));
-            }
 
-            let _ = self.rule_provider.set(providers);
-            // Verdicts computed before the rule-sets were bound assumed there
-            // were none; drop them.
-            self.skip_cache.invalidate_all();
+                // Verdicts computed before the rule-sets were bound assumed there
+                // were none; drop them.
+                self.skip_cache.invalidate_all();
+            }
         }
     }
 
@@ -200,23 +189,11 @@ impl FakeDns {
     /// matches are covered by the `on_change` subscription installed in
     /// [`FakeDns::add_rule_set`].
     fn compute_should_skip(&self, domain: &str) -> bool {
-        // 1. Static `fake-ip-filter` entries.
-        if let Some(host) = &self.skipped_hostnames
-            && host.search(domain).is_some()
-        {
-            return true;
+        if let Some(filter) = &self.domain_filter {
+            filter.apply(domain)
+        } else {
+            false
         }
-
-        // 2. `rule-set:` entries.
-        if let Some(rps) = self.rule_provider.get() {
-            let sess = Session {
-                destination: SocksAddr::Domain(domain.to_owned(), 443),
-                ..Default::default()
-            };
-            return rps.iter().any(|rp| rp.search(&sess));
-        }
-
-        false
     }
 
     #[allow(dead_code)]
@@ -391,8 +368,7 @@ mod tests {
             ipnet6: "fdfe:5a70:6451:982b::/64"
                 .parse::<ipnet::Ipv6Net>()
                 .unwrap(),
-            skipped_hostnames: None,
-            ruleset_names: None,
+            domain_filter: None,
             store,
         })
         .unwrap();
@@ -428,8 +404,7 @@ mod tests {
             ipnet6: "fdfe:5a70:6451:982b::/64"
                 .parse::<ipnet::Ipv6Net>()
                 .unwrap(),
-            skipped_hostnames: None,
-            ruleset_names: None,
+            domain_filter: None,
             store,
         })
         .unwrap();
@@ -463,8 +438,9 @@ mod tests {
             ipnet6: "fdfe:5a70:6451:982b::/64"
                 .parse::<ipnet::Ipv6Net>()
                 .unwrap(),
-            skipped_hostnames: Some(tree),
-            ruleset_names: None,
+            domain_filter: Some(crate::app::dns::filters::DomainFilter::new(vec![
+                "example.com",
+            ])),
             store,
         })
         .unwrap();
@@ -495,8 +471,7 @@ mod tests {
             ipnet6: "fdfe:5a70:6451:982b::/64"
                 .parse::<ipnet::Ipv6Net>()
                 .unwrap(),
-            skipped_hostnames: None,
-            ruleset_names: None,
+            domain_filter: None,
             store,
         })
         .unwrap();
@@ -505,6 +480,7 @@ mod tests {
 
         pool.lookup("bar.com").await;
         pool.lookup("baz.com").await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         let next = pool.lookup("foo.com").await;
 
         assert_ne!(first, next);
@@ -524,8 +500,7 @@ mod tests {
             ipnet6: "fdfe:5a70:6451:982b::/64"
                 .parse::<ipnet::Ipv6Net>()
                 .unwrap(),
-            skipped_hostnames: None,
-            ruleset_names: None,
+            domain_filter: None,
             store,
         })
         .unwrap();
@@ -545,8 +520,7 @@ mod tests {
             ipnet6: "fdfe:5a70:6451:982b::/64"
                 .parse::<ipnet::Ipv6Net>()
                 .unwrap(),
-            skipped_hostnames: None,
-            ruleset_names: None,
+            domain_filter: None,
             store,
         })
         .unwrap();
@@ -570,8 +544,7 @@ mod tests {
             ipnet6: "fdfe:5a70:6451:982b::/64"
                 .parse::<ipnet::Ipv6Net>()
                 .unwrap(),
-            skipped_hostnames: None,
-            ruleset_names: None,
+            domain_filter: None,
             store,
         })
         .unwrap();
@@ -634,8 +607,7 @@ mod tests {
             ipnet6: "fdfe:5a70:6451:982b::/64"
                 .parse::<ipnet::Ipv6Net>()
                 .unwrap(),
-            skipped_hostnames: None,
-            ruleset_names: None,
+            domain_filter: None,
             store,
         })
         .unwrap();

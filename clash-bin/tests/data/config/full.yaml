@@ -196,6 +196,10 @@ dns:
   nameserver-policy:
     "+.internal.corp.com": "10.0.0.1"
     "www.baidu.com": "114.114.114.114"
+    "geosite:cn":
+      - "114.114.114.114"
+      - "223.5.5.5"
+    "rule-set:adblock": "1.1.1.1"
 
   # Nameservers used only for resolving proxy server hostnames (must be IPs).
   # These also support the proxy= fragment to route through an outbound.

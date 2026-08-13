@@ -33,6 +33,10 @@ fn default_route_table() -> u32 {
     DEFAULT_ROUTE_TABLE
 }
 
+fn default_cors_allow_origins() -> Option<Vec<String>> {
+    Some(vec!["*".to_string()])
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum DnsHijack {
@@ -456,7 +460,8 @@ pub struct Config {
     /// ```yaml
     /// cors-allow-origins:
     ///   - "https://example.com"
-    #[serde(rename = "cors-allow-origins")]
+    #[serde(rename = "cors-allow-origins", default = "default_cors_allow_origins")]
+    #[educe(Default = Some(vec!["*".to_string()]))]
     pub cors_allow_origins: Option<Vec<String>>,
     /// outbound interface name
     /// # Note
@@ -706,7 +711,7 @@ pub struct DNS {
     /// Direct nameservers, used when domain is in fake-ip-filter
     pub direct_nameserver: Vec<String>,
     /// Lookup domains via specific nameservers
-    pub nameserver_policy: HashMap<String, String>,
+    pub nameserver_policy: HashMap<String, NameServerPolicyValue>,
     /// Configure EDNS Client Subnet information to send with upstream queries
     pub edns_client_subnet: Option<EdnsClientSubnet>,
     /// When true, upstream DNS queries from `nameserver`, `fallback` and
@@ -714,6 +719,22 @@ pub struct DNS {
     /// instead of going DIRECT. `default-nameserver` and
     /// `proxy-server-nameserver` are not affected.
     pub respect_rules: bool,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(untagged)]
+pub enum NameServerPolicyValue {
+    Single(String),
+    List(Vec<String>),
+}
+
+impl NameServerPolicyValue {
+    pub fn as_slice(&self) -> &[String] {
+        match self {
+            NameServerPolicyValue::Single(s) => std::slice::from_ref(s),
+            NameServerPolicyValue::List(list) => list.as_slice(),
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Default, Clone, Debug)]

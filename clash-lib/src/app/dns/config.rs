@@ -38,7 +38,7 @@ impl Display for NameServer {
 pub struct FallbackFilter {
     pub geo_ip: bool,
     pub geo_ip_code: String,
-    pub ip_cidr: Option<Vec<ipnet::IpNet>>,
+    pub ip_cidr: Vec<String>,
     pub domain: Vec<String>,
 }
 
@@ -67,7 +67,7 @@ pub struct Config {
     pub store_fake_ip: bool,
     pub store_smart_stats: bool,
     pub hosts: Option<trie::StringTrie<IpAddr>>,
-    pub nameserver_policy: HashMap<String, NameServer>,
+    pub nameserver_policy: HashMap<String, Vec<NameServer>>,
     pub edns_client_subnet: Option<EdnsClientSubnet>,
     pub fw_mark: Option<u32>,
     pub respect_rules: bool,
@@ -183,21 +183,28 @@ impl Config {
     }
 
     pub fn parse_nameserver_policy(
-        policy_map: &HashMap<String, String>,
-    ) -> Result<HashMap<String, NameServer>, Error> {
+        policy_map: &HashMap<String, crate::config::def::NameServerPolicyValue>,
+    ) -> Result<HashMap<String, Vec<NameServer>>, Error> {
         let mut policy = HashMap::new();
 
-        for (domain, server) in policy_map {
-            let nameservers = Config::parse_nameserver(&[server.to_owned()])?;
+        for (domain, server_val) in policy_map {
+            let nameservers = Config::parse_nameserver(server_val.as_slice())?;
 
-            let (_, valid) = trie::valid_and_split_domain(domain);
-            if !valid {
-                return Err(Error::InvalidConfig(format!(
-                    "DNS ResolverRule invalid domain: {}",
-                    &domain
-                )));
+            for sub_domain in domain.split(',') {
+                let sub_domain = sub_domain.trim();
+                if !sub_domain.starts_with("geosite:")
+                    && !sub_domain.starts_with("rule-set:")
+                {
+                    let (_, valid) = trie::valid_and_split_domain(sub_domain);
+                    if !valid {
+                        return Err(Error::InvalidConfig(format!(
+                            "DNS ResolverRule invalid domain: {}",
+                            sub_domain
+                        )));
+                    }
+                }
             }
-            policy.insert(domain.into(), nameservers[0].clone());
+            policy.insert(domain.into(), nameservers);
         }
         Ok(policy)
     }
@@ -513,11 +520,10 @@ fn parse_edns_client_subnet(
 
 impl From<crate::config::def::FallbackFilter> for FallbackFilter {
     fn from(c: crate::config::def::FallbackFilter) -> Self {
-        let ipcidr = Config::parse_fallback_ip_cidr(&c.ip_cidr);
         Self {
             geo_ip: c.geo_ip,
             geo_ip_code: c.geo_ip_code.to_uppercase(),
-            ip_cidr: ipcidr.ok(),
+            ip_cidr: c.ip_cidr,
             domain: c.domain,
         }
     }
@@ -551,5 +557,31 @@ mod tests {
         let _sock: std::net::SocketAddr = format!("{}:{}", ns[0].host, ns[0].port)
             .parse()
             .expect("address should parse to SocketAddr");
+    }
+
+    #[test]
+    fn parse_nameserver_policy_with_geosite_and_ruleset() {
+        use crate::config::def::NameServerPolicyValue;
+
+        let mut policy_map = std::collections::HashMap::new();
+        policy_map.insert(
+            "geosite:cn,private".to_string(),
+            NameServerPolicyValue::List(vec!["114.114.114.114".to_string(), "223.5.5.5".to_string()]),
+        );
+        policy_map.insert(
+            "rule-set:adblock".to_string(),
+            NameServerPolicyValue::Single("1.1.1.1".to_string()),
+        );
+        policy_map.insert(
+            "+.google.com".to_string(),
+            NameServerPolicyValue::Single("8.8.8.8".to_string()),
+        );
+
+        let res = Config::parse_nameserver_policy(&policy_map);
+        assert!(res.is_ok());
+        let map = res.unwrap();
+        assert_eq!(map.len(), 3);
+        assert_eq!(map.get("geosite:cn,private").unwrap().len(), 2);
+        assert_eq!(map.get("rule-set:adblock").unwrap().len(), 1);
     }
 }

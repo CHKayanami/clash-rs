@@ -21,7 +21,10 @@ pub(super) fn convert(c: &def::Config) -> Result<General, crate::Error> {
             external_ui: c.external_ui.clone(),
             external_ui_download_url: c.external_ui_url.clone(),
             secret: c.secret.clone(),
-            cors_allow_origins: c.cors_allow_origins.clone(),
+            cors_allow_origins: c
+                .cors_allow_origins
+                .clone()
+                .or_else(|| Some(vec!["*".to_string()])),
             external_controller_ipc: c.external_controller_ipc.clone(),
         },
         mode: c.mode,
