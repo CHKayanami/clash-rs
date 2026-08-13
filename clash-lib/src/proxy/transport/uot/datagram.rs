@@ -5,18 +5,18 @@ use std::{
 };
 
 use bytes::{Buf, BufMut, BytesMut};
-use futures::{Sink, Stream, ready};
+use futures::{ready, Sink, Stream};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tracing::{debug, trace};
 
 use crate::{
-    proxy::{AnyStream, datagram::UdpPacket},
+    proxy::{datagram::UdpPacket, AnyStream},
     session::SocksAddr,
 };
 
 const MAX_PACKET_LENGTH: usize = u16::MAX as usize;
 
-pub struct OutboundDatagramAnytls {
+pub struct OutboundDatagramUotV2 {
     inner: AnyStream,
     target_addr: SocksAddr,
 
@@ -32,7 +32,7 @@ pub struct OutboundDatagramAnytls {
     length_buf: [u8; 2],
 }
 
-impl OutboundDatagramAnytls {
+impl OutboundDatagramUotV2 {
     pub fn new(inner: AnyStream, target_addr: SocksAddr) -> Self {
         Self {
             inner,
@@ -52,7 +52,7 @@ impl OutboundDatagramAnytls {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!(
-                    "udp payload too large for anytls uot: {} > {}",
+                    "udp payload too large for uot v2: {} > {}",
                     payload.len(),
                     MAX_PACKET_LENGTH
                 ),
@@ -66,7 +66,7 @@ impl OutboundDatagramAnytls {
     }
 }
 
-impl Sink<UdpPacket> for OutboundDatagramAnytls {
+impl Sink<UdpPacket> for OutboundDatagramUotV2 {
     type Error = io::Error;
 
     fn poll_ready(
@@ -120,7 +120,7 @@ impl Sink<UdpPacket> for OutboundDatagramAnytls {
         ready!(inner.poll_flush(cx))?;
 
         if let Some(packet) = &this.pending_packet {
-            trace!("sent anytls udp packet, len={}", packet.data.len());
+            trace!("sent uot v2 udp packet, len={}", packet.data.len());
         }
 
         this.pending_packet = None;
@@ -137,7 +137,7 @@ impl Sink<UdpPacket> for OutboundDatagramAnytls {
     }
 }
 
-impl Stream for OutboundDatagramAnytls {
+impl Stream for OutboundDatagramUotV2 {
     type Item = UdpPacket;
 
     fn poll_next(
@@ -160,7 +160,7 @@ impl Stream for OutboundDatagramAnytls {
 
                         this.header_read += read;
                         if this.header_read < this.length_buf.len() {
-                            continue; // keep looping; poll_read will register waker when it returns Pending
+                            continue;
                         }
 
                         let packet_len =
@@ -171,7 +171,7 @@ impl Stream for OutboundDatagramAnytls {
                         }
                         if packet_len > MAX_PACKET_LENGTH {
                             debug!(
-                                "invalid anytls udp packet length: {}",
+                                "invalid uot v2 udp packet length: {}",
                                 packet_len
                             );
                             return Poll::Ready(None);
@@ -182,7 +182,7 @@ impl Stream for OutboundDatagramAnytls {
                         this.packet_buf.reserve(packet_len);
                     }
                     Err(err) => {
-                        debug!("failed to read anytls udp length header: {}", err);
+                        debug!("failed to read uot v2 udp length header: {}", err);
                         return Poll::Ready(None);
                     }
                 }
@@ -190,15 +190,13 @@ impl Stream for OutboundDatagramAnytls {
 
             if let Some(packet_len) = this.packet_len {
                 let remaining = packet_len - this.packet_buf.len();
-                // Read directly into packet_buf's spare capacity: avoids an
-                // intermediate copy through a scratch buffer.
                 let n = {
                     let spare = this.packet_buf.spare_capacity_mut();
                     let mut read_buf = ReadBuf::uninit(&mut spare[..remaining]);
                     match inner.as_mut().poll_read(cx, &mut read_buf) {
                         Poll::Pending => return Poll::Pending,
                         Poll::Ready(Err(err)) => {
-                            debug!("failed to read anytls udp payload: {}", err);
+                            debug!("failed to read uot v2 udp payload: {}", err);
                             return Poll::Ready(None);
                         }
                         Poll::Ready(Ok(())) => read_buf.filled().len(),
@@ -207,8 +205,6 @@ impl Stream for OutboundDatagramAnytls {
                 if n == 0 {
                     return Poll::Ready(None);
                 }
-                // SAFETY: poll_read initialized exactly `n` bytes starting at
-                // spare_capacity_mut()[0]; advance_mut exposes them as initialized.
                 unsafe { this.packet_buf.advance_mut(n) };
 
                 if this.packet_buf.len() == packet_len {

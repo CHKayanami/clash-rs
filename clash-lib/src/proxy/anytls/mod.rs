@@ -2,7 +2,6 @@ use erased_serde::Serialize as ErasedSerialize;
 use std::{collections::HashMap, io, sync::Arc};
 
 use async_trait::async_trait;
-use bytes::{BufMut, BytesMut};
 use tokio::io::AsyncWriteExt;
 use tracing::debug;
 
@@ -24,7 +23,6 @@ use super::{
     utils::{GLOBAL_DIRECT_CONNECTOR, RemoteConnector},
 };
 
-mod datagram;
 pub mod inbound;
 pub mod padding;
 pub mod pool;
@@ -32,7 +30,7 @@ pub mod session;
 pub mod stream;
 pub mod types;
 
-use datagram::OutboundDatagramAnytls;
+use super::transport::uot::OutboundDatagramUotV2;
 use padding::PaddingFactory;
 use pool::{SessionPool, SessionPoolConfig};
 use session::AnyTlsClientSession;
@@ -71,8 +69,6 @@ impl std::fmt::Debug for Handler {
 }
 
 impl Handler {
-    const UDP_OVER_TCP_V2_MAGIC_ADDR: &str = "sp.v2.udp-over-tcp.arpa";
-
     pub fn new(opts: HandlerOptions) -> Self {
         let pool = SessionPool::new(opts.pool_config.clone());
 
@@ -153,13 +149,6 @@ impl Handler {
         .await?;
         let stream = session.open_stream(destination).await?;
         Ok(Box::new(stream))
-    }
-
-    fn encode_uot_connect_request(dst_addr: &SocksAddr) -> BytesMut {
-        let mut request = BytesMut::new();
-        request.put_u8(1); // isConnect = true (UoT v2 connect mode)
-        dst_addr.write_buf(&mut request);
-        request
     }
 }
 
@@ -253,19 +242,19 @@ impl OutboundHandler for Handler {
         connector: &dyn RemoteConnector,
     ) -> io::Result<BoxedChainedDatagram> {
         let uot_dest =
-            SocksAddr::try_from((Self::UDP_OVER_TCP_V2_MAGIC_ADDR.to_owned(), 0))?;
+            SocksAddr::try_from((crate::proxy::transport::uot::UDP_OVER_TCP_V2_MAGIC_HOST.to_owned(), 0))?;
 
         let session = self
             .get_or_create_session(resolver, connector, sess)
             .await?;
         let mut stream = session.open_stream(&uot_dest).await?;
 
-        let request = Self::encode_uot_connect_request(&sess.destination);
+        let request = crate::proxy::transport::uot::encode_uot_connect_request(&sess.destination);
         stream.write_all(&request).await?;
         stream.flush().await?;
 
         let datagram =
-            OutboundDatagramAnytls::new(Box::new(stream), sess.destination.clone());
+            OutboundDatagramUotV2::new(Box::new(stream), sess.destination.clone());
         let chained = crate::app::dispatcher::ChainedDatagramWrapper::new(datagram);
         chained.append_to_chain(self.name()).await;
         Ok(Box::new(chained))
@@ -400,7 +389,7 @@ mod tests {
     #[test]
     fn test_encode_uot_connect_request() {
         let dst = SocksAddr::try_from(("1.1.1.1".to_owned(), 53)).unwrap();
-        let req = Handler::encode_uot_connect_request(&dst);
+        let req = crate::proxy::transport::uot::encode_uot_connect_request(&dst);
 
         assert_eq!(req[0], 1);
         let parsed = SocksAddr::try_from(&req[1..]).unwrap();
@@ -410,7 +399,7 @@ mod tests {
     #[test]
     fn test_encode_uot_connect_request_domain() {
         let dst = SocksAddr::try_from(("example.com".to_owned(), 80)).unwrap();
-        let req = Handler::encode_uot_connect_request(&dst);
+        let req = crate::proxy::transport::uot::encode_uot_connect_request(&dst);
 
         assert_eq!(req[0], 1);
         let parsed = SocksAddr::try_from(&req[1..]).unwrap();

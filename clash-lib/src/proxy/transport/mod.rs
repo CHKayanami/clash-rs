@@ -9,6 +9,7 @@ pub mod splice_tls;
 mod tls;
 #[cfg(feature = "shadowsocks")]
 mod v2ray;
+pub mod uot;
 mod ws;
 
 pub use grpc::Client as GrpcClient;

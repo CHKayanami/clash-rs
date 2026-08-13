@@ -203,6 +203,8 @@ pub struct OutboundShadowsocks {
     pub udp: bool,
     pub plugin: Option<String>,
     pub plugin_opts: Option<HashMap<String, serde_yaml::Value>>,
+    #[serde(default, alias = "uot", alias = "udp-over-tcp")]
+    pub udp_over_tcp: bool,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Default)]

@@ -19,11 +19,10 @@ use crate::{
     proxy::{
         AnyStream, ConnectorType, DialWithConnector, HandlerCommonOptions,
         OutboundHandler, OutboundType, PlainProxyAPIResponse,
-        shadowsocks::map_cipher,
-        transport::TransportLayer,
+        shadowsocks::map_cipher, transport::TransportLayer,
         utils::{GLOBAL_DIRECT_CONNECTOR, RemoteConnector},
     },
-    session::Session,
+    session::{Session, SocksAddr},
 };
 use async_trait::async_trait;
 use erased_serde::Serialize as ErasedSerialize;
@@ -32,6 +31,7 @@ use shadowsocks::{
     context::Context, relay::udprelay::proxy_socket::UdpSocketType,
 };
 use std::{collections::HashMap, fmt::Debug, io, sync::Arc};
+use tokio::io::AsyncWriteExt;
 use tracing::debug;
 
 pub struct HandlerOptions {
@@ -43,6 +43,7 @@ pub struct HandlerOptions {
     pub cipher: String,
     pub plugin: Option<TransportLayer>,
     pub udp: bool,
+    pub uot: bool,
 }
 
 pub struct Handler {
@@ -126,7 +127,7 @@ impl OutboundHandler for Handler {
     }
 
     async fn support_udp(&self) -> bool {
-        self.opts.udp
+        self.opts.udp || self.opts.uot
     }
 
     async fn connect_stream(
@@ -207,6 +208,44 @@ impl OutboundHandler for Handler {
         resolver: ThreadSafeDNSResolver,
         connector: &dyn RemoteConnector,
     ) -> io::Result<BoxedChainedDatagram> {
+        if self.opts.uot {
+            let uot_dest = SocksAddr::try_from((
+                crate::proxy::transport::uot::UDP_OVER_TCP_V2_MAGIC_HOST.to_owned(),
+                0,
+            ))?;
+            let uot_sess = Session {
+                destination: uot_dest,
+                ..sess.clone()
+            };
+
+            let stream = connector
+                .connect_stream(
+                    resolver.clone(),
+                    self.opts.server.as_str(),
+                    self.opts.port,
+                    self.opts.common_opts.tfo,
+                    sess.iface.as_ref(),
+                    #[cfg(target_os = "linux")]
+                    sess.so_mark,
+                )
+                .await?;
+
+            let mut stream = self.proxy_stream(stream, &uot_sess, resolver).await?;
+
+            let request = crate::proxy::transport::uot::encode_uot_connect_request(&sess.destination);
+
+            stream.write_all(&request).await?;
+            stream.flush().await?;
+
+            let datagram = crate::proxy::transport::uot::OutboundDatagramUotV2::new(
+                stream,
+                sess.destination.clone(),
+            );
+            let chained = ChainedDatagramWrapper::new(datagram);
+            chained.append_to_chain(self.name()).await;
+            return Ok(Box::new(chained));
+        }
+
         let cfg = self.server_config()?;
 
         // Resolve up front and dial the concrete address. `connect_datagram`
@@ -366,6 +405,7 @@ mod tests {
             cipher: CIPHER.to_owned(),
             plugin: Default::default(),
             udp: false,
+            uot: false,
         };
 
         let handler = Arc::new(Handler::new(opts));
@@ -436,6 +476,7 @@ mod tests {
             cipher: CIPHER.to_owned(),
             plugin: Some(Box::new(client)),
             udp: false,
+            uot: false,
         };
         let handler: Arc<dyn OutboundHandler> = Arc::new(Handler::new(opts));
         // we need to store all the runners in a container, to make sure all of
@@ -506,6 +547,7 @@ mod tests {
             cipher: CIPHER.to_owned(),
             plugin: Some(plugin),
             udp: false,
+            uot: false,
         };
 
         let handler: Arc<dyn OutboundHandler> = Arc::new(Handler::new(opts));
@@ -551,10 +593,32 @@ mod tests {
             cipher: CIPHER.to_owned(),
             plugin: Some(Box::new(plugin)),
             udp: false,
+            uot: false,
         };
 
         let handler: Arc<dyn OutboundHandler> = Arc::new(Handler::new(opts));
         run_test_suites_and_cleanup(handler, container, Suite::tcp_tests()).await
+    }
+
+    #[tokio::test]
+    async fn test_ss_uot_config_and_handler() {
+        let yaml = r#"
+        name: test-ss-uot
+        type: ss
+        server: 127.0.0.1
+        port: 8388
+        cipher: aes-128-gcm
+        password: secretpassword
+        udp-over-tcp: true
+        "#;
+
+        let ss_config: crate::config::internal::proxy::OutboundShadowsocks =
+            serde_yaml::from_str(yaml).expect("failed to parse ss uot yaml");
+        assert!(ss_config.udp_over_tcp);
+
+        let handler = Handler::try_from(ss_config).expect("failed to convert handler");
+        assert!(handler.support_udp().await);
+        assert!(handler.opts.uot);
     }
 }
 

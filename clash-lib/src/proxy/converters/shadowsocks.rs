@@ -94,6 +94,7 @@ impl TryFrom<&OutboundShadowsocks> for Handler {
                 None => None,
             },
             udp: s.udp,
+            uot: s.udp_over_tcp,
         });
         Ok(h)
     }

@@ -350,6 +350,7 @@ proxies:
     cipher: aes-256-gcm
     password: "mypassword"
     udp: true
+    # udp-over-tcp: true            # Enable UDP-over-TCP v2 (alias: uot)
     # connect-via: another-proxy    # chain through another proxy (alias: dialer-proxy)
     # Simple-obfs plugin:
     # plugin: obfs
