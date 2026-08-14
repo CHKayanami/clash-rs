@@ -35,6 +35,8 @@ use crate::app::dns::ThreadSafeDNSResolver;
 
 use super::statistics_manager::Manager;
 
+use crate::app::sniffer::ArcSniffer;
+
 // SS2022 (AEAD-2022) MAX_PACKET_SIZE is 0xFFFF (65535 bytes). Using a relay
 // buffer smaller than that forces the cipher to split every full packet into
 // multiple smaller encrypted chunks, multiplying encrypt/decrypt overhead.
@@ -50,6 +52,7 @@ pub struct Dispatcher {
     mode: Arc<AtomicU8>,
     manager: Arc<Manager>,
     tcp_buffer_size: usize,
+    sniffer: Option<ArcSniffer>,
 }
 
 impl Debug for Dispatcher {
@@ -66,6 +69,7 @@ impl Dispatcher {
         mode: RunMode,
         statistics_manager: Arc<Manager>,
         tcp_buffer_size: Option<usize>,
+        sniffer: Option<ArcSniffer>,
     ) -> Self {
         Self {
             outbound_manager,
@@ -74,6 +78,7 @@ impl Dispatcher {
             mode: Arc::new(AtomicU8::new(mode as u8)),
             manager: statistics_manager,
             tcp_buffer_size: tcp_buffer_size.unwrap_or(DEFAULT_BUFFER_SIZE),
+            sniffer,
         }
     }
 
@@ -93,8 +98,12 @@ impl Dispatcher {
         mut sess: Session,
         mut lhs: Box<dyn ClientStream>,
     ) {
+        let force_dns_mapping = self
+            .sniffer
+            .as_ref()
+            .map_or(false, |s| s.config.force_dns_mapping);
         let dest: SocksAddr =
-            match reverse_lookup(&self.resolver, &sess.destination).await {
+            match reverse_lookup(&self.resolver, &sess.destination, force_dns_mapping).await {
                 Some(dest) => dest,
                 None => {
                     warn!("failed to resolve destination {}", sess);
@@ -103,6 +112,21 @@ impl Dispatcher {
             };
 
         sess.destination = dest.clone();
+        sess.orig_destination = Some(dest.clone());
+
+        // Perform domain sniffing if sniffer is configured
+        let mut override_dest = false;
+        if let Some(sniffer) = &self.sniffer {
+            let (sniffed_domain, new_lhs, should_override) =
+                sniffer.sniff_stream(&sess, lhs).await;
+            lhs = new_lhs;
+            if let Some(domain) = sniffed_domain {
+                let port = sess.destination.port();
+                sess.sniffed_domain = Some(domain.clone());
+                sess.destination = SocksAddr::Domain(domain, port);
+                override_dest = should_override;
+            }
+        }
 
         let mode = self.get_mode();
         let (outbound_name, rule) = match mode {
@@ -110,6 +134,16 @@ impl Dispatcher {
             RunMode::Rule => self.router.match_route(&mut sess).await,
             RunMode::Direct => (PROXY_DIRECT, None),
         };
+
+        // If override_destination is not requested and original destination was an IP,
+        // restore original destination for outbound connection
+        if !override_dest {
+            if let Some(orig) = &sess.orig_destination {
+                if !orig.is_domain() {
+                    sess.destination = orig.clone();
+                }
+            }
+        }
 
         debug!("dispatching {} to {}[{}]", sess, outbound_name, mode);
 
@@ -245,6 +279,7 @@ impl Dispatcher {
         let resolver = self.resolver.clone();
         let mode = self.mode.clone();
         let manager = self.manager.clone();
+        let sniffer = self.sniffer.clone();
 
         let (mut local_w, mut local_r) = udp_inbound.split();
         let (remote_receiver_w, mut remote_receiver_r) =
@@ -311,8 +346,11 @@ impl Dispatcher {
                                 continue;
                             };
 
+                            let force_dns_mapping = sniffer
+                                .as_ref()
+                                .map_or(false, |s| s.config.force_dns_mapping);
                             let orig_dst_ip = packet.dst_addr.ip();
-                            let dest = match reverse_lookup(&resolver, &packet.dst_addr).await {
+                            let mut dest = match reverse_lookup(&resolver, &packet.dst_addr, force_dns_mapping).await {
                                 Some(dest) => dest,
                                 None => {
                                     warn!("failed to resolve destination {}", sess);
@@ -320,8 +358,23 @@ impl Dispatcher {
                                 }
                             };
 
+                            let orig_dest = dest.clone();
+                            let mut override_dest = false;
+                            if let Some(ref sniffer) = sniffer {
+                                if !dest.is_domain() || sniffer.should_force_sniff(&dest) {
+                                    if let Some((domain, should_override)) =
+                                        sniffer.sniff_datagram(dest.port(), &packet.data)
+                                    {
+                                        sess.sniffed_domain = Some(domain.clone());
+                                        dest = SocksAddr::Domain(domain, dest.port());
+                                        override_dest = should_override;
+                                    }
+                                }
+                            }
+
                             sess.source = src_addr;
                             sess.destination = dest.clone();
+                            sess.orig_destination = Some(orig_dest.clone());
                             sess.inbound_user = packet.inbound_user.clone();
                             sess.resolved_ip = match &dest {
                                 SocksAddr::Ip(addr) => Some(addr.ip()),
@@ -335,6 +388,10 @@ impl Dispatcher {
                                 RunMode::Rule => router.match_route(&mut sess).await,
                                 RunMode::Direct => (PROXY_DIRECT, None),
                             };
+
+                            if !override_dest && !orig_dest.is_domain() {
+                                sess.destination = orig_dest.clone();
+                            }
 
                             let mgr = outbound_manager.clone();
                             let handler = match mgr.get_outbound(outbound_name) {
@@ -539,6 +596,7 @@ fn forward_to_remote(
 async fn reverse_lookup(
     resolver: &Arc<dyn ClashResolver>,
     dst: &SocksAddr,
+    force_dns_mapping: bool,
 ) -> Option<SocksAddr> {
     // A malformed host is client-controlled input on a hot path, so surface it
     // as a dropped packet rather than a panic that kills the relay task.
@@ -554,27 +612,25 @@ async fn reverse_lookup(
 
     let dst = match dst {
         SocksAddr::Ip(socket_addr) => {
-            if resolver.fake_ip_enabled() {
-                let ip = socket_addr.ip();
-                if resolver.is_fake_ip(ip).await {
-                    trace!("looking up fake ip: {}", socket_addr.ip());
-                    let host = resolver.reverse_lookup(ip).await;
-                    match host {
-                        Some(host) => to_addr(host, socket_addr.port())?,
-                        None => {
-                            error!("failed to reverse lookup fake ip: {}", ip);
-                            return None;
-                        }
+            let ip = socket_addr.ip();
+            if resolver.fake_ip_enabled() && resolver.is_fake_ip(ip).await {
+                trace!("looking up fake ip: {}", ip);
+                let host = resolver.reverse_lookup(ip).await;
+                match host {
+                    Some(host) => to_addr(host, socket_addr.port())?,
+                    None => {
+                        error!("failed to reverse lookup fake ip: {}", ip);
+                        return None;
                     }
-                } else {
-                    (*socket_addr).into()
                 }
-            } else {
-                trace!("looking up resolve cache ip: {}", socket_addr.ip());
-                match resolver.cached_for(socket_addr.ip()).await {
+            } else if force_dns_mapping || !resolver.fake_ip_enabled() {
+                trace!("looking up resolve cache ip: {}", ip);
+                match resolver.cached_for(ip).await {
                     Some(resolved) => to_addr(resolved, socket_addr.port())?,
                     _ => (*socket_addr).into(),
                 }
+            } else {
+                (*socket_addr).into()
             }
         }
         SocksAddr::Domain(host, port) => to_addr(host.to_owned(), *port)?,

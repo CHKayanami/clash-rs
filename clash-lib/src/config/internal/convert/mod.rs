@@ -21,6 +21,7 @@ mod general;
 mod listener;
 mod proxy_group;
 mod rule_provider;
+mod sniffer;
 mod tun;
 
 use super::{
@@ -60,6 +61,7 @@ pub(super) fn convert(mut c: def::Config) -> Result<config::Config, crate::Error
             store_selected: c.profile.store_selected,
             store_smart_stats: c.profile.store_smart_stats,
         },
+        sniffer: sniffer::convert(c.sniffer.take()),
         rules: c
             .rule
             .take()

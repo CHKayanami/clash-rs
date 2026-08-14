@@ -257,13 +257,22 @@ fn parse_listen_addr(addr: &str) -> Result<SocketAddr, Error> {
 impl Config {
     pub fn parse_outbound_proxy(url: &Url) -> Option<String> {
         let frag = url.fragment()?;
-        let pairs = frag.split("&");
+        let pairs = frag.split('&');
         for pair in pairs {
-            if pair.starts_with("proxy=") {
-                let outbound = pair.trim_start_matches("proxy=");
-                return Some(outbound.into());
-            } else if !pair.contains("=") {
-                return Some(pair.into());
+            if let Some(outbound) = pair.strip_prefix("proxy=") {
+                let decoded = percent_encoding::percent_decode_str(outbound)
+                    .decode_utf8_lossy()
+                    .into_owned();
+                if !decoded.is_empty() {
+                    return Some(decoded);
+                }
+            } else if !pair.is_empty() && !pair.contains('=') {
+                let decoded = percent_encoding::percent_decode_str(pair)
+                    .decode_utf8_lossy()
+                    .into_owned();
+                if !decoded.is_empty() {
+                    return Some(decoded);
+                }
             }
         }
 
@@ -272,11 +281,15 @@ impl Config {
 
     pub fn parse_outbound_interface(url: &Url) -> Option<String> {
         let frag = url.fragment()?;
-        let pairs = frag.split("&");
+        let pairs = frag.split('&');
         for first in pairs {
-            if first.starts_with("interface=") {
-                let iface = first.trim_start_matches("interface=");
-                return Some(iface.into());
+            if let Some(iface) = first.strip_prefix("interface=") {
+                let decoded = percent_encoding::percent_decode_str(iface)
+                    .decode_utf8_lossy()
+                    .into_owned();
+                if !decoded.is_empty() {
+                    return Some(decoded);
+                }
             }
         }
 
@@ -583,5 +596,19 @@ mod tests {
         assert_eq!(map.len(), 3);
         assert_eq!(map.get("geosite:cn,private").unwrap().len(), 2);
         assert_eq!(map.get("rule-set:adblock").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn parse_nameserver_with_unicode_proxy() {
+        let servers = vec![
+            "https://8.8.8.8/dns-query#proxy=🚀 节点选择".to_string(),
+            "tls://1.1.1.1:853#🚀 节点选择".to_string(),
+            "https://1.1.1.1/dns-query#proxy=%F0%9F%9A%80%20%E8%8A%82%E7%82%B9%E9%80%89%E6%8B%A9".to_string(),
+        ];
+        let ns = Config::parse_nameserver(&servers).expect("parse failed");
+        assert_eq!(ns.len(), 3);
+        assert_eq!(ns[0].proxy.as_deref(), Some("🚀 节点选择"));
+        assert_eq!(ns[1].proxy.as_deref(), Some("🚀 节点选择"));
+        assert_eq!(ns[2].proxy.as_deref(), Some("🚀 节点选择"));
     }
 }

@@ -33,6 +33,7 @@ pub struct Config {
     pub tun: TunConfig,
     pub experimental: Option<def::Experimental>,
     pub profile: Profile,
+    pub sniffer: Option<crate::app::sniffer::SnifferConfig>,
     pub rules: Vec<RuleType>,
     pub rule_providers: HashMap<String, RuleProviderDef>,
     pub users: Vec<auth::User>,

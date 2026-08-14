@@ -797,6 +797,10 @@ async fn create_components(
 
     let statistics_manager = StatisticsManager::new();
 
+    let sniffer = config
+        .sniffer
+        .map(|c| Arc::new(crate::app::sniffer::Sniffer::new(c)));
+
     debug!("initializing dispatcher");
     let dispatcher = Arc::new(Dispatcher::new(
         outbound_manager.clone(),
@@ -805,6 +809,7 @@ async fn create_components(
         config.general.mode,
         statistics_manager.clone(),
         config.experimental.and_then(|e| e.tcp_buffer_size),
+        sniffer,
     ));
 
     debug!("initializing authenticator");

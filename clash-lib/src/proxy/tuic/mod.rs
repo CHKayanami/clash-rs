@@ -519,6 +519,7 @@ mod tests {
             process_name: None,
             traffic_stats: None,
             inbound_user: None,
+            ..Default::default()
         };
 
         let mut stream = handler.connect_stream(&session, resolver).await?;
@@ -573,6 +574,7 @@ mod tests {
             process_name: None,
             traffic_stats: None,
             inbound_user: None,
+            ..Default::default()
         };
 
         let result = handler.connect_stream(&session, resolver).await;
@@ -637,6 +639,7 @@ mod tests {
             process_name: None,
             traffic_stats: None,
             inbound_user: None,
+            ..Default::default()
         };
 
         let mut stream = handler.connect_stream(&session, resolver).await?;
@@ -692,6 +695,7 @@ mod tests {
             process_name: None,
             traffic_stats: None,
             inbound_user: None,
+            ..Default::default()
         };
 
         let mut stream = handler.connect_stream(&session, resolver).await?;

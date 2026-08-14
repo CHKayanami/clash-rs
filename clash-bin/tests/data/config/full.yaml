@@ -212,6 +212,52 @@ dns:
     ipv4: 1.2.3.0/24
     ipv6: 2001:db8::/56
 
+# ── Domain Sniffer ────────────────────────────────────────────────────────────
+# Inspects connection payload (TLS SNI, HTTP Host, QUIC SNI) to extract the
+# domain name for rule routing, traffic logging, and destination overriding.
+sniffer:
+  enable: true
+
+  # Force mapping destination real IP back to queried domain using DNS history cache.
+  # Useful in non-fake-ip modes or for pure IP connections. Default is false.
+  force-dns-mapping: true
+
+  # Whether to perform payload sniffing on pure IP (non-fake-ip / direct IP) connections.
+  # Default is true.
+  parse-pure-ip: true
+
+  # Override the destination address with the sniffed domain when connecting to outbounds.
+  # When true, outbounds resolve and connect to the sniffed domain rather than the original IP.
+  # Can also be set individually per protocol below.
+  override-destination: false
+
+  # Protocol-specific sniffer configuration
+  sniff:
+    TLS:
+      ports: [443, 8443]
+      # override-destination: false
+    HTTP:
+      ports: [80, "8080-8880"]
+      override-destination: true
+    QUIC:
+      ports: [443]
+      # override-destination: false
+
+  # Domains to skip sniffing (keeps original IP directly)
+  skip-domain:
+    - "Mijia Cloud"
+    - "+.apple.com"
+
+  # Force sniffing even if the destination is already a domain name (or resolved by fake-ip)
+  force-domain:
+    - "+.google.com"
+
+  # Legacy Clash.Meta syntax for enabling protocols (optional):
+  # sniffing:
+  #   - tls
+  #   - http
+  #   - quic
+
 # ── TUN Device ────────────────────────────────────────────────────────────────
 tun:
   enable: false

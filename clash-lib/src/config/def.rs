@@ -89,6 +89,51 @@ pub struct TunConfig {
     pub dns_hijack: DnsHijack,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum PortOrRange {
+    Port(Port),
+    Range(String),
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[serde(rename_all = "kebab-case")]
+pub struct SniffItemConfig {
+    pub ports: Option<Vec<PortOrRange>>,
+    pub override_destination: Option<bool>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[serde(rename_all = "kebab-case")]
+pub struct SniffProtocolsConfig {
+    #[serde(rename = "TLS", alias = "tls")]
+    pub tls: Option<SniffItemConfig>,
+    #[serde(rename = "HTTP", alias = "http")]
+    pub http: Option<SniffItemConfig>,
+    #[serde(rename = "QUIC", alias = "quic")]
+    pub quic: Option<SniffItemConfig>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[serde(rename_all = "kebab-case")]
+pub struct SnifferConfig {
+    pub enable: bool,
+    #[serde(default)]
+    pub override_destination: bool,
+    #[serde(default)]
+    pub sniff: Option<SniffProtocolsConfig>,
+    #[serde(default)]
+    pub sniffing: Option<Vec<String>>,
+    #[serde(default)]
+    pub force_dns_mapping: Option<bool>,
+    #[serde(default)]
+    pub parse_pure_ip: Option<bool>,
+    #[serde(default)]
+    pub skip_domain: Option<Vec<String>>,
+    #[serde(default)]
+    pub force_domain: Option<Vec<String>>,
+}
+
 #[derive(Serialize, Deserialize, Default, Copy, Clone)]
 #[serde(rename_all = "lowercase")]
 pub enum RunMode {
@@ -408,6 +453,8 @@ pub struct Config {
     pub dns: DNS,
     /// Profile settings
     pub profile: Profile,
+    /// Domain Sniffer settings
+    pub sniffer: Option<SnifferConfig>,
     /// Proxy settings
     #[serde(rename = "proxies")]
     pub proxy: Option<Vec<OutboundProxyProtocol>>,
@@ -805,7 +852,7 @@ impl Default for Profile {
     }
 }
 
-#[derive(PartialEq, Debug, Clone, Serialize, Copy)]
+#[derive(PartialEq, Eq, Debug, Clone, Serialize, Copy)]
 pub struct Port(pub u16);
 
 impl From<Port> for u16 {
@@ -1614,5 +1661,39 @@ proxies:
         } else {
             panic!("expected ssh proxy");
         }
+    }
+
+    #[test]
+    fn parse_sniffer_config() {
+        let cfg = r#"
+sniffer:
+  enable: true
+  override-destination: false
+  sniff:
+    TLS:
+      ports: [443, 8443]
+    HTTP:
+      ports: [80, "8080-8880"]
+      override-destination: true
+    QUIC:
+      ports: [443]
+  skip-domain:
+    - "Mijia Cloud"
+    - "+.apple.com"
+  force-domain:
+    - "+.google.com"
+"#;
+        let c = cfg.parse::<Config>().expect("should parse sniffer config");
+        let sniffer = c.sniffer.expect("sniffer should be present");
+        assert!(sniffer.enable);
+        assert!(!sniffer.override_destination);
+        assert_eq!(sniffer.skip_domain.unwrap(), vec!["Mijia Cloud", "+.apple.com"]);
+        assert_eq!(sniffer.force_domain.unwrap(), vec!["+.google.com"]);
+
+        let sniff = sniffer.sniff.expect("sniff protocols should be present");
+        assert!(sniff.tls.is_some());
+        assert!(sniff.http.is_some());
+        assert!(sniff.quic.is_some());
+        assert_eq!(sniff.http.unwrap().override_destination, Some(true));
     }
 }

@@ -1501,6 +1501,7 @@ dependencies = [
  "opentelemetry-semantic-conventions",
  "opentelemetry_sdk",
  "parking_lot",
+ "percent-encoding",
  "portable-atomic",
  "prost",
  "prost-build",

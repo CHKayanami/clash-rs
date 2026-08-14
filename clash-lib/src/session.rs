@@ -438,6 +438,10 @@ pub struct Session {
     /// Set by the Shadowsocks inbound before dispatch; used for per-user
     /// traffic attribution.
     pub inbound_user: Option<String>,
+    /// Domain name sniffed from TLS SNI / HTTP Host / QUIC SNI
+    pub sniffed_domain: Option<String>,
+    /// Original destination address before sniffing or DNS mapping override
+    pub orig_destination: Option<SocksAddr>,
 }
 
 impl Session {
@@ -473,6 +477,9 @@ impl Session {
         if let Some(ref user) = self.inbound_user {
             rv.insert("inboundUser".to_string(), Box::new(user.clone()) as _);
         }
+        if let Some(ref sniffed) = self.sniffed_domain {
+            rv.insert("sniffedDomain".to_string(), Box::new(sniffed.clone()) as _);
+        }
         rv
     }
 }
@@ -493,6 +500,8 @@ impl Default for Session {
             process_name: None,
             traffic_stats: None,
             inbound_user: None,
+            sniffed_domain: None,
+            orig_destination: None,
         }
     }
 }
@@ -521,6 +530,7 @@ impl Debug for Session {
             .field("network", &self.network)
             .field("source", &self.source)
             .field("destination", &self.destination)
+            .field("sniffed_domain", &self.sniffed_domain)
             .field("packet_mark", &self.so_mark)
             .field("iface", &self.iface)
             .field("country", &self.country)
@@ -545,6 +555,8 @@ impl Clone for Session {
             process_name: self.process_name.clone(),
             traffic_stats: self.traffic_stats.clone(),
             inbound_user: self.inbound_user.clone(),
+            sniffed_domain: self.sniffed_domain.clone(),
+            orig_destination: self.orig_destination.clone(),
         }
     }
 }
