@@ -5,15 +5,17 @@ use ipnet::IpNet;
 use netlink_packet_route::{
     AddressFamily,
     route::RouteAttribute,
-    rule::{RuleAction, RuleAttribute, RulePortRange, FIB_RULE_INVERT},
+    rule::{RuleAction, RuleAttribute, RuleFlags, RulePortRange},
 };
-use rtnetlink::new_connection;
+use rtnetlink::{IpVersion, RouteMessageBuilder, new_connection};
 use tracing::warn;
 
 use crate::{
     app::net::OutboundInterface, common::errors::new_io_error,
     config::internal::config::TunConfig,
 };
+
+const FIB_RULE_INVERT: RuleFlags = RuleFlags::from_bits_retain(0x02);
 
 async fn get_rtnetlink_handle() -> std::io::Result<rtnetlink::Handle> {
     let (conn, handle, _) = new_connection().map_err(new_io_error)?;
@@ -40,23 +42,25 @@ async fn add_route_internal(via: &OutboundInterface, dest: &IpNet) -> std::io::R
     let handle = get_rtnetlink_handle().await?;
     match dest {
         IpNet::V4(v4) => {
-            handle
-                .route()
-                .add()
-                .v4()
+            let route = RouteMessageBuilder::<Ipv4Addr>::new()
                 .destination_prefix(v4.addr(), v4.prefix_len())
                 .output_interface(via.index)
+                .build();
+            handle
+                .route()
+                .add(route)
                 .execute()
                 .await
                 .map_err(new_io_error)?;
         }
         IpNet::V6(v6) => {
-            handle
-                .route()
-                .add()
-                .v6()
+            let route = RouteMessageBuilder::<Ipv6Addr>::new()
                 .destination_prefix(v6.addr(), v6.prefix_len())
                 .output_interface(via.index)
+                .build();
+            handle
+                .route()
+                .add(route)
                 .execute()
                 .await
                 .map_err(new_io_error)?;
@@ -77,24 +81,26 @@ async fn add_default_route_to_table(
     v6: bool,
 ) -> std::io::Result<()> {
     if !v6 {
-        handle
-            .route()
-            .add()
-            .v4()
+        let route = RouteMessageBuilder::<Ipv4Addr>::new()
             .destination_prefix(Ipv4Addr::UNSPECIFIED, 0)
             .output_interface(ifindex)
             .table_id(table_id)
+            .build();
+        handle
+            .route()
+            .add(route)
             .execute()
             .await
             .map_err(new_io_error)?;
     } else {
-        handle
-            .route()
-            .add()
-            .v6()
+        let route = RouteMessageBuilder::<Ipv6Addr>::new()
             .destination_prefix(Ipv6Addr::UNSPECIFIED, 0)
             .output_interface(ifindex)
             .table_id(table_id)
+            .build();
+        handle
+            .route()
+            .add(route)
             .execute()
             .await
             .map_err(new_io_error)?;
@@ -108,18 +114,27 @@ async fn add_rule_not_fwmark(
     so_mark: u32,
     family: AddressFamily,
 ) -> std::io::Result<()> {
-    let mut req = handle.rule().add();
-    if family == AddressFamily::Inet {
-        req = req.v4();
-    } else {
-        req = req.v6();
+    match family {
+        AddressFamily::Inet => {
+            let mut req = handle.rule().add().v4();
+            let msg = req.message_mut();
+            msg.header.flags |= FIB_RULE_INVERT;
+            msg.header.action = RuleAction::ToTable;
+            msg.attributes.push(RuleAttribute::FwMark(so_mark));
+            msg.attributes.push(RuleAttribute::Table(table_id));
+            req.execute().await.map_err(new_io_error)?;
+        }
+        AddressFamily::Inet6 => {
+            let mut req = handle.rule().add().v6();
+            let msg = req.message_mut();
+            msg.header.flags |= FIB_RULE_INVERT;
+            msg.header.action = RuleAction::ToTable;
+            msg.attributes.push(RuleAttribute::FwMark(so_mark));
+            msg.attributes.push(RuleAttribute::Table(table_id));
+            req.execute().await.map_err(new_io_error)?;
+        }
+        _ => {}
     }
-    let msg = req.message_mut();
-    msg.header.flags |= FIB_RULE_INVERT;
-    msg.header.action = RuleAction::ToTbl;
-    msg.nlas.push(RuleAttribute::FwMark(so_mark));
-    msg.nlas.push(RuleAttribute::Table(table_id));
-    req.execute().await.map_err(new_io_error)?;
     Ok(())
 }
 
@@ -127,17 +142,25 @@ async fn add_rule_suppress_prefixlength_main(
     handle: &rtnetlink::Handle,
     family: AddressFamily,
 ) -> std::io::Result<()> {
-    let mut req = handle.rule().add();
-    if family == AddressFamily::Inet {
-        req = req.v4();
-    } else {
-        req = req.v6();
+    match family {
+        AddressFamily::Inet => {
+            let mut req = handle.rule().add().v4();
+            let msg = req.message_mut();
+            msg.header.action = RuleAction::ToTable;
+            msg.attributes.push(RuleAttribute::Table(254));
+            msg.attributes.push(RuleAttribute::SuppressPrefixLen(0));
+            req.execute().await.map_err(new_io_error)?;
+        }
+        AddressFamily::Inet6 => {
+            let mut req = handle.rule().add().v6();
+            let msg = req.message_mut();
+            msg.header.action = RuleAction::ToTable;
+            msg.attributes.push(RuleAttribute::Table(254));
+            msg.attributes.push(RuleAttribute::SuppressPrefixLen(0));
+            req.execute().await.map_err(new_io_error)?;
+        }
+        _ => {}
     }
-    let msg = req.message_mut();
-    msg.header.action = RuleAction::ToTbl;
-    msg.nlas.push(RuleAttribute::Table(254));
-    msg.nlas.push(RuleAttribute::SuppressPrefixLen(0));
-    req.execute().await.map_err(new_io_error)?;
     Ok(())
 }
 
@@ -147,21 +170,33 @@ async fn add_rule_dport(
     port: u16,
     family: AddressFamily,
 ) -> std::io::Result<()> {
-    let mut req = handle.rule().add();
-    if family == AddressFamily::Inet {
-        req = req.v4();
-    } else {
-        req = req.v6();
+    match family {
+        AddressFamily::Inet => {
+            let mut req = handle.rule().add().v4();
+            let msg = req.message_mut();
+            msg.header.action = RuleAction::ToTable;
+            msg.attributes.push(RuleAttribute::Table(table_id));
+            msg.attributes
+                .push(RuleAttribute::DestinationPortRange(RulePortRange {
+                    start: port,
+                    end: port,
+                }));
+            req.execute().await.map_err(new_io_error)?;
+        }
+        AddressFamily::Inet6 => {
+            let mut req = handle.rule().add().v6();
+            let msg = req.message_mut();
+            msg.header.action = RuleAction::ToTable;
+            msg.attributes.push(RuleAttribute::Table(table_id));
+            msg.attributes
+                .push(RuleAttribute::DestinationPortRange(RulePortRange {
+                    start: port,
+                    end: port,
+                }));
+            req.execute().await.map_err(new_io_error)?;
+        }
+        _ => {}
     }
-    let msg = req.message_mut();
-    msg.header.action = RuleAction::ToTbl;
-    msg.nlas.push(RuleAttribute::Table(table_id));
-    msg.nlas
-        .push(RuleAttribute::DestinationPortRange(RulePortRange {
-            start: port,
-            end: port,
-        }));
-    req.execute().await.map_err(new_io_error)?;
     Ok(())
 }
 
@@ -215,7 +250,7 @@ pub fn setup_policy_routing(
 
 async fn cleanup_rules_for_family(
     handle: &rtnetlink::Handle,
-    family: AddressFamily,
+    family: IpVersion,
     table_id: u32,
     so_mark: Option<u32>,
     has_dns_hijack: bool,
@@ -224,13 +259,13 @@ async fn cleanup_rules_for_family(
     let mut to_delete = Vec::new();
 
     while let Some(msg) = rules_stream.try_next().await.map_err(new_io_error)? {
-        let is_invert = (msg.header.flags & FIB_RULE_INVERT) != 0;
+        let is_invert = msg.header.flags.contains(FIB_RULE_INVERT);
         let mut table = None;
         let mut fwmark = None;
         let mut suppress_prefixlen = None;
         let mut dport_range = None;
 
-        for nla in &msg.nlas {
+        for nla in &msg.attributes {
             match nla {
                 RuleAttribute::Table(t) => table = Some(*t),
                 RuleAttribute::FwMark(m) => fwmark = Some(*m),
@@ -273,20 +308,25 @@ async fn cleanup_rules_for_family(
 async fn cleanup_routes_for_table(
     handle: &rtnetlink::Handle,
     table_id: u32,
-    family: AddressFamily,
+    family: IpVersion,
 ) -> std::io::Result<()> {
-    let route_family = if family == AddressFamily::Inet {
-        rtnetlink::RouteAddressFamily::V4
-    } else {
-        rtnetlink::RouteAddressFamily::V6
+    let req = match family {
+        IpVersion::V4 => {
+            let route = RouteMessageBuilder::<Ipv4Addr>::new().build();
+            handle.route().get(route)
+        }
+        IpVersion::V6 => {
+            let route = RouteMessageBuilder::<Ipv6Addr>::new().build();
+            handle.route().get(route)
+        }
     };
 
-    let mut routes_stream = handle.route().get(route_family).execute();
+    let mut routes_stream = req.execute();
     let mut to_delete = Vec::new();
 
     while let Some(msg) = routes_stream.try_next().await.map_err(new_io_error)? {
         let mut table = None;
-        for nla in &msg.nlas {
+        for nla in &msg.attributes {
             if let RouteAttribute::Table(t) = nla {
                 table = Some(*t);
             }
@@ -316,7 +356,7 @@ async fn routes_clean_up_async(tun_cfg: &TunConfig) -> std::io::Result<()> {
     // Clean up rules
     cleanup_rules_for_family(
         &handle,
-        AddressFamily::Inet,
+        IpVersion::V4,
         table,
         tun_cfg.so_mark,
         has_dns_hijack,
@@ -326,7 +366,7 @@ async fn routes_clean_up_async(tun_cfg: &TunConfig) -> std::io::Result<()> {
     if enable_v6 {
         cleanup_rules_for_family(
             &handle,
-            AddressFamily::Inet6,
+            IpVersion::V6,
             table,
             tun_cfg.so_mark,
             has_dns_hijack,
@@ -335,9 +375,9 @@ async fn routes_clean_up_async(tun_cfg: &TunConfig) -> std::io::Result<()> {
     }
 
     // Clean up routes in table
-    cleanup_routes_for_table(&handle, table, AddressFamily::Inet).await?;
+    cleanup_routes_for_table(&handle, table, IpVersion::V4).await?;
     if enable_v6 {
-        cleanup_routes_for_table(&handle, table, AddressFamily::Inet6).await?;
+        cleanup_routes_for_table(&handle, table, IpVersion::V6).await?;
     }
 
     Ok(())
