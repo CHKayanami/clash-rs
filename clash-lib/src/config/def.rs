@@ -931,6 +931,9 @@ pub struct HttpRuleProviderDef {
     /// Inline rules embedded directly in the config (alias: `payload`).
     #[serde(alias = "payload")]
     pub inline_rules: Option<Vec<String>>,
+    /// Outbound proxy node to use when downloading the rule set.
+    #[serde(default)]
+    pub proxy: Option<String>,
 }
 
 /// File-based rule provider loaded from a local path.

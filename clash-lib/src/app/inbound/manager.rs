@@ -187,6 +187,8 @@ impl InboundManager {
                         path,
                         Some(cwd.clone()),
                         dns_resolver.clone(),
+                        None,
+                        None,
                     );
                     (Arc::new(v), Duration::from_secs(interval))
                 }

@@ -803,6 +803,7 @@ proxy-providers:
     url: "https://example.com/subscription"
     interval: 86400                 # seconds between downloads
     path: ./providers/remote.yaml   # local cache path
+    # proxy: Manual                 # outbound proxy node used to download (default: DIRECT)
     health-check:
       enable: true
       url: "http://www.gstatic.com/generate_204"
@@ -826,6 +827,7 @@ rule-providers:
     interval: 86400
     behavior: classical
     # format: yaml                  # yaml (default) | text | mrs
+    # proxy: Manual                 # outbound proxy node used to download (default: DIRECT)
 
 # ── Rules ─────────────────────────────────────────────────────────────────────
 # Evaluated top-to-bottom; first match wins.

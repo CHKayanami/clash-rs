@@ -25,6 +25,8 @@ pub struct HttpClient {
     timeout: tokio::time::Duration,
 }
 
+pub const DEFAULT_HTTP_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs(30);
+
 impl HttpClient {
     pub fn new(
         dns_resolver: ThreadSafeDNSResolver,
@@ -42,7 +44,7 @@ impl HttpClient {
             dns_resolver,
             outbounds: bootstrap_outbounds,
             tls_config: Arc::new(tls_config),
-            timeout: timeout.unwrap_or(tokio::time::Duration::from_secs(10)),
+            timeout: timeout.unwrap_or(DEFAULT_HTTP_TIMEOUT),
         })
     }
 

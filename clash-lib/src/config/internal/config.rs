@@ -332,6 +332,7 @@ pub struct HttpRuleProvider {
     pub format: Option<RuleSetFormat>,
     #[serde(alias = "payload")]
     pub inline_rules: Option<Vec<String>>,
+    pub proxy: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]

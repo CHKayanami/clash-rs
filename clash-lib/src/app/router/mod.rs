@@ -13,6 +13,7 @@ use crate::{
     },
     config::internal::{config::RuleProviderDef, rule::RuleType},
     print_and_exit,
+    proxy::utils::OutboundHandlerRegistry,
     session::Session,
 };
 
@@ -53,6 +54,8 @@ impl Router {
         rules: Vec<RuleType>,
         rule_providers: HashMap<String, RuleProviderDef>,
         dns_resolver: ThreadSafeDNSResolver,
+        system_resolver: Option<ThreadSafeDNSResolver>,
+        outbound_registry: Option<OutboundHandlerRegistry>,
         country_mmdb: Option<MmdbLookup>,
         asn_mmdb: Option<MmdbLookup>,
         geodata: Option<GeoDataLookup>,
@@ -64,6 +67,8 @@ impl Router {
             rule_providers,
             &mut rule_provider_registry,
             dns_resolver.clone(),
+            system_resolver,
+            outbound_registry,
             country_mmdb.clone(),
             geodata.clone(),
             cwd,
@@ -229,6 +234,8 @@ impl Router {
         rule_providers: HashMap<String, RuleProviderDef>,
         rule_provider_registry: &mut HashMap<String, ThreadSafeRuleProvider>,
         resolver: ThreadSafeDNSResolver,
+        system_resolver: Option<ThreadSafeDNSResolver>,
+        outbound_registry: Option<OutboundHandlerRegistry>,
         mmdb: Option<MmdbLookup>,
         geodata: Option<GeoDataLookup>,
         cwd: String,
@@ -236,13 +243,21 @@ impl Router {
         for (name, provider) in rule_providers.into_iter() {
             match provider {
                 RuleProviderDef::Http(http) => {
+                    let resolver_to_use = if http.proxy.is_some() {
+                        resolver.clone()
+                    } else {
+                        system_resolver.clone().unwrap_or_else(|| resolver.clone())
+                    };
+
                     let vehicle = http_vehicle::Vehicle::new(
                         http.url.parse::<Uri>().unwrap_or_else(|_| {
                             print_and_exit!("invalid provider url: {}", http.url)
                         }),
                         http.path,
                         Some(cwd.clone()),
-                        resolver.clone(),
+                        resolver_to_use,
+                        http.proxy,
+                        outbound_registry.clone(),
                     );
 
                     // Default to yaml if not specified
@@ -572,6 +587,8 @@ mod tests {
             ],
             Default::default(),
             mock_resolver,
+            None,
+            None,
             Some(Arc::new(mmdb)),
             None,
             Some(Arc::new(geodata)),
@@ -602,7 +619,7 @@ mod tests {
                 router
                     .match_route(&mut Session {
                         destination: crate::session::SocksAddr::Domain(
-                            domain.to_string(),
+                             domain.to_string(),
                             1111
                         ),
                         ..Default::default()
@@ -619,7 +636,6 @@ mod tests {
     #[tokio::test]
     async fn test_network_rule() {
         initialize();
-
         let mut mock_resolver = MockClashResolver::new();
         mock_resolver.expect_resolve().returning(|_, _| Ok(None));
         let mock_resolver = Arc::new(mock_resolver);
@@ -637,6 +653,8 @@ mod tests {
             ],
             Default::default(),
             mock_resolver,
+            None,
+            None,
             None,
             None,
             None,

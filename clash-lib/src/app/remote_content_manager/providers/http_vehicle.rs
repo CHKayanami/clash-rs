@@ -3,8 +3,9 @@ use crate::{
     app::dns::ThreadSafeDNSResolver,
     common::{
         errors::map_io_error,
-        http::{HttpClient, new_http_client},
+        http::{ClashHTTPClientExt, HttpClient, new_http_client},
     },
+    proxy::utils::OutboundHandlerRegistry,
 };
 
 use async_trait::async_trait;
@@ -22,6 +23,7 @@ use std::path::{Path, PathBuf};
 pub struct Vehicle {
     pub url: Uri,
     pub path: PathBuf,
+    pub outbound: Option<String>,
     http_client: HttpClient,
 }
 
@@ -31,8 +33,10 @@ impl Vehicle {
         path: P,
         cwd: Option<P>,
         dns_resolver: ThreadSafeDNSResolver,
+        outbound: Option<String>,
+        outbounds: Option<OutboundHandlerRegistry>,
     ) -> Self {
-        let client = new_http_client(dns_resolver, None)
+        let client = new_http_client(dns_resolver, outbounds)
             .expect("failed to create http client");
         let uri = url.into();
         let path_ref = path.as_ref();
@@ -48,6 +52,7 @@ impl Vehicle {
                 Some(cwd) => cwd.as_ref().join(path_buf),
                 None => path_buf,
             },
+            outbound,
             http_client: client,
         }
     }
@@ -65,6 +70,11 @@ impl ProviderVehicle for Vehicle {
                 http::header::USER_AGENT,
                 DEFAULT_USER_AGENT.parse().expect("must parse user agent"),
             );
+            if let Some(outbound) = &self.outbound {
+                req.extensions_mut().insert(ClashHTTPClientExt {
+                    outbound: Some(outbound.clone()),
+                });
+            }
             *req.body_mut() = http_body_util::Empty::<bytes::Bytes>::new();
             *req.uri_mut() = current_uri.clone();
 
@@ -156,7 +166,7 @@ mod tests {
         let u = server.url("/test_http_vehicle").parse::<Uri>().unwrap();
         let p = std::env::temp_dir().join("test_http_vehicle");
         let r = Arc::new(EnhancedResolver::new_default().await);
-        let v = super::Vehicle::new(u, p, None, r.clone() as ThreadSafeDNSResolver);
+        let v = super::Vehicle::new(u, p, None, r.clone() as ThreadSafeDNSResolver, None, None);
 
         let data = v.read().await.unwrap();
         mock.assert();
@@ -179,7 +189,7 @@ mod tests {
         let u = server.url("/redirect").parse::<Uri>().unwrap();
         let p = std::env::temp_dir().join("test_http_vehicle_redirect");
         let r = Arc::new(EnhancedResolver::new_default().await);
-        let v = super::Vehicle::new(u, p, None, r.clone() as ThreadSafeDNSResolver);
+        let v = super::Vehicle::new(u, p, None, r.clone() as ThreadSafeDNSResolver, None, None);
 
         let data = v.read().await.unwrap();
         mock_redirect.assert();
@@ -192,8 +202,42 @@ mod tests {
         initialize();
         let u = "http://example.com/test".parse::<Uri>().unwrap();
         let r = Arc::new(EnhancedResolver::new_default().await);
-        let v = super::Vehicle::new(u.clone(), "", None, r.clone() as ThreadSafeDNSResolver);
+        let v = super::Vehicle::new(u.clone(), "", None, r.clone() as ThreadSafeDNSResolver, None, None);
         let expected_md5 = crate::common::utils::md5_str(u.to_string().as_bytes());
         assert_eq!(v.path(), format!("cache/{expected_md5}"));
     }
+
+    #[tokio::test]
+    async fn test_http_vehicle_with_proxy() {
+        initialize();
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(GET).path("/test_proxy_vehicle");
+            then.status(200).body("proxied success");
+        });
+
+        let u = server.url("/test_proxy_vehicle").parse::<Uri>().unwrap();
+        let p = std::env::temp_dir().join("test_proxy_vehicle");
+        let r = Arc::new(EnhancedResolver::new_default().await);
+
+        let mut registry_map = std::collections::HashMap::new();
+        let direct_handler = Arc::new(crate::proxy::direct::Handler::new("my-proxy"))
+            as crate::proxy::AnyOutboundHandler;
+        registry_map.insert("my-proxy".to_string(), direct_handler);
+        let registry = Arc::new(parking_lot::RwLock::new(registry_map));
+
+        let v = super::Vehicle::new(
+            u,
+            p,
+            None,
+            r.clone() as ThreadSafeDNSResolver,
+            Some("my-proxy".to_string()),
+            Some(registry),
+        );
+
+        let data = v.read().await.unwrap();
+        mock.assert();
+        assert_eq!(str::from_utf8(&data).unwrap(), "proxied success");
+    }
 }
+

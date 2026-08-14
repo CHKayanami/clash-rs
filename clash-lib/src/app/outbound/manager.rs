@@ -98,6 +98,7 @@ impl OutboundManager {
         proxy_providers: HashMap<String, OutboundProxyProviderDef>,
         proxy_names: Vec<String>,
         dns_resolver: ThreadSafeDNSResolver,
+        system_resolver: Option<ThreadSafeDNSResolver>,
         cache_store: ThreadSafeCacheFile,
         cwd: String,
         fw_mark: Option<u32>,
@@ -119,7 +120,7 @@ impl OutboundManager {
         };
 
         debug!("initializing proxy providers");
-        m.load_proxy_providers(cwd, proxy_providers, dns_resolver)
+        m.load_proxy_providers(cwd, proxy_providers, dns_resolver, system_resolver)
             .await?;
 
         debug!("initializing handlers");
@@ -942,6 +943,7 @@ impl OutboundManager {
         cwd: String,
         proxy_providers: HashMap<String, OutboundProxyProviderDef>,
         resolver: ThreadSafeDNSResolver,
+        system_resolver: Option<ThreadSafeDNSResolver>,
     ) -> Result<(), Error> {
         let proxy_manager = &self.proxy_manager;
         let provider_registry = &mut self.proxy_providers;
@@ -973,13 +975,20 @@ impl OutboundManager {
                             let md5 = crate::common::utils::md5_str(http.url.as_bytes());
                             format!("proxy_providers/{md5}")
                         });
+                    let resolver_to_use = if http.proxy.is_some() {
+                        resolver.clone()
+                    } else {
+                        system_resolver.clone().unwrap_or_else(|| resolver.clone())
+                    };
                     let vehicle = http_vehicle::Vehicle::new(
                         http.url.parse::<Uri>().unwrap_or_else(|_| {
                             print_and_exit!("invalid provider url: {}", http.url);
                         }),
                         path,
                         Some(cwd.clone()),
-                        resolver.clone(),
+                        resolver_to_use,
+                        http.proxy,
+                        Some(self.registry.clone()),
                     );
                     (
                         Arc::new(vehicle) as ThreadSafeProviderVehicle,

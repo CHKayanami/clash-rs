@@ -817,6 +817,8 @@ pub struct OutboundHttpProvider {
     #[serde(default)]
     pub path: Option<String>,
     pub health_check: HealthCheck,
+    #[serde(default)]
+    pub proxy: Option<String>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug)]
