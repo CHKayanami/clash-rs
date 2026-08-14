@@ -10,15 +10,25 @@
 
 A custom protocol, rule based network proxy software.
 
+**English** · [简体中文](README_zh.md)
+
 [![CI](https://github.com/Watfaq/clash-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/Watfaq/clash-rs/actions/workflows/ci.yml)
 [![codecov](https://codecov.io/gh/Watfaq/clash-rs/graph/badge.svg?token=ZQK5WB63KR)](https://codecov.io/gh/Watfaq/clash-rs)
 
 </div>
 
+> [!NOTE]
+> **About this Fork**:
+> - ⚡ **Performance & Stability**: Extensively refactored and performance-tuned with rewritten core protocol stacks.
+> - 🚀 **New Features**: Shadowsocks UOT (UDP-over-TCP), Domain Sniffing (TLS SNI / HTTP Host / QUIC SNI), etc.
+> - 🪶 **Minimal Build**: Lightweight by design; excludes TUN mode and optional protocols (`SSH`, `WireGuard`, `Tailscale`, `Shadowquic`, `Tor`).
+> - 📖 **Configuration Reference**: See [full.yaml](https://github.com/CHKayanami/clash-rs/blob/master/clash-bin/tests/data/config/full.yaml).
+
 ## ✨ Features
 
 - 🌈 Flexible traffic routing rules based off source/destination IP/Domain/GeoIP etc.
 - 📦 Local anti spoofing DNS with support of UDP/TCP/DoH/DoT remote, and expose it as a local UDP/TCP/DoH/DoT server.
+- 🔍 Domain Sniffer for TLS SNI, HTTP Host, and QUIC Initial SNI decryption to enable accurate routing for transparent proxies.
 - ⚙️ AnyTLS/Hysteria2/Shadowquic/Shadowsocks/Socks5(TCP/UDP)/SSH/Tailscale/tor(onion)/Trojan/Tuic/VLess/Vmess/Wireguard(userspace) outbound support with different underlying transports(gRPC/TLS/H2/WebSocket/etc.).
 - 🔀 Multiple inbound modes: HTTP, SOCKS5, Mixed, Shadowsocks, AnyTLS, Redir, TProxy, and TUN (utun) for transparent proxying.
 - 🌍 Dynamic remote rule/proxy loader.
