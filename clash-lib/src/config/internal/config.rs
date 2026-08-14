@@ -106,6 +106,119 @@ pub struct Profile {
     // store_fake_ip: bool,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub enum DnsHijackRule {
+    Any {
+        network: Option<crate::session::Network>,
+        port: u16,
+    },
+    IpNet {
+        network: Option<crate::session::Network>,
+        ipnet: IpNet,
+        port: u16,
+    },
+}
+
+impl std::str::FromStr for DnsHijackRule {
+    type Err = crate::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let (network, rest) = if let Some(stripped) = s.strip_prefix("tcp://") {
+            (Some(crate::session::Network::Tcp), stripped)
+        } else if let Some(stripped) = s.strip_prefix("udp://") {
+            (Some(crate::session::Network::Udp), stripped)
+        } else {
+            (None, s)
+        };
+
+        let (host_str, port) = if let Some((h, p)) = rest.rsplit_once(':') {
+            if let Ok(port) = p.parse::<u16>() {
+                (h, port)
+            } else {
+                (rest, 53)
+            }
+        } else {
+            (rest, 53)
+        };
+
+        if host_str.eq_ignore_ascii_case("any")
+            || host_str == "0.0.0.0"
+            || host_str == "::"
+        {
+            Ok(DnsHijackRule::Any { network, port })
+        } else if let Ok(ipnet) = host_str.parse::<IpNet>() {
+            Ok(DnsHijackRule::IpNet {
+                network,
+                ipnet,
+                port,
+            })
+        } else if let Ok(ip) = host_str.parse::<std::net::IpAddr>() {
+            let ipnet = match ip {
+                std::net::IpAddr::V4(v4) => {
+                    IpNet::V4(ipnet::Ipv4Net::new(v4, 32).unwrap())
+                }
+                std::net::IpAddr::V6(v6) => {
+                    IpNet::V6(ipnet::Ipv6Net::new(v6, 128).unwrap())
+                }
+            };
+            Ok(DnsHijackRule::IpNet {
+                network,
+                ipnet,
+                port,
+            })
+        } else {
+            Err(crate::Error::InvalidConfig(format!(
+                "invalid dns-hijack rule: {s}"
+            )))
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum DnsHijack {
+    Disabled,
+    All,
+    Rules(Vec<DnsHijackRule>),
+}
+
+impl Default for DnsHijack {
+    fn default() -> Self {
+        Self::Disabled
+    }
+}
+
+impl DnsHijack {
+    pub fn is_enabled(&self) -> bool {
+        !matches!(self, Self::Disabled)
+    }
+
+    pub fn is_hijacked(
+        &self,
+        network: crate::session::Network,
+        dst: &std::net::SocketAddr,
+    ) -> bool {
+        match self {
+            Self::Disabled => false,
+            Self::All => dst.port() == 53,
+            Self::Rules(rules) => rules.iter().any(|rule| match rule {
+                DnsHijackRule::Any {
+                    network: net,
+                    port,
+                } => (net.is_none() || *net == Some(network)) && dst.port() == *port,
+                DnsHijackRule::IpNet {
+                    network: net,
+                    ipnet,
+                    port,
+                } => {
+                    (net.is_none() || *net == Some(network))
+                        && dst.port() == *port
+                        && ipnet.contains(&dst.ip())
+                }
+            }),
+        }
+    }
+}
+
 #[derive(Default, Clone)]
 pub struct TunConfig {
     pub enable: bool,
@@ -117,7 +230,7 @@ pub struct TunConfig {
     pub mtu: Option<u16>,
     pub so_mark: Option<u32>,
     pub route_table: u32,
-    pub dns_hijack: bool,
+    pub dns_hijack: DnsHijack,
 }
 
 #[derive(Serialize, Clone, Debug, Copy, PartialEq, Hash, Eq)]
@@ -241,7 +354,20 @@ pub struct InlineRuleProvider {
 
 #[cfg(test)]
 mod tests {
-    use crate::config::{def, internal::convert::convert, listener::InboundOpts};
+    use std::str::FromStr;
+
+    use crate::{
+        config::{
+            def,
+            internal::{
+                config::{DnsHijack, DnsHijackRule},
+                convert::convert,
+            },
+            listener::InboundOpts,
+        },
+        session::Network,
+    };
+
     #[test]
     fn from_def_config() {
         let cfg = r#"
@@ -261,5 +387,41 @@ mod tests {
             InboundOpts::Mixed { common_opts, .. } => common_opts.port == 9091,
             _ => false,
         }));
+    }
+
+    #[test]
+    fn test_dns_hijack_rules() {
+        let rule_any = DnsHijackRule::from_str("any:53").unwrap();
+        let rule_tcp = DnsHijackRule::from_str("tcp://8.8.8.8:53").unwrap();
+        let rule_udp = DnsHijackRule::from_str("udp://1.1.1.1:53").unwrap();
+        let rule_subnet = DnsHijackRule::from_str("198.18.0.0/16:53").unwrap();
+
+        let hijack_any = DnsHijack::Rules(vec![rule_any]);
+        assert!(hijack_any.is_hijacked(Network::Tcp, &"1.2.3.4:53".parse().unwrap()));
+        assert!(hijack_any.is_hijacked(Network::Udp, &"1.2.3.4:53".parse().unwrap()));
+
+        let hijack = DnsHijack::Rules(vec![rule_tcp, rule_udp, rule_subnet]);
+
+        let addr_8888 = "8.8.8.8:53".parse().unwrap();
+        let addr_1111 = "1.1.1.1:53".parse().unwrap();
+        let addr_fakeip = "198.18.0.2:53".parse().unwrap();
+        let addr_other = "9.9.9.9:53".parse().unwrap();
+
+        assert!(hijack.is_hijacked(Network::Tcp, &addr_8888));
+        assert!(!hijack.is_hijacked(Network::Udp, &addr_8888));
+
+        assert!(hijack.is_hijacked(Network::Udp, &addr_1111));
+        assert!(!hijack.is_hijacked(Network::Tcp, &addr_1111));
+
+        assert!(hijack.is_hijacked(Network::Tcp, &addr_fakeip));
+        assert!(hijack.is_hijacked(Network::Udp, &addr_fakeip));
+
+        assert!(!hijack.is_hijacked(Network::Tcp, &addr_other));
+        assert!(!hijack.is_hijacked(Network::Udp, &addr_other));
+
+        let hijack_all = DnsHijack::All;
+        assert!(hijack_all.is_hijacked(Network::Tcp, &addr_other));
+        assert!(hijack_all.is_hijacked(Network::Udp, &addr_other));
+        assert!(!hijack_all.is_hijacked(Network::Udp, &"9.9.9.9:80".parse().unwrap()));
     }
 }

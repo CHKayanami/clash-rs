@@ -16,7 +16,7 @@ pub(crate) async fn handle_inbound_datagram(
     dispatcher: Arc<Dispatcher>,
     resolver: ThreadSafeDNSResolver,
     so_mark: Option<u32>,
-    dns_hijack: bool,
+    dns_hijack: crate::config::internal::config::DnsHijack,
 ) {
     // tun i/o
     // lr: app packets went into tun will be accessed from lr
@@ -28,10 +28,10 @@ pub(crate) async fn handle_inbound_datagram(
     // dispatcher <-> tun communications
     // l_tx: dispatcher write packet responded from remote proxy
     // l_rx: in fut1 items are forwarded to ls
-    let (l_tx, mut l_rx) = tokio::sync::mpsc::channel::<UdpPacket>(32);
+    let (l_tx, mut l_rx) = tokio::sync::mpsc::channel::<UdpPacket>(512);
 
     // forward packets from tun to dispatcher
-    let (d_tx, d_rx) = tokio::sync::mpsc::channel::<UdpPacket>(32);
+    let (d_tx, d_rx) = tokio::sync::mpsc::channel::<UdpPacket>(512);
 
     // for dispatcher - the dispatcher would receive packets from this channel,
     // which is from the stack and send back packets to this channel, which
@@ -93,7 +93,7 @@ pub(crate) async fn handle_inbound_datagram(
 
             trace!("tun -> dispatcher: {:?}", pkt);
 
-            if dns_hijack && pkt.dst_addr.port() == 53 {
+            if dns_hijack.is_hijacked(Network::Udp, &remote_addr) {
                 trace!("got dns packet: {:?}, returning from Clash DNS server", pkt);
 
                 match hickory_proto::op::Message::from_vec(&pkt.data) {

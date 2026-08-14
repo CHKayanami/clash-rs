@@ -263,7 +263,7 @@ impl Runner for TunRunner {
         let so_mark = self.cfg.so_mark;
         let dispatcher = self.dispatcher.clone();
         let resolver = self.resolver.clone();
-        let dns_hijack = self.cfg.dns_hijack;
+        let dns_hijack = self.cfg.dns_hijack.clone();
         let cancellation_token = self.cancellation_token.clone();
 
         tokio::spawn(async move {
@@ -354,6 +354,8 @@ impl Runner for TunRunner {
             };
 
             let dsp = dispatcher.clone();
+            let res = resolver.clone();
+            let dh = dns_hijack.clone();
             let mut fut_tcp_dispatch = async || {
                 while let Some(stream) = tcp_listener.next().await {
                     debug!(
@@ -365,7 +367,9 @@ impl Runner for TunRunner {
                     tokio::spawn(handle_inbound_stream(
                         stream,
                         dsp.clone(),
+                        res.clone(),
                         so_mark,
+                        dh.clone(),
                     ));
                 }
 
@@ -383,7 +387,7 @@ impl Runner for TunRunner {
                 Err(Error::Operation("tun stopped unexpectedly 3".to_string()))
             };
 
-            match tokio::select! {
+            let run_res = tokio::select! {
                 res = fut_dispatcher_tun() => res,
                 res = fut_tun_dispatcher() => res,
                 res = fut_tcp_dispatch() => res,
@@ -392,16 +396,16 @@ impl Runner for TunRunner {
                     info!("tun stop signal received");
                     Ok(())
                 },
-            } {
-                Ok(_) => {
-                    info!("tun runner exited");
-                    Ok(())
-                }
-                Err(e) => {
-                    error!("tun runner error: {}", e);
-                    Err(e)
-                }
+            };
+
+            if let Err(ref e) = run_res {
+                error!("tun runner error: {}", e);
             }
+            if let Err(e) = routes::maybe_routes_clean_up(&cfg) {
+                warn!("error cleaning up routes during tun runner shutdown: {}", e);
+            }
+            info!("tun runner exited");
+            run_res
         });
     }
 

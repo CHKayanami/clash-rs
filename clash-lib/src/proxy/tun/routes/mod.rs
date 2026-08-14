@@ -35,9 +35,6 @@ use crate::app::net::get_interface_by_name;
 #[allow(dead_code)]
 pub fn maybe_add_routes(cfg: &TunConfig, tun_name: &str) -> std::io::Result<()> {
     if cfg.route_all || !cfg.routes.is_empty() {
-        #[cfg(target_os = "linux")]
-        linux::check_ip_command_installed()?;
-
         let tun_iface = get_interface_by_name(tun_name).ok_or_else(|| {
             std::io::Error::new(
                 std::io::ErrorKind::NotFound,
@@ -94,7 +91,7 @@ pub fn maybe_add_routes(cfg: &TunConfig, tun_name: &str) -> std::io::Result<()> 
                     // We can't set name server to clash DNS listener address
                     // because it may not be on standard port 53
                     // Windows only support DNS server on port 53
-                    if cfg.dns_hijack {
+                    if cfg.dns_hijack.is_enabled() {
                         warn!(
                             "DNS hijack is enabled, setting fake DNS servers for \
                              the tun interface"

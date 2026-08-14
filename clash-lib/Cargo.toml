@@ -245,6 +245,8 @@ hyperlocal = { version = "0.9", features = ["client"] }
 
 [target.'cfg(target_os="linux")'.dependencies]
 unix-udp-sock = { git = "https://github.com/Watfaq/unix-udp-sock.git", rev = "847c80b519f0fd8cff5c887ae708429897d08671" }
+rtnetlink = "0.14"
+netlink-packet-route = "0.19"
 
 [target.'cfg(target_os="ios")'.dependencies]
 tracing-oslog = "0.3"

@@ -43,6 +43,39 @@ pub fn add_route(via: &OutboundInterface, dest: &IpNet) -> std::io::Result<()> {
     }
 }
 
+pub fn delete_route(via: &OutboundInterface, dest: &IpNet) -> std::io::Result<()> {
+    let mut cmd = std::process::Command::new("route");
+    cmd.arg("delete");
+
+    match dest {
+        IpNet::V4(_) => {
+            cmd.arg("-net")
+                .arg(dest.to_string())
+                .arg("-interface")
+                .arg(&via.name);
+            warn!("executing: route delete -net {} -interface {}", dest, via.name);
+        }
+        IpNet::V6(_) => {
+            cmd.arg("-inet6")
+                .arg(dest.to_string())
+                .arg("-interface")
+                .arg(&via.name);
+            warn!(
+                "executing: route delete -inet6 {} -interface {}",
+                dest, via.name
+            );
+        }
+    }
+
+    let output = cmd.output()?;
+
+    if !output.status.success() {
+        Err(new_io_error("delete route failed"))
+    } else {
+        Ok(())
+    }
+}
+
 fn get_default_gateway()
 -> std::io::Result<(Option<Ipv4Addr>, Option<std::net::Ipv6Addr>)> {
     // IPv4
@@ -146,8 +179,64 @@ pub fn maybe_add_default_route() -> std::io::Result<()> {
     }
 }
 
+fn extract_tun_name(device_id: &str) -> String {
+    if let Ok(u) = url::Url::parse(device_id) {
+        if let Some(host) = u.host_str() {
+            return host.to_string();
+        }
+    }
+    device_id.to_string()
+}
+
 /// failing to delete the default route won't cause route failure
 pub fn maybe_routes_clean_up(cfg: &TunConfig) -> std::io::Result<()> {
+    if !cfg.route_all && cfg.routes.is_empty() {
+        return Ok(());
+    }
+
+    let tun_name = extract_tun_name(&cfg.device_id);
+    let tun_iface = crate::app::net::get_interface_by_name(&tun_name);
+
+    if let Some(ref iface) = tun_iface {
+        if cfg.route_all {
+            let mut routes_to_delete = vec![
+                IpNet::new(std::net::IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 1)
+                    .unwrap(),
+                IpNet::new(std::net::IpAddr::V4(Ipv4Addr::new(128, 0, 0, 0)), 1)
+                    .unwrap(),
+            ];
+
+            if iface.addr_v6.is_some() || cfg.gateway_v6.is_some() {
+                routes_to_delete.push(
+                    IpNet::new(
+                        std::net::IpAddr::V6(std::net::Ipv6Addr::new(
+                            0, 0, 0, 0, 0, 0, 0, 0,
+                        )),
+                        1,
+                    )
+                    .unwrap(),
+                );
+                routes_to_delete.push(
+                    IpNet::new(
+                        std::net::IpAddr::V6(std::net::Ipv6Addr::new(
+                            0x8000, 0, 0, 0, 0, 0, 0, 0,
+                        )),
+                        1,
+                    )
+                    .unwrap(),
+                );
+            }
+
+            for r in routes_to_delete {
+                let _ = delete_route(iface, &r);
+            }
+        } else {
+            for r in &cfg.routes {
+                let _ = delete_route(iface, r);
+            }
+        }
+    }
+
     if !cfg.route_all {
         return Ok(());
     }

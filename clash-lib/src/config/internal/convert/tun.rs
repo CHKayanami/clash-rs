@@ -36,8 +36,24 @@ pub fn convert(
             so_mark: t.so_mark,
             route_table: t.route_table,
             dns_hijack: match t.dns_hijack {
-                def::DnsHijack::Switch(b) => b,
-                def::DnsHijack::List(_) => true,
+                def::DnsHijack::Switch(b) => {
+                    if b {
+                        config::DnsHijack::All
+                    } else {
+                        config::DnsHijack::Disabled
+                    }
+                }
+                def::DnsHijack::List(list) => {
+                    if list.is_empty() {
+                        config::DnsHijack::Disabled
+                    } else {
+                        let rules = list
+                            .into_iter()
+                            .map(|s| s.parse())
+                            .collect::<Result<Vec<config::DnsHijackRule>, _>>()?;
+                        config::DnsHijack::Rules(rules)
+                    }
+                }
             },
         }),
         None => Ok(config::TunConfig::default()),
