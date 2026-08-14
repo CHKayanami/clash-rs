@@ -966,11 +966,18 @@ impl OutboundManager {
         for (name, provider) in proxy_providers.into_iter() {
             let (vehicle, interval_secs, health_check) = match provider {
                 OutboundProxyProviderDef::Http(http) => {
+                    let path = http
+                        .path
+                        .filter(|p| !p.trim().is_empty())
+                        .unwrap_or_else(|| {
+                            let md5 = crate::common::utils::md5_str(http.url.as_bytes());
+                            format!("proxy_providers/{md5}")
+                        });
                     let vehicle = http_vehicle::Vehicle::new(
                         http.url.parse::<Uri>().unwrap_or_else(|_| {
                             print_and_exit!("invalid provider url: {}", http.url);
                         }),
-                        http.path,
+                        path,
                         Some(cwd.clone()),
                         resolver.clone(),
                     );

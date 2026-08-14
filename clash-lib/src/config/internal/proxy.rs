@@ -806,14 +806,16 @@ impl OutboundProxyProviderDef {
     }
 }
 
-#[derive(serde::Serialize, serde::Deserialize, Debug)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 #[serde(rename_all = "kebab-case")]
 pub struct OutboundHttpProvider {
     #[serde(skip)]
     pub name: String,
     pub url: String,
+    #[serde(default)]
     pub interval: u64,
-    pub path: String,
+    #[serde(default)]
+    pub path: Option<String>,
     pub health_check: HealthCheck,
 }
 
@@ -827,7 +829,7 @@ pub struct OutboundFileProvider {
     pub health_check: HealthCheck,
 }
 
-#[derive(serde::Serialize, serde::Deserialize, Debug)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub struct HealthCheck {
     pub enable: bool,
     pub url: String,

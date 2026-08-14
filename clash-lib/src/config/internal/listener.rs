@@ -339,8 +339,10 @@ pub struct InboundHttpProvider {
     #[serde(skip)]
     pub name: String,
     pub url: String,
+    #[serde(default)]
     pub interval: u64,
-    pub path: String,
+    #[serde(default)]
+    pub path: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]

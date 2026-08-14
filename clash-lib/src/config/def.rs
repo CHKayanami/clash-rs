@@ -1161,6 +1161,51 @@ rule-providers:
     }
 
     #[test]
+    fn parse_providers_optional_path() {
+        let cfg = r#"
+proxy-providers:
+  http-proxy-no-path:
+    type: http
+    url: "https://example.com/proxies.yaml"
+    interval: 3600
+    health-check:
+      enable: true
+      interval: 600
+      url: http://www.gstatic.com/generate_204
+  http-proxy-empty-path:
+    type: http
+    url: "https://example.com/proxies2.yaml"
+    path: ""
+    health-check:
+      enable: true
+      interval: 600
+      url: http://www.gstatic.com/generate_204
+
+rule-providers:
+  http-rule-empty-path:
+    type: http
+    url: "https://example.com/rules.yaml"
+    path: ""
+    behavior: domain
+
+inbound-providers:
+  http-inbound-no-path:
+    type: http
+    url: "https://example.com/inbounds.yaml"
+"#;
+        let c = cfg.parse::<Config>().expect("should parse config with optional/empty provider path");
+        assert!(c.proxy_provider.is_some());
+        assert!(c.rule_provider.is_some());
+        assert!(c.inbound_provider.is_some());
+
+        let internal: crate::config::internal::config::Config =
+            c.try_into().expect("convert should succeed");
+        assert_eq!(internal.proxy_providers.len(), 2);
+        assert_eq!(internal.rule_providers.len(), 1);
+        assert_eq!(internal.inbound_providers.len(), 1);
+    }
+
+    #[test]
     fn parse_example() {
         let example_cfg = r###"
 # Port of HTTP(S) proxy server on the local end

@@ -176,6 +176,12 @@ impl InboundManager {
                             continue;
                         }
                     };
+                    let path = path
+                        .filter(|p| !p.trim().is_empty())
+                        .unwrap_or_else(|| {
+                            let md5 = crate::common::utils::md5_str(url.as_bytes());
+                            format!("inbound_providers/{md5}")
+                        });
                     let v = http_vehicle::Vehicle::new(
                         uri,
                         path,

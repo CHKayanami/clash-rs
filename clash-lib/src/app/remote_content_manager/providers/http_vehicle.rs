@@ -32,14 +32,21 @@ impl Vehicle {
         cwd: Option<P>,
         dns_resolver: ThreadSafeDNSResolver,
     ) -> Self {
-        // TODO(dev0): support remote content manager via proxy
         let client = new_http_client(dns_resolver, None)
             .expect("failed to create http client");
+        let uri = url.into();
+        let path_ref = path.as_ref();
+        let path_buf = if path_ref.as_os_str().is_empty() {
+            let md5 = crate::common::utils::md5_str(uri.to_string().as_bytes());
+            PathBuf::from(format!("cache/{md5}"))
+        } else {
+            path_ref.to_path_buf()
+        };
         Self {
-            url: url.into(),
+            url: uri,
             path: match cwd {
-                Some(cwd) => cwd.as_ref().join(path),
-                None => path.as_ref().to_path_buf(),
+                Some(cwd) => cwd.as_ref().join(path_buf),
+                None => path_buf,
             },
             http_client: client,
         }
@@ -178,5 +185,15 @@ mod tests {
         mock_redirect.assert();
         mock_target.assert();
         assert_eq!(str::from_utf8(&data).unwrap(), "redirect success");
+    }
+
+    #[tokio::test]
+    async fn test_http_vehicle_empty_path() {
+        initialize();
+        let u = "http://example.com/test".parse::<Uri>().unwrap();
+        let r = Arc::new(EnhancedResolver::new_default().await);
+        let v = super::Vehicle::new(u.clone(), "", None, r.clone() as ThreadSafeDNSResolver);
+        let expected_md5 = crate::common::utils::md5_str(u.to_string().as_bytes());
+        assert_eq!(v.path(), format!("cache/{expected_md5}"));
     }
 }

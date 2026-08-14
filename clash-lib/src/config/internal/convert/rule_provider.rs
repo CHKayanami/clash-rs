@@ -19,11 +19,14 @@ pub(super) fn convert(
         .map(|(name, provider)| {
             let converted = match provider {
                 def::RuleProviderDef::Http(h) => {
-                    let path = h.path.unwrap_or_else(|| {
-                        let key = &h.url;
-                        let md5 = md5_str(key.as_bytes());
-                        format!("rules/{md5}")
-                    });
+                    let path = h
+                        .path
+                        .filter(|p| !p.trim().is_empty())
+                        .unwrap_or_else(|| {
+                            let key = &h.url;
+                            let md5 = md5_str(key.as_bytes());
+                            format!("rules/{md5}")
+                        });
                     RuleProviderDef::Http(HttpRuleProvider {
                         url: h.url,
                         interval: h.interval,
@@ -43,10 +46,13 @@ pub(super) fn convert(
                     })
                 }
                 def::RuleProviderDef::Inline(i) => {
-                    let path = i.path.unwrap_or_else(|| {
-                        let md5 = md5_str(name.as_bytes());
-                        format!("rules/{md5}")
-                    });
+                    let path = i
+                        .path
+                        .filter(|p| !p.trim().is_empty())
+                        .unwrap_or_else(|| {
+                            let md5 = md5_str(name.as_bytes());
+                            format!("rules/{md5}")
+                        });
                     RuleProviderDef::Inline(InlineRuleProvider {
                         path,
                         behavior: i.behavior,

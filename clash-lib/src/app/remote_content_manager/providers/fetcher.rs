@@ -88,7 +88,7 @@ where
         let mut inner = self.inner.write().await;
 
         let content = match metadata(&vehicle_path) {
-            Ok(meta) => {
+            Ok(meta) if meta.is_file() => {
                 let content = fs::read(&vehicle_path)?;
                 is_local = true;
                 inner.updated_at = meta.modified()?;
@@ -98,7 +98,7 @@ where
                     > self.interval;
                 content
             }
-            Err(_) => self.vehicle.read().await?,
+            _ => self.vehicle.read().await?,
         };
 
         let parser_guard = &self.parser;
@@ -117,9 +117,10 @@ where
         if self.vehicle_type() != ProviderVehicleType::File && !is_local {
             let p = self.vehicle.path().to_owned();
             let path = Path::new(p.as_str());
-            let prefix = path.parent().unwrap();
-            if !prefix.exists() {
-                fs::create_dir_all(prefix)?;
+            if let Some(prefix) = path.parent() {
+                if !prefix.as_os_str().is_empty() && !prefix.exists() {
+                    fs::create_dir_all(prefix)?;
+                }
             }
             fs::write(self.vehicle.path(), &content)?;
         }
@@ -173,9 +174,10 @@ where
         if vehicle.typ() != ProviderVehicleType::File {
             let p = vehicle.path().to_owned();
             let path = Path::new(p.as_str());
-            let prefix = path.parent().unwrap();
-            if !prefix.exists() {
-                fs::create_dir_all(prefix)?;
+            if let Some(prefix) = path.parent() {
+                if !prefix.as_os_str().is_empty() && !prefix.exists() {
+                    fs::create_dir_all(prefix)?;
+                }
             }
 
             fs::write(vehicle.path(), &content)?;
