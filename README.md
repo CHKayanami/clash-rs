@@ -20,7 +20,7 @@ A custom protocol, rule based network proxy software.
 > [!NOTE]
 > **About this Fork**:
 > - ⚡ **Performance & Stability**: Extensively refactored and performance-tuned with rewritten core protocol stacks.
-> - 🚀 **New Features**: Shadowsocks UOT (UDP-over-TCP), Domain Sniffing (TLS SNI / HTTP Host / QUIC SNI), etc.
+> - 🚀 **New Features**: Shadowsocks UOT (UDP-over-TCP), Domain Sniffing (TLS SNI / HTTP Host / QUIC SNI), H2MUX, etc.
 > - 🪶 **Minimal Build**: Lightweight by design; excludes TUN mode and optional protocols (`SSH`, `WireGuard`, `Tailscale`, `Shadowquic`, `Tor`).
 > - 📖 **Configuration Reference**: See [full.yaml](https://github.com/CHKayanami/clash-rs/blob/master/clash-bin/tests/data/config/full.yaml).
 

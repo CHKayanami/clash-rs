@@ -464,6 +464,25 @@ proxies:
     skip-cert-verify: false
     server-name: example.com        # SNI (alias: servername)
 
+  - name: vmess-http
+    type: vmess
+    server: 1.2.3.4
+    port: 80
+    uuid: b831381d-6324-4d53-ad4f-8cda48b30811
+    alterId: 0
+    cipher: auto
+    network: http
+    http-opts:
+      method: GET
+      path:
+        - /
+        - /video
+      headers:
+        Host:
+          - example.com
+        User-Agent:
+          - "Mozilla/5.0"
+
   - name: vmess-ws
     type: vmess
     server: 1.2.3.4
