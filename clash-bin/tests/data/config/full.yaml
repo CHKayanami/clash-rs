@@ -415,6 +415,24 @@ proxies:
     # password: "server-key=:user-key="
     udp: true
 
+  # Shadowsocks with Multiplexing (h2mux):
+  # Multiplexing multiplexes multiple logical streams over a single long-lived carrier connection.
+  # Applicable protocols: ss, vmess, vless, trojan, socks5.
+  - name: ss-h2mux
+    type: ss
+    server: 1.2.3.4
+    port: 8390
+    cipher: 2022-blake3-aes-256-gcm
+    password: "base64-encoded-32-byte-server-key="
+    udp: true
+    smux:                           # alias: multiplex
+      enabled: true                 # alias: enable
+      protocol: h2mux               # h2mux (default & recommended)
+      max-connections: 4            # max underlying carrier TCP connections (default: 4)
+      min-streams: 4                # min streams per connection before opening a new one (default: 4)
+      max-streams: 0                # max streams per connection (0 = unlimited)
+      padding: true                 # append random padding header to resist traffic analysis
+
   # ── SOCKS5 ──────────────────────────────────────────────────────────────────
   - name: socks5-plain
     type: socks5
@@ -542,6 +560,12 @@ proxies:
       - h2
       - http/1.1
     udp: true
+    # smux:
+    #   enabled: true
+    #   protocol: h2mux
+    #   max-connections: 4
+    #   min-streams: 4
+    #   padding: true
 
   - name: trojan-grpc
     type: trojan

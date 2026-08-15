@@ -23,6 +23,8 @@ use vmess_impl::OutboundDatagramVmess;
 
 mod vmess_impl;
 
+use crate::proxy::transport::mux::{H2MuxPool, MuxOption};
+
 pub struct HandlerOptions {
     pub name: String,
     pub common_opts: HandlerCommonOptions,
@@ -35,12 +37,14 @@ pub struct HandlerOptions {
     pub transport: Option<TransportLayer>,
     // maybe shadow-tls?
     pub tls: Option<TransportLayer>,
+    pub smux: Option<MuxOption>,
 }
 
 pub struct Handler {
     opts: HandlerOptions,
 
     connector: Option<Arc<dyn RemoteConnector>>,
+    mux_pool: Option<Arc<H2MuxPool>>,
 }
 
 impl_default_connector!(Handler);
@@ -55,7 +59,17 @@ impl std::fmt::Debug for Handler {
 
 impl Handler {
     pub fn new(opts: HandlerOptions, connector: Option<Arc<dyn RemoteConnector>>) -> Self {
-        Self { opts, connector }
+        let mux_pool = opts
+            .smux
+            .as_ref()
+            .filter(|s| s.enable)
+            .map(|s| H2MuxPool::new(s.clone()));
+
+        Self {
+            opts,
+            connector,
+            mux_pool,
+        }
     }
 
     async fn inner_proxy_stream<'a>(
@@ -156,6 +170,35 @@ impl OutboundHandler for Handler {
         resolver: ThreadSafeDNSResolver,
         connector: &dyn RemoteConnector,
     ) -> io::Result<BoxedChainedStream> {
+        if let Some(mux) = &self.mux_pool {
+            let dialer = || async {
+                let stream = connector
+                    .connect_stream(
+                        resolver.clone(),
+                        self.opts.server.as_str(),
+                        self.opts.port,
+                        self.opts.common_opts.tfo,
+                        sess.iface.as_ref(),
+                        #[cfg(target_os = "linux")]
+                        sess.so_mark,
+                    )
+                    .await?;
+                let carrier_sess = Session {
+                    destination: crate::session::SocksAddr::Domain(
+                        crate::proxy::transport::mux::h2mux::protocol::MUX_DESTINATION_HOST
+                            .to_string(),
+                        crate::proxy::transport::mux::h2mux::protocol::MUX_DESTINATION_PORT,
+                    ),
+                    ..sess.clone()
+                };
+                self.inner_proxy_stream(stream, &carrier_sess, false).await
+            };
+            let s = mux.open_stream(&sess.destination, false, dialer).await?;
+            let chained = ChainedStreamWrapper::new(s);
+            chained.append_to_chain(self.name()).await;
+            return Ok(Box::new(chained));
+        }
+
         let stream = connector
             .connect_stream(
                 resolver,

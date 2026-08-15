@@ -10,6 +10,7 @@ pub mod splice_tls;
 mod tls;
 #[cfg(feature = "shadowsocks")]
 mod v2ray;
+pub mod mux;
 pub mod uot;
 mod ws;
 

@@ -1068,6 +1068,7 @@ mod tests {
             plugin_opts: None,
             udp: true,
             udp_over_tcp: false,
+            smux: None,
         });
 
         let ss2 = OutboundProxyProtocol::Ss(OutboundShadowsocks {
@@ -1084,6 +1085,7 @@ mod tests {
             plugin_opts: None,
             udp: true,
             udp_over_tcp: false,
+            smux: None,
         });
 
         // Pass ss2 before ss1 in the input list to verify topological sort resolves ss1 first

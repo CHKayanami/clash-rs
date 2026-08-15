@@ -26,6 +26,8 @@ pub fn build_handler(
     s: &OutboundShadowsocks,
     connector: Option<Arc<dyn RemoteConnector>>,
 ) -> Result<Handler, crate::Error> {
+    s.smux.as_ref().map(|m| m.validate()).transpose()?;
+
     let h = Handler::new(
         HandlerOptions {
             name: s.common_opts.name.to_owned(),
@@ -97,6 +99,7 @@ pub fn build_handler(
             },
             udp: s.udp,
             uot: s.udp_over_tcp,
+            smux: s.smux.clone(),
         },
         connector,
     );

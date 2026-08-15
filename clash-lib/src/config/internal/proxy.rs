@@ -247,6 +247,8 @@ pub struct OutboundShadowsocks {
     pub plugin_opts: Option<HashMap<String, serde_yaml::Value>>,
     #[serde(default, alias = "uot", alias = "udp-over-tcp")]
     pub udp_over_tcp: bool,
+    #[serde(default, alias = "multiplex")]
+    pub smux: Option<crate::proxy::transport::mux::MuxOption>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Default)]
@@ -263,6 +265,8 @@ pub struct OutboundSocks5 {
     pub skip_cert_verify: bool,
     #[serde(default = "default_bool_true")]
     pub udp: bool,
+    #[serde(default, alias = "multiplex")]
+    pub smux: Option<crate::proxy::transport::mux::MuxOption>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Default)]
@@ -349,6 +353,8 @@ pub struct OutboundTrojan {
     /// File path or inline PEM client private key for mTLS.
     /// Must be set together with `tls-cert`.
     pub tls_key: Option<String>,
+    #[serde(default, alias = "multiplex")]
+    pub smux: Option<crate::proxy::transport::mux::MuxOption>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Default)]
@@ -376,6 +382,8 @@ pub struct OutboundVmess {
     /// File path or inline PEM client private key for mTLS.
     /// Must be set together with `tls-cert`.
     pub tls_key: Option<String>,
+    #[serde(default, alias = "multiplex")]
+    pub smux: Option<crate::proxy::transport::mux::MuxOption>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Default)]
@@ -403,6 +411,8 @@ pub struct OutboundVless {
     /// File path or inline PEM client private key for mTLS.
     /// Must be set together with `tls-cert`.
     pub tls_key: Option<String>,
+    #[serde(default, alias = "multiplex")]
+    pub smux: Option<crate::proxy::transport::mux::MuxOption>,
 }
 
 #[cfg(feature = "wireguard")]

@@ -27,7 +27,9 @@ pub fn build_handler(
     s: &OutboundVless,
     connector: Option<Arc<dyn RemoteConnector>>,
 ) -> Result<Handler, crate::Error> {
-        let skip_cert_verify = s.skip_cert_verify.unwrap_or_default();
+    s.smux.as_ref().map(|m| m.validate()).transpose()?;
+
+    let skip_cert_verify = s.skip_cert_verify.unwrap_or_default();
         if skip_cert_verify {
             warn!(
                 "skipping TLS cert verification for {}",
@@ -184,6 +186,7 @@ pub fn build_handler(
                 .flatten(),
             tls,
             flow: s.flow.clone(),
+            smux: s.smux.clone(),
         },
         connector,
     ))

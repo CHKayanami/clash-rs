@@ -67,7 +67,7 @@ pub use group::{fallback, loadbalance, relay, selector, urltest};
 mod common;
 pub mod inbound;
 mod options;
-mod transport;
+pub mod transport;
 pub mod tunnel;
 
 use crate::proxy::group::GroupProxyAPIResponse;

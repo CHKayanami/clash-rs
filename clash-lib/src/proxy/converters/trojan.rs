@@ -27,6 +27,8 @@ pub fn build_handler(
     s: &OutboundTrojan,
     connector: Option<Arc<dyn RemoteConnector>>,
 ) -> Result<Handler, crate::Error> {
+    s.smux.as_ref().map(|m| m.validate()).transpose()?;
+
     let skip_cert_verify = s.skip_cert_verify.unwrap_or_default();
     if skip_cert_verify {
         warn!("skip_cert_verify is set to true for {}", s.common_opts.name);
@@ -105,6 +107,7 @@ pub fn build_handler(
                 })
                 .transpose()?
                 .flatten(),
+            smux: s.smux.clone(),
         },
         connector,
     );

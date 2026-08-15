@@ -33,6 +33,8 @@ use std::{collections::HashMap, fmt::Debug, io, sync::Arc};
 use tokio::io::AsyncWriteExt;
 use tracing::debug;
 
+use crate::proxy::transport::mux::{H2MuxPool, MuxOption};
+
 pub struct HandlerOptions {
     pub name: String,
     pub common_opts: HandlerCommonOptions,
@@ -43,6 +45,7 @@ pub struct HandlerOptions {
     pub plugin: Option<TransportLayer>,
     pub udp: bool,
     pub uot: bool,
+    pub smux: Option<MuxOption>,
 }
 
 pub struct Handler {
@@ -52,6 +55,7 @@ pub struct Handler {
     /// Built lazily and reused: `ServerConfig::new` re-derives the key from the
     /// password, and this used to run on every single connection.
     cfg: std::sync::OnceLock<ServerConfig>,
+    mux_pool: Option<Arc<H2MuxPool>>,
 }
 
 #[async_trait]
@@ -71,11 +75,18 @@ impl Debug for Handler {
 
 impl Handler {
     pub fn new(opts: HandlerOptions, connector: Option<Arc<dyn RemoteConnector>>) -> Self {
+        let mux_pool = opts
+            .smux
+            .as_ref()
+            .filter(|s| s.enable)
+            .map(|s| H2MuxPool::new(s.clone()));
+
         Self {
             opts,
             ctx: Context::new_shared(ServerType::Local),
             connector,
             cfg: std::sync::OnceLock::new(),
+            mux_pool,
         }
     }
 
@@ -228,6 +239,36 @@ impl OutboundHandler for Handler {
         resolver: ThreadSafeDNSResolver,
         connector: &dyn RemoteConnector,
     ) -> io::Result<BoxedChainedStream> {
+        if let Some(mux) = &self.mux_pool {
+            let dialer = || async {
+                let stream = connector
+                    .connect_stream(
+                        resolver.clone(),
+                        self.opts.server.as_str(),
+                        self.opts.port,
+                        self.opts.common_opts.tfo,
+                        sess.iface.as_ref(),
+                        #[cfg(target_os = "linux")]
+                        sess.so_mark,
+                    )
+                    .await?;
+                let carrier_sess = Session {
+                    destination: SocksAddr::Domain(
+                        crate::proxy::transport::mux::h2mux::protocol::MUX_DESTINATION_HOST
+                            .to_string(),
+                        crate::proxy::transport::mux::h2mux::protocol::MUX_DESTINATION_PORT,
+                    ),
+                    ..sess.clone()
+                };
+                self.proxy_stream(stream, &carrier_sess, resolver.clone())
+                    .await
+            };
+            let s = mux.open_stream(&sess.destination, false, dialer).await?;
+            let chained = ChainedStreamWrapper::new(s);
+            chained.append_to_chain(self.name()).await;
+            return Ok(Box::new(chained));
+        }
+
         let stream = connector
             .connect_stream(
                 resolver.clone(),
