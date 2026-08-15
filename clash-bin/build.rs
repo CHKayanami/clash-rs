@@ -1,6 +1,3 @@
-#![feature(cfg_version)]
-#![cfg_attr(not(version("1.88.0")), feature(let_chains))]
-
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     // Watch both CLASH_* and GitHub-provided env vars so rebuilds trigger correctly
@@ -19,15 +16,13 @@ fn main() {
         .or_else(|| std::env::var_os("GITHUB_SHA"))
         .and_then(|v| v.into_string().ok());
 
-    let version = if let Some(ref git_ref_val) = git_ref
-        && git_ref_val == "refs/heads/master"
-        && let Some(ref sha) = git_sha
-    {
-        let short_sha = &sha[..7.min(sha.len())];
-        // Nightly release below
-        format!("{}-alpha+sha.{short_sha}", env!("CARGO_PKG_VERSION"))
-    } else {
-        env!("CARGO_PKG_VERSION").into()
+    let version = match (git_ref.as_deref(), git_sha.as_deref()) {
+        (Some("refs/heads/master"), Some(sha)) => {
+            let short_sha = &sha[..7.min(sha.len())];
+            // Nightly release below
+            format!("{}-alpha+sha.{short_sha}", env!("CARGO_PKG_VERSION"))
+        }
+        _ => env!("CARGO_PKG_VERSION").into(),
     };
     println!("cargo:rustc-env=CLASH_VERSION_OVERRIDE={version}");
 

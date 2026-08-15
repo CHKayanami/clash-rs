@@ -342,10 +342,7 @@ impl OutboundManager {
                 h.try_into()
                     .map(|x: hysteria2::Handler| Arc::new(x) as _)
                     .inspect_err(|e| {
-                        error!(
-                            "failed to load hysteria2 outbound {}: {}",
-                            name, e
-                        );
+                        error!("failed to load hysteria2 outbound {}: {}", name, e);
                     })
                     .ok()
             }
@@ -355,10 +352,7 @@ impl OutboundManager {
                 crate::proxy::converters::wireguard::build_handler(&wg, connector)
                     .map(|x: wg::Handler| Arc::new(x) as AnyOutboundHandler)
                     .inspect_err(|e| {
-                        error!(
-                            "failed to load wireguard outbound {}: {}",
-                            name, e
-                        );
+                        error!("failed to load wireguard outbound {}: {}", name, e);
                     })
                     .ok()
             }
@@ -397,14 +391,9 @@ impl OutboundManager {
                 let name = sqcfg.common_opts.name.clone();
                 sqcfg
                     .try_into()
-                    .map(|x: shadowquic::Handler| {
-                        Arc::new(x) as AnyOutboundHandler
-                    })
+                    .map(|x: shadowquic::Handler| Arc::new(x) as AnyOutboundHandler)
                     .inspect_err(|e| {
-                        error!(
-                            "failed to load shadowquic outbound {}: {}",
-                            name, e
-                        );
+                        error!("failed to load shadowquic outbound {}: {}", name, e);
                     })
                     .ok()
             }
@@ -413,14 +402,9 @@ impl OutboundManager {
                 let name = tscfg.name.clone();
                 tscfg
                     .try_into()
-                    .map(|x: tailscale::Handler| {
-                        Arc::new(x) as AnyOutboundHandler
-                    })
+                    .map(|x: tailscale::Handler| Arc::new(x) as AnyOutboundHandler)
                     .inspect_err(|e| {
-                        error!(
-                            "failed to load tailscale outbound {}: {}",
-                            name, e
-                        );
+                        error!("failed to load tailscale outbound {}: {}", name, e);
                     })
                     .ok()
             }
@@ -451,7 +435,8 @@ impl OutboundManager {
                             Arc::new(ProxyConnector::new(
                                 h.clone(),
                                 Box::new(DirectConnector::new()),
-                            )) as Arc<dyn RemoteConnector>
+                            ))
+                                as Arc<dyn RemoteConnector>
                         })
                     });
 
@@ -642,8 +627,7 @@ impl OutboundManager {
                         && !group_providers.contains(provider_name)
                         && matches!(
                             provider.vehicle_type(),
-                            ProviderVehicleType::Http
-                                | ProviderVehicleType::File
+                            ProviderVehicleType::Http | ProviderVehicleType::File
                         )
                     {
                         group_providers.push(provider_name.clone());
@@ -972,7 +956,8 @@ impl OutboundManager {
                         .path
                         .filter(|p| !p.trim().is_empty())
                         .unwrap_or_else(|| {
-                            let md5 = crate::common::utils::md5_str(http.url.as_bytes());
+                            let md5 =
+                                crate::common::utils::md5_str(http.url.as_bytes());
                             format!("proxy_providers/{md5}")
                         });
                     let resolver_to_use = if http.proxy.is_some() {
