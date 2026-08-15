@@ -20,3 +20,54 @@ where
         StringOrNum::Num(n) => Ok(n),
     }
 }
+
+pub fn deserialize_opt_string_or_seq<'de, D>(
+    deserializer: D,
+) -> Result<Option<Vec<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum StringOrSeq {
+        String(String),
+        Seq(Vec<String>),
+    }
+
+    let opt = Option::<StringOrSeq>::deserialize(deserializer)?;
+    Ok(opt.map(|s| match s {
+        StringOrSeq::String(s) => vec![s],
+        StringOrSeq::Seq(seq) => seq,
+    }))
+}
+
+pub fn deserialize_map_string_or_seq<'de, D>(
+    deserializer: D,
+) -> Result<Option<std::collections::HashMap<String, Vec<String>>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum StringOrSeq {
+        String(String),
+        Seq(Vec<String>),
+    }
+
+    let map =
+        Option::<std::collections::HashMap<String, StringOrSeq>>::deserialize(
+            deserializer,
+        )?;
+    Ok(map.map(|m| {
+        m.into_iter()
+            .map(|(k, v)| {
+                let v = match v {
+                    StringOrSeq::String(s) => vec![s],
+                    StringOrSeq::Seq(seq) => seq,
+                };
+                (k, v)
+            })
+            .collect()
+    }))
+}
+

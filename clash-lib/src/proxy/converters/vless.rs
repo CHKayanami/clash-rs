@@ -6,7 +6,8 @@ use crate::{
     proxy::{
         HandlerCommonOptions,
         transport::{
-            GrpcClient, H2Client, RealityClient, TlsClient, TransportLayer, WsClient,
+            GrpcClient, H2Client, HttpClient, RealityClient, TlsClient,
+            TransportLayer, WsClient,
         },
         utils::RemoteConnector,
         vless::{Handler, HandlerOptions},
@@ -97,7 +98,7 @@ pub fn build_handler(
                             .as_ref()
                             .map(|x| match x.as_str() {
                                 "tcp" => Ok(vec![]),
-                                "ws" => Ok(vec!["http/1.1".to_owned()]),
+                                "ws" | "http" => Ok(vec!["http/1.1".to_owned()]),
                                 "h2" | "grpc" => Ok(vec!["h2".to_owned()]),
                                 _ => Err(Error::InvalidConfig(format!(
                                     "unsupported network: {x}"
@@ -142,6 +143,14 @@ pub fn build_handler(
                         .ok_or(Error::InvalidConfig(
                             "ws_opts is required for ws".to_owned(),
                         )),
+                    "http" => {
+                        let default_http_opts = crate::config::proxy::HttpOpt::default();
+                        let opts = s.http_opts.as_ref().unwrap_or(&default_http_opts);
+                        let client: HttpClient = (opts, &s.common_opts)
+                            .try_into()
+                            .map_err(|e| Error::InvalidConfig(format!("invalid http options: {e}")))?;
+                        Ok(Some(TransportLayer::Http(client)))
+                    }
                     "h2" => s
                         .h2_opts
                         .as_ref()
@@ -418,6 +427,42 @@ mod tests {
         assert!(
             handler.is_ok(),
             "VLess handler with network: h2 should parse successfully"
+        );
+    }
+
+    #[test]
+    fn test_vless_network_http() {
+        crate::tests::initialize();
+        use crate::config::internal::proxy::HttpOpt;
+        use std::collections::HashMap;
+
+        let mut headers = HashMap::new();
+        headers.insert(
+            "Host".to_string(),
+            vec!["example.com".to_string()],
+        );
+
+        let config = OutboundVless {
+            common_opts: CommonConfigOptions {
+                name: "test-http".to_string(),
+                server: "example.com".to_string(),
+                port: 80,
+                ..Default::default()
+            },
+            uuid: "00000000-0000-0000-0000-000000000000".to_string(),
+            network: Some("http".to_string()),
+            http_opts: Some(HttpOpt {
+                method: Some("GET".to_string()),
+                path: Some(vec!["/video".to_string()]),
+                headers: Some(headers),
+            }),
+            ..Default::default()
+        };
+
+        let handler = Handler::try_from(&config);
+        assert!(
+            handler.is_ok(),
+            "VLess handler with network: http should parse successfully"
         );
     }
 }

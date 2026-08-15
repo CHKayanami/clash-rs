@@ -6,7 +6,10 @@ use crate::{
     config::internal::proxy::OutboundVmess,
     proxy::{
         HandlerCommonOptions,
-        transport::{GrpcClient, H2Client, TlsClient, TransportLayer, WsClient},
+        transport::{
+            GrpcClient, H2Client, HttpClient, TlsClient, TransportLayer,
+            WsClient,
+        },
         utils::RemoteConnector,
         vmess::{Handler, HandlerOptions},
     },
@@ -59,6 +62,20 @@ pub fn build_handler(
                         .ok_or(Error::InvalidConfig(
                             "ws_opts is required for ws".to_owned(),
                         )),
+                    "http" => {
+                        let default_http_opts =
+                            crate::config::proxy::HttpOpt::default();
+                        let opts =
+                            s.http_opts.as_ref().unwrap_or(&default_http_opts);
+                        let client: HttpClient = (opts, &s.common_opts)
+                            .try_into()
+                            .map_err(|e| {
+                                Error::InvalidConfig(format!(
+                                    "invalid http options: {e}"
+                                ))
+                            })?;
+                        Ok(Some(TransportLayer::Http(client)))
+                    }
                     "h2" => s
                         .h2_opts
                         .as_ref()
@@ -108,7 +125,7 @@ pub fn build_handler(
                         .as_ref()
                         .map(|x| match x.as_str() {
                             "tcp" => Ok(vec![]),
-                            "ws" => Ok(vec!["http/1.1".to_owned()]),
+                            "ws" | "http" => Ok(vec!["http/1.1".to_owned()]),
                             "h2" | "grpc" => Ok(vec!["h2".to_owned()]),
                             _ => Err(Error::InvalidConfig(format!(
                                 "unsupported network: {x}"
@@ -140,7 +157,8 @@ impl TryFrom<&OutboundVmess> for Handler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::internal::proxy::{CommonConfigOptions, H2Opt};
+    use crate::config::internal::proxy::{CommonConfigOptions, H2Opt, HttpOpt};
+    use std::collections::HashMap;
 
     #[test]
     fn test_vmess_network_tcp() {
@@ -199,6 +217,42 @@ mod tests {
         assert!(
             handler.is_ok(),
             "VMess handler with network: h2 should parse successfully"
+        );
+    }
+
+    #[test]
+    fn test_vmess_network_http() {
+        crate::tests::initialize();
+        let mut headers = HashMap::new();
+        headers.insert(
+            "Host".to_string(),
+            vec!["example.com".to_string()],
+        );
+
+        let config = OutboundVmess {
+            common_opts: CommonConfigOptions {
+                name: "test-http".to_string(),
+                server: "example.com".to_string(),
+                port: 80,
+                ..Default::default()
+            },
+            uuid: "test-uuid".to_string(),
+            alter_id: 0,
+            cipher: Some("auto".to_string()),
+            udp: Some(true),
+            network: Some("http".to_string()),
+            http_opts: Some(HttpOpt {
+                method: Some("GET".to_string()),
+                path: Some(vec!["/video".to_string()]),
+                headers: Some(headers),
+            }),
+            ..Default::default()
+        };
+
+        let handler = Handler::try_from(&config);
+        assert!(
+            handler.is_ok(),
+            "VMess handler with network: http should parse successfully"
         );
     }
 }

@@ -3,8 +3,8 @@ use http::uri::InvalidUri;
 
 use crate::{
     Error,
-    config::proxy::{CommonConfigOptions, GrpcOpt, H2Opt, WsOpt},
-    proxy::transport::{self, GrpcClient, H2Client, WsClient},
+    config::proxy::{CommonConfigOptions, GrpcOpt, H2Opt, HttpOpt, WsOpt},
+    proxy::transport::{self, GrpcClient, H2Client, HttpClient, WsClient},
 };
 
 impl TryFrom<(&WsOpt, &CommonConfigOptions)> for WsClient {
@@ -71,6 +71,41 @@ impl TryFrom<(&H2Opt, &CommonConfigOptions)> for H2Client {
             std::collections::HashMap::new(),
             http::Method::GET,
             path.try_into()?,
+        ))
+    }
+}
+
+impl TryFrom<(&HttpOpt, &CommonConfigOptions)> for HttpClient {
+    type Error = std::convert::Infallible;
+
+    fn try_from(pair: (&HttpOpt, &CommonConfigOptions)) -> Result<Self, Self::Error> {
+        let (x, common) = pair;
+        let host = x
+            .headers
+            .as_ref()
+            .and_then(|h| h.get("Host").or_else(|| h.get("host")))
+            .and_then(|hosts| hosts.first())
+            .cloned()
+            .unwrap_or_else(|| common.server.clone());
+
+        let method = x
+            .method
+            .clone()
+            .unwrap_or_else(|| "GET".to_string());
+
+        let path = x
+            .path
+            .clone()
+            .unwrap_or_else(|| vec!["/".to_string()]);
+
+        let headers = x.headers.clone().unwrap_or_default();
+
+        Ok(HttpClient::new(
+            host,
+            common.port,
+            method,
+            path,
+            headers,
         ))
     }
 }

@@ -274,6 +274,15 @@ pub struct WsOpt {
     pub early_data_header_name: Option<String>,
 }
 
+#[derive(serde::Serialize, serde::Deserialize, Debug, Default, Clone)]
+pub struct HttpOpt {
+    pub method: Option<String>,
+    #[serde(default, deserialize_with = "crate::config::utils::deserialize_opt_string_or_seq")]
+    pub path: Option<Vec<String>>,
+    #[serde(default, deserialize_with = "crate::config::utils::deserialize_map_string_or_seq")]
+    pub headers: Option<HashMap<String, Vec<String>>>,
+}
+
 #[derive(serde::Serialize, serde::Deserialize, Debug, Default)]
 pub struct H2Opt {
     pub host: Option<Vec<String>>,
@@ -358,6 +367,7 @@ pub struct OutboundVmess {
     pub server_name: Option<String>,
     pub network: Option<String>,
     pub ws_opts: Option<WsOpt>,
+    pub http_opts: Option<HttpOpt>,
     pub h2_opts: Option<H2Opt>,
     pub grpc_opts: Option<GrpcOpt>,
     /// File path or inline PEM client certificate for mTLS.
@@ -381,6 +391,7 @@ pub struct OutboundVless {
     pub server_name: Option<String>,
     pub network: Option<String>,
     pub ws_opts: Option<WsOpt>,
+    pub http_opts: Option<HttpOpt>,
     pub h2_opts: Option<H2Opt>,
     pub grpc_opts: Option<GrpcOpt>,
     pub reality_opts: Option<RealityOpt>,
