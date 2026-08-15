@@ -99,7 +99,7 @@ pub fn build_handler(
                         s.network
                             .as_ref()
                             .map(|x| match x.as_str() {
-                                "tcp" => Ok(vec![]),
+                                "tcp" | "raw" => Ok(vec![]),
                                 "ws" | "http" => Ok(vec!["http/1.1".to_owned()]),
                                 "h2" | "grpc" => Ok(vec!["h2".to_owned()]),
                                 _ => Err(Error::InvalidConfig(format!(
@@ -132,7 +132,7 @@ pub fn build_handler(
                 .network
                 .clone()
                 .map(|x| match x.as_str() {
-                    "tcp" => Ok(None),
+                    "tcp" | "raw" => Ok(None),
                     "ws" => s
                         .ws_opts
                         .as_ref()
@@ -232,6 +232,36 @@ mod tests {
         assert!(
             handler.is_ok(),
             "VLess handler with network: tcp should parse successfully"
+        );
+    }
+
+    #[test]
+    fn test_vless_network_raw() {
+        crate::tests::initialize();
+        // Test that network: raw is accepted as an alias for tcp and results in successful parsing
+        let config = OutboundVless {
+            common_opts: CommonConfigOptions {
+                name: "test-raw".to_string(),
+                server: "example.com".to_string(),
+                port: 443,
+                ..Default::default()
+            },
+            uuid: "test-uuid".to_string(),
+            udp: Some(true),
+            tls: Some(true),
+            skip_cert_verify: Some(true),
+            server_name: Some("example.com".to_string()),
+            network: Some("raw".to_string()),
+            ws_opts: None,
+            h2_opts: None,
+            grpc_opts: None,
+            ..Default::default()
+        };
+
+        let handler = Handler::try_from(&config);
+        assert!(
+            handler.is_ok(),
+            "VLess handler with network: raw should parse successfully"
         );
     }
 
@@ -387,7 +417,7 @@ mod tests {
             uuid: "00000000-0000-0000-0000-000000000000".to_string(),
             tls: Some(false),
             reality_opts: Some(RealityOpt {
-                public_key: "qpUtN9F_H6pQ4lF5Fp9G1G5eFm5eFm5eFm5eFm5eFm4="
+                public_key: "qpUtN9F_H6pQ4lF5Fp9G1G5eFm5eFm5eFm5eFm5eFm4"
                     .to_string(),
                 short_id: None,
             }),
