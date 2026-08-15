@@ -48,11 +48,11 @@ export function initSettingsFromUrl(): { apiUrl?: string; secret?: string } {
   if (window.location.hash.includes('?')) {
     const hashQuery = window.location.hash.slice(window.location.hash.indexOf('?') + 1);
     const hashParams = new URLSearchParams(hashQuery);
-    for (const [key, value] of hashParams.entries()) {
+    hashParams.forEach((value, key) => {
       if (!params.has(key)) {
         params.set(key, value);
       }
-    }
+    });
   }
 
   const result: { apiUrl?: string; secret?: string } = {};
