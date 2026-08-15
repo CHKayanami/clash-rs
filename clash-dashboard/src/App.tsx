@@ -1,5 +1,6 @@
 import { HashRouter as BrowserRouter, Routes, Route } from 'react-router-dom';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+import { ApiError } from './lib/api';
 import { Layout } from './components/Layout';
 import { Overview } from './pages/Overview';
 import { ProxyList } from './pages/ProxyList';
@@ -13,7 +14,12 @@ import { Settings } from './pages/Settings';
 const queryClient = new QueryClient({
   defaultOptions: {
     queries: {
-      retry: 1,
+      retry: (failureCount, error) => {
+        if (error instanceof ApiError && error.status === 401) {
+          return false;
+        }
+        return failureCount < 1;
+      },
       staleTime: 5000,
     },
   },

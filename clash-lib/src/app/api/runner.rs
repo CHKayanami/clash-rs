@@ -193,9 +193,17 @@ impl Runner for ApiRunner {
                 .with_state(app_state)
                 .layer(ServiceBuilder::new().layer(TraceLayer::new_for_http()));
 
+            async fn ui_redirect(uri: http::Uri) -> Redirect {
+                if let Some(query) = uri.query() {
+                    Redirect::to(&format!("/ui/?{}", query))
+                } else {
+                    Redirect::to("/ui/")
+                }
+            }
+
             if let Some(external_ui) = controller_cfg.external_ui {
                 router = router
-                    .route("/ui", get(|| async { Redirect::to("/ui/") }))
+                    .route("/ui", get(ui_redirect))
                     .nest_service(
                         "/ui/",
                         ServeDir::new(PathBuf::from(cwd).join(external_ui)),
@@ -205,7 +213,7 @@ impl Runner for ApiRunner {
                 {
                     use super::embedded_dashboard;
                     router = router
-                        .route("/ui", get(|| async { Redirect::to("/ui/") }))
+                        .route("/ui", get(ui_redirect))
                         .route("/ui/", get(embedded_dashboard::serve_index))
                         .route("/ui/{*path}", get(embedded_dashboard::serve_asset));
                 }

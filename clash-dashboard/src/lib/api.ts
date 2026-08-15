@@ -136,6 +136,15 @@ export interface ConnectionsData {
 }
 
 // HTTP client
+export class ApiError extends Error {
+  status: number;
+  constructor(status: number, message: string) {
+    super(message);
+    this.name = 'ApiError';
+    this.status = status;
+  }
+}
+
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
   const baseUrl = getApiUrl();
   const secret = getSecret();
@@ -165,7 +174,18 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
         if (text.trim()) message = text.trim();
       }
     } catch { /* ignore */ }
-    throw new Error(message);
+
+    if (response.status === 401) {
+      const isSettingsPage =
+        typeof window !== 'undefined' &&
+        (window.location.hash.startsWith('#/settings') ||
+          window.location.pathname.endsWith('/settings'));
+      if (!isSettingsPage && typeof window !== 'undefined') {
+        window.location.hash = '#/settings';
+      }
+    }
+
+    throw new ApiError(response.status, message);
   }
 
   if (response.status === 204) {
@@ -180,7 +200,7 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
   try {
     return JSON.parse(raw) as T;
   } catch {
-    throw new Error(`Invalid JSON response from ${path}`);
+    throw new ApiError(response.status, `Invalid JSON response from ${path}`);
   }
 }
 

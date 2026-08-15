@@ -10,7 +10,12 @@ function isDevMode(): boolean {
 }
 
 export function Settings() {
-  const [apiUrl, setApiUrlState] = useState(getApiUrl);
+  const [apiUrl, setApiUrlState] = useState(() => {
+    if (isDevMode() && !localStorage.getItem('clash-api-url')) {
+      return 'http://127.0.0.1:9090';
+    }
+    return getApiUrl();
+  });
   const [secret, setSecretState] = useState(getSecret);
   const [saved, setSaved] = useState(false);
   const saveTimersRef = useRef<number[]>([]);
@@ -31,12 +36,6 @@ export function Settings() {
 
   const isConnected = !!data && !error;
   const showDevPrompt = isDevMode() && !isConnected && !localStorage.getItem('clash-api-url');
-
-  useEffect(() => {
-    if (isDevMode() && !localStorage.getItem('clash-api-url')) {
-      setApiUrlState('http://127.0.0.1:9090');
-    }
-  }, []);
 
   function handleSave() {
     setApiUrl(apiUrl);
@@ -106,7 +105,12 @@ export function Settings() {
             </>
           ) : (
             <>
-              <div className="text-[15px] font-semibold text-white">Cannot reach API</div>
+              <div className="text-[15px] font-semibold text-white">
+                {(error as { status?: number })?.status === 401 ||
+                (error as Error)?.message?.toLowerCase().includes('unauthorized')
+                  ? 'Authentication failed (401)'
+                  : 'Cannot reach API'}
+              </div>
               <div className="text-[12px] font-mono text-white/70">{getApiUrl()}</div>
             </>
           )}
