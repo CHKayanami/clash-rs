@@ -46,6 +46,7 @@ pub fn build_handler(
                 .network
                 .clone()
                 .map(|x| match x.as_str() {
+                    "tcp" => Ok(None),
                     "ws" => s
                         .ws_opts
                         .as_ref()
@@ -53,7 +54,7 @@ pub fn build_handler(
                             let client: WsClient = (x, &s.common_opts)
                                 .try_into()
                                 .expect("invalid ws options");
-                            TransportLayer::Ws(client)
+                            Some(TransportLayer::Ws(client))
                         })
                         .ok_or(Error::InvalidConfig(
                             "ws_opts is required for ws".to_owned(),
@@ -65,7 +66,7 @@ pub fn build_handler(
                             let client: H2Client = (x, &s.common_opts)
                                 .try_into()
                                 .expect("invalid h2 options");
-                            TransportLayer::H2(client)
+                            Some(TransportLayer::H2(client))
                         })
                         .ok_or(Error::InvalidConfig(
                             "h2_opts is required for h2".to_owned(),
@@ -78,7 +79,7 @@ pub fn build_handler(
                                 (s.server_name.clone(), x, &s.common_opts)
                                     .try_into()
                                     .expect("invalid grpc options");
-                            TransportLayer::Grpc(client)
+                            Some(TransportLayer::Grpc(client))
                         })
                         .ok_or(Error::InvalidConfig(
                             "grpc_opts is required for grpc".to_owned(),
@@ -87,7 +88,8 @@ pub fn build_handler(
                         "unsupported network: {x}"
                     ))),
                 })
-                .transpose()?,
+                .transpose()?
+                .flatten(),
             tls: if s.tls.unwrap_or_default() {
                 let client = TlsClient::new(
                     s.skip_cert_verify.unwrap_or_default(),
@@ -105,8 +107,8 @@ pub fn build_handler(
                     s.network
                         .as_ref()
                         .map(|x| match x.as_str() {
+                            "tcp" => Ok(vec![]),
                             "ws" => Ok(vec!["http/1.1".to_owned()]),
-                            "http" => Ok(vec![]),
                             "h2" | "grpc" => Ok(vec!["h2".to_owned()]),
                             _ => Err(Error::InvalidConfig(format!(
                                 "unsupported network: {x}"
@@ -132,5 +134,71 @@ impl TryFrom<&OutboundVmess> for Handler {
 
     fn try_from(s: &OutboundVmess) -> Result<Self, Self::Error> {
         build_handler(s, None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::internal::proxy::{CommonConfigOptions, H2Opt};
+
+    #[test]
+    fn test_vmess_network_tcp() {
+        crate::tests::initialize();
+        let config = OutboundVmess {
+            common_opts: CommonConfigOptions {
+                name: "test-tcp".to_string(),
+                server: "example.com".to_string(),
+                port: 443,
+                ..Default::default()
+            },
+            uuid: "test-uuid".to_string(),
+            alter_id: 0,
+            cipher: Some("auto".to_string()),
+            udp: Some(true),
+            tls: Some(true),
+            skip_cert_verify: Some(true),
+            server_name: Some("example.com".to_string()),
+            network: Some("tcp".to_string()),
+            ..Default::default()
+        };
+
+        let handler = Handler::try_from(&config);
+        assert!(
+            handler.is_ok(),
+            "VMess handler with network: tcp should parse successfully"
+        );
+    }
+
+    #[test]
+    fn test_vmess_network_h2() {
+        crate::tests::initialize();
+        let config = OutboundVmess {
+            common_opts: CommonConfigOptions {
+                name: "test-h2".to_string(),
+                server: "example.com".to_string(),
+                port: 443,
+                ..Default::default()
+            },
+            uuid: "test-uuid".to_string(),
+            alter_id: 0,
+            cipher: Some("auto".to_string()),
+            udp: Some(true),
+            tls: Some(true),
+            skip_cert_verify: Some(true),
+            server_name: Some("example.com".to_string()),
+            network: Some("h2".to_string()),
+            h2_opts: Some(H2Opt {
+                host: Some(vec!["example.com".to_string()]),
+                path: Some("/test".to_string()),
+            }),
+            ..Default::default()
+        };
+
+        let handler = Handler::try_from(&config);
+        assert!(
+            handler.is_ok(),
+            "VMess handler with network: h2 should parse successfully"
+        );
     }
 }

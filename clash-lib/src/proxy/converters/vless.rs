@@ -98,7 +98,6 @@ pub fn build_handler(
                             .map(|x| match x.as_str() {
                                 "tcp" => Ok(vec![]),
                                 "ws" => Ok(vec!["http/1.1".to_owned()]),
-                                "http" => Ok(vec![]),
                                 "h2" | "grpc" => Ok(vec!["h2".to_owned()]),
                                 _ => Err(Error::InvalidConfig(format!(
                                     "unsupported network: {x}"
@@ -390,4 +389,36 @@ mod tests {
             "VLESS with Reality and omitted short_id should succeed"
         );
     }
+
+    #[test]
+    fn test_vless_network_h2() {
+        crate::tests::initialize();
+        use crate::config::internal::proxy::H2Opt;
+
+        let config = OutboundVless {
+            common_opts: CommonConfigOptions {
+                name: "test-h2".to_string(),
+                server: "example.com".to_string(),
+                port: 443,
+                ..Default::default()
+            },
+            uuid: "00000000-0000-0000-0000-000000000000".to_string(),
+            tls: Some(true),
+            skip_cert_verify: Some(true),
+            server_name: Some("example.com".to_string()),
+            network: Some("h2".to_string()),
+            h2_opts: Some(H2Opt {
+                host: Some(vec!["example.com".to_string()]),
+                path: Some("/test".to_string()),
+            }),
+            ..Default::default()
+        };
+
+        let handler = Handler::try_from(&config);
+        assert!(
+            handler.is_ok(),
+            "VLess handler with network: h2 should parse successfully"
+        );
+    }
 }
+

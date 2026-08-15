@@ -73,6 +73,7 @@ pub fn build_handler(
                 .network
                 .as_ref()
                 .map(|x| match x.as_str() {
+                    "tcp" => Ok(None),
                     "ws" => s
                         .ws_opts
                         .as_ref()
@@ -80,7 +81,7 @@ pub fn build_handler(
                             let client: WsClient = (x, &s.common_opts)
                                 .try_into()
                                 .expect("invalid ws_opts");
-                            TransportLayer::Ws(client)
+                            Some(TransportLayer::Ws(client))
                         })
                         .ok_or(Error::InvalidConfig(
                             "ws_opts is required for ws".to_owned(),
@@ -93,7 +94,7 @@ pub fn build_handler(
                                 (s.sni.clone(), x, &s.common_opts)
                                     .try_into()
                                     .expect("invalid grpc_opts");
-                            TransportLayer::Grpc(client)
+                            Some(TransportLayer::Grpc(client))
                         })
                         .ok_or(Error::InvalidConfig(
                             "grpc_opts is required for grpc".to_owned(),
@@ -102,7 +103,8 @@ pub fn build_handler(
                         "unsupported trojan network: {x}"
                     ))),
                 })
-                .transpose()?,
+                .transpose()?
+                .flatten(),
         },
         connector,
     );
@@ -114,5 +116,34 @@ impl TryFrom<&OutboundTrojan> for Handler {
 
     fn try_from(s: &OutboundTrojan) -> Result<Self, Self::Error> {
         build_handler(s, None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::internal::proxy::CommonConfigOptions;
+
+    #[test]
+    fn test_trojan_network_tcp() {
+        crate::tests::initialize();
+        let config = OutboundTrojan {
+            common_opts: CommonConfigOptions {
+                name: "test-trojan-tcp".to_string(),
+                server: "example.com".to_string(),
+                port: 443,
+                ..Default::default()
+            },
+            password: "test-password".to_string(),
+            sni: Some("example.com".to_string()),
+            network: Some("tcp".to_string()),
+            ..Default::default()
+        };
+
+        let handler = Handler::try_from(&config);
+        assert!(
+            handler.is_ok(),
+            "Trojan handler with network: tcp should parse successfully"
+        );
     }
 }

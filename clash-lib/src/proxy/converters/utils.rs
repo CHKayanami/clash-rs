@@ -60,7 +60,11 @@ impl TryFrom<(&H2Opt, &CommonConfigOptions)> for H2Client {
             .as_ref()
             .map(|x| x.to_owned())
             .unwrap_or(vec![common.server.to_owned()]);
-        let path = x.path.as_ref().map(|x| x.to_owned()).unwrap_or_default();
+        let path = x
+            .path
+            .as_deref()
+            .filter(|p| !p.is_empty())
+            .unwrap_or("/");
 
         Ok(H2Client::new(
             host,
