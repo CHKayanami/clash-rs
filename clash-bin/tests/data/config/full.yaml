@@ -136,8 +136,15 @@ dns:
 
   # CIDR for the fake-IP pool (must not overlap with real routes)
   fake-ip-range: 198.18.0.1/16
+  fake-ip-range6: fc00::/18
 
-  # Domains that bypass fake-IP — always resolved to their real IPs
+  # Fake IP filter mode:
+  #   blacklist — domains in fake-ip-filter bypass fake-IP (resolved to real IPs); all other domains use fake-IP (default)
+  #   whitelist — only domains in fake-ip-filter use fake-IP; all other domains bypass fake-IP (resolved to real IPs)
+  fake-ip-filter-mode: blacklist
+
+  # Domains for the fake-IP filter (blacklist or whitelist based on fake-ip-filter-mode)
+  # Supports domain names, wildcards (*.lan), and rule-set references (rule-set:provider-name)
   fake-ip-filter:
     - "*.lan"
     - "localhost.ptlogin2.qq.com"

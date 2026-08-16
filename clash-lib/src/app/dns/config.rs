@@ -3,7 +3,9 @@ use crate::{
     Error,
     app::net::{OutboundInterface, get_interface_by_name, get_outbound_interface},
     common::trie,
-    config::def::{DNSListen, DNSMode, EdnsClientSubnet as DefEdnsClientSubnet},
+    config::def::{
+        DNSListen, DNSMode, EdnsClientSubnet as DefEdnsClientSubnet, FakeIpFilterMode,
+    },
 };
 use ipnet::{AddrParseError, Ipv4Net, Ipv6Net};
 use std::{
@@ -62,6 +64,7 @@ pub struct Config {
     pub fake_ip_range: ipnet::Ipv4Net,
     pub fake_ip_range6: ipnet::Ipv6Net,
     pub fake_ip_filter: Vec<String>,
+    pub fake_ip_filter_mode: FakeIpFilterMode,
     pub black_filter: Vec<String>,
     pub store_fake_ip: bool,
     pub store_smart_stats: bool,
@@ -457,6 +460,7 @@ impl TryFrom<&crate::config::def::Config> for Config {
                 |_| Error::InvalidConfig(String::from("invalid fake ipv6 range")),
             )?,
             fake_ip_filter: dc.fake_ip_filter.clone(),
+            fake_ip_filter_mode: dc.fake_ip_filter_mode,
             black_filter: dc.black_filter.clone(),
             store_fake_ip: c.profile.store_fake_ip,
             store_smart_stats: c.profile.store_smart_stats,

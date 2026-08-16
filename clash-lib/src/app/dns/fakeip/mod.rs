@@ -1,13 +1,21 @@
-use crate::Error;
-use crate::app::router::ThreadSafeRuleProvider;
-use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::{net, sync::Arc};
+use std::{
+    collections::HashMap,
+    net::{self, IpAddr, Ipv4Addr, Ipv6Addr},
+    sync::{
+        Arc,
+        atomic::{AtomicU32, Ordering},
+    },
+};
 
 use async_trait::async_trait;
 use portable_atomic::AtomicU128;
 use tracing::debug;
+
+use crate::{
+    Error,
+    app::{dns::filters::DomainFilter, router::ThreadSafeRuleProvider},
+    config::def::FakeIpFilterMode,
+};
 
 mod file_store;
 mod mem_store;
@@ -18,7 +26,8 @@ pub use mem_store::InMemStore;
 pub struct Opts {
     pub ipnet: ipnet::Ipv4Net,
     pub ipnet6: ipnet::Ipv6Net,
-    pub domain_filter: Option<crate::app::dns::filters::DomainFilter>,
+    pub domain_filter: Option<DomainFilter>,
+    pub filter_mode: FakeIpFilterMode,
     pub store: Box<dyn Store>,
 }
 
@@ -54,7 +63,8 @@ pub struct FakePoolV6 {
 pub struct FakeDns {
     v4_pool: Option<FakePoolV4>,
     v6_pool: Option<FakePoolV6>,
-    domain_filter: Option<crate::app::dns::filters::DomainFilter>,
+    domain_filter: Option<DomainFilter>,
+    filter_mode: FakeIpFilterMode,
     store: Box<dyn Store>,
     /// Memoized `should_skip` verdicts. Covers both static `fake-ip-filter`
     /// entries and `rule-set:` matches; cleared wholesale whenever one of the
@@ -113,6 +123,7 @@ impl FakeDns {
             v4_pool,
             v6_pool,
             domain_filter: opt.domain_filter,
+            filter_mode: opt.filter_mode,
             store: opt.store,
             skip_cache: moka::sync::Cache::builder().max_capacity(1000).build(),
         })
@@ -189,10 +200,14 @@ impl FakeDns {
     /// matches are covered by the `on_change` subscription installed in
     /// [`FakeDns::add_rule_set`].
     fn compute_should_skip(&self, domain: &str) -> bool {
-        if let Some(filter) = &self.domain_filter {
+        let matched = if let Some(filter) = &self.domain_filter {
             filter.apply(domain)
         } else {
             false
+        };
+        match self.filter_mode {
+            FakeIpFilterMode::Blacklist => matched,
+            FakeIpFilterMode::Whitelist => !matched,
         }
     }
 
@@ -352,9 +367,14 @@ impl FakeDns {
 mod tests {
     use std::{net, sync::Arc};
 
-    use crate::{app::dns::fakeip::mem_store::InMemStore, common::trie};
+    use tempfile::tempdir;
 
-    use super::{FakeDns, Opts, Store};
+    use super::{FakeDns, FileStore, InMemStore, Opts, Store};
+    use crate::{
+        app::{dns::filters::DomainFilter, profile::ThreadSafeCacheFile},
+        common::trie,
+        config::def::FakeIpFilterMode,
+    };
 
     #[tokio::test]
     async fn test_inmem_basic() {
@@ -369,6 +389,7 @@ mod tests {
                 .parse::<ipnet::Ipv6Net>()
                 .unwrap(),
             domain_filter: None,
+            filter_mode: FakeIpFilterMode::Blacklist,
             store,
         })
         .unwrap();
@@ -405,6 +426,7 @@ mod tests {
                 .parse::<ipnet::Ipv6Net>()
                 .unwrap(),
             domain_filter: None,
+            filter_mode: FakeIpFilterMode::Blacklist,
             store,
         })
         .unwrap();
@@ -438,9 +460,8 @@ mod tests {
             ipnet6: "fdfe:5a70:6451:982b::/64"
                 .parse::<ipnet::Ipv6Net>()
                 .unwrap(),
-            domain_filter: Some(crate::app::dns::filters::DomainFilter::new(vec![
-                "example.com",
-            ])),
+            domain_filter: Some(DomainFilter::new(vec!["example.com"])),
+            filter_mode: FakeIpFilterMode::Blacklist,
             store,
         })
         .unwrap();
@@ -459,6 +480,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_pool_skip_whitelist() {
+        let store = Box::new(InMemStore::new(10));
+
+        let ipnet = "192.168.0.0/30".parse::<ipnet::IpNet>().unwrap();
+        let pool = FakeDns::new(Opts {
+            ipnet: match ipnet {
+                ipnet::IpNet::V4(v4) => v4,
+                _ => panic!(),
+            },
+            ipnet6: "fdfe:5a70:6451:982b::/64"
+                .parse::<ipnet::Ipv6Net>()
+                .unwrap(),
+            domain_filter: Some(DomainFilter::new(vec!["example.com"])),
+            filter_mode: FakeIpFilterMode::Whitelist,
+            store,
+        })
+        .unwrap();
+
+        // In whitelist mode, domains in fake-ip-filter get fake-ip (should NOT skip)
+        assert!(!pool.should_skip("example.com"));
+        assert!(!pool.should_skip("example.com"));
+
+        // Domains NOT in fake-ip-filter resolve real IP (SHOULD skip)
+        assert!(pool.should_skip("foo.com"));
+        assert!(pool.should_skip("foo.com"));
+
+        pool.add_rule_set(&std::collections::HashMap::new()).await;
+        assert!(!pool.should_skip("example.com"));
+        assert!(pool.should_skip("foo.com"));
+    }
+
+    #[tokio::test]
+    async fn test_pool_skip_empty_filters() {
+        let store = Box::new(InMemStore::new(10));
+        let ipnet = "192.168.0.0/30".parse::<ipnet::IpNet>().unwrap();
+
+        // Blacklist with no filter -> nothing is skipped (all fake IP)
+        let blacklist_pool = FakeDns::new(Opts {
+            ipnet: match ipnet {
+                ipnet::IpNet::V4(v4) => v4,
+                _ => panic!(),
+            },
+            ipnet6: "fdfe:5a70:6451:982b::/64"
+                .parse::<ipnet::Ipv6Net>()
+                .unwrap(),
+            domain_filter: None,
+            filter_mode: FakeIpFilterMode::Blacklist,
+            store,
+        })
+        .unwrap();
+
+        assert!(!blacklist_pool.should_skip("example.com"));
+        assert!(!blacklist_pool.should_skip("foo.com"));
+
+        // Whitelist with no filter -> everything is skipped (all real IP)
+        let store_wl = Box::new(InMemStore::new(10));
+        let whitelist_pool = FakeDns::new(Opts {
+            ipnet: match ipnet {
+                ipnet::IpNet::V4(v4) => v4,
+                _ => panic!(),
+            },
+            ipnet6: "fdfe:5a70:6451:982b::/64"
+                .parse::<ipnet::Ipv6Net>()
+                .unwrap(),
+            domain_filter: None,
+            filter_mode: FakeIpFilterMode::Whitelist,
+            store: store_wl,
+        })
+        .unwrap();
+
+        assert!(whitelist_pool.should_skip("example.com"));
+        assert!(whitelist_pool.should_skip("foo.com"));
+    }
+
+    #[tokio::test]
     async fn test_pool_max_cache_size() {
         let store = Box::new(InMemStore::new(2));
 
@@ -472,6 +568,7 @@ mod tests {
                 .parse::<ipnet::Ipv6Net>()
                 .unwrap(),
             domain_filter: None,
+            filter_mode: FakeIpFilterMode::Blacklist,
             store,
         })
         .unwrap();
@@ -501,6 +598,7 @@ mod tests {
                 .parse::<ipnet::Ipv6Net>()
                 .unwrap(),
             domain_filter: None,
+            filter_mode: FakeIpFilterMode::Blacklist,
             store,
         })
         .unwrap();
@@ -521,6 +619,7 @@ mod tests {
                 .parse::<ipnet::Ipv6Net>()
                 .unwrap(),
             domain_filter: None,
+            filter_mode: FakeIpFilterMode::Blacklist,
             store,
         })
         .unwrap();
@@ -545,6 +644,7 @@ mod tests {
                 .parse::<ipnet::Ipv6Net>()
                 .unwrap(),
             domain_filter: None,
+            filter_mode: FakeIpFilterMode::Blacklist,
             store,
         })
         .unwrap();
@@ -588,10 +688,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_file_store_basic() {
-        use crate::app::dns::fakeip::file_store::FileStore;
-        use crate::app::profile::ThreadSafeCacheFile;
-        use tempfile::tempdir;
-
         let temp_dir = tempdir().unwrap();
         let cache_path = temp_dir.path().join("test_cache.db");
         let cache_store =
@@ -608,6 +704,7 @@ mod tests {
                 .parse::<ipnet::Ipv6Net>()
                 .unwrap(),
             domain_filter: None,
+            filter_mode: FakeIpFilterMode::Blacklist,
             store,
         })
         .unwrap();
@@ -654,10 +751,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_file_store_fallback() {
-        use crate::app::dns::fakeip::file_store::FileStore;
-        use crate::app::profile::ThreadSafeCacheFile;
-        use tempfile::tempdir;
-
         let temp_dir = tempdir().unwrap();
         let cache_path = temp_dir.path().join("test_cache_fallback.db");
         let cache_store =

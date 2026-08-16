@@ -790,6 +790,8 @@ pub struct DNS {
     pub fake_ip_range6: String,
     /// Fake IP addresses filter
     pub fake_ip_filter: Vec<String>,
+    /// Fake IP filter mode (blacklist / whitelist)
+    pub fake_ip_filter_mode: FakeIpFilterMode,
     /// DNS blacklisted domains
     pub black_filter: Vec<String>,
     /// Default nameservers, used to resolve DoH hostnames
@@ -825,6 +827,14 @@ impl NameServerPolicyValue {
             NameServerPolicyValue::List(list) => list.as_slice(),
         }
     }
+}
+
+#[derive(Serialize, Deserialize, Default, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum FakeIpFilterMode {
+    #[default]
+    Blacklist,
+    Whitelist,
 }
 
 #[derive(Serialize, Deserialize, Default, Clone, Debug)]
@@ -1860,5 +1870,50 @@ tun:
 
         // Check strict validation accepts Mihomo TUN fields without error
         assert!(super::check_unknown_fields(cfg).is_ok());
+    }
+
+    #[test]
+    fn parse_fake_ip_filter_mode() {
+        // Default should be blacklist
+        let cfg_default = r#"
+dns:
+  enable: true
+  enhanced-mode: fake-ip
+"#;
+        let c = cfg_default.parse::<Config>().unwrap();
+        assert_eq!(
+            c.dns.fake_ip_filter_mode,
+            super::FakeIpFilterMode::Blacklist
+        );
+
+        // Explicit blacklist
+        let cfg_blacklist = r#"
+dns:
+  enable: true
+  enhanced-mode: fake-ip
+  fake-ip-filter-mode: blacklist
+  fake-ip-filter:
+    - "*.lan"
+"#;
+        let c = cfg_blacklist.parse::<Config>().unwrap();
+        assert_eq!(
+            c.dns.fake_ip_filter_mode,
+            super::FakeIpFilterMode::Blacklist
+        );
+
+        // Explicit whitelist
+        let cfg_whitelist = r#"
+dns:
+  enable: true
+  enhanced-mode: fake-ip
+  fake-ip-filter-mode: whitelist
+  fake-ip-filter:
+    - "*.google.com"
+"#;
+        let c = cfg_whitelist.parse::<Config>().unwrap();
+        assert_eq!(
+            c.dns.fake_ip_filter_mode,
+            super::FakeIpFilterMode::Whitelist
+        );
     }
 }

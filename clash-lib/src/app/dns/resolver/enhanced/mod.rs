@@ -273,6 +273,7 @@ impl EnhancedResolver {
                         } else {
                             None
                         },
+                        filter_mode: cfg.fake_ip_filter_mode,
                         store: if cfg.store_fake_ip {
                             Box::new(FileStore::new(store))
                         } else {
