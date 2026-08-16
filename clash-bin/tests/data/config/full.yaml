@@ -143,6 +143,9 @@ dns:
   #   whitelist — only domains in fake-ip-filter use fake-IP; all other domains bypass fake-IP (resolved to real IPs)
   fake-ip-filter-mode: blacklist
 
+  # Fake IP TTL (seconds, default: 1)
+  fake-ip-ttl: 1
+
   # Domains for the fake-IP filter (blacklist or whitelist based on fake-ip-filter-mode)
   # Supports domain names, wildcards (*.lan), and rule-set references (rule-set:provider-name)
   fake-ip-filter:

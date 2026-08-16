@@ -792,6 +792,9 @@ pub struct DNS {
     pub fake_ip_filter: Vec<String>,
     /// Fake IP filter mode (blacklist / whitelist)
     pub fake_ip_filter_mode: FakeIpFilterMode,
+    /// Fake IP TTL
+    #[educe(Default = 1)]
+    pub fake_ip_ttl: u32,
     /// DNS blacklisted domains
     pub black_filter: Vec<String>,
     /// Default nameservers, used to resolve DoH hostnames
@@ -1916,4 +1919,29 @@ dns:
             super::FakeIpFilterMode::Whitelist
         );
     }
+
+    #[test]
+    fn parse_fake_ip_ttl() {
+        // Default fake-ip-ttl should be 1
+        let cfg_default = r#"
+dns:
+  enable: true
+  enhanced-mode: fake-ip
+"#;
+        let c = cfg_default.parse::<Config>().unwrap();
+        assert_eq!(c.dns.fake_ip_ttl, 1);
+        assert!(super::check_unknown_fields(cfg_default).is_ok());
+
+        // Custom fake-ip-ttl
+        let cfg_custom = r#"
+dns:
+  enable: true
+  enhanced-mode: fake-ip
+  fake-ip-ttl: 60
+"#;
+        let c = cfg_custom.parse::<Config>().unwrap();
+        assert_eq!(c.dns.fake_ip_ttl, 60);
+        assert!(super::check_unknown_fields(cfg_custom).is_ok());
+    }
 }
+

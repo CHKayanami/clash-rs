@@ -639,4 +639,35 @@ async fn test_black_domain_filter() {
     );
 }
 
+#[tokio::test]
+async fn test_fake_ip_ttl() {
+    use crate::app::dns::fakeip::{FakeDns, InMemStore, Opts};
+
+    let mut resolver = EnhancedResolver::new_default().await;
+    resolver.fake_ip_ttl = 5;
+    resolver.fake_dns = Some(Arc::new(
+        FakeDns::new(Opts {
+            ipnet: "198.18.0.1/16".parse().unwrap(),
+            ipnet6: "fc00::/18".parse().unwrap(),
+            domain_filter: None,
+            filter_mode: crate::config::def::FakeIpFilterMode::Blacklist,
+            store: Box::new(InMemStore::new(1000)),
+        })
+        .unwrap(),
+    ));
+
+    let mut msg = op::Message::query();
+    let mut query = op::Query::new();
+    let name = rr::Name::from_str_relaxed("example.com").unwrap();
+    query.set_name(name);
+    query.set_query_type(rr::RecordType::A);
+    msg.add_query(query);
+
+    let response = resolver.exchange_all(&msg).await.unwrap();
+    assert_eq!(response.metadata.response_code, op::ResponseCode::NoError);
+    assert_eq!(response.answers.len(), 1);
+    assert_eq!(response.answers[0].ttl(), 5);
+}
+
+
 

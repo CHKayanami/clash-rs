@@ -59,6 +59,7 @@ pub struct EnhancedResolver {
     proxy_server_domains: Option<trie::StringTrie<bool>>,
 
     fake_dns: Option<ThreadSafeFakeDns>,
+    fake_ip_ttl: u32,
 
     reverse_lookup_cache: Option<moka::future::Cache<net::IpAddr, String>>,
     black_domain_filter: Option<BlackDomainFilter>,
@@ -101,6 +102,7 @@ impl EnhancedResolver {
             proxy_server_domains: None,
 
             fake_dns: None,
+            fake_ip_ttl: 1,
 
             reverse_lookup_cache: None,
             black_domain_filter: None,
@@ -141,6 +143,7 @@ impl EnhancedResolver {
             proxy_server_domains: None,
 
             fake_dns: None,
+            fake_ip_ttl: cfg.fake_ip_ttl,
 
             reverse_lookup_cache: None,
             black_domain_filter: None,
@@ -304,6 +307,7 @@ impl EnhancedResolver {
                 None
             },
             collector,
+            fake_ip_ttl: cfg.fake_ip_ttl,
         }
     }
 
@@ -639,6 +643,7 @@ impl ClashResolver for EnhancedResolver {
         }
 
         let mut current_ttl = 60; // 默认 TTL
+        let mut is_fake_ip = false;
         // 2. 预先构建基础响应报文（带上 Transaction ID 并在头部标记为 Response）
         let mut res = build_dns_response_message(req, true, false);
 
@@ -700,7 +705,8 @@ impl ClashResolver for EnhancedResolver {
                         let ip = fake_dns.lookup(&host).await;
                         debug!("fake dns lookup_v4: {} -> {:?}", host, ip);
                         resolved_ips.push(ip);
-                        current_ttl = 1;
+                        current_ttl = self.fake_ip_ttl;
+                        is_fake_ip = true;
                         if let Some(collector) = &self.collector {
                             collector.record(&host, true);
                         }
@@ -709,7 +715,8 @@ impl ClashResolver for EnhancedResolver {
                         let ip = fake_dns.lookupv6(&host).await;
                         debug!("fake dns lookup_v6: {} -> {:?}", host, ip);
                         resolved_ips.push(ip);
-                        current_ttl = 1;
+                        current_ttl = self.fake_ip_ttl;
+                        is_fake_ip = true;
                         if let Some(collector) = &self.collector {
                             collector.record(&host, true);
                         }
@@ -731,7 +738,7 @@ impl ClashResolver for EnhancedResolver {
             return self.exchange(req).await;
         }
 
-        if current_ttl != 1 {
+        if !is_fake_ip {
             if let Some(collector) = &self.collector {
                 collector.record(&host, false);
             }
