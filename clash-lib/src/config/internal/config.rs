@@ -219,17 +219,34 @@ impl DnsHijack {
     }
 }
 
-#[derive(Default, Clone)]
+#[derive(Default, Clone, Debug)]
 pub struct TunConfig {
     pub enable: bool,
     pub device_id: String,
+    pub stack: Option<String>,
     pub route_all: bool,
     pub routes: Vec<IpNet>,
+    pub route_exclude_address: Vec<IpNet>,
+    pub auto_detect_interface: bool,
     pub gateway: Ipv4Net,
     pub gateway_v6: Option<Ipv6Net>,
     pub mtu: Option<u16>,
+    pub gso: Option<bool>,
+    pub gso_max_size: Option<u32>,
     pub so_mark: Option<u32>,
     pub route_table: u32,
+    pub iproute2_rule_index: Option<u32>,
+    pub strict_route: bool,
+    pub endpoint_independent_nat: bool,
+    pub udp_timeout: Option<u64>,
+    pub file_descriptor: Option<i32>,
+    pub include_interface: Vec<String>,
+    pub exclude_interface: Vec<String>,
+    pub include_uid: Vec<u32>,
+    pub exclude_uid: Vec<u32>,
+    pub include_android_user: Vec<i32>,
+    pub include_package: Vec<String>,
+    pub exclude_package: Vec<String>,
     pub dns_hijack: DnsHijack,
 }
 

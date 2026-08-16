@@ -37,7 +37,7 @@ fn default_cors_allow_origins() -> Option<Vec<String>> {
     Some(vec!["*".to_string()])
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(untagged)]
 pub enum DnsHijack {
     Switch(bool),
@@ -50,7 +50,7 @@ impl Default for DnsHijack {
     }
 }
 
-#[derive(Serialize, Deserialize, Default)]
+#[derive(Serialize, Deserialize, Default, Debug, Clone)]
 #[serde(rename_all = "kebab-case")]
 pub struct TunConfig {
     pub enable: bool,
@@ -65,24 +65,61 @@ pub struct TunConfig {
     ///
     /// *Note*: macOS requires the `utun` prefix
     pub device_id: String,
+    /// tun protocol stack (e.g. system, gvisor, mixed)
+    pub stack: Option<String>,
     /// tun interface address
+    #[serde(alias = "inet4-address")]
     #[serde(default = "default_tun_address")]
     pub gateway: String,
     /// tun interface address for IPv6
     /// # Note
     /// - set this to enable IPv6 support in the tun interface
     /// - Example: `2001:fac::1/64`
-    #[serde(alias = "gateway-v6")]
+    #[serde(alias = "gateway-v6", alias = "inet6-address")]
     pub gateway_v6: Option<String>,
+    #[serde(alias = "route-address")]
     pub routes: Option<Vec<String>>,
+    #[serde(alias = "inet4-route-address")]
+    pub inet4_route_address: Option<Vec<String>>,
+    #[serde(alias = "inet6-route-address")]
+    pub inet6_route_address: Option<Vec<String>>,
+    #[serde(alias = "route-exclude-address")]
+    pub route_exclude_address: Option<Vec<String>>,
+    #[serde(alias = "inet4-route-exclude-address")]
+    pub inet4_route_exclude_address: Option<Vec<String>>,
+    #[serde(alias = "inet6-route-exclude-address")]
+    pub inet6_route_exclude_address: Option<Vec<String>>,
+    #[serde(alias = "auto-route")]
     #[serde(default)]
     pub route_all: bool,
+    #[serde(alias = "auto-detect-interface")]
+    pub auto_detect_interface: Option<bool>,
     pub mtu: Option<u16>,
+    pub gso: Option<bool>,
+    pub gso_max_size: Option<u32>,
     /// fwmark on Linux only
     pub so_mark: Option<u32>,
     /// policy routing table on Linux only
+    #[serde(alias = "iproute2-table-index")]
     #[serde(default = "default_route_table")]
     pub route_table: u32,
+    #[serde(alias = "iproute2-rule-index")]
+    pub iproute2_rule_index: Option<u32>,
+    #[serde(alias = "strict-route")]
+    pub strict_route: Option<bool>,
+    #[serde(alias = "endpoint-independent-nat")]
+    pub endpoint_independent_nat: Option<bool>,
+    #[serde(alias = "udp-timeout")]
+    pub udp_timeout: Option<u64>,
+    #[serde(alias = "file-descriptor")]
+    pub file_descriptor: Option<i32>,
+    pub include_interface: Option<Vec<String>>,
+    pub exclude_interface: Option<Vec<String>>,
+    pub include_uid: Option<Vec<u32>>,
+    pub exclude_uid: Option<Vec<u32>>,
+    pub include_android_user: Option<Vec<i32>>,
+    pub include_package: Option<Vec<String>>,
+    pub exclude_package: Option<Vec<String>>,
     /// Will hijack UDP:53 DNS queries to the Clash DNS server if set to true
     /// setting to a list has the same effect as setting to true
     #[serde(default)]
@@ -1743,5 +1780,79 @@ sniffer:
         assert!(sniff.http.is_some());
         assert!(sniff.quic.is_some());
         assert_eq!(sniff.http.unwrap().override_destination, Some(true));
+    }
+
+    #[test]
+    fn parse_mihomo_tun_config() {
+        let cfg = r#"
+tun:
+  enable: true
+  stack: gvisor
+  device: Mihomo
+  auto-route: true
+  auto-detect-interface: true
+  dns-hijack:
+    - any:53
+    - "tcp://any:53"
+  strict-route: true
+  inet4-address: 198.18.0.1/16
+  inet6-address: fdfe:dcba:9876::1/64
+  route-address:
+    - 0.0.0.0/1
+    - 128.0.0.0/1
+  inet4-route-address:
+    - 198.18.0.0/16
+  inet6-route-address:
+    - ::/1
+    - 8000::/1
+  route-exclude-address:
+    - 192.168.0.0/16
+  inet4-route-exclude-address:
+    - 10.0.0.0/8
+  inet6-route-exclude-address:
+    - fc00::/7
+  mtu: 9000
+  gso: true
+  gso-max-size: 65536
+  udp-timeout: 300
+  iproute2-table-index: 2024
+  iproute2-rule-index: 9000
+  endpoint-independent-nat: true
+  file-descriptor: 10
+"#;
+        let c = cfg.parse::<Config>().expect("should parse mihomo tun config");
+        let tun_def = c.tun.as_ref().expect("tun config should be present");
+        assert!(tun_def.enable);
+        assert_eq!(tun_def.stack.as_deref(), Some("gvisor"));
+        assert!(tun_def.route_all);
+        assert_eq!(tun_def.gateway, "198.18.0.1/16");
+        assert_eq!(tun_def.gateway_v6.as_deref(), Some("fdfe:dcba:9876::1/64"));
+        assert_eq!(tun_def.mtu, Some(9000));
+        assert_eq!(tun_def.gso, Some(true));
+        assert_eq!(tun_def.gso_max_size, Some(65536));
+        assert_eq!(tun_def.route_table, 2024);
+        assert_eq!(tun_def.iproute2_rule_index, Some(9000));
+        assert_eq!(tun_def.strict_route, Some(true));
+        assert_eq!(tun_def.endpoint_independent_nat, Some(true));
+        assert_eq!(tun_def.udp_timeout, Some(300));
+        assert_eq!(tun_def.file_descriptor, Some(10));
+
+        // Test conversion into internal config
+        let internal: crate::config::config::Config =
+            c.try_into().expect("conversion should succeed");
+        let internal_tun = internal.tun;
+        assert!(internal_tun.enable);
+        assert!(internal_tun.route_all);
+        assert_eq!(internal_tun.device_id, "Mihomo");
+        assert_eq!(internal_tun.routes.len(), 5);
+        assert_eq!(internal_tun.route_exclude_address.len(), 3);
+        assert_eq!(internal_tun.route_table, 2024);
+        assert_eq!(internal_tun.iproute2_rule_index, Some(9000));
+        assert!(internal_tun.strict_route);
+        assert!(internal_tun.endpoint_independent_nat);
+        assert_eq!(internal_tun.mtu, Some(9000));
+
+        // Check strict validation accepts Mihomo TUN fields without error
+        assert!(super::check_unknown_fields(cfg).is_ok());
     }
 }

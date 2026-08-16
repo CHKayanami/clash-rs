@@ -157,10 +157,10 @@ impl<'a> TxToken for TxTokenImpl<'a> {
     where
         F: FnOnce(&mut [u8]) -> R,
     {
-        let mut buffer = vec![0u8; len];
-        let result = f(&mut buffer);
+        let mut buffer = crate::ring_buffer::acquire_vec(len);
+        let result = f(&mut buffer[..len]);
 
-        let packet = Packet::new(buffer);
+        let packet = Packet::new(bytes::Bytes::from(buffer).slice(..len));
         self.tx_sender.send(packet);
 
         result

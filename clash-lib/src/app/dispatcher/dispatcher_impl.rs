@@ -12,7 +12,6 @@ use crate::{
     },
     proxy::{
         AnyInboundDatagram, ClientStream, OutboundType, datagram::UdpPacket,
-        utils::ToCanonical,
     },
     session::{Session, SocksAddr},
 };
@@ -292,7 +291,9 @@ impl Dispatcher {
             async move {
                 let mut sessions: HashMap<SocksAddr, OutboundSession> = HashMap::new();
                 let mut delay_queue: DelayQueue<SocksAddr> = DelayQueue::new();
-                let timeout_duration = Duration::from_secs(DEFAULT_UDP_SESSION_TIMEOUT_SECS);
+                let timeout_duration = sess
+                    .udp_timeout
+                    .unwrap_or_else(|| Duration::from_secs(DEFAULT_UDP_SESSION_TIMEOUT_SECS));
 
                 loop {
                     tokio::select! {
@@ -331,10 +332,10 @@ impl Dispatcher {
                             let mut sess = sess.clone();
 
                             if let SocksAddr::Ip(addr) = &mut packet.dst_addr {
-                                *addr = (*addr).to_canonical();
+                                addr.set_ip(addr.ip().to_canonical());
                             }
                             if let SocksAddr::Ip(addr) = &mut packet.src_addr {
-                                *addr = (*addr).to_canonical();
+                                addr.set_ip(addr.ip().to_canonical());
                             }
 
                             let Some(src_addr) = packet.src_addr.clone().try_into_socket_addr()

@@ -20,8 +20,8 @@ use std::{
 };
 use tokio::sync::mpsc;
 
-const DEFAULT_TCP_SEND_BUFFER_SIZE: u32 = 256 * 1024; // 256 KiB
-const DEFAULT_TCP_RECV_BUFFER_SIZE: u32 = 256 * 1024; // 256 KiB
+const DEFAULT_TCP_SEND_BUFFER_SIZE: u32 = 64 * 1024; // 64 KiB
+const DEFAULT_TCP_RECV_BUFFER_SIZE: u32 = 64 * 1024; // 64 KiB
 
 /// Time-to-live for SYN tracker entries. Duplicates within this window are
 /// suppressed to prevent the same SYN from creating multiple smoltcp sockets.
@@ -253,28 +253,25 @@ impl TcpListener {
                     }
 
                     if syn_tracker.len() >= SYN_TRACK_MAX {
-                        continue;
+                        syn_tracker.retain(|_, time| now.duration_since(*time) < SYN_TRACK_TTL);
+                        if syn_tracker.len() >= SYN_TRACK_MAX {
+                            continue;
+                        }
                     }
 
                     let mut socket = tcp::Socket::new(
-                        tcp::SocketBuffer::new(vec![
-                            0u8;
-                            DEFAULT_TCP_RECV_BUFFER_SIZE
-                                as usize
-                        ]),
-                        tcp::SocketBuffer::new(vec![
-                            0u8;
-                            DEFAULT_TCP_SEND_BUFFER_SIZE
-                                as usize
-                        ]),
+                        tcp::SocketBuffer::new(crate::ring_buffer::acquire_vec(
+                            DEFAULT_TCP_RECV_BUFFER_SIZE as usize,
+                        )),
+                        tcp::SocketBuffer::new(crate::ring_buffer::acquire_vec(
+                            DEFAULT_TCP_SEND_BUFFER_SIZE as usize,
+                        )),
                     );
                     socket.set_keep_alive(Some(smoltcp::time::Duration::from_secs(
                         28,
                     )));
 
-                    socket.set_timeout(Some(smoltcp::time::Duration::from_secs(
-                        if cfg!(target_os = "linux") { 7200 } else { 60 },
-                    )));
+                    socket.set_timeout(Some(smoltcp::time::Duration::from_secs(60)));
                     // Default
                     socket.set_ack_delay(Some(Duration::from_millis(10).into()));
                     socket.set_nagle_enabled(false);

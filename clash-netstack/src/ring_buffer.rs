@@ -1,10 +1,63 @@
 use std::{
     cell::UnsafeCell,
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::{
+        LazyLock, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 
+const MAX_POOLED_BUFFERS: usize = 128;
+
+static BOXED_BUFFER_POOL: LazyLock<Mutex<Vec<Box<[u8]>>>> =
+    LazyLock::new(|| Mutex::new(Vec::new()));
+
+pub(crate) fn acquire_boxed_slice(capacity: usize) -> Box<[u8]> {
+    if let Ok(mut pool) = BOXED_BUFFER_POOL.lock() {
+        if let Some(buf) = pool.pop() {
+            if buf.len() == capacity {
+                return buf;
+            }
+        }
+    }
+    vec![0u8; capacity].into_boxed_slice()
+}
+
+pub(crate) fn release_boxed_slice(buf: Box<[u8]>) {
+    if let Ok(mut pool) = BOXED_BUFFER_POOL.lock() {
+        if pool.len() < MAX_POOLED_BUFFERS {
+            pool.push(buf);
+        }
+    }
+}
+
+static VEC_BUFFER_POOL: LazyLock<Mutex<Vec<Vec<u8>>>> =
+    LazyLock::new(|| Mutex::new(Vec::new()));
+
+pub fn acquire_vec(capacity: usize) -> Vec<u8> {
+    if let Ok(mut pool) = VEC_BUFFER_POOL.lock() {
+        if let Some(mut v) = pool.pop() {
+            if v.capacity() >= capacity {
+                v.resize(capacity, 0);
+                return v;
+            }
+        }
+    }
+    vec![0u8; capacity]
+}
+
+#[allow(dead_code)]
+pub fn release_vec(mut v: Vec<u8>) {
+    if let Ok(mut pool) = VEC_BUFFER_POOL.lock() {
+        if pool.len() < MAX_POOLED_BUFFERS {
+            v.clear();
+            pool.push(v);
+        }
+    }
+}
+
 pub struct LockFreeRingBuffer {
-    buffer: UnsafeCell<Box<[u8]>>,
+    buffer: UnsafeCell<Option<Box<[u8]>>>,
+    raw_ptr: *mut u8,
     capacity: usize,
     write_pos: AtomicUsize, // Only TCP thread writes
     read_pos: AtomicUsize,  // Only app thread reads
@@ -15,8 +68,11 @@ unsafe impl Sync for LockFreeRingBuffer {}
 
 impl LockFreeRingBuffer {
     pub fn new(capacity: usize) -> Self {
+        let mut buffer = acquire_boxed_slice(capacity);
+        let raw_ptr = buffer.as_mut_ptr();
         Self {
-            buffer: UnsafeCell::new(vec![0u8; capacity].into_boxed_slice()),
+            buffer: UnsafeCell::new(Some(buffer)),
+            raw_ptr,
             capacity,
             write_pos: AtomicUsize::new(0),
             read_pos: AtomicUsize::new(0),
@@ -41,7 +97,7 @@ impl LockFreeRingBuffer {
         }
 
         unsafe {
-            let buffer = &mut *self.buffer.get();
+            let buffer = std::slice::from_raw_parts_mut(self.raw_ptr, self.capacity);
 
             // Handle wrap-around
             if write_pos + to_write <= self.capacity {
@@ -82,7 +138,7 @@ impl LockFreeRingBuffer {
         }
 
         unsafe {
-            let buffer = &*self.buffer.get();
+            let buffer = std::slice::from_raw_parts(self.raw_ptr, self.capacity);
 
             // Handle wrap-around
             if read_pos + to_read <= self.capacity {
@@ -114,5 +170,34 @@ impl LockFreeRingBuffer {
         let read_pos = self.read_pos.load(Ordering::Acquire);
         let write_pos = self.write_pos.load(Ordering::Acquire);
         ((write_pos + 1) % self.capacity) == read_pos
+    }
+}
+
+impl Drop for LockFreeRingBuffer {
+    fn drop(&mut self) {
+        unsafe {
+            if let Some(buf) = (*self.buffer.get()).take() {
+                release_boxed_slice(buf);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_ring_buffer_pooling() {
+        let rb = LockFreeRingBuffer::new(64 * 1024);
+        assert_eq!(rb.enqueue_slice(b"hello world"), 11);
+        let mut out = [0u8; 11];
+        assert_eq!(rb.dequeue_slice(&mut out), 11);
+        assert_eq!(&out, b"hello world");
+        drop(rb);
+
+        // Next allocation should reuse pooled buffer
+        let rb2 = LockFreeRingBuffer::new(64 * 1024);
+        assert_eq!(rb2.enqueue_slice(b"reused"), 6);
     }
 }

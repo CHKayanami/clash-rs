@@ -237,6 +237,14 @@ pub fn maybe_routes_clean_up(cfg: &TunConfig) -> std::io::Result<()> {
         }
     }
 
+    if !cfg.route_exclude_address.is_empty() {
+        if let Some(ref outbound_iface) = get_outbound_interface() {
+            for r in &cfg.route_exclude_address {
+                let _ = delete_route(outbound_iface, r);
+            }
+        }
+    }
+
     if !cfg.route_all {
         return Ok(());
     }

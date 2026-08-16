@@ -442,6 +442,8 @@ pub struct Session {
     pub sniffed_domain: Option<String>,
     /// Original destination address before sniffing or DNS mapping override
     pub orig_destination: Option<SocksAddr>,
+    /// Custom UDP session idle timeout
+    pub udp_timeout: Option<std::time::Duration>,
 }
 
 impl Session {
@@ -502,6 +504,7 @@ impl Default for Session {
             inbound_user: None,
             sniffed_domain: None,
             orig_destination: None,
+            udp_timeout: None,
         }
     }
 }
@@ -557,6 +560,7 @@ impl Clone for Session {
             inbound_user: self.inbound_user.clone(),
             sniffed_domain: self.sniffed_domain.clone(),
             orig_destination: self.orig_destination.clone(),
+            udp_timeout: self.udp_timeout,
         }
     }
 }

@@ -7,8 +7,8 @@ homepage = { workspace = true }
 authors = { workspace = true }
 
 [features]
-default = ["dashboard","aws-lc-rs","clash-lib/zero_copy","tproxy", "redir"]
-standard = ["tun", "ssh", "shadowquic", "wireguard", "tailscale", "clash-lib/zero_copy", "tproxy", "redir"]
+default = ["dashboard","aws-lc-rs","clash-lib/zero_copy","tproxy", "redir","tun"]
+standard = ["ssh", "shadowquic", "wireguard", "tailscale"]
 minimal = ["shadowsocks", "tuic"]
 
 plus = ["standard", "onion"]

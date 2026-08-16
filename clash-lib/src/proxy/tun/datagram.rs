@@ -17,6 +17,9 @@ pub(crate) async fn handle_inbound_datagram(
     resolver: ThreadSafeDNSResolver,
     so_mark: Option<u32>,
     dns_hijack: crate::config::internal::config::DnsHijack,
+    udp_timeout: Option<u64>,
+    strict_route: bool,
+    exclude_routes: Arc<Vec<ipnet::IpNet>>,
 ) {
     // tun i/o
     // lr: app packets went into tun will be accessed from lr
@@ -46,6 +49,7 @@ pub(crate) async fn handle_inbound_datagram(
             debug!("selecting outbound interface: {:?} for tun UDP traffic", x);
         }),
         so_mark,
+        udp_timeout: udp_timeout.map(std::time::Duration::from_secs),
         ..Default::default()
     };
 
@@ -92,6 +96,17 @@ pub(crate) async fn handle_inbound_datagram(
             if remote_addr.ip().is_multicast() {
                 continue;
             }
+
+            if strict_route
+                && exclude_routes.iter().any(|net| net.contains(&remote_addr.ip()))
+            {
+                trace!(
+                    "strict-route: dropping tun UDP packet to excluded subnet: {:?}",
+                    remote_addr
+                );
+                continue 'read_packet;
+            }
+
             let pkt = UdpPacket {
                 data: data.into_bytes(),
                 src_addr: local_addr.into(),

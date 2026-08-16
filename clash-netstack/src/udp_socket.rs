@@ -97,10 +97,16 @@ impl SplitRead {
             let src_addr = SocketAddr::new(src_ip, src_port);
             let dst_addr = SocketAddr::new(dst_ip, dst_port);
 
+            let base_ptr = data.data().as_ptr() as usize;
+            let payload_ptr = packet.payload().as_ptr() as usize;
+            let offset = payload_ptr.saturating_sub(base_ptr);
+            let payload_len = packet.payload().len();
+            let udp_payload = data.into_bytes().slice(offset..offset + payload_len);
+
             trace!("created UDP socket for {src_addr} <-> {dst_addr}");
 
             Some(UdpPacket {
-                data: Packet::new(packet.payload().to_vec()),
+                data: Packet::new(udp_payload),
                 local_addr: src_addr,
                 remote_addr: dst_addr,
             })
@@ -136,15 +142,17 @@ impl SplitWrite {
             }
         };
 
-        let mut ip_packet_writer =
-            Vec::with_capacity(builder.size(packet.data.data().len()));
+        let packet_len = builder.size(packet.data.data().len());
+        let mut ip_packet_writer = Vec::with_capacity(packet_len);
         builder
             .write(&mut ip_packet_writer, packet.data.data())
             .map_err(std::io::Error::other)?;
 
+        let bytes = bytes::Bytes::from(ip_packet_writer);
+
         // UDP is inherently unreliable — drop the packet if the outbound
         // channel is full rather than blocking the UDP handler task.
-        match self.send.try_send(Packet::new(ip_packet_writer)) {
+        match self.send.try_send(Packet::new(bytes)) {
             Ok(()) => Ok(()),
             Err(mpsc::error::TrySendError::Full(_)) => Ok(()),
             Err(mpsc::error::TrySendError::Closed(_)) => {

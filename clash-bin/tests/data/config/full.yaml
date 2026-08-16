@@ -262,34 +262,90 @@ sniffer:
 tun:
   enable: false
 
+  # TCP/IP protocol stack implementation:
+  #   system   — OS kernel native TCP stack (via virtual TCP-NAT loopback) + zero-copy userspace UDP (default, recommended)
+  #   smoltcp  — Pure userspace network stack (alias: gvisor)
+  #   mixed    — Mixed mode (alias for system)
+  stack: system
+
   # Device identifier:
-  #   "utun1989"       — macOS (utun prefix required by the OS)
-  #   "dev://tun0"     — Linux explicit device
+  #   "utun1989"       — macOS (utun prefix required by OS)
+  #   "dev://tun0"     — Linux explicit device (alias: "tun0")
   #   "fd://3"         — use an existing open file descriptor
-  device-id: "dev://utun1989"
+  device: "dev://utun1989"
+  # device-id: "dev://utun1989"     # Legacy alias for device
 
-  gateway: "198.18.0.1/24"         # TUN IPv4 address and prefix
-  gateway-v6: "fd00:fac::1/64"     # TUN IPv6 address (enables IPv6 in TUN)
+  # TUN interface IP addresses and CIDR masks:
+  inet4-address: "198.18.0.1/16"     # TUN IPv4 address and prefix (alias: gateway)
+  inet6-address: "fd00:fac::1/64"    # TUN IPv6 address and prefix (alias: gateway-v6)
 
-  route-all: true                   # Install a default route through the TUN
+  # Routing and Auto-routing:
+  auto-route: true                   # Install default route / policy routes through TUN (alias: route-all)
+  auto-detect-interface: true        # Automatically detect and track changes to default outbound interface
 
-  # Additional static routes through the TUN (used when route-all is false)
-  routes:
-    - 1.1.1.1/32
-    - 8.8.8.8/32
+  # Additional routes routed into TUN (used when auto-route is false, or to explicitly route subnets):
+  inet4-route-address:               # Aliases: route-address, routes
+    - 0.0.0.0/1
+    - 128.0.0.0/1
+  inet6-route-address:
+    - "::/1"
+    - "8000::/1"
 
-  # mtu: 1500                       # MTU for the TUN interface
+  # Routes to exclude / bypass from TUN routing (traffic stays direct via default physical gateway):
+  inet4-route-exclude-address:       # Alias: route-exclude-address
+    - 192.168.0.0/16
+    - 10.0.0.0/8
+    - 172.16.0.0/12
+  inet6-route-exclude-address:
+    - "fc00::/7"
+    - "fe80::/10"
 
-  so-mark: 0                        # fwmark for TUN-originated packets (Linux only)
-  route-table: 2468                 # Policy routing table (Linux only)
+  # Strict routing (Linux policy routing & anti-leak blackhole protection):
+  # When enabled, prevents traffic from leaking through default interface and drops unreachable destinations
+  strict-route: true
+
+  # Interface MTU (default: 1500; on Windows defaults to 65535 when GSO is disabled)
+  mtu: 1500
+
+  # Generic Segmentation Offload (GSO) - Linux only:
+  # Offloads large TCP packet segmentation to userspace GSO engine, dramatically improving throughput
+  gso: true
+  gso-max-size: 65536                # Maximum GSO buffer size in bytes (max: 65536)
+
+  # UDP Session Timeout in seconds (default: 300 seconds)
+  udp-timeout: 300
+
+  # Full-cone NAT (Endpoint-Independent NAT):
+  endpoint-independent-nat: false
+
+  # Linux specific policy routing and routing table:
+  so-mark: 0                         # fwmark for TUN-originated packets (Linux only)
+  iproute2-table-index: 2468         # Policy routing table index (Linux only, alias: route-table)
+  iproute2-rule-index: 8964          # Policy routing rule priority (Linux only)
+
+  # Process / UID / Package Filtering (Linux & Android):
+  # include-interface:
+  #   - eth0
+  # exclude-interface:
+  #   - docker0
+  # include-uid:
+  #   - 1000
+  # exclude-uid:
+  #   - 0
+  # include-android-user:
+  #   - 0
+  # include-package:
+  #   - com.android.chrome
+  # exclude-package:
+  #   - com.android.settings
 
   # Intercept DNS queries and redirect them to the Clash DNS server.
-  # true = hijack all DNS, false = no hijack
+  # true = hijack all DNS (0.0.0.0:53), false = no hijack
   # List form = hijack only specific addresses:
-  dns-hijack: true
-  # dns-hijack:
-  #   - 1.1.1.1:53
-  #   - 8.8.8.8:53
+  dns-hijack:
+    - "0.0.0.0:53"
+    - "8.8.8.8:53"
+    - "1.1.1.1:53"
 
 # ── Inbound Listeners (Advanced) ──────────────────────────────────────────────
 # Fine-grained control over inbound endpoints. These supplement or replace the

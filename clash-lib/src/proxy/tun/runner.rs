@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use futures::{FutureExt, SinkExt, StreamExt, future::BoxFuture};
 use tokio_util::sync::CancellationToken;
@@ -9,9 +9,7 @@ use crate::{
     Error,
     app::{dispatcher::Dispatcher, dns::ThreadSafeDNSResolver},
     config::config::TunConfig,
-    proxy::tun::{
-        datagram::handle_inbound_datagram, routes, stream::handle_inbound_stream,
-    },
+    proxy::tun::{datagram::handle_inbound_datagram, routes},
     runner::Runner,
 };
 
@@ -78,12 +76,14 @@ impl TunRunner {
                     let dev =
                         u.host().expect("tun dev must be provided").to_string();
                     if cfg!(target_os = "macos") && !dev.starts_with("utun") {
-                        return Err(Error::InvalidConfig(format!(
-                            "invalid device id: {}. tun name must be utunX",
-                            cfg.device_id
-                        )));
+                        warn!(
+                            "tun device id '{}' is not supported on macOS (must start with 'utun'), falling back to 'utun1989'",
+                            dev
+                        );
+                        tun_init_config.tun_name = Some("utun1989".to_string());
+                    } else {
+                        tun_init_config.tun_name = Some(dev);
                     }
-                    tun_init_config.tun_name = Some(dev);
                     #[cfg(target_os = "windows")]
                     {
                         let guid = u.query_pairs().find(|(k, _)| k == "guid");
@@ -103,13 +103,16 @@ impl TunRunner {
                 }
             },
             Err(_) => {
-                if cfg!(target_os = "macos") && !&cfg.device_id.starts_with("utun") {
-                    return Err(Error::InvalidConfig(format!(
-                        "invalid device id: {}. tun name must be utunX",
-                        cfg.device_id
-                    )));
+                let dev = cfg.device_id.clone();
+                if cfg!(target_os = "macos") && !dev.starts_with("utun") {
+                    warn!(
+                        "tun device id '{}' is not supported on macOS (must start with 'utun'), falling back to 'utun1989'",
+                        dev
+                    );
+                    tun_init_config.tun_name = Some("utun1989".to_string());
+                } else {
+                    tun_init_config.tun_name = Some(dev);
                 }
-                tun_init_config.tun_name = Some(cfg.device_id.clone());
             }
         };
 
@@ -147,10 +150,37 @@ impl TunRunner {
                     }
 
                     let mut tun_builder = DeviceBuilder::new();
-                    tun_builder =
-                        tun_builder.name(&tun_name).mtu(cfg.mtu.unwrap_or(
-                            if cfg!(windows) { 65535u16 } else { 1500u16 },
-                        ));
+                    #[cfg(not(target_os = "linux"))]
+                    let gso_enabled = {
+                        if cfg.gso.unwrap_or(false) {
+                            warn!("GSO is only supported on Linux, ignoring on this platform");
+                        }
+                        false
+                    };
+                    #[cfg(target_os = "linux")]
+                    let gso_enabled = cfg.gso.unwrap_or(false);
+
+                    let gso_max_size = cfg.gso_max_size.unwrap_or(65536) as usize;
+                    let stack_mtu = cfg.mtu.unwrap_or(1500) as usize;
+                    let effective_mtu = if gso_enabled {
+                        (gso_max_size.min(65535)) as u16
+                    } else {
+                        cfg.mtu.unwrap_or(if cfg!(windows) { 65535u16 } else { 1500u16 })
+                    };
+
+                    if gso_enabled {
+                        info!(
+                            "TUN GSO enabled (gso_max_size: {}, standard MTU: {})",
+                            gso_max_size, stack_mtu
+                        );
+                    }
+
+                    tun_builder = tun_builder.name(&tun_name).mtu(effective_mtu);
+
+                    #[cfg(target_os = "linux")]
+                    if gso_enabled {
+                        tun_builder = tun_builder.offload(true);
+                    }
 
                     if !tun_exist {
                         debug!("setting tun ipv4 addr: {:?}", cfg.gateway);
@@ -296,27 +326,79 @@ impl Runner for TunRunner {
             let (mut tun_sink, mut tun_stream) = framed.split::<bytes::Bytes>();
             let (mut stack_sink, mut stack_stream) = stack.split();
 
+            let auto_detect_cancel = cancellation_token.clone();
+            if cfg.auto_detect_interface {
+                tokio::spawn(async move {
+                    let mut interval =
+                        tokio::time::interval(std::time::Duration::from_secs(3));
+                    while !auto_detect_cancel.is_cancelled() {
+                        tokio::select! {
+                            _ = auto_detect_cancel.cancelled() => break,
+                            _ = interval.tick() => {
+                                if let Some(new_iface) =
+                                    crate::app::net::get_outbound_interface()
+                                {
+                                    let mut current =
+                                        crate::app::net::DEFAULT_OUTBOUND_INTERFACE
+                                            .write()
+                                            .await;
+                                    let changed = match &*current {
+                                        Some(old) => {
+                                            old.name != new_iface.name
+                                                || old.index != new_iface.index
+                                        }
+                                        None => true,
+                                    };
+                                    if changed {
+                                        info!(
+                                            "auto-detected default outbound interface \
+                                             changed to {} (index: {})",
+                                            new_iface.name, new_iface.index
+                                        );
+                                        *current = Some(new_iface);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+
+            let (tun_tx, mut tun_rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(4096);
+            let tun_tx_for_dispatcher = tun_tx.clone();
+            let tun_tx_for_system_tcp = tun_tx.clone();
+
+            let mut fut_tun_writer = async || {
+                while let Some(pkt) = tun_rx.recv().await {
+                    if let Err(e) = tun_sink.send(pkt).await {
+                        if e.kind() == std::io::ErrorKind::TimedOut
+                            || e.kind() == std::io::ErrorKind::WouldBlock
+                            || e.kind() == std::io::ErrorKind::InvalidInput
+                            || e.raw_os_error() == Some(22)
+                        {
+                            warn!(
+                                "failed to send pkt to tun, dropping packet: {}",
+                                e
+                            );
+                            continue;
+                        }
+                        error!("failed to send pkt to tun: {}", e);
+                        break;
+                    }
+                }
+
+                Err(Error::Operation("tun stopped unexpectedly 0".to_string()))
+            };
+
             // dispatcher -> stack -> tun
             let mut fut_dispatcher_tun = async || {
                 while let Some(pkt) = stack_stream.next().await {
                     match pkt {
                         Ok(pkt) => {
-                            if let Err(e) = tun_sink.send(pkt.into_bytes()).await {
-                                // TimedOut means the Wintun/TUN send ring buffer
-                                // was full for too long (driver backpressure). Drop
-                                // the packet and keep the runner alive — packet loss
-                                // is normal at the IP layer; TCP will retransmit and
-                                // UDP is inherently best-effort.
-                                if e.kind() == std::io::ErrorKind::TimedOut
-                                    || e.kind() == std::io::ErrorKind::WouldBlock
-                                {
-                                    warn!(
-                                        "tun send buffer full, dropping packet: {}",
-                                        e
-                                    );
-                                    continue;
-                                }
-                                error!("failed to send pkt to tun: {}", e);
+                            if let Err(e) =
+                                tun_tx_for_dispatcher.send(pkt.into_bytes()).await
+                            {
+                                error!("failed to send pkt to tun writer: {}", e);
                                 break;
                             }
                         }
@@ -330,17 +412,167 @@ impl Runner for TunRunner {
                 Err(Error::Operation("tun stopped unexpectedly 0".to_string()))
             };
 
+            let stack_type = cfg.stack.as_deref().unwrap_or("system");
+            let use_system_stack = stack_type.eq_ignore_ascii_case("system")
+                || stack_type.eq_ignore_ascii_case("mixed");
+
+            if use_system_stack {
+                info!("TUN stack initialized in 'system' mode (kernel native TCP NAT loopback + userspace UDP)");
+            } else if stack_type.eq_ignore_ascii_case("gvisor") {
+                info!("TUN stack initialized in 'smoltcp' mode (via 'gvisor' compatibility alias)");
+            } else {
+                info!("TUN stack initialized in 'smoltcp' mode (pure userspace NetStack)");
+            }
+
+            let (server_v4, client_v4) = {
+                let server = cfg.gateway.addr();
+                let octets = server.octets();
+                let client = std::net::Ipv4Addr::new(
+                    octets[0],
+                    octets[1],
+                    octets[2],
+                    octets[3].wrapping_add(1),
+                );
+                (server, client)
+            };
+
+            let v4_tcp_info = if use_system_stack {
+                match tokio::net::TcpListener::bind((server_v4, 0)).await {
+                    Ok(l) => {
+                        let port = l.local_addr().map(|a| a.port()).unwrap_or(0);
+                        info!(
+                            "System stack IPv4 TCP listener active at {}:{}",
+                            server_v4, port
+                        );
+                        Some((l, (server_v4, client_v4, port)))
+                    }
+                    Err(e) => {
+                        warn!("Failed to bind system stack IPv4 TCP listener: {}", e);
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
+            let (listener_v4, v4_nat_info) = match v4_tcp_info {
+                Some((l, info)) => (Some(l), Some(info)),
+                None => (None, None),
+            };
+
+            let v6_tcp_info = if use_system_stack && cfg.gateway_v6.is_some() {
+                let server_v6 = cfg.gateway_v6.as_ref().unwrap().addr();
+                let mut octets = server_v6.octets();
+                octets[15] = octets[15].wrapping_add(1);
+                let client_v6 = std::net::Ipv6Addr::from(octets);
+
+                match tokio::net::TcpListener::bind((server_v6, 0)).await {
+                    Ok(l) => {
+                        let port = l.local_addr().map(|a| a.port()).unwrap_or(0);
+                        info!(
+                            "System stack IPv6 TCP listener active at [{}]:{}",
+                            server_v6, port
+                        );
+                        Some((l, (server_v6, client_v6, port)))
+                    }
+                    Err(e) => {
+                        warn!("Failed to bind system stack IPv6 TCP listener: {}", e);
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
+            let (listener_v6, v6_nat_info) = match v6_tcp_info {
+                Some((l, info)) => (Some(l), Some(info)),
+                None => (None, None),
+            };
+
+            let system_nat = Arc::new(super::system_stack::SystemTcpNat::new());
+
+            let gso_enabled = cfg.gso.unwrap_or(false);
+            let stack_mtu = cfg.mtu.unwrap_or(1500) as usize;
+
             // tun -> stack -> dispatcher
+            let nat = system_nat.clone();
             let mut fut_tun_dispatcher = async || {
                 while let Some(pkt) = tun_stream.next().await {
                     match pkt {
                         Ok(pkt) => {
-                            if let Err(e) = stack_sink
-                                .send(watfaq_netstack::Packet::new(pkt))
-                                .await
-                            {
-                                error!("failed to send pkt to stack: {}", e);
-                                break;
+                            let packets: Vec<bytes::Bytes> =
+                                if gso_enabled && pkt.len() > stack_mtu {
+                                    super::gso::split_gso_packet(pkt.into(), stack_mtu)
+                                } else {
+                                    vec![pkt.into()]
+                                };
+
+                            for single_pkt in packets {
+                                if use_system_stack
+                                    && smoltcp::wire::IpVersion::of_packet(&single_pkt)
+                                        .is_ok()
+                                {
+                                    let is_tcp = match smoltcp::wire::IpVersion::of_packet(
+                                        &single_pkt,
+                                    )
+                                    .unwrap()
+                                    {
+                                        smoltcp::wire::IpVersion::Ipv4 => {
+                                            smoltcp::wire::Ipv4Packet::new_checked(
+                                                &single_pkt[..],
+                                            )
+                                            .map(|p| {
+                                                p.next_header()
+                                                    == smoltcp::wire::IpProtocol::Tcp
+                                            })
+                                            .unwrap_or(false)
+                                        }
+                                        smoltcp::wire::IpVersion::Ipv6 => {
+                                            smoltcp::wire::Ipv6Packet::new_checked(
+                                                &single_pkt[..],
+                                            )
+                                            .map(|p| {
+                                                p.next_header()
+                                                    == smoltcp::wire::IpProtocol::Tcp
+                                            })
+                                            .unwrap_or(false)
+                                        }
+                                    };
+
+                                    if is_tcp {
+                                        let mut pkt_vec = single_pkt.to_vec();
+                                        if let Some(true) =
+                                            super::system_stack::process_system_tcp_packet(
+                                                &mut pkt_vec,
+                                                v4_nat_info,
+                                                v6_nat_info,
+                                                &nat,
+                                            )
+                                        {
+                                            if let Err(e) = tun_tx_for_system_tcp
+                                                .send(bytes::Bytes::from(pkt_vec))
+                                                .await
+                                            {
+                                                error!(
+                                                    "failed to write system TCP packet to tun channel: {}",
+                                                    e
+                                                );
+                                                break;
+                                            }
+                                            continue;
+                                        }
+                                    }
+                                }
+
+                                if let Err(e) = stack_sink
+                                    .send(watfaq_netstack::Packet::new(single_pkt))
+                                    .await
+                                {
+                                    error!("failed to send pkt to stack: {}", e);
+                                    return Err(Error::Operation(
+                                        "tun stopped unexpectedly 1".to_string(),
+                                    ));
+                                }
                             }
                         }
                         Err(e) => {
@@ -355,26 +587,87 @@ impl Runner for TunRunner {
 
             let dsp = dispatcher.clone();
             let res = resolver.clone();
+            let strict_route = cfg.strict_route;
+            let exclude_routes = Arc::new(cfg.route_exclude_address.clone());
+            let exclude_routes_tcp = exclude_routes.clone();
             let dh = dns_hijack.clone();
-            let mut fut_tcp_dispatch = async || {
-                while let Some(stream) = tcp_listener.next().await {
-                    debug!(
-                        "new tun TCP connection: {} -> {}",
-                        stream.local_addr(),
-                        stream.remote_addr()
-                    );
+            let udp_timeout_secs = cfg.udp_timeout.unwrap_or(300);
 
-                    tokio::spawn(handle_inbound_stream(
-                        stream,
-                        dsp.clone(),
-                        res.clone(),
-                        so_mark,
-                        dh.clone(),
-                    ));
+            let fut_tcp_dispatch = async || {
+                if use_system_stack {
+                    if let Some(l4) = listener_v4 {
+                        let nat_clone = system_nat.clone();
+                        let dsp_clone = dsp.clone();
+                        let res_clone = res.clone();
+                        let dh_clone = dh.clone();
+                        let ex_clone = exclude_routes_tcp.clone();
+                        tokio::spawn(async move {
+                            super::system_stack::start_system_tcp_listener(
+                                l4,
+                                nat_clone,
+                                dsp_clone,
+                                res_clone,
+                                so_mark,
+                                dh_clone,
+                                strict_route,
+                                ex_clone,
+                            )
+                            .await;
+                        });
+                    }
+
+                    if let Some(l6) = listener_v6 {
+                        let nat_clone = system_nat.clone();
+                        let dsp_clone = dsp.clone();
+                        let res_clone = res.clone();
+                        let dh_clone = dh.clone();
+                        let ex_clone = exclude_routes_tcp.clone();
+                        tokio::spawn(async move {
+                            super::system_stack::start_system_tcp_listener(
+                                l6,
+                                nat_clone,
+                                dsp_clone,
+                                res_clone,
+                                so_mark,
+                                dh_clone,
+                                strict_route,
+                                ex_clone,
+                            )
+                            .await;
+                        });
+                    }
+
+                    let nat_cleaner = system_nat.clone();
+                    let timeout = Duration::from_secs(udp_timeout_secs);
+                    let mut interval =
+                        tokio::time::interval(Duration::from_secs(30));
+                    loop {
+                        interval.tick().await;
+                        nat_cleaner.cleanup_timeout(timeout);
+                    }
+                } else {
+                    while let Some(stream) = tcp_listener.next().await {
+                        debug!(
+                            "new tun TCP connection: {} -> {}",
+                            stream.local_addr(),
+                            stream.remote_addr()
+                        );
+
+                        tokio::spawn(super::stream::handle_inbound_netstack_stream(
+                            stream,
+                            dsp.clone(),
+                            res.clone(),
+                            so_mark,
+                            dh.clone(),
+                            strict_route,
+                            exclude_routes_tcp.clone(),
+                        ));
+                    }
+
+                    Err(Error::Operation("tun stopped unexpectedly 2".to_string()))
                 }
-
-                Err(Error::Operation("tun stopped unexpectedly 2".to_string()))
             };
+            let udp_timeout = cfg.udp_timeout;
             let fut_udp_dispatch = async || {
                 handle_inbound_datagram(
                     udp_socket,
@@ -382,12 +675,16 @@ impl Runner for TunRunner {
                     resolver.clone(),
                     so_mark,
                     dns_hijack,
+                    udp_timeout,
+                    strict_route,
+                    exclude_routes,
                 )
                 .await;
                 Err(Error::Operation("tun stopped unexpectedly 3".to_string()))
             };
 
             let run_res = tokio::select! {
+                res = fut_tun_writer() => res,
                 res = fut_dispatcher_tun() => res,
                 res = fut_tun_dispatcher() => res,
                 res = fut_tcp_dispatch() => res,

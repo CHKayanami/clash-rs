@@ -119,5 +119,22 @@ pub fn maybe_add_routes(cfg: &TunConfig, tun_name: &str) -> std::io::Result<()> 
         }
     }
 
+    if !cfg.route_exclude_address.is_empty() {
+        if let Some(outbound_iface) = crate::app::net::get_outbound_interface() {
+            for r in &cfg.route_exclude_address {
+                warn!(
+                    "adding bypass route for excluded subnet {} dev {}",
+                    r, outbound_iface.name
+                );
+                let _ = add_route(&outbound_iface, r).inspect_err(|e| {
+                    warn!(
+                        "failed to add bypass route for excluded subnet {}: {}",
+                        r, e
+                    );
+                });
+            }
+        }
+    }
+
     Ok(())
 }

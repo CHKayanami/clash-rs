@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{net::SocketAddr, sync::Arc};
 
 use tracing::{debug, warn};
 
@@ -8,26 +8,40 @@ use crate::{
         dns::{ThreadSafeDNSResolver, exchange_with_resolver},
         net::DEFAULT_OUTBOUND_INTERFACE,
     },
+    proxy::ProxyStream,
     session::{Network, Session, Type},
 };
 
-pub(crate) async fn handle_inbound_stream(
-    stream: watfaq_netstack::TcpStream,
+pub(crate) async fn handle_inbound_stream<S: ProxyStream + 'static>(
+    stream: S,
+    source: SocketAddr,
+    destination: SocketAddr,
     dispatcher: Arc<Dispatcher>,
     resolver: ThreadSafeDNSResolver,
     so_mark: Option<u32>,
     dns_hijack: crate::config::internal::config::DnsHijack,
+    strict_route: bool,
+    exclude_routes: Arc<Vec<ipnet::IpNet>>,
 ) {
-    if dns_hijack.is_hijacked(Network::Tcp, &stream.remote_addr()) {
-        handle_tcp_dns_hijack(stream, resolver).await;
+    let remote_ip = destination.ip();
+    if strict_route && exclude_routes.iter().any(|net| net.contains(&remote_ip)) {
+        debug!(
+            "strict-route: rejecting tun TCP stream to excluded subnet: {}",
+            destination
+        );
+        return;
+    }
+
+    if dns_hijack.is_hijacked(Network::Tcp, &destination) {
+        handle_tcp_dns_hijack(stream, source, destination, resolver).await;
         return;
     }
 
     let sess = Session {
         network: Network::Tcp,
         typ: Type::Tun,
-        source: stream.local_addr(),
-        destination: stream.remote_addr().into(),
+        source,
+        destination: destination.into(),
         iface: DEFAULT_OUTBOUND_INTERFACE
             .read()
             .await
@@ -46,14 +60,39 @@ pub(crate) async fn handle_inbound_stream(
     dispatcher.dispatch_stream(sess, Box::new(stream)).await;
 }
 
-async fn handle_tcp_dns_hijack(
-    mut stream: watfaq_netstack::TcpStream,
+pub(crate) async fn handle_inbound_netstack_stream(
+    stream: watfaq_netstack::TcpStream,
+    dispatcher: Arc<Dispatcher>,
+    resolver: ThreadSafeDNSResolver,
+    so_mark: Option<u32>,
+    dns_hijack: crate::config::internal::config::DnsHijack,
+    strict_route: bool,
+    exclude_routes: Arc<Vec<ipnet::IpNet>>,
+) {
+    let source = stream.local_addr();
+    let destination = stream.remote_addr();
+    handle_inbound_stream(
+        stream,
+        source,
+        destination,
+        dispatcher,
+        resolver,
+        so_mark,
+        dns_hijack,
+        strict_route,
+        exclude_routes,
+    )
+    .await;
+}
+
+async fn handle_tcp_dns_hijack<S: ProxyStream + 'static>(
+    mut stream: S,
+    local: SocketAddr,
+    remote: SocketAddr,
     resolver: ThreadSafeDNSResolver,
 ) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    let remote = stream.remote_addr();
-    let local = stream.local_addr();
     debug!("hijacking TCP DNS request from {} to {}", local, remote);
 
     loop {

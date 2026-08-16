@@ -1,8 +1,10 @@
 mod datagram;
+pub mod gso;
 mod routes;
 pub mod runner;
 pub use runner::TunRunner;
 mod stream;
+pub mod system_stack;
 
 #[cfg(test)]
 mod tests {

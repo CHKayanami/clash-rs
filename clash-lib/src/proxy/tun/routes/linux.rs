@@ -112,6 +112,7 @@ async fn add_rule_not_fwmark(
     handle: &rtnetlink::Handle,
     table_id: u32,
     so_mark: u32,
+    rule_index: Option<u32>,
     family: AddressFamily,
 ) -> std::io::Result<()> {
     match family {
@@ -122,6 +123,9 @@ async fn add_rule_not_fwmark(
             msg.header.action = RuleAction::ToTable;
             msg.attributes.push(RuleAttribute::FwMark(so_mark));
             msg.attributes.push(RuleAttribute::Table(table_id));
+            if let Some(pref) = rule_index {
+                msg.attributes.push(RuleAttribute::Priority(pref));
+            }
             req.execute().await.map_err(new_io_error)?;
         }
         AddressFamily::Inet6 => {
@@ -131,6 +135,9 @@ async fn add_rule_not_fwmark(
             msg.header.action = RuleAction::ToTable;
             msg.attributes.push(RuleAttribute::FwMark(so_mark));
             msg.attributes.push(RuleAttribute::Table(table_id));
+            if let Some(pref) = rule_index {
+                msg.attributes.push(RuleAttribute::Priority(pref));
+            }
             req.execute().await.map_err(new_io_error)?;
         }
         _ => {}
@@ -140,6 +147,7 @@ async fn add_rule_not_fwmark(
 
 async fn add_rule_suppress_prefixlength_main(
     handle: &rtnetlink::Handle,
+    rule_index: Option<u32>,
     family: AddressFamily,
 ) -> std::io::Result<()> {
     match family {
@@ -149,6 +157,9 @@ async fn add_rule_suppress_prefixlength_main(
             msg.header.action = RuleAction::ToTable;
             msg.attributes.push(RuleAttribute::Table(254));
             msg.attributes.push(RuleAttribute::SuppressPrefixLen(0));
+            if let Some(pref) = rule_index {
+                msg.attributes.push(RuleAttribute::Priority(pref.saturating_sub(1)));
+            }
             req.execute().await.map_err(new_io_error)?;
         }
         AddressFamily::Inet6 => {
@@ -157,6 +168,9 @@ async fn add_rule_suppress_prefixlength_main(
             msg.header.action = RuleAction::ToTable;
             msg.attributes.push(RuleAttribute::Table(254));
             msg.attributes.push(RuleAttribute::SuppressPrefixLen(0));
+            if let Some(pref) = rule_index {
+                msg.attributes.push(RuleAttribute::Priority(pref.saturating_sub(1)));
+            }
             req.execute().await.map_err(new_io_error)?;
         }
         _ => {}
@@ -168,6 +182,7 @@ async fn add_rule_dport(
     handle: &rtnetlink::Handle,
     table_id: u32,
     port: u16,
+    rule_index: Option<u32>,
     family: AddressFamily,
 ) -> std::io::Result<()> {
     match family {
@@ -181,6 +196,9 @@ async fn add_rule_dport(
                     start: port,
                     end: port,
                 }));
+            if let Some(pref) = rule_index {
+                msg.attributes.push(RuleAttribute::Priority(pref.saturating_sub(2)));
+            }
             req.execute().await.map_err(new_io_error)?;
         }
         AddressFamily::Inet6 => {
@@ -193,6 +211,38 @@ async fn add_rule_dport(
                     start: port,
                     end: port,
                 }));
+            if let Some(pref) = rule_index {
+                msg.attributes.push(RuleAttribute::Priority(pref.saturating_sub(2)));
+            }
+            req.execute().await.map_err(new_io_error)?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+async fn add_rule_strict_blackhole(
+    handle: &rtnetlink::Handle,
+    rule_index: Option<u32>,
+    family: AddressFamily,
+) -> std::io::Result<()> {
+    match family {
+        AddressFamily::Inet => {
+            let mut req = handle.rule().add().v4();
+            let msg = req.message_mut();
+            msg.header.action = RuleAction::Blackhole;
+            if let Some(pref) = rule_index {
+                msg.attributes.push(RuleAttribute::Priority(pref.saturating_add(1)));
+            }
+            req.execute().await.map_err(new_io_error)?;
+        }
+        AddressFamily::Inet6 => {
+            let mut req = handle.rule().add().v6();
+            let msg = req.message_mut();
+            msg.header.action = RuleAction::Blackhole;
+            if let Some(pref) = rule_index {
+                msg.attributes.push(RuleAttribute::Priority(pref.saturating_add(1)));
+            }
             req.execute().await.map_err(new_io_error)?;
         }
         _ => {}
@@ -206,6 +256,7 @@ async fn setup_policy_routing_async(
 ) -> std::io::Result<()> {
     let handle = get_rtnetlink_handle().await?;
     let table = tun_cfg.route_table;
+    let rule_index = tun_cfg.iproute2_rule_index;
     let enable_v6 = tun_cfg.gateway_v6.is_some();
 
     // 1. Add default route in table
@@ -216,24 +267,58 @@ async fn setup_policy_routing_async(
 
     // 2. Add rule not fwmark table
     if let Some(so_mark) = tun_cfg.so_mark {
-        add_rule_not_fwmark(&handle, table, so_mark, AddressFamily::Inet).await?;
+        add_rule_not_fwmark(
+            &handle,
+            table,
+            so_mark,
+            rule_index,
+            AddressFamily::Inet,
+        )
+        .await?;
         if enable_v6 {
-            add_rule_not_fwmark(&handle, table, so_mark, AddressFamily::Inet6)
-                .await?;
+            add_rule_not_fwmark(
+                &handle,
+                table,
+                so_mark,
+                rule_index,
+                AddressFamily::Inet6,
+            )
+            .await?;
         }
     }
 
     // 3. Add rule suppress_prefixlength 0 table main
-    add_rule_suppress_prefixlength_main(&handle, AddressFamily::Inet).await?;
+    add_rule_suppress_prefixlength_main(&handle, rule_index, AddressFamily::Inet)
+        .await?;
     if enable_v6 {
-        add_rule_suppress_prefixlength_main(&handle, AddressFamily::Inet6).await?;
+        add_rule_suppress_prefixlength_main(
+            &handle,
+            rule_index,
+            AddressFamily::Inet6,
+        )
+        .await?;
     }
 
     // 4. Add rule dport 53 table (if dns_hijack is enabled)
     if tun_cfg.dns_hijack.is_enabled() {
-        add_rule_dport(&handle, table, 53, AddressFamily::Inet).await?;
+        add_rule_dport(&handle, table, 53, rule_index, AddressFamily::Inet)
+            .await?;
         if enable_v6 {
-            add_rule_dport(&handle, table, 53, AddressFamily::Inet6).await?;
+            add_rule_dport(&handle, table, 53, rule_index, AddressFamily::Inet6)
+                .await?;
+        }
+    }
+
+    // 5. Add strict route blackhole rule (if strict_route is enabled)
+    if tun_cfg.strict_route {
+        warn!(
+            "strict_route is enabled, adding blackhole rule to prevent direct \
+             route leaks"
+        );
+        add_rule_strict_blackhole(&handle, rule_index, AddressFamily::Inet).await?;
+        if enable_v6 {
+            add_rule_strict_blackhole(&handle, rule_index, AddressFamily::Inet6)
+                .await?;
         }
     }
 
@@ -291,7 +376,9 @@ async fn cleanup_rules_for_family(
             && dport_range == Some((53, 53))
             && table == Some(table_id);
 
-        if is_our_not_fwmark || is_our_suppress || is_our_dport {
+        let is_blackhole = msg.header.action == RuleAction::Blackhole;
+
+        if is_our_not_fwmark || is_our_suppress || is_our_dport || is_blackhole {
             to_delete.push(msg);
         }
     }
