@@ -20,8 +20,8 @@
 > [!NOTE]
 > **本 Fork 分支特性与说明**：
 > - ⚡ **性能与稳定性优化**：针对核心路径进行了大量重构与性能调优，重写了部分协议栈实现。
-> - 🚀 **新功能特性**：新增 Shadowsocks UOT (UDP-over-TCP)、域名嗅探（TLS SNI / HTTP Host / QUIC SNI）、H2MUX 等。
-> - 🪶 **Minimal 轻量版本**：默认精简，不包含 TUN 模式及以下协议：`SSH`、`WireGuard`、`Tailscale`、`Shadowquic`、`Tor`。
+> - 🚀 **新功能特性**：新增 Shadowsocks UOT (UDP-over-TCP)、域名嗅探（TLS SNI / HTTP Host / QUIC SNI）、H2MUX 、TUN system stack。
+> - 🪶 **Minimal 轻量版本**：默认精简，不包含以下协议：`SSH`、`WireGuard`、`Tailscale`、`Shadowquic`、`Tor`。
 > - 📖 **完整配置参考**：请参阅 [full.yaml](https://github.com/CHKayanami/clash-rs/blob/master/clash-bin/tests/data/config/full.yaml)。
 
 ## ✨ 特性
