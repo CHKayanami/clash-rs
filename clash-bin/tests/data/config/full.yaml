@@ -261,6 +261,7 @@ sniffer:
 # ── TUN Device ────────────────────────────────────────────────────────────────
 tun:
   enable: false
+  # enable-tcp: true                  # Enable TCP processing in TUN (alias: tcp, default: true). Set to false to omit TCP listener and only receive UDP.
 
   # TCP/IP protocol stack implementation:
   #   system   — OS kernel native TCP stack (via virtual TCP-NAT loopback) + zero-copy userspace UDP (default, recommended)

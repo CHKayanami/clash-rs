@@ -542,8 +542,21 @@ async fn create_components(
     dns_collect_file: Option<String>,
 ) -> Result<RuntimeComponents> {
     if config.tun.enable {
-        debug!("tun enabled, initializing default outbound interface");
-        init_net_config(config.tun.so_mark).await;
+        let explicit_iface = config
+            .general
+            .interface
+            .as_ref()
+            .and_then(|i| i.clone().into_iface_name());
+        let need_iface = explicit_iface.is_some()
+            || config.tun.route_all
+            || config.tun.auto_detect_interface;
+        if need_iface {
+            debug!("tun enabled with auto-route or explicit interface, initializing default outbound interface");
+            init_net_config(explicit_iface.as_deref(), config.tun.so_mark).await;
+        } else {
+            debug!("tun enabled without auto-route/auto-detect, skipping default outbound interface binding");
+            *crate::app::net::TUN_SOMARK.write().await = config.tun.so_mark;
+        }
     }
 
     let cancellation_token = tokio_util::sync::CancellationToken::new();

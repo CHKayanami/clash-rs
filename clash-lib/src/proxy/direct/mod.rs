@@ -170,8 +170,13 @@ impl OutboundHandler for Handler {
         // client (keyed by src_addr only in the dispatcher). Use a dual-stack
         // socket so one socket can send to both IPv4 and IPv6 destinations
         // without EAFNOSUPPORT.
+        let iface = if sess.destination.ip().is_some_and(|ip| ip.is_loopback()) {
+            None
+        } else {
+            sess.iface.as_ref()
+        };
         let udp = new_dual_stack_udp_socket(
-            sess.iface.as_ref(),
+            iface,
             #[cfg(target_os = "linux")]
             sess.so_mark,
         )?;

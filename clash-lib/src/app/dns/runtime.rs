@@ -112,13 +112,18 @@ impl RuntimeProvider for DnsRuntimeProvider {
 
         let provider = self.clone();
         let dns = self.dns_resolver.clone();
+        let iface = if server_addr.ip().is_loopback() {
+            None
+        } else {
+            self.iface.clone()
+        };
         let sess = Session {
             source: src,
             network: Network::Tcp,
             typ: Type::Ignore,
             destination: server_addr.into(),
             so_mark: self.so_mark,
-            iface: self.iface.clone(),
+            iface,
             ..Default::default()
         };
         Box::pin(async move {
@@ -142,13 +147,18 @@ impl RuntimeProvider for DnsRuntimeProvider {
 
         let provider = self.clone();
         let dns = self.dns_resolver.clone();
+        let iface = if server_addr.ip().is_loopback() {
+            None
+        } else {
+            self.iface.clone()
+        };
         let sess = Session {
             source: src,
             network: Network::Udp,
             typ: Type::Ignore,
             destination: server_addr.into(),
             so_mark: self.so_mark,
-            iface: self.iface.clone(),
+            iface,
             ..Default::default()
         };
 

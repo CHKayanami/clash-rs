@@ -436,7 +436,7 @@ impl Runner for TunRunner {
                 (server, client)
             };
 
-            let v4_tcp_info = if use_system_stack {
+            let v4_tcp_info = if use_system_stack && cfg.enable_tcp {
                 match tokio::net::TcpListener::bind((server_v4, 0)).await {
                     Ok(l) => {
                         let port = l.local_addr().map(|a| a.port()).unwrap_or(0);
@@ -460,7 +460,7 @@ impl Runner for TunRunner {
                 None => (None, None),
             };
 
-            let v6_tcp_info = if use_system_stack && cfg.gateway_v6.is_some() {
+            let v6_tcp_info = if use_system_stack && cfg.enable_tcp && cfg.gateway_v6.is_some() {
                 let server_v6 = cfg.gateway_v6.as_ref().unwrap().addr();
                 let mut octets = server_v6.octets();
                 octets[15] = octets[15].wrapping_add(1);
@@ -496,6 +496,7 @@ impl Runner for TunRunner {
 
             // tun -> stack -> dispatcher
             let nat = system_nat.clone();
+            let enable_tcp = cfg.enable_tcp;
             let mut fut_tun_dispatcher = async || {
                 while let Some(pkt) = tun_stream.next().await {
                     match pkt {
@@ -508,9 +509,8 @@ impl Runner for TunRunner {
                                 };
 
                             for single_pkt in packets {
-                                if use_system_stack
-                                    && smoltcp::wire::IpVersion::of_packet(&single_pkt)
-                                        .is_ok()
+                                if smoltcp::wire::IpVersion::of_packet(&single_pkt)
+                                    .is_ok()
                                 {
                                     let is_tcp = match smoltcp::wire::IpVersion::of_packet(
                                         &single_pkt,
@@ -540,26 +540,33 @@ impl Runner for TunRunner {
                                     };
 
                                     if is_tcp {
-                                        let mut pkt_vec = single_pkt.to_vec();
-                                        if let Some(true) =
-                                            super::system_stack::process_system_tcp_packet(
-                                                &mut pkt_vec,
-                                                v4_nat_info,
-                                                v6_nat_info,
-                                                &nat,
-                                            )
-                                        {
-                                            if let Err(e) = tun_tx_for_system_tcp
-                                                .send(bytes::Bytes::from(pkt_vec))
-                                                .await
-                                            {
-                                                error!(
-                                                    "failed to write system TCP packet to tun channel: {}",
-                                                    e
-                                                );
-                                                break;
-                                            }
+                                        if !enable_tcp {
+                                            // TCP is disabled on TUN, drop incoming TCP packet
                                             continue;
+                                        }
+
+                                        if use_system_stack {
+                                            let mut pkt_vec = single_pkt.to_vec();
+                                            if let Some(true) =
+                                                super::system_stack::process_system_tcp_packet(
+                                                    &mut pkt_vec,
+                                                    v4_nat_info,
+                                                    v6_nat_info,
+                                                    &nat,
+                                                )
+                                            {
+                                                if let Err(e) = tun_tx_for_system_tcp
+                                                    .send(bytes::Bytes::from(pkt_vec))
+                                                    .await
+                                                {
+                                                    error!(
+                                                        "failed to write system TCP packet to tun channel: {}",
+                                                        e
+                                                    );
+                                                    break;
+                                                }
+                                                continue;
+                                            }
                                         }
                                     }
                                 }
@@ -594,7 +601,9 @@ impl Runner for TunRunner {
             let udp_timeout_secs = cfg.udp_timeout.unwrap_or(300);
 
             let fut_tcp_dispatch = async || {
-                if use_system_stack {
+                if !enable_tcp {
+                    futures::future::pending::<Result<(), Error>>().await
+                } else if use_system_stack {
                     if let Some(l4) = listener_v4 {
                         let nat_clone = system_nat.clone();
                         let dsp_clone = dsp.clone();

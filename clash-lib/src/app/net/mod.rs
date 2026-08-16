@@ -20,8 +20,11 @@ pub static TUN_SOMARK: LazyLock<tokio::sync::RwLock<Option<u32>>> =
 /// globally manage default outbound interface
 /// This function should be called as early as possible
 /// so that other config initialization can use the default outbound interface
-pub async fn init_net_config(tun_somark: Option<u32>) {
-    *DEFAULT_OUTBOUND_INTERFACE.write().await = get_outbound_interface();
+pub async fn init_net_config(explicit_iface: Option<&str>, tun_somark: Option<u32>) {
+    let iface = explicit_iface
+        .and_then(get_interface_by_name)
+        .or_else(get_outbound_interface);
+    *DEFAULT_OUTBOUND_INTERFACE.write().await = iface;
     *TUN_SOMARK.write().await = tun_somark;
 
     trace!(
@@ -62,15 +65,12 @@ impl From<NetworkInterface> for OutboundInterface {
 
                 match addr {
                     network_interface::Addr::V4(addr) => {
-                        if !addr.ip.is_loopback()
-                            && !addr.ip.is_link_local()
-                            && !addr.ip.is_unspecified()
-                        {
+                        if !addr.ip.is_loopback() && v4.is_none() {
                             v4 = Some(*addr);
                         }
                     }
                     network_interface::Addr::V6(addr) => {
-                        if addr.ip.is_unique_local() || addr.ip.is_global() {
+                        if !addr.ip.is_loopback() && v6.is_none() {
                             v6 = Some(*addr);
                         }
                     }
@@ -80,15 +80,16 @@ impl From<NetworkInterface> for OutboundInterface {
             (v4, v6)
         }
 
-        let addr = get_outbound_ip_from_interface(&iface);
-        OutboundInterface {
+        let (v4, v6) = get_outbound_ip_from_interface(&iface);
+
+        Self {
             name: iface.name,
-            addr_v4: addr.0.map(|x| x.ip),
-            netmask_v4: addr.0.and_then(|x| x.netmask),
-            broadcast_v4: addr.0.and_then(|x| x.broadcast),
-            addr_v6: addr.1.map(|x| x.ip),
-            netmask_v6: addr.1.and_then(|x| x.netmask),
-            broadcast_v6: addr.1.and_then(|x| x.broadcast),
+            addr_v4: v4.map(|x| x.ip),
+            netmask_v4: v4.and_then(|x| x.netmask),
+            broadcast_v4: v4.and_then(|x| x.broadcast),
+            addr_v6: v6.map(|x| x.ip),
+            netmask_v6: v6.and_then(|x| x.netmask),
+            broadcast_v6: v6.and_then(|x| x.broadcast),
             index: iface.index,
             mac_addr: iface.mac_addr,
         }
@@ -139,6 +140,14 @@ pub fn get_outbound_interface() -> Option<OutboundInterface> {
         .map(Into::into)
         .filter(|iface: &OutboundInterface| {
             !iface.name.contains("tun")
+                && !iface.name.starts_with("br-")
+                && !iface.name.starts_with("docker")
+                && !iface.name.starts_with("veth")
+                && !iface.name.starts_with("dummy")
+                && !iface.name.contains("dummy")
+                && !iface.name.starts_with("lo")
+                && !iface.name.ends_with("-lan")
+                && !iface.name.starts_with("lan")
                 && (iface.addr_v4.is_some() || iface.addr_v6.is_some())
         })
         .collect::<Vec<_>>();
@@ -151,36 +160,45 @@ pub fn get_outbound_interface() -> Option<OutboundInterface> {
     } else if cfg!(target_os = "windows") {
         &["Ethernet", "Wi-Fi", "Tailscale"]
     } else if cfg!(target_os = "linux") {
-        &["eth", "wlp", "en", "Tailscale"]
+        &["pppoe", "wan", "ppp", "eth", "wlp", "en", "Tailscale"]
     } else if cfg!(target_os = "macos") {
         &["en", "pdp_ip", "Tailscale"]
     } else {
-        &["eth", "en", "wlp"]
+        &["pppoe", "wan", "ppp", "eth", "en", "wlp"]
     };
 
     all_outbounds.sort_by(|left, right| {
-        match (left.addr_v6, right.addr_v6) {
-            (Some(_), None) => return std::cmp::Ordering::Less,
-            (None, Some(_)) => return std::cmp::Ordering::Greater,
-            (Some(left), Some(right)) => {
-                if left.is_unicast_global() && !right.is_unicast_global() {
-                    return std::cmp::Ordering::Less;
-                } else if !left.is_unicast_global() && right.is_unicast_global() {
-                    return std::cmp::Ordering::Greater;
-                }
-            }
-            _ => {}
-        }
-        let left = priority
+        let left_p = priority
             .iter()
             .position(|x| left.name.contains(x))
             .unwrap_or(usize::MAX);
-        let right = priority
+        let right_p = priority
             .iter()
             .position(|x| right.name.contains(x))
             .unwrap_or(usize::MAX);
 
-        left.cmp(&right)
+        if left_p != right_p {
+            return left_p.cmp(&right_p);
+        }
+
+        match (left.addr_v6, right.addr_v6) {
+            (Some(l), Some(r)) => {
+                if l.is_unicast_global() && !r.is_unicast_global() {
+                    return std::cmp::Ordering::Less;
+                } else if !l.is_unicast_global() && r.is_unicast_global() {
+                    return std::cmp::Ordering::Greater;
+                }
+            }
+            (Some(l), None) if l.is_unicast_global() => {
+                return std::cmp::Ordering::Less;
+            }
+            (None, Some(r)) if r.is_unicast_global() => {
+                return std::cmp::Ordering::Greater;
+            }
+            _ => {}
+        }
+
+        std::cmp::Ordering::Equal
     });
 
     trace!(

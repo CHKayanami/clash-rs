@@ -29,6 +29,10 @@ fn default_tun_address() -> String {
     "198.18.0.1/24".to_string()
 }
 
+fn default_tun_address_v6() -> Option<String> {
+    Some("fdfe:dcba:9876::1/64".to_string())
+}
+
 fn default_route_table() -> u32 {
     DEFAULT_ROUTE_TABLE
 }
@@ -74,8 +78,9 @@ pub struct TunConfig {
     /// tun interface address for IPv6
     /// # Note
     /// - set this to enable IPv6 support in the tun interface
-    /// - Example: `2001:fac::1/64`
+    /// - Example: `fdfe:dcba:9876::1/64`
     #[serde(alias = "gateway-v6", alias = "inet6-address")]
+    #[serde(default = "default_tun_address_v6")]
     pub gateway_v6: Option<String>,
     #[serde(alias = "route-address")]
     pub routes: Option<Vec<String>>,
@@ -124,6 +129,9 @@ pub struct TunConfig {
     /// setting to a list has the same effect as setting to true
     #[serde(default)]
     pub dns_hijack: DnsHijack,
+    /// Enable TCP processing in TUN mode (default: true)
+    #[serde(alias = "tcp", alias = "enable-tcp")]
+    pub enable_tcp: Option<bool>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]

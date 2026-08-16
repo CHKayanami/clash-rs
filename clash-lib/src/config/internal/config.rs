@@ -219,9 +219,10 @@ impl DnsHijack {
     }
 }
 
-#[derive(Default, Clone, Debug)]
+#[derive(Clone, Debug)]
 pub struct TunConfig {
     pub enable: bool,
+    pub enable_tcp: bool,
     pub device_id: String,
     pub stack: Option<String>,
     pub route_all: bool,
@@ -248,6 +249,41 @@ pub struct TunConfig {
     pub include_package: Vec<String>,
     pub exclude_package: Vec<String>,
     pub dns_hijack: DnsHijack,
+}
+
+impl Default for TunConfig {
+    fn default() -> Self {
+        Self {
+            enable: false,
+            enable_tcp: true,
+            device_id: String::new(),
+            stack: None,
+            route_all: false,
+            routes: Vec::new(),
+            route_exclude_address: Vec::new(),
+            auto_detect_interface: false,
+            gateway: Ipv4Net::default(),
+            gateway_v6: None,
+            mtu: None,
+            gso: None,
+            gso_max_size: None,
+            so_mark: None,
+            route_table: 0,
+            iproute2_rule_index: None,
+            strict_route: false,
+            endpoint_independent_nat: false,
+            udp_timeout: None,
+            file_descriptor: None,
+            include_interface: Vec::new(),
+            exclude_interface: Vec::new(),
+            include_uid: Vec::new(),
+            exclude_uid: Vec::new(),
+            include_android_user: Vec::new(),
+            include_package: Vec::new(),
+            exclude_package: Vec::new(),
+            dns_hijack: DnsHijack::Disabled,
+        }
+    }
 }
 
 #[derive(Serialize, Clone, Debug, Copy, PartialEq, Hash, Eq)]

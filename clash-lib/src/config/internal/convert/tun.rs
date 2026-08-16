@@ -50,6 +50,7 @@ pub fn convert(
 
             Ok(config::TunConfig {
                 enable: t.enable,
+                enable_tcp: t.enable_tcp.unwrap_or(true),
                 device_id,
                 stack: t.stack,
                 route_all: t.route_all,
@@ -109,3 +110,44 @@ pub fn convert(
         None => Ok(config::TunConfig::default()),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_tun_enable_tcp_defaults_to_true() {
+        let yaml = r#"
+        enable: true
+        "#;
+        let def_tun: def::TunConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(def_tun.enable_tcp, None);
+        let cfg = convert(Some(def_tun)).unwrap();
+        assert!(cfg.enable_tcp);
+    }
+
+    #[test]
+    fn test_tun_enable_tcp_explicit_false() {
+        let yaml = r#"
+        enable: true
+        enable-tcp: false
+        "#;
+        let def_tun: def::TunConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(def_tun.enable_tcp, Some(false));
+        let cfg = convert(Some(def_tun)).unwrap();
+        assert!(!cfg.enable_tcp);
+    }
+
+    #[test]
+    fn test_tun_tcp_alias_false() {
+        let yaml = r#"
+        enable: true
+        tcp: false
+        "#;
+        let def_tun: def::TunConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(def_tun.enable_tcp, Some(false));
+        let cfg = convert(Some(def_tun)).unwrap();
+        assert!(!cfg.enable_tcp);
+    }
+}
+
