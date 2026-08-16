@@ -350,6 +350,7 @@ impl Dispatcher {
                                 .as_ref()
                                 .map_or(false, |s| s.config.force_dns_mapping);
                             let orig_dst_ip = packet.dst_addr.ip();
+                            let orig_inbound_dst = packet.dst_addr.clone();
                             let mut dest = match reverse_lookup(&resolver, &packet.dst_addr, force_dns_mapping).await {
                                 Some(dest) => dest,
                                 None => {
@@ -463,7 +464,7 @@ impl Dispatcher {
                                         UDP_CHANNEL_CAPACITY,
                                     );
 
-                                let orig_dest = dest.clone();
+                                let orig_inbound_dst = orig_inbound_dst.clone();
                                 let relay_sess = sess.clone();
                                 let remote_receiver_w = remote_receiver_w.clone();
 
@@ -483,7 +484,7 @@ impl Dispatcher {
                                     // remote -> local
                                     let incoming = async move {
                                         while let Some(mut packet) = remote_r.next().await {
-                                            packet.src_addr = orig_dest.clone();
+                                            packet.src_addr = orig_inbound_dst.clone();
                                             packet.dst_addr = relay_sess.source.into();
                                             debug!(
                                                 "UDP NAT for packet: {:?}, session: {}",

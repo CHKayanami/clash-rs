@@ -57,12 +57,20 @@ pub(crate) async fn handle_inbound_datagram(
     let fut1 = tokio::spawn(async move {
         while let Some(pkt) = l_rx.recv().await {
             trace!("tun <- dispatcher: {:?}", pkt);
+            let Some(src_addr) = pkt.src_addr.clone().try_into_socket_addr() else {
+                warn!("tun drop packet: src_addr is not a valid socket addr: {:?}", pkt.src_addr);
+                continue;
+            };
+            let Some(dst_addr) = pkt.dst_addr.clone().try_into_socket_addr() else {
+                warn!("tun drop packet: dst_addr is not a valid socket addr: {:?}", pkt.dst_addr);
+                continue;
+            };
             if let Err(e) = ls
                 .send(
                     (
                         pkt.data,
-                        pkt.src_addr.must_into_socket_addr(),
-                        pkt.dst_addr.must_into_socket_addr(),
+                        src_addr,
+                        dst_addr,
                     )
                         .into(),
                 )
@@ -103,16 +111,20 @@ pub(crate) async fn handle_inbound_datagram(
                                    pkt: &UdpPacket| {
                                 match msg.to_vec() {
                                     Ok(data) => {
+                                        let Some(dst_addr) = pkt.dst_addr.clone().try_into_socket_addr() else {
+                                            warn!("dns hijack drop: dst_addr is not a valid socket addr");
+                                            return;
+                                        };
+                                        let Some(src_addr) = pkt.src_addr.clone().try_into_socket_addr() else {
+                                            warn!("dns hijack drop: src_addr is not a valid socket addr");
+                                            return;
+                                        };
                                         if let Err(e) = ls_dns
                                             .send(
                                                 (
                                                     data,
-                                                    pkt.dst_addr
-                                                        .clone()
-                                                        .must_into_socket_addr(),
-                                                    pkt.src_addr
-                                                        .clone()
-                                                        .must_into_socket_addr(),
+                                                    dst_addr,
+                                                    src_addr,
                                                 )
                                                     .into(),
                                             )
