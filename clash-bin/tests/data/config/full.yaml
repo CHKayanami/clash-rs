@@ -207,6 +207,12 @@ dns:
     - 8.8.8.8
     - tls://1.1.1.1:853
 
+  # When true, upstream DNS queries from `nameserver`, `fallback` and
+  # `nameserver-policy` clients are dispatched through the rule engine
+  # instead of going DIRECT. `default-nameserver` and
+  # `proxy-server-nameserver` are not affected.
+  respect-rules: false
+
   # EDNS Client Subnet — sent along with upstream queries for geo-aware responses
   edns-client-subnet:
     ipv4: 1.2.3.0/24

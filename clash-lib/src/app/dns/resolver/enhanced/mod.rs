@@ -56,7 +56,6 @@ pub struct EnhancedResolver {
     policy: Option<NameServerPolicyContainer>,
 
     proxy_resolver: Option<Vec<ThreadSafeDNSClient>>,
-    direct_resolver: Option<Vec<ThreadSafeDNSClient>>,
     proxy_server_domains: Option<trie::StringTrie<bool>>,
 
     fake_dns: Option<ThreadSafeFakeDns>,
@@ -99,7 +98,6 @@ impl EnhancedResolver {
             policy: None,
 
             proxy_resolver: None,
-            direct_resolver: None,
             proxy_server_domains: None,
 
             fake_dns: None,
@@ -140,7 +138,6 @@ impl EnhancedResolver {
             policy: None,
 
             proxy_resolver: None,
-            direct_resolver: None,
             proxy_server_domains: None,
 
             fake_dns: None,
@@ -166,30 +163,6 @@ impl EnhancedResolver {
                 warn!(
                     "no usable proxy-server-nameserver clients were \
                          initialized; proxy server domain resolution will fall \
-                         back to the main nameservers"
-                );
-                None
-            } else {
-                Some(clients)
-            }
-        } else {
-            None
-        };
-
-        let direct_resolver = if let Some(direct_resolver) = cfg.direct_nameserver {
-            let clients = make_clients(
-                direct_resolver,
-                Some(default_resolver.clone()),
-                outbounds.clone(),
-                edns_client_subnet.clone(),
-                cfg.fw_mark,
-                rule_dispatch.clone(),
-            )
-            .await;
-            if clients.is_empty() {
-                warn!(
-                    "no usable direct-nameserver clients were \
-                         initialized; direct DNS resolution will fall \
                          back to the main nameservers"
                 );
                 None
@@ -312,7 +285,6 @@ impl EnhancedResolver {
             },
 
             proxy_resolver,
-            direct_resolver,
             proxy_server_domains: proxy_server_domains_trie,
 
             reverse_lookup_cache: Some(
@@ -471,20 +443,6 @@ impl EnhancedResolver {
                 return EnhancedResolver::batch_exchange(proxy_resolver, message).await;
             }
 
-            if self.fake_ip_enabled()
-                && let Some(domain) = EnhancedResolver::domain_name_of_message(message)
-                && let Some(direct_resolver) = &self.direct_resolver
-                && self
-                    .fake_dns
-                    .as_ref()
-                    .map_or(false, |fd| fd.should_skip(&domain))
-            {
-                debug!(
-                    "using direct-nameserver for fake-ip-filter domain: {}",
-                    domain
-                );
-                return EnhancedResolver::batch_exchange(direct_resolver, message).await;
-            }
 
             if EnhancedResolver::is_ip_request(q) {
                 return self.ip_exchange(message).await;

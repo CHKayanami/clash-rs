@@ -800,8 +800,6 @@ pub struct DNS {
     pub default_nameserver: Vec<String>,
     /// Proxy server nameservers, used to resolve proxy server hostnames
     pub proxy_server_nameserver: Vec<String>,
-    /// Direct nameservers, used when domain is in fake-ip-filter
-    pub direct_nameserver: Vec<String>,
     /// Lookup domains via specific nameservers
     pub nameserver_policy: HashMap<String, NameServerPolicyValue>,
     /// Configure EDNS Client Subnet information to send with upstream queries

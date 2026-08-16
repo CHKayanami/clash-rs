@@ -1,10 +1,7 @@
 use std::{
     collections::HashMap,
     net::Ipv4Addr,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::Arc,
     time::Instant,
 };
 
@@ -642,115 +639,4 @@ async fn test_black_domain_filter() {
     );
 }
 
-#[tokio::test]
-async fn test_direct_nameserver_routing_logic() {
-    use crate::app::dns::Client;
-    use crate::config::def::DNSMode;
-    use hickory_proto::rr::{RData, Record, rdata::A};
 
-    #[derive(Debug)]
-    struct TestDnsClient {
-        id: String,
-        called: Arc<AtomicBool>,
-    }
-    #[async_trait::async_trait]
-    impl Client for TestDnsClient {
-        fn id(&self) -> String {
-            self.id.clone()
-        }
-        async fn exchange(
-            &self,
-            msg: &op::Message,
-        ) -> anyhow::Result<op::Message> {
-            self.called.store(true, Ordering::Relaxed);
-            let mut response =
-                crate::app::dns::helper::build_dns_response_message(
-                    msg, true, false,
-                );
-
-            // Add a dummy IP answer so that ip_list is not empty
-            let name = msg.queries.first().unwrap().name().clone();
-            let rdata = RData::A(A(std::net::Ipv4Addr::new(1, 2, 3, 4)));
-            let record = Record::from_rdata(name, 60, rdata);
-            response.add_answers(vec![record]);
-            Ok(response)
-        }
-    }
-
-    let temp_dir = tempdir().unwrap();
-    let cache_store = ThreadSafeCacheFile::new(
-        temp_dir.path().join("cache.db").to_str().unwrap(),
-        false,
-    );
-
-    let mut config = Config::default();
-    config.enable = true;
-    config.ipv6 = false;
-    config.enhance_mode = DNSMode::FakeIp;
-    config.fake_ip_range = "198.18.0.1/16".parse().unwrap();
-    config.fake_ip_range6 = "fc00::/18".parse().unwrap();
-    config.fake_ip_filter = vec!["bypass.example.com".to_string()];
-
-    let mut resolver = EnhancedResolver::new(
-        config,
-        cache_store,
-        None,
-        Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
-        None,
-        None,
-    )
-    .await;
-
-    let main_called = Arc::new(AtomicBool::new(false));
-    let direct_called = Arc::new(AtomicBool::new(false));
-
-    // Inject our mock clients
-    resolver.main = vec![Arc::new(TestDnsClient {
-        id: "main-client".to_string(),
-        called: main_called.clone(),
-    })];
-    resolver.direct_resolver = Some(vec![Arc::new(TestDnsClient {
-        id: "direct-client".to_string(),
-        called: direct_called.clone(),
-    })]);
-
-    // A query for "bypass.example.com" (Type A) should go to direct_resolver because it is in fake_ip_filter.
-    let mut msg = op::Message::query();
-    let mut query = op::Query::new();
-    let name = rr::Name::from_str_relaxed("bypass.example.com").unwrap();
-    query.set_name(name);
-    query.set_query_type(rr::RecordType::A);
-    msg.add_query(query);
-
-    let _res = resolver.exchange_all(&msg).await.unwrap();
-    assert!(
-        direct_called.load(Ordering::Relaxed),
-        "direct_resolver should have been called for A query"
-    );
-    assert!(
-        !main_called.load(Ordering::Relaxed),
-        "main resolver should NOT have been called for A query"
-    );
-
-    // Reset flags
-    direct_called.store(false, Ordering::Relaxed);
-    main_called.store(false, Ordering::Relaxed);
-
-    // A non-IP query (Type TXT) for "bypass.example.com" should also go to direct_resolver because of fake_ip_filter.
-    let mut txt_msg = op::Message::query();
-    let mut txt_query = op::Query::new();
-    let txt_name = rr::Name::from_str_relaxed("bypass.example.com").unwrap();
-    txt_query.set_name(txt_name);
-    txt_query.set_query_type(rr::RecordType::TXT);
-    txt_msg.add_query(txt_query);
-
-    let _txt_res = resolver.exchange_all(&txt_msg).await.unwrap();
-    assert!(
-        direct_called.load(Ordering::Relaxed),
-        "direct_resolver should have been called for TXT query"
-    );
-    assert!(
-        !main_called.load(Ordering::Relaxed),
-        "main resolver should NOT have been called for TXT query"
-    );
-}
