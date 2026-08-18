@@ -96,6 +96,12 @@ fn is_dynamic_dst_ip4_bypassed(ip_be: [u8; 4]) -> bool {
 }
 
 #[inline(always)]
+fn is_src_ip6_bypassed(ip: [u8; 16]) -> bool {
+    let key = Key::new(128, ip);
+    BYPASS_SRC_IP6S.get(&key).is_some()
+}
+
+#[inline(always)]
 fn is_dst_ip6_bypassed(ip: [u8; 16]) -> bool {
     // 1. Loopback (::1/128) & Unspecified (::/128)
     // 2. Link-local unicast (fe80::/10)
@@ -107,7 +113,8 @@ fn is_dst_ip6_bypassed(ip: [u8; 16]) -> bool {
     {
         return true;
     }
-    false
+    let key = Key::new(128, ip);
+    BYPASS_DST_IP6S.get(&key).is_some()
 }
 
 #[inline(always)]
@@ -115,21 +122,16 @@ fn is_dynamic_dst_ip6_bypassed(ip: [u8; 16]) -> bool {
     unsafe { DYNAMIC_BYPASS_DST_IP6S.get(&ip).is_some() }
 }
 
-#[allow(dead_code)]
 #[inline(always)]
-fn is_src_ip6_bypassed(_ip: [u8; 16]) -> bool {
-    false
-}
-
-#[allow(dead_code)]
-#[inline(always)]
-fn is_src_ip6_proxied(_ip: [u8; 16]) -> bool {
-    true
+fn is_src_ip6_proxied(ip: [u8; 16]) -> bool {
+    let key = Key::new(128, ip);
+    PROXY_SRC_IP6S.get(&key).is_some()
 }
 
 #[inline(always)]
-fn is_dst_ip6_proxied(_ip: [u8; 16]) -> bool {
-    true
+fn is_dst_ip6_proxied(ip: [u8; 16]) -> bool {
+    let key = Key::new(128, ip);
+    PROXY_DST_IP6S.get(&key).is_some()
 }
 
 // ── Redirect helper: sets cb[] and performs bpf_redirect ──
@@ -303,6 +305,12 @@ fn handle_lan_ingress_impl(ctx: *mut __sk_buff, link_h_len: usize) -> i32 {
         let src_ip = *pkt.tuples.five.src_ip.as_bytes();
 
         if dst_port != 53 {
+            if is_src_ip6_bypassed(src_ip) {
+                return TC_ACT_OK;
+            }
+            if param.has_proxy_src_ips != 0 && !is_src_ip6_proxied(src_ip) {
+                return TC_ACT_OK;
+            }
             if is_src_port_bypassed(src_port) {
                 return TC_ACT_OK;
             }
@@ -313,6 +321,9 @@ fn handle_lan_ingress_impl(ctx: *mut __sk_buff, link_h_len: usize) -> i32 {
                 return TC_ACT_OK;
             }
             if is_dst_port_bypassed(dst_port, param.tproxy_port as u16) {
+                return TC_ACT_OK;
+            }
+            if param.has_proxy_dst_ips != 0 && !is_dst_ip6_proxied(dst_ip) {
                 return TC_ACT_OK;
             }
             if param.has_proxy_dst_ports != 0 && unsafe { PROXY_DST_PORTS.get(&dst_port).is_none() } {

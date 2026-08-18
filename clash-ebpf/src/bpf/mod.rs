@@ -15,7 +15,7 @@ pub mod linux {
     use aya::programs::{CgroupAttachMode, CgroupSock, SchedClassifier, TcAttachType};
     use aya::{Ebpf, EbpfLoader};
     use std::fs::File;
-    use std::net::Ipv4Addr;
+    use std::net::{Ipv4Addr, Ipv6Addr};
     use std::str::FromStr;
     use tracing::{debug, info, warn};
 
@@ -111,7 +111,7 @@ pub mod linux {
                 }
             }
 
-            // 4. Populate BYPASS_SRC_IPS map
+            // 4. Populate BYPASS_SRC_IPS and BYPASS_SRC_IP6S maps
             if let Some(map) = bpf.map_mut("BYPASS_SRC_IPS") {
                 if let Ok(mut ip_trie) = LpmTrie::<_, u32, u8>::try_from(map) {
                     for ip_str in bypass_ips.iter().chain(bypass_src_ips.iter()) {
@@ -125,11 +125,25 @@ pub mod linux {
                             let _ = ip_trie.insert(&key, 1, 0);
                         }
                     }
-                    debug!("Configured {} source bypass IP/CIDRs in BPF Trie map", bypass_ips.len() + bypass_src_ips.len());
+                    debug!("Configured {} source bypass IPv4 IP/CIDRs in BPF Trie map", bypass_ips.len() + bypass_src_ips.len());
+                }
+            }
+            if let Some(map) = bpf.map_mut("BYPASS_SRC_IP6S") {
+                if let Ok(mut ip_trie) = LpmTrie::<_, [u8; 16], u8>::try_from(map) {
+                    for ip_str in bypass_ips.iter().chain(bypass_src_ips.iter()) {
+                        if let Ok(net) = ipnet::Ipv6Net::from_str(ip_str) {
+                            let key = Key::new(net.prefix_len() as u32, net.network().octets());
+                            let _ = ip_trie.insert(&key, 1, 0);
+                        } else if let Ok(ip) = Ipv6Addr::from_str(ip_str) {
+                            let key = Key::new(128, ip.octets());
+                            let _ = ip_trie.insert(&key, 1, 0);
+                        }
+                    }
+                    debug!("Configured {} source bypass IPv6 IP/CIDRs in BPF Trie map", bypass_ips.len() + bypass_src_ips.len());
                 }
             }
 
-            // 5. Populate BYPASS_DST_IPS map
+            // 5. Populate BYPASS_DST_IPS and BYPASS_DST_IP6S maps
             if let Some(map) = bpf.map_mut("BYPASS_DST_IPS") {
                 if let Ok(mut ip_trie) = LpmTrie::<_, u32, u8>::try_from(map) {
                     for ip_str in bypass_ips.iter().chain(bypass_dst_ips.iter()) {
@@ -143,7 +157,21 @@ pub mod linux {
                             let _ = ip_trie.insert(&key, 1, 0);
                         }
                     }
-                    debug!("Configured {} dest bypass IP/CIDRs in BPF Trie map", bypass_ips.len() + bypass_dst_ips.len());
+                    debug!("Configured {} dest bypass IPv4 IP/CIDRs in BPF Trie map", bypass_ips.len() + bypass_dst_ips.len());
+                }
+            }
+            if let Some(map) = bpf.map_mut("BYPASS_DST_IP6S") {
+                if let Ok(mut ip_trie) = LpmTrie::<_, [u8; 16], u8>::try_from(map) {
+                    for ip_str in bypass_ips.iter().chain(bypass_dst_ips.iter()) {
+                        if let Ok(net) = ipnet::Ipv6Net::from_str(ip_str) {
+                            let key = Key::new(net.prefix_len() as u32, net.network().octets());
+                            let _ = ip_trie.insert(&key, 1, 0);
+                        } else if let Ok(ip) = Ipv6Addr::from_str(ip_str) {
+                            let key = Key::new(128, ip.octets());
+                            let _ = ip_trie.insert(&key, 1, 0);
+                        }
+                    }
+                    debug!("Configured {} dest bypass IPv6 IP/CIDRs in BPF Trie map", bypass_ips.len() + bypass_dst_ips.len());
                 }
             }
 
@@ -165,7 +193,7 @@ pub mod linux {
                 }
             }
 
-            // 8. Populate PROXY_SRC_IPS map
+            // 8. Populate PROXY_SRC_IPS and PROXY_SRC_IP6S maps
             if let Some(map) = bpf.map_mut("PROXY_SRC_IPS") {
                 if let Ok(mut ip_trie) = LpmTrie::<_, u32, u8>::try_from(map) {
                     for ip_str in proxy_ips.iter().chain(proxy_src_ips.iter()) {
@@ -181,8 +209,21 @@ pub mod linux {
                     }
                 }
             }
+            if let Some(map) = bpf.map_mut("PROXY_SRC_IP6S") {
+                if let Ok(mut ip_trie) = LpmTrie::<_, [u8; 16], u8>::try_from(map) {
+                    for ip_str in proxy_ips.iter().chain(proxy_src_ips.iter()) {
+                        if let Ok(net) = ipnet::Ipv6Net::from_str(ip_str) {
+                            let key = Key::new(net.prefix_len() as u32, net.network().octets());
+                            let _ = ip_trie.insert(&key, 1, 0);
+                        } else if let Ok(ip) = Ipv6Addr::from_str(ip_str) {
+                            let key = Key::new(128, ip.octets());
+                            let _ = ip_trie.insert(&key, 1, 0);
+                        }
+                    }
+                }
+            }
 
-            // 9. Populate PROXY_DST_IPS map
+            // 9. Populate PROXY_DST_IPS and PROXY_DST_IP6S maps
             if let Some(map) = bpf.map_mut("PROXY_DST_IPS") {
                 if let Ok(mut ip_trie) = LpmTrie::<_, u32, u8>::try_from(map) {
                     for ip_str in proxy_ips.iter().chain(proxy_dst_ips.iter()) {
@@ -198,6 +239,19 @@ pub mod linux {
                     }
                 }
             }
+            if let Some(map) = bpf.map_mut("PROXY_DST_IP6S") {
+                if let Ok(mut ip_trie) = LpmTrie::<_, [u8; 16], u8>::try_from(map) {
+                    for ip_str in proxy_ips.iter().chain(proxy_dst_ips.iter()) {
+                        if let Ok(net) = ipnet::Ipv6Net::from_str(ip_str) {
+                            let key = Key::new(net.prefix_len() as u32, net.network().octets());
+                            let _ = ip_trie.insert(&key, 1, 0);
+                        } else if let Ok(ip) = Ipv6Addr::from_str(ip_str) {
+                            let key = Key::new(128, ip.octets());
+                            let _ = ip_trie.insert(&key, 1, 0);
+                        }
+                    }
+                }
+            }
 
             self.bpf = Some(bpf);
 
@@ -206,23 +260,42 @@ pub mod linux {
                 warn!("cgroup bypass attachment: {e}");
             }
 
-            // 11. Attach TC Ingress on configured LAN interfaces (局域网入站拦截)
-            for lan in lan_interfaces {
+            // 11. Attach TC Ingress on configured/detected LAN interfaces (局域网入站拦截)
+            let detected_lan_fallback;
+            let effective_lan = if lan_interfaces.is_empty() || lan_interfaces.iter().any(|s| s == "auto") {
+                detected_lan_fallback = crate::manager::detect_lan_interfaces(lan_interfaces, wan_interface);
+                &detected_lan_fallback[..]
+            } else {
+                lan_interfaces
+            };
+
+            for lan in effective_lan {
                 if !lan.is_empty() {
                     let prog_name = if Self::iface_is_ethernet(lan) { "lan_ingress_l2" } else { "lan_ingress_l3" };
                     if let Err(e) = self.attach_tc_interface(lan, true, prog_name) {
                         warn!("Failed to attach TC ingress ({}) on {}: {}", prog_name, lan, e);
+                    } else {
+                        info!("Attached TC ingress ({}) on {}", prog_name, lan);
                     }
                 }
             }
 
             // 12. Attach TC Egress on configured WAN interface (or primary LAN interface in single-homed setups)
-            let effective_wan = wan_interface.or_else(|| lan_interfaces.first().map(|s| s.as_str()));
+            let detected_wan_fallback;
+            let effective_wan = match wan_interface {
+                Some("auto") | None | Some("") => {
+                    detected_wan_fallback = crate::manager::detect_default_wan_interface(lan_interfaces);
+                    detected_wan_fallback.as_deref().or_else(|| lan_interfaces.first().map(|s| s.as_str()))
+                }
+                Some(wan) => Some(wan),
+            };
             if let Some(wan) = effective_wan {
                 if !wan.is_empty() {
                     let prog_name = if Self::iface_is_ethernet(wan) { "wan_egress_l2" } else { "wan_egress_l3" };
                     if let Err(e) = self.attach_tc_interface(wan, false, prog_name) {
                         warn!("Failed to attach TC egress ({}) on {}: {}", prog_name, wan, e);
+                    } else {
+                        info!("Attached TC egress ({}) on {}", prog_name, wan);
                     }
                 }
             }

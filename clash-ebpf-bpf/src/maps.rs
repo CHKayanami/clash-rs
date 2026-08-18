@@ -15,7 +15,13 @@ pub static BYPASS_DST_PORTS: HashMap<u16, u8> = HashMap::with_max_entries(256, 0
 pub static BYPASS_SRC_IPS: LpmTrie<u32, u8> = LpmTrie::with_max_entries(1024, 0);
 
 #[map]
+pub static BYPASS_SRC_IP6S: LpmTrie<[u8; 16], u8> = LpmTrie::with_max_entries(1024, 0);
+
+#[map]
 pub static BYPASS_DST_IPS: LpmTrie<u32, u8> = LpmTrie::with_max_entries(1024, 0);
+
+#[map]
+pub static BYPASS_DST_IP6S: LpmTrie<[u8; 16], u8> = LpmTrie::with_max_entries(1024, 0);
 
 #[map]
 pub static PROXY_SRC_PORTS: HashMap<u16, u8> = HashMap::with_max_entries(256, 0);
@@ -27,7 +33,13 @@ pub static PROXY_DST_PORTS: HashMap<u16, u8> = HashMap::with_max_entries(256, 0)
 pub static PROXY_SRC_IPS: LpmTrie<u32, u8> = LpmTrie::with_max_entries(1024, 0);
 
 #[map]
+pub static PROXY_SRC_IP6S: LpmTrie<[u8; 16], u8> = LpmTrie::with_max_entries(1024, 0);
+
+#[map]
 pub static PROXY_DST_IPS: LpmTrie<u32, u8> = LpmTrie::with_max_entries(1024, 0);
+
+#[map]
+pub static PROXY_DST_IP6S: LpmTrie<[u8; 16], u8> = LpmTrie::with_max_entries(1024, 0);
 
 #[map]
 pub static DYNAMIC_BYPASS_DST_IPS: LruHashMap<u32, u8> = LruHashMap::with_max_entries(16384, 0);

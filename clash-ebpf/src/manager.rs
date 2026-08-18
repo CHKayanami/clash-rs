@@ -1,6 +1,7 @@
 use crate::config::EbpfConfig;
 use crate::listener::{EbpfListener, ListenerError};
 use crate::netns::{DaeNs, NetNsError};
+use network_interface::NetworkInterfaceConfig;
 use std::sync::Arc;
 use thiserror::Error;
 use tracing::info;
@@ -206,8 +207,22 @@ impl EbpfManager {
             // Bind transparent listener inside daens
             let listener = Arc::new(EbpfListener::bind(&ns, self.config.clone())?);
 
+            // Resolve effective WAN interface (handling "auto", OpenWrt PPPoE/VLAN, multi-metric routes)
+            let effective_wan = match self.config.wan_interface.as_deref() {
+                Some("auto") | None | Some("") => detect_default_wan_interface(&self.config.lan_interface),
+                Some(w) => Some(w.to_string()),
+            };
+
+            // Resolve effective LAN interfaces (handling "auto", OpenWrt br-lan, multi-NIC and single-NIC setups)
+            let effective_lan = detect_lan_interfaces(&self.config.lan_interface, effective_wan.as_deref());
+
+            info!(
+                "Resolved network topology -> LAN interfaces: {:?}, WAN interface: {:?}",
+                effective_lan, effective_wan
+            );
+
             let mut all_dst_ips = self.config.bypass_dst_ips.clone();
-            let detected_ips = detect_interface_ips(&self.config.lan_interface, self.config.wan_interface.as_deref());
+            let detected_ips = detect_interface_ips(&effective_lan, effective_wan.as_deref());
             let mut local_ip_u32 = 0u32;
             for ip in &detected_ips {
                 if !all_dst_ips.contains(ip) {
@@ -250,8 +265,8 @@ impl EbpfManager {
             if let Err(e) = bpf_guard.load_and_attach(
                 crate::bpf::EMBEDDED_BPF_OBJECT,
                 &bpf_param,
-                &self.config.lan_interface,
-                self.config.wan_interface.as_deref(),
+                &effective_lan,
+                effective_wan.as_deref(),
                 &self.config.bypass_ports,
                 &self.config.bypass_src_ports,
                 &self.config.bypass_dst_ports,
@@ -289,8 +304,8 @@ impl EbpfManager {
             self.listener = Some(listener.clone());
 
             info!(
-                "clash-ebpf started: TCP port {}, UDP port {}, LAN interfaces: {:?}",
-                self.config.tproxy_port, self.config.tproxy_udp_port, self.config.lan_interface
+                "clash-ebpf started: TCP port {}, UDP port {}, LAN interfaces: {:?}, WAN interface: {:?}",
+                self.config.tproxy_port, self.config.tproxy_udp_port, self.config.lan_interface, effective_wan
             );
 
             Ok(listener)
@@ -336,6 +351,193 @@ impl EbpfManager {
             std::net::IpAddr::V6(v6) => self.add_dynamic_bypass_ip6(v6).await,
         }
     }
+}
+
+/// Detect the default WAN egress interface for Linux and OpenWrt router environments.
+pub fn detect_default_wan_interface(lan_interfaces: &[String]) -> Option<String> {
+    #[cfg(target_os = "linux")]
+    {
+        // 1. Try reading /proc/net/route (IPv4 default routes sorted by Metric)
+        if let Ok(content) = std::fs::read_to_string("/proc/net/route") {
+            let mut candidates: Vec<(String, u32)> = Vec::new();
+            for line in content.lines().skip(1) {
+                let fields: Vec<&str> = line.split_whitespace().collect();
+                if fields.len() >= 11 {
+                    let iface = fields[0];
+                    let dest = fields[1];
+                    let mask = fields[7];
+                    let flags_hex = fields[3];
+                    let metric = fields[6].parse::<u32>().unwrap_or(u32::MAX);
+
+                    let flags = u32::from_str_radix(flags_hex, 16).unwrap_or(0);
+                    if (dest == "00000000" && mask == "00000000") || (flags & 0x1 != 0 && dest == "00000000") {
+                        if iface != "lo"
+                            && iface != "dae0"
+                            && iface != "dae0peer"
+                            && !iface.starts_with("docker")
+                            && !iface.starts_with("veth")
+                            && !iface.starts_with("tun")
+                            && !lan_interfaces.iter().any(|lan| lan == iface)
+                        {
+                            candidates.push((iface.to_string(), metric));
+                        }
+                    }
+                }
+            }
+            if !candidates.is_empty() {
+                candidates.sort_by_key(|(_, m)| *m);
+                return Some(candidates[0].0.clone());
+            }
+        }
+
+        // 2. Try reading /proc/net/ipv6_route (IPv6 default routes sorted by Metric)
+        if let Ok(content) = std::fs::read_to_string("/proc/net/ipv6_route") {
+            let mut candidates: Vec<(String, u32)> = Vec::new();
+            for line in content.lines() {
+                let fields: Vec<&str> = line.split_whitespace().collect();
+                if fields.len() >= 10 {
+                    let dest = fields[0];
+                    let prefix_len = fields[1];
+                    let metric = u32::from_str_radix(fields[5], 16).unwrap_or(u32::MAX);
+                    let iface = fields[9];
+                    if dest == "00000000000000000000000000000000" && prefix_len == "00" {
+                        if iface != "lo"
+                            && iface != "dae0"
+                            && iface != "dae0peer"
+                            && !iface.starts_with("docker")
+                            && !iface.starts_with("veth")
+                            && !iface.starts_with("tun")
+                            && !lan_interfaces.iter().any(|lan| lan == iface)
+                        {
+                            candidates.push((iface.to_string(), metric));
+                        }
+                    }
+                }
+            }
+            if !candidates.is_empty() {
+                candidates.sort_by_key(|(_, m)| *m);
+                return Some(candidates[0].0.clone());
+            }
+        }
+    }
+
+    // 3. Heuristic matching via NetworkInterface::show() for OpenWrt & Linux
+    if let Ok(interface_list) = network_interface::NetworkInterface::show() {
+        let priority_prefixes = [
+            "pppoe-wan",
+            "pppoe",
+            "wan",
+            "ppp",
+            "eth",
+            "enp",
+            "en",
+            "wlp",
+            "wlan",
+        ];
+
+        let mut valid_ifaces: Vec<(String, usize, bool)> = Vec::new();
+        for iface in interface_list {
+            let name = iface.name;
+            if name == "lo"
+                || name == "dae0"
+                || name == "dae0peer"
+                || name.starts_with("docker")
+                || name.starts_with("veth")
+                || name.starts_with("tun")
+                || name.starts_with("br-")
+                || lan_interfaces.iter().any(|lan| lan == &name)
+            {
+                continue;
+            }
+
+            let has_non_local_ip = iface.addr.iter().any(|a| {
+                let ip = a.ip();
+                !ip.is_loopback() && !ip.is_unspecified()
+            });
+
+            let prio = priority_prefixes
+                .iter()
+                .position(|&p| name.starts_with(p) || name.contains(p))
+                .unwrap_or(usize::MAX);
+
+            valid_ifaces.push((name, prio, has_non_local_ip));
+        }
+
+        valid_ifaces.sort_by(|a, b| {
+            b.2.cmp(&a.2).then_with(|| a.1.cmp(&b.1))
+        });
+
+        if let Some((name, _, _)) = valid_ifaces.first() {
+            return Some(name.clone());
+        }
+    }
+
+    // 4. Fallback to primary LAN interface in single-NIC / single-homed setups
+    lan_interfaces.first().cloned()
+}
+
+/// Detect effective LAN ingress interfaces for Linux and OpenWrt router environments.
+pub fn detect_lan_interfaces(configured_lan: &[String], effective_wan: Option<&str>) -> Vec<String> {
+    let non_auto_lan: Vec<String> = configured_lan
+        .iter()
+        .filter(|s| !s.is_empty() && s.as_str() != "auto")
+        .cloned()
+        .collect();
+
+    if !non_auto_lan.is_empty() {
+        return non_auto_lan;
+    }
+
+    // 1. OpenWrt Bridge preference: look for "br-lan" or bridge interface
+    if let Ok(interface_list) = network_interface::NetworkInterface::show() {
+        for iface in &interface_list {
+            if (iface.name == "br-lan" || iface.name == "lan") && effective_wan != Some(iface.name.as_str()) {
+                return vec![iface.name.clone()];
+            }
+        }
+
+        // 2. Multi-NIC router setup: collect active interfaces that are not WAN, loopback, or virtual
+        let mut candidates: Vec<String> = Vec::new();
+        for iface in &interface_list {
+            let name = &iface.name;
+            if name == "lo"
+                || name == "dae0"
+                || name == "dae0peer"
+                || name.starts_with("docker")
+                || name.starts_with("veth")
+                || name.starts_with("tun")
+                || name.starts_with("tailscale")
+                || name.starts_with("wg")
+                || name.starts_with("ppp")
+                || name.starts_with("pppoe")
+                || effective_wan == Some(name.as_str())
+            {
+                continue;
+            }
+
+            let has_non_local_ip = iface.addr.iter().any(|a| {
+                let ip = a.ip();
+                !ip.is_loopback() && !ip.is_unspecified()
+            });
+
+            if has_non_local_ip {
+                candidates.push(name.clone());
+            }
+        }
+
+        if !candidates.is_empty() {
+            return candidates;
+        }
+    }
+
+    // 3. Fallback: single-NIC / on-a-stick topology (use effective_wan as LAN too)
+    if let Some(wan) = effective_wan {
+        if !wan.is_empty() {
+            return vec![wan.to_string()];
+        }
+    }
+
+    Vec::new()
 }
 
 #[allow(dead_code)]
