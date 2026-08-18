@@ -666,7 +666,7 @@ async fn test_fake_ip_ttl() {
     let response = resolver.exchange_all(&msg).await.unwrap();
     assert_eq!(response.metadata.response_code, op::ResponseCode::NoError);
     assert_eq!(response.answers.len(), 1);
-    assert_eq!(response.answers[0].ttl(), 5);
+    assert_eq!(response.answers[0].ttl, 5);
 }
 
 

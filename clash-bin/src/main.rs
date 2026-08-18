@@ -294,8 +294,9 @@ fn main() -> anyhow::Result<()> {
         dns_collect_file: cli.dns_collect_file.map(|p| p.to_string_lossy().to_string()),
     })
     .inspect_err(|err| eprintln!("Failed to start clash: {err}"))?;
-    Ok(())
+    exit(0);
 }
+
 
 #[cfg(test)]
 mod env_truthy_tests {

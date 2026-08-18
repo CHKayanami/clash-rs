@@ -27,6 +27,8 @@ tailscale = ["clash-lib/tailscale"]
 tproxy = ["clash-lib/tproxy"]
 redir = ["clash-lib/redir"]
 tun = ["clash-lib/tun"]
+ebpf = ["clash-lib/ebpf"]
+
 
 bench = ["clash-lib/bench"]
 dashboard = ["clash-lib/dashboard"]

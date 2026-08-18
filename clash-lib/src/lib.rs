@@ -403,7 +403,8 @@ pub async fn start(
     let cwd_clone = cwd.clone();
     let reload_token = shutdown_token.child_token();
     let shutdown_token_clone = shutdown_token.clone();
-    tokio::spawn(async move {
+    let reload_handle = tokio::spawn(async move {
+
         // Listen for config reload signal and reload config
         loop {
             tokio::select! {
@@ -490,10 +491,16 @@ pub async fn start(
     });
 
     tokio::select! {
-        result = tokio::signal::ctrl_c() => { result.map_err(Error::Io)?; }
+        result = tokio::signal::ctrl_c() => {
+            shutdown_token.cancel();
+            result.map_err(Error::Io)?;
+        }
         _ = shutdown_token.cancelled() => {}
     }
+    let _ = reload_handle.await;
     Ok(())
+
+
 }
 
 struct RuntimeComponents {
@@ -506,6 +513,8 @@ struct RuntimeComponents {
 
     #[cfg(feature = "tun")]
     tun_runner: ArcRunner,
+    #[cfg(feature = "ebpf")]
+    ebpf_runner: ArcRunner,
     dns_listener: ArcRunner,
     inbound_manager: Arc<InboundManager>,
     dns_listen: DNSListenAddr,
@@ -523,6 +532,8 @@ impl RuntimeComponents {
     fn start_all(&self) {
         #[cfg(feature = "tun")]
         self.tun_runner.run_async();
+        #[cfg(feature = "ebpf")]
+        self.ebpf_runner.run_async();
         self.dns_listener.run_async();
         self.inbound_manager.run_async();
     }
@@ -530,9 +541,12 @@ impl RuntimeComponents {
     fn stop_all(&self) {
         #[cfg(feature = "tun")]
         self.tun_runner.shutdown();
+        #[cfg(feature = "ebpf")]
+        self.ebpf_runner.shutdown();
         self.dns_listener.shutdown();
         self.inbound_manager.shutdown();
     }
+
 }
 
 async fn create_components(
@@ -862,6 +876,17 @@ async fn create_components(
         Some(cancellation_token.child_token()),
     )?);
 
+    #[cfg(feature = "ebpf")]
+    debug!("initializing ebpf runner");
+    #[cfg(feature = "ebpf")]
+    let ebpf_runner: ArcRunner = Arc::new(proxy::ebpf::EbpfRunner::new(
+        config.ebpf.unwrap_or_default(),
+        dispatcher.clone(),
+        dns_resolver.clone(),
+        Some(cancellation_token.child_token()),
+    ));
+
+
     debug!("initializing dns listener");
     let dns_listener: ArcRunner = Arc::new(dns::DnsRunner::new(
         dns_enable,
@@ -882,6 +907,8 @@ async fn create_components(
         inbound_manager,
         #[cfg(feature = "tun")]
         tun_runner,
+        #[cfg(feature = "ebpf")]
+        ebpf_runner,
         dns_listener,
         dns_listen,
         dns_enabled: dns_enable,
@@ -891,6 +918,7 @@ async fn create_components(
         asn_mmdb_path,
         geodata,
         geosite_path,
+
     })
 }
 

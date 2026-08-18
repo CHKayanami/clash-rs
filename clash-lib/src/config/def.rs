@@ -54,6 +54,75 @@ impl Default for DnsHijack {
     }
 }
 
+#[derive(Serialize, Deserialize, Default, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub struct EbpfConfig {
+    pub enable: bool,
+    #[serde(default)]
+    pub lan_interface: Vec<String>,
+    #[serde(default)]
+    pub wan_interface: Option<String>,
+    #[serde(default = "default_tproxy_port")]
+    pub tproxy_port: u16,
+    #[serde(default = "default_tproxy_port")]
+    pub tproxy_udp_port: u16,
+    #[serde(default = "default_true")]
+    pub auto_route: bool,
+    #[serde(default = "default_bypass_ports")]
+    pub bypass_ports: Vec<u16>,
+    #[serde(default = "default_bypass_ports")]
+    pub bypass_src_ports: Vec<u16>,
+    #[serde(default)]
+    pub bypass_dst_ports: Vec<u16>,
+    #[serde(default)]
+    pub bypass_ips: Vec<String>,
+    #[serde(default)]
+    pub bypass_src_ips: Vec<String>,
+    #[serde(default = "default_bypass_dst_ips")]
+    pub bypass_dst_ips: Vec<String>,
+    #[serde(default)]
+    pub proxy_ports: Vec<u16>,
+    #[serde(default)]
+    pub proxy_src_ports: Vec<u16>,
+    #[serde(default)]
+    pub proxy_dst_ports: Vec<u16>,
+    #[serde(default)]
+    pub proxy_ips: Vec<String>,
+    #[serde(default)]
+    pub proxy_src_ips: Vec<String>,
+    #[serde(default)]
+    pub proxy_dst_ips: Vec<String>,
+    #[serde(default = "default_true")]
+    pub auto_direct_offload: bool,
+}
+
+fn default_bypass_ports() -> Vec<u16> {
+    vec![22, 67, 68, 5353]
+}
+
+fn default_bypass_dst_ips() -> Vec<String> {
+    vec![
+        "127.0.0.0/8".to_string(),
+        "169.254.0.0/16".to_string(),
+        "224.0.0.0/4".to_string(),
+        "::1/128".to_string(),
+        "fe80::/10".to_string(),
+        "fc00::/7".to_string(),
+        "ff00::/8".to_string(),
+    ]
+}
+
+
+
+
+fn default_tproxy_port() -> u16 {
+    12345
+}
+
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Serialize, Deserialize, Default, Debug, Clone)]
 #[serde(rename_all = "kebab-case")]
 pub struct TunConfig {
@@ -582,6 +651,7 @@ pub struct Config {
     ///   device-id: "dev://utun1989"
     /// ```
     pub tun: Option<TunConfig>,
+    pub ebpf: Option<EbpfConfig>,
 
     /// Explicit inbound listener definitions. Each entry must have a unique
     /// `name` and `type` (`http`, `socks`, `mixed`, `tproxy`, `redir`,

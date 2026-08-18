@@ -91,6 +91,10 @@ impl Dispatcher {
         decode_mode(self.mode.load(Ordering::Relaxed))
     }
 
+    pub fn router(&self) -> &ArcRouter {
+        &self.router
+    }
+
     #[instrument(skip(self, sess, lhs), fields(trace_id = sess.id))]
     pub async fn dispatch_stream(
         &self,
@@ -360,6 +364,12 @@ impl Dispatcher {
                                 }
                             };
 
+                            let sess_id = match sessions.get(&dest) {
+                                Some(s) => s.id,
+                                None => crate::session::generate_session_id(),
+                            };
+                            sess.id = sess_id;
+
                             let orig_dest = dest.clone();
                             let mut override_dest = false;
                             if let Some(ref sniffer) = sniffer {
@@ -522,12 +532,14 @@ impl Dispatcher {
                                 sessions.insert(
                                     dest.clone(),
                                     OutboundSession {
+                                        id: sess.id,
                                         sender: remote_sender,
                                         delay_key,
                                         _relay_handle: relay_handle,
                                     },
                                 );
                             }
+
                         }
                     }
                 }
@@ -543,10 +555,12 @@ impl Dispatcher {
 type OutboundPacketSender = tokio::sync::mpsc::Sender<(UdpPacket, SocksAddr)>;
 
 struct OutboundSession {
+    id: u64,
     sender: OutboundPacketSender,
     delay_key: tokio_util::time::delay_queue::Key,
     _relay_handle: JoinHandle<()>,
 }
+
 
 impl Drop for OutboundSession {
     fn drop(&mut self) {

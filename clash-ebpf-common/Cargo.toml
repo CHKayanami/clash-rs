@@ -1,0 +1,15 @@
+[package]
+name = "clash-ebpf-common"
+version.workspace = true
+edition.workspace = true
+license = "MIT"
+description = "Common data structures and constants shared between kernel eBPF and userspace for clash-rs"
+
+[dependencies]
+
+[target.'cfg(target_os = "linux")'.dependencies]
+aya = { version = "0.14", default-features = false, optional = true }
+
+[features]
+default = []
+user = ["dep:aya"]

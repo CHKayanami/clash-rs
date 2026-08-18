@@ -7,8 +7,12 @@ members = [
     "clash-doc",
     "clash-ffi",
     "clash-dns",
-    "clash-netstack"
+    "clash-netstack",
+    "clash-ebpf",
+    "clash-ebpf-common"
 ]
+exclude = ["clash-ebpf-bpf"]
+
 
 
 [workspace.package]
@@ -49,4 +53,3 @@ needless_collect = "deny"
 [patch.crates-io]
 rustls = { git = "https://github.com/Watfaq/rustls.git", branch = "watfaq/0.23.40" }
 tokio-rustls = { git = "https://github.com/Watfaq/tokio-rustls.git", branch = "watfaq/0.26.4" }
-

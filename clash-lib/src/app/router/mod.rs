@@ -105,6 +105,26 @@ impl Router {
         self.geodata.as_ref()
     }
 
+    /// Quick check if a domain routes to DIRECT.
+    pub async fn is_domain_direct(&self, domain: &str) -> bool {
+        let mut sess = Session {
+            destination: crate::session::SocksAddr::Domain(domain.to_string(), 80),
+            ..Default::default()
+        };
+        let (outbound, _) = self.match_route(&mut sess).await;
+        outbound.eq_ignore_ascii_case("DIRECT")
+    }
+
+    /// Quick check if an IP address routes to DIRECT.
+    pub async fn is_ip_direct(&self, ip: std::net::IpAddr) -> bool {
+        let mut sess = Session {
+            destination: crate::session::SocksAddr::Ip(std::net::SocketAddr::new(ip, 80)),
+            ..Default::default()
+        };
+        let (outbound, _) = self.match_route(&mut sess).await;
+        outbound.eq_ignore_ascii_case("DIRECT")
+    }
+
     /// this mutates the session, attaching resolved IP and ASN
     pub async fn match_route(
         &self,

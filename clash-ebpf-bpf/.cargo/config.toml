@@ -1,0 +1,13 @@
+[target.bpfel-unknown-none]
+rustflags = [
+  "-C",
+  "opt-level=2",
+  "-C",
+  "debuginfo=2",
+  "-C",
+  "link-arg=--emit=obj",
+  "-C",
+  "link-arg=--llvm-args=-bpf-stack-size=4096",
+  "-C",
+  "link-arg=--btf",
+]

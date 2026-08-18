@@ -1,0 +1,28 @@
+# ==========================================================
+# clash-rs eBPF 极简全功能测试配置
+# (所有管理端口、保留网段和本机物理 IP 均已由程序自动探测与内置放行)
+# ==========================================================
+
+mode: rule
+log-level: debug
+
+
+# 1. 内置 DNS 增强配置 (Fake-IP 模式)
+dns:
+  enable: true
+  listen: 0.0.0.0:1053
+  enhanced-mode: fake-ip
+  fake-ip-range: 198.18.0.1/16
+  nameserver:
+    - 223.5.5.5
+
+# 2. eBPF 内核透明代理引擎 (极简配置，开箱即用)
+ebpf:
+  enable: true
+  lan-interface: ["enp3s0"]
+  wan-interface: "enp3s0"
+
+
+
+rules:
+  - MATCH,DIRECT

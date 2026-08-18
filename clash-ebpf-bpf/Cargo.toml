@@ -1,0 +1,24 @@
+[package]
+name = "clash-ebpf-bpf"
+version = "0.10.7"
+edition = "2024"
+license = "MIT"
+
+[dependencies]
+aya-ebpf = "0.2"
+aya-ebpf-bindings = "0.2"
+aya-ebpf-cty = "0.3"
+clash-ebpf-common = { path = "../clash-ebpf-common" }
+network-types = "0.2.0"
+
+[[bin]]
+name = "clash-ebpf-bpf"
+path = "src/main.rs"
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+lto = true
+opt-level = 2

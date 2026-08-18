@@ -30,6 +30,8 @@ pub mod http;
 pub mod mixed;
 #[cfg(all(target_os = "linux", feature = "tproxy"))]
 pub mod tproxy;
+#[cfg(feature = "ebpf")]
+pub mod ebpf;
 
 #[cfg(all(target_os = "linux", feature = "redir"))]
 pub mod redir;

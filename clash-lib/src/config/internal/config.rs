@@ -31,7 +31,9 @@ pub struct Config {
     pub general: General,
     pub dns: dns::Config,
     pub tun: TunConfig,
+    pub ebpf: Option<def::EbpfConfig>,
     pub experimental: Option<def::Experimental>,
+
     pub profile: Profile,
     pub sniffer: Option<crate::app::sniffer::SnifferConfig>,
     pub rules: Vec<RuleType>,

@@ -41,6 +41,7 @@ shadowquic = ["dep:shadowquic", "shadowquic?/shadowquic-quinn"]
 wireguard = ["dep:boringtun", "dep:smoltcp"]
 tailscale = ["dep:tailscale"]
 tproxy = []
+ebpf = ["dep:clash-ebpf"]
 tun = [
     "dep:tun-rs",
     "dep:watfaq-netstack",
@@ -148,6 +149,7 @@ rust-embed = { version = "8", optional = true }
 # TUN
 tun-rs = { version = "2", features = ["async", "async_framed"], optional = true }
 watfaq-netstack = { path = "../clash-netstack", optional = true }
+clash-ebpf = { path = "../clash-ebpf", optional = true }
 smoltcp = { version = "0.13", default-features = false, features = ["std", "log", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-udp", "socket-tcp"], optional = true }
 
 # WireGuard
