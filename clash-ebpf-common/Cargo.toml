@@ -6,6 +6,7 @@ license = "MIT"
 description = "Common data structures and constants shared between kernel eBPF and userspace for clash-rs"
 
 [dependencies]
+network-types = { version = "0.2.0", default-features = false }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 aya = { version = "0.14", default-features = false, optional = true }

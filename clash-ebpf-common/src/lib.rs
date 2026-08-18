@@ -1,5 +1,11 @@
 #![no_std]
 
+pub mod conn;
+pub mod dae_ip;
+
+pub use conn::{ParseTransportCtx, Tuples, TuplesKey};
+pub use dae_ip::In6Addr;
+
 pub const DAE_TPROXY_MARK: u32 = 0x1dae;
 pub const DAE_BYPASS_MARK: u32 = 0x2dae;
 
