@@ -4,7 +4,7 @@ use std::fmt;
 use std::time::Duration;
 
 #[cfg(feature = "aead-cipher-2022")]
-use lru_time_cache::LruCache;
+use moka::sync::Cache;
 
 #[cfg(feature = "aead-cipher-2022")]
 use crate::relay::tcprelay::proxy_stream::protocol::v2::SERVER_STREAM_TIMESTAMP_MAX_DIFF;
@@ -16,7 +16,7 @@ pub struct ReplayProtector {
     // AEAD 2022 TCP protocol has a timestamp, which can already reject most of the replay requests,
     // so we only need to remember nonce that are in the valid time range
     #[cfg(feature = "aead-cipher-2022")]
-    nonce_set: spin::Mutex<LruCache<Vec<u8>, ()>>,
+    nonce_set: Cache<Vec<u8>, ()>,
 }
 
 impl fmt::Debug for ReplayProtector {
@@ -31,9 +31,10 @@ impl ReplayProtector {
     pub fn new(config_type: ServerType) -> Self {
         Self {
             #[cfg(feature = "aead-cipher-2022")]
-            nonce_set: spin::Mutex::new(LruCache::with_expiry_duration(Duration::from_secs(
-                SERVER_STREAM_TIMESTAMP_MAX_DIFF * 2,
-            ))),
+            nonce_set: Cache::builder()
+                .max_capacity(16384)
+                .time_to_live(Duration::from_secs(SERVER_STREAM_TIMESTAMP_MAX_DIFF * 2))
+                .build(),
         }
     }
 
@@ -48,11 +49,10 @@ impl ReplayProtector {
 
         #[cfg(feature = "aead-cipher-2022")]
         if method.is_aead_2022() {
-            let mut set = self.nonce_set.lock();
-            if set.get(nonce).is_some() {
+            if self.nonce_set.contains_key(nonce) {
                 return true;
             }
-            set.insert(nonce.to_vec(), ());
+            self.nonce_set.insert(nonce.to_vec(), ());
             return false;
         }
 

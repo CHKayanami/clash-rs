@@ -1663,7 +1663,7 @@ dependencies = [
  "env_logger",
  "futures",
  "log",
- "lru_time_cache",
+ "moka",
  "pin-project",
  "rand 0.10.1",
  "shadowsocks-crypto",
@@ -4866,12 +4866,6 @@ name = "lru-slab"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "112b39cec0b298b6c1999fee3e31427f74f676e4cb9879ed1a121b43661a4154"
-
-[[package]]
-name = "lru_time_cache"
-version = "0.11.11"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9106e1d747ffd48e6be5bb2d97fa706ed25b144fbee4d5c02eae110cd8d6badd"
 
 [[package]]
 name = "managed"

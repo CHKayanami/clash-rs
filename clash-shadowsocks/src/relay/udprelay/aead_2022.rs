@@ -46,13 +46,9 @@
 
 use std::{
     cell::RefCell,
-    cmp::Ordering,
-    collections::hash_map::DefaultHasher,
-    hash::{Hash, Hasher},
     io::{self, Cursor, Seek, SeekFrom},
-    rc::Rc,
     slice,
-    sync::Arc,
+    sync::{Arc, LazyLock},
     time::{Duration, SystemTime},
 };
 
@@ -63,7 +59,7 @@ use aes::{
 use byte_string::ByteStr;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use log::{error, trace};
-use lru_time_cache::LruCache;
+use moka::sync::Cache;
 
 #[cfg(feature = "aead-cipher-2022-extra")]
 use crate::crypto::v2::udp::ChaCha8Poly1305Cipher;
@@ -108,42 +104,25 @@ pub enum ProtocolError {
 /// AEAD 2022 protocol result
 pub type ProtocolResult<T> = Result<T, ProtocolError>;
 
-#[derive(PartialEq, Eq, Hash, Clone, Debug)]
+#[derive(PartialEq, Eq, Hash, Clone, Copy, Debug)]
 struct CipherKey {
     method: CipherKind,
     key: usize,
     session_id: u64,
 }
 
-impl PartialOrd for CipherKey {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for CipherKey {
-    fn cmp(&self, other: &Self) -> Ordering {
-        let hash1 = {
-            let mut hasher = DefaultHasher::new();
-            self.hash(&mut hasher);
-            hasher.finish()
-        };
-        let hash2 = {
-            let mut hasher = DefaultHasher::new();
-            other.hash(&mut hasher);
-            hasher.finish()
-        };
-
-        hash1.cmp(&hash2)
-    }
-}
-
 const CIPHER_CACHE_DURATION: Duration = Duration::from_secs(30);
-const CIPHER_CACHE_LIMIT: usize = 102400;
+const CIPHER_CACHE_LIMIT: usize = 4096;
+
+static CIPHER_CACHE: LazyLock<Cache<CipherKey, Arc<UdpCipher>>> = LazyLock::new(|| {
+    Cache::builder()
+        .max_capacity(CIPHER_CACHE_LIMIT as u64)
+        .time_to_idle(CIPHER_CACHE_DURATION)
+        .build()
+});
 
 thread_local! {
-    static CIPHER_CACHE: RefCell<LruCache<CipherKey, Rc<UdpCipher>>> =
-        RefCell::new(LruCache::with_expiry_duration_and_capacity(CIPHER_CACHE_DURATION, CIPHER_CACHE_LIMIT));
+    static FAST_PATH: RefCell<Option<(CipherKey, Arc<UdpCipher>)>> = const { RefCell::new(None) };
 }
 
 #[inline]
@@ -154,21 +133,26 @@ pub fn get_now_timestamp() -> u64 {
     }
 }
 
-fn get_cipher(method: CipherKind, key: &[u8], session_id: u64) -> Rc<UdpCipher> {
-    CIPHER_CACHE.with(|cache| {
-        let mut cache = cache.borrow_mut();
+fn get_cipher(method: CipherKind, key: &[u8], session_id: u64) -> Arc<UdpCipher> {
+    let cache_key = CipherKey {
+        method,
+        // The key is stored in ServerConfig structure, so the address of it won't change.
+        key: key.as_ptr() as usize,
+        session_id,
+    };
 
-        let cache_key = CipherKey {
-            method,
-            // The key is stored in ServerConfig structure, so the address of it won't change.
-            key: key.as_ptr() as usize,
-            session_id,
-        };
+    FAST_PATH.with(|fast| {
+        let mut fast = fast.borrow_mut();
 
-        cache
-            .entry(cache_key)
-            .or_insert_with(|| Rc::new(UdpCipher::new(method, key, session_id)))
-            .clone()
+        if let Some((ref k, ref cipher)) = *fast {
+            if *k == cache_key {
+                return cipher.clone();
+            }
+        }
+
+        let cipher = CIPHER_CACHE.get_with(cache_key, || Arc::new(UdpCipher::new(method, key, session_id)));
+        *fast = Some((cache_key, cipher.clone()));
+        cipher
     })
 }
 
