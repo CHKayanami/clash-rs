@@ -265,10 +265,6 @@ impl ShadowsocksUdpIo {
 }
 
 impl DatagramSend for ShadowsocksUdpIo {
-    fn poll_send(&self, _: &mut Context<'_>, _: &[u8]) -> Poll<io::Result<usize>> {
-        Poll::Ready(Err(new_io_error("not supported for shadowsocks udp io")))
-    }
-
     fn poll_send_to(
         &self,
         cx: &mut Context<'_>,
@@ -315,12 +311,6 @@ impl DatagramSend for ShadowsocksUdpIo {
             Poll::Pending => Poll::Pending,
         }
     }
-
-    fn poll_send_ready(&self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        let mut w = self.w.lock();
-        w.poll_ready_unpin(cx)
-            .map_err(|e| new_io_error(e.to_string()))
-    }
 }
 
 impl DatagramReceive for ShadowsocksUdpIo {
@@ -365,9 +355,5 @@ impl DatagramReceive for ShadowsocksUdpIo {
         _: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<std::net::SocketAddr>> {
         Poll::Ready(Err(new_io_error("not supported for shadowsocks udp io")))
-    }
-
-    fn poll_recv_ready(&self, _: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Poll::Ready(Ok(()))
     }
 }

@@ -8,7 +8,7 @@ use std::{
 };
 
 use futures::ready;
-use tokio::{io::ReadBuf, net::ToSocketAddrs};
+use tokio::io::ReadBuf;
 
 #[inline]
 fn make_mtu_error(packet_size: usize, mtu: usize) -> io::Error {
@@ -38,31 +38,6 @@ impl UdpSocket {
         self.mtu
     }
 
-    /// Wrapper of `UdpSocket::poll_send`
-    pub fn poll_send(&self, cx: &mut TaskContext<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
-        // Check MTU
-        if let Some(mtu) = self.mtu
-            && buf.len() > mtu
-        {
-            return Err(make_mtu_error(buf.len(), mtu)).into();
-        }
-
-        self.socket.poll_send(cx, buf)
-    }
-
-    /// Wrapper of `UdpSocket::send`
-    #[inline]
-    pub async fn send(&self, buf: &[u8]) -> io::Result<usize> {
-        // Check MTU
-        if let Some(mtu) = self.mtu
-            && buf.len() > mtu
-        {
-            return Err(make_mtu_error(buf.len(), mtu));
-        }
-
-        self.socket.send(buf).await
-    }
-
     /// Wrapper of `UdpSocket::poll_send_to`
     pub fn poll_send_to(&self, cx: &mut TaskContext<'_>, buf: &[u8], target: SocketAddr) -> Poll<io::Result<usize>> {
         // Check MTU
@@ -73,19 +48,6 @@ impl UdpSocket {
         }
 
         self.socket.poll_send_to(cx, buf, target)
-    }
-
-    /// Wrapper of `UdpSocket::send_to`
-    #[inline]
-    pub async fn send_to<A: ToSocketAddrs>(&self, buf: &[u8], target: A) -> io::Result<usize> {
-        // Check MTU
-        if let Some(mtu) = self.mtu
-            && buf.len() > mtu
-        {
-            return Err(make_mtu_error(buf.len(), mtu));
-        }
-
-        self.socket.send_to(buf, target).await
     }
 
     /// Wrapper of `UdpSocket::poll_recv`
@@ -102,20 +64,6 @@ impl UdpSocket {
         Ok(()).into()
     }
 
-    /// Wrapper of `UdpSocket::recv`
-    #[inline]
-    pub async fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
-        let n = self.socket.recv(buf).await?;
-
-        if let Some(mtu) = self.mtu
-            && n > mtu
-        {
-            return Err(make_mtu_error(n, mtu));
-        }
-
-        Ok(n)
-    }
-
     /// Wrapper of `UdpSocket::poll_recv_from`
     #[inline]
     pub fn poll_recv_from(&self, cx: &mut TaskContext<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<SocketAddr>> {
@@ -128,20 +76,6 @@ impl UdpSocket {
         }
 
         Ok(addr).into()
-    }
-
-    /// Wrapper of `UdpSocket::recv_from`
-    #[inline]
-    pub async fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
-        let (n, addr) = self.socket.recv_from(buf).await?;
-
-        if let Some(mtu) = self.mtu
-            && n > mtu
-        {
-            return Err(make_mtu_error(n, mtu));
-        }
-
-        Ok((n, addr))
     }
 }
 

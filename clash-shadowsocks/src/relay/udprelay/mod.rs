@@ -50,7 +50,7 @@
 use std::time::Duration;
 
 pub use self::proxy_socket::ProxySocket;
-pub use compat::{DatagramReceive, DatagramReceiveExt, DatagramSend, DatagramSendExt, DatagramSocket};
+pub use compat::{DatagramReceive, DatagramSend, DatagramSocket};
 
 #[cfg(feature = "aead-cipher")]
 mod aead;

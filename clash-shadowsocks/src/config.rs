@@ -4,7 +4,6 @@ use std::{
     collections::HashMap,
     fmt::{self, Debug, Display},
     net::SocketAddr,
-    str::FromStr,
     sync::Arc,
 };
 
@@ -488,59 +487,6 @@ impl From<&ServerAddr> for Address {
         match *addr {
             ServerAddr::SocketAddr(sa) => Self::SocketAddress(sa),
             ServerAddr::DomainName(ref dn, port) => Self::DomainNameAddress(dn.clone(), port),
-        }
-    }
-}
-
-/// Policy for handling replay attack requests
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Default)]
-pub enum ReplayAttackPolicy {
-    /// Default strategy based on protocol
-    ///
-    /// SIP022 (AEAD-2022): Reject
-    /// SIP004 (AEAD): Ignore
-    /// Stream: Ignore
-    #[default]
-    Default,
-    /// Ignore it completely
-    Ignore,
-    /// Try to detect replay attack and warn about it
-    Detect,
-    /// Try to detect replay attack and reject the request
-    Reject,
-}
-
-impl Display for ReplayAttackPolicy {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match *self {
-            Self::Default => f.write_str("default"),
-            Self::Ignore => f.write_str("ignore"),
-            Self::Detect => f.write_str("detect"),
-            Self::Reject => f.write_str("reject"),
-        }
-    }
-}
-
-/// Error while parsing ReplayAttackPolicy from string
-#[derive(Debug, Clone, Copy)]
-pub struct ReplayAttackPolicyError;
-
-impl Display for ReplayAttackPolicyError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("invalid ReplayAttackPolicy")
-    }
-}
-
-impl FromStr for ReplayAttackPolicy {
-    type Err = ReplayAttackPolicyError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "default" => Ok(Self::Default),
-            "ignore" => Ok(Self::Ignore),
-            "detect" => Ok(Self::Detect),
-            "reject" => Ok(Self::Reject),
-            _ => Err(ReplayAttackPolicyError),
         }
     }
 }

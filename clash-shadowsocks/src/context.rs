@@ -2,11 +2,8 @@
 
 use std::{io, sync::Arc};
 
-use byte_string::ByteStr;
-use log::warn;
-
 use crate::{
-    config::{ReplayAttackPolicy, ServerType},
+    config::ServerType,
     crypto::CipherKind,
     security::replay::ReplayProtector,
 };
@@ -14,11 +11,8 @@ use crate::{
 /// Service context
 #[derive(Debug)]
 pub struct Context {
-    // Protector against replay attack
-    // The actual replay detection behavior is implemented in ReplayProtector
+    // Protector against replay attack (AEAD-2022)
     replay_protector: ReplayProtector,
-    // Policy against replay attack
-    replay_policy: ReplayAttackPolicy,
 }
 
 /// `Context` for sharing between services
@@ -29,7 +23,6 @@ impl Context {
     pub fn new(config_type: ServerType) -> Self {
         Self {
             replay_protector: ReplayProtector::new(config_type),
-            replay_policy: ReplayAttackPolicy::Default,
         }
     }
 
@@ -38,16 +31,11 @@ impl Context {
         SharedContext::new(Self::new(config_type))
     }
 
-    /// Check if nonce exist or not
-    ///
-    /// If not, set into the current bloom filter
+    /// Check if nonce exist or not (for generating unique nonces)
     #[cfg(any(feature = "stream-cipher", feature = "aead-cipher", feature = "aead-cipher-2022"))]
     #[inline(always)]
     fn check_nonce_and_set(&self, method: CipherKind, nonce: &[u8]) -> bool {
-        match self.replay_policy {
-            ReplayAttackPolicy::Ignore => false,
-            _ => self.replay_protector.check_nonce_and_set(method, nonce),
-        }
+        self.replay_protector.check_nonce_and_set(method, nonce)
     }
 
     /// Generate nonce (IV or SALT)
@@ -77,47 +65,22 @@ impl Context {
         }
     }
 
-    /// Check nonce replay
+    /// Check nonce replay (AEAD-2022)
     pub fn check_nonce_replay(&self, method: CipherKind, nonce: &[u8]) -> io::Result<()> {
         if nonce.is_empty() {
             return Ok(());
         }
 
-        #[allow(unused_mut)]
-        let mut replay_policy = self.replay_policy;
-
         #[cfg(feature = "aead-cipher-2022")]
         if method.is_aead_2022() {
-            // AEAD-2022 can't be ignored.
-            replay_policy = ReplayAttackPolicy::Reject;
+            if self.replay_protector.check_nonce_and_set(method, nonce) {
+                return Err(io::Error::other("detected repeated nonce (iv/salt)"));
+            }
+            return Ok(());
         }
 
-        match replay_policy {
-            ReplayAttackPolicy::Default | ReplayAttackPolicy::Ignore => Ok(()),
-            ReplayAttackPolicy::Detect => {
-                if self.replay_protector.check_nonce_and_set(method, nonce) {
-                    warn!("detected repeated nonce (iv/salt) {:?}", ByteStr::new(nonce));
-                }
-                Ok(())
-            }
-            ReplayAttackPolicy::Reject => {
-                if self.replay_protector.check_nonce_and_set(method, nonce) {
-                    let err = io::Error::other("detected repeated nonce (iv/salt)");
-                    Err(err)
-                } else {
-                    Ok(())
-                }
-            }
-        }
-    }
-
-    /// Set policy against replay attack
-    pub fn set_replay_attack_policy(&mut self, replay_policy: ReplayAttackPolicy) {
-        self.replay_policy = replay_policy;
-    }
-
-    /// Get policy against replay attack
-    pub fn replay_attack_policy(&self) -> ReplayAttackPolicy {
-        self.replay_policy
+        let _ = method;
+        let _ = nonce;
+        Ok(())
     }
 }
