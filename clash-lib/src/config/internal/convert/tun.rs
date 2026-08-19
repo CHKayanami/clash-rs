@@ -105,6 +105,7 @@ pub fn convert(
                         }
                     }
                 },
+                max_pooled_buffers: t.max_pooled_buffers,
             })
         }
         None => Ok(config::TunConfig::default()),

@@ -19,20 +19,39 @@ pub struct DomainSet {
 
 impl DomainSet {
     pub fn has(&self, key: &str) -> bool {
-        let key = key
-            .chars()
-            .rev()
-            .map(|x| x.to_ascii_lowercase())
-            .collect::<Vec<_>>();
+        let key_bytes = key.as_bytes();
+        let mut stack_buf = [0u8; 256];
+        let heap_buf;
+        let rev_key: &[u8] = if key_bytes.len() <= 256 {
+            let slice = &mut stack_buf[..key_bytes.len()];
+            for (i, &b) in key_bytes.iter().rev().enumerate() {
+                slice[i] = b.to_ascii_lowercase();
+            }
+            slice
+        } else {
+            heap_buf = key_bytes
+                .iter()
+                .rev()
+                .map(|b| b.to_ascii_lowercase())
+                .collect::<Vec<u8>>();
+            &heap_buf
+        };
+        let key = rev_key;
         let mut node_id = 0;
         let mut bm_idx = 0;
 
+        #[derive(Clone, Copy)]
         struct Cursor {
             bm_idx: usize,
             index: usize,
         }
 
-        let mut stack = vec![];
+        let mut stack_inline = [Cursor {
+            bm_idx: 0,
+            index: 0,
+        }; 8];
+        let mut stack_len = 0;
+        let mut stack_heap: Vec<Cursor> = Vec::new();
 
         #[derive(PartialEq)]
         enum State {
@@ -42,21 +61,25 @@ impl DomainSet {
 
         let mut i: usize = 0;
 
-        while i < key.len()
-        // i++
-        {
+        while i < key.len() {
             let mut state = State::Restart;
 
             'ctrl: while state == State::Restart {
                 state = State::Done;
 
                 let c = key[i];
-                loop
-                // bm_idx++
-                {
+                loop {
                     if get_bit(&self.label_bit_map, bm_idx) {
-                        if !stack.is_empty() {
-                            let cursor: Cursor = stack.pop().unwrap();
+                        let cursor_opt = if !stack_heap.is_empty() {
+                            stack_heap.pop()
+                        } else if stack_len > 0 {
+                            stack_len -= 1;
+                            Some(stack_inline[stack_len])
+                        } else {
+                            None
+                        };
+
+                        if let Some(cursor) = cursor_opt {
                             let next_node_id = count_zeros(
                                 &self.label_bit_map,
                                 &self.ranks,
@@ -69,10 +92,11 @@ impl DomainSet {
                                 next_node_id - 1,
                             ) + 1;
 
-                            let mut j = cursor.index;
-                            while j < key.len() && key[j] != DOMAIN_STEP as char {
-                                j += 1;
-                            }
+                            let j = cursor.index
+                                + key[cursor.index..]
+                                    .iter()
+                                    .position(|&b| b == DOMAIN_STEP)
+                                    .unwrap_or(key.len() - cursor.index);
                             if j == key.len() {
                                 if get_bit(&self.leaves, next_node_id as isize) {
                                     return true;
@@ -110,8 +134,13 @@ impl DomainSet {
                             bm_idx: bm_idx as usize,
                             index: i,
                         };
-                        stack.push(cursor);
-                    } else if self.labels[bm_idx as usize - node_id] == c as u8 {
+                        if stack_len < 8 && stack_heap.is_empty() {
+                            stack_inline[stack_len] = cursor;
+                            stack_len += 1;
+                        } else {
+                            stack_heap.push(cursor);
+                        }
+                    } else if self.labels[bm_idx as usize - node_id] == c {
                         break;
                     }
 
@@ -172,38 +201,37 @@ impl DomainSet {
     }
 
     fn init(&mut self) {
-        self.ranks.clear(); // Ensure clean state
-        self.selects.clear();
-
+        self.ranks.clear();
+        self.ranks.reserve(self.label_bit_map.len() + 1);
         self.ranks.push(0);
-        for i in 0..self.label_bit_map.len() {
-            let n = self.label_bit_map[i].count_ones();
-            // Ensure ranks has enough capacity or handle potential panic if last()
-            // is called on empty vec
-            let last_rank = self.ranks.last().copied().unwrap_or(0);
-            self.ranks.push(last_rank + n as i32);
+
+        let mut total_ones: usize = 0;
+        for &word in &self.label_bit_map {
+            let n = word.count_ones() as usize;
+            total_ones += n;
+            self.ranks.push(total_ones as i32);
         }
 
-        let mut n: u64 = 0; // a bit counting
-        let total_bits = self.label_bit_map.len() * 64;
+        let select_cap = (total_ones + 63) / 64;
+        self.selects.clear();
+        self.selects.reserve(select_cap);
 
-        for i in 0..total_bits {
-            let word_index = i >> 6;
-            let bit_index = i & 63;
-
-            if word_index >= self.label_bit_map.len() {
-                break;
-            }
-
-            let is_set = (self.label_bit_map[word_index] >> bit_index) & 1;
-            if is_set == 1 {
-                if n & 63 == 0 {
-                    // Check if it's the start of a select block (every 64th '1' bit)
-                    self.selects.push(i as i32);
+        let mut ones_count: usize = 0;
+        for (word_idx, &word) in self.label_bit_map.iter().enumerate() {
+            let mut w = word;
+            let base_bit = (word_idx * 64) as i32;
+            while w != 0 {
+                let bit_idx = w.trailing_zeros() as i32;
+                if ones_count & 63 == 0 {
+                    self.selects.push(base_bit + bit_idx);
                 }
-                n += 1;
+                ones_count += 1;
+                w &= w - 1; // Clear lowest set bit
             }
         }
+
+        self.ranks.shrink_to_fit();
+        self.selects.shrink_to_fit();
     }
 
     #[cfg(test)]
@@ -342,40 +370,64 @@ impl<T> From<StringTrie<T>> for DomainSet {
     }
 }
 
+#[inline(always)]
 fn get_bit(bm: &[u64], i: isize) -> bool {
-    if bm.is_empty() {
+    if i < 0 {
         return false;
     }
-    bm[(i >> 6) as usize] & (1 << (i & 63) as usize) != 0
-}
-
-fn set_bit(bm: &mut Vec<u64>, i: usize, v: bool) {
-    while i >> 6 >= (bm.len()) {
-        bm.push(0);
+    let word_idx = (i >> 6) as usize;
+    if let Some(&word) = bm.get(word_idx) {
+        (word & (1u64 << ((i as usize) & 63))) != 0
+    } else {
+        false
     }
-    bm[i >> 6] |= (v as u64) << (i & 63);
 }
 
+#[inline]
+fn set_bit(bm: &mut Vec<u64>, i: usize, v: bool) {
+    let word_idx = i >> 6;
+    if word_idx >= bm.len() {
+        bm.resize(word_idx + 1, 0);
+    }
+    if v {
+        bm[word_idx] |= 1u64 << (i & 63);
+    } else {
+        bm[word_idx] &= !(1u64 << (i & 63));
+    }
+}
+
+#[inline(always)]
 fn count_zeros(bm: &[u64], ranks: &[i32], i: usize) -> usize {
-    i - ranks[i >> 6] as usize
-        - (bm[i >> 6] & ((1 << (i & 63)) - 1)).count_ones() as usize
+    let word_idx = i >> 6;
+    let bit_idx = i & 63;
+    let mask = if bit_idx == 0 {
+        0
+    } else {
+        (1u64 << bit_idx) - 1
+    };
+    i - ranks[word_idx] as usize - (bm[word_idx] & mask).count_ones() as usize
 }
 
+#[inline]
 fn select_ith_one(bm: &[u64], ranks: &[i32], selects: &[i32], i: usize) -> usize {
-    let base = selects[i >> 6] & !63;
-    let mut find_ith_one = i as isize - ranks[base as usize >> 6] as isize;
-    for (i, w) in bm.iter().enumerate().skip(base as usize >> 6) {
-        let mut bit_idx = 0;
-        let mut w = *w;
-        while w > 0 {
-            find_ith_one -= (w & 1) as isize;
-            if find_ith_one < 0 {
-                return (i << 6) + bit_idx;
-            }
+    let base = (selects[i >> 6] & !63) as usize >> 6;
+    let mut find_ith_one = i as isize - ranks[base] as isize;
 
-            let t0 = (w & !1).trailing_zeros();
-            w = w.unbounded_shr(t0);
-            bit_idx += t0 as usize;
+    for (word_idx, &w) in bm.iter().enumerate().skip(base) {
+        let ones = w.count_ones() as isize;
+        if find_ith_one >= ones {
+            find_ith_one -= ones;
+            continue;
+        }
+
+        let mut w = w;
+        while w > 0 {
+            let bit_idx = w.trailing_zeros() as usize;
+            if find_ith_one == 0 {
+                return (word_idx << 6) + bit_idx;
+            }
+            find_ith_one -= 1;
+            w &= w - 1; // Clear lowest set bit
         }
     }
 

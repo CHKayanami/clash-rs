@@ -5,7 +5,7 @@ use std::{
     io::{BufReader, Cursor, Read},
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
 };
-use tracing::{debug, error, warn};
+use tracing::debug;
 
 use crate::{
     app::remote_content_manager::providers::rule_provider::{
@@ -154,42 +154,35 @@ fn parse_ipcidr_payload<R: Read>(reader: &mut R) -> Result<RuleContent> {
 
     let mut cidr_trie = CidrTrie::new();
 
-    for i in 0..ranges_len {
-        let mut range_buf = [0u8; 32];
+    const CHUNK_RANGES: usize = 128; // 128 * 32 bytes = 4KB
+    let mut buf = [0u8; CHUNK_RANGES * 32];
+    let mut remaining = ranges_len;
+    let mut current_idx = 0;
+
+    while remaining > 0 {
+        let to_read = remaining.min(CHUNK_RANGES);
+        let bytes_to_read = to_read * 32;
         reader
-            .read_exact(&mut range_buf)
-            .with_context(|| format!("Failed to read IP range #{i}"))?;
+            .read_exact(&mut buf[..bytes_to_read])
+            .with_context(|| {
+                format!("Failed to read IP ranges starting at #{current_idx}")
+            })?;
 
-        let from_ip_bytes: [u8; 16] = range_buf[0..16].try_into().unwrap();
-        let to_ip_bytes: [u8; 16] = range_buf[16..32].try_into().unwrap();
-        let from_ip = IpAddr::from(from_ip_bytes);
-        let to_ip = IpAddr::from(to_ip_bytes);
+        for (offset, chunk) in buf[..bytes_to_read].chunks_exact(32).enumerate() {
+            let i = current_idx + offset;
+            let from_ip_bytes: [u8; 16] = chunk[0..16].try_into().unwrap();
+            let to_ip_bytes: [u8; 16] = chunk[16..32].try_into().unwrap();
+            let from_ip = IpAddr::from(from_ip_bytes);
+            let to_ip = IpAddr::from(to_ip_bytes);
 
-        // Convert the range to CIDRs
-        match range_to_cidrs(from_ip, to_ip) {
-            Ok(cidrs) => {
-                for cidr in cidrs {
-                    // CidrTrie::insert expects a &str
-                    if !cidr_trie.insert(&cidr.to_string()) {
-                        // Log potentially invalid CIDR strings if insert fails
-                        warn!(
-                            "Failed to insert CIDR {} derived from range {} - {} \
-                             into CidrTrie",
-                            cidr, from_ip, to_ip
-                        );
-                    }
-                }
-            }
-            Err(e) => {
-                error!(
-                    "Failed to convert range {} - {} to CIDRs for range #{}: {}",
-                    from_ip, to_ip, i, e
-                );
-                // Decide whether to continue or bail out
-                // continue; // Skip this range
-                return Err(e).context(format!("Error processing IP range #{i}")); // Bail out
-            }
+            emit_range_cidrs(from_ip, to_ip, |cidr| {
+                cidr_trie.insert_net(cidr);
+            })
+            .with_context(|| format!("Error processing IP range #{i}"))?;
         }
+
+        remaining -= to_read;
+        current_idx += to_read;
     }
 
     debug!(
@@ -215,12 +208,25 @@ fn read_u64_vec<R: Read>(
     count: usize,
     field_name: &str,
 ) -> Result<Vec<u64>> {
+    const CHUNK_SIZE: usize = 1024;
     let mut vec = Vec::with_capacity(count);
-    for i in 0..count {
-        let val = reader.read_u64::<BigEndian>().with_context(|| {
-            format!("Failed to read {field_name} data element #{i}")
+    let mut buf = [0u8; CHUNK_SIZE * 8];
+    let mut remaining = count;
+    let mut idx = 0;
+
+    while remaining > 0 {
+        let to_read = remaining.min(CHUNK_SIZE);
+        let bytes_to_read = to_read * 8;
+        reader.read_exact(&mut buf[..bytes_to_read]).with_context(|| {
+            format!("Failed to read {field_name} data elements starting at #{idx}")
         })?;
-        vec.push(val);
+
+        for chunk in buf[..bytes_to_read].chunks_exact(8) {
+            vec.push(u64::from_be_bytes(chunk.try_into().unwrap()));
+        }
+
+        remaining -= to_read;
+        idx += to_read;
     }
     Ok(vec)
 }
@@ -239,20 +245,31 @@ fn read_byte_vec<R: Read>(
             MAX_BYTE_VEC_LEN
         );
     }
-    let mut vec = vec![0u8; len];
-    reader.read_exact(&mut vec).with_context(|| {
-        format!("Failed to read {field_name} data ({len} bytes)")
-    })?;
+    let mut vec = Vec::with_capacity(len);
+    reader
+        .take(len as u64)
+        .read_to_end(&mut vec)
+        .with_context(|| format!("Failed to read {field_name} data ({len} bytes)"))?;
+    if vec.len() != len {
+        bail!(
+            "Unexpected EOF while reading {field_name}: expected {len} bytes, got {}",
+            vec.len()
+        );
+    }
     Ok(vec)
 }
 
 // --- Range to CIDR Conversion Logic ---
 
-/// Converts an inclusive IP address range [start, end] into a minimal list of
-/// CIDR prefixes using an optimized algorithm.
-fn range_to_cidrs(start: IpAddr, end: IpAddr) -> Result<Vec<IpNet>> {
+/// Converts an inclusive IP address range [start, end] into CIDR prefixes,
+/// directly emitting each CIDR to avoid intermediate heap allocations.
+fn emit_range_cidrs<F: FnMut(IpNet)>(
+    start: IpAddr,
+    end: IpAddr,
+    emit: F,
+) -> Result<()> {
     if start > end {
-        return Ok(Vec::new()); // Empty range
+        return Ok(()); // Empty range
     }
 
     // Normalize IPv4-mapped IPv6 addresses
@@ -279,46 +296,39 @@ fn range_to_cidrs(start: IpAddr, end: IpAddr) -> Result<Vec<IpNet>> {
 
     match (start, end) {
         (IpAddr::V4(start_v4), IpAddr::V4(end_v4)) => {
-            range_to_cidrs_v4(start_v4, end_v4)
+            emit_range_cidrs_v4(start_v4, end_v4, emit)
         }
         (IpAddr::V6(start_v6), IpAddr::V6(end_v6)) => {
-            range_to_cidrs_v6(start_v6, end_v6)
+            emit_range_cidrs_v6(start_v6, end_v6, emit)
         }
         _ => unreachable!("Already checked address family"),
     }
 }
 
-fn range_to_cidrs_v4(start: Ipv4Addr, end: Ipv4Addr) -> Result<Vec<IpNet>> {
-    let mut result = Vec::new();
+fn emit_range_cidrs_v4<F: FnMut(IpNet)>(
+    start: Ipv4Addr,
+    end: Ipv4Addr,
+    mut emit: F,
+) -> Result<()> {
     let mut current = u32::from(start);
     let end_u32 = u32::from(end);
 
     while current <= end_u32 {
-        // Find the largest CIDR block starting at current that fits within the range
-
-        // 1. Find alignment: how many trailing zeros does current have?
         let trailing_zeros = if current == 0 {
             32
         } else {
             current.trailing_zeros()
         };
 
-        // 2. Find the largest block size that fits in the remaining range
         let remaining_ips = end_u32 - current + 1;
-
-        // Find the largest power of 2 that is <= remaining_ips
-        // Note: remaining_ips is always >= 1 due to loop condition
         let max_block_size_bits = 31 - remaining_ips.leading_zeros();
-
-        // Take the minimum: we can't use more bits than alignment allows
         let block_size_bits = trailing_zeros.min(max_block_size_bits);
         let prefix_len = 32 - block_size_bits;
 
         let cidr =
             IpNet::new(IpAddr::V4(Ipv4Addr::from(current)), prefix_len as u8)?;
-        result.push(cidr);
+        emit(cidr);
 
-        // Move to next block
         let block_size = 1u64 << block_size_bits;
         let next = current as u64 + block_size;
         if next > end_u32 as u64 || next > u32::MAX as u64 {
@@ -327,40 +337,33 @@ fn range_to_cidrs_v4(start: Ipv4Addr, end: Ipv4Addr) -> Result<Vec<IpNet>> {
         current = next as u32;
     }
 
-    Ok(result)
+    Ok(())
 }
 
-fn range_to_cidrs_v6(start: Ipv6Addr, end: Ipv6Addr) -> Result<Vec<IpNet>> {
-    let mut result = Vec::new();
+fn emit_range_cidrs_v6<F: FnMut(IpNet)>(
+    start: Ipv6Addr,
+    end: Ipv6Addr,
+    mut emit: F,
+) -> Result<()> {
     let mut current = u128::from(start);
     let end_u128 = u128::from(end);
 
     while current <= end_u128 {
-        // Find the largest CIDR block starting at current that fits within the range
-
-        // 1. Find alignment: how many trailing zeros does current have?
         let trailing_zeros = if current == 0 {
             128
         } else {
             current.trailing_zeros()
         };
 
-        // 2. Find the largest block size that fits in the remaining range
         let remaining_ips = end_u128 - current + 1;
-
-        // Find the largest power of 2 that is <= remaining_ips
-        // Note: remaining_ips is always >= 1 due to loop condition
         let max_block_size_bits = 127 - remaining_ips.leading_zeros();
-
-        // Take the minimum: we can't use more bits than alignment allows
         let block_size_bits = trailing_zeros.min(max_block_size_bits);
         let prefix_len = 128 - block_size_bits;
 
         let cidr =
             IpNet::new(IpAddr::V6(Ipv6Addr::from(current)), prefix_len as u8)?;
-        result.push(cidr);
+        emit(cidr);
 
-        // Move to next block
         debug_assert!(
             block_size_bits < 128,
             "block_size_bits should always be less than 128"
@@ -373,6 +376,15 @@ fn range_to_cidrs_v6(start: Ipv6Addr, end: Ipv6Addr) -> Result<Vec<IpNet>> {
         }
     }
 
+    Ok(())
+}
+
+/// Converts an inclusive IP address range [start, end] into a minimal list of
+/// CIDR prefixes using an optimized algorithm.
+#[cfg(test)]
+fn range_to_cidrs(start: IpAddr, end: IpAddr) -> Result<Vec<IpNet>> {
+    let mut result = Vec::new();
+    emit_range_cidrs(start, end, |cidr| result.push(cidr))?;
     Ok(result)
 }
 

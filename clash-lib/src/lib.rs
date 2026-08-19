@@ -324,7 +324,11 @@ pub async fn start(
     let target = env!("CLASH_TARGET_TRIPLE");
     let author = env!("CLASH_FORK_AUTHOR");
     let features = option_env!("CLASH_FEATURES").unwrap_or("");
-    let features_str = if features.is_empty() { "none" } else { features };
+    let features_str = if features.is_empty() {
+        "none"
+    } else {
+        features
+    };
     if target.is_empty() {
         info!(
             "starting clash-rs {} (fork by {}) {}/{} features: {}",
@@ -404,7 +408,6 @@ pub async fn start(
     let reload_token = shutdown_token.child_token();
     let shutdown_token_clone = shutdown_token.clone();
     let reload_handle = tokio::spawn(async move {
-
         // Listen for config reload signal and reload config
         loop {
             tokio::select! {
@@ -490,17 +493,33 @@ pub async fn start(
         Ok::<(), Error>(())
     });
 
+    #[cfg(unix)]
+    let mut sigterm =
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .map_err(Error::Io)?;
+
     tokio::select! {
         result = tokio::signal::ctrl_c() => {
             shutdown_token.cancel();
             result.map_err(Error::Io)?;
         }
+        _ = async {
+            #[cfg(unix)]
+            {
+                sigterm.recv().await;
+            }
+            #[cfg(not(unix))]
+            {
+                std::future::pending::<()>().await;
+            }
+        } => {
+            tracing::info!("received SIGTERM, shutting down gracefully");
+            shutdown_token.cancel();
+        }
         _ = shutdown_token.cancelled() => {}
     }
     let _ = reload_handle.await;
     Ok(())
-
-
 }
 
 struct RuntimeComponents {
@@ -546,7 +565,6 @@ impl RuntimeComponents {
         self.dns_listener.shutdown();
         self.inbound_manager.shutdown();
     }
-
 }
 
 async fn create_components(
@@ -565,10 +583,14 @@ async fn create_components(
             || config.tun.route_all
             || config.tun.auto_detect_interface;
         if need_iface {
-            debug!("tun enabled with auto-route or explicit interface, initializing default outbound interface");
+            debug!(
+                "tun enabled with auto-route or explicit interface, initializing default outbound interface"
+            );
             init_net_config(explicit_iface.as_deref(), config.tun.so_mark).await;
         } else {
-            debug!("tun enabled without auto-route/auto-detect, skipping default outbound interface binding");
+            debug!(
+                "tun enabled without auto-route/auto-detect, skipping default outbound interface binding"
+            );
             *crate::app::net::TUN_SOMARK.write().await = config.tun.so_mark;
         }
     }
@@ -886,7 +908,6 @@ async fn create_components(
         Some(cancellation_token.child_token()),
     ));
 
-
     debug!("initializing dns listener");
     let dns_listener: ArcRunner = Arc::new(dns::DnsRunner::new(
         dns_enable,
@@ -918,7 +939,6 @@ async fn create_components(
         asn_mmdb_path,
         geodata,
         geosite_path,
-
     })
 }
 

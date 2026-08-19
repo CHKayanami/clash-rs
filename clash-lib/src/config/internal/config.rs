@@ -203,10 +203,9 @@ impl DnsHijack {
             Self::Disabled => false,
             Self::All => dst.port() == 53,
             Self::Rules(rules) => rules.iter().any(|rule| match rule {
-                DnsHijackRule::Any {
-                    network: net,
-                    port,
-                } => (net.is_none() || *net == Some(network)) && dst.port() == *port,
+                DnsHijackRule::Any { network: net, port } => {
+                    (net.is_none() || *net == Some(network)) && dst.port() == *port
+                }
                 DnsHijackRule::IpNet {
                     network: net,
                     ipnet,
@@ -251,6 +250,7 @@ pub struct TunConfig {
     pub include_package: Vec<String>,
     pub exclude_package: Vec<String>,
     pub dns_hijack: DnsHijack,
+    pub max_pooled_buffers: Option<usize>,
 }
 
 impl Default for TunConfig {
@@ -284,6 +284,7 @@ impl Default for TunConfig {
             include_package: Vec::new(),
             exclude_package: Vec::new(),
             dns_hijack: DnsHijack::Disabled,
+            max_pooled_buffers: None,
         }
     }
 }
@@ -453,8 +454,12 @@ mod tests {
         let rule_subnet = DnsHijackRule::from_str("198.18.0.0/16:53").unwrap();
 
         let hijack_any = DnsHijack::Rules(vec![rule_any]);
-        assert!(hijack_any.is_hijacked(Network::Tcp, &"1.2.3.4:53".parse().unwrap()));
-        assert!(hijack_any.is_hijacked(Network::Udp, &"1.2.3.4:53".parse().unwrap()));
+        assert!(
+            hijack_any.is_hijacked(Network::Tcp, &"1.2.3.4:53".parse().unwrap())
+        );
+        assert!(
+            hijack_any.is_hijacked(Network::Udp, &"1.2.3.4:53".parse().unwrap())
+        );
 
         let hijack = DnsHijack::Rules(vec![rule_tcp, rule_udp, rule_subnet]);
 
@@ -478,6 +483,8 @@ mod tests {
         let hijack_all = DnsHijack::All;
         assert!(hijack_all.is_hijacked(Network::Tcp, &addr_other));
         assert!(hijack_all.is_hijacked(Network::Udp, &addr_other));
-        assert!(!hijack_all.is_hijacked(Network::Udp, &"9.9.9.9:80".parse().unwrap()));
+        assert!(
+            !hijack_all.is_hijacked(Network::Udp, &"9.9.9.9:80".parse().unwrap())
+        );
     }
 }

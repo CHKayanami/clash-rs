@@ -347,7 +347,7 @@ impl EbpfListener {
             msg.msg_iov = &mut iov;
             msg.msg_iovlen = 1;
             msg.msg_control = control_buf.as_mut_ptr() as *mut libc::c_void;
-            msg.msg_controllen = control_buf.len() as libc::size_t;
+            msg.msg_controllen = control_buf.len() as _;
 
             let n = unsafe { libc::recvmsg(fd, &mut msg, libc::MSG_DONTWAIT) };
             if n < 0 {

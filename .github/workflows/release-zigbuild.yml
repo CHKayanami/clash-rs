@@ -42,7 +42,7 @@ jobs:
             archive-name: clash-rs-standard-x86_64-unknown-linux-gnu
             binary-name: clash-rs
             archive-ext: tar.gz
-            features: standard
+            features: standard,ebpf
             os: ubuntu-latest
             use-zigbuild: true
             opt-level: "3"
@@ -50,7 +50,7 @@ jobs:
             archive-name: clash-rs-minimal-x86_64-unknown-linux-gnu
             binary-name: clash-rs
             archive-ext: tar.gz
-            features: minimal
+            features: minimal,ebpf
             os: ubuntu-latest
             use-zigbuild: true
             opt-level: "3"
@@ -60,7 +60,7 @@ jobs:
             archive-name: clash-rs-standard-x86_64-unknown-linux-musl
             binary-name: clash-rs
             archive-ext: tar.gz
-            features: standard,mimalloc
+            features: standard,mimalloc,ebpf
             os: ubuntu-latest
             use-zigbuild: true
             opt-level: "3"
@@ -68,7 +68,7 @@ jobs:
             archive-name: clash-rs-minimal-x86_64-unknown-linux-musl
             binary-name: clash-rs
             archive-ext: tar.gz
-            features: minimal,mimalloc
+            features: minimal,mimalloc,ebpf
             os: ubuntu-latest
             use-zigbuild: true
             opt-level: "3"
@@ -78,7 +78,7 @@ jobs:
             archive-name: clash-rs-standard-aarch64-unknown-linux-gnu
             binary-name: clash-rs
             archive-ext: tar.gz
-            features: standard
+            features: standard,ebpf
             os: ubuntu-latest
             use-zigbuild: true
             opt-level: "3"
@@ -86,7 +86,7 @@ jobs:
             archive-name: clash-rs-minimal-aarch64-unknown-linux-gnu
             binary-name: clash-rs
             archive-ext: tar.gz
-            features: minimal
+            features: minimal,ebpf
             os: ubuntu-latest
             use-zigbuild: true
             opt-level: "3"
@@ -96,7 +96,7 @@ jobs:
             archive-name: clash-rs-standard-aarch64-unknown-linux-musl
             binary-name: clash-rs
             archive-ext: tar.gz
-            features: standard,mimalloc
+            features: standard,mimalloc,ebpf
             os: ubuntu-latest
             use-zigbuild: true
             opt-level: "s"
@@ -104,7 +104,7 @@ jobs:
             archive-name: clash-rs-minimal-aarch64-unknown-linux-musl
             binary-name: clash-rs
             archive-ext: tar.gz
-            features: minimal,mimalloc
+            features: minimal,mimalloc,ebpf
             os: ubuntu-latest
             use-zigbuild: true
             opt-level: "s"
@@ -114,7 +114,7 @@ jobs:
             archive-name: clash-rs-standard-armv7-unknown-linux-gnueabihf
             binary-name: clash-rs
             archive-ext: tar.gz
-            features: standard
+            features: standard,ebpf
             os: ubuntu-latest
             use-zigbuild: true
             opt-level: "s"
@@ -122,7 +122,7 @@ jobs:
             archive-name: clash-rs-minimal-armv7-unknown-linux-gnueabihf
             binary-name: clash-rs
             archive-ext: tar.gz
-            features: minimal
+            features: minimal,ebpf
             os: ubuntu-latest
             use-zigbuild: true
             opt-level: "s"
@@ -132,7 +132,7 @@ jobs:
             archive-name: clash-rs-standard-armv7-unknown-linux-musleabihf
             binary-name: clash-rs
             archive-ext: tar.gz
-            features: standard,mimalloc
+            features: standard,mimalloc,ebpf
             os: ubuntu-latest
             use-zigbuild: true
             opt-level: "s"
@@ -140,7 +140,7 @@ jobs:
             archive-name: clash-rs-minimal-armv7-unknown-linux-musleabihf
             binary-name: clash-rs
             archive-ext: tar.gz
-            features: minimal,mimalloc
+            features: minimal,mimalloc,ebpf
             os: ubuntu-latest
             use-zigbuild: true
             opt-level: "s"
@@ -150,7 +150,7 @@ jobs:
             archive-name: clash-rs-minimal-riscv64gc-unknown-linux-musl
             binary-name: clash-rs
             archive-ext: tar.gz
-            features: minimal
+            features: minimal,ebpf
             os: ubuntu-latest
             use-zigbuild: true
             opt-level: "s"
@@ -160,7 +160,7 @@ jobs:
             archive-name: clash-rs-minimal-i686-unknown-linux-musl
             binary-name: clash-rs
             archive-ext: tar.gz
-            features: minimal
+            features: minimal,ebpf
             os: ubuntu-latest
             use-zigbuild: true
             opt-level: "s"
@@ -264,6 +264,16 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      - name: Install Nightly Rust (for eBPF)
+        if: runner.os == 'Linux'
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+
+      - name: Install bpf-linker
+        if: runner.os == 'Linux'
+        uses: taiki-e/install-action@bpf-linker
+
       - name: Setup Zig
         if: matrix.use-zigbuild
         uses: goto-bus-stop/setup-zig@v2
@@ -271,6 +281,12 @@ jobs:
       - name: Install cargo-zigbuild
         if: matrix.use-zigbuild
         uses: taiki-e/install-action@cargo-zigbuild
+
+      - name: Build eBPF Bytecode
+        if: runner.os == 'Linux'
+        run: |
+          cd clash-ebpf-bpf
+          cargo +nightly build --release -Zbuild-std=core --target bpfel-unknown-none
 
       - name: Build with cargo-zigbuild
         if: matrix.use-zigbuild

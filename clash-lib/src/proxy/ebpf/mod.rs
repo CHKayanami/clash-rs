@@ -1,5 +1,6 @@
 use crate::app::dispatcher::Dispatcher;
 use crate::app::dns::ThreadSafeDNSResolver;
+#[cfg(target_os = "linux")]
 use crate::app::remote_content_manager::providers::rule_provider::CidrTrie;
 use crate::config::def::EbpfConfig;
 #[cfg(target_os = "linux")]
@@ -26,6 +27,7 @@ pub struct RotatingBloomFilter {
     interval: std::time::Duration,
 }
 
+#[allow(dead_code)]
 impl RotatingBloomFilter {
     pub fn new(interval: std::time::Duration) -> Self {
         Self {
@@ -216,6 +218,7 @@ pub struct EbpfInbound {
 
 /// Resolves raw IP/CIDR strings and `rule-set:` / `ruleset:` references against rule providers,
 /// then performs deduplication and aggregation (merging subnets) using ipnet.
+#[allow(dead_code)]
 pub fn resolve_and_aggregate_ip_cidrs(
     entries: &[String],
     rule_providers: &std::collections::HashMap<String, crate::app::router::ThreadSafeRuleProvider>,

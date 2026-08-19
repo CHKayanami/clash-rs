@@ -42,6 +42,14 @@ panic = "unwind"
 incremental = true
 codegen-units = 256
 
+[profile.profiling]
+inherits = "release"
+debug = "line-tables-only"
+strip = "none"
+opt-level = "s"
+lto = "fat"
+codegen-units = 1
+
 [workspace.lints.rust]
 warnings = "deny"
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(docker_test)', 'cfg(throughput_test)', 'cfg(tokio_unstable)'] }

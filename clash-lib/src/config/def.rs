@@ -199,6 +199,9 @@ pub struct TunConfig {
     /// Enable TCP processing in TUN mode (default: true)
     #[serde(alias = "tcp", alias = "enable-tcp")]
     pub enable_tcp: Option<bool>,
+    /// Max pooled 64KB buffers in userspace netstack
+    #[serde(alias = "max-pooled-buffers", alias = "pooled-buffers")]
+    pub max_pooled_buffers: Option<usize>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]

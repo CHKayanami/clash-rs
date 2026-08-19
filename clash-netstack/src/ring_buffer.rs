@@ -6,7 +6,15 @@ use std::{
     },
 };
 
-const MAX_POOLED_BUFFERS: usize = 128;
+static MAX_POOLED_BUFFERS: AtomicUsize = AtomicUsize::new(128);
+
+pub fn set_max_pooled_buffers(limit: usize) {
+    MAX_POOLED_BUFFERS.store(limit, Ordering::Relaxed);
+}
+
+pub fn max_pooled_buffers() -> usize {
+    MAX_POOLED_BUFFERS.load(Ordering::Relaxed)
+}
 
 static BOXED_BUFFER_POOL: LazyLock<Mutex<Vec<Box<[u8]>>>> =
     LazyLock::new(|| Mutex::new(Vec::new()));
@@ -24,7 +32,7 @@ pub(crate) fn acquire_boxed_slice(capacity: usize) -> Box<[u8]> {
 
 pub(crate) fn release_boxed_slice(buf: Box<[u8]>) {
     if let Ok(mut pool) = BOXED_BUFFER_POOL.lock() {
-        if pool.len() < MAX_POOLED_BUFFERS {
+        if pool.len() < max_pooled_buffers() {
             pool.push(buf);
         }
     }
@@ -48,7 +56,7 @@ pub fn acquire_vec(capacity: usize) -> Vec<u8> {
 #[allow(dead_code)]
 pub fn release_vec(mut v: Vec<u8>) {
     if let Ok(mut pool) = VEC_BUFFER_POOL.lock() {
-        if pool.len() < MAX_POOLED_BUFFERS {
+        if pool.len() < max_pooled_buffers() {
             v.clear();
             pool.push(v);
         }

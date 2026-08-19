@@ -277,6 +277,16 @@ impl TunRunner {
                 }
             };
 
+        let pool_limit = cfg.max_pooled_buffers.or_else(|| {
+            std::env::var("CLASH_NETSTACK_MAX_POOLED_BUFFERS")
+                .or_else(|_| std::env::var("TUN_MAX_POOLED_BUFFERS"))
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+        });
+        if let Some(limit) = pool_limit {
+            watfaq_netstack::set_max_pooled_buffers(limit);
+        }
+
         let (stack, tcp_listener, udp_socket) = watfaq_netstack::NetStack::new();
         Ok((tun, stack, tcp_listener, udp_socket))
     }

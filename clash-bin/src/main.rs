@@ -117,7 +117,12 @@ fn env_truthy(name: &str) -> bool {
 
 fn main() -> anyhow::Result<()> {
     #[cfg(feature = "dhat-heap")]
-    let _profiler = dhat::Profiler::new_heap();
+    let _profiler = {
+        let path = std::env::var("DHAT_FILE")
+            .or_else(|_| std::env::var("DHAT_OUTPUT_FILE"))
+            .unwrap_or_else(|_| "/tmp/dhat-heap.json".to_string());
+        dhat::Profiler::builder().file_name(path).build()
+    };
 
     // Those arguments are for compatibility with `mihomo`
     // Technically, I do not think `mihomo` is a modern/standard POSIX Cli program
@@ -294,7 +299,7 @@ fn main() -> anyhow::Result<()> {
         dns_collect_file: cli.dns_collect_file.map(|p| p.to_string_lossy().to_string()),
     })
     .inspect_err(|err| eprintln!("Failed to start clash: {err}"))?;
-    exit(0);
+    Ok(())
 }
 
 
