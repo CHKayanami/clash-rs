@@ -1,0 +1,67 @@
+[package]
+name = "clash-shadowsocks"
+version = { workspace = true }
+edition = { workspace = true }
+repository = { workspace = true }
+authors = { workspace = true }
+license = "MIT"
+description = "Shadowsocks protocol implementation for clash-rs"
+
+[features]
+default = ["aead-cipher"]
+
+# Enable Stream Cipher Protocol
+stream-cipher = [
+    "shadowsocks-crypto/v1-stream",
+    "shadowsocks-crypto/aws-lc",
+]
+
+# Enable AEAD ciphers
+aead-cipher = [
+    "shadowsocks-crypto/v1-aead",
+    "shadowsocks-crypto/aws-lc",
+]
+
+# Enable extra AEAD ciphers
+aead-cipher-extra = ["aead-cipher", "shadowsocks-crypto/v1-aead-extra"]
+
+aead-cipher-2022 = [
+    "shadowsocks-crypto/v2",
+    "shadowsocks-crypto/aws-lc",
+    "rand",
+    "aes",
+    "lru_time_cache",
+]
+aead-cipher-2022-extra = ["aead-cipher-2022", "shadowsocks-crypto/v2-extra"]
+
+[dependencies]
+log = "0.4"
+bytes = "1"
+cfg-if = "1"
+byte_string = "1.0"
+base64 = "0.23"
+spin = { version = "0.12", features = ["std"] }
+pin-project = "1.1"
+thiserror = "2.0"
+rand = { version = "0.10", optional = true }
+lru_time_cache = { version = "0.11", optional = true }
+
+futures = "0.3"
+tokio = { version = "1", features = [
+    "io-util",
+    "macros",
+    "net",
+    "sync",
+    "time",
+] }
+
+aes = { version = "0.9", optional = true }
+blake3 = "1"
+shadowsocks-crypto = { version = "0.7.0", default-features = false }
+
+[dev-dependencies]
+env_logger = "0.11"
+tokio = { version = "1", features = ["rt-multi-thread"] }
+
+[lints.clippy]
+uninlined_format_args = "allow"

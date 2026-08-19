@@ -9,7 +9,8 @@ members = [
     "clash-dns",
     "clash-netstack",
     "clash-ebpf",
-    "clash-ebpf-common"
+    "clash-ebpf-common",
+    "clash-shadowsocks"
 ]
 exclude = ["clash-ebpf-bpf"]
 

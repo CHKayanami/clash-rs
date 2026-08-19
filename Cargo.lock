@@ -1520,6 +1520,7 @@ dependencies = [
  "chacha20poly1305 0.11.0",
  "chrono",
  "clash-ebpf",
+ "clash-shadowsocks",
  "console-subscriber",
  "const-fnv1a-hash",
  "crc32fast",
@@ -1592,7 +1593,6 @@ dependencies = [
  "sha1 0.11.0",
  "sha2 0.11.0",
  "shadowquic",
- "shadowsocks",
  "smoltcp 0.13.1",
  "sock2proc",
  "socket2 0.6.4",
@@ -1648,6 +1648,28 @@ dependencies = [
  "mimalloc",
  "sentry",
  "tikv-jemallocator",
+]
+
+[[package]]
+name = "clash-shadowsocks"
+version = "0.10.7"
+dependencies = [
+ "aes 0.9.1",
+ "base64 0.23.1",
+ "blake3",
+ "byte_string",
+ "bytes",
+ "cfg-if",
+ "env_logger",
+ "futures",
+ "log",
+ "lru_time_cache",
+ "pin-project",
+ "rand 0.10.1",
+ "shadowsocks-crypto",
+ "spin 0.12.3",
+ "thiserror 2.0.18",
+ "tokio",
 ]
 
 [[package]]
@@ -2604,26 +2626,6 @@ name = "dyn-clone"
 version = "1.0.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d0881ea181b1df73ff77ffaaf9c7544ecc11e82fba9b5f27b262a3c73a332555"
-
-[[package]]
-name = "dynosaur"
-version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a12303417f378f29ba12cb12fc78a9df0d8e16ccb1ad94abf04d48d96bdda532"
-dependencies = [
- "dynosaur_derive",
-]
-
-[[package]]
-name = "dynosaur_derive"
-version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0b0713d5c1d52e774c5cd7bb8b043d7c0fc4f921abfb678556140bfbe6ab2364"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.117",
-]
 
 [[package]]
 name = "ecdsa"
@@ -7977,17 +7979,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "sealed"
-version = "0.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "22f968c5ea23d555e670b449c1c5e7b2fc399fdaec1d304a17cd48e288abc107"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.117",
-]
-
-[[package]]
 name = "sec1"
 version = "0.7.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8505,41 +8496,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "shadowsocks"
-version = "1.25.0"
-source = "git+https://github.com/shadowsocks/shadowsocks-rust.git?rev=c4d8d18527289d12470cad1ce718754c908a75fe#c4d8d18527289d12470cad1ce718754c908a75fe"
-dependencies = [
- "aes 0.9.1",
- "base64 0.22.1",
- "blake3",
- "byte_string",
- "bytes",
- "cfg-if",
- "dynosaur",
- "futures",
- "libc",
- "log",
- "lru_time_cache",
- "percent-encoding",
- "pin-project",
- "rand 0.10.1",
- "sealed",
- "sendfd",
- "serde",
- "serde_json",
- "serde_urlencoded",
- "shadowsocks-crypto",
- "socket2 0.6.4",
- "spin 0.10.0",
- "thiserror 2.0.18",
- "tokio",
- "tokio-tfo",
- "trait-variant",
- "url",
- "windows-sys 0.61.2",
-]
-
-[[package]]
 name = "shadowsocks-crypto"
 version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8794,9 +8750,9 @@ dependencies = [
 
 [[package]]
 name = "spin"
-version = "0.10.0"
+version = "0.12.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d5fe4ccb98d9c292d56fec89a5e07da7fc4cf0dc11e156b41793132775d3e591"
+checksum = "0134f9043ed38b087ac4f7d4af44c79e2c9e5094421fe3164f435ce585953b10"
 dependencies = [
  "lock_api",
 ]
@@ -10895,17 +10851,6 @@ version = "0.2.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ad06847b7afb65c7866a36664b75c40b895e318cea4f71299f013fb22965329d"
 dependencies = [
- "quote",
- "syn 2.0.117",
-]
-
-[[package]]
-name = "trait-variant"
-version = "0.1.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "70977707304198400eb4835a78f6a9f928bf41bba420deb8fdb175cd965d77a7"
-dependencies = [
- "proc-macro2",
  "quote",
  "syn 2.0.117",
 ]
