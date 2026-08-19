@@ -8,18 +8,23 @@ pub async fn get_proxies_from_providers(
     providers: &Vec<ArcProxyProvider>,
     touch: bool,
 ) -> Vec<AnyOutboundHandler> {
-    let mut proxies = vec![];
-    let mut proxy_names = HashSet::new();
+    let mut provider_proxies = Vec::with_capacity(providers.len());
     for provider in providers {
         if touch {
             provider.touch().await;
         }
 
-        let mut proxies_from_provider = provider.proxies().await.to_vec();
+        provider_proxies.push(provider.proxies().await);
+    }
 
-        proxies_from_provider.retain(|p| proxy_names.insert(p.name().to_owned()));
-
-        proxies.append(&mut proxies_from_provider);
+    let mut proxy_names = HashSet::new();
+    let mut proxies = Vec::new();
+    for list in &provider_proxies {
+        for p in list {
+            if proxy_names.insert(p.name()) {
+                proxies.push(p.clone());
+            }
+        }
     }
     proxies
 }

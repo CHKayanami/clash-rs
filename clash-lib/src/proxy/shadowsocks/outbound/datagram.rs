@@ -200,7 +200,8 @@ where
                     unsafe {
                         me.buf.set_len(n);
                     }
-                    let data = me.buf.split_to(n).freeze();
+                    let data = bytes::Bytes::copy_from_slice(&me.buf[..n]);
+                    me.buf.clear();
                     return Poll::Ready(Some(UdpPacket {
                         data,
                         src_addr: match src {
