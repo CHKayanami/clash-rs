@@ -45,4 +45,18 @@ impl CidrTrie {
             IpAddr::V6(v6) => self.v6.longest_match(v6).is_some(),
         }
     }
+
+    pub fn iter_nets(&self) -> impl Iterator<Item = ipnet::IpNet> + '_ {
+        let v4_iter = self.v4.iter().filter_map(|(ip, mask, _)| {
+            ipnet::Ipv4Net::new(ip, mask as u8).ok().map(ipnet::IpNet::V4)
+        });
+        let v6_iter = self.v6.iter().filter_map(|(ip, mask, _)| {
+            ipnet::Ipv6Net::new(ip, mask as u8).ok().map(ipnet::IpNet::V6)
+        });
+        v4_iter.chain(v6_iter)
+    }
+
+    pub fn get_ip_cidrs(&self) -> Vec<ipnet::IpNet> {
+        self.iter_nets().collect()
+    }
 }

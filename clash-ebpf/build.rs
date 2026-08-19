@@ -26,8 +26,10 @@ fn main() {
             size
         );
     } else {
-        panic!(
-            "cargo:error=eBPF binary not found! Please build it first: cd clash-ebpf-bpf && cargo +nightly build --release -Zbuild-std=core --target bpfel-unknown-none"
+        std::fs::write(&dest, b"").expect("Failed to create dummy eBPF object");
+        println!(
+            "cargo:warning=eBPF binary not found, created dummy artifact at {}. Real eBPF functionality requires building clash-ebpf-bpf first.",
+            dest.display()
         );
     }
 

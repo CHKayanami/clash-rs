@@ -21,9 +21,6 @@ pub struct EbpfConfig {
     #[serde(default = "default_tproxy_port", rename = "tproxy-udp-port")]
     pub tproxy_udp_port: u16,
 
-    /// Automatically manage default route and direct offload.
-    #[serde(default = "default_true", rename = "auto-route")]
-    pub auto_route: bool,
 
     /// General bypass ports (applies to both source and dest).
     #[serde(default = "default_bypass_ports", rename = "bypass-ports")]
@@ -37,15 +34,15 @@ pub struct EbpfConfig {
     #[serde(default, rename = "bypass-dst-ports")]
     pub bypass_dst_ports: Vec<u16>,
 
-    /// General bypass IPs/CIDRs (applies to both source and dest).
+    /// General bypass IPs/CIDRs or rulesets (applies to both source and dest).
     #[serde(default, rename = "bypass-ips")]
     pub bypass_ips: Vec<String>,
 
-    /// Source IPs/CIDRs to bypass (e.g., specific LAN client IPs).
+    /// Source IPs/CIDRs or rulesets to bypass (e.g., specific LAN client IPs).
     #[serde(default, rename = "bypass-src-ips")]
     pub bypass_src_ips: Vec<String>,
 
-    /// Destination IPs/CIDRs to bypass (e.g., local subnets, multicast).
+    /// Destination IPs/CIDRs or rulesets to bypass (e.g., local subnets, multicast).
     #[serde(default = "default_bypass_dst_ips", rename = "bypass-dst-ips")]
     pub bypass_dst_ips: Vec<String>,
 
@@ -61,15 +58,15 @@ pub struct EbpfConfig {
     #[serde(default, rename = "proxy-dst-ports")]
     pub proxy_dst_ports: Vec<u16>,
 
-    /// General proxy whitelist IPs/CIDRs (applies to both source and dest).
+    /// General proxy whitelist IPs/CIDRs or rulesets (applies to both source and dest).
     #[serde(default, rename = "proxy-ips")]
     pub proxy_ips: Vec<String>,
 
-    /// Source IPs/CIDRs to proxy (e.g. specific LAN client IPs to be proxied).
+    /// Source IPs/CIDRs or rulesets to proxy (e.g. specific LAN client IPs to be proxied).
     #[serde(default, rename = "proxy-src-ips")]
     pub proxy_src_ips: Vec<String>,
 
-    /// Destination IPs/CIDRs to proxy (only traffic to these destination IPs will be proxied).
+    /// Destination IPs/CIDRs or rulesets to proxy (only traffic to these destination IPs will be proxied).
     #[serde(default, rename = "proxy-dst-ips")]
     pub proxy_dst_ips: Vec<String>,
 
@@ -102,7 +99,6 @@ fn default_bypass_dst_ips() -> Vec<String> {
     ]
 }
 
-
 impl Default for EbpfConfig {
     fn default() -> Self {
         Self {
@@ -111,7 +107,6 @@ impl Default for EbpfConfig {
             wan_interface: Some("auto".to_string()),
             tproxy_port: default_tproxy_port(),
             tproxy_udp_port: default_tproxy_port(),
-            auto_route: true,
             bypass_ports: default_bypass_ports(),
             bypass_src_ports: default_bypass_ports(),
             bypass_dst_ports: Vec::new(),
@@ -126,5 +121,80 @@ impl Default for EbpfConfig {
             proxy_dst_ips: Vec::new(),
             auto_direct_offload: true,
         }
+    }
+}
+
+/// Parse, deduplicate, and aggregate a list of IP/CIDR strings.
+pub fn aggregate_ip_cidrs(entries: impl IntoIterator<Item = impl AsRef<str>>) -> Vec<String> {
+    use std::str::FromStr;
+
+    let mut v4_nets = Vec::new();
+    let mut v6_nets = Vec::new();
+
+    for item in entries {
+        let s = item.as_ref().trim();
+        if s.is_empty() {
+            continue;
+        }
+
+        if let Ok(net) = ipnet::IpNet::from_str(s) {
+            match net {
+                ipnet::IpNet::V4(v4) => v4_nets.push(v4),
+                ipnet::IpNet::V6(v6) => v6_nets.push(v6),
+            }
+        } else if let Ok(ip) = std::net::IpAddr::from_str(s) {
+            match ip {
+                std::net::IpAddr::V4(v4) => {
+                    if let Ok(net) = ipnet::Ipv4Net::new(v4, 32) {
+                        v4_nets.push(net);
+                    }
+                }
+                std::net::IpAddr::V6(v6) => {
+                    if let Ok(net) = ipnet::Ipv6Net::new(v6, 128) {
+                        v6_nets.push(net);
+                    }
+                }
+            }
+        }
+    }
+
+    let agg_v4 = ipnet::Ipv4Net::aggregate(&v4_nets);
+    let agg_v6 = ipnet::Ipv6Net::aggregate(&v6_nets);
+
+    let mut result = Vec::with_capacity(agg_v4.len() + agg_v6.len());
+    for n in agg_v4 {
+        result.push(n.to_string());
+    }
+    for n in agg_v6 {
+        result.push(n.to_string());
+    }
+    result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_aggregate_ip_cidrs() {
+        let inputs = vec![
+            "192.168.1.0/24",
+            "192.168.1.10/32",
+            "10.0.0.0/24",
+            "10.0.1.0/24",
+            "10.0.2.0/24",
+            "10.0.3.0/24",
+            "::1",
+            "fe80::/10",
+            "fe80::1/128",
+        ];
+
+        let agg = aggregate_ip_cidrs(&inputs);
+        assert!(agg.contains(&"192.168.1.0/24".to_string()));
+        assert!(!agg.contains(&"192.168.1.10/32".to_string())); // subsumed
+        assert!(agg.contains(&"10.0.0.0/22".to_string())); // merged 4 /24s into /22
+        assert!(agg.contains(&"::1/128".to_string()));
+        assert!(agg.contains(&"fe80::/10".to_string()));
+        assert!(!agg.contains(&"fe80::1/128".to_string())); // subsumed
     }
 }

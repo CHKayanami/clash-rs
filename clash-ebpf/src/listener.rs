@@ -20,10 +20,13 @@ pub struct EbpfListener {
     tcp_listener_v6: Option<TcpListener>,
     udp_socket_v4: Arc<UdpSocket>,
     udp_socket_v6: Option<Arc<UdpSocket>>,
+    #[allow(dead_code)]
     dns_reply_socket_v4: Option<Arc<UdpSocket>>,
+    #[allow(dead_code)]
     dns_reply_socket_v6: Option<Arc<UdpSocket>>,
     #[allow(dead_code)]
     config: EbpfConfig,
+    #[allow(dead_code)]
     ns: Arc<DaeNs>,
 }
 
@@ -208,6 +211,7 @@ impl EbpfListener {
 
     /// Sends a DNS reply datagram to `dst` with `src` (the original destination DNS server) as the source address
     /// via pktinfo ancillary data on the cached transparent socket bound to port 53.
+    #[allow(unused_variables)]
     pub async fn send_dns_reply(&self, data: &[u8], src: SocketAddr, dst: SocketAddr) -> std::io::Result<usize> {
         #[cfg(target_os = "linux")]
         {

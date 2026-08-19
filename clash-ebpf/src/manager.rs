@@ -235,6 +235,7 @@ impl EbpfManager {
                     }
                 }
             }
+            all_dst_ips = crate::config::aggregate_ip_cidrs(&all_dst_ips);
 
             let has_proxy_src_ips = if !self.config.proxy_ips.is_empty() || !self.config.proxy_src_ips.is_empty() { 1 } else { 0 };
             let has_proxy_dst_ips = if !self.config.proxy_ips.is_empty() || !self.config.proxy_dst_ips.is_empty() { 1 } else { 0 };

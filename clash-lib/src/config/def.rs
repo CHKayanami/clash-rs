@@ -66,8 +66,6 @@ pub struct EbpfConfig {
     pub tproxy_port: u16,
     #[serde(default = "default_tproxy_port")]
     pub tproxy_udp_port: u16,
-    #[serde(default = "default_true")]
-    pub auto_route: bool,
     #[serde(default = "default_bypass_ports")]
     pub bypass_ports: Vec<u16>,
     #[serde(default = "default_bypass_ports")]

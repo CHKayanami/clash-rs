@@ -131,6 +131,10 @@ pub trait RuleProvider: Provider {
         let _ = limit;
         vec![]
     }
+    /// Returns all IP/CIDR subnets contained in this provider if it is an IPCIDR provider.
+    fn get_ip_cidrs(&self) -> Vec<ipnet::IpNet> {
+        vec![]
+    }
 }
 
 pub type ThreadSafeRuleProvider = Arc<dyn RuleProvider + Send + Sync>;
@@ -393,6 +397,14 @@ impl RuleProvider for RuleProviderImpl {
                 .take(limit)
                 .map(|r| format!("{},{}", r.type_name(), r.payload()))
                 .collect(),
+            _ => vec![],
+        }
+    }
+
+    fn get_ip_cidrs(&self) -> Vec<ipnet::IpNet> {
+        let inner = self.inner.read().unwrap();
+        match &inner.content {
+            RuleContent::Ipcidr(trie) => trie.get_ip_cidrs(),
             _ => vec![],
         }
     }

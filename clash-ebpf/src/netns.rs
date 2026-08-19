@@ -114,6 +114,10 @@ pub mod non_linux {
             Err(NetNsError::UnsupportedPlatform)
         }
 
+        pub fn try_clone(&self) -> Result<Self, NetNsError> {
+            Err(NetNsError::UnsupportedPlatform)
+        }
+
         pub fn with_daens<F, R>(&self, _f: F) -> Result<R, NetNsError>
         where
             F: FnOnce() -> R,
