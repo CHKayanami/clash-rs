@@ -1,11 +1,14 @@
 use super::platform::must_bind_socket_on_interface;
-use crate::{app::net::OutboundInterface, proxy::AnyStream};
+use crate::{
+    app::{dns::ThreadSafeDNSResolver, net::OutboundInterface},
+    proxy::AnyStream,
+};
 
 use futures::io;
 use socket2::{Domain, Protocol, Socket, TcpKeepalive, Type};
 
 use std::{
-    net::{Ipv4Addr, Ipv6Addr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     time::Duration,
 };
 use tokio::{
@@ -14,6 +17,11 @@ use tokio::{
 };
 use tokio_tfo::TfoStream;
 use tracing::{debug, error, instrument, trace};
+
+/// Connection Attempt Delay for Happy Eyeballs.
+/// Set to 1s to comfortably accommodate global cross-border proxy server RTTs
+/// while still eliminating the 10s blackhole timeout.
+const HAPPY_EYEBALLS_DELAY: Duration = Duration::from_secs(1);
 
 pub fn apply_tcp_options(s: &TcpStream) -> std::io::Result<()> {
     #[cfg(not(target_os = "windows"))]
@@ -130,6 +138,131 @@ pub async fn new_tcp_stream(
                 io::ErrorKind::TimedOut,
                 "standard tcp connection timed out",
             )),
+        }
+    }
+}
+
+/// Dial TCP with Happy Eyeballs (RFC 8305) dual-stack fast fallback.
+///
+/// If `host` is an IP literal, dials directly.
+/// If `host` is a domain name, resolves both IPv6 and IPv4 in parallel.
+/// If both families are available, attempts IPv6 first with a 250ms Connection
+/// Attempt Delay, then races IPv4 concurrently, eliminating the 10s timeout
+/// stall when IPv6 has a routing black hole.
+pub async fn dial_tcp_with_happy_eyeballs(
+    host: &str,
+    port: u16,
+    resolver: &ThreadSafeDNSResolver,
+    iface: Option<&OutboundInterface>,
+    tfo: bool,
+    #[cfg(target_os = "linux")] so_mark: Option<u32>,
+) -> std::io::Result<AnyStream> {
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return new_tcp_stream(
+            SocketAddr::new(ip, port),
+            iface,
+            tfo,
+            #[cfg(target_os = "linux")]
+            so_mark,
+        )
+        .await;
+    }
+
+    let (v6_res, v4_res) = tokio::join!(
+        resolver.resolve_v6(host, false),
+        resolver.resolve_v4(host, false),
+    );
+
+    let v6_ip = v6_res.ok().flatten().map(IpAddr::V6);
+    let v4_ip = v4_res.ok().flatten().map(IpAddr::V4);
+
+    match (v6_ip, v4_ip) {
+        (Some(v6), Some(v4)) => {
+            let v6_addr = SocketAddr::new(v6, port);
+            let v4_addr = SocketAddr::new(v4, port);
+
+            let v6_dial = new_tcp_stream(
+                v6_addr,
+                iface,
+                tfo,
+                #[cfg(target_os = "linux")]
+                so_mark,
+            );
+            tokio::pin!(v6_dial);
+
+            tokio::select! {
+                res = &mut v6_dial => {
+                    match res {
+                        Ok(stream) => return Ok(stream),
+                        Err(e) => {
+                            debug!("IPv6 connect to {v6_addr} failed ({e}), falling back to IPv4 {v4_addr}");
+                            return new_tcp_stream(
+                                v4_addr,
+                                iface,
+                                tfo,
+                                #[cfg(target_os = "linux")]
+                                so_mark,
+                            ).await;
+                        }
+                    }
+                }
+                _ = tokio::time::sleep(HAPPY_EYEBALLS_DELAY) => {
+                    debug!("IPv6 connect to {v6_addr} delayed past {HAPPY_EYEBALLS_DELAY:?}, racing IPv4 {v4_addr}");
+                }
+            }
+
+            let v4_dial = new_tcp_stream(
+                v4_addr,
+                iface,
+                tfo,
+                #[cfg(target_os = "linux")]
+                so_mark,
+            );
+            tokio::pin!(v4_dial);
+
+            tokio::select! {
+                res_v6 = &mut v6_dial => {
+                    match res_v6 {
+                        Ok(stream) => Ok(stream),
+                        Err(err_v6) => {
+                            debug!("IPv6 connect to {v6_addr} failed ({err_v6}), waiting for IPv4");
+                            v4_dial.await
+                        }
+                    }
+                }
+                res_v4 = &mut v4_dial => {
+                    match res_v4 {
+                        Ok(stream) => Ok(stream),
+                        Err(err_v4) => {
+                            debug!("IPv4 connect to {v4_addr} failed ({err_v4}), waiting for IPv6");
+                            v6_dial.await
+                        }
+                    }
+                }
+            }
+        }
+        (Some(v6), None) => {
+            new_tcp_stream(
+                SocketAddr::new(v6, port),
+                iface,
+                tfo,
+                #[cfg(target_os = "linux")]
+                so_mark,
+            )
+            .await
+        }
+        (None, Some(v4)) => {
+            new_tcp_stream(
+                SocketAddr::new(v4, port),
+                iface,
+                tfo,
+                #[cfg(target_os = "linux")]
+                so_mark,
+            )
+            .await
+        }
+        (None, None) => {
+            Err(std::io::Error::other(format!("no dns result for {host}")))
         }
     }
 }
@@ -452,4 +585,74 @@ mod tests {
             "socket must have a non-zero local port even when iface is set"
         );
     }
+
+    #[tokio::test]
+    async fn test_dial_happy_eyeballs_ip_literal() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        tokio::spawn(async move {
+            let _ = listener.accept().await;
+        });
+
+        let mock_resolver = crate::app::dns::MockClashResolver::new();
+        // Resolver should not be invoked for IP literal
+        let resolver: ThreadSafeDNSResolver = std::sync::Arc::new(mock_resolver);
+
+        let stream = dial_tcp_with_happy_eyeballs(
+            "127.0.0.1",
+            port,
+            &resolver,
+            None,
+            false,
+            #[cfg(target_os = "linux")]
+            None,
+        )
+        .await;
+
+        assert!(stream.is_ok(), "IP literal dial should succeed");
+    }
+
+    #[tokio::test]
+    async fn test_dial_happy_eyeballs_fast_fallback_on_v6_blackhole() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        tokio::spawn(async move {
+            let _ = listener.accept().await;
+        });
+
+        let mut mock_resolver = crate::app::dns::MockClashResolver::new();
+        // Return an unreachable documentation IPv6 address (2001:db8::1) that blackholes
+        mock_resolver
+            .expect_resolve_v6()
+            .returning(|_, _| Ok(Some("2001:db8::1".parse::<Ipv6Addr>().unwrap())));
+        // Return working localhost IPv4
+        mock_resolver
+            .expect_resolve_v4()
+            .returning(|_, _| Ok(Some(Ipv4Addr::LOCALHOST)));
+
+        let resolver: ThreadSafeDNSResolver = std::sync::Arc::new(mock_resolver);
+
+        let start = std::time::Instant::now();
+        let stream = dial_tcp_with_happy_eyeballs(
+            "dualstack.test",
+            port,
+            &resolver,
+            None,
+            false,
+            #[cfg(target_os = "linux")]
+            None,
+        )
+        .await;
+
+        let elapsed = start.elapsed();
+        assert!(stream.is_ok(), "Should successfully connect via IPv4");
+        // Happy Eyeballs should connect within ~500ms instead of 10s timeout
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "Happy Eyeballs should fallback quickly, elapsed: {elapsed:?}"
+        );
+    }
 }
+

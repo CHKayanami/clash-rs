@@ -10,11 +10,10 @@ use crate::{
         },
         dns::ThreadSafeDNSResolver,
     },
-    common::errors::map_io_error,
     proxy::{
         OutboundHandler,
         direct::datagram::OutboundDatagramImpl,
-        utils::{new_dual_stack_udp_socket, prepare_tcp_socket},
+        utils::{dial_tcp_with_happy_eyeballs, new_dual_stack_udp_socket},
     },
     session::Session,
 };
@@ -26,7 +25,6 @@ use super::{
     utils::RemoteConnector,
 };
 use async_trait::async_trait;
-use futures::TryFutureExt;
 
 #[derive(Clone)]
 pub struct Handler {
@@ -45,35 +43,9 @@ impl Handler {
             name: name.to_owned(),
         }
     }
-
-    /// Open one TCP connection to `endpoint`, honouring the session's interface
-    /// and firewall mark.
-    async fn dial(
-        sess: &Session,
-        endpoint: std::net::SocketAddr,
-    ) -> std::io::Result<tokio::net::TcpStream> {
-        let socket = prepare_tcp_socket(
-            endpoint,
-            sess.iface.as_ref(),
-            #[cfg(target_os = "linux")]
-            sess.so_mark,
-        )?;
-
-        tokio::time::timeout(CONNECT_TIMEOUT, socket.connect(endpoint))
-            .await
-            .map_err(|_| {
-                std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    "tcp connection timed out",
-                )
-            })?
-    }
 }
 
 impl DialWithConnector for Handler {}
-
-/// How long a direct TCP connect may take before being abandoned.
-const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 #[async_trait]
 impl OutboundHandler for Handler {
@@ -100,63 +72,18 @@ impl OutboundHandler for Handler {
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
     ) -> std::io::Result<BoxedChainedStream> {
-        let host = sess.destination.host();
-        let port = sess.destination.port();
+        let stream = dial_tcp_with_happy_eyeballs(
+            sess.destination.host().as_str(),
+            sess.destination.port(),
+            &resolver,
+            sess.iface.as_ref(),
+            false,
+            #[cfg(target_os = "linux")]
+            sess.so_mark,
+        )
+        .await?;
 
-        let remote_ip = resolver
-            .resolve(host.as_str(), false)
-            .map_err(map_io_error)
-            .await?
-            .ok_or_else(|| std::io::Error::other("no dns result"))?;
-
-        let first_err = match Self::dial(sess, (remote_ip, port).into()).await {
-            Ok(stream) => {
-                let s = ChainedStreamWrapper::new(stream);
-                s.append_to_chain(self.name()).await;
-                return Ok(Box::new(s));
-            }
-            Err(e) => e,
-        };
-
-        // `resolve` hands back a single address, so a host that is reachable
-        // over one family but not the other (a broken IPv6 path being the
-        // common case) failed outright. Retry once against the other family
-        // before giving up. Only meaningful for names — an IP literal resolves
-        // to itself.
-        let fallback_ip = if sess.destination.is_domain() {
-            if remote_ip.is_ipv6() {
-                resolver
-                    .resolve_v4(host.as_str(), false)
-                    .await
-                    .ok()
-                    .flatten()
-                    .map(std::net::IpAddr::from)
-            } else {
-                resolver
-                    .resolve_v6(host.as_str(), false)
-                    .await
-                    .ok()
-                    .flatten()
-                    .map(std::net::IpAddr::from)
-            }
-        } else {
-            None
-        };
-
-        let Some(fallback_ip) = fallback_ip.filter(|ip| *ip != remote_ip) else {
-            return Err(first_err);
-        };
-
-        tracing::debug!(
-            "direct connect to {remote_ip} failed ({first_err}), retrying \
-             {host} via {fallback_ip}"
-        );
-
-        let tcp_stream = Self::dial(sess, (fallback_ip, port).into())
-            .await
-            .map_err(|_| first_err)?;
-
-        let s = ChainedStreamWrapper::new(tcp_stream);
+        let s = ChainedStreamWrapper::new(stream);
         s.append_to_chain(self.name()).await;
         Ok(Box::new(s))
     }

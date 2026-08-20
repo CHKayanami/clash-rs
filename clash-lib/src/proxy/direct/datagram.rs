@@ -5,7 +5,8 @@ use crate::{
 use bytes::BytesMut;
 use futures::{Sink, Stream, ready};
 use std::{
-    collections::HashMap,
+    cell::RefCell,
+    collections::{HashMap, VecDeque},
     io,
     net::{IpAddr, SocketAddr},
     pin::Pin,
@@ -24,6 +25,34 @@ const MAX_CONSECUTIVE_RECV_ERRORS: usize = 32;
 /// on every send made a client talking to N destinations pay O(N) per packet.
 const UDP_DOMAIN_MAP_SWEEP_THRESHOLD: usize = 64;
 
+/// Minimum interval between two consecutive `ip_to_logical` sweeps to avoid
+/// sweeping repeatedly within high-PPS burst transmissions.
+const UDP_DOMAIN_MAP_SWEEP_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Maximum number of datagrams to batch drain on a single ready notification.
+const MAX_BATCH_RECV_PACKETS: usize = 16;
+
+const UDP_RECV_CHUNK_SIZE: usize = 256 * 1024;
+const MAX_UDP_DATAGRAM_SIZE: usize = 65535;
+
+thread_local! {
+    static UDP_CHUNK_BUF: RefCell<BytesMut> = RefCell::new(BytesMut::new());
+}
+
+#[inline]
+fn canonicalize_src(src: SocketAddr) -> SocketAddr {
+    match src {
+        SocketAddr::V6(v6) => {
+            if let Some(v4) = v6.ip().to_ipv4_mapped() {
+                SocketAddr::from((v4, v6.port()))
+            } else {
+                src
+            }
+        }
+        _ => src,
+    }
+}
+
 #[must_use = "sinks do nothing unless polled"]
 // TODO: maybe we should use abstract datagram IO interface instead of the
 // Stream + Sink trait
@@ -35,10 +64,10 @@ pub struct OutboundDatagramImpl {
     resolver: ThreadSafeDNSResolver,
     flushed: bool,
     pkt: Option<UdpPacket>,
-    recv_buf: BytesMut,
     // real upstream IP → dst_addr of the most recent outgoing packet to that
     // IP; used in poll_next to translate src_addr back to dst_addr.
     ip_to_logical: HashMap<SocketAddr, (SocksAddr, Instant)>,
+    last_sweep: Instant,
     /// In-flight DNS resolution task for the current queued packet.
     /// Using a JoinHandle (Send + Sync) rather than a raw BoxFuture so that
     /// OutboundDatagramImpl satisfies the Sync bound required by
@@ -49,6 +78,8 @@ pub struct OutboundDatagramImpl {
     /// retries so we never re-poll an already-completed DNS task.
     resolved_dst: Option<SocketAddr>,
     consecutive_recv_errors: usize,
+    /// Prefetch buffer for datagram batching on ready events.
+    recv_queue: VecDeque<UdpPacket>,
 }
 
 impl OutboundDatagramImpl {
@@ -62,11 +93,12 @@ impl OutboundDatagramImpl {
             resolver,
             flushed: true,
             pkt: None,
-            recv_buf: BytesMut::with_capacity(65535),
             ip_to_logical: HashMap::new(),
+            last_sweep: Instant::now(),
             pending_dns: None,
             resolved_dst: None,
             consecutive_recv_errors: 0,
+            recv_queue: VecDeque::with_capacity(MAX_BATCH_RECV_PACKETS),
         }
     }
 }
@@ -113,6 +145,7 @@ impl Sink<UdpPacket> for OutboundDatagramImpl {
             ref mut pkt,
             ref resolver,
             ref mut ip_to_logical,
+            ref mut last_sweep,
             ref mut pending_dns,
             ref mut resolved_dst,
             ..
@@ -157,7 +190,7 @@ impl Sink<UdpPacket> for OutboundDatagramImpl {
                                 Some(ip) => Ok(SocketAddr::from((ip, port))),
                                 None => Err(io::Error::other(format!(
                                     "resolve domain failed: {domain}"
-                                ))),
+                                 ))),
                             }
                         })
                     });
@@ -201,12 +234,21 @@ impl Sink<UdpPacket> for OutboundDatagramImpl {
 
         let n = ready!(inner.poll_send_to(cx, p.data.as_ref(), send_dst))?;
 
-        let now = Instant::now();
-        if ip_to_logical.len() > UDP_DOMAIN_MAP_SWEEP_THRESHOLD {
-            ip_to_logical
-                .retain(|_, (_, ts)| now.duration_since(*ts) < UDP_DOMAIN_MAP_TTL);
+        // Only register logical domain mappings for Domain destinations.
+        // Pure IP destinations do not need logical domain restoration, avoiding
+        // unnecessary heap allocations and hash map thrashing on high-PPS IP flows.
+        if matches!(p.dst_addr, SocksAddr::Domain(..)) {
+            let now = Instant::now();
+            if ip_to_logical.len() > UDP_DOMAIN_MAP_SWEEP_THRESHOLD
+                && now.duration_since(*last_sweep) >= UDP_DOMAIN_MAP_SWEEP_INTERVAL
+            {
+                ip_to_logical
+                    .retain(|_, (_, ts)| now.duration_since(*ts) < UDP_DOMAIN_MAP_TTL);
+                *last_sweep = now;
+            }
+            ip_to_logical.insert(dst, (p.dst_addr.clone(), now));
         }
-        ip_to_logical.insert(dst, (p.dst_addr.clone(), now));
+
         // Save length before clearing pkt (NLL ends p's borrow after this).
         let data_len = p.data.len();
 
@@ -240,73 +282,109 @@ impl Stream for OutboundDatagramImpl {
     ) -> Poll<Option<Self::Item>> {
         let Self {
             ref mut inner,
-            ref mut recv_buf,
             ref ip_to_logical,
             ref mut consecutive_recv_errors,
+            ref mut recv_queue,
             ..
         } = *self;
 
-        loop {
-            if recv_buf.capacity() < 65535 {
-                recv_buf.reserve(65535 - recv_buf.capacity());
+        // 1. Fast Path: return buffered datagram immediately without syscall
+        if let Some(packet) = recv_queue.pop_front() {
+            return Poll::Ready(Some(packet));
+        }
+
+        UDP_CHUNK_BUF.with_borrow_mut(|chunk_buf| {
+            if chunk_buf.capacity() - chunk_buf.len() < MAX_UDP_DATAGRAM_SIZE {
+                *chunk_buf = BytesMut::with_capacity(UDP_RECV_CHUNK_SIZE);
             }
 
-            let mut buf = ReadBuf::uninit(recv_buf.spare_capacity_mut());
-            match ready!(inner.poll_recv_from(cx, &mut buf)) {
-                Ok(src) => {
-                    *consecutive_recv_errors = 0;
-                    let n = buf.filled().len();
-                    unsafe {
-                        recv_buf.set_len(n);
-                    }
-                    let data = recv_buf.split_to(n).freeze();
-                    // On dual-stack (AF_INET6) sockets the OS returns IPv4
-                    // sender addresses in IPv4-mapped form (::ffff:x.x.x.x).
-                    // Canonicalize back to plain IPv4 so that ip_to_logical
-                    // lookups succeed and the returned src_addr matches what the
-                    // caller (e.g. a DNS client) expects.
-                    let src = match src {
-                        SocketAddr::V6(v6) => {
-                            if let Some(v4) = v6.ip().to_ipv4_mapped() {
-                                SocketAddr::from((v4, v6.port()))
-                            } else {
-                                src
+            loop {
+                let unfilled = chunk_buf.spare_capacity_mut();
+                let mut buf = ReadBuf::uninit(unfilled);
+                match ready!(inner.poll_recv_from(cx, &mut buf)) {
+                    Ok(src) => {
+                        *consecutive_recv_errors = 0;
+                        let filled_len = buf.filled().len();
+                        unsafe {
+                            let new_len = chunk_buf.len() + filled_len;
+                            chunk_buf.set_len(new_len);
+                        }
+                        let data = chunk_buf.split_to(filled_len).freeze();
+                        let src = canonicalize_src(src);
+                        let src_addr = ip_to_logical
+                            .get(&src)
+                            .map(|(logical, _)| logical.clone())
+                            .unwrap_or_else(|| src.into());
+                        let first_packet = UdpPacket {
+                            data,
+                            src_addr,
+                            // Overwritten by the dispatcher with the originating
+                            // client address on the reply path.
+                            dst_addr: SocksAddr::any_ipv4(),
+                            ..Default::default()
+                        };
+
+                        // 2. Batch Drain: opportunistically drain more packets from socket
+                        while recv_queue.len() < MAX_BATCH_RECV_PACKETS - 1 {
+                            if chunk_buf.capacity() - chunk_buf.len() < MAX_UDP_DATAGRAM_SIZE {
+                                *chunk_buf = BytesMut::with_capacity(UDP_RECV_CHUNK_SIZE);
+                            }
+                            let spare = chunk_buf.spare_capacity_mut();
+                            let spare_slice = unsafe {
+                                std::slice::from_raw_parts_mut(
+                                    spare.as_mut_ptr() as *mut u8,
+                                    spare.len(),
+                                )
+                            };
+                            match inner.try_recv_from(spare_slice) {
+                                Ok((n, next_src)) => {
+                                    unsafe {
+                                        let new_len = chunk_buf.len() + n;
+                                        chunk_buf.set_len(new_len);
+                                    }
+                                    let next_data = chunk_buf.split_to(n).freeze();
+                                    let next_src = canonicalize_src(next_src);
+                                    let next_src_addr = ip_to_logical
+                                        .get(&next_src)
+                                        .map(|(logical, _)| logical.clone())
+                                        .unwrap_or_else(|| next_src.into());
+
+                                    recv_queue.push_back(UdpPacket {
+                                        data: next_data,
+                                        src_addr: next_src_addr,
+                                        dst_addr: SocksAddr::any_ipv4(),
+                                        ..Default::default()
+                                    });
+                                }
+                                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                                    break;
+                                }
+                                Err(e) => {
+                                    tracing::trace!("Direct UDP transient batch recv error: {e}");
+                                    break;
+                                }
                             }
                         }
-                        _ => src,
-                    };
-                    let src_addr = ip_to_logical
-                        .get(&src)
-                        .map(|(logical, _)| logical.clone())
-                        .unwrap_or_else(|| src.into());
-                    return Poll::Ready(Some(UdpPacket {
-                        data,
-                        src_addr,
-                        // Overwritten by the dispatcher with the originating
-                        // client address on the reply path.
-                        dst_addr: SocksAddr::any_ipv4(),
-                        ..Default::default()
-                    }));
-                }
-                // A UDP socket reports plenty of transient failures — an inbound
-                // ICMP port-unreachable for an earlier packet surfaces here as
-                // ECONNREFUSED. Ending the stream on the first one tore down the
-                // whole association, and this is the DIRECT path.
-                Err(e) => {
-                    *consecutive_recv_errors += 1;
-                    if *consecutive_recv_errors >= MAX_CONSECUTIVE_RECV_ERRORS {
-                        tracing::warn!(
-                            "direct udp recv failed {} times in a row, ending \
-                         association: {}",
-                            consecutive_recv_errors,
-                            e
-                        );
-                        return Poll::Ready(None);
+
+                        return Poll::Ready(Some(first_packet));
                     }
-                    tracing::debug!("direct udp recv error (continuing): {}", e);
+                    // A UDP socket reports plenty of transient failures — an inbound
+                    // ICMP port-unreachable for an earlier packet surfaces here as
+                    // ECONNREFUSED. Ending the stream on the first one tore down the
+                    // whole association, and this is the DIRECT path.
+                    Err(e) => {
+                        *consecutive_recv_errors += 1;
+                        if *consecutive_recv_errors >= MAX_CONSECUTIVE_RECV_ERRORS {
+                            tracing::warn!(
+                                "Direct UDP socket reached error limit ({MAX_CONSECUTIVE_RECV_ERRORS}), closing: {e}"
+                            );
+                            return Poll::Ready(None);
+                        }
+                        tracing::trace!("Direct UDP transient recv error: {e}");
+                    }
                 }
             }
-        }
+        })
     }
 }
 
@@ -512,4 +590,72 @@ mod tests {
         // src_addr is the raw IP because the sender is not in ip_to_logical.
         assert_eq!(pkt.src_addr, SocksAddr::Ip(third_party_addr));
     }
+
+    /// Pure IP destinations should not insert into `ip_to_logical`,
+    /// saving allocations and map lookups.
+    #[tokio::test]
+    async fn test_pure_ip_dest_bypasses_ip_to_logical() {
+        let echo_port = spawn_echo_server().await;
+        let mut datagram = make_datagram().await;
+
+        let ip_dst = SocksAddr::Ip(SocketAddr::from((Ipv4Addr::LOCALHOST, echo_port)));
+        datagram
+            .send(UdpPacket {
+                data: bytes::Bytes::from_static(b"pure-ip"),
+                dst_addr: ip_dst.clone(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        // ip_to_logical should remain empty for pure IP destinations
+        assert!(datagram.ip_to_logical.is_empty());
+
+        let pkt = tokio::time::timeout(Duration::from_secs(2), datagram.next())
+            .await
+            .expect("timed out")
+            .expect("stream ended");
+
+        assert_eq!(pkt.src_addr, ip_dst);
+        assert_eq!(pkt.data.as_ref(), b"pure-ip");
+    }
+
+    /// Verify batch receive drain: multiple packets arriving in burst are queued
+    /// and yielded correctly via `Stream::poll_next`.
+    #[tokio::test]
+    async fn test_batch_recv_burst_packets() {
+        let echo_port = spawn_echo_server().await;
+        let mut datagram = make_datagram().await;
+
+        let dst = SocksAddr::Domain("echo.test".to_owned(), echo_port);
+
+        // Send 5 packets in a burst
+        for i in 0..5 {
+            let payload = format!("burst-{i}");
+            datagram
+                .send(UdpPacket {
+                    data: bytes::Bytes::from(payload),
+                    dst_addr: dst.clone(),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+        }
+
+        let mut received = Vec::new();
+        for _ in 0..5 {
+            let pkt = tokio::time::timeout(Duration::from_secs(2), datagram.next())
+                .await
+                .expect("timed out")
+                .expect("stream ended");
+            assert_eq!(pkt.src_addr, dst);
+            received.push(String::from_utf8(pkt.data.to_vec()).unwrap());
+        }
+
+        assert_eq!(received.len(), 5);
+        for i in 0..5 {
+            assert!(received.contains(&format!("burst-{i}")));
+        }
+    }
 }
+

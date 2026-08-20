@@ -6,7 +6,7 @@ use std::{
 };
 use tracing::trace;
 
-use super::{new_tcp_stream, new_udp_socket};
+use super::{dial_tcp_with_happy_eyeballs, new_udp_socket};
 use crate::{
     app::{
         dispatcher::{
@@ -16,7 +16,6 @@ use crate::{
         dns::ThreadSafeDNSResolver,
         net::OutboundInterface,
     },
-    common::errors::new_io_error,
     proxy::{
         AnyOutboundDatagram, AnyOutboundHandler, AnyStream,
         direct::datagram::OutboundDatagramImpl,
@@ -74,21 +73,16 @@ impl RemoteConnector for DirectConnector {
         iface: Option<&OutboundInterface>,
         #[cfg(target_os = "linux")] so_mark: Option<u32>,
     ) -> std::io::Result<AnyStream> {
-        let dial_addr = resolver
-            .resolve(address, false)
-            .await
-            .map_err(|v| new_io_error(format!("can't resolve dns: {v}")))?
-            .ok_or(new_io_error("no dns result"))?;
-
-        new_tcp_stream(
-            (dial_addr, port).into(),
+        dial_tcp_with_happy_eyeballs(
+            address,
+            port,
+            &resolver,
             iface,
             tfo,
             #[cfg(target_os = "linux")]
             so_mark,
         )
         .await
-        .map(|x| Box::new(x) as _)
     }
 
     async fn connect_datagram(
