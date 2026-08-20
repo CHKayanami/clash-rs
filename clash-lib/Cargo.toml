@@ -218,6 +218,7 @@ aws-lc-rs = { version = "1", default-features = false, optional = true }
 
 # tproxy
 tempfile = "3.27"
+quick_cache = "0.7.0"
 
 [dev-dependencies]
 mockall = "0.14.0"

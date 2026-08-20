@@ -1572,6 +1572,7 @@ dependencies = [
  "prost-build",
  "protox",
  "public-suffix",
+ "quick_cache",
  "quinn 0.11.9",
  "quinn-proto 0.11.14",
  "rand 0.10.1",
@@ -6840,6 +6841,18 @@ dependencies = [
  "libc",
  "paste",
  "thiserror 2.0.18",
+]
+
+[[package]]
+name = "quick_cache"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "403c1a912fec895cafb223201e368234842acb9220aaf08ab042ae89ba5f135c"
+dependencies = [
+ "equivalent",
+ "foldhash 0.2.0",
+ "hashbrown 0.17.1",
+ "parking_lot",
 ]
 
 [[package]]

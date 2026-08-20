@@ -88,10 +88,7 @@ async fn test_lru_cache_hit_with_recursion_desired() {
 
     let mut resolver = EnhancedResolver::new_default().await;
     resolver.main.clear(); // ensure cache miss would fail deterministically
-    resolver.lru_cache = Some(hickory_resolver::ResponseCache::new(
-        16,
-        hickory_resolver::TtlConfig::default(),
-    ));
+    resolver.lru_cache = Some(super::cache::DnsCache::new(16));
 
     let mut request = op::Message::query();
     let mut query = op::Query::new();
@@ -104,17 +101,16 @@ async fn test_lru_cache_hit_with_recursion_desired() {
     request.add_query(query);
     request.metadata.recursion_desired = true;
 
-    let mut cached = op::Message::response(0, op::OpCode::Query);
     let ip = std::net::Ipv4Addr::new(127, 0, 0, 1);
-    cached.add_answer(rr::Record::from_rdata(
+    let record = rr::Record::from_rdata(
         name,
         300,
         rr::RData::A(rr::rdata::A(ip)),
-    ));
+    );
 
     let lru = resolver.lru_cache.as_ref().unwrap();
     let q = request.queries.first().unwrap().clone();
-    lru.insert(q, Ok(cached), Instant::now());
+    lru.insert(q, vec![record], Instant::now());
 
     let response = resolver
         .exchange(&request)

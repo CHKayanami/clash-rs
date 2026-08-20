@@ -2,6 +2,7 @@ use crate::{
     app::dns::ThreadSafeDNSResolver, common::errors::new_io_error,
     proxy::datagram::UdpPacket, session::SocksAddr,
 };
+use bytes::BytesMut;
 use futures::{Sink, Stream, ready};
 use std::{
     collections::HashMap,
@@ -34,7 +35,7 @@ pub struct OutboundDatagramImpl {
     resolver: ThreadSafeDNSResolver,
     flushed: bool,
     pkt: Option<UdpPacket>,
-    recv_buf: Vec<u8>,
+    recv_buf: BytesMut,
     // real upstream IP → dst_addr of the most recent outgoing packet to that
     // IP; used in poll_next to translate src_addr back to dst_addr.
     ip_to_logical: HashMap<SocketAddr, (SocksAddr, Instant)>,
@@ -61,7 +62,7 @@ impl OutboundDatagramImpl {
             resolver,
             flushed: true,
             pkt: None,
-            recv_buf: vec![0u8; 65535],
+            recv_buf: BytesMut::with_capacity(65535),
             ip_to_logical: HashMap::new(),
             pending_dns: None,
             resolved_dst: None,
@@ -246,11 +247,19 @@ impl Stream for OutboundDatagramImpl {
         } = *self;
 
         loop {
-            let mut buf = ReadBuf::new(recv_buf.as_mut_slice());
+            if recv_buf.capacity() < 65535 {
+                recv_buf.reserve(65535 - recv_buf.capacity());
+            }
+
+            let mut buf = ReadBuf::uninit(recv_buf.spare_capacity_mut());
             match ready!(inner.poll_recv_from(cx, &mut buf)) {
                 Ok(src) => {
                     *consecutive_recv_errors = 0;
-                    let data = bytes::Bytes::copy_from_slice(buf.filled());
+                    let n = buf.filled().len();
+                    unsafe {
+                        recv_buf.set_len(n);
+                    }
+                    let data = recv_buf.split_to(n).freeze();
                     // On dual-stack (AF_INET6) sockets the OS returns IPv4
                     // sender addresses in IPv4-mapped form (::ffff:x.x.x.x).
                     // Canonicalize back to plain IPv4 so that ip_to_logical

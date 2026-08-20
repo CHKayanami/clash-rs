@@ -40,6 +40,8 @@ impl UdpPacket {
     }
 }
 
+use bytes::{BufMut, BytesMut};
+
 pub struct UdpSocket {
     inbound: mpsc::UnboundedReceiver<Packet>,
     outbound: mpsc::Sender<Packet>,
@@ -57,6 +59,7 @@ impl UdpSocket {
         let read = SplitRead { recv: self.inbound };
         let write = SplitWrite {
             send: self.outbound,
+            buf: BytesMut::new(),
         };
         (read, write)
     }
@@ -117,6 +120,7 @@ impl SplitRead {
 #[derive(Clone)]
 pub struct SplitWrite {
     send: mpsc::Sender<Packet>,
+    buf: BytesMut,
 }
 
 impl SplitWrite {
@@ -143,12 +147,15 @@ impl SplitWrite {
         };
 
         let packet_len = builder.size(packet.data.data().len());
-        let mut ip_packet_writer = Vec::with_capacity(packet_len);
+        if self.buf.capacity() < packet_len {
+            self.buf.reserve(packet_len.max(2048) - self.buf.capacity());
+        }
+        let mut writer = (&mut self.buf).writer();
         builder
-            .write(&mut ip_packet_writer, packet.data.data())
+            .write(&mut writer, packet.data.data())
             .map_err(std::io::Error::other)?;
 
-        let bytes = bytes::Bytes::from(ip_packet_writer);
+        let bytes = self.buf.split().freeze();
 
         // UDP is inherently unreliable — drop the packet if the outbound
         // channel is full rather than blocking the UDP handler task.

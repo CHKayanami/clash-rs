@@ -69,7 +69,7 @@ pub struct FakeDns {
     /// Memoized `should_skip` verdicts. Covers both static `fake-ip-filter`
     /// entries and `rule-set:` matches; cleared wholesale whenever one of the
     /// bound rule-sets reloads (see [`FakeDns::add_rule_set`]).
-    skip_cache: moka::sync::Cache<String, bool>,
+    skip_cache: Arc<quick_cache::sync::Cache<String, bool>>,
 }
 
 impl FakeDns {
@@ -125,7 +125,7 @@ impl FakeDns {
             domain_filter: opt.domain_filter,
             filter_mode: opt.filter_mode,
             store: opt.store,
-            skip_cache: moka::sync::Cache::builder().max_capacity(1000).build(),
+            skip_cache: Arc::new(quick_cache::sync::Cache::new(1000)),
         })
     }
 
@@ -162,7 +162,7 @@ impl FakeDns {
                 // Subscribe before publishing the providers, so no query can be
                 // served from a cache that isn't wired for invalidation yet.
                 //
-                // `moka` cache handles are cheap to clone and share one backing
+                // `Arc<quick_cache>` handles are cheap to clone and share one backing
                 // store, so the callback carries a handle rather than a
                 // back-reference to `FakeDns` — no reference cycle, and nothing
                 // here keeps the resolver alive.
@@ -174,13 +174,13 @@ impl FakeDns {
                             "rule-set {} reloaded, clearing fake-ip skip cache",
                             name
                         );
-                        cache.invalidate_all();
+                        cache.clear();
                     }));
                 }
 
                 // Verdicts computed before the rule-sets were bound assumed there
                 // were none; drop them.
-                self.skip_cache.invalidate_all();
+                self.skip_cache.clear();
             }
         }
     }
@@ -575,9 +575,9 @@ mod tests {
 
         let first = pool.lookup("foo.com").await;
 
-        pool.lookup("bar.com").await;
-        pool.lookup("baz.com").await;
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        for i in 0..10 {
+            pool.lookup(&format!("domain{i}.com")).await;
+        }
         let next = pool.lookup("foo.com").await;
 
         assert_ne!(first, next);

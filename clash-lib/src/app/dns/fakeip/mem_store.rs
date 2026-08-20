@@ -1,7 +1,7 @@
 use std::net::IpAddr;
 
 use async_trait::async_trait;
-use moka::sync::Cache;
+use quick_cache::sync::Cache;
 
 use super::Store;
 
@@ -13,8 +13,8 @@ pub struct InMemStore {
 impl InMemStore {
     pub fn new(size: usize) -> Self {
         Self {
-            itoh: Cache::builder().max_capacity(size as u64).build(),
-            htoi: Cache::builder().max_capacity(size as u64).build(),
+            itoh: Cache::new(size),
+            htoi: Cache::new(size),
         }
     }
 
@@ -70,14 +70,14 @@ impl Store for InMemStore {
 
     async fn del_by_ip(&self, ip: std::net::IpAddr) {
         if let Some(host) = self.itoh.get(&ip) {
-            self.itoh.invalidate(&ip);
+            self.itoh.remove(&ip);
             let key = Self::make_host_key(&host, ip.is_ipv6());
-            self.htoi.invalidate(&key);
+            self.htoi.remove(&key);
         }
     }
 
     async fn exist(&self, ip: std::net::IpAddr) -> bool {
-        self.itoh.contains_key(&ip)
+        self.itoh.peek(&ip).is_some()
     }
 
     async fn copy_to(&self, #[allow(unused)] store: &dyn Store) {

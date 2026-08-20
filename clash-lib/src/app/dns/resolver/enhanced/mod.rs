@@ -1,7 +1,9 @@
+mod cache;
 mod policy;
 #[cfg(test)]
 mod tests;
 
+pub use cache::DnsCache;
 pub use policy::NameServerPolicyContainer;
 
 use crate::{
@@ -52,7 +54,7 @@ pub struct EnhancedResolver {
     fallback: Option<Vec<ThreadSafeDNSClient>>,
     fallback_filter: Option<FallbackFilter>,
 
-    lru_cache: Option<hickory_resolver::ResponseCache>,
+    lru_cache: Option<DnsCache>,
     policy: Option<NameServerPolicyContainer>,
 
     proxy_resolver: Option<Vec<ThreadSafeDNSClient>>,
@@ -240,10 +242,7 @@ impl EnhancedResolver {
                     Some(filter)
                 }
             },
-            lru_cache: Some(hickory_resolver::ResponseCache::new(
-                4096,
-                hickory_resolver::TtlConfig::default(),
-            )),
+            lru_cache: Some(DnsCache::new(4096)),
             policy: if !cfg.nameserver_policy.is_empty() {
                 let mut container = NameServerPolicyContainer::new();
                 for (domain, ns) in &cfg.nameserver_policy {
@@ -393,16 +392,14 @@ impl EnhancedResolver {
 
         // Cache hit — return early
         if let Some(lru) = &self.lru_cache
-            && let Some(Ok(cached)) = lru
-                .get(q, Instant::now())
-                .map(|c| c.inspect_err(|x| warn!("failed to get cached message: {}", x)))
+            && let Some(answers) = lru.get(q, Instant::now())
         {
             trace!(
                 q = q.to_string(),
                 "cache hit for DNS query, returning cached response",
             );
             let mut reply = build_dns_response_message(message, true, false);
-            reply.add_answers(cached.answers.iter().cloned());
+            reply.add_answers(answers);
             let ip_list = EnhancedResolver::ip_list_of_message(&reply);
             if !ip_list.is_empty() {
                 if let Some(collector) = &self.collector {
@@ -475,7 +472,7 @@ impl EnhancedResolver {
                 ips.is_empty() || ips.iter().any(|ip| !ip.is_unspecified())
             }
         {
-            lru.insert(q.clone(), Ok(msg.clone()), Instant::now());
+            lru.insert(q.clone(), msg.answers.clone(), Instant::now());
         }
 
         rv
