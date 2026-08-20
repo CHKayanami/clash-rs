@@ -49,7 +49,7 @@ use std::{
     io::{self, Cursor, Seek, SeekFrom},
     slice,
     sync::{Arc, LazyLock},
-    time::{Duration, SystemTime},
+    time::SystemTime,
 };
 
 use aes::{
@@ -59,7 +59,7 @@ use aes::{
 use byte_string::ByteStr;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use log::{error, trace};
-use moka::sync::Cache;
+use quick_cache::sync::Cache;
 
 #[cfg(feature = "aead-cipher-2022-extra")]
 use crate::crypto::v2::udp::ChaCha8Poly1305Cipher;
@@ -111,14 +111,48 @@ struct CipherKey {
     session_id: u64,
 }
 
-const CIPHER_CACHE_DURATION: Duration = Duration::from_secs(30);
 const CIPHER_CACHE_LIMIT: usize = 4096;
 
+/// Per-socket / Per-outbound cache for AEAD 2022 UdpCipher
+#[derive(Default)]
+pub struct UdpCipherCache {
+    send: std::sync::Mutex<Option<(u64, Arc<UdpCipher>)>>,
+    recv: std::sync::Mutex<Option<(u64, Arc<UdpCipher>)>>,
+}
+
+impl std::fmt::Debug for UdpCipherCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UdpCipherCache").finish()
+    }
+}
+
+impl UdpCipherCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    #[inline]
+    pub fn get_or_create(&self, is_send: bool, method: CipherKind, key: &[u8], session_id: u64) -> Arc<UdpCipher> {
+        let slot = if is_send { &self.send } else { &self.recv };
+        {
+            if let Ok(guard) = slot.lock() {
+                if let Some((s_id, ref cipher)) = *guard {
+                    if s_id == session_id {
+                        return cipher.clone();
+                    }
+                }
+            }
+        }
+        let cipher = get_cipher(method, key, session_id);
+        if let Ok(mut guard) = slot.lock() {
+            *guard = Some((session_id, cipher.clone()));
+        }
+        cipher
+    }
+}
+
 static CIPHER_CACHE: LazyLock<Cache<CipherKey, Arc<UdpCipher>>> = LazyLock::new(|| {
-    Cache::builder()
-        .max_capacity(CIPHER_CACHE_LIMIT as u64)
-        .time_to_idle(CIPHER_CACHE_DURATION)
-        .build()
+    Cache::new(CIPHER_CACHE_LIMIT)
 });
 
 thread_local! {
@@ -150,7 +184,9 @@ fn get_cipher(method: CipherKind, key: &[u8], session_id: u64) -> Arc<UdpCipher>
             }
         }
 
-        let cipher = CIPHER_CACHE.get_with(cache_key, || Arc::new(UdpCipher::new(method, key, session_id)));
+        let cipher = CIPHER_CACHE
+            .get_or_insert_with(&cache_key, || Ok::<_, std::convert::Infallible>(Arc::new(UdpCipher::new(method, key, session_id))))
+            .unwrap();
         *fast = Some((cache_key, cipher.clone()));
         cipher
     })
@@ -164,17 +200,25 @@ fn encrypt_message(
     packet: &mut BytesMut,
     session_id: u64,
     eih_len: usize,
+    cipher_cache: Option<&UdpCipherCache>,
 ) {
     unsafe {
         packet.advance_mut(method.tag_len());
     }
+
+    let get_udp_cipher = |is_send: bool, session_id: u64, cipher_key: &[u8]| -> Arc<UdpCipher> {
+        match cipher_cache {
+            Some(cache) => cache.get_or_create(is_send, method, cipher_key, session_id),
+            None => get_cipher(method, cipher_key, session_id),
+        }
+    };
 
     match method {
         CipherKind::AEAD2022_BLAKE3_CHACHA20_POLY1305 => {
             // ChaCha20-Poly1305 uses PSK as key, prepended nonce in packet
             let nonce_size = ChaCha20Poly1305Cipher::nonce_size();
 
-            let cipher = get_cipher(method, key, session_id);
+            let cipher = get_udp_cipher(true, session_id, key);
 
             let (nonce, message) = packet.split_at_mut(nonce_size);
             cipher.encrypt_packet(nonce, message);
@@ -184,7 +228,7 @@ fn encrypt_message(
             // ChaCha8-Poly1305 uses PSK as key, prepended nonce in packet
             let nonce_size = ChaCha8Poly1305Cipher::nonce_size();
 
-            let cipher = get_cipher(method, key, session_id);
+            let cipher = get_udp_cipher(true, session_id, key);
 
             let (nonce, message) = packet.split_at_mut(nonce_size);
             cipher.encrypt_packet(nonce, message);
@@ -192,7 +236,7 @@ fn encrypt_message(
         CipherKind::AEAD2022_BLAKE3_AES_128_GCM | CipherKind::AEAD2022_BLAKE3_AES_256_GCM => {
             // AES-*-GCM uses derived key, and part of the packet header as nonce
 
-            let cipher = get_cipher(method, key, session_id);
+            let cipher = get_udp_cipher(true, session_id, key);
 
             // Encrypt the rest of the packet with AEAD cipher (AES-*-GCM)
             let (packet_header, mut message) = packet.split_at_mut(16);
@@ -232,8 +276,16 @@ fn decrypt_message(
     key: &[u8],
     packet: &mut [u8],
     user_manager: Option<&ServerUserManager>,
+    cipher_cache: Option<&UdpCipherCache>,
 ) -> ProtocolResult<Option<Arc<ServerUser>>> {
     let mut client_user = None;
+
+    let get_udp_cipher = |is_send: bool, session_id: u64, cipher_key: &[u8]| -> Arc<UdpCipher> {
+        match cipher_cache {
+            Some(cache) => cache.get_or_create(is_send, method, cipher_key, session_id),
+            None => get_cipher(method, cipher_key, session_id),
+        }
+    };
 
     match method {
         CipherKind::AEAD2022_BLAKE3_CHACHA20_POLY1305 => {
@@ -251,7 +303,7 @@ fn decrypt_message(
                 u64::from_be(session_id_slice[0])
             };
 
-            let cipher = get_cipher(method, key, session_id);
+            let cipher = get_udp_cipher(false, session_id, key);
 
             if !cipher.decrypt_packet(nonce, message) {
                 return Err(ProtocolError::DecryptPayloadError);
@@ -273,7 +325,7 @@ fn decrypt_message(
                 u64::from_be(session_id_slice[0])
             };
 
-            let cipher = get_cipher(method, key, session_id);
+            let cipher = get_udp_cipher(false, session_id, key);
 
             if !cipher.decrypt_packet(nonce, message) {
                 return Err(ProtocolError::DecryptPayloadError);
@@ -355,16 +407,16 @@ fn decrypt_message(
                         }
                         Some(user) => {
                             trace!("{:?} chosen by EIH", user);
-                            let cipher = get_cipher(method, user.key(), session_id);
+                            let cipher = get_udp_cipher(false, session_id, user.key());
                             client_user = Some(user);
                             cipher
                         }
                     }
                 } else {
-                    get_cipher(method, key, session_id)
+                    get_udp_cipher(false, session_id, key)
                 }
             } else {
-                get_cipher(method, key, session_id)
+                get_udp_cipher(false, session_id, key)
             };
 
             let nonce = &packet_header[4..16];
@@ -390,6 +442,7 @@ fn get_nonce_len(method: CipherKind) -> usize {
 }
 
 /// Encrypt `Client -> Server` UDP AEAD protocol packet
+#[allow(dead_code)]
 #[allow(clippy::too_many_arguments)]
 pub fn encrypt_client_payload_aead_2022(
     context: &Context,
@@ -400,6 +453,32 @@ pub fn encrypt_client_payload_aead_2022(
     identity_keys: &[Bytes],
     payload: &[u8],
     dst: &mut BytesMut,
+) {
+    encrypt_client_payload_aead_2022_cached(
+        context,
+        method,
+        key,
+        addr,
+        control,
+        identity_keys,
+        payload,
+        dst,
+        None,
+    );
+}
+
+/// Encrypt `Client -> Server` UDP AEAD protocol packet with optional per-socket cipher cache
+#[allow(clippy::too_many_arguments)]
+pub fn encrypt_client_payload_aead_2022_cached(
+    context: &Context,
+    method: CipherKind,
+    key: &[u8],
+    addr: &Address,
+    control: &UdpSocketControlData,
+    identity_keys: &[Bytes],
+    payload: &[u8],
+    dst: &mut BytesMut,
+    cipher_cache: Option<&UdpCipherCache>,
 ) {
     let padding_size = get_aead_2022_padding_size(payload);
     let nonce_size = get_nonce_len(method);
@@ -508,7 +587,7 @@ pub fn encrypt_client_payload_aead_2022(
     } else {
         &identity_keys[0]
     };
-    encrypt_message(context, method, ipsk, key, dst, control.client_session_id, eih_size);
+    encrypt_message(context, method, ipsk, key, dst, control.client_session_id, eih_size, cipher_cache);
 }
 
 /// Decrypt `Client -> Server` UDP AEAD protocol packet
@@ -529,7 +608,7 @@ pub fn decrypt_client_payload_aead_2022(
         return Err(ProtocolError::PacketTooShort(header_len, payload.len()));
     }
 
-    let user = decrypt_message(context, method, key, payload, user_manager)?;
+    let user = decrypt_message(context, method, key, payload, user_manager, None)?;
 
     let data = &payload[nonce_len..payload.len() - tag_len];
     let mut cursor = Cursor::new(data);
@@ -620,15 +699,27 @@ pub fn encrypt_server_payload_aead_2022(
     addr.write_to_buf(dst);
     dst.put_slice(payload);
 
-    encrypt_message(context, method, key, key, dst, control.server_session_id, 0);
+    encrypt_message(context, method, key, key, dst, control.server_session_id, 0, None);
 }
 
 /// Decrypt `Server -> Client` UDP AEAD protocol packet
+#[allow(dead_code)]
 pub fn decrypt_server_payload_aead_2022(
     context: &Context,
     method: CipherKind,
     key: &[u8],
     payload: &mut [u8],
+) -> ProtocolResult<(usize, Address, UdpSocketControlData)> {
+    decrypt_server_payload_aead_2022_cached(context, method, key, payload, None)
+}
+
+/// Decrypt `Server -> Client` UDP AEAD protocol packet with optional per-socket cipher cache
+pub fn decrypt_server_payload_aead_2022_cached(
+    context: &Context,
+    method: CipherKind,
+    key: &[u8],
+    payload: &mut [u8],
+    cipher_cache: Option<&UdpCipherCache>,
 ) -> ProtocolResult<(usize, Address, UdpSocketControlData)> {
     let nonce_len = get_nonce_len(method);
     let tag_len = method.tag_len();
@@ -637,7 +728,7 @@ pub fn decrypt_server_payload_aead_2022(
         return Err(ProtocolError::PacketTooShort(header_len, payload.len()));
     }
 
-    let user = decrypt_message(context, method, key, payload, None)?;
+    let user = decrypt_message(context, method, key, payload, None, cipher_cache)?;
     debug_assert!(user.is_none(), "server respond packet shouldn't have EIH");
 
     let data = &payload[nonce_len..payload.len() - tag_len];

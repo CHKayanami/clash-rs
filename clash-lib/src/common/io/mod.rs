@@ -57,6 +57,92 @@ impl From<std::io::Error> for CopyBidirectionalError {
     }
 }
 
+const INITIAL_COPY_BUFFER_SIZE: usize = 8 * 1024;
+const POOL_SHARDS: usize = 16;
+const BUFFER_POOL_MAX_SIZE_PER_SHARD: usize = 16;
+
+static BUFFER_POOLS: std::sync::LazyLock<[std::sync::Mutex<Vec<BytesMut>>; POOL_SHARDS]> =
+    std::sync::LazyLock::new(|| std::array::from_fn(|_| std::sync::Mutex::new(Vec::new())));
+
+thread_local! {
+    static TLS_SHARD_HINT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[inline]
+fn get_shard_index() -> usize {
+    TLS_SHARD_HINT.with(|hint| {
+        let idx = hint.get();
+        hint.set((idx + 1) % POOL_SHARDS);
+        idx
+    })
+}
+
+/// Pooled buffer that returns to pool on drop instead of deallocating (shoes-style RAII).
+#[derive(Debug)]
+pub struct PooledBuffer {
+    buffer: BytesMut,
+    shard: usize,
+}
+
+impl PooledBuffer {
+    /// Get a buffer from the pool or create a new one.
+    pub fn with_capacity(cap: usize) -> Self {
+        let shard = get_shard_index();
+        if let Ok(mut pool) = BUFFER_POOLS[shard].lock() {
+            if let Some(mut buffer) = pool.pop() {
+                if buffer.capacity() < cap {
+                    buffer.reserve(cap - buffer.capacity());
+                }
+                buffer.resize(cap, 0);
+                return Self { buffer, shard };
+            }
+        }
+        let mut buffer = BytesMut::with_capacity(cap);
+        buffer.resize(cap, 0);
+        Self { buffer, shard }
+    }
+
+    #[inline]
+    #[allow(dead_code)]
+    pub fn len(&self) -> usize {
+        self.buffer.len()
+    }
+
+    #[inline]
+    #[allow(dead_code)]
+    pub fn is_empty(&self) -> bool {
+        self.buffer.is_empty()
+    }
+}
+
+impl std::ops::Deref for PooledBuffer {
+    type Target = [u8];
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        &self.buffer[..]
+    }
+}
+
+impl std::ops::DerefMut for PooledBuffer {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.buffer[..]
+    }
+}
+
+impl Drop for PooledBuffer {
+    fn drop(&mut self) {
+        if let Ok(mut pool) = BUFFER_POOLS[self.shard].lock() {
+            if pool.len() < BUFFER_POOL_MAX_SIZE_PER_SHARD {
+                let mut buffer = std::mem::replace(&mut self.buffer, BytesMut::new());
+                buffer.clear();
+                pool.push(buffer);
+            }
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct CopyBuffer {
     read_done: bool,
@@ -64,7 +150,8 @@ pub struct CopyBuffer {
     pos: usize,
     cap: usize,
     amt: u64,
-    buf: Box<[u8]>,
+    target_cap: usize,
+    buf: PooledBuffer,
 }
 
 impl CopyBuffer {
@@ -76,22 +163,21 @@ impl CopyBuffer {
             pos: 0,
             cap: 0,
             amt: 0,
-            buf: vec![0; 2 * 1024].into_boxed_slice(),
+            target_cap: 2 * 1024,
+            buf: PooledBuffer::with_capacity(2 * 1024),
         }
     }
 
-    pub fn new_with_capacity(size: usize) -> Result<Self, std::io::Error> {
-        let mut buf = Vec::new();
-        buf.try_reserve(size)
-            .map_err(|e| std::io::Error::other(format!("new buffer failed: {e}")))?;
-        buf.resize(size, 0);
+    pub fn new_with_capacity(target_cap: usize) -> Result<Self, std::io::Error> {
+        let initial_size = target_cap.min(INITIAL_COPY_BUFFER_SIZE);
         Ok(Self {
             read_done: false,
             need_flush: false,
             pos: 0,
             cap: 0,
             amt: 0,
-            buf: buf.into_boxed_slice(),
+            target_cap,
+            buf: PooledBuffer::with_capacity(initial_size),
         })
     }
 
@@ -114,8 +200,13 @@ impl CopyBuffer {
             // If our buffer is empty, then we need to read some data to
             // continue.
             if self.pos == self.cap && !self.read_done {
+                // If previous read filled the entire buffer, jump directly to target_cap in a single step
+                if self.cap == self.buf.len() && self.buf.len() < self.target_cap {
+                    self.buf = PooledBuffer::with_capacity(self.target_cap);
+                }
+
                 let me = &mut *self;
-                let mut buf = ReadBuf::new(&mut me.buf);
+                let mut buf = ReadBuf::new(&mut me.buf[..]);
 
                 match reader.as_mut().poll_read(cx, &mut buf) {
                     Poll::Ready(Ok(_)) => (),
@@ -498,5 +589,62 @@ impl<T: ReadExactBase> ReadExt for T {
                 return Poll::Ready(Ok(()));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    #[test]
+    fn test_copy_buffer_initial_capacity() {
+        let small = CopyBuffer::new_with_capacity(4096).unwrap();
+        assert_eq!(small.buf.len(), 4096);
+        assert_eq!(small.target_cap, 4096);
+
+        let large = CopyBuffer::new_with_capacity(128 * 1024).unwrap();
+        assert_eq!(large.buf.len(), INITIAL_COPY_BUFFER_SIZE);
+        assert_eq!(large.target_cap, 128 * 1024);
+    }
+
+    #[tokio::test]
+    async fn test_copy_buffer_adaptive_grow() {
+        let test_data = vec![0x42_u8; 64 * 1024];
+        let mut reader = Cursor::new(test_data.clone());
+        let mut writer = Vec::new();
+
+        let mut copy_buf = CopyBuffer::new_with_capacity(64 * 1024).unwrap();
+        assert_eq!(copy_buf.buf.len(), 8192);
+
+        let res = futures::future::poll_fn(|cx| {
+            copy_buf.poll_copy(
+                cx,
+                Pin::new(&mut reader),
+                Pin::new(&mut writer),
+                None,
+            )
+        })
+        .await;
+
+        assert!(res.is_ok());
+        assert_eq!(res.unwrap(), 64 * 1024);
+        assert_eq!(writer, test_data);
+        // After transferring data larger than 8KB in full reads, buffer should have grown to target_cap
+        assert_eq!(copy_buf.buf.len(), 64 * 1024);
+        assert_eq!(copy_buf.amount_transferred(), 64 * 1024);
+    }
+
+    #[test]
+    fn test_pooled_buffer_recycle() {
+        let buf = PooledBuffer::with_capacity(32 * 1024);
+        assert_eq!(buf.len(), 32 * 1024);
+        assert!(buf.buffer.capacity() >= 32 * 1024);
+        drop(buf);
+
+        // Can acquire again seamlessly
+        let buf2 = PooledBuffer::with_capacity(16 * 1024);
+        assert_eq!(buf2.len(), 16 * 1024);
+        drop(buf2);
     }
 }

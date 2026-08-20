@@ -6,7 +6,7 @@ use std::{
     task::{Context, Poll},
 };
 
-use bytes::BytesMut;
+use bytes::Bytes;
 use futures::{
     Sink, SinkExt, Stream, StreamExt, ready,
     stream::{SplitSink, SplitStream},
@@ -35,6 +35,12 @@ use crate::{
 /// session, but a permanently broken socket still has to terminate.
 const MAX_CONSECUTIVE_RECV_ERRORS: usize = 32;
 
+use std::cell::RefCell;
+
+thread_local! {
+    static UDP_RECV_BUF: RefCell<[u8; 65535]> = const { RefCell::new([0u8; 65535]) };
+}
+
 pub struct OutboundDatagramShadowsocks<S> {
     inner: ProxySocket<S>,
     /// The SS server addr
@@ -45,7 +51,6 @@ pub struct OutboundDatagramShadowsocks<S> {
     pkt: Option<UdpPacket>,
 
     // for Stream
-    buf: BytesMut,
     consecutive_recv_errors: usize,
 
     ss_control: UdpSocketControlData,
@@ -61,7 +66,6 @@ impl<S> OutboundDatagramShadowsocks<S> {
             flushed: true,
             pkt: None,
             remote_addr,
-            buf: BytesMut::with_capacity(65535),
             consecutive_recv_errors: 0,
 
             ss_control,
@@ -184,58 +188,53 @@ where
     ) -> Poll<Option<Self::Item>> {
         let me = self.get_mut();
 
-        loop {
-            if me.buf.capacity() < 65535 {
-                me.buf.reserve(65535 - me.buf.capacity());
-            }
+        UDP_RECV_BUF.with_borrow_mut(|recv_buf| {
+            loop {
+                let mut read_buf = ReadBuf::new(&mut recv_buf[..]);
 
-            let mut read_buf = ReadBuf::uninit(me.buf.spare_capacity_mut());
+                let rv = ready!(me.inner.poll_recv(cx, &mut read_buf));
+                debug!("recv udp packet from remote ss server: {:?}", rv);
 
-            let rv = ready!(me.inner.poll_recv(cx, &mut read_buf));
-            debug!("recv udp packet from remote ss server: {:?}", rv);
-
-            match rv {
-                Ok((n, src, ..)) => {
-                    me.consecutive_recv_errors = 0;
-                    unsafe {
-                        me.buf.set_len(n);
+                match rv {
+                    Ok((n, src, ..)) => {
+                        me.consecutive_recv_errors = 0;
+                        let data = Bytes::copy_from_slice(&recv_buf[..n]);
+                        return Poll::Ready(Some(UdpPacket {
+                            data,
+                            src_addr: match src {
+                                shadowsocks::relay::Address::SocketAddress(a) => {
+                                    a.into()
+                                }
+                                shadowsocks::relay::Address::DomainNameAddress(
+                                    domain,
+                                    port,
+                                ) => SocksAddr::Domain(domain, port),
+                            },
+                            // overwritten by the dispatcher with the original client
+                            // address on the reply path
+                            dst_addr: SocksAddr::any_ipv4(),
+                            inbound_user: None,
+                        }));
                     }
-                    let data = me.buf.split_to(n).freeze();
-                    return Poll::Ready(Some(UdpPacket {
-                        data,
-                        src_addr: match src {
-                            shadowsocks::relay::Address::SocketAddress(a) => {
-                                a.into()
-                            }
-                            shadowsocks::relay::Address::DomainNameAddress(
-                                domain,
-                                port,
-                            ) => SocksAddr::Domain(domain, port),
-                        },
-                        // overwritten by the dispatcher with the original client
-                        // address on the reply path
-                        dst_addr: SocksAddr::any_ipv4(),
-                        inbound_user: None,
-                    }));
-                }
-                // A single undecryptable datagram used to end the whole
-                // association: the dispatcher drives this stream with
-                // `while let Some(..)`, so `None` tears down the relay task.
-                // Drop the packet and keep the session alive instead.
-                Err(e) => {
-                    me.consecutive_recv_errors += 1;
-                    if me.consecutive_recv_errors >= MAX_CONSECUTIVE_RECV_ERRORS {
-                        error!(
-                            "shadowsocks udp recv failed {} times in a row, \
-                             ending association: {}",
-                            me.consecutive_recv_errors, e
-                        );
-                        return Poll::Ready(None);
+                    // A single undecryptable datagram used to end the whole
+                    // association: the dispatcher drives this stream with
+                    // `while let Some(..)`, so `None` tears down the relay task.
+                    // Drop the packet and keep the session alive instead.
+                    Err(e) => {
+                        me.consecutive_recv_errors += 1;
+                        if me.consecutive_recv_errors >= MAX_CONSECUTIVE_RECV_ERRORS {
+                            error!(
+                                "shadowsocks udp recv failed {} times in a row, \
+                                 ending association: {}",
+                                me.consecutive_recv_errors, e
+                            );
+                            return Poll::Ready(None);
+                        }
+                        debug!("dropping undecryptable shadowsocks udp packet: {}", e);
                     }
-                    debug!("dropping undecryptable shadowsocks udp packet: {}", e);
                 }
             }
-        }
+        })
     }
 }
 

@@ -11,4 +11,4 @@ pub use ring_buffer::{max_pooled_buffers, set_max_pooled_buffers};
 pub use stack::{NetStack, Packet, StackSplitSink, StackSplitStream};
 pub use tcp_listener::TcpListener;
 pub use tcp_stream::TcpStream;
-pub use udp_socket::{UdpPacket, UdpSocket};
+pub use udp_socket::{SplitRead, SplitWrite, UdpPacket, UdpSocket, parse_udp_packet};

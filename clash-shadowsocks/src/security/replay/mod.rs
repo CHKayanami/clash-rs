@@ -1,13 +1,8 @@
 use std::fmt;
 
 #[cfg(feature = "aead-cipher-2022")]
-use std::time::Duration;
+use quick_cache::sync::Cache;
 
-#[cfg(feature = "aead-cipher-2022")]
-use moka::sync::Cache;
-
-#[cfg(feature = "aead-cipher-2022")]
-use crate::relay::tcprelay::proxy_stream::protocol::v2::SERVER_STREAM_TIMESTAMP_MAX_DIFF;
 use crate::{config::ServerType, crypto::CipherKind};
 
 /// A protector against replay attack (AEAD 2022)
@@ -31,10 +26,7 @@ impl ReplayProtector {
     pub fn new(config_type: ServerType) -> Self {
         Self {
             #[cfg(feature = "aead-cipher-2022")]
-            nonce_set: Cache::builder()
-                .max_capacity(16384)
-                .time_to_live(Duration::from_secs(SERVER_STREAM_TIMESTAMP_MAX_DIFF * 2))
-                .build(),
+            nonce_set: Cache::new(16384),
         }
     }
 

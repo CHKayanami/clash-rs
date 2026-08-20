@@ -9,7 +9,6 @@ use axum::{
     response::IntoResponse,
     routing::get,
 };
-use serde_json::json;
 use tracing::{debug, warn};
 
 use crate::app::api::{
@@ -17,7 +16,7 @@ use crate::app::api::{
     handlers::{
         connection::GetConnectionsQuery,
         flows::ws_handle as flows_ws_handle,
-        memory::{GetMemoryQuery, GetMemoryResponse},
+        memory::GetMemoryQuery,
     },
 };
 
@@ -76,11 +75,7 @@ pub async fn traffic(
         loop {
             interval.tick().await;
             let (up, down) = state.statistics_manager.now();
-            let response = json!({
-                "up": up,
-                "down": down,
-            })
-            .to_string();
+            let response = format!(r#"{{"up":{up},"down":{down}}}"#);
 
             if let Err(e) = socket.send(Message::Text(response.into())).await {
                 debug!("ws connection closed with error: {}", e);
@@ -102,23 +97,13 @@ pub async fn memory(
     query: Query<GetMemoryQuery>,
 ) -> impl IntoResponse {
     let callback = async move |mut socket: WebSocket| {
-        let interval = query.interval.unwrap_or(1);
+        let interval = query.interval.unwrap_or(1).max(1);
         let mut interval = tokio::time::interval(Duration::from_secs(interval));
 
         loop {
             interval.tick().await;
-            let snapshot = GetMemoryResponse {
-                inuse: state.statistics_manager.memory_usage(),
-                oslimit: 0,
-            };
-
-            let body = match serde_json::to_string(&snapshot) {
-                Ok(body) => body,
-                Err(e) => {
-                    debug!("failed to serialize memory snapshot: {}", e);
-                    break;
-                }
-            };
+            let inuse = state.statistics_manager.memory_usage();
+            let body = format!(r#"{{"inuse":{inuse},"oslimit":0}}"#);
 
             if let Err(e) = socket.send(Message::Text(body.into())).await {
                 debug!("ws connection closed with error: {}", e);

@@ -10,11 +10,11 @@ static DOMAIN_STEP: u8 = b'.';
 
 #[derive(Default)]
 pub struct DomainSet {
-    leaves: Vec<u64>,
-    label_bit_map: Vec<u64>,
-    labels: Vec<u8>,
-    ranks: Vec<i32>,
-    selects: Vec<i32>,
+    leaves: Box<[u64]>,
+    label_bit_map: Box<[u64]>,
+    labels: Box<[u8]>,
+    ranks: Box<[i32]>,
+    selects: Box<[i32]>,
 }
 
 impl DomainSet {
@@ -189,49 +189,45 @@ impl DomainSet {
         label_bit_map: Vec<u64>,
         labels: Vec<u8>,
     ) -> Self {
-        let mut set = Self {
-            leaves,
-            label_bit_map,
-            labels,
-            ranks: Vec::new(),
-            selects: Vec::new(),
-        };
-        set.init();
-        set
+        let (ranks, selects) = Self::compute_ranks_and_selects(&label_bit_map);
+        Self {
+            leaves: leaves.into_boxed_slice(),
+            label_bit_map: label_bit_map.into_boxed_slice(),
+            labels: labels.into_boxed_slice(),
+            ranks,
+            selects,
+        }
     }
 
-    fn init(&mut self) {
-        self.ranks.clear();
-        self.ranks.reserve(self.label_bit_map.len() + 1);
-        self.ranks.push(0);
+    fn compute_ranks_and_selects(label_bit_map: &[u64]) -> (Box<[i32]>, Box<[i32]>) {
+        let mut ranks = Vec::with_capacity(label_bit_map.len() + 1);
+        ranks.push(0);
 
         let mut total_ones: usize = 0;
-        for &word in &self.label_bit_map {
+        for &word in label_bit_map {
             let n = word.count_ones() as usize;
             total_ones += n;
-            self.ranks.push(total_ones as i32);
+            ranks.push(total_ones as i32);
         }
 
         let select_cap = (total_ones + 63) / 64;
-        self.selects.clear();
-        self.selects.reserve(select_cap);
+        let mut selects = Vec::with_capacity(select_cap);
 
         let mut ones_count: usize = 0;
-        for (word_idx, &word) in self.label_bit_map.iter().enumerate() {
+        for (word_idx, &word) in label_bit_map.iter().enumerate() {
             let mut w = word;
             let base_bit = (word_idx * 64) as i32;
             while w != 0 {
                 let bit_idx = w.trailing_zeros() as i32;
                 if ones_count & 63 == 0 {
-                    self.selects.push(base_bit + bit_idx);
+                    selects.push(base_bit + bit_idx);
                 }
                 ones_count += 1;
                 w &= w - 1; // Clear lowest set bit
             }
         }
 
-        self.ranks.shrink_to_fit();
-        self.selects.shrink_to_fit();
+        (ranks.into_boxed_slice(), selects.into_boxed_slice())
     }
 
     #[cfg(test)]
@@ -314,7 +310,9 @@ impl<T> From<StringTrie<T>> for DomainSet {
         });
         keys.sort();
 
-        let mut rv = DomainSet::default();
+        let mut leaves = Vec::new();
+        let mut label_bit_map = Vec::new();
+        let mut labels = Vec::new();
 
         let mut l_idx = 0;
 
@@ -329,7 +327,7 @@ impl<T> From<StringTrie<T>> for DomainSet {
             let elt = &mut queue[i];
             if elt.col == keys[elt.s].len() {
                 elt.s += 1;
-                set_bit(&mut rv.leaves, i, true);
+                set_bit(&mut leaves, i, true);
             }
 
             let mut j = elt.s;
@@ -349,13 +347,13 @@ impl<T> From<StringTrie<T>> for DomainSet {
                 });
                 // Safely handle potential None if keys[frm] is shorter than col
                 if let Some(char_at_col) = keys[frm].chars().nth(col) {
-                    rv.labels.push(char_at_col as u8);
-                    set_bit(&mut rv.label_bit_map, l_idx, false);
+                    labels.push(char_at_col as u8);
+                    set_bit(&mut label_bit_map, l_idx, false);
                     l_idx += 1;
                 }
             }
 
-            set_bit(&mut rv.label_bit_map, l_idx, true);
+            set_bit(&mut label_bit_map, l_idx, true);
             l_idx += 1;
 
             if i == queue.len() - 1 {
@@ -364,9 +362,7 @@ impl<T> From<StringTrie<T>> for DomainSet {
             i += 1;
         }
 
-        rv.init();
-
-        rv
+        Self::from_mrs_parts(leaves, label_bit_map, labels)
     }
 }
 

@@ -41,7 +41,7 @@ pub struct TrackerInfo {
     #[serde(rename = "id")]
     pub uuid: uuid::Uuid,
     #[serde(rename = "metadata")]
-    pub session: HashMap<String, Box<dyn erased_serde::Serialize + Send + Sync>>,
+    pub session_holder: Session,
     #[serde(rename = "upload")]
     pub upload_total: AtomicU64,
     #[serde(rename = "download")]
@@ -57,8 +57,6 @@ pub struct TrackerInfo {
 
     #[serde(skip)]
     pub proxy_chain_holder: ProxyChain,
-    #[serde(skip)]
-    pub session_holder: Session,
 
     /// Per-user byte counters, separate from `upload_total`/`download_total`.
     /// Only incremented when `session_holder.inbound_user` is set.
@@ -69,12 +67,58 @@ pub struct TrackerInfo {
     pub user_download: AtomicU64,
 }
 
+impl Clone for TrackerInfo {
+    fn clone(&self) -> Self {
+        Self {
+            uuid: self.uuid,
+            session_holder: self.session_holder.clone(),
+            upload_total: AtomicU64::new(self.upload_total.load(Ordering::Relaxed)),
+            download_total: AtomicU64::new(
+                self.download_total.load(Ordering::Relaxed),
+            ),
+            start_time: self.start_time,
+            proxy_chain: self.proxy_chain.clone(),
+            rule: self.rule.clone(),
+            rule_payload: self.rule_payload.clone(),
+            proxy_chain_holder: self.proxy_chain_holder.clone(),
+            user_upload: AtomicU64::new(self.user_upload.load(Ordering::Relaxed)),
+            user_download: AtomicU64::new(
+                self.user_download.load(Ordering::Relaxed),
+            ),
+        }
+    }
+}
+
+pub struct ConnectionView {
+    pub tracker: Arc<TrackerInfo>,
+    pub chains: Vec<String>,
+}
+
+impl Serialize for ConnectionView {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+        let mut s = serializer.serialize_struct("TrackerInfo", 8)?;
+        s.serialize_field("id", &self.tracker.uuid)?;
+        s.serialize_field("metadata", &self.tracker.session_holder)?;
+        s.serialize_field("upload", &self.tracker.upload_total.load(Ordering::Relaxed))?;
+        s.serialize_field("download", &self.tracker.download_total.load(Ordering::Relaxed))?;
+        s.serialize_field("start", &self.tracker.start_time)?;
+        s.serialize_field("chains", &self.chains)?;
+        s.serialize_field("rule", &self.tracker.rule)?;
+        s.serialize_field("rulePayload", &self.tracker.rule_payload)?;
+        s.end()
+    }
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Snapshot {
     download_total: u64,
     upload_total: u64,
-    connections: Vec<TrackerInfo>,
+    connections: Vec<ConnectionView>,
     memory: usize,
 }
 
@@ -254,6 +298,19 @@ impl Manager {
     }
 
     pub async fn snapshot(&self) -> Snapshot {
+        if self.connections.is_empty() {
+            return Snapshot {
+                download_total: self
+                    .download_total
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                upload_total: self
+                    .upload_total
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                connections: Vec::new(),
+                memory: self.memory_usage(),
+            };
+        }
+
         let conns_data: Vec<(Arc<TrackerInfo>, ProxyChain)> = self
             .connections
             .iter()
@@ -266,19 +323,10 @@ impl Manager {
 
         let mut connections = Vec::with_capacity(conns_data.len());
         for (t, chain_holder) in conns_data {
-            let chain = chain_holder.0.read().await;
-            connections.push(TrackerInfo {
-                uuid: t.uuid,
-                upload_total: AtomicU64::new(t.upload_total.load(Ordering::Relaxed)),
-                download_total: AtomicU64::new(
-                    t.download_total.load(Ordering::Relaxed),
-                ),
-                start_time: t.start_time,
-                proxy_chain: chain.clone(),
-                rule: t.rule.clone(),
-                rule_payload: t.rule_payload.clone(),
-                session: t.session_holder.as_map(),
-                ..Default::default()
+            let chains = chain_holder.snapshot().await;
+            connections.push(ConnectionView {
+                tracker: t,
+                chains,
             });
         }
 

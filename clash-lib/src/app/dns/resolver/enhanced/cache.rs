@@ -1,12 +1,13 @@
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use hickory_proto::{op, rr};
-use moka::sync::Cache;
 use moka::Expiry;
+use moka::sync::Cache;
 
 #[derive(Clone, Debug)]
 pub struct CachedEntry {
-    pub answers: Vec<rr::Record>,
+    pub answers: Arc<[rr::Record]>,
     pub expires_at: Instant,
 }
 
@@ -61,7 +62,7 @@ impl DnsCache {
                 return None;
             }
             let remaining_ttl = entry.remaining_ttl_secs(now).max(1);
-            let mut answers = entry.answers.clone();
+            let mut answers: Vec<rr::Record> = entry.answers.to_vec();
             for ans in &mut answers {
                 ans.ttl = remaining_ttl;
             }
@@ -81,7 +82,7 @@ impl DnsCache {
         }
         let expires_at = now + Duration::from_secs(min_ttl as u64);
         let entry = CachedEntry {
-            answers,
+            answers: answers.into(),
             expires_at,
         };
         self.inner.insert(query, entry);

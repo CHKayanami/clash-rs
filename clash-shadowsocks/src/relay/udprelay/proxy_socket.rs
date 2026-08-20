@@ -28,10 +28,15 @@ use crate::{
 use super::{
     compat::{DatagramReceive, DatagramSend, DatagramSocket},
     crypto_io::{
-        ProtocolError, ProtocolResult, decrypt_client_payload, decrypt_server_payload, encrypt_client_payload,
-        encrypt_server_payload,
+        ProtocolError, ProtocolResult, decrypt_client_payload, encrypt_server_payload,
     },
 };
+#[cfg(not(feature = "aead-cipher-2022"))]
+use super::crypto_io::{decrypt_server_payload, encrypt_client_payload};
+#[cfg(feature = "aead-cipher-2022")]
+use super::crypto_io::{decrypt_server_payload_cached, encrypt_client_payload_cached};
+#[cfg(feature = "aead-cipher-2022")]
+use super::aead_2022::UdpCipherCache;
 
 /// UDP socket type, defining whether the socket is used in Client or Server
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,16 +64,18 @@ pub enum ProxySocketError {
 impl From<ProxySocketError> for io::Error {
     fn from(e: ProxySocketError) -> Self {
         match e {
-            ProxySocketError::IoError(e) => e,
-            _ => Self::other(e),
+            ProxySocketError::IoError(err) => err,
+            ProxySocketError::ProtocolError(err) => io::Error::new(ErrorKind::Other, err),
+            ProxySocketError::ProtocolErrorWithPeer(.., err) => io::Error::new(ErrorKind::Other, err),
+            ProxySocketError::InvalidServerUser(..) => io::Error::new(ErrorKind::Other, "invalid server user identity"),
         }
     }
 }
 
-static DEFAULT_SOCKET_CONTROL: LazyLock<UdpSocketControlData> = LazyLock::new(UdpSocketControlData::default);
-
 /// `ProxySocket` result type
 pub type ProxySocketResult<T> = Result<T, ProxySocketError>;
+
+static DEFAULT_SOCKET_CONTROL: LazyLock<UdpSocketControlData> = LazyLock::new(UdpSocketControlData::default);
 
 /// UDP client for communicating with ShadowSocks' server
 #[derive(Debug)]
@@ -82,6 +89,8 @@ pub struct ProxySocket<S> {
     context: SharedContext,
     identity_keys: Arc<Vec<Bytes>>,
     user_manager: Option<Arc<ServerUserManager>>,
+    #[cfg(feature = "aead-cipher-2022")]
+    cipher_cache: UdpCipherCache,
 }
 
 impl<S> ProxySocket<S> {
@@ -106,6 +115,8 @@ impl<S> ProxySocket<S> {
                 UdpSocketType::Client => None,
                 UdpSocketType::Server => svr_cfg.clone_user_manager(),
             },
+            #[cfg(feature = "aead-cipher-2022")]
+            cipher_cache: UdpCipherCache::new(),
         }
     }
 
@@ -133,16 +144,32 @@ where
         send_buf: &mut BytesMut,
     ) -> ProxySocketResult<()> {
         match self.socket_type {
-            UdpSocketType::Client => encrypt_client_payload(
-                &self.context,
-                self.method,
-                &self.key,
-                addr,
-                control,
-                identity_keys,
-                payload,
-                send_buf,
-            ),
+            UdpSocketType::Client => {
+                #[cfg(feature = "aead-cipher-2022")]
+                encrypt_client_payload_cached(
+                    &self.context,
+                    self.method,
+                    &self.key,
+                    addr,
+                    control,
+                    identity_keys,
+                    payload,
+                    send_buf,
+                    Some(&self.cipher_cache),
+                );
+
+                #[cfg(not(feature = "aead-cipher-2022"))]
+                encrypt_client_payload(
+                    &self.context,
+                    self.method,
+                    &self.key,
+                    addr,
+                    control,
+                    identity_keys,
+                    payload,
+                    send_buf,
+                );
+            }
             UdpSocketType::Server => {
                 let mut key = self.key.as_ref();
 
@@ -214,7 +241,19 @@ where
         user_manager: Option<&ServerUserManager>,
     ) -> ProtocolResult<(usize, Address, Option<UdpSocketControlData>)> {
         match self.socket_type {
-            UdpSocketType::Client => decrypt_server_payload(&self.context, self.method, &self.key, recv_buf),
+            UdpSocketType::Client => {
+                #[cfg(feature = "aead-cipher-2022")]
+                return decrypt_server_payload_cached(
+                    &self.context,
+                    self.method,
+                    &self.key,
+                    recv_buf,
+                    Some(&self.cipher_cache),
+                );
+
+                #[cfg(not(feature = "aead-cipher-2022"))]
+                return decrypt_server_payload(&self.context, self.method, &self.key, recv_buf);
+            }
             UdpSocketType::Server => {
                 decrypt_client_payload(&self.context, self.method, &self.key, recv_buf, user_manager)
             }

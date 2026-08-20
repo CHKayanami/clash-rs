@@ -199,8 +199,8 @@ impl Sniffer {
             return (None, stream, false);
         }
 
-        // Attempt to read initial bytes with timeout
-        let mut buf = vec![0u8; MAX_SNIFF_BUFFER_SIZE];
+        // Attempt to read initial bytes with timeout using stack buffer
+        let mut buf = [0u8; MAX_SNIFF_BUFFER_SIZE];
         let read_res = tokio::time::timeout(DEFAULT_SNIFF_TIMEOUT, stream.read(&mut buf)).await;
 
         let n = match read_res {
@@ -220,8 +220,7 @@ impl Sniffer {
             }
         };
 
-        buf.truncate(n);
-        let prefix_bytes = Bytes::from(buf);
+        let prefix_bytes = Bytes::copy_from_slice(&buf[..n]);
 
         // 1. Try TLS SNI
         if tls_enabled {

@@ -57,7 +57,7 @@ impl std::fmt::Debug for IfaceEvent<'_> {
 /// Application can Stream the packets from the stack
 pub struct NetStack {
     // where the packets get into UDP Stack
-    udp_inbound: mpsc::UnboundedSender<Packet>,
+    udp_inbound: mpsc::Sender<crate::udp_socket::UdpPacket>,
     // inject TCP packets into the stack
     // where the packets get into TCP Stack
     tcp_inbound: mpsc::UnboundedSender<Packet>,
@@ -102,14 +102,14 @@ impl NetStack {
         crate::udp_socket::UdpSocket,
     ) {
         let (tcp_packet_sender, tcp_packet_receiver) = mpsc::channel::<Packet>(4096);
-        // UDP uses a separate bounded channel.  UDP is inherently lossy so
+        // UDP uses a separate bounded channel. UDP is inherently lossy so
         // drop-on-full (via try_send) is correct; the bound prevents unbounded
         // memory growth if a remote floods responses faster than the consumer
         // can drain them.
         let (udp_packet_sender, udp_packet_receiver) = mpsc::channel::<Packet>(4096);
 
         let (udp_inbound_app, udp_outbound_stack) =
-            mpsc::unbounded_channel::<Packet>();
+            mpsc::channel::<crate::udp_socket::UdpPacket>(4096);
 
         // this UdpSocket is essentially an Iface for UDP but much simpler as it only
         // does packets forwarding
@@ -136,15 +136,21 @@ impl NetStack {
     }
 }
 
+enum PendingInbound {
+    Udp(crate::udp_socket::UdpPacket),
+    Tcp(Packet),
+}
+
 pub struct StackSplitSink {
-    udp_inbound: mpsc::UnboundedSender<Packet>,
+    udp_inbound: mpsc::Sender<crate::udp_socket::UdpPacket>,
     tcp_inbound: mpsc::UnboundedSender<Packet>,
 
-    packet_container: Option<(Packet, IpProtocol)>,
+    packet_container: Option<PendingInbound>,
 }
+
 impl StackSplitSink {
     pub fn new(
-        udp_inbound: mpsc::UnboundedSender<Packet>,
+        udp_inbound: mpsc::Sender<crate::udp_socket::UdpPacket>,
         tcp_inbound: mpsc::UnboundedSender<Packet>,
     ) -> Self {
         Self {
@@ -154,6 +160,7 @@ impl StackSplitSink {
         }
     }
 }
+
 impl futures::Sink<Packet> for StackSplitSink {
     type Error = std::io::Error;
 
@@ -178,18 +185,31 @@ impl futures::Sink<Packet> for StackSplitSink {
 
         trace_ip_packet("tun inbound packet", item.data());
 
+        // Fast-path: single-pass zero-copy parsing for UDP packets
+        if let Some((src_addr, dst_addr, payload_range)) =
+            crate::udp_socket::parse_udp_packet(item.data())
+        {
+            let payload = item.into_bytes().slice(payload_range);
+            self.packet_container = Some(PendingInbound::Udp(
+                crate::udp_socket::UdpPacket {
+                    data: Packet::new(payload),
+                    local_addr: src_addr,
+                    remote_addr: dst_addr,
+                },
+            ));
+            return Ok(());
+        }
+
+        // TCP / ICMP parsing
         let packet = IpPacket::new_checked(item.data())
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
         let protocol = packet.protocol();
         if matches!(
             protocol,
-            IpProtocol::Tcp
-                | IpProtocol::Udp
-                | IpProtocol::Icmp
-                | IpProtocol::Icmpv6
+            IpProtocol::Tcp | IpProtocol::Icmp | IpProtocol::Icmpv6
         ) {
-            self.packet_container.replace((item, protocol));
+            self.packet_container = Some(PendingInbound::Tcp(item));
         } else {
             debug!("tun IP packet ignored (protocol: {protocol:?})");
         }
@@ -201,27 +221,28 @@ impl futures::Sink<Packet> for StackSplitSink {
         mut self: std::pin::Pin<&mut Self>,
         _cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Result<(), Self::Error>> {
-        let (item, proto) = match self.packet_container.take() {
+        let pending = match self.packet_container.take() {
             Some(val) => val,
             None => return std::task::Poll::Ready(Ok(())),
         };
 
-        match proto {
-            IpProtocol::Udp => match self.udp_inbound.send(item) {
-                Ok(()) => {}
-                Err(e) => {
-                    debug!("Failed to send UDP packet: {e}");
-                    self.packet_container = Some((e.0, proto));
+        match pending {
+            PendingInbound::Udp(udp_pkt) => {
+                match self.udp_inbound.try_send(udp_pkt) {
+                    Ok(()) => {}
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        log::trace!("UDP inbound queue full, dropped packet");
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                        log::debug!("UDP inbound queue closed");
+                    }
                 }
-            },
-            IpProtocol::Tcp | IpProtocol::Icmp | IpProtocol::Icmpv6 => {
-                self.tcp_inbound.send(item).map_err(|e| {
+            }
+            PendingInbound::Tcp(tcp_pkt) => {
+                self.tcp_inbound.send(tcp_pkt).map_err(|e| {
                     debug!("Failed to send TCP packet: {e}");
                     std::io::Error::new(std::io::ErrorKind::BrokenPipe, e)
                 })?;
-            }
-            _ => {
-                debug!("Unsupported protocol for packet: {proto:?}");
             }
         }
         std::task::Poll::Ready(Ok(()))

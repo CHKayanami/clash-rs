@@ -1,5 +1,7 @@
+use bytes::BytesMut;
 use std::{
     cell::UnsafeCell,
+    ops::{Deref, DerefMut},
     sync::{
         LazyLock, Mutex,
         atomic::{AtomicUsize, Ordering},
@@ -16,55 +18,90 @@ pub fn max_pooled_buffers() -> usize {
     MAX_POOLED_BUFFERS.load(Ordering::Relaxed)
 }
 
-static BOXED_BUFFER_POOL: LazyLock<Mutex<Vec<Box<[u8]>>>> =
+static BUFFER_POOL: LazyLock<Mutex<Vec<BytesMut>>> =
     LazyLock::new(|| Mutex::new(Vec::new()));
 
-pub(crate) fn acquire_boxed_slice(capacity: usize) -> Box<[u8]> {
-    if let Ok(mut pool) = BOXED_BUFFER_POOL.lock() {
-        if let Some(buf) = pool.pop() {
-            if buf.len() == capacity {
-                return buf;
+/// Pooled buffer that returns to pool on drop instead of deallocating.
+#[derive(Debug)]
+pub struct PooledBuffer {
+    buffer: BytesMut,
+}
+
+impl PooledBuffer {
+    /// Get a buffer from the pool or create a new one with requested working capacity.
+    pub fn with_capacity(cap: usize) -> Self {
+        if let Ok(mut pool) = BUFFER_POOL.lock() {
+            if let Some(mut buffer) = pool.pop() {
+                if buffer.capacity() < cap {
+                    buffer.reserve(cap - buffer.capacity());
+                }
+                buffer.resize(cap, 0);
+                return Self { buffer };
+            }
+        }
+        let mut buffer = BytesMut::with_capacity(cap);
+        buffer.resize(cap, 0);
+        Self { buffer }
+    }
+
+    #[inline]
+    #[allow(dead_code)]
+    pub fn len(&self) -> usize {
+        self.buffer.len()
+    }
+
+    #[inline]
+    #[allow(dead_code)]
+    pub fn is_empty(&self) -> bool {
+        self.buffer.is_empty()
+    }
+
+    #[inline]
+    pub fn as_mut_ptr(&mut self) -> *mut u8 {
+        self.buffer.as_mut_ptr()
+    }
+
+    #[inline]
+    #[allow(dead_code)]
+    pub fn as_ptr(&self) -> *const u8 {
+        self.buffer.as_ptr()
+    }
+}
+
+impl Deref for PooledBuffer {
+    type Target = [u8];
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        &self.buffer[..]
+    }
+}
+
+impl DerefMut for PooledBuffer {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.buffer[..]
+    }
+}
+
+impl Drop for PooledBuffer {
+    fn drop(&mut self) {
+        if let Ok(mut pool) = BUFFER_POOL.lock() {
+            if pool.len() < max_pooled_buffers() {
+                let mut buffer = std::mem::replace(&mut self.buffer, BytesMut::new());
+                buffer.clear();
+                pool.push(buffer);
             }
         }
     }
-    vec![0u8; capacity].into_boxed_slice()
 }
-
-pub(crate) fn release_boxed_slice(buf: Box<[u8]>) {
-    if let Ok(mut pool) = BOXED_BUFFER_POOL.lock() {
-        if pool.len() < max_pooled_buffers() {
-            pool.push(buf);
-        }
-    }
-}
-
-static VEC_BUFFER_POOL: LazyLock<Mutex<Vec<Vec<u8>>>> =
-    LazyLock::new(|| Mutex::new(Vec::new()));
 
 pub fn acquire_vec(capacity: usize) -> Vec<u8> {
-    if let Ok(mut pool) = VEC_BUFFER_POOL.lock() {
-        if let Some(mut v) = pool.pop() {
-            if v.capacity() >= capacity {
-                v.resize(capacity, 0);
-                return v;
-            }
-        }
-    }
     vec![0u8; capacity]
 }
 
-#[allow(dead_code)]
-pub fn release_vec(mut v: Vec<u8>) {
-    if let Ok(mut pool) = VEC_BUFFER_POOL.lock() {
-        if pool.len() < max_pooled_buffers() {
-            v.clear();
-            pool.push(v);
-        }
-    }
-}
-
 pub struct LockFreeRingBuffer {
-    buffer: UnsafeCell<Option<Box<[u8]>>>,
+    buffer: UnsafeCell<Option<PooledBuffer>>,
     raw_ptr: *mut u8,
     capacity: usize,
     write_pos: AtomicUsize, // Only TCP thread writes
@@ -76,7 +113,7 @@ unsafe impl Sync for LockFreeRingBuffer {}
 
 impl LockFreeRingBuffer {
     pub fn new(capacity: usize) -> Self {
-        let mut buffer = acquire_boxed_slice(capacity);
+        let mut buffer = PooledBuffer::with_capacity(capacity);
         let raw_ptr = buffer.as_mut_ptr();
         Self {
             buffer: UnsafeCell::new(Some(buffer)),
@@ -184,9 +221,7 @@ impl LockFreeRingBuffer {
 impl Drop for LockFreeRingBuffer {
     fn drop(&mut self) {
         unsafe {
-            if let Some(buf) = (*self.buffer.get()).take() {
-                release_boxed_slice(buf);
-            }
+            let _ = (*self.buffer.get()).take();
         }
     }
 }
@@ -207,5 +242,8 @@ mod tests {
         // Next allocation should reuse pooled buffer
         let rb2 = LockFreeRingBuffer::new(64 * 1024);
         assert_eq!(rb2.enqueue_slice(b"reused"), 6);
+        let mut out2 = [0u8; 6];
+        assert_eq!(rb2.dequeue_slice(&mut out2), 6);
+        assert_eq!(&out2, b"reused");
     }
 }

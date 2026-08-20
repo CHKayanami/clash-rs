@@ -61,7 +61,8 @@ fn split_ipv4_gso(packet: Bytes, mtu: usize) -> Vec<Bytes> {
         return vec![packet];
     }
 
-    let mut segments = Vec::new();
+    let num_segments = payload.len().div_ceil(max_seg_payload);
+    let mut segments = Vec::with_capacity(num_segments);
     let src_ip = ipv4.src_addr();
     let dst_ip = ipv4.dst_addr();
     let mut seq_num = tcp.seq_number();
@@ -152,7 +153,8 @@ fn split_ipv6_gso(packet: Bytes, mtu: usize) -> Vec<Bytes> {
         return vec![packet];
     }
 
-    let mut segments = Vec::new();
+    let num_segments = payload.len().div_ceil(max_seg_payload);
+    let mut segments = Vec::with_capacity(num_segments);
     let src_ip = ipv6.src_addr();
     let dst_ip = ipv6.dst_addr();
     let mut seq_num = tcp.seq_number();

@@ -47,7 +47,7 @@ codegen-units = 256
 inherits = "release"
 debug = "line-tables-only"
 strip = "none"
-opt-level = "s"
+opt-level = "z"
 lto = "fat"
 codegen-units = 1
 

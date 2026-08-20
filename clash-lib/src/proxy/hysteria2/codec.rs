@@ -515,10 +515,15 @@ impl Defragger {
             self.cnt += 1;
             if self.cnt as usize == self.frags.len() {
                 // now we have all fragments
+                let total_len: usize = self
+                    .frags
+                    .iter()
+                    .filter_map(|p| p.as_ref().map(|x| x.data.len()))
+                    .sum();
                 let frags = std::mem::take(&mut self.frags);
                 let mut iters = frags.into_iter().map(|x| x.unwrap());
                 let mut pkt0 = iters.next().unwrap();
-                let mut data_buf = BytesMut::new();
+                let mut data_buf = BytesMut::with_capacity(total_len);
                 data_buf.extend_from_slice(&pkt0.data);
                 for pkt in iters {
                     data_buf.extend_from_slice(&pkt.data);

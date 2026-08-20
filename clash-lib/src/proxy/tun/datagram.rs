@@ -31,10 +31,10 @@ pub(crate) async fn handle_inbound_datagram(
     // dispatcher <-> tun communications
     // l_tx: dispatcher write packet responded from remote proxy
     // l_rx: in fut1 items are forwarded to ls
-    let (l_tx, mut l_rx) = tokio::sync::mpsc::channel::<UdpPacket>(512);
+    let (l_tx, mut l_rx) = tokio::sync::mpsc::channel::<UdpPacket>(2048);
 
     // forward packets from tun to dispatcher
-    let (d_tx, d_rx) = tokio::sync::mpsc::channel::<UdpPacket>(512);
+    let (d_tx, d_rx) = tokio::sync::mpsc::channel::<UdpPacket>(2048);
 
     // for dispatcher - the dispatcher would receive packets from this channel,
     // which is from the stack and send back packets to this channel, which
@@ -59,22 +59,21 @@ pub(crate) async fn handle_inbound_datagram(
 
     // dispatcher -> tun
     let fut1 = tokio::spawn(async move {
-        while let Some(pkt) = l_rx.recv().await {
-            trace!("tun <- dispatcher: {:?}", pkt);
-            let Some(src_addr) = pkt.src_addr.clone().try_into_socket_addr() else {
-                warn!("tun drop packet: src_addr is not a valid socket addr: {:?}", pkt.src_addr);
+        while let Some(UdpPacket { data, src_addr, dst_addr, .. }) = l_rx.recv().await {
+            let Some(src_sock_addr) = src_addr.try_into_socket_addr() else {
+                warn!("tun drop packet: src_addr is not a valid socket addr");
                 continue;
             };
-            let Some(dst_addr) = pkt.dst_addr.clone().try_into_socket_addr() else {
-                warn!("tun drop packet: dst_addr is not a valid socket addr: {:?}", pkt.dst_addr);
+            let Some(dst_sock_addr) = dst_addr.try_into_socket_addr() else {
+                warn!("tun drop packet: dst_addr is not a valid socket addr");
                 continue;
             };
             if let Err(e) = ls
                 .send(
                     (
-                        pkt.data,
-                        src_addr,
-                        dst_addr,
+                        data,
+                        src_sock_addr,
+                        dst_sock_addr,
                     )
                         .into(),
                 )
@@ -87,32 +86,40 @@ pub(crate) async fn handle_inbound_datagram(
 
     // tun -> dispatcher
     let fut2 = tokio::spawn(async move {
-        'read_packet: while let Some(watfaq_netstack::UdpPacket {
-            data,
-            local_addr,
-            remote_addr,
-        }) = lr.recv().await
-        {
-            if remote_addr.ip().is_multicast() {
-                continue;
+        let mut batch = Vec::with_capacity(32);
+        'outer: loop {
+            batch.clear();
+            let count = lr.recv_many(&mut batch, 32).await;
+            if count == 0 {
+                break 'outer;
             }
 
-            if strict_route
-                && exclude_routes.iter().any(|net| net.contains(&remote_addr.ip()))
+            'read_packet: for watfaq_netstack::UdpPacket {
+                data,
+                local_addr,
+                remote_addr,
+            } in batch.drain(..)
             {
-                trace!(
-                    "strict-route: dropping tun UDP packet to excluded subnet: {:?}",
-                    remote_addr
-                );
-                continue 'read_packet;
-            }
+                if remote_addr.ip().is_multicast() {
+                    continue;
+                }
 
-            let pkt = UdpPacket {
-                data: data.into_bytes(),
-                src_addr: local_addr.into(),
-                dst_addr: remote_addr.into(),
-                inbound_user: None,
-            };
+                if strict_route
+                    && exclude_routes.iter().any(|net| net.contains(&remote_addr.ip()))
+                {
+                    trace!(
+                        "strict-route: dropping tun UDP packet to excluded subnet: {:?}",
+                        remote_addr
+                    );
+                    continue 'read_packet;
+                }
+
+                let pkt = UdpPacket {
+                    data: data.into_bytes(),
+                    src_addr: local_addr.into(),
+                    dst_addr: remote_addr.into(),
+                    inbound_user: None,
+                };
 
             trace!("tun -> dispatcher: {:?}", pkt);
 
@@ -193,10 +200,11 @@ pub(crate) async fn handle_inbound_datagram(
                 continue 'read_packet;
             }
 
-            match d_tx.send(pkt).await {
-                Ok(_) => {}
-                Err(e) => {
-                    warn!("failed to send udp packet to proxy: {}", e);
+                match d_tx.send(pkt).await {
+                    Ok(_) => {}
+                    Err(e) => {
+                        warn!("failed to send udp packet to proxy: {}", e);
+                    }
                 }
             }
         }

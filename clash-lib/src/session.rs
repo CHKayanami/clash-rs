@@ -1,10 +1,8 @@
 use crate::app::net::OutboundInterface;
 use anyhow::anyhow;
 use bytes::{Buf, BufMut};
-use erased_serde::Serialize as ESerialize;
-use serde::Serialize;
+use serde::{Serialize, Serializer};
 use std::{
-    collections::HashMap,
     fmt::{Debug, Display, Formatter},
     io,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
@@ -409,7 +407,6 @@ pub fn generate_session_id() -> u64 {
     NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed)
 }
 
-#[derive(Serialize)]
 pub struct Session {
     /// Unique trace ID for the session request lifecycle.
     pub id: u64,
@@ -449,43 +446,64 @@ pub struct Session {
     pub udp_timeout: Option<std::time::Duration>,
 }
 
-impl Session {
-    pub fn as_map(&self) -> HashMap<String, Box<dyn ESerialize + Send + Sync>> {
-        let mut rv = HashMap::new();
-        rv.insert("id".to_string(), Box::new(self.id) as _);
-        rv.insert("network".to_string(), Box::new(self.network) as _);
-        rv.insert("type".to_string(), Box::new(self.typ) as _);
-        rv.insert("sourceIP".to_string(), Box::new(self.source.ip()) as _);
-        rv.insert("sourcePort".to_string(), Box::new(self.source.port()) as _);
-        rv.insert("destinationIP".to_string(), {
-            let ip = self.resolved_ip.or(self.destination.ip());
-            let asn = self.asn.clone();
+struct DestinationIpHelper<'a>(Option<IpAddr>, Option<&'a str>);
 
-            let rv = match (ip, asn) {
-                (Some(ip), Some(asn)) => format!("{ip}({asn})"),
-                (Some(ip), None) => ip.to_string(),
-                (None, _) => "".to_string(),
-            };
-            Box::new(rv) as _
-        });
-        rv.insert(
-            "destinationPort".to_string(),
-            Box::new(self.destination.port()) as _,
+impl Serialize for DestinationIpHelper<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match (self.0, self.1) {
+            (Some(ip), Some(asn)) => {
+                serializer.collect_str(&format_args!("{ip}({asn})"))
+            }
+            (Some(ip), None) => serializer.collect_str(&ip),
+            (None, _) => serializer.serialize_str(""),
+        }
+    }
+}
+
+impl Serialize for Session {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        use serde::ser::SerializeMap;
+
+        let mut count = 10;
+        if self.inbound_user.is_some() {
+            count += 1;
+        }
+        if self.sniffed_domain.is_some() {
+            count += 1;
+        }
+
+        let mut map = serializer.serialize_map(Some(count))?;
+        map.serialize_entry("id", &self.id)?;
+        map.serialize_entry("network", &self.network)?;
+        map.serialize_entry("type", &self.typ)?;
+        map.serialize_entry("sourceIP", &self.source.ip())?;
+        map.serialize_entry("sourcePort", &self.source.port())?;
+
+        let dest_ip_helper = DestinationIpHelper(
+            self.resolved_ip.or_else(|| self.destination.ip()),
+            self.asn.as_deref(),
         );
-        rv.insert("host".to_string(), Box::new(self.destination.host()) as _);
-        rv.insert("asn".to_string(), Box::new(self.asn.clone()) as _);
-        rv.insert("country".to_string(), Box::new(self.country.clone()) as _);
-        rv.insert(
-            "traffic_stats".to_string(),
-            Box::new(self.traffic_stats.clone()) as _,
-        );
+        map.serialize_entry("destinationIP", &dest_ip_helper)?;
+        map.serialize_entry("destinationPort", &self.destination.port())?;
+        map.serialize_entry("host", &self.destination.host())?;
+        map.serialize_entry("asn", &self.asn)?;
+        map.serialize_entry("country", &self.country)?;
+        map.serialize_entry("traffic_stats", &self.traffic_stats)?;
+
         if let Some(ref user) = self.inbound_user {
-            rv.insert("inboundUser".to_string(), Box::new(user.clone()) as _);
+            map.serialize_entry("inboundUser", user)?;
         }
         if let Some(ref sniffed) = self.sniffed_domain {
-            rv.insert("sniffedDomain".to_string(), Box::new(sniffed.clone()) as _);
+            map.serialize_entry("sniffedDomain", sniffed)?;
         }
-        rv
+
+        map.end()
     }
 }
 
@@ -593,4 +611,27 @@ fn test_session_id() {
 
     let display_str = s1.to_string();
     assert!(display_str.contains(&format!("[#{}]", s1.id)));
+}
+
+#[test]
+fn test_session_serialize() {
+    let mut s = Session::default();
+    s.resolved_ip = Some(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)));
+    s.asn = Some("Cloudflare".to_string());
+    s.inbound_user = Some("alice".to_string());
+    s.sniffed_domain = Some("example.com".to_string());
+
+    let val: serde_json::Value = serde_json::to_value(&s).unwrap();
+    assert_eq!(val["destinationIP"], "1.1.1.1(Cloudflare)");
+    assert_eq!(val["inboundUser"], "alice");
+    assert_eq!(val["sniffedDomain"], "example.com");
+
+    s.asn = None;
+    let val2: serde_json::Value = serde_json::to_value(&s).unwrap();
+    assert_eq!(val2["destinationIP"], "1.1.1.1");
+
+    s.resolved_ip = None;
+    s.destination = SocksAddr::Domain("example.com".to_string(), 80);
+    let val3: serde_json::Value = serde_json::to_value(&s).unwrap();
+    assert_eq!(val3["destinationIP"], "");
 }

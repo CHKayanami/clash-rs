@@ -34,8 +34,8 @@ use crate::{
 use super::aead::{decrypt_payload_aead, encrypt_payload_aead};
 #[cfg(feature = "aead-cipher-2022")]
 use super::aead_2022::{
-    decrypt_client_payload_aead_2022, decrypt_server_payload_aead_2022, encrypt_client_payload_aead_2022,
-    encrypt_server_payload_aead_2022,
+    UdpCipherCache, decrypt_client_payload_aead_2022, decrypt_server_payload_aead_2022_cached,
+    encrypt_client_payload_aead_2022_cached, encrypt_server_payload_aead_2022,
 };
 use super::options::UdpSocketControlData;
 #[cfg(feature = "stream-cipher")]
@@ -72,6 +72,27 @@ pub fn encrypt_client_payload(
     payload: &[u8],
     dst: &mut BytesMut,
 ) {
+    #[cfg(feature = "aead-cipher-2022")]
+    encrypt_client_payload_cached(context, method, key, addr, control, identity_keys, payload, dst, None);
+
+    #[cfg(not(feature = "aead-cipher-2022"))]
+    encrypt_client_payload_cached(context, method, key, addr, control, identity_keys, payload, dst);
+}
+
+/// Encrypt `Client -> Server` payload into ShadowSocks UDP encrypted packet with optional per-socket cipher cache
+#[allow(clippy::too_many_arguments)]
+pub fn encrypt_client_payload_cached(
+    context: &Context,
+    method: CipherKind,
+    key: &[u8],
+    addr: &Address,
+    control: &UdpSocketControlData,
+    identity_keys: &[Bytes],
+    payload: &[u8],
+    dst: &mut BytesMut,
+    #[cfg(feature = "aead-cipher-2022")]
+    cipher_cache: Option<&UdpCipherCache>,
+) {
     match method.category() {
         CipherCategory::None => {
             let _ = context;
@@ -96,7 +117,7 @@ pub fn encrypt_client_payload(
         }
         #[cfg(feature = "aead-cipher-2022")]
         CipherCategory::Aead2022 => {
-            encrypt_client_payload_aead_2022(context, method, key, addr, control, identity_keys, payload, dst)
+            encrypt_client_payload_aead_2022_cached(context, method, key, addr, control, identity_keys, payload, dst, cipher_cache)
         }
     }
 }
@@ -187,6 +208,22 @@ pub fn decrypt_server_payload(
     key: &[u8],
     payload: &mut [u8],
 ) -> ProtocolResult<(usize, Address, Option<UdpSocketControlData>)> {
+    #[cfg(feature = "aead-cipher-2022")]
+    return decrypt_server_payload_cached(context, method, key, payload, None);
+
+    #[cfg(not(feature = "aead-cipher-2022"))]
+    return decrypt_server_payload_cached(context, method, key, payload);
+}
+
+/// Decrypt `Server -> Client` payload from ShadowSocks UDP encrypted packet with optional per-socket cipher cache
+pub fn decrypt_server_payload_cached(
+    context: &Context,
+    method: CipherKind,
+    key: &[u8],
+    payload: &mut [u8],
+    #[cfg(feature = "aead-cipher-2022")]
+    cipher_cache: Option<&UdpCipherCache>,
+) -> ProtocolResult<(usize, Address, Option<UdpSocketControlData>)> {
     match method.category() {
         CipherCategory::None => {
             let _ = context;
@@ -212,7 +249,7 @@ pub fn decrypt_server_payload(
             .map(|(n, a)| (n, a, None))
             .map_err(Into::into),
         #[cfg(feature = "aead-cipher-2022")]
-        CipherCategory::Aead2022 => decrypt_server_payload_aead_2022(context, method, key, payload)
+        CipherCategory::Aead2022 => decrypt_server_payload_aead_2022_cached(context, method, key, payload, cipher_cache)
             .map(|(n, a, c)| (n, a, Some(c)))
             .map_err(Into::into),
     }

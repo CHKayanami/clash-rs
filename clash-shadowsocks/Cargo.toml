@@ -30,7 +30,7 @@ aead-cipher-2022 = [
     "shadowsocks-crypto/aws-lc",
     "rand",
     "aes",
-    "moka",
+    "quick_cache",
 ]
 aead-cipher-2022-extra = ["aead-cipher-2022", "shadowsocks-crypto/v2-extra"]
 
@@ -44,7 +44,7 @@ spin = { version = "0.12", features = ["std"] }
 pin-project = "1.1"
 thiserror = "2.0"
 rand = { version = "0.10", optional = true }
-moka = { version = "0.12", features = ["sync"], optional = true }
+quick_cache = { version = "0.7", optional = true }
 
 futures = "0.3"
 tokio = { version = "1", features = [
