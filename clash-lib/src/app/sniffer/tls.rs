@@ -33,7 +33,8 @@ pub fn parse_client_hello_handshake(data: &[u8]) -> Option<String> {
         return None;
     }
 
-    let handshake_len = ((data[1] as usize) << 16) | ((data[2] as usize) << 8) | (data[3] as usize);
+    let handshake_len =
+        ((data[1] as usize) << 16) | ((data[2] as usize) << 8) | (data[3] as usize);
     let mut pos = 4;
     let limit = data.len().min(4 + handshake_len);
 
@@ -124,8 +125,9 @@ fn parse_sni_extension(data: &[u8]) -> Option<String> {
             let host_bytes = &data[pos..pos + name_len];
             if let Ok(host) = std::str::from_utf8(host_bytes) {
                 let trimmed = host.trim().trim_end_matches('.');
-                if !trimmed.is_empty() {
-                    return Some(trimmed.to_ascii_lowercase());
+                let lower = trimmed.to_ascii_lowercase();
+                if !lower.is_empty() && is_valid_hostname(&lower) {
+                    return Some(lower);
                 }
             }
         }
@@ -134,6 +136,34 @@ fn parse_sni_extension(data: &[u8]) -> Option<String> {
     }
 
     None
+}
+
+/// Validate that a string looks like a valid hostname according to RFC 1035 / 1123.
+pub fn is_valid_hostname(hostname: &str) -> bool {
+    if hostname.is_empty() || hostname.len() > 253 {
+        return false;
+    }
+
+    for label in hostname.split('.') {
+        if label.is_empty() || label.len() > 63 {
+            return false;
+        }
+
+        let first = label.chars().next().unwrap_or('\0');
+        let last = label.chars().last().unwrap_or('\0');
+
+        if !first.is_ascii_alphanumeric() || !last.is_ascii_alphanumeric() {
+            return false;
+        }
+
+        for ch in label.chars() {
+            if !ch.is_ascii_alphanumeric() && ch != '-' && ch != '_' {
+                return false;
+            }
+        }
+    }
+
+    true
 }
 
 #[cfg(test)]

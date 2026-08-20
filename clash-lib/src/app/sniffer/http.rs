@@ -30,7 +30,8 @@ pub fn parse_http_host(data: &[u8]) -> Option<String> {
         Ok(s) => s,
         Err(_) => {
             // Even if whole buffer is not valid UTF-8, try converting lossily or slice up to headers
-            let valid_len = match std::str::from_utf8(&data[..data.len().min(4096)]) {
+            let valid_len = match std::str::from_utf8(&data[..data.len().min(4096)])
+            {
                 Ok(s) => s.len(),
                 Err(e) => e.valid_up_to(),
             };
@@ -48,7 +49,8 @@ pub fn parse_http_host(data: &[u8]) -> Option<String> {
         }
 
         let trimmed = line.trim();
-        if let Some(rest) = trimmed.strip_prefix("Host:")
+        if let Some(rest) = trimmed
+            .strip_prefix("Host:")
             .or_else(|| trimmed.strip_prefix("host:"))
             .or_else(|| trimmed.strip_prefix("HOST:"))
         {
@@ -82,10 +84,11 @@ fn sanitize_host(raw: &str) -> Option<String> {
     };
 
     let host = host.trim_end_matches('.');
-    if host.is_empty() {
+    let host_lower = host.to_ascii_lowercase();
+    if host_lower.is_empty() || !super::tls::is_valid_hostname(&host_lower) {
         None
     } else {
-        Some(host.to_ascii_lowercase())
+        Some(host_lower)
     }
 }
 

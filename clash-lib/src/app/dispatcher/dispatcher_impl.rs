@@ -10,9 +10,7 @@ use crate::{
         def::RunMode,
         internal::proxy::{PROXY_DIRECT, PROXY_GLOBAL},
     },
-    proxy::{
-        AnyInboundDatagram, ClientStream, OutboundType, datagram::UdpPacket,
-    },
+    proxy::{AnyInboundDatagram, ClientStream, OutboundType, datagram::UdpPacket},
     session::{Session, SocksAddr},
 };
 use futures::{SinkExt, StreamExt};
@@ -105,14 +103,19 @@ impl Dispatcher {
             .sniffer
             .as_ref()
             .map_or(false, |s| s.config.force_dns_mapping);
-        let dest: SocksAddr =
-            match reverse_lookup(&self.resolver, &sess.destination, force_dns_mapping).await {
-                Some(dest) => dest,
-                None => {
-                    warn!("failed to resolve destination {}", sess);
-                    return;
-                }
-            };
+        let dest: SocksAddr = match reverse_lookup(
+            &self.resolver,
+            &sess.destination,
+            force_dns_mapping,
+        )
+        .await
+        {
+            Some(dest) => dest,
+            None => {
+                warn!("failed to resolve destination {}", sess);
+                return;
+            }
+        };
 
         sess.destination = dest.clone();
         sess.orig_destination = Some(dest.clone());
@@ -287,7 +290,8 @@ impl Dispatcher {
         let (mut local_w, mut local_r) = udp_inbound.split();
         let (remote_receiver_w, mut remote_receiver_r) =
             tokio::sync::mpsc::channel::<UdpPacket>(UDP_CHANNEL_CAPACITY);
-        let (close_sender, mut close_receiver) = tokio::sync::oneshot::channel::<u8>();
+        let (close_sender, mut close_receiver) =
+            tokio::sync::oneshot::channel::<u8>();
 
         let current_span = tracing::Span::current();
 
@@ -374,9 +378,12 @@ impl Dispatcher {
                             let mut override_dest = false;
                             if let Some(ref sniffer) = sniffer {
                                 if !dest.is_domain() || sniffer.should_force_sniff(&dest) {
-                                    if let Some((domain, should_override)) =
+                                    let sniffed = if let Some(dst_sock) = packet.dst_addr.clone().try_into_socket_addr() {
+                                        sniffer.sniff_udp_datagram(src_addr, dst_sock, &packet.data)
+                                    } else {
                                         sniffer.sniff_datagram(dest.port(), &packet.data)
-                                    {
+                                    };
+                                    if let Some((domain, should_override)) = sniffed {
                                         sess.sniffed_domain = Some(domain.clone());
                                         dest = SocksAddr::Domain(domain, dest.port());
                                         override_dest = should_override;
@@ -560,7 +567,6 @@ struct OutboundSession {
     delay_key: tokio_util::time::delay_queue::Key,
     _relay_handle: JoinHandle<()>,
 }
-
 
 impl Drop for OutboundSession {
     fn drop(&mut self) {
