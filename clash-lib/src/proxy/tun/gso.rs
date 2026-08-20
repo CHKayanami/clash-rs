@@ -1,19 +1,19 @@
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use smoltcp::wire::{
     IpAddress, IpProtocol, IpVersion, Ipv4Packet, Ipv6Packet, TcpControl, TcpPacket,
     TcpRepr,
 };
 
 /// Splits a large GSO IP packet into standard MTU-sized IP packets.
-pub fn split_gso_packet(packet: Bytes, mtu: usize) -> Vec<Bytes> {
+pub fn split_gso_packet(packet: Bytes, mtu: usize) -> Vec<BytesMut> {
     if packet.len() <= mtu {
-        return vec![packet];
+        return vec![BytesMut::from(&packet[..])];
     }
 
     match IpVersion::of_packet(&packet) {
         Ok(IpVersion::Ipv4) => split_ipv4_gso(packet, mtu),
         Ok(IpVersion::Ipv6) => split_ipv6_gso(packet, mtu),
-        Err(_) => vec![packet],
+        Err(_) => vec![BytesMut::from(&packet[..])],
     }
 }
 
@@ -31,34 +31,34 @@ fn extract_tcp_control(tcp: &TcpPacket<&[u8]>) -> TcpControl {
     }
 }
 
-fn split_ipv4_gso(packet: Bytes, mtu: usize) -> Vec<Bytes> {
+fn split_ipv4_gso(packet: Bytes, mtu: usize) -> Vec<BytesMut> {
     let Ok(ipv4) = Ipv4Packet::new_checked(&packet[..]) else {
-        return vec![packet];
+        return vec![BytesMut::from(&packet[..])];
     };
 
     if ipv4.next_header() != IpProtocol::Tcp {
-        return vec![packet];
+        return vec![BytesMut::from(&packet[..])];
     }
 
     let ip_header_len = ipv4.header_len() as usize;
     if packet.len() <= ip_header_len {
-        return vec![packet];
+        return vec![BytesMut::from(&packet[..])];
     }
 
     let Ok(tcp) = TcpPacket::new_checked(&packet[ip_header_len..]) else {
-        return vec![packet];
+        return vec![BytesMut::from(&packet[..])];
     };
 
     let tcp_header_len = tcp.header_len() as usize;
     let headers_len = ip_header_len + tcp_header_len;
     if packet.len() <= headers_len {
-        return vec![packet];
+        return vec![BytesMut::from(&packet[..])];
     }
 
     let payload = &packet[headers_len..];
     let max_seg_payload = mtu.saturating_sub(headers_len);
     if max_seg_payload == 0 {
-        return vec![packet];
+        return vec![BytesMut::from(&packet[..])];
     }
 
     let num_segments = payload.len().div_ceil(max_seg_payload);
@@ -75,7 +75,8 @@ fn split_ipv4_gso(packet: Bytes, mtu: usize) -> Vec<Bytes> {
     for (i, chunk) in payload.chunks(max_seg_payload).enumerate() {
         let is_last = (i + 1) * max_seg_payload >= payload.len();
         let total_packet_len = headers_len + chunk.len();
-        let mut buf = vec![0u8; total_packet_len];
+        let mut buf = BytesMut::with_capacity(total_packet_len);
+        buf.resize(total_packet_len, 0);
 
         // 1. Copy & update IPv4 header
         buf[..ip_header_len].copy_from_slice(&packet[..ip_header_len]);
@@ -116,41 +117,41 @@ fn split_ipv4_gso(packet: Bytes, mtu: usize) -> Vec<Bytes> {
             &smoltcp::phy::ChecksumCapabilities::default(),
         );
 
-        segments.push(Bytes::from(buf));
+        segments.push(buf);
         seq_num = seq_num + chunk.len();
     }
 
     segments
 }
 
-fn split_ipv6_gso(packet: Bytes, mtu: usize) -> Vec<Bytes> {
+fn split_ipv6_gso(packet: Bytes, mtu: usize) -> Vec<BytesMut> {
     let Ok(ipv6) = Ipv6Packet::new_checked(&packet[..]) else {
-        return vec![packet];
+        return vec![BytesMut::from(&packet[..])];
     };
 
     if ipv6.next_header() != IpProtocol::Tcp {
-        return vec![packet];
+        return vec![BytesMut::from(&packet[..])];
     }
 
     let ip_header_len = 40;
     if packet.len() <= ip_header_len {
-        return vec![packet];
+        return vec![BytesMut::from(&packet[..])];
     }
 
     let Ok(tcp) = TcpPacket::new_checked(&packet[ip_header_len..]) else {
-        return vec![packet];
+        return vec![BytesMut::from(&packet[..])];
     };
 
     let tcp_header_len = tcp.header_len() as usize;
     let headers_len = ip_header_len + tcp_header_len;
     if packet.len() <= headers_len {
-        return vec![packet];
+        return vec![BytesMut::from(&packet[..])];
     }
 
     let payload = &packet[headers_len..];
     let max_seg_payload = mtu.saturating_sub(headers_len);
     if max_seg_payload == 0 {
-        return vec![packet];
+        return vec![BytesMut::from(&packet[..])];
     }
 
     let num_segments = payload.len().div_ceil(max_seg_payload);
@@ -167,7 +168,8 @@ fn split_ipv6_gso(packet: Bytes, mtu: usize) -> Vec<Bytes> {
     for (i, chunk) in payload.chunks(max_seg_payload).enumerate() {
         let is_last = (i + 1) * max_seg_payload >= payload.len();
         let total_packet_len = headers_len + chunk.len();
-        let mut buf = vec![0u8; total_packet_len];
+        let mut buf = BytesMut::with_capacity(total_packet_len);
+        buf.resize(total_packet_len, 0);
 
         // 1. Copy & update IPv6 header
         buf[..ip_header_len].copy_from_slice(&packet[..ip_header_len]);
@@ -207,7 +209,7 @@ fn split_ipv6_gso(packet: Bytes, mtu: usize) -> Vec<Bytes> {
             &smoltcp::phy::ChecksumCapabilities::default(),
         );
 
-        segments.push(Bytes::from(buf));
+        segments.push(buf);
         seq_num = seq_num + chunk.len();
     }
 
@@ -224,7 +226,7 @@ mod tests {
         let small_pkt = Bytes::from_static(b"short packet");
         let res = split_gso_packet(small_pkt.clone(), 1500);
         assert_eq!(res.len(), 1);
-        assert_eq!(res[0], small_pkt);
+        assert_eq!(&res[0][..], &small_pkt[..]);
     }
 
     #[test]

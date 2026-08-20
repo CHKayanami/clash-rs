@@ -511,14 +511,14 @@ impl Runner for TunRunner {
                 while let Some(pkt) = tun_stream.next().await {
                     match pkt {
                         Ok(pkt) => {
-                            let packets: Vec<bytes::Bytes> =
+                            let packets: Vec<bytes::BytesMut> =
                                 if gso_enabled && pkt.len() > stack_mtu {
                                     super::gso::split_gso_packet(pkt.into(), stack_mtu)
                                 } else {
-                                    vec![pkt.into()]
+                                    vec![pkt]
                                 };
 
-                            for single_pkt in packets {
+                            for mut single_pkt in packets {
                                 if smoltcp::wire::IpVersion::of_packet(&single_pkt)
                                     .is_ok()
                                 {
@@ -556,17 +556,16 @@ impl Runner for TunRunner {
                                         }
 
                                         if use_system_stack {
-                                            let mut pkt_vec = single_pkt.to_vec();
                                             if let Some(true) =
                                                 super::system_stack::process_system_tcp_packet(
-                                                    &mut pkt_vec,
+                                                    &mut single_pkt,
                                                     v4_nat_info,
                                                     v6_nat_info,
                                                     &nat,
                                                 )
                                             {
                                                 if let Err(e) = tun_tx_for_system_tcp
-                                                    .send(bytes::Bytes::from(pkt_vec))
+                                                    .send(single_pkt.freeze())
                                                     .await
                                                 {
                                                     error!(
@@ -582,7 +581,7 @@ impl Runner for TunRunner {
                                 }
 
                                 if let Err(e) = stack_sink
-                                    .send(watfaq_netstack::Packet::new(single_pkt))
+                                    .send(watfaq_netstack::Packet::new(single_pkt.freeze()))
                                     .await
                                 {
                                     error!("failed to send pkt to stack: {}", e);

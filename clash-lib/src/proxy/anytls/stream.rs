@@ -3,7 +3,7 @@
 //! A Stream represents a single multiplexed connection within an AnyTLS Session.
 //! It implements AsyncRead and AsyncWrite for transparent integration into clash-rs.
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -14,6 +14,9 @@ use tokio::sync::mpsc;
 use tokio_util::sync::PollSender;
 
 use super::types::MAX_FRAME_DATA_SIZE;
+
+/// Default capacity for outbound stream write chunk buffer (64 KB)
+const WRITE_BUFFER_CHUNK_SIZE: usize = 64 * 1024;
 
 /// Buffer size for bounded channels (number of messages, not bytes)
 pub const STREAM_CHANNEL_BUFFER: usize = 16;
@@ -31,6 +34,9 @@ pub struct AnyTlsStream {
 
     /// Offset into read_buffer for partial consumption
     read_offset: usize,
+
+    /// Chunk buffer for outgoing writes to avoid per-write heap allocation
+    write_buf: BytesMut,
 
     /// Poll-based sender for outgoing data to session (bounded with backpressure)
     data_tx: PollSender<(u32, Bytes)>,
@@ -67,6 +73,7 @@ impl AnyTlsStream {
             data_rx,
             read_buffer: Bytes::new(),
             read_offset: 0,
+            write_buf: BytesMut::with_capacity(WRITE_BUFFER_CHUNK_SIZE),
             data_tx: PollSender::new(data_tx),
             session_closed,
             stream_closed: false,
@@ -177,7 +184,11 @@ impl AsyncWrite for AnyTlsStream {
         match self.data_tx.poll_reserve(cx) {
             Poll::Ready(Ok(())) => {
                 let write_len = buf.len().min(MAX_FRAME_DATA_SIZE);
-                let data = Bytes::copy_from_slice(&buf[..write_len]);
+                if self.write_buf.capacity() < write_len {
+                    self.write_buf.reserve(WRITE_BUFFER_CHUNK_SIZE.max(write_len));
+                }
+                self.write_buf.extend_from_slice(&buf[..write_len]);
+                let data = self.write_buf.split().freeze();
                 let id = self.id;
                 match self.data_tx.send_item((id, data)) {
                     Ok(()) => Poll::Ready(Ok(write_len)),

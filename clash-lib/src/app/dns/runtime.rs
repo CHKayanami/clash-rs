@@ -139,10 +139,10 @@ impl RuntimeProvider for DnsRuntimeProvider {
         server_addr: SocketAddr,
     ) -> std::pin::Pin<Box<dyn Send + Future<Output = std::io::Result<Self::Udp>>>>
     {
-        let src: SocketAddr = if server_addr.is_ipv4() {
-            "0.0.0.0:0".parse().unwrap()
+        let src = if server_addr.is_ipv4() {
+            SocketAddr::from(([0, 0, 0, 0], 0))
         } else {
-            "[::]:0".parse().unwrap()
+            SocketAddr::from(([0; 16], 0))
         };
 
         let provider = self.clone();
@@ -219,14 +219,14 @@ impl DnsUdpSocket for DnsProxyUdpSocket {
         ready!(inner.poll_ready_unpin(cx))?;
 
         let src = if target.is_ipv4() {
-            "0.0.0.0:0".parse().unwrap()
+            SocketAddr::from(([0, 0, 0, 0], 0))
         } else {
-            "[::]:0".parse().unwrap()
+            SocketAddr::from(([0; 16], 0))
         };
 
         let packet = UdpPacket {
             data: bytes::Bytes::copy_from_slice(buf),
-            src_addr: src,
+            src_addr: src.into(),
             dst_addr: target.into(),
             inbound_user: None,
         };

@@ -9,6 +9,7 @@ use crate::{
 };
 
 use async_trait::async_trait;
+use bytes::BytesMut;
 use std::{
     io,
     net::SocketAddr,
@@ -303,6 +304,7 @@ async fn handle_inbound_datagram(
     // tproxy -> dispatcher
     let fut2 = async move {
         let mut buf = vec![0_u8; 1024 * 64];
+        let mut chunk_buf = BytesMut::with_capacity(1024 * 64);
         let mut consecutive_errors = 0usize;
         let mut dropped = 0u64;
 
@@ -370,11 +372,25 @@ async fn handle_inbound_datagram(
                 continue;
             }
 
-            for chunk in buf[0..len].chunks(chunk_size) {
+            if chunk_buf.capacity() < len {
+                chunk_buf.reserve((1024 * 64).max(len));
+            }
+            chunk_buf.extend_from_slice(&buf[0..len]);
+            let full_bytes = chunk_buf.split().freeze();
+
+            let src_canonical = meta.addr.to_canonical();
+            let dst_canonical = orig_dst.to_canonical();
+
+            let num_chunks = len.div_ceil(chunk_size);
+            for chunk_idx in 0..num_chunks {
+                let start = chunk_idx * chunk_size;
+                let end = (start + chunk_size).min(len);
+                let chunk_data = full_bytes.slice(start..end);
+
                 let pkt = UdpPacket {
-                    data: bytes::Bytes::copy_from_slice(chunk),
-                    src_addr: meta.addr.to_canonical().into(),
-                    dst_addr: orig_dst.to_canonical().into(),
+                    data: chunk_data,
+                    src_addr: src_canonical.into(),
+                    dst_addr: dst_canonical.into(),
                     inbound_user: None,
                 };
 

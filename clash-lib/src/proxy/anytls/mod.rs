@@ -513,4 +513,44 @@ mod tests {
         app.read_exact(&mut recv_buf).await.unwrap();
         assert_eq!(recv_buf, payload);
     }
+
+    #[tokio::test]
+    async fn test_open_anytls_stream_multiple_writes() {
+        let h = make_handler(false, false);
+        let dst = SocksAddr::try_from(("1.2.3.4".to_owned(), 80)).unwrap();
+        let (client, mut server) = duplex(131072);
+
+        let mut app = h.open_anytls_stream(Box::new(client), &dst).await.unwrap();
+
+        // Drain initial handshake bytes
+        let mut hash_buf = [0u8; 32];
+        server.read_exact(&mut hash_buf).await.unwrap();
+        let pad_len = server.read_u16().await.unwrap() as usize;
+        if pad_len > 0 {
+            let mut pad_buf = vec![0u8; pad_len];
+            server.read_exact(&mut pad_buf).await.unwrap();
+        }
+        read_frame_raw(&mut server).await; // SETTINGS
+        read_frame_raw(&mut server).await; // SYN
+        read_frame_raw(&mut server).await; // PSH (dest)
+
+        // Multiple consecutive writes from client → server
+        for chunk_idx in 0..10 {
+            let data = format!("chunk payload {chunk_idx}");
+            app.write_all(data.as_bytes()).await.unwrap();
+            
+            // May receive Command::Waste (0) padding frame before Command::Psh (2)
+            let (cmd, sid, recv_data) = loop {
+                let (cmd, sid, recv_data) = read_frame_raw(&mut server).await;
+                if cmd != types::Command::Waste as u8 {
+                    break (cmd, sid, recv_data);
+                }
+            };
+            assert_eq!(cmd, types::Command::Psh as u8);
+            assert_eq!(sid, 1);
+            assert_eq!(recv_data, data.as_bytes());
+        }
+    }
 }
+
+

@@ -57,24 +57,27 @@ impl From<std::io::Error> for CopyBidirectionalError {
     }
 }
 
+const SMALL_BUFFER_THRESHOLD: usize = 16 * 1024;
 const INITIAL_COPY_BUFFER_SIZE: usize = 8 * 1024;
 const POOL_SHARDS: usize = 16;
 const BUFFER_POOL_MAX_SIZE_PER_SHARD: usize = 16;
 
-static BUFFER_POOLS: std::sync::LazyLock<[std::sync::Mutex<Vec<BytesMut>>; POOL_SHARDS]> =
+static SMALL_BUFFER_POOLS: std::sync::LazyLock<[std::sync::Mutex<Vec<BytesMut>>; POOL_SHARDS]> =
+    std::sync::LazyLock::new(|| std::array::from_fn(|_| std::sync::Mutex::new(Vec::new())));
+
+static LARGE_BUFFER_POOLS: std::sync::LazyLock<[std::sync::Mutex<Vec<BytesMut>>; POOL_SHARDS]> =
     std::sync::LazyLock::new(|| std::array::from_fn(|_| std::sync::Mutex::new(Vec::new())));
 
 thread_local! {
-    static TLS_SHARD_HINT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static TLS_THREAD_SHARD: usize = {
+        static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % POOL_SHARDS
+    };
 }
 
 #[inline]
 fn get_shard_index() -> usize {
-    TLS_SHARD_HINT.with(|hint| {
-        let idx = hint.get();
-        hint.set((idx + 1) % POOL_SHARDS);
-        idx
-    })
+    TLS_THREAD_SHARD.with(|&idx| idx)
 }
 
 /// Pooled buffer that returns to pool on drop instead of deallocating (shoes-style RAII).
@@ -82,24 +85,44 @@ fn get_shard_index() -> usize {
 pub struct PooledBuffer {
     buffer: BytesMut,
     shard: usize,
+    is_large: bool,
 }
 
 impl PooledBuffer {
     /// Get a buffer from the pool or create a new one.
     pub fn with_capacity(cap: usize) -> Self {
+        let is_large = cap > SMALL_BUFFER_THRESHOLD;
         let shard = get_shard_index();
-        if let Ok(mut pool) = BUFFER_POOLS[shard].lock() {
+        let pool_ref = if is_large {
+            &LARGE_BUFFER_POOLS[shard]
+        } else {
+            &SMALL_BUFFER_POOLS[shard]
+        };
+
+        if let Ok(mut pool) = pool_ref.lock() {
             if let Some(mut buffer) = pool.pop() {
                 if buffer.capacity() < cap {
                     buffer.reserve(cap - buffer.capacity());
                 }
-                buffer.resize(cap, 0);
-                return Self { buffer, shard };
+                unsafe {
+                    buffer.set_len(cap);
+                }
+                return Self {
+                    buffer,
+                    shard,
+                    is_large,
+                };
             }
         }
         let mut buffer = BytesMut::with_capacity(cap);
-        buffer.resize(cap, 0);
-        Self { buffer, shard }
+        unsafe {
+            buffer.set_len(cap);
+        }
+        Self {
+            buffer,
+            shard,
+            is_large,
+        }
     }
 
     #[inline]
@@ -133,7 +156,13 @@ impl std::ops::DerefMut for PooledBuffer {
 
 impl Drop for PooledBuffer {
     fn drop(&mut self) {
-        if let Ok(mut pool) = BUFFER_POOLS[self.shard].lock() {
+        let pool_ref = if self.is_large {
+            &LARGE_BUFFER_POOLS[self.shard]
+        } else {
+            &SMALL_BUFFER_POOLS[self.shard]
+        };
+
+        if let Ok(mut pool) = pool_ref.lock() {
             if pool.len() < BUFFER_POOL_MAX_SIZE_PER_SHARD {
                 let mut buffer = std::mem::replace(&mut self.buffer, BytesMut::new());
                 buffer.clear();

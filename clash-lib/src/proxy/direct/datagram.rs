@@ -32,11 +32,25 @@ const UDP_DOMAIN_MAP_SWEEP_INTERVAL: Duration = Duration::from_secs(1);
 /// Maximum number of datagrams to batch drain on a single ready notification.
 const MAX_BATCH_RECV_PACKETS: usize = 16;
 
-const UDP_RECV_CHUNK_SIZE: usize = 256 * 1024;
+const UDP_RECV_CHUNK_SIZE: usize = 64 * 1024;
 const MAX_UDP_DATAGRAM_SIZE: usize = 65535;
 
 thread_local! {
     static UDP_CHUNK_BUF: RefCell<BytesMut> = RefCell::new(BytesMut::new());
+}
+
+#[inline]
+fn ensure_chunk_capacity(chunk_buf: &mut BytesMut) {
+    if chunk_buf.capacity() - chunk_buf.len() < MAX_UDP_DATAGRAM_SIZE {
+        if chunk_buf.is_empty() {
+            let cap = chunk_buf.capacity();
+            if cap < UDP_RECV_CHUNK_SIZE {
+                chunk_buf.reserve(UDP_RECV_CHUNK_SIZE - cap);
+            }
+        } else {
+            *chunk_buf = BytesMut::with_capacity(UDP_RECV_CHUNK_SIZE);
+        }
+    }
 }
 
 #[inline]
@@ -294,9 +308,7 @@ impl Stream for OutboundDatagramImpl {
         }
 
         UDP_CHUNK_BUF.with_borrow_mut(|chunk_buf| {
-            if chunk_buf.capacity() - chunk_buf.len() < MAX_UDP_DATAGRAM_SIZE {
-                *chunk_buf = BytesMut::with_capacity(UDP_RECV_CHUNK_SIZE);
-            }
+            ensure_chunk_capacity(chunk_buf);
 
             loop {
                 let unfilled = chunk_buf.spare_capacity_mut();
@@ -326,9 +338,7 @@ impl Stream for OutboundDatagramImpl {
 
                         // 2. Batch Drain: opportunistically drain more packets from socket
                         while recv_queue.len() < MAX_BATCH_RECV_PACKETS - 1 {
-                            if chunk_buf.capacity() - chunk_buf.len() < MAX_UDP_DATAGRAM_SIZE {
-                                *chunk_buf = BytesMut::with_capacity(UDP_RECV_CHUNK_SIZE);
-                            }
+                            ensure_chunk_capacity(chunk_buf);
                             let spare = chunk_buf.spare_capacity_mut();
                             let spare_slice = unsafe {
                                 std::slice::from_raw_parts_mut(
