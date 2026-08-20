@@ -337,6 +337,22 @@ pub mod linux {
             Ok(())
         }
 
+        /// Dynamically remove a direct bypass IPv4 destination from the map.
+        pub fn remove_dynamic_bypass_ip4(&mut self, ip: Ipv4Addr) -> Result<(), String> {
+            use aya::maps::HashMap;
+            let Some(bpf) = self.bpf.as_mut() else {
+                return Err("eBPF not loaded".to_string());
+            };
+            let map = bpf.map_mut("DYNAMIC_BYPASS_DST_IPS")
+                .ok_or_else(|| "map 'DYNAMIC_BYPASS_DST_IPS' not found".to_string())?;
+            let mut lru = HashMap::<_, u32, u8>::try_from(map)
+                .map_err(|e| format!("DYNAMIC_BYPASS_DST_IPS: {e}"))?;
+            let ip_u32 = u32::from_ne_bytes(ip.octets());
+            let _ = lru.remove(&ip_u32);
+            debug!(ip = %ip, "Removed dynamic direct offload IPv4 from eBPF");
+            Ok(())
+        }
+
         /// Dynamically add a direct bypass IPv6 destination to the LRU map.
         pub fn add_dynamic_bypass_ip6(&mut self, ip: std::net::Ipv6Addr) -> Result<(), String> {
             use aya::maps::HashMap;
@@ -350,6 +366,21 @@ pub mod linux {
             lru.insert(ip.octets(), 1, 0)
                 .map_err(|e| format!("Failed to insert dynamic direct IPv6 {ip}: {e}"))?;
             debug!(ip = %ip, "Added dynamic direct offload IPv6 to eBPF");
+            Ok(())
+        }
+
+        /// Dynamically remove a direct bypass IPv6 destination from the map.
+        pub fn remove_dynamic_bypass_ip6(&mut self, ip: std::net::Ipv6Addr) -> Result<(), String> {
+            use aya::maps::HashMap;
+            let Some(bpf) = self.bpf.as_mut() else {
+                return Err("eBPF not loaded".to_string());
+            };
+            let map = bpf.map_mut("DYNAMIC_BYPASS_DST_IP6S")
+                .ok_or_else(|| "map 'DYNAMIC_BYPASS_DST_IP6S' not found".to_string())?;
+            let mut lru = HashMap::<_, [u8; 16], u8>::try_from(map)
+                .map_err(|e| format!("DYNAMIC_BYPASS_DST_IP6S: {e}"))?;
+            let _ = lru.remove(&ip.octets());
+            debug!(ip = %ip, "Removed dynamic direct offload IPv6 from eBPF");
             Ok(())
         }
 
@@ -534,6 +565,12 @@ pub mod non_linux {
             Ok(())
         }
         pub fn add_dynamic_bypass_ip6(&mut self, _ip: std::net::Ipv6Addr) -> Result<(), String> {
+            Ok(())
+        }
+        pub fn remove_dynamic_bypass_ip4(&mut self, _ip: std::net::Ipv4Addr) -> Result<(), String> {
+            Ok(())
+        }
+        pub fn remove_dynamic_bypass_ip6(&mut self, _ip: std::net::Ipv6Addr) -> Result<(), String> {
             Ok(())
         }
         pub fn unload(&mut self) {}

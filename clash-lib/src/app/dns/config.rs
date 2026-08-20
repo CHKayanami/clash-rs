@@ -74,6 +74,9 @@ pub struct Config {
     pub edns_client_subnet: Option<EdnsClientSubnet>,
     pub fw_mark: Option<u32>,
     pub respect_rules: bool,
+    pub optimistic_cache_ttl: u32,
+    pub fixed_domain_ttl: HashMap<String, u32>,
+    pub stale_cache_retention: u32,
 }
 
 impl Config {
@@ -483,6 +486,9 @@ impl TryFrom<&crate::config::def::Config> for Config {
             nameserver_policy,
             edns_client_subnet,
             respect_rules: dc.respect_rules,
+            optimistic_cache_ttl: dc.optimistic_cache_ttl,
+            fixed_domain_ttl: dc.fixed_domain_ttl.clone(),
+            stale_cache_retention: dc.stale_cache_retention,
         })
     }
 }

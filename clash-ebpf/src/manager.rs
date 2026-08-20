@@ -352,6 +352,24 @@ impl EbpfManager {
             std::net::IpAddr::V6(v6) => self.add_dynamic_bypass_ip6(v6).await,
         }
     }
+
+    /// Dynamically remove a direct bypass IPv4 destination.
+    pub async fn remove_dynamic_bypass_ip4(&self, ip: std::net::Ipv4Addr) -> Result<(), String> {
+        self.bpf_manager.lock().await.remove_dynamic_bypass_ip4(ip)
+    }
+
+    /// Dynamically remove a direct bypass IPv6 destination.
+    pub async fn remove_dynamic_bypass_ip6(&self, ip: std::net::Ipv6Addr) -> Result<(), String> {
+        self.bpf_manager.lock().await.remove_dynamic_bypass_ip6(ip)
+    }
+
+    /// Dynamically remove a direct bypass IP (v4 or v6) destination.
+    pub async fn remove_dynamic_bypass_ip(&self, ip: std::net::IpAddr) -> Result<(), String> {
+        match ip {
+            std::net::IpAddr::V4(v4) => self.remove_dynamic_bypass_ip4(v4).await,
+            std::net::IpAddr::V6(v6) => self.remove_dynamic_bypass_ip6(v6).await,
+        }
+    }
 }
 
 /// Detect the default WAN egress interface for Linux and OpenWrt router environments.

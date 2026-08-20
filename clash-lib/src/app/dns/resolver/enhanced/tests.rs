@@ -86,9 +86,7 @@ async fn test_resolve_v6_literal_when_ipv6_disabled() {
 async fn test_lru_cache_hit_with_recursion_desired() {
     use hickory_proto::op;
 
-    let mut resolver = EnhancedResolver::new_default().await;
-    resolver.main.clear(); // ensure cache miss would fail deterministically
-    resolver.lru_cache = Some(super::cache::DnsCache::new(16));
+    let resolver = EnhancedResolver::new_with_cache_for_test(super::cache::DnsCache::new(16)).await;
 
     let mut request = op::Message::query();
     let mut query = op::Query::new();
@@ -639,9 +637,7 @@ async fn test_black_domain_filter() {
 async fn test_fake_ip_ttl() {
     use crate::app::dns::fakeip::{FakeDns, InMemStore, Opts};
 
-    let mut resolver = EnhancedResolver::new_default().await;
-    resolver.fake_ip_ttl = 5;
-    resolver.fake_dns = Some(Arc::new(
+    let fake_dns = Arc::new(
         FakeDns::new(Opts {
             ipnet: "198.18.0.1/16".parse().unwrap(),
             ipnet6: "fc00::/18".parse().unwrap(),
@@ -650,7 +646,8 @@ async fn test_fake_ip_ttl() {
             store: Box::new(InMemStore::new(1000)),
         })
         .unwrap(),
-    ));
+    );
+    let resolver = EnhancedResolver::new_fake_dns_for_test(5, fake_dns).await;
 
     let mut msg = op::Message::query();
     let mut query = op::Query::new();

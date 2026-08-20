@@ -184,7 +184,10 @@ mod tests {
         collector.flush_if_needed().await;
 
         let content = std::fs::read_to_string(&file_path).unwrap();
-        let lines: Vec<&str> = content.lines().collect();
+        let lines: Vec<&str> = content
+            .lines()
+            .filter(|l| !l.trim().starts_with('#') && !l.trim().is_empty())
+            .collect();
         assert_eq!(lines.len(), 2);
         assert!(lines.contains(&"example.com fakeip"));
         assert!(lines.contains(&"google.com realip"));
@@ -216,7 +219,10 @@ mod tests {
         collector.flush_if_needed().await;
 
         let content = std::fs::read_to_string(&file_path).unwrap();
-        let lines: Vec<&str> = content.lines().collect();
+        let lines: Vec<&str> = content
+            .lines()
+            .filter(|l| !l.trim().starts_with('#') && !l.trim().is_empty())
+            .collect();
         assert_eq!(lines.len(), 3);
         assert!(lines.contains(&"newdomain.com realip"));
     }

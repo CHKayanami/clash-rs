@@ -885,6 +885,20 @@ pub struct DNS {
     /// instead of going DIRECT. `default-nameserver` and
     /// `proxy-server-nameserver` are not affected.
     pub respect_rules: bool,
+    /// Minimum TTL for optimistic DNS cache in seconds (0 = follow upstream TTL)
+    #[serde(default)]
+    pub optimistic_cache_ttl: u32,
+    /// Per-domain fixed TTL overrides (0 = never cache)
+    #[serde(default)]
+    pub fixed_domain_ttl: HashMap<String, u32>,
+    /// Retention duration in seconds for expired cache entries used for serve-stale fallback
+    #[educe(Default = 3600)]
+    #[serde(default = "default_stale_cache_retention")]
+    pub stale_cache_retention: u32,
+}
+
+fn default_stale_cache_retention() -> u32 {
+    3600
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]

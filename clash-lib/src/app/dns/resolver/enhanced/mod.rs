@@ -3,7 +3,7 @@ mod policy;
 #[cfg(test)]
 mod tests;
 
-pub use cache::DnsCache;
+pub use cache::{CacheLookup, DnsCache};
 pub use policy::NameServerPolicyContainer;
 
 use crate::{
@@ -46,7 +46,19 @@ use std::{
 
 use tracing::{debug, error, instrument, trace, warn};
 
+#[derive(Clone)]
 pub struct EnhancedResolver {
+    inner: Arc<EnhancedResolverInner>,
+}
+
+impl std::ops::Deref for EnhancedResolver {
+    type Target = EnhancedResolverInner;
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+pub struct EnhancedResolverInner {
     ipv6: AtomicBool,
     hosts: Option<trie::StringTrie<net::IpAddr>>,
     main: Vec<ThreadSafeDNSClient>,
@@ -66,6 +78,11 @@ pub struct EnhancedResolver {
     reverse_lookup_cache: Option<moka::future::Cache<net::IpAddr, String>>,
     black_domain_filter: Option<BlackDomainFilter>,
     collector: Option<ThreadSafeDnsCollector>,
+
+    optimistic_cache_ttl: u32,
+    stale_cache_retention: Duration,
+    fixed_domain_ttl: Option<trie::StringTrie<u32>>,
+    revalidate_inflight: Arc<dashmap::DashSet<String>>,
 }
 
 impl EnhancedResolver {
@@ -77,38 +94,97 @@ impl EnhancedResolver {
         use crate::app::dns::config::NameServer;
         use crate::app::dns::dns_client::DNSNetMode;
 
-        EnhancedResolver {
-            ipv6: AtomicBool::new(false),
-            hosts: None,
-            main: make_clients(
-                vec![NameServer {
-                    net: DNSNetMode::Udp,
-                    host: url::Host::Ipv4(Ipv4Addr::from_octets([8, 8, 8, 8])),
-                    port: 53,
-                    interface: None,
-                    proxy: None,
-                }],
-                None,
-                Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
-                None,
-                None,
-                None,
-            )
-            .await,
-            fallback: None,
-            fallback_filter: None,
-            lru_cache: None,
-            policy: None,
+        Self {
+            inner: Arc::new(EnhancedResolverInner {
+                ipv6: AtomicBool::new(false),
+                hosts: None,
+                main: make_clients(
+                    vec![NameServer {
+                        net: DNSNetMode::Udp,
+                        host: url::Host::Ipv4(Ipv4Addr::from_octets([8, 8, 8, 8])),
+                        port: 53,
+                        interface: None,
+                        proxy: None,
+                    }],
+                    None,
+                    Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
+                    None,
+                    None,
+                    None,
+                )
+                .await,
+                fallback: None,
+                fallback_filter: None,
+                lru_cache: None,
+                policy: None,
 
-            proxy_resolver: None,
-            proxy_server_domains: None,
+                proxy_resolver: None,
+                proxy_server_domains: None,
 
-            fake_dns: None,
-            fake_ip_ttl: 1,
+                fake_dns: None,
+                fake_ip_ttl: 1,
 
-            reverse_lookup_cache: None,
-            black_domain_filter: None,
-            collector: None,
+                reverse_lookup_cache: None,
+                black_domain_filter: None,
+                collector: None,
+
+                optimistic_cache_ttl: 0,
+                stale_cache_retention: Duration::from_secs(3600),
+                fixed_domain_ttl: None,
+                revalidate_inflight: Arc::new(dashmap::DashSet::new()),
+            }),
+        }
+    }
+
+    #[cfg(test)]
+    pub async fn new_with_cache_for_test(cache: DnsCache) -> Self {
+        Self {
+            inner: Arc::new(EnhancedResolverInner {
+                ipv6: AtomicBool::new(false),
+                hosts: None,
+                main: vec![],
+                fallback: None,
+                fallback_filter: None,
+                lru_cache: Some(cache),
+                policy: None,
+                proxy_resolver: None,
+                proxy_server_domains: None,
+                fake_dns: None,
+                fake_ip_ttl: 1,
+                reverse_lookup_cache: None,
+                black_domain_filter: None,
+                collector: None,
+                optimistic_cache_ttl: 0,
+                stale_cache_retention: Duration::from_secs(3600),
+                fixed_domain_ttl: None,
+                revalidate_inflight: Arc::new(dashmap::DashSet::new()),
+            }),
+        }
+    }
+
+    #[cfg(test)]
+    pub async fn new_fake_dns_for_test(fake_ip_ttl: u32, fake_dns: ThreadSafeFakeDns) -> Self {
+        Self {
+            inner: Arc::new(EnhancedResolverInner {
+                ipv6: AtomicBool::new(false),
+                hosts: None,
+                main: vec![],
+                fallback: None,
+                fallback_filter: None,
+                lru_cache: None,
+                policy: None,
+                proxy_resolver: None,
+                proxy_server_domains: None,
+                fake_dns: Some(fake_dns),
+                fake_ip_ttl,
+                reverse_lookup_cache: None,
+                black_domain_filter: None,
+                collector: None,
+                optimistic_cache_ttl: 0,
+                stale_cache_retention: Duration::from_secs(3600),
+                fixed_domain_ttl: None,
+                revalidate_inflight: Arc::new(dashmap::DashSet::new()),
+            }),
         }
     }
 
@@ -123,33 +199,40 @@ impl EnhancedResolver {
         let edns_client_subnet = cfg.edns_client_subnet.clone();
 
         let default_resolver = Arc::new(EnhancedResolver {
-            ipv6: AtomicBool::new(false),
-            hosts: None,
-            main: make_clients(
-                cfg.default_nameserver.clone(),
-                None,
-                Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
-                edns_client_subnet.clone(),
-                cfg.fw_mark,
-                // default-nameserver is the bootstrap path used to resolve
-                // DoH/DoT hostnames — it MUST NOT go through the rule engine.
-                None,
-            )
-            .await,
-            fallback: None,
-            fallback_filter: None,
-            lru_cache: None,
-            policy: None,
+            inner: Arc::new(EnhancedResolverInner {
+                ipv6: AtomicBool::new(false),
+                hosts: None,
+                main: make_clients(
+                    cfg.default_nameserver.clone(),
+                    None,
+                    Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
+                    edns_client_subnet.clone(),
+                    cfg.fw_mark,
+                    // default-nameserver is the bootstrap path used to resolve
+                    // DoH/DoT hostnames — it MUST NOT go through the rule engine.
+                    None,
+                )
+                .await,
+                fallback: None,
+                fallback_filter: None,
+                lru_cache: None,
+                policy: None,
 
-            proxy_resolver: None,
-            proxy_server_domains: None,
+                proxy_resolver: None,
+                proxy_server_domains: None,
 
-            fake_dns: None,
-            fake_ip_ttl: cfg.fake_ip_ttl,
+                fake_dns: None,
+                fake_ip_ttl: cfg.fake_ip_ttl,
 
-            reverse_lookup_cache: None,
-            black_domain_filter: None,
-            collector: None,
+                reverse_lookup_cache: None,
+                black_domain_filter: None,
+                collector: None,
+
+                optimistic_cache_ttl: 0,
+                stale_cache_retention: Duration::from_secs(3600),
+                fixed_domain_ttl: None,
+                revalidate_inflight: Arc::new(dashmap::DashSet::new()),
+            }),
         });
 
         let proxy_resolver = if let Some(proxy_resolver) = cfg.proxy_server_nameserver {
@@ -201,7 +284,7 @@ impl EnhancedResolver {
                 None
             };
 
-        Self {
+        let inner = Arc::new(EnhancedResolverInner {
             ipv6: AtomicBool::new(cfg.ipv6),
             main: make_clients(
                 cfg.nameserver.clone(),
@@ -307,7 +390,21 @@ impl EnhancedResolver {
             },
             collector,
             fake_ip_ttl: cfg.fake_ip_ttl,
-        }
+            optimistic_cache_ttl: cfg.optimistic_cache_ttl,
+            stale_cache_retention: Duration::from_secs(cfg.stale_cache_retention as u64),
+            fixed_domain_ttl: if !cfg.fixed_domain_ttl.is_empty() {
+                let mut trie = trie::StringTrie::new();
+                for (domain, ttl) in &cfg.fixed_domain_ttl {
+                    trie.insert(domain, Arc::new(*ttl));
+                }
+                Some(trie)
+            } else {
+                None
+            },
+            revalidate_inflight: Arc::new(dashmap::DashSet::new()),
+        });
+
+        Self { inner }
     }
 
     #[instrument(skip(message), level = "trace")]
@@ -390,33 +487,82 @@ impl EnhancedResolver {
             return Ok(res);
         }
 
-        // Cache hit — return early
-        if let Some(lru) = &self.lru_cache
-            && let Some(answers) = lru.get(q, Instant::now())
-        {
-            trace!(
-                q = q.to_string(),
-                "cache hit for DNS query, returning cached response",
-            );
-            let mut reply = build_dns_response_message(message, true, false);
-            reply.add_answers(answers);
-            let ip_list = EnhancedResolver::ip_list_of_message(&reply);
-            if !ip_list.is_empty() {
-                if let Some(collector) = &self.collector {
-                    collector.record(&host, false);
+        // Cache lookup with Fresh Hit & Stale-While-Revalidate support
+        if let Some(lru) = &self.lru_cache {
+            match lru.lookup(q, Instant::now()) {
+                CacheLookup::Hit(answers) => {
+                    trace!(
+                        q = q.to_string(),
+                        "cache hit for DNS query, returning cached response",
+                    );
+                    let mut reply = build_dns_response_message(message, true, false);
+                    reply.add_answers(answers);
+                    let ip_list = EnhancedResolver::ip_list_of_message(&reply);
+                    if !ip_list.is_empty() {
+                        if let Some(collector) = &self.collector {
+                            collector.record(&host, false);
+                        }
+                    }
+                    return Ok(reply);
                 }
+                CacheLookup::Stale(stale_answers) => {
+                    trace!(
+                        q = q.to_string(),
+                        "stale cache hit for DNS query, returning stale response and triggering background revalidation",
+                    );
+                    // Stale-While-Revalidate: singleflight background refresh
+                    let query_key = format!("{}:{:?}", q.name(), q.query_type());
+                    if !self.revalidate_inflight.contains(&query_key) {
+                        self.revalidate_inflight.insert(query_key.clone());
+                        let inflight = self.revalidate_inflight.clone();
+                        let key = query_key.clone();
+                        let this = self.clone();
+                        let msg_clone = message.clone();
+                        tokio::spawn(async move {
+                            trace!("Stale-While-Revalidate starting for {}", key);
+                            let _ = this.exchange_no_cache(&msg_clone).await;
+                            inflight.remove(&key);
+                            trace!("Stale-While-Revalidate completed for {}", key);
+                        });
+                    }
+
+                    let mut reply = build_dns_response_message(message, true, false);
+                    reply.add_answers(stale_answers);
+                    let ip_list = EnhancedResolver::ip_list_of_message(&reply);
+                    if !ip_list.is_empty() {
+                        if let Some(collector) = &self.collector {
+                            collector.record(&host, false);
+                        }
+                    }
+                    return Ok(reply);
+                }
+                CacheLookup::Miss => {}
             }
-            return Ok(reply);
         }
 
         trace!(q = q.to_string(), "querying resolver");
-        let res = self.exchange_no_cache(message).await.map(|mut r| {
-            if let Some(edns) = r.edns.as_mut() {
-                // Remove only padding options, keep everything else
-                edns.options_mut().remove(rr::rdata::opt::EdnsCode::Padding);
+        let res = match self.exchange_no_cache(message).await {
+            Ok(mut r) => {
+                if let Some(edns) = r.edns.as_mut() {
+                    // Remove only padding options, keep everything else
+                    edns.options_mut().remove(rr::rdata::opt::EdnsCode::Padding);
+                }
+                Ok(r)
             }
-            r
-        });
+            Err(e) => {
+                // Serve-Stale fallback: if upstream query failed, degrade to stale cache if available
+                if let Some(lru) = &self.lru_cache
+                    && let Some(stale_answers) = lru.get_stale(q, Instant::now())
+                {
+                    warn!("upstream DNS exchange failed: {e}, degrading to serve-stale cache for {host}");
+                    let mut reply = build_dns_response_message(message, true, false);
+                    reply.add_answers(stale_answers);
+                    Ok(reply)
+                } else {
+                    Err(e)
+                }
+            }
+        };
         trace!(q = q.to_string(), "query completed");
         if let Ok(ref msg) = res {
             let ip_list = EnhancedResolver::ip_list_of_message(msg);
@@ -427,6 +573,14 @@ impl EnhancedResolver {
             }
         }
         res
+    }
+
+    fn match_fixed_domain_ttl(&self, domain: &str) -> Option<u32> {
+        self.fixed_domain_ttl
+            .as_ref()?
+            .search(domain)?
+            .get_data()
+            .copied()
     }
 
     async fn exchange_no_cache(&self, message: &op::Message) -> anyhow::Result<op::Message> {
@@ -472,7 +626,16 @@ impl EnhancedResolver {
                 ips.is_empty() || ips.iter().any(|ip| !ip.is_unspecified())
             }
         {
-            lru.insert(q.clone(), msg.answers.clone(), Instant::now());
+            let host_clean = q.name().to_ascii().trim_end_matches('.').to_owned();
+            let fixed_ttl = self.match_fixed_domain_ttl(&host_clean);
+            lru.insert_with_policy(
+                q.clone(),
+                msg.answers.clone(),
+                self.optimistic_cache_ttl,
+                fixed_ttl,
+                self.stale_cache_retention,
+                Instant::now(),
+            );
         }
 
         rv

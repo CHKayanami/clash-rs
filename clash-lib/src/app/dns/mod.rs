@@ -30,7 +30,7 @@ pub use rule_dispatch::{PendingOutboundManager, PendingRouter, RuleDispatch};
 pub use resolver::{EnhancedResolver, SystemResolver, new as new_resolver};
 
 pub use server::DnsRunner;
-#[cfg(feature = "tun")]
+#[cfg(any(feature = "tun", feature = "ebpf"))]
 pub use server::exchange_with_resolver;
 
 #[async_trait]
