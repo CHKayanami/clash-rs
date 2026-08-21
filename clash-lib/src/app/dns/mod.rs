@@ -49,6 +49,8 @@ pub enum ResolverKind {
 
 pub type ThreadSafeDNSResolver = Arc<dyn ClashResolver>;
 
+pub type DnsResolutionHook = Arc<dyn Fn(&str, &[std::net::IpAddr], std::time::Duration) + Send + Sync>;
+
 /// A implementation of "anti-poisoning" Resolver
 /// it can hold multiple clients in different protocols
 /// each client can also hold a "default_resolver"
@@ -56,6 +58,8 @@ pub type ThreadSafeDNSResolver = Arc<dyn ClashResolver>;
 #[cfg_attr(test, automock)]
 #[async_trait]
 pub trait ClashResolver: Sync + Send {
+    fn register_resolution_hook(&self, _hook: DnsResolutionHook) {}
+
     async fn resolve(
         &self,
         host: &str,

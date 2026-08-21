@@ -108,6 +108,8 @@ impl Router {
     /// Quick check if a domain routes to DIRECT.
     pub async fn is_domain_direct(&self, domain: &str) -> bool {
         let mut sess = Session {
+            id: 0,
+            typ: crate::session::Type::RouteProbe,
             destination: crate::session::SocksAddr::Domain(domain.to_string(), 80),
             ..Default::default()
         };
@@ -118,6 +120,8 @@ impl Router {
     /// Quick check if an IP address routes to DIRECT.
     pub async fn is_ip_direct(&self, ip: std::net::IpAddr) -> bool {
         let mut sess = Session {
+            id: 0,
+            typ: crate::session::Type::RouteProbe,
             destination: crate::session::SocksAddr::Ip(std::net::SocketAddr::new(ip, 80)),
             ..Default::default()
         };

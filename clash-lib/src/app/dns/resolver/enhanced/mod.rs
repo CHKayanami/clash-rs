@@ -15,8 +15,8 @@ use crate::{
     common::trie,
     config::def::DNSMode,
     dns::{
-        ClashResolver, Config, ResolverKind, RuleDispatch, ThreadSafeDNSClient,
-        ThreadSafeDnsCollector,
+        ClashResolver, Config, DnsResolutionHook, ResolverKind, RuleDispatch,
+        ThreadSafeDNSClient, ThreadSafeDnsCollector,
         fakeip::{self, FileStore, InMemStore, ThreadSafeFakeDns},
         filters::{BlackDomainFilter, DomainFilter, FallbackFilter, PendingMmdb},
         helper::make_clients,
@@ -38,7 +38,7 @@ use rand::seq::IndexedRandom;
 use std::{
     net,
     sync::{
-        Arc,
+        Arc, OnceLock,
         atomic::{AtomicBool, Ordering::Relaxed},
     },
     time::{Duration, Instant},
@@ -83,6 +83,7 @@ pub struct EnhancedResolverInner {
     stale_cache_retention: Duration,
     fixed_domain_ttl: Option<trie::StringTrie<u32>>,
     revalidate_inflight: Arc<dashmap::DashSet<String>>,
+    resolution_hook: OnceLock<DnsResolutionHook>,
 }
 
 impl EnhancedResolver {
@@ -132,6 +133,7 @@ impl EnhancedResolver {
                 stale_cache_retention: Duration::from_secs(3600),
                 fixed_domain_ttl: None,
                 revalidate_inflight: Arc::new(dashmap::DashSet::new()),
+                resolution_hook: OnceLock::new(),
             }),
         }
     }
@@ -158,6 +160,7 @@ impl EnhancedResolver {
                 stale_cache_retention: Duration::from_secs(3600),
                 fixed_domain_ttl: None,
                 revalidate_inflight: Arc::new(dashmap::DashSet::new()),
+                resolution_hook: OnceLock::new(),
             }),
         }
     }
@@ -184,6 +187,7 @@ impl EnhancedResolver {
                 stale_cache_retention: Duration::from_secs(3600),
                 fixed_domain_ttl: None,
                 revalidate_inflight: Arc::new(dashmap::DashSet::new()),
+                resolution_hook: OnceLock::new(),
             }),
         }
     }
@@ -232,6 +236,7 @@ impl EnhancedResolver {
                 stale_cache_retention: Duration::from_secs(3600),
                 fixed_domain_ttl: None,
                 revalidate_inflight: Arc::new(dashmap::DashSet::new()),
+                resolution_hook: OnceLock::new(),
             }),
         });
 
@@ -402,6 +407,7 @@ impl EnhancedResolver {
                 None
             },
             revalidate_inflight: Arc::new(dashmap::DashSet::new()),
+            resolution_hook: OnceLock::new(),
         });
 
         Self { inner }
@@ -636,6 +642,14 @@ impl EnhancedResolver {
                 self.stale_cache_retention,
                 Instant::now(),
             );
+
+            if let Some(hook) = self.resolution_hook.get() {
+                let ips = EnhancedResolver::ip_list_of_message(msg);
+                if !ips.is_empty() {
+                    let raw_min_ttl = msg.answers.iter().map(|r| r.ttl).min().unwrap_or(300).max(1);
+                    hook(&host_clean, &ips, Duration::from_secs(raw_min_ttl as u64));
+                }
+            }
         }
 
         rv
@@ -748,6 +762,10 @@ impl EnhancedResolver {
 
 #[async_trait]
 impl ClashResolver for EnhancedResolver {
+    fn register_resolution_hook(&self, hook: DnsResolutionHook) {
+        let _ = self.resolution_hook.set(hook);
+    }
+
     #[instrument(skip(self), level = "trace")]
     async fn resolve(
         &self,

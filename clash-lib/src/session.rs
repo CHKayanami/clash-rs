@@ -388,6 +388,7 @@ pub enum Type {
     Shadowsocks,
     Anytls,
     Ignore,
+    RouteProbe,
 }
 
 impl Display for Network {

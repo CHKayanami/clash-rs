@@ -662,5 +662,111 @@ async fn test_fake_ip_ttl() {
     assert_eq!(response.answers[0].ttl, 5);
 }
 
+#[tokio::test]
+async fn test_dns_resolution_hook_triggered_on_cache_write() {
+    use std::sync::atomic::AtomicBool;
+    use std::sync::{Mutex, OnceLock};
+    use std::time::Duration;
+    use super::EnhancedResolverInner;
+    use crate::app::dns::config::NameServer;
+    use crate::app::dns::dns_client::DNSNetMode;
+    use crate::app::dns::helper::make_clients;
+    use crate::app::dns::resolver::enhanced::cache::DnsCache;
+
+    // Start a local mock DNS UDP server on 127.0.0.1:0
+    let server_sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let server_addr = server_sock.local_addr().unwrap();
+
+    let server_task = tokio::spawn(async move {
+        let mut buf = [0u8; 512];
+        if let Ok((len, src)) = server_sock.recv_from(&mut buf).await {
+            if let Ok(req) = op::Message::from_vec(&buf[..len]) {
+                let mut resp = op::Message::query();
+                resp.metadata.id = req.metadata.id;
+                resp.metadata.message_type = op::MessageType::Response;
+                resp.metadata.response_code = op::ResponseCode::NoError;
+                resp.queries = req.queries.clone();
+
+                let name = req.queries[0].name().clone();
+                let record = rr::Record::from_rdata(
+                    name,
+                    120,
+                    rr::RData::A(hickory_proto::rr::rdata::A(std::net::Ipv4Addr::new(93, 184, 216, 34))),
+                );
+                resp.add_answer(record);
+                if let Ok(bytes) = resp.to_vec() {
+                    let _ = server_sock.send_to(&bytes, src).await;
+                }
+            }
+        }
+    });
+
+    let clients = make_clients(
+        vec![NameServer {
+            net: DNSNetMode::Udp,
+            host: url::Host::Ipv4(match server_addr.ip() {
+                std::net::IpAddr::V4(v4) => v4,
+                _ => unreachable!(),
+            }),
+            port: server_addr.port(),
+            interface: None,
+            proxy: None,
+        }],
+        None,
+        Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
+        None,
+        None,
+        None,
+    ).await;
+
+    let resolver = EnhancedResolver {
+        inner: Arc::new(EnhancedResolverInner {
+            ipv6: AtomicBool::new(false),
+            hosts: None,
+            main: clients,
+            fallback: None,
+            fallback_filter: None,
+            lru_cache: Some(DnsCache::new(100)),
+            policy: None,
+            proxy_resolver: None,
+            proxy_server_domains: None,
+            fake_dns: None,
+            fake_ip_ttl: 1,
+            reverse_lookup_cache: None,
+            black_domain_filter: None,
+            collector: None,
+            optimistic_cache_ttl: 0,
+            stale_cache_retention: Duration::from_secs(3600),
+            fixed_domain_ttl: None,
+            revalidate_inflight: Arc::new(dashmap::DashSet::new()),
+            resolution_hook: OnceLock::new(),
+        }),
+    };
+
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let captured_clone = captured.clone();
+    resolver.register_resolution_hook(Arc::new(move |domain, ips, ttl| {
+        captured_clone.lock().unwrap().push((domain.to_string(), ips.to_vec(), ttl));
+    }));
+
+    let mut query = op::Query::new();
+    let name = rr::Name::from_str_relaxed("hook-test.com").unwrap();
+    query.set_name(name);
+    query.set_query_type(rr::RecordType::A);
+
+    let mut msg = op::Message::query();
+    msg.metadata.recursion_desired = true;
+    msg.add_query(query);
+
+    let _ = resolver.exchange(&msg).await.expect("query should succeed");
+    let _ = server_task.await;
+
+    let recorded = captured.lock().unwrap().clone();
+    assert_eq!(recorded.len(), 1);
+    assert_eq!(recorded[0].0, "hook-test.com");
+    assert_eq!(recorded[0].1, vec![std::net::IpAddr::V4(std::net::Ipv4Addr::new(93, 184, 216, 34))]);
+    assert_eq!(recorded[0].2, std::time::Duration::from_secs(120));
+}
+
 
 

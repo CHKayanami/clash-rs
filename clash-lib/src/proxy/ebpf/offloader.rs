@@ -169,6 +169,12 @@ impl OffloadDesiredState {
 
     fn remove_owner(&mut self, domain: &str) {
         if let Some((domain_key, owner)) = self.owners.remove_entry(domain) {
+            tracing::info!(
+                "[eBPF DirectOffloader] Domain TTL expired: {} (holding {} IPs: {:?})",
+                domain_key,
+                owner.ips.len(),
+                owner.ips
+            );
             for ip in &owner.ips {
                 if let Some(domains) = self.reverse.get_mut(ip) {
                     domains.remove(&domain_key);
@@ -268,7 +274,7 @@ pub struct DirectOffloader {
 #[cfg(target_os = "linux")]
 impl DirectOffloader {
     pub fn new(
-        manager: Arc<tokio::sync::Mutex<Option<clash_ebpf::EbpfManager>>>,
+        manager: Arc<tokio::sync::OnceCell<Arc<clash_ebpf::EbpfManager>>>,
         resolver: ThreadSafeDNSResolver,
         bypass_dst_trie: Arc<CidrTrie>,
     ) -> Self {
@@ -281,44 +287,79 @@ impl DirectOffloader {
                 let now = Instant::now();
                 state.expire(now);
 
-                // Flush dirty IPs to eBPF manager
+                // Flush dirty IPs to eBPF manager in batch
                 if !state.dirty_ips.is_empty() {
-                    let dirty_list: Vec<IpAddr> = state.dirty_ips.iter().copied().collect();
-                    let mgr_guard = manager.lock().await;
-                    if let Some(mgr) = mgr_guard.as_ref() {
-                        for ip in dirty_list {
-                            let desired = state.desired.get(&ip).copied();
-                            let applied = state.applied.contains(&ip);
+                    let mut add_v4 = Vec::new();
+                    let mut add_v6 = Vec::new();
+                    let mut del_v4 = Vec::new();
+                    let mut del_v6 = Vec::new();
 
-                            match (desired, applied) {
-                                (Some(true), false) => {
-                                    if let Err(e) = mgr.add_dynamic_bypass_ip(ip).await {
-                                        tracing::debug!("eBPF dynamic bypass insert failed for {ip}: {e}");
-                                    } else {
-                                        state.applied.insert(ip);
-                                    }
-                                }
-                                (None, true) => {
-                                    if let Err(e) = mgr.remove_dynamic_bypass_ip(ip).await {
-                                        tracing::debug!("eBPF dynamic bypass remove failed for {ip}: {e}");
-                                    } else {
-                                        state.applied.remove(&ip);
-                                    }
-                                }
-                                _ => {}
-                            }
-                            state.dirty_ips.remove(&ip);
+                    for ip in &state.dirty_ips {
+                        let desired = state.desired.get(ip).copied();
+                        let applied = state.applied.contains(ip);
+
+                        match (desired, applied) {
+                            (Some(true), false) => match ip {
+                                IpAddr::V4(v4) => add_v4.push(*v4),
+                                IpAddr::V6(v6) => add_v6.push(*v6),
+                            },
+                            (None, true) => match ip {
+                                IpAddr::V4(v4) => del_v4.push(*v4),
+                                IpAddr::V6(v6) => del_v6.push(*v6),
+                            },
+                            _ => {}
                         }
-                    } else {
-                        state.dirty_ips.clear();
                     }
+
+                    if !add_v4.is_empty() || !add_v6.is_empty() || !del_v4.is_empty() || !del_v6.is_empty() {
+                        if let Some(mgr) = manager.get() {
+                            if let Err(e) = mgr
+                                .update_dynamic_bypass_batch(&add_v4, &add_v6, &del_v4, &del_v6)
+                                .await
+                            {
+                                tracing::warn!("eBPF dynamic bypass batch update failed: {e}");
+                            } else {
+                                if !add_v4.is_empty() || !add_v6.is_empty() {
+                                    tracing::info!(
+                                        "[eBPF DirectOffloader] Dynamic bypass added: IPv4={:?}, IPv6={:?}",
+                                        add_v4,
+                                        add_v6
+                                    );
+                                }
+                                for v4 in &add_v4 {
+                                    state.applied.insert(IpAddr::V4(*v4));
+                                }
+                                for v6 in &add_v6 {
+                                    state.applied.insert(IpAddr::V6(*v6));
+                                }
+                                if !del_v4.is_empty() || !del_v6.is_empty() {
+                                    tracing::info!(
+                                        "[eBPF DirectOffloader] Dynamic bypass removed: IPv4={:?}, IPv6={:?}",
+                                        del_v4,
+                                        del_v6
+                                    );
+                                }
+                                for v4 in &del_v4 {
+                                    state.applied.remove(&IpAddr::V4(*v4));
+                                }
+                                for v6 in &del_v6 {
+                                    state.applied.remove(&IpAddr::V6(*v6));
+                                }
+                            }
+                        }
+                    }
+                    state.dirty_ips.clear();
                 }
 
                 let next_deadline = state.next_deadline();
 
                 tokio::select! {
                     Some(obs) = rx.recv() => {
-                        state.observe(&obs.domain, &obs.ips, obs.action, obs.ttl, Instant::now());
+                        let now = Instant::now();
+                        state.observe(&obs.domain, &obs.ips, obs.action, obs.ttl, now);
+                        while let Ok(obs) = rx.try_recv() {
+                            state.observe(&obs.domain, &obs.ips, obs.action, obs.ttl, now);
+                        }
                     }
                     _ = async {
                         if let Some(deadline) = next_deadline {
@@ -349,7 +390,7 @@ impl DirectOffloader {
     ) {
         let mut valid_ips = Vec::new();
         for ip in ips {
-            if !is_reserved_ip(ip) && !self.resolver.is_fake_ip(ip).await && !self.bypass_dst_trie.contains(ip) {
+            if !is_reserved_ip(ip) && !self.resolver.is_fake_ip(ip).await {
                 valid_ips.push(ip);
             }
         }
@@ -368,6 +409,18 @@ impl DirectOffloader {
 #[cfg(not(target_os = "linux"))]
 #[derive(Clone)]
 pub struct DirectOffloader;
+
+#[cfg(not(target_os = "linux"))]
+impl DirectOffloader {
+    pub async fn observe(
+        &self,
+        _domain: String,
+        _ips: Vec<IpAddr>,
+        _action: RoutingAction,
+        _ttl: std::time::Duration,
+    ) {
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -428,5 +481,28 @@ mod tests {
         assert!(state.dirty_ips.contains(&ip));
         assert!(state.owners.is_empty());
         assert!(state.reverse.is_empty());
+    }
+
+    #[test]
+    fn test_offload_desired_state_batch_multiple_ips() {
+        let mut state = OffloadDesiredState::new();
+        let now = Instant::now();
+        let ip1: IpAddr = "1.1.1.1".parse().unwrap();
+        let ip2: IpAddr = "1.1.1.2".parse().unwrap();
+        let ip3: IpAddr = "2606:4700:4700::1111".parse().unwrap();
+
+        // Observe multiple IPs for a single direct domain
+        state.observe(
+            "cloudflare-dns.com",
+            &[ip1, ip2, ip3],
+            RoutingAction::Direct,
+            std::time::Duration::from_secs(300),
+            now,
+        );
+
+        assert_eq!(state.desired.len(), 3);
+        assert!(state.dirty_ips.contains(&ip1));
+        assert!(state.dirty_ips.contains(&ip2));
+        assert!(state.dirty_ips.contains(&ip3));
     }
 }

@@ -36,7 +36,7 @@ pub struct EbpfManager {
     netns: Option<Arc<DaeNs>>,
     #[allow(dead_code)]
     listener: Option<Arc<EbpfListener>>,
-    bpf_manager: Arc<tokio::sync::Mutex<crate::bpf::BpfProgramManager>>,
+    bpf_manager: crate::bpf::BpfProgramManager,
 }
 
 impl EbpfManager {
@@ -45,7 +45,7 @@ impl EbpfManager {
             config,
             netns: None,
             listener: None,
-            bpf_manager: Arc::new(tokio::sync::Mutex::new(crate::bpf::BpfProgramManager::new())),
+            bpf_manager: crate::bpf::BpfProgramManager::new(),
         }
     }
 
@@ -268,8 +268,7 @@ impl EbpfManager {
                 _pad1: 0,
             };
 
-            let mut bpf_guard = self.bpf_manager.lock().await;
-            if let Err(e) = bpf_guard.load_and_attach(
+            if let Err(e) = self.bpf_manager.load_and_attach(
                 crate::bpf::EMBEDDED_BPF_OBJECT,
                 &bpf_param,
                 &effective_lan,
@@ -295,7 +294,7 @@ impl EbpfManager {
 
             // Publish listener socket fds into LISTEN_SOCKET_MAP for bpf_sk_assign.
             // This must happen after both listener binding and BPF loading.
-            if let Err(e) = bpf_guard.publish_listener_sockets(
+            if let Err(e) = self.bpf_manager.publish_listener_sockets(
                 listener.tcp_v4_raw_fd(),
                 listener.tcp_v6_raw_fd(),
                 listener.udp_v4_raw_fd(),
@@ -303,9 +302,6 @@ impl EbpfManager {
             ) {
                 tracing::warn!("Failed to publish listener sockets to SOCKMAP: {e}");
             }
-
-
-            drop(bpf_guard);
 
             self.netns = Some(ns);
             self.listener = Some(listener.clone());
@@ -322,11 +318,9 @@ impl EbpfManager {
 
 
     /// Stops the eBPF datapath and cleans up all hooks, interfaces and namespaces.
-    pub async fn stop(&mut self) {
+    pub async fn stop(&self) {
         info!("Stopping clash-ebpf datapath...");
-        self.bpf_manager.lock().await.unload();
-        self.listener.take();
-        self.netns.take();
+        self.bpf_manager.unload();
 
         #[cfg(target_os = "linux")]
         {
@@ -341,40 +335,18 @@ impl EbpfManager {
         info!("clash-ebpf datapath stopped successfully");
     }
 
-    /// Dynamically add a direct bypass IPv4 destination.
-    pub async fn add_dynamic_bypass_ip4(&self, ip: std::net::Ipv4Addr) -> Result<(), String> {
-        self.bpf_manager.lock().await.add_dynamic_bypass_ip4(ip)
-    }
 
-    /// Dynamically add a direct bypass IPv6 destination.
-    pub async fn add_dynamic_bypass_ip6(&self, ip: std::net::Ipv6Addr) -> Result<(), String> {
-        self.bpf_manager.lock().await.add_dynamic_bypass_ip6(ip)
-    }
 
-    /// Dynamically add a direct bypass IP (v4 or v6) destination.
-    pub async fn add_dynamic_bypass_ip(&self, ip: std::net::IpAddr) -> Result<(), String> {
-        match ip {
-            std::net::IpAddr::V4(v4) => self.add_dynamic_bypass_ip4(v4).await,
-            std::net::IpAddr::V6(v6) => self.add_dynamic_bypass_ip6(v6).await,
-        }
-    }
-
-    /// Dynamically remove a direct bypass IPv4 destination.
-    pub async fn remove_dynamic_bypass_ip4(&self, ip: std::net::Ipv4Addr) -> Result<(), String> {
-        self.bpf_manager.lock().await.remove_dynamic_bypass_ip4(ip)
-    }
-
-    /// Dynamically remove a direct bypass IPv6 destination.
-    pub async fn remove_dynamic_bypass_ip6(&self, ip: std::net::Ipv6Addr) -> Result<(), String> {
-        self.bpf_manager.lock().await.remove_dynamic_bypass_ip6(ip)
-    }
-
-    /// Dynamically remove a direct bypass IP (v4 or v6) destination.
-    pub async fn remove_dynamic_bypass_ip(&self, ip: std::net::IpAddr) -> Result<(), String> {
-        match ip {
-            std::net::IpAddr::V4(v4) => self.remove_dynamic_bypass_ip4(v4).await,
-            std::net::IpAddr::V6(v6) => self.remove_dynamic_bypass_ip6(v6).await,
-        }
+    /// Dynamically update direct bypass IP destinations in batch.
+    pub async fn update_dynamic_bypass_batch(
+        &self,
+        add_v4: &[std::net::Ipv4Addr],
+        add_v6: &[std::net::Ipv6Addr],
+        remove_v4: &[std::net::Ipv4Addr],
+        remove_v6: &[std::net::Ipv6Addr],
+    ) -> Result<(), String> {
+        self.bpf_manager
+            .update_dynamic_bypass_batch(add_v4, add_v6, remove_v4, remove_v6)
     }
 }
 

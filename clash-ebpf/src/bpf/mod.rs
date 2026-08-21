@@ -11,6 +11,7 @@ pub mod linux {
     use aya::maps::lpm_trie::Key;
     use aya::maps::{Array, HashMap, LpmTrie, MapData, RingBuf, SockMap};
     use aya::programs::cgroup_sock::CgroupSockLink;
+    use aya::programs::cgroup_sock_addr::CgroupSockAddrLink;
     use aya::programs::tc::SchedClassifierLink;
     use aya::programs::{
         CgroupAttachMode, CgroupSock, CgroupSockAddr, SchedClassifier, TcAttachType,
@@ -18,23 +19,238 @@ pub mod linux {
     use aya::{Ebpf, EbpfLoader};
     use std::fs::File;
     use std::net::{Ipv4Addr, Ipv6Addr};
+    use std::os::fd::{AsFd, AsRawFd, RawFd};
     use std::str::FromStr;
+    use std::sync::atomic::{AtomicU8, Ordering};
     use tracing::{debug, info, warn};
+
+    const BPF_MAP_UPDATE_ELEM: libc::c_long = 2;
+    const BPF_MAP_DELETE_ELEM: libc::c_long = 3;
+    const BPF_MAP_UPDATE_BATCH: libc::c_long = 26;
+    const BPF_MAP_DELETE_BATCH: libc::c_long = 27;
+
+    #[repr(C)]
+    struct BpfElemAttr {
+        map_fd: u32,
+        pad: u32,
+        key: u64,
+        value: u64,
+        flags: u64,
+    }
+
+    #[repr(C)]
+    struct BpfBatchAttr {
+        in_batch: u64,
+        out_batch: u64,
+        keys: u64,
+        values: u64,
+        count: u32,
+        map_fd: u32,
+        elem_flags: u64,
+        flags: u64,
+    }
+
+    fn bpf_update_elem_raw<K, V>(map_fd: RawFd, key: &K, value: &V) -> Result<(), i64> {
+        let mut attr: BpfElemAttr = unsafe { core::mem::zeroed() };
+        attr.map_fd = map_fd as u32;
+        attr.key = key as *const K as u64;
+        attr.value = value as *const V as u64;
+        let ret = unsafe {
+            libc::syscall(
+                libc::SYS_bpf,
+                BPF_MAP_UPDATE_ELEM,
+                &mut attr as *mut BpfElemAttr as *mut libc::c_void,
+                core::mem::size_of::<BpfElemAttr>(),
+            )
+        };
+        if ret < 0 {
+            Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO) as i64)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn bpf_delete_elem_raw<K>(map_fd: RawFd, key: &K) -> Result<(), i64> {
+        let mut attr: BpfElemAttr = unsafe { core::mem::zeroed() };
+        attr.map_fd = map_fd as u32;
+        attr.key = key as *const K as u64;
+        let ret = unsafe {
+            libc::syscall(
+                libc::SYS_bpf,
+                BPF_MAP_DELETE_ELEM,
+                &mut attr as *mut BpfElemAttr as *mut libc::c_void,
+                core::mem::size_of::<BpfElemAttr>(),
+            )
+        };
+        if ret < 0 {
+            Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO) as i64)
+        } else {
+            Ok(())
+        }
+    }
+
+    #[derive(Debug)]
+    pub struct BatchCapability(AtomicU8);
+
+    impl BatchCapability {
+        const UNKNOWN: u8 = 0;
+        const SUPPORTED: u8 = 1;
+        const UNSUPPORTED: u8 = 2;
+
+        pub const fn new() -> Self {
+            Self(AtomicU8::new(Self::UNKNOWN))
+        }
+
+        pub fn is_unsupported(&self) -> bool {
+            self.0.load(Ordering::Relaxed) == Self::UNSUPPORTED
+        }
+
+        pub fn observe(&self, result: Result<(), i64>) -> bool {
+            match result {
+                Ok(()) => {
+                    self.0.store(Self::SUPPORTED, Ordering::Relaxed);
+                    true
+                }
+                Err(e) if e == libc::ENOENT as i64 => {
+                    self.0.store(Self::SUPPORTED, Ordering::Relaxed);
+                    true
+                }
+                Err(e) if is_capability_errno(e) => {
+                    self.0.store(Self::UNSUPPORTED, Ordering::Relaxed);
+                    false
+                }
+                Err(_) => true,
+            }
+        }
+    }
+
+    fn is_capability_errno(errno: i64) -> bool {
+        errno == libc::EINVAL as i64
+            || errno == libc::EOPNOTSUPP as i64
+            || errno == libc::EPERM as i64
+            || errno == libc::ENOSYS as i64
+    }
+
+    unsafe fn bpf_batch_syscall(cmd: libc::c_long, attr: &mut BpfBatchAttr) -> Result<(), i64> {
+        let ret = unsafe {
+            libc::syscall(
+                libc::SYS_bpf,
+                cmd,
+                attr as *mut BpfBatchAttr as *mut libc::c_void,
+                core::mem::size_of::<BpfBatchAttr>(),
+            )
+        };
+        if ret < 0 {
+            Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO) as i64)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn map_raw_fd(map: &aya::maps::Map) -> RawFd {
+        use aya::maps::Map;
+        let data: &aya::maps::MapData = match map {
+            Map::Array(d)
+            | Map::ArrayOfMaps(d)
+            | Map::BloomFilter(d)
+            | Map::CgroupArray(d)
+            | Map::CgroupStorage(d)
+            | Map::CgrpStorage(d)
+            | Map::CpuMap(d)
+            | Map::DevMap(d)
+            | Map::DevMapHash(d)
+            | Map::HashMap(d)
+            | Map::HashOfMaps(d)
+            | Map::InodeStorage(d)
+            | Map::LpmTrie(d)
+            | Map::LruHashMap(d)
+            | Map::PerCpuArray(d)
+            | Map::PerCpuCgroupStorage(d)
+            | Map::PerCpuHashMap(d)
+            | Map::PerCpuLruHashMap(d)
+            | Map::PerfEventArray(d)
+            | Map::ProgramArray(d)
+            | Map::Queue(d)
+            | Map::ReusePortSockArray(d)
+            | Map::RingBuf(d)
+            | Map::SockHash(d)
+            | Map::SockMap(d)
+            | Map::SkStorage(d)
+            | Map::Stack(d)
+            | Map::StackTraceMap(d)
+            | Map::Unsupported(d)
+            | Map::XskMap(d) => d,
+        };
+        data.fd().as_fd().as_raw_fd()
+    }
+
+    fn bpf_update_batch_raw<K, V>(
+        cap: &BatchCapability,
+        map_fd: RawFd,
+        keys: &[K],
+        values: &[V],
+    ) -> Result<bool, String> {
+        if cap.is_unsupported() || keys.is_empty() {
+            return Ok(false);
+        }
+        let mut attr: BpfBatchAttr = unsafe { core::mem::zeroed() };
+        attr.map_fd = map_fd as u32;
+        attr.keys = keys.as_ptr() as u64;
+        attr.values = values.as_ptr() as u64;
+        attr.count = keys.len() as u32;
+        let result = unsafe { bpf_batch_syscall(BPF_MAP_UPDATE_BATCH, &mut attr) };
+        if !cap.observe(result) {
+            debug!("BPF_MAP_UPDATE_BATCH unsupported on this kernel, falling back to per-element insert");
+            return Ok(false);
+        }
+        result.map_err(|e| format!("BPF_MAP_UPDATE_BATCH failed with errno={e}"))?;
+        Ok(true)
+    }
+
+    fn bpf_delete_batch_raw<K>(
+        cap: &BatchCapability,
+        map_fd: RawFd,
+        keys: &[K],
+    ) -> Result<bool, String> {
+        if cap.is_unsupported() || keys.is_empty() {
+            return Ok(false);
+        }
+        let mut attr: BpfBatchAttr = unsafe { core::mem::zeroed() };
+        attr.map_fd = map_fd as u32;
+        attr.keys = keys.as_ptr() as u64;
+        attr.count = keys.len() as u32;
+        let result = unsafe { bpf_batch_syscall(BPF_MAP_DELETE_BATCH, &mut attr) };
+        if !cap.observe(result) {
+            debug!("BPF_MAP_DELETE_BATCH unsupported on this kernel, falling back to per-element remove");
+            return Ok(false);
+        }
+        match result {
+            Ok(()) => Ok(true),
+            Err(e) if e == libc::ENOENT as i64 => Ok(true),
+            Err(e) => Err(format!("BPF_MAP_DELETE_BATCH failed with errno={e}")),
+        }
+    }
 
     pub struct BpfProgramManager {
         bpf: Option<Ebpf>,
-        tc_links: Vec<SchedClassifierLink>,
-        cgroup_links: Vec<CgroupSockLink>,
-        event_task: Option<tokio::task::JoinHandle<()>>,
+        tc_links: std::sync::Mutex<Vec<SchedClassifierLink>>,
+        cgroup_sock_links: std::sync::Mutex<Vec<CgroupSockLink>>,
+        cgroup_sock_addr_links: std::sync::Mutex<Vec<CgroupSockAddrLink>>,
+        event_abort: Option<tokio::task::AbortHandle>,
+        cap_batch_update: BatchCapability,
+        cap_batch_delete: BatchCapability,
     }
 
     impl BpfProgramManager {
         pub fn new() -> Self {
             Self {
                 bpf: None,
-                tc_links: Vec::new(),
-                cgroup_links: Vec::new(),
-                event_task: None,
+                tc_links: std::sync::Mutex::new(Vec::new()),
+                cgroup_sock_links: std::sync::Mutex::new(Vec::new()),
+                cgroup_sock_addr_links: std::sync::Mutex::new(Vec::new()),
+                event_abort: None,
+                cap_batch_update: BatchCapability::new(),
+                cap_batch_delete: BatchCapability::new(),
             }
         }
 
@@ -292,7 +508,8 @@ pub mod linux {
                         tokio::io::Interest::READABLE,
                     ) {
                         Ok(async_fd) => {
-                            self.event_task = Some(tokio::spawn(consume_dae_events(async_fd)));
+                            let task = tokio::spawn(consume_dae_events(async_fd));
+                            self.event_abort = Some(task.abort_handle());
                             debug!("Started eBPF EVENT_RINGBUF event consumer task");
                         }
                         Err(e) => {
@@ -368,59 +585,87 @@ pub mod linux {
             Ok(())
         }
 
-        pub fn add_dynamic_bypass_ip4(&mut self, ip: Ipv4Addr) -> Result<(), String> {
-            let Some(bpf) = self.bpf.as_mut() else {
+        pub fn update_dynamic_bypass_batch(
+            &self,
+            add_v4: &[Ipv4Addr],
+            add_v6: &[Ipv6Addr],
+            remove_v4: &[Ipv4Addr],
+            remove_v6: &[Ipv6Addr],
+        ) -> Result<(), String> {
+            let Some(bpf) = self.bpf.as_ref() else {
                 return Err("eBPF not loaded".to_string());
             };
-            let map = bpf.map_mut("DYNAMIC_BYPASS_DST_IPS")
-                .ok_or_else(|| "map 'DYNAMIC_BYPASS_DST_IPS' not found".to_string())?;
-            let mut lru = HashMap::<_, u32, u8>::try_from(map)
-                .map_err(|e| format!("map 'DYNAMIC_BYPASS_DST_IPS': {e}"))?;
-            let ip_u32 = u32::from_ne_bytes(ip.octets());
-            lru.insert(ip_u32, 1, 0)
-                .map_err(|e| format!("Failed to insert dynamic bypass IPv4: {e}"))?;
-            debug!("Added dynamic bypass IPv4: {}", ip);
-            Ok(())
-        }
 
-        pub fn remove_dynamic_bypass_ip4(&mut self, ip: Ipv4Addr) -> Result<(), String> {
-            let Some(bpf) = self.bpf.as_mut() else {
-                return Err("eBPF not loaded".to_string());
-            };
-            let map = bpf.map_mut("DYNAMIC_BYPASS_DST_IPS")
-                .ok_or_else(|| "map 'DYNAMIC_BYPASS_DST_IPS' not found".to_string())?;
-            let mut lru = HashMap::<_, u32, u8>::try_from(map)
-                .map_err(|e| format!("map 'DYNAMIC_BYPASS_DST_IPS': {e}"))?;
-            let ip_u32 = u32::from_ne_bytes(ip.octets());
-            let _ = lru.remove(&ip_u32);
-            debug!("Removed dynamic bypass IPv4: {}", ip);
-            Ok(())
-        }
+            // 1. IPv4 Dynamic Bypass
+            if !add_v4.is_empty() || !remove_v4.is_empty() {
+                let map = bpf
+                    .map("DYNAMIC_BYPASS_DST_IPS")
+                    .ok_or_else(|| "map 'DYNAMIC_BYPASS_DST_IPS' not found".to_string())?;
+                let raw_fd = map_raw_fd(map);
 
-        pub fn add_dynamic_bypass_ip6(&mut self, ip: Ipv6Addr) -> Result<(), String> {
-            let Some(bpf) = self.bpf.as_mut() else {
-                return Err("eBPF not loaded".to_string());
-            };
-            let map = bpf.map_mut("DYNAMIC_BYPASS_DST_IP6S")
-                .ok_or_else(|| "map 'DYNAMIC_BYPASS_DST_IP6S' not found".to_string())?;
-            let mut lru = HashMap::<_, [u8; 16], u8>::try_from(map)
-                .map_err(|e| format!("map 'DYNAMIC_BYPASS_DST_IP6S': {e}"))?;
-            lru.insert(ip.octets(), 1, 0)
-                .map_err(|e| format!("Failed to insert dynamic bypass IPv6: {e}"))?;
-            debug!("Added dynamic bypass IPv6: {}", ip);
-            Ok(())
-        }
+                if !add_v4.is_empty() {
+                    let keys: Vec<u32> = add_v4.iter().map(|ip| u32::from_ne_bytes(ip.octets())).collect();
+                    let values: Vec<u8> = vec![1u8; keys.len()];
+                    let handled = bpf_update_batch_raw(&self.cap_batch_update, raw_fd, &keys, &values)?;
+                    if !handled {
+                        for (k, ip) in keys.iter().zip(add_v4.iter()) {
+                            if let Err(e) = bpf_update_elem_raw(raw_fd, k, &1u8) {
+                                debug!("Failed to insert dynamic bypass IPv4 {}: errno={}", ip, e);
+                            }
+                        }
+                    } else {
+                        debug!("Batch updated {} dynamic bypass IPv4s via BPF_MAP_UPDATE_BATCH", add_v4.len());
+                    }
+                }
 
-        pub fn remove_dynamic_bypass_ip6(&mut self, ip: Ipv6Addr) -> Result<(), String> {
-            let Some(bpf) = self.bpf.as_mut() else {
-                return Err("eBPF not loaded".to_string());
-            };
-            let map = bpf.map_mut("DYNAMIC_BYPASS_DST_IP6S")
-                .ok_or_else(|| "map 'DYNAMIC_BYPASS_DST_IP6S' not found".to_string())?;
-            let mut lru = HashMap::<_, [u8; 16], u8>::try_from(map)
-                .map_err(|e| format!("map 'DYNAMIC_BYPASS_DST_IP6S': {e}"))?;
-            let _ = lru.remove(&ip.octets());
-            debug!("Removed dynamic bypass IPv6: {}", ip);
+                if !remove_v4.is_empty() {
+                    let keys: Vec<u32> = remove_v4.iter().map(|ip| u32::from_ne_bytes(ip.octets())).collect();
+                    let handled = bpf_delete_batch_raw(&self.cap_batch_delete, raw_fd, &keys)?;
+                    if !handled {
+                        for k in &keys {
+                            let _ = bpf_delete_elem_raw(raw_fd, k);
+                        }
+                    } else {
+                        debug!("Batch removed {} dynamic bypass IPv4s via BPF_MAP_DELETE_BATCH", remove_v4.len());
+                    }
+                }
+            }
+
+            // 2. IPv6 Dynamic Bypass
+            if !add_v6.is_empty() || !remove_v6.is_empty() {
+                let map = bpf
+                    .map("DYNAMIC_BYPASS_DST_IP6S")
+                    .ok_or_else(|| "map 'DYNAMIC_BYPASS_DST_IP6S' not found".to_string())?;
+                let raw_fd = map_raw_fd(map);
+
+                if !add_v6.is_empty() {
+                    let keys: Vec<[u8; 16]> = add_v6.iter().map(|ip| ip.octets()).collect();
+                    let values: Vec<u8> = vec![1u8; keys.len()];
+                    let handled = bpf_update_batch_raw(&self.cap_batch_update, raw_fd, &keys, &values)?;
+                    if !handled {
+                        for (k, ip) in keys.iter().zip(add_v6.iter()) {
+                            if let Err(e) = bpf_update_elem_raw(raw_fd, k, &1u8) {
+                                debug!("Failed to insert dynamic bypass IPv6 {}: errno={}", ip, e);
+                            }
+                        }
+                    } else {
+                        debug!("Batch updated {} dynamic bypass IPv6s via BPF_MAP_UPDATE_BATCH", add_v6.len());
+                    }
+                }
+
+                if !remove_v6.is_empty() {
+                    let keys: Vec<[u8; 16]> = remove_v6.iter().map(|ip| ip.octets()).collect();
+                    let handled = bpf_delete_batch_raw(&self.cap_batch_delete, raw_fd, &keys)?;
+                    if !handled {
+                        for k in &keys {
+                            let _ = bpf_delete_elem_raw(raw_fd, k);
+                        }
+                    } else {
+                        debug!("Batch removed {} dynamic bypass IPv6s via BPF_MAP_DELETE_BATCH", remove_v6.len());
+                    }
+                }
+            }
+
             Ok(())
         }
 
@@ -496,7 +741,9 @@ pub mod linux {
                         if p.load().is_ok() {
                             if let Ok(link_id) = p.attach(&cgroup_file, CgroupAttachMode::Single) {
                                 if let Ok(link) = p.take_link(link_id) {
-                                    std::mem::forget(link);
+                                    if let Ok(mut guard) = self.cgroup_sock_links.lock() {
+                                        guard.push(link);
+                                    }
                                     debug!("Attached cgroup hook '{}'", name);
                                 }
                             }
@@ -516,7 +763,9 @@ pub mod linux {
                         if p.load().is_ok() {
                             if let Ok(link_id) = p.attach(&cgroup_file, CgroupAttachMode::Single) {
                                 if let Ok(link) = p.take_link(link_id) {
-                                    std::mem::forget(link);
+                                    if let Ok(mut guard) = self.cgroup_sock_addr_links.lock() {
+                                        guard.push(link);
+                                    }
                                     debug!("Attached cgroup hook '{}'", name);
                                 }
                             }
@@ -570,21 +819,29 @@ pub mod linux {
                 .take_link(link_id)
                 .map_err(|e| format!("Failed to take TC link: {e}"))?;
 
-            std::mem::forget(link);
+            if let Ok(mut guard) = self.tc_links.lock() {
+                guard.push(link);
+            }
 
             info!("Attached TC {} program '{}' on {}", if is_ingress { "ingress" } else { "egress" }, prog_name, iface);
             Ok(())
         }
 
         /// Detach all active TC and cgroup links and stop event consumer.
-        pub fn unload(&mut self) {
+        pub fn unload(&self) {
             info!("Unloading all eBPF TC and cgroup links...");
-            if let Some(task) = self.event_task.take() {
-                task.abort();
+            if let Some(handle) = &self.event_abort {
+                handle.abort();
             }
-            self.tc_links.clear();
-            self.cgroup_links.clear();
-            self.bpf.take();
+            if let Ok(mut guard) = self.tc_links.lock() {
+                guard.clear();
+            }
+            if let Ok(mut guard) = self.cgroup_sock_links.lock() {
+                guard.clear();
+            }
+            if let Ok(mut guard) = self.cgroup_sock_addr_links.lock() {
+                guard.clear();
+            }
             info!("All eBPF links detached successfully");
         }
     }
@@ -749,16 +1006,13 @@ pub mod non_linux {
         ) -> Result<(), String> {
             Ok(())
         }
-        pub fn add_dynamic_bypass_ip4(&mut self, _ip: std::net::Ipv4Addr) -> Result<(), String> {
-            Ok(())
-        }
-        pub fn add_dynamic_bypass_ip6(&mut self, _ip: std::net::Ipv6Addr) -> Result<(), String> {
-            Ok(())
-        }
-        pub fn remove_dynamic_bypass_ip4(&mut self, _ip: std::net::Ipv4Addr) -> Result<(), String> {
-            Ok(())
-        }
-        pub fn remove_dynamic_bypass_ip6(&mut self, _ip: std::net::Ipv6Addr) -> Result<(), String> {
+        pub fn update_dynamic_bypass_batch(
+            &self,
+            _add_v4: &[std::net::Ipv4Addr],
+            _add_v6: &[std::net::Ipv6Addr],
+            _remove_v4: &[std::net::Ipv4Addr],
+            _remove_v6: &[std::net::Ipv6Addr],
+        ) -> Result<(), String> {
             Ok(())
         }
         pub fn publish_listener_sockets(
@@ -770,7 +1024,7 @@ pub mod non_linux {
         ) -> Result<(), String> {
             Ok(())
         }
-        pub fn unload(&mut self) {}
+        pub fn unload(&self) {}
     }
 }
 
