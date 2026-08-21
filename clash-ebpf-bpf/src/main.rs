@@ -9,12 +9,18 @@ fn panic(_: &core::panic::PanicInfo) -> ! {
 mod maps;
 mod transport;
 
-use aya_ebpf::bindings::{__sk_buff, bpf_sock, TC_ACT_OK};
+use aya_ebpf::bindings::{__sk_buff, bpf_sock, bpf_sock_addr, TC_ACT_OK};
 use aya_ebpf::helpers::{bpf_get_current_pid_tgid, bpf_redirect};
 use aya_ebpf::maps::lpm_trie::Key;
 use aya_ebpf::programs::TcContext;
-use aya_ebpf_bindings::helpers::{bpf_map_lookup_elem, bpf_sk_assign, bpf_sk_release, bpf_skb_change_head, bpf_skb_store_bytes};
-use clash_ebpf_common::{DaeParam, RedirectEntry, RedirectTuple, DAE_BYPASS_MARK, DAE_TPROXY_MARK};
+use aya_ebpf_bindings::helpers::{
+    bpf_get_current_comm, bpf_get_socket_cookie, bpf_ktime_get_ns, bpf_map_lookup_elem,
+    bpf_sk_assign, bpf_sk_release, bpf_skb_change_head, bpf_skb_store_bytes,
+};
+use clash_ebpf_common::{
+    DaeEvent, DaeEventType, DaeParam, PIDName, RedirectEntry, RedirectTuple, DAE_BYPASS_MARK,
+    DAE_TPROXY_MARK,
+};
 use core::ffi::c_void;
 use core::mem;
 use maps::*;
@@ -32,6 +38,73 @@ const SK_UDP6: u32 = 3;
 #[inline(always)]
 fn get_param() -> Option<&'static DaeParam> {
     DAE_PARAM.get(0)
+}
+
+#[inline(always)]
+pub fn send_dae_event(
+    type_: u32,
+    pid: u32,
+    pname: Option<&[u8; 16]>,
+    outbound: u8,
+    l4proto: u8,
+    sip: Option<&[u32; 4]>,
+    dip: Option<&[u32; 4]>,
+    sport: u16,
+    dport: u16,
+) {
+    let mut e: DaeEvent = unsafe { mem::zeroed() };
+    e.timestamp = unsafe { bpf_ktime_get_ns() };
+    e.type_ = type_;
+    e.pid = pid;
+    e.outbound = outbound;
+    e.l4proto = l4proto;
+    e.sport = sport;
+    e.dport = dport;
+    if let Some(p) = pname {
+        e.pname.copy_from_slice(p);
+    }
+    if let Some(s) = sip {
+        e.sip.copy_from_slice(s);
+    }
+    if let Some(d) = dip {
+        e.dip.copy_from_slice(d);
+    }
+    let _ = EVENT_RINGBUF.output::<DaeEvent>(&e, 0);
+}
+
+#[inline(always)]
+fn get_pid_pname(pid_pname: &mut PIDName) -> i32 {
+    let pid_tgid = bpf_get_current_pid_tgid();
+    pid_pname.last_seen_ns = unsafe { bpf_ktime_get_ns() };
+    pid_pname.pid = (pid_tgid >> 32) as u32;
+
+    let ret = unsafe {
+        bpf_get_current_comm(
+            pid_pname.pname.as_mut_ptr() as *mut aya_ebpf_cty::c_void,
+            pid_pname.pname.len() as u32,
+        )
+    };
+    if ret != 0 {
+        pid_pname.pname[0] = 0;
+    }
+    0
+}
+
+#[inline(always)]
+fn update_map_elem_by_cookie(cookie: u64) -> i32 {
+    if cookie == 0 {
+        return 0;
+    }
+    if let Some(ptr) = COOKIE_PID_MAP.get_ptr_mut(&cookie) {
+        let now = unsafe { bpf_ktime_get_ns() };
+        let entry = unsafe { &mut *ptr };
+        entry.last_seen_ns = now;
+        return 0;
+    }
+    let mut val: PIDName = unsafe { mem::zeroed() };
+    let _ = get_pid_pname(&mut val);
+    let _ = COOKIE_PID_MAP.insert(&cookie, &val, 0);
+    0
 }
 
 #[inline(always)]
@@ -231,31 +304,34 @@ fn handle_lan_ingress_impl(ctx: *mut __sk_buff, link_h_len: usize) -> i32 {
         ];
 
         // 1. 本机直连流量放行
-        if dst_port != 53 && param.local_ip != 0 && ip_be == param.local_ip.to_ne_bytes() {
+        if param.local_ip != 0 && ip_be == param.local_ip.to_ne_bytes() {
             return TC_ACT_OK;
         }
 
-        // 2. DNS 流量 (dst_port == 53) 绝对重定向，其它流量执行白名单与 bypass 判定
-        if dst_port != 53 {
-            if is_src_ip4_bypassed(src_ip_be) {
-                return TC_ACT_OK;
-            }
-            if param.has_proxy_src_ips != 0 && !is_src_ip4_proxied(src_ip_be) {
-                return TC_ACT_OK;
-            }
-            if is_src_port_bypassed(src_port) {
-                return TC_ACT_OK;
-            }
-            if param.has_proxy_src_ports != 0 && unsafe { PROXY_SRC_PORTS.get(&src_port).is_none() } {
-                return TC_ACT_OK;
-            }
+        // 2. 源 IP / 源端口 Bypass 与白名单判定 (对所有流量生效，包括 53)
+        if is_src_ip4_bypassed(src_ip_be) {
+            return TC_ACT_OK;
+        }
+        if param.has_proxy_src_ips != 0 && !is_src_ip4_proxied(src_ip_be) {
+            return TC_ACT_OK;
+        }
+        if is_src_port_bypassed(src_port) {
+            return TC_ACT_OK;
+        }
+        if param.has_proxy_src_ports != 0 && unsafe { PROXY_SRC_PORTS.get(&src_port).is_none() } {
+            return TC_ACT_OK;
+        }
 
-            if is_dst_ip4_bypassed(ip_be) || is_dynamic_dst_ip4_bypassed(ip_be) {
-                return TC_ACT_OK;
-            }
-            if is_dst_port_bypassed(dst_port, param.tproxy_port as u16) {
-                return TC_ACT_OK;
-            }
+        // 3. 目标 IP / 目标端口 Bypass 判定 (对所有流量生效，包括 53)
+        if is_dst_ip4_bypassed(ip_be) || is_dynamic_dst_ip4_bypassed(ip_be) {
+            return TC_ACT_OK;
+        }
+        if is_dst_port_bypassed(dst_port, param.tproxy_port as u16) {
+            return TC_ACT_OK;
+        }
+
+        // 4. 目标白名单过滤 (针对业务端口；未被 bypass 的 DNS 53 默认放行至代理)
+        if dst_port != 53 {
             if param.has_proxy_dst_ips != 0 && !is_dst_ip4_proxied(ip_be) {
                 return TC_ACT_OK;
             }
@@ -292,37 +368,60 @@ fn handle_lan_ingress_impl(ctx: *mut __sk_buff, link_h_len: usize) -> i32 {
             dmac,
         };
         unsafe {
+            let is_new_flow = REDIRECT_TRACK.get(&tuple).is_none();
             let _ = REDIRECT_TRACK.insert(&tuple, &entry, 0);
             let l4proto = if pkt.l4proto == IPPROTO_TCP {
                 pkt.listener_l4proto
             } else {
                 IPPROTO_UDP
             };
+
+            if is_new_flow {
+                let sip_u32 = [u32::from_be_bytes(src_ip_be), 0, 0, 0];
+                let dip_u32 = [u32::from_be_bytes(ip_be), 0, 0, 0];
+                send_dae_event(
+                    DaeEventType::Redirected as u32,
+                    0,
+                    None,
+                    0,
+                    pkt.l4proto,
+                    Some(&sip_u32),
+                    Some(&dip_u32),
+                    src_port,
+                    dst_port,
+                );
+            }
+
             do_redirect(ctx, param, link_h_len, l4proto, ETH_P_IP)
         }
     } else if is_ipv6 {
         let dst_ip = *pkt.tuples.five.dst_ip.as_bytes();
         let src_ip = *pkt.tuples.five.src_ip.as_bytes();
 
+        // 1. 源 IP / 源端口 Bypass 与白名单判定 (对所有流量生效，包括 53)
+        if is_src_ip6_bypassed(src_ip) {
+            return TC_ACT_OK;
+        }
+        if param.has_proxy_src_ips != 0 && !is_src_ip6_proxied(src_ip) {
+            return TC_ACT_OK;
+        }
+        if is_src_port_bypassed(src_port) {
+            return TC_ACT_OK;
+        }
+        if param.has_proxy_src_ports != 0 && unsafe { PROXY_SRC_PORTS.get(&src_port).is_none() } {
+            return TC_ACT_OK;
+        }
+
+        // 2. 目标 IP / 目标端口 Bypass 判定 (对所有流量生效，包括 53)
+        if is_dst_ip6_bypassed(dst_ip) || is_dynamic_dst_ip6_bypassed(dst_ip) {
+            return TC_ACT_OK;
+        }
+        if is_dst_port_bypassed(dst_port, param.tproxy_port as u16) {
+            return TC_ACT_OK;
+        }
+
+        // 3. 目标白名单过滤 (针对业务端口；未被 bypass 的 DNS 53 默认放行至代理)
         if dst_port != 53 {
-            if is_src_ip6_bypassed(src_ip) {
-                return TC_ACT_OK;
-            }
-            if param.has_proxy_src_ips != 0 && !is_src_ip6_proxied(src_ip) {
-                return TC_ACT_OK;
-            }
-            if is_src_port_bypassed(src_port) {
-                return TC_ACT_OK;
-            }
-            if param.has_proxy_src_ports != 0 && unsafe { PROXY_SRC_PORTS.get(&src_port).is_none() } {
-                return TC_ACT_OK;
-            }
-            if is_dst_ip6_bypassed(dst_ip) || is_dynamic_dst_ip6_bypassed(dst_ip) {
-                return TC_ACT_OK;
-            }
-            if is_dst_port_bypassed(dst_port, param.tproxy_port as u16) {
-                return TC_ACT_OK;
-            }
             if param.has_proxy_dst_ips != 0 && !is_dst_ip6_proxied(dst_ip) {
                 return TC_ACT_OK;
             }
@@ -354,12 +453,34 @@ fn handle_lan_ingress_impl(ctx: *mut __sk_buff, link_h_len: usize) -> i32 {
             dmac,
         };
         unsafe {
+            let is_new_flow = REDIRECT_TRACK.get(&tuple).is_none();
             let _ = REDIRECT_TRACK.insert(&tuple, &entry, 0);
             let l4proto = if pkt.l4proto == IPPROTO_TCP {
                 pkt.listener_l4proto
             } else {
                 IPPROTO_UDP
             };
+
+            if is_new_flow {
+                let mut sip_u32 = [0u32; 4];
+                let mut dip_u32 = [0u32; 4];
+                for i in 0..4 {
+                    sip_u32[i] = u32::from_ne_bytes([src_ip[i * 4], src_ip[i * 4 + 1], src_ip[i * 4 + 2], src_ip[i * 4 + 3]]);
+                    dip_u32[i] = u32::from_ne_bytes([dst_ip[i * 4], dst_ip[i * 4 + 1], dst_ip[i * 4 + 2], dst_ip[i * 4 + 3]]);
+                }
+                send_dae_event(
+                    DaeEventType::Redirected as u32,
+                    0,
+                    None,
+                    0,
+                    pkt.l4proto,
+                    Some(&sip_u32),
+                    Some(&dip_u32),
+                    src_port,
+                    dst_port,
+                );
+            }
+
             do_redirect(ctx, param, link_h_len, l4proto, ETH_P_IPV6)
         }
     } else {
@@ -384,6 +505,39 @@ fn handle_wan_egress_impl(ctx: *mut __sk_buff, link_h_len: usize) -> i32 {
         return TC_ACT_OK;
     };
     if param.dae0_ifindex == 0 {
+        return TC_ACT_OK;
+    }
+
+    let cookie = unsafe { bpf_get_socket_cookie(ctx as *mut _) };
+    let pid_pname = if cookie != 0 {
+        unsafe { COOKIE_PID_MAP.get(&cookie) }
+    } else {
+        None
+    };
+
+    // 2. 进程过滤与本机流量过滤 (提前短路，避免不必要的数据包解析开销)
+    if let Some(pp) = pid_pname {
+        // 自身控制面进程防环路
+        if param.control_plane_pid != 0 && pp.pid == param.control_plane_pid {
+            return TC_ACT_OK;
+        }
+        // 黑名单：匹配 bypass_processes 直接放行
+        if param.has_bypass_processes != 0
+            && unsafe { BYPASS_PROCESSES.get(&pp.pname).is_some() }
+        {
+            return TC_ACT_OK;
+        }
+        // 白名单：配置了 proxy_processes 且未命中白名单直接放行
+        if param.has_proxy_processes != 0 {
+            if unsafe { PROXY_PROCESSES.get(&pp.pname).is_none() } {
+                return TC_ACT_OK;
+            }
+        } else if param.proxy_local == 0 {
+            // 未配置白名单且未开启代理本机流量，直接放行
+            return TC_ACT_OK;
+        }
+    } else if param.proxy_local == 0 {
+        // 未识别出进程且未开启代理本机流量，直接放行
         return TC_ACT_OK;
     }
 
@@ -416,21 +570,25 @@ fn handle_wan_egress_impl(ctx: *mut __sk_buff, link_h_len: usize) -> i32 {
             pkt.tuples.five.src_ip[15],
         ];
 
-        // 2. DNS 流量 (dst_port == 53): 100% 绝对重定向至 DNS 模块
+        // 3. 源端口 / 目标 IP / 目标端口 Bypass 判定 (对所有流量生效，包括 53)
+        if is_src_port_bypassed(src_port) {
+            return TC_ACT_OK;
+        }
+        if is_dst_ip4_bypassed(ip_be) || is_dynamic_dst_ip4_bypassed(ip_be) {
+            return TC_ACT_OK;
+        }
+        if is_dst_port_bypassed(dst_port, param.tproxy_port as u16) {
+            return TC_ACT_OK;
+        }
+
+        // 4. 目标白名单过滤 (针对业务端口；未被 bypass 的 DNS 53 默认放行至代理)
         if dst_port != 53 {
-            if is_src_port_bypassed(src_port) {
-                return TC_ACT_OK;
-            }
-            if is_dst_ip4_bypassed(ip_be) || is_dynamic_dst_ip4_bypassed(ip_be) {
-                return TC_ACT_OK;
-            }
-            if is_dst_port_bypassed(dst_port, param.tproxy_port as u16) {
-                return TC_ACT_OK;
-            }
             if param.has_proxy_dst_ips != 0 && !is_dst_ip4_proxied(ip_be) {
                 return TC_ACT_OK;
             }
-            if param.has_proxy_dst_ports != 0 && unsafe { PROXY_DST_PORTS.get(&dst_port).is_none() } {
+            if param.has_proxy_dst_ports != 0
+                && unsafe { PROXY_DST_PORTS.get(&dst_port).is_none() }
+            {
                 return TC_ACT_OK;
             }
         }
@@ -463,32 +621,57 @@ fn handle_wan_egress_impl(ctx: *mut __sk_buff, link_h_len: usize) -> i32 {
             dmac,
         };
         unsafe {
+            let is_new_flow = REDIRECT_TRACK.get(&tuple).is_none();
             let _ = REDIRECT_TRACK.insert(&tuple, &entry, 0);
             let l4proto = if pkt.l4proto == IPPROTO_TCP {
                 pkt.listener_l4proto
             } else {
                 IPPROTO_UDP
             };
+
+            if is_new_flow {
+                let pid = pid_pname.map(|p| p.pid).unwrap_or(0);
+                let pname = pid_pname.map(|p| &p.pname);
+                let sip_u32 = [u32::from_be_bytes(src_ip_be), 0, 0, 0];
+                let dip_u32 = [u32::from_be_bytes(ip_be), 0, 0, 0];
+                send_dae_event(
+                    DaeEventType::Redirected as u32,
+                    pid,
+                    pname,
+                    1,
+                    pkt.l4proto,
+                    Some(&sip_u32),
+                    Some(&dip_u32),
+                    src_port,
+                    dst_port,
+                );
+            }
+
             do_redirect(ctx, param, link_h_len, l4proto, ETH_P_IP)
         }
     } else if is_ipv6 {
         let dst_ip = *pkt.tuples.five.dst_ip.as_bytes();
         let src_ip = *pkt.tuples.five.src_ip.as_bytes();
 
+        // 3. 源端口 / 目标 IP / 目标端口 Bypass 判定 (对所有流量生效，包括 53)
+        if is_src_port_bypassed(src_port) {
+            return TC_ACT_OK;
+        }
+        if is_dst_ip6_bypassed(dst_ip) || is_dynamic_dst_ip6_bypassed(dst_ip) {
+            return TC_ACT_OK;
+        }
+        if is_dst_port_bypassed(dst_port, param.tproxy_port as u16) {
+            return TC_ACT_OK;
+        }
+
+        // 4. 目标白名单过滤 (针对业务端口；未被 bypass 的 DNS 53 默认放行至代理)
         if dst_port != 53 {
-            if is_src_port_bypassed(src_port) {
-                return TC_ACT_OK;
-            }
-            if is_dst_ip6_bypassed(dst_ip) || is_dynamic_dst_ip6_bypassed(dst_ip) {
-                return TC_ACT_OK;
-            }
-            if is_dst_port_bypassed(dst_port, param.tproxy_port as u16) {
-                return TC_ACT_OK;
-            }
             if param.has_proxy_dst_ips != 0 && !is_dst_ip6_proxied(dst_ip) {
                 return TC_ACT_OK;
             }
-            if param.has_proxy_dst_ports != 0 && unsafe { PROXY_DST_PORTS.get(&dst_port).is_none() } {
+            if param.has_proxy_dst_ports != 0
+                && unsafe { PROXY_DST_PORTS.get(&dst_port).is_none() }
+            {
                 return TC_ACT_OK;
             }
         }
@@ -516,18 +699,46 @@ fn handle_wan_egress_impl(ctx: *mut __sk_buff, link_h_len: usize) -> i32 {
             dmac,
         };
         unsafe {
+            let is_new_flow = REDIRECT_TRACK.get(&tuple).is_none();
             let _ = REDIRECT_TRACK.insert(&tuple, &entry, 0);
             let l4proto = if pkt.l4proto == IPPROTO_TCP {
                 pkt.listener_l4proto
             } else {
                 IPPROTO_UDP
             };
+
+            if is_new_flow {
+                let pid = pid_pname.map(|p| p.pid).unwrap_or(0);
+                let pname = pid_pname.map(|p| &p.pname);
+                let mut sip_u32 = [0u32; 4];
+                let mut dip_u32 = [0u32; 4];
+                for i in 0..4 {
+                    sip_u32[i] = u32::from_ne_bytes([src_ip[i * 4], src_ip[i * 4 + 1], src_ip[i * 4 + 2], src_ip[i * 4 + 3]]);
+                    dip_u32[i] = u32::from_ne_bytes([dst_ip[i * 4], dst_ip[i * 4 + 1], dst_ip[i * 4 + 2], dst_ip[i * 4 + 3]]);
+                }
+                send_dae_event(
+                    DaeEventType::Redirected as u32,
+                    pid,
+                    pname,
+                    1,
+                    pkt.l4proto,
+                    Some(&sip_u32),
+                    Some(&dip_u32),
+                    src_port,
+                    dst_port,
+                );
+            }
+
             do_redirect(ctx, param, link_h_len, l4proto, ETH_P_IPV6)
         }
     } else {
         TC_ACT_OK
     }
 }
+
+// ─────────────────────────────────────────────────────────────
+// 3. TC Entrypoints
+// ─────────────────────────────────────────────────────────────
 
 #[unsafe(no_mangle)]
 #[unsafe(link_section = "classifier")]
@@ -597,7 +808,9 @@ pub fn dae0peer_ingress(ctx: *mut __sk_buff) -> i32 {
     }
 
     // Set mark for policy routing (mark → table 100 → local route)
-    unsafe { (*ctx).mark = DAE_TPROXY_MARK; }
+    unsafe {
+        (*ctx).mark = DAE_TPROXY_MARK;
+    }
 
     // Force PACKET_HOST so the IP stack accepts this packet
     let _ = tc_ctx.change_type(0);
@@ -619,9 +832,9 @@ fn assign_listener_socket(ctx: *mut __sk_buff, listener_l4proto: u8) -> i32 {
 
     let key: u32 = match (listener_l4proto, is_v6) {
         (IPPROTO_TCP, false) => SK_TCP4,
-        (IPPROTO_TCP, true)  => SK_TCP6,
+        (IPPROTO_TCP, true) => SK_TCP6,
         (IPPROTO_UDP, false) => SK_UDP4,
-        (IPPROTO_UDP, true)  => SK_UDP6,
+        (IPPROTO_UDP, true) => SK_UDP6,
         _ => return -1,
     };
 
@@ -643,6 +856,17 @@ fn assign_listener_socket(ctx: *mut __sk_buff, listener_l4proto: u8) -> i32 {
 #[unsafe(no_mangle)]
 #[unsafe(link_section = "classifier")]
 pub fn dae0_ingress(ctx: *mut __sk_buff) -> i32 {
+    handle_dae0_ingress_impl(ctx)
+}
+
+#[unsafe(no_mangle)]
+#[unsafe(link_section = "classifier")]
+pub fn dae0_ingress_l2(ctx: *mut __sk_buff) -> i32 {
+    handle_dae0_ingress_impl(ctx)
+}
+
+#[inline(always)]
+fn handle_dae0_ingress_impl(ctx: *mut __sk_buff) -> i32 {
     let tc_ctx = TcContext::new(ctx);
     let mut pkt: ParsedPacket = unsafe { mem::zeroed() };
     if parse_packet(&tc_ctx, EthHdr::LEN as u32, &mut pkt) != 0 {
@@ -655,8 +879,8 @@ pub fn dae0_ingress(ctx: *mut __sk_buff) -> i32 {
     let (src_ip, dst_ip, ip_version) = if is_ipv4 {
         let mut s = [0u8; 16];
         let mut d = [0u8; 16];
-        s[0..4].copy_from_slice(&pkt.tuples.five.src_ip[12..16]);
-        d[0..4].copy_from_slice(&pkt.tuples.five.dst_ip[12..16]);
+        s[12..16].copy_from_slice(&pkt.tuples.five.src_ip[12..16]);
+        d[12..16].copy_from_slice(&pkt.tuples.five.dst_ip[12..16]);
         (s, d, 4)
     } else if is_ipv6 {
         (*pkt.tuples.five.src_ip.as_bytes(), *pkt.tuples.five.dst_ip.as_bytes(), 6)
@@ -682,20 +906,22 @@ pub fn dae0_ingress(ctx: *mut __sk_buff) -> i32 {
         let ifindex = entry.ifindex;
 
         unsafe {
-            bpf_skb_store_bytes(
-                ctx,
-                mem::offset_of!(EthHdr, src_addr) as u32,
-                smac.as_ptr() as *const _,
-                6,
-                0,
-            );
-            bpf_skb_store_bytes(
-                ctx,
-                mem::offset_of!(EthHdr, dst_addr) as u32,
-                dmac.as_ptr() as *const _,
-                6,
-                0,
-            );
+            if dmac != [0; 6] {
+                let _ = bpf_skb_store_bytes(
+                    ctx,
+                    mem::offset_of!(EthHdr, src_addr) as u32,
+                    smac.as_ptr() as *const _,
+                    6,
+                    0,
+                );
+                let _ = bpf_skb_store_bytes(
+                    ctx,
+                    mem::offset_of!(EthHdr, dst_addr) as u32,
+                    dmac.as_ptr() as *const _,
+                    6,
+                    0,
+                );
+            }
 
             let flags: u64 = if from_wan != 0 { 1 } else { 0 }; // 1 = BPF_F_INGRESS
             if from_wan != 0 {
@@ -709,22 +935,23 @@ pub fn dae0_ingress(ctx: *mut __sk_buff) -> i32 {
 }
 
 // ─────────────────────────────────────────────────────────────
-// 5. Cgroup Socket Attachments (用于直连打标，与原项目保持一致)
+// 4. Cgroup Socket Attachments (用于进程跟踪与自环避免)
 // ─────────────────────────────────────────────────────────────
 
 #[unsafe(no_mangle)]
 #[unsafe(link_section = "cgroup/sock_create")]
 pub fn tproxy_wan_cg_sock_create(ctx: *mut bpf_sock) -> i32 {
+    let cookie = unsafe { bpf_get_socket_cookie(ctx as *mut _) };
+    update_map_elem_by_cookie(cookie);
+
     let pid_tgid = bpf_get_current_pid_tgid();
     let pid = (pid_tgid >> 32) as u32;
 
-    let Some(param) = get_param() else {
-        return 1;
-    };
-
-    if param.control_plane_pid != 0 && pid == param.control_plane_pid {
-        unsafe {
-            (*ctx).mark = DAE_BYPASS_MARK;
+    if let Some(param) = get_param() {
+        if param.control_plane_pid != 0 && pid == param.control_plane_pid {
+            unsafe {
+                (*ctx).mark = DAE_BYPASS_MARK;
+            }
         }
     }
 
@@ -733,6 +960,43 @@ pub fn tproxy_wan_cg_sock_create(ctx: *mut bpf_sock) -> i32 {
 
 #[unsafe(no_mangle)]
 #[unsafe(link_section = "cgroup/sock_release")]
-pub fn tproxy_wan_cg_sock_release(_ctx: *mut bpf_sock) -> i32 {
+pub fn tproxy_wan_cg_sock_release(ctx: *mut bpf_sock) -> i32 {
+    let cookie = unsafe { bpf_get_socket_cookie(ctx as *mut _) };
+    if cookie != 0 {
+        let _ = COOKIE_PID_MAP.remove(&cookie);
+    }
     1
 }
+
+#[unsafe(no_mangle)]
+#[unsafe(link_section = "cgroup/connect4")]
+pub fn tproxy_wan_cg_connect4(ctx: *mut bpf_sock_addr) -> i32 {
+    let cookie = unsafe { bpf_get_socket_cookie(ctx as *mut _) };
+    update_map_elem_by_cookie(cookie);
+    1
+}
+
+#[unsafe(no_mangle)]
+#[unsafe(link_section = "cgroup/connect6")]
+pub fn tproxy_wan_cg_connect6(ctx: *mut bpf_sock_addr) -> i32 {
+    let cookie = unsafe { bpf_get_socket_cookie(ctx as *mut _) };
+    update_map_elem_by_cookie(cookie);
+    1
+}
+
+#[unsafe(no_mangle)]
+#[unsafe(link_section = "cgroup/sendmsg4")]
+pub fn tproxy_wan_cg_sendmsg4(ctx: *mut bpf_sock_addr) -> i32 {
+    let cookie = unsafe { bpf_get_socket_cookie(ctx as *mut _) };
+    update_map_elem_by_cookie(cookie);
+    1
+}
+
+#[unsafe(no_mangle)]
+#[unsafe(link_section = "cgroup/sendmsg6")]
+pub fn tproxy_wan_cg_sendmsg6(ctx: *mut bpf_sock_addr) -> i32 {
+    let cookie = unsafe { bpf_get_socket_cookie(ctx as *mut _) };
+    update_map_elem_by_cookie(cookie);
+    1
+}
+

@@ -92,6 +92,12 @@ pub struct EbpfConfig {
     pub proxy_dst_ips: Vec<String>,
     #[serde(default = "default_true")]
     pub auto_direct_offload: bool,
+    #[serde(default = "default_true")]
+    pub proxy_local: bool,
+    #[serde(default, alias = "proxy-process")]
+    pub proxy_processes: Vec<String>,
+    #[serde(default, alias = "bypass-process")]
+    pub bypass_processes: Vec<String>,
 }
 
 fn default_bypass_ports() -> Vec<u16> {

@@ -9,10 +9,12 @@ pub const EMBEDDED_BPF_OBJECT: &[u8] = include_bytes!(env!("CLASH_EBPF_OBJECT"))
 pub mod linux {
     use super::DaeParam;
     use aya::maps::lpm_trie::Key;
-    use aya::maps::{Array, HashMap, LpmTrie, SockMap};
+    use aya::maps::{Array, HashMap, LpmTrie, MapData, RingBuf, SockMap};
     use aya::programs::cgroup_sock::CgroupSockLink;
     use aya::programs::tc::SchedClassifierLink;
-    use aya::programs::{CgroupAttachMode, CgroupSock, SchedClassifier, TcAttachType};
+    use aya::programs::{
+        CgroupAttachMode, CgroupSock, CgroupSockAddr, SchedClassifier, TcAttachType,
+    };
     use aya::{Ebpf, EbpfLoader};
     use std::fs::File;
     use std::net::{Ipv4Addr, Ipv6Addr};
@@ -23,6 +25,7 @@ pub mod linux {
         bpf: Option<Ebpf>,
         tc_links: Vec<SchedClassifierLink>,
         cgroup_links: Vec<CgroupSockLink>,
+        event_task: Option<tokio::task::JoinHandle<()>>,
     }
 
     impl BpfProgramManager {
@@ -31,8 +34,8 @@ pub mod linux {
                 bpf: None,
                 tc_links: Vec::new(),
                 cgroup_links: Vec::new(),
+                event_task: None,
             }
-
         }
 
         /// Detect the root cgroup2 mount point from /proc/mounts.
@@ -66,10 +69,10 @@ pub mod linux {
             proxy_ips: &[String],
             proxy_src_ips: &[String],
             proxy_dst_ips: &[String],
+            proxy_processes: &[String],
+            bypass_processes: &[String],
             netns: Option<&crate::netns::linux::DaeNs>,
         ) -> Result<(), String> {
-
-
             if obj_bytes.is_empty() {
                 warn!("eBPF ELF bytecode is empty; skipping eBPF kernel hooks attachment");
                 return Ok(());
@@ -253,14 +256,60 @@ pub mod linux {
                 }
             }
 
+            // 10. Populate PROXY_PROCESSES map
+            if let Some(map) = bpf.map_mut("PROXY_PROCESSES") {
+                if let Ok(mut proc_map) = HashMap::<_, [u8; 16], u8>::try_from(map) {
+                    for proc in proxy_processes {
+                        let mut key = [0u8; 16];
+                        let bytes = proc.as_bytes();
+                        let len = bytes.len().min(16);
+                        key[..len].copy_from_slice(&bytes[..len]);
+                        let _ = proc_map.insert(key, 1, 0);
+                    }
+                    debug!("Configured {} proxy processes in BPF map", proxy_processes.len());
+                }
+            }
+
+            // 11. Populate BYPASS_PROCESSES map
+            if let Some(map) = bpf.map_mut("BYPASS_PROCESSES") {
+                if let Ok(mut proc_map) = HashMap::<_, [u8; 16], u8>::try_from(map) {
+                    for proc in bypass_processes {
+                        let mut key = [0u8; 16];
+                        let bytes = proc.as_bytes();
+                        let len = bytes.len().min(16);
+                        key[..len].copy_from_slice(&bytes[..len]);
+                        let _ = proc_map.insert(key, 1, 0);
+                    }
+                    debug!("Configured {} bypass processes in BPF map", bypass_processes.len());
+                }
+            }
+
+            // 12. Spawn RingBuf consumer for kernel events
+            if let Some(map) = bpf.take_map("EVENT_RINGBUF") {
+                if let Ok(ring_buf) = RingBuf::try_from(map) {
+                    match tokio::io::unix::AsyncFd::with_interest(
+                        ring_buf,
+                        tokio::io::Interest::READABLE,
+                    ) {
+                        Ok(async_fd) => {
+                            self.event_task = Some(tokio::spawn(consume_dae_events(async_fd)));
+                            debug!("Started eBPF EVENT_RINGBUF event consumer task");
+                        }
+                        Err(e) => {
+                            warn!("Failed to setup AsyncFd for EVENT_RINGBUF: {e}");
+                        }
+                    }
+                }
+            }
+
             self.bpf = Some(bpf);
 
-            // 10. Attach cgroup bypass hooks
+            // 13. Attach cgroup bypass and process tracking hooks
             if let Err(e) = self.attach_cgroup() {
                 warn!("cgroup bypass attachment: {e}");
             }
 
-            // 11. Attach TC Ingress on configured/detected LAN interfaces (局域网入站拦截)
+            // 14. Attach TC Ingress on configured/detected LAN interfaces (局域网入站拦截)
             let detected_lan_fallback;
             let effective_lan = if lan_interfaces.is_empty() || lan_interfaces.iter().any(|s| s == "auto") {
                 detected_lan_fallback = crate::manager::detect_lan_interfaces(lan_interfaces, wan_interface);
@@ -280,7 +329,7 @@ pub mod linux {
                 }
             }
 
-            // 12. Attach TC Egress on configured WAN interface (or primary LAN interface in single-homed setups)
+            // 15. Attach TC Egress on configured WAN interface (or primary LAN interface in single-homed setups)
             let detected_wan_fallback;
             let effective_wan = match wan_interface {
                 Some("auto") | None | Some("") => {
@@ -300,14 +349,14 @@ pub mod linux {
                 }
             }
 
-            // 13. Attach TC Ingress on dae0 for reply short-circuit and MAC restoration
+            // 16. Attach TC Ingress on dae0 for reply short-circuit and MAC restoration (in host netns)
             if let Err(e) = self.attach_tc_interface("dae0", true, "dae0_ingress") {
                 warn!("Failed to attach TC ingress on dae0: {}", e);
             }
 
-            // 14. Attach TC Ingress on dae0peer inside daens for PACKET_HOST acceptance
+            // 17. Attach TC Ingress on dae0peer inside daens for PACKET_HOST acceptance
             if let Some(ns) = netns {
-                let _ = ns.with_daens(|| -> std::io::Result<()> {
+                let _ = ns.with_daens(|| -> Result<(), String> {
                     if let Err(e) = self.attach_tc_interface("dae0peer", true, "dae0peer_ingress") {
                         warn!("Failed to attach TC ingress on dae0peer inside daens: {}", e);
                     }
@@ -315,72 +364,63 @@ pub mod linux {
                 });
             }
 
-
+            info!("eBPF programs and TC/cgroup hooks successfully attached");
             Ok(())
-
         }
 
-        /// Dynamically add a direct bypass IPv4 destination to the LRU map.
         pub fn add_dynamic_bypass_ip4(&mut self, ip: Ipv4Addr) -> Result<(), String> {
-            use aya::maps::HashMap;
             let Some(bpf) = self.bpf.as_mut() else {
                 return Err("eBPF not loaded".to_string());
             };
             let map = bpf.map_mut("DYNAMIC_BYPASS_DST_IPS")
                 .ok_or_else(|| "map 'DYNAMIC_BYPASS_DST_IPS' not found".to_string())?;
             let mut lru = HashMap::<_, u32, u8>::try_from(map)
-                .map_err(|e| format!("DYNAMIC_BYPASS_DST_IPS: {e}"))?;
+                .map_err(|e| format!("map 'DYNAMIC_BYPASS_DST_IPS': {e}"))?;
             let ip_u32 = u32::from_ne_bytes(ip.octets());
             lru.insert(ip_u32, 1, 0)
-                .map_err(|e| format!("Failed to insert dynamic direct IP {ip}: {e}"))?;
-            debug!(ip = %ip, "Added dynamic direct offload IPv4 to eBPF");
+                .map_err(|e| format!("Failed to insert dynamic bypass IPv4: {e}"))?;
+            debug!("Added dynamic bypass IPv4: {}", ip);
             Ok(())
         }
 
-        /// Dynamically remove a direct bypass IPv4 destination from the map.
         pub fn remove_dynamic_bypass_ip4(&mut self, ip: Ipv4Addr) -> Result<(), String> {
-            use aya::maps::HashMap;
             let Some(bpf) = self.bpf.as_mut() else {
                 return Err("eBPF not loaded".to_string());
             };
             let map = bpf.map_mut("DYNAMIC_BYPASS_DST_IPS")
                 .ok_or_else(|| "map 'DYNAMIC_BYPASS_DST_IPS' not found".to_string())?;
             let mut lru = HashMap::<_, u32, u8>::try_from(map)
-                .map_err(|e| format!("DYNAMIC_BYPASS_DST_IPS: {e}"))?;
+                .map_err(|e| format!("map 'DYNAMIC_BYPASS_DST_IPS': {e}"))?;
             let ip_u32 = u32::from_ne_bytes(ip.octets());
             let _ = lru.remove(&ip_u32);
-            debug!(ip = %ip, "Removed dynamic direct offload IPv4 from eBPF");
+            debug!("Removed dynamic bypass IPv4: {}", ip);
             Ok(())
         }
 
-        /// Dynamically add a direct bypass IPv6 destination to the LRU map.
-        pub fn add_dynamic_bypass_ip6(&mut self, ip: std::net::Ipv6Addr) -> Result<(), String> {
-            use aya::maps::HashMap;
+        pub fn add_dynamic_bypass_ip6(&mut self, ip: Ipv6Addr) -> Result<(), String> {
             let Some(bpf) = self.bpf.as_mut() else {
                 return Err("eBPF not loaded".to_string());
             };
             let map = bpf.map_mut("DYNAMIC_BYPASS_DST_IP6S")
                 .ok_or_else(|| "map 'DYNAMIC_BYPASS_DST_IP6S' not found".to_string())?;
             let mut lru = HashMap::<_, [u8; 16], u8>::try_from(map)
-                .map_err(|e| format!("DYNAMIC_BYPASS_DST_IP6S: {e}"))?;
+                .map_err(|e| format!("map 'DYNAMIC_BYPASS_DST_IP6S': {e}"))?;
             lru.insert(ip.octets(), 1, 0)
-                .map_err(|e| format!("Failed to insert dynamic direct IPv6 {ip}: {e}"))?;
-            debug!(ip = %ip, "Added dynamic direct offload IPv6 to eBPF");
+                .map_err(|e| format!("Failed to insert dynamic bypass IPv6: {e}"))?;
+            debug!("Added dynamic bypass IPv6: {}", ip);
             Ok(())
         }
 
-        /// Dynamically remove a direct bypass IPv6 destination from the map.
-        pub fn remove_dynamic_bypass_ip6(&mut self, ip: std::net::Ipv6Addr) -> Result<(), String> {
-            use aya::maps::HashMap;
+        pub fn remove_dynamic_bypass_ip6(&mut self, ip: Ipv6Addr) -> Result<(), String> {
             let Some(bpf) = self.bpf.as_mut() else {
                 return Err("eBPF not loaded".to_string());
             };
             let map = bpf.map_mut("DYNAMIC_BYPASS_DST_IP6S")
                 .ok_or_else(|| "map 'DYNAMIC_BYPASS_DST_IP6S' not found".to_string())?;
             let mut lru = HashMap::<_, [u8; 16], u8>::try_from(map)
-                .map_err(|e| format!("DYNAMIC_BYPASS_DST_IP6S: {e}"))?;
+                .map_err(|e| format!("map 'DYNAMIC_BYPASS_DST_IP6S': {e}"))?;
             let _ = lru.remove(&ip.octets());
-            debug!(ip = %ip, "Removed dynamic direct offload IPv6 from eBPF");
+            debug!("Removed dynamic bypass IPv6: {}", ip);
             Ok(())
         }
 
@@ -436,7 +476,7 @@ pub mod linux {
         }
 
 
-        /// Attach cgroup socket programs to root cgroup2 for process bypass.
+        /// Attach cgroup socket programs to root cgroup2 for process bypass and tracking.
         fn attach_cgroup(&mut self) -> Result<(), String> {
             let Some(bpf) = self.bpf.as_mut() else {
                 return Err("eBPF not loaded".to_string());
@@ -465,11 +505,30 @@ pub mod linux {
                 }
             }
 
-            info!("Attached cgroup bypass hooks to {}", cgroup_path);
+            for name in &[
+                "tproxy_wan_cg_connect4",
+                "tproxy_wan_cg_connect6",
+                "tproxy_wan_cg_sendmsg4",
+                "tproxy_wan_cg_sendmsg6",
+            ] {
+                if let Some(prog) = bpf.program_mut(name) {
+                    if let Ok(p) = <&mut CgroupSockAddr>::try_from(prog) {
+                        if p.load().is_ok() {
+                            if let Ok(link_id) = p.attach(&cgroup_file, CgroupAttachMode::Single) {
+                                if let Ok(link) = p.take_link(link_id) {
+                                    std::mem::forget(link);
+                                    debug!("Attached cgroup hook '{}'", name);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            info!("Attached cgroup bypass & process tracking hooks to {}", cgroup_path);
             Ok(())
         }
         /// Check whether a network interface is an Ethernet device (ARPHRD_ETHER = 1).
-        /// This determines whether TC hooks see L2 frames (with Ethernet header) or L3 (raw IP).
         fn iface_is_ethernet(iface: &str) -> bool {
             std::fs::read_to_string(format!("/sys/class/net/{iface}/type"))
                 .ok()
@@ -484,7 +543,6 @@ pub mod linux {
                 return Err("eBPF not loaded".to_string());
             };
 
-            // Ensure clsact qdisc exists on the interface (ignore error if already exists)
             let _ = aya::programs::tc::qdisc_add_clsact(iface);
 
             let attach_type = if is_ingress {
@@ -512,20 +570,147 @@ pub mod linux {
                 .take_link(link_id)
                 .map_err(|e| format!("Failed to take TC link: {e}"))?;
 
-            // Forget the link so Aya never silently detaches it on struct drops
             std::mem::forget(link);
 
             info!("Attached TC {} program '{}' on {}", if is_ingress { "ingress" } else { "egress" }, prog_name, iface);
             Ok(())
         }
 
-        /// Detach all active TC and cgroup links.
+        /// Detach all active TC and cgroup links and stop event consumer.
         pub fn unload(&mut self) {
             info!("Unloading all eBPF TC and cgroup links...");
+            if let Some(task) = self.event_task.take() {
+                task.abort();
+            }
             self.tc_links.clear();
             self.cgroup_links.clear();
             self.bpf.take();
             info!("All eBPF links detached successfully");
+        }
+    }
+
+    /// Drain `EVENT_RINGBUF` into rate-limited structured logs.
+    async fn consume_dae_events(
+        mut async_fd: tokio::io::unix::AsyncFd<RingBuf<MapData>>,
+    ) {
+        use clash_ebpf_common::{DaeEvent, DaeEventType};
+        let mut window = std::time::Instant::now();
+        let mut emitted: u32 = 0;
+        let mut suppressed: u64 = 0;
+        const EVENT_LOG_MAX_PER_SEC: u32 = 32;
+
+        loop {
+            let mut guard = match async_fd.readable_mut().await {
+                Ok(g) => g,
+                Err(e) => {
+                    debug!("DaeEvent ringbuf AsyncFd wait failed: {e}");
+                    break;
+                }
+            };
+
+            {
+                let ring_buf = guard.get_inner_mut();
+                while let Some(item) = ring_buf.next() {
+                    let bytes: &[u8] = &item;
+                    if bytes.len() < core::mem::size_of::<DaeEvent>() {
+                        continue;
+                    }
+                    let ev: DaeEvent = unsafe {
+                        core::ptr::read_unaligned(bytes.as_ptr() as *const DaeEvent)
+                    };
+
+                    if window.elapsed() >= std::time::Duration::from_secs(1) {
+                        if suppressed > 0 {
+                            warn!("eBPF datapath events suppressed: {suppressed} in the last second");
+                        }
+                        window = std::time::Instant::now();
+                        emitted = 0;
+                        suppressed = 0;
+                    }
+
+                    if emitted >= EVENT_LOG_MAX_PER_SEC {
+                        suppressed += 1;
+                        continue;
+                    }
+                    emitted += 1;
+
+                    let pname_end = ev
+                        .pname
+                        .iter()
+                        .position(|&b| b == 0)
+                        .unwrap_or(ev.pname.len());
+                    let pname = String::from_utf8_lossy(&ev.pname[..pname_end]);
+
+                    let sip = if ev.sip[1] == 0 && ev.sip[2] == 0 && ev.sip[3] == 0 {
+                        std::net::IpAddr::V4(std::net::Ipv4Addr::from(ev.sip[0]))
+                    } else {
+                        let mut b = [0u8; 16];
+                        for (i, c) in ev.sip.iter().enumerate() {
+                            b[i * 4..i * 4 + 4].copy_from_slice(&c.to_ne_bytes());
+                        }
+                        std::net::IpAddr::V6(std::net::Ipv6Addr::from(b))
+                    };
+                    let dip = if ev.dip[1] == 0 && ev.dip[2] == 0 && ev.dip[3] == 0 {
+                        std::net::IpAddr::V4(std::net::Ipv4Addr::from(ev.dip[0]))
+                    } else {
+                        let mut b = [0u8; 16];
+                        for (i, c) in ev.dip.iter().enumerate() {
+                            b[i * 4..i * 4 + 4].copy_from_slice(&c.to_ne_bytes());
+                        }
+                        std::net::IpAddr::V6(std::net::Ipv6Addr::from(b))
+                    };
+
+                    match ev.type_ {
+                        t if t == DaeEventType::Redirected as u32 => {
+                            info!(
+                                target: "clash-ebpf",
+                                pid = ev.pid,
+                                pname = %pname,
+                                proto = ev.l4proto,
+                                %sip,
+                                sport = ev.sport,
+                                %dip,
+                                dport = ev.dport,
+                                "eBPF packet redirected to tproxy"
+                            );
+                        }
+                        t if t == DaeEventType::Blocked as u32 => {
+                            warn!(
+                                target: "clash-ebpf",
+                                pid = ev.pid,
+                                pname = %pname,
+                                "eBPF packet blocked"
+                            );
+                        }
+                        t if t == DaeEventType::TcpConnOverflow as u32 => {
+                            warn!(
+                                target: "clash-ebpf",
+                                pid = ev.pid,
+                                pname = %pname,
+                                "eBPF TCP conntrack overflow"
+                            );
+                        }
+                        t if t == DaeEventType::UdpConnOverflow as u32 => {
+                            warn!(
+                                target: "clash-ebpf",
+                                pid = ev.pid,
+                                pname = %pname,
+                                "eBPF UDP conntrack overflow"
+                            );
+                        }
+                        _ => {
+                            debug!(
+                                target: "clash-ebpf",
+                                type_ = ev.type_,
+                                pid = ev.pid,
+                                pname = %pname,
+                                "eBPF datapath event"
+                            );
+                        }
+                    }
+                }
+            }
+            guard.clear_ready();
         }
     }
 }
@@ -558,6 +743,9 @@ pub mod non_linux {
             _proxy_ips: &[String],
             _proxy_src_ips: &[String],
             _proxy_dst_ips: &[String],
+            _proxy_processes: &[String],
+            _bypass_processes: &[String],
+            _netns: Option<&crate::netns::non_linux::DaeNs>,
         ) -> Result<(), String> {
             Ok(())
         }
@@ -571,6 +759,15 @@ pub mod non_linux {
             Ok(())
         }
         pub fn remove_dynamic_bypass_ip6(&mut self, _ip: std::net::Ipv6Addr) -> Result<(), String> {
+            Ok(())
+        }
+        pub fn publish_listener_sockets(
+            &mut self,
+            _tcp4_fd: std::os::raw::c_int,
+            _tcp6_fd: Option<std::os::raw::c_int>,
+            _udp4_fd: std::os::raw::c_int,
+            _udp6_fd: Option<std::os::raw::c_int>,
+        ) -> Result<(), String> {
             Ok(())
         }
         pub fn unload(&mut self) {}

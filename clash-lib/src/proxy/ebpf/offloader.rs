@@ -97,20 +97,33 @@ impl OffloadDesiredState {
         let new_ips = ips.iter().copied().collect::<BTreeSet<_>>();
 
         let mut affected_ips = Vec::new();
+        let mut final_ips = BTreeSet::new();
+        let incoming_has_v4 = ips.iter().any(|ip| ip.is_ipv4());
+        let incoming_has_v6 = ips.iter().any(|ip| ip.is_ipv6());
 
         if let Some(old_owner) = self.owners.get(&domain_key) {
-            for removed_ip in old_owner.ips.difference(&new_ips) {
-                if let Some(domains) = self.reverse.get_mut(removed_ip) {
-                    domains.remove(&domain_key);
-                    if domains.is_empty() {
-                        self.reverse.remove(removed_ip);
+            for old_ip in &old_owner.ips {
+                let should_replace = (old_ip.is_ipv4() && incoming_has_v4)
+                    || (old_ip.is_ipv6() && incoming_has_v6);
+                if should_replace {
+                    if !new_ips.contains(old_ip) {
+                        if let Some(domains) = self.reverse.get_mut(old_ip) {
+                            domains.remove(&domain_key);
+                            if domains.is_empty() {
+                                self.reverse.remove(old_ip);
+                            }
+                        }
+                        affected_ips.push(*old_ip);
                     }
+                } else {
+                    // Retain IPs of the other address family that were not part of this DNS query
+                    final_ips.insert(*old_ip);
                 }
-                affected_ips.push(*removed_ip);
             }
         }
 
         for ip in &new_ips {
+            final_ips.insert(*ip);
             self.reverse
                 .entry(*ip)
                 .or_default()
@@ -121,7 +134,7 @@ impl OffloadDesiredState {
         self.owners.insert(
             Arc::clone(&domain_key),
             DomainOwner {
-                ips: new_ips,
+                ips: final_ips,
                 action,
                 expires_at,
                 sequence: seq,

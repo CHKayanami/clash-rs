@@ -1,6 +1,8 @@
 use aya_ebpf::macros::map;
-use aya_ebpf::maps::{Array, HashMap, LpmTrie, LruHashMap, PerCpuArray, SockMap};
-use clash_ebpf_common::{DaeParam, ParseTransportCtx, RedirectEntry, RedirectTuple};
+use aya_ebpf::maps::{Array, HashMap, LpmTrie, LruHashMap, PerCpuArray, RingBuf, SockMap};
+use clash_ebpf_common::{
+    DaeParam, PIDName, ParseTransportCtx, RedirectEntry, RedirectTuple,
+};
 
 #[map]
 pub static DAE_PARAM: Array<DaeParam> = Array::with_max_entries(1, 0);
@@ -58,3 +60,20 @@ pub static LISTEN_SOCKET_MAP: SockMap = SockMap::with_max_entries(4, 0);
 /// PerCpuArray for packet transport parsing scratch memory (zero-allocation fast path).
 #[map]
 pub static PARSE_CTX_MAP: PerCpuArray<ParseTransportCtx> = PerCpuArray::with_max_entries(1, 0);
+
+/// Socket cookie to PID and process name mapping (populated by cgroup socket hooks).
+#[map]
+pub static COOKIE_PID_MAP: HashMap<u64, PIDName> = HashMap::with_max_entries(65536, 0);
+
+/// Process whitelist for local traffic proxying (comm name matching).
+#[map]
+pub static PROXY_PROCESSES: HashMap<[u8; 16], u8> = HashMap::with_max_entries(256, 0);
+
+/// Process blacklist for local traffic bypassing (comm name matching).
+#[map]
+pub static BYPASS_PROCESSES: HashMap<[u8; 16], u8> = HashMap::with_max_entries(256, 0);
+
+/// RingBuffer for sending events and alerts from eBPF to userspace.
+#[map]
+pub static EVENT_RINGBUF: RingBuf = RingBuf::with_byte_size(262144, 0);
+

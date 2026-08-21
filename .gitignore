@@ -15,6 +15,8 @@ docs
 
 # don't check in this real config
 ignore*.yaml
+test*.yaml
+test*.log
 config.yaml
 cache.db
 Country.mmdb

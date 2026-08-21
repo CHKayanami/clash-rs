@@ -96,6 +96,7 @@ impl EbpfManager {
             let peer_v6: Ipv6Addr = DAENS_PEER_IPV6.parse().unwrap();
 
             host_nl.addr_op(true, dae0_idx, FAM_V4, &host_v4.octets(), 32)?;
+            let _ = host_nl.addr_op(true, dae0_idx, FAM_V6, &host_v6.octets(), 64);
             host_nl.set_link_up(dae0_idx, true)?;
 
             // Move peer to daens
@@ -242,6 +243,9 @@ impl EbpfManager {
             let has_proxy_src_ports = if !self.config.proxy_ports.is_empty() || !self.config.proxy_src_ports.is_empty() { 1 } else { 0 };
             let has_proxy_dst_ports = if !self.config.proxy_ports.is_empty() || !self.config.proxy_dst_ports.is_empty() { 1 } else { 0 };
             let direct_offload_enabled = if self.config.auto_direct_offload { 1 } else { 0 };
+            let proxy_local = if self.config.proxy_local { 1 } else { 0 };
+            let has_proxy_processes = if !self.config.proxy_processes.is_empty() { 1 } else { 0 };
+            let has_bypass_processes = if !self.config.bypass_processes.is_empty() { 1 } else { 0 };
 
             // Initialize eBPF programs and attach TC/cgroup hooks via Aya
             let bpf_param = clash_ebpf_common::DaeParam {
@@ -250,7 +254,7 @@ impl EbpfManager {
                 wan_ifindex: 0,
                 dae0peer_mac,
                 use_redirect_peer: 0,
-                _pad0: 0,
+                proxy_local,
                 dae_socket_mark: clash_ebpf_common::DAE_BYPASS_MARK,
                 control_plane_pid: std::process::id(),
                 local_ip: local_ip_u32,
@@ -259,7 +263,9 @@ impl EbpfManager {
                 has_proxy_src_ports,
                 has_proxy_dst_ports,
                 direct_offload_enabled,
-                _pad1: [0; 3],
+                has_proxy_processes,
+                has_bypass_processes,
+                _pad1: 0,
             };
 
             let mut bpf_guard = self.bpf_manager.lock().await;
@@ -280,10 +286,10 @@ impl EbpfManager {
                 &self.config.proxy_ips,
                 &self.config.proxy_src_ips,
                 &self.config.proxy_dst_ips,
+                &self.config.proxy_processes,
+                &self.config.bypass_processes,
                 Some(&ns),
             ) {
-
-
                 tracing::warn!("eBPF hooks attachment: {e}");
             }
 

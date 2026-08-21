@@ -11,10 +11,13 @@ log-level: debug
 dns:
   enable: true
   listen: 0.0.0.0:1053
-  enhanced-mode: fake-ip
+  enhanced-mode: normal
   fake-ip-range: 198.18.0.1/16
   nameserver:
     - 223.5.5.5
+  nameserver-policy:
+    "+.google.com":"1.1.1.1#myproxy"
+    "+.cloudflare-quic.com":"1.1.1.1#myproxy"
 
 # 2. eBPF 内核透明代理引擎 (极简配置，开箱即用)
 ebpf:
@@ -22,7 +25,55 @@ ebpf:
   lan-interface: ["enp3s0"]
   wan-interface: "enp3s0"
 
+proxies:
 
+proxy-groups:
+  - name: PROXY
+    type: select
+    proxies:
+      - myproxy
+      - DIRECT
 
 rules:
+  - DOMAIN-SUFFIX,baidu.com,DIRECT
+  - DOMAIN-SUFFIX,cloudflare-quic.com,PROXY
+  - DOMAIN-SUFFIX,google.com,PROXY
+  - DOMAIN-SUFFIX,cloudflare-quic.com,PROXY
   - MATCH,DIRECT
+
+sniffer:
+  enable: true
+
+  # Force mapping destination real IP back to queried domain using DNS history cache.
+  # Useful in non-fake-ip modes or for pure IP connections. Default is false.
+  force-dns-mapping: true
+
+  # Whether to perform payload sniffing on pure IP (non-fake-ip / direct IP) connections.
+  # Default is true.
+  parse-pure-ip: true
+
+  # Override the destination address with the sniffed domain when connecting to outbounds.
+  # When true, outbounds resolve and connect to the sniffed domain rather than the original IP.
+  # Can also be set individually per protocol below.
+  override-destination: false
+
+  # Protocol-specific sniffer configuration
+  sniff:
+    TLS:
+      ports: [443, 8443]
+      # override-destination: false
+    HTTP:
+      ports: [80, "8080-8880"]
+      override-destination: true
+    QUIC:
+      ports: [443]
+      # override-destination: false
+
+  # Domains to skip sniffing (keeps original IP directly)
+  skip-domain:
+    - "Mijia Cloud"
+    - "+.apple.com"
+
+  # Force sniffing even if the destination is already a domain name (or resolved by fake-ip)
+  force-domain:
+    - "+.google.com"

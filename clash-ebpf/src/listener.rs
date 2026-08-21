@@ -61,7 +61,7 @@ impl EbpfListener {
             let tcp_listener_v4 = TcpListener::from_std(tcp_sock_v4.into())?;
 
             // 2. TCP IPv6 Transparent Listener (Optional)
-            let tcp_listener_v6 = (|| -> std::io::Result<TcpListener> {
+            let tcp_listener_v6 = match (|| -> std::io::Result<TcpListener> {
                 let tcp_sock_v6 = Socket::new(Domain::IPV6, Type::STREAM, Some(Protocol::TCP))?;
                 tcp_sock_v6.set_reuse_address(true)?;
                 tcp_sock_v6.set_only_v6(true)?;
@@ -84,7 +84,16 @@ impl EbpfListener {
                 tcp_sock_v6.bind(&addr_v6.into())?;
                 tcp_sock_v6.listen(1024)?;
                 TcpListener::from_std(tcp_sock_v6.into())
-            })().ok();
+            })() {
+                Ok(l) => {
+                    tracing::info!("Bound TCP IPv6 transparent listener on port {}", config.tproxy_port);
+                    Some(l)
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to bind TCP IPv6 transparent listener: {e}");
+                    None
+                }
+            };
 
             // 3. UDP IPv4 Transparent Listener
             let udp_sock_v4 = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
@@ -116,7 +125,7 @@ impl EbpfListener {
             let udp_socket_v4 = UdpSocket::from_std(udp_sock_v4.into())?;
 
             // 4. UDP IPv6 Transparent Listener (Optional)
-            let udp_socket_v6 = (|| -> std::io::Result<UdpSocket> {
+            let udp_socket_v6 = match (|| -> std::io::Result<UdpSocket> {
                 let udp_sock_v6 = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
                 udp_sock_v6.set_reuse_address(true)?;
                 udp_sock_v6.set_only_v6(true)?;
@@ -145,7 +154,16 @@ impl EbpfListener {
                 let udp_addr_v6 = SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, config.tproxy_udp_port, 0, 0));
                 udp_sock_v6.bind(&udp_addr_v6.into())?;
                 UdpSocket::from_std(udp_sock_v6.into())
-            })().ok();
+            })() {
+                Ok(s) => {
+                    tracing::info!("Bound UDP IPv6 transparent listener on port {}", config.tproxy_udp_port);
+                    Some(s)
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to bind UDP IPv6 transparent listener: {e}");
+                    None
+                }
+            };
 
             // 5. Dedicated cached transparent DNS reply sockets (bound to :53 in daens)
             let dns_reply_socket_v4 = (|| -> std::io::Result<UdpSocket> {
@@ -255,6 +273,10 @@ impl EbpfListener {
             let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
             socket.set_nonblocking(true)?;
             socket.set_reuse_address(true)?;
+            #[cfg(target_os = "linux")]
+            {
+                let _ = socket.set_reuse_port(true);
+            }
 
             #[cfg(target_os = "linux")]
             {

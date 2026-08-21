@@ -2,9 +2,11 @@
 
 pub mod conn;
 pub mod dae_ip;
+pub mod event;
 
 pub use conn::{ParseTransportCtx, Tuples, TuplesKey};
 pub use dae_ip::In6Addr;
+pub use event::{DaeEvent, DaeEventType, PIDName};
 
 pub const DAE_TPROXY_MARK: u32 = 0x1dae;
 pub const DAE_BYPASS_MARK: u32 = 0x2dae;
@@ -17,7 +19,7 @@ pub struct DaeParam {
     pub wan_ifindex: u32,
     pub dae0peer_mac: [u8; 6],
     pub use_redirect_peer: u8,
-    pub _pad0: u8,
+    pub proxy_local: u8,
     pub dae_socket_mark: u32,
     pub control_plane_pid: u32,
     pub local_ip: u32,
@@ -26,7 +28,9 @@ pub struct DaeParam {
     pub has_proxy_src_ports: u8,
     pub has_proxy_dst_ports: u8,
     pub direct_offload_enabled: u8,
-    pub _pad1: [u8; 3],
+    pub has_proxy_processes: u8,
+    pub has_bypass_processes: u8,
+    pub _pad1: u8,
 }
 
 #[repr(C)]

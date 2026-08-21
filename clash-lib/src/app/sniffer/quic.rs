@@ -421,6 +421,11 @@ impl QuicSniffOutcome {
     }
 }
 
+#[inline]
+pub fn is_grease_version(version: u32) -> bool {
+    (version & 0x0f0f_0f0f) == 0x0a0a_0a0a
+}
+
 /// Key identifying a UDP flow: (src_addr, dst_addr)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct UdpFlowKey {
@@ -429,8 +434,8 @@ pub struct UdpFlowKey {
 }
 
 const SNIFFER_TTL: std::time::Duration = std::time::Duration::from_secs(5);
-const NO_SNI_THRESHOLD: u32 = 3;
-const FAILED_DCID_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+const NO_SNI_THRESHOLD: u32 = 4;
+const FAILED_DCID_TTL: std::time::Duration = std::time::Duration::from_secs(1);
 const MAX_INITIAL_SNIFF_PACKETS: u32 = 8;
 
 struct SnifferSession {
@@ -546,6 +551,18 @@ impl PacketSnifferPool {
         let fragments = match fragments {
             Some(f) => f,
             None => {
+                let is_grease_or_vn = if data.len() >= 5 && (data[0] & 0x80) != 0 && (data[0] & 0x40) != 0 {
+                    let ver = u32::from_be_bytes([data[1], data[2], data[3], data[4]]);
+                    ver == 0 || is_grease_version(ver)
+                } else {
+                    false
+                };
+
+                if is_grease_or_vn {
+                    drop(sessions);
+                    return QuicSniffOutcome::Incomplete;
+                }
+
                 session.error_count += 1;
                 let failed = session.error_count >= NO_SNI_THRESHOLD;
                 if failed {

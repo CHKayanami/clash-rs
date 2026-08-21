@@ -73,6 +73,18 @@ pub struct EbpfConfig {
     /// Automatically offload DIRECT domains/IPs to eBPF map for fast path forwarding.
     #[serde(default = "default_true", rename = "auto-direct-offload")]
     pub auto_direct_offload: bool,
+
+    /// Whether to proxy local machine originated traffic (default: true).
+    #[serde(default = "default_true", rename = "proxy-local")]
+    pub proxy_local: bool,
+
+    /// Process names (comm) to proxy for local traffic. If non-empty, only matching processes will be proxied.
+    #[serde(default, rename = "proxy-processes", alias = "proxy-process")]
+    pub proxy_processes: Vec<String>,
+
+    /// Process names (comm) to bypass for local traffic. Matching processes will be bypassed directly.
+    #[serde(default, rename = "bypass-processes", alias = "bypass-process")]
+    pub bypass_processes: Vec<String>,
 }
 
 fn default_tproxy_port() -> u16 {
@@ -120,6 +132,9 @@ impl Default for EbpfConfig {
             proxy_src_ips: Vec::new(),
             proxy_dst_ips: Vec::new(),
             auto_direct_offload: true,
+            proxy_local: true,
+            proxy_processes: Vec::new(),
+            bypass_processes: Vec::new(),
         }
     }
 }

@@ -598,15 +598,6 @@ impl AnyTlsClientSession {
             self.active_streams.fetch_add(1, Ordering::Relaxed);
         }
 
-        let synack_rx = if self.peer_version.load(Ordering::Relaxed) >= 2 {
-            let (tx, rx) = oneshot::channel();
-            let mut pending = self.pending_opens.lock();
-            pending.insert(stream_id, tx);
-            Some(rx)
-        } else {
-            None
-        };
-
         let mut dest_data = BytesMut::new();
         destination.write_buf(&mut dest_data);
         let dest_bytes = dest_data.freeze();
@@ -627,44 +618,6 @@ impl AnyTlsClientSession {
         } else {
             self.send_control_frame(Command::Syn, stream_id, Bytes::new())?;
             self.send_control_frame(Command::Psh, stream_id, dest_bytes)?;
-        }
-
-        if let Some(synack_rx) = synack_rx {
-            match tokio::time::timeout(std::time::Duration::from_secs(3), synack_rx)
-                .await
-            {
-                Ok(Ok(Ok(()))) => {
-                    debug!("AnyTLS stream {} opened (v2 synack ok)", stream_id);
-                }
-                Ok(Ok(Err(error))) => {
-                    let mut streams = self.streams.write();
-                    if streams.remove(&stream_id).is_some() {
-                        self.active_streams.fetch_sub(1, Ordering::Relaxed);
-                    }
-                    return Err(io::Error::new(
-                        io::ErrorKind::ConnectionRefused,
-                        format!("AnyTLS stream open failed: {}", error),
-                    ));
-                }
-                Ok(Err(_)) => {
-                    let mut streams = self.streams.write();
-                    if streams.remove(&stream_id).is_some() {
-                        self.active_streams.fetch_sub(1, Ordering::Relaxed);
-                    }
-                    return Err(io::Error::new(
-                        io::ErrorKind::ConnectionAborted,
-                        "AnyTLS stream open cancelled",
-                    ));
-                }
-                Err(_) => {
-                    let mut pending = self.pending_opens.lock();
-                    pending.remove(&stream_id);
-                    debug!(
-                        "AnyTLS stream {} synack timeout, assuming v1",
-                        stream_id
-                    );
-                }
-            }
         }
 
         let (stream_write_tx, mut stream_write_rx) =
