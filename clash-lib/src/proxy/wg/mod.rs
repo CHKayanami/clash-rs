@@ -264,14 +264,14 @@ impl OutboundHandler for Handler {
             inner
                 .device_manager
                 .look_up_dns(
-                    &sess.destination.host(),
+                    sess.destination.host_cow().as_ref(),
                     (server.parse::<IpAddr>().unwrap(), 53).into(),
                 )
                 .await
                 .ok_or(new_io_error("invalid remote address"))?
         } else {
             resolver
-                .resolve(&sess.destination.host(), false)
+                .resolve(sess.destination.host_cow().as_ref(), false)
                 .map_err(map_io_error)
                 .await?
                 .ok_or(new_io_error("invalid remote address"))?

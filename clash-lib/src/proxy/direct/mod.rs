@@ -73,7 +73,7 @@ impl OutboundHandler for Handler {
         resolver: ThreadSafeDNSResolver,
     ) -> std::io::Result<BoxedChainedStream> {
         let stream = dial_tcp_with_happy_eyeballs(
-            sess.destination.host().as_str(),
+            sess.destination.host_cow().as_ref(),
             sess.destination.port(),
             &resolver,
             sess.iface.as_ref(),
@@ -126,7 +126,7 @@ impl OutboundHandler for Handler {
         let s = connector
             .connect_stream(
                 resolver,
-                sess.destination.host().as_str(),
+                sess.destination.host_cow().as_ref(),
                 sess.destination.port(),
                 false,
                 sess.iface.as_ref(),

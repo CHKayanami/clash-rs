@@ -32,7 +32,7 @@ const UDP_DOMAIN_MAP_SWEEP_INTERVAL: Duration = Duration::from_secs(1);
 /// Maximum number of datagrams to batch drain on a single ready notification.
 const MAX_BATCH_RECV_PACKETS: usize = 16;
 
-const UDP_RECV_CHUNK_SIZE: usize = 64 * 1024;
+const UDP_RECV_CHUNK_SIZE: usize = 256 * 1024;
 const MAX_UDP_DATAGRAM_SIZE: usize = 65535;
 
 thread_local! {
@@ -42,14 +42,7 @@ thread_local! {
 #[inline]
 fn ensure_chunk_capacity(chunk_buf: &mut BytesMut) {
     if chunk_buf.capacity() - chunk_buf.len() < MAX_UDP_DATAGRAM_SIZE {
-        if chunk_buf.is_empty() {
-            let cap = chunk_buf.capacity();
-            if cap < UDP_RECV_CHUNK_SIZE {
-                chunk_buf.reserve(UDP_RECV_CHUNK_SIZE - cap);
-            }
-        } else {
-            *chunk_buf = BytesMut::with_capacity(UDP_RECV_CHUNK_SIZE);
-        }
+        *chunk_buf = BytesMut::with_capacity(UDP_RECV_CHUNK_SIZE);
     }
 }
 

@@ -146,6 +146,14 @@ impl SocksAddr {
         }
     }
 
+
+    pub fn host_cow(&self) -> std::borrow::Cow<'_, str> {
+        match self {
+            SocksAddr::Ip(ip) => std::borrow::Cow::Owned(ip.ip().to_string()),
+            SocksAddr::Domain(domain, _) => std::borrow::Cow::Borrowed(domain.as_str()),
+        }
+    }
+
     pub fn host(&self) -> String {
         match self {
             SocksAddr::Ip(ip) => ip.ip().to_string(),
@@ -492,7 +500,7 @@ impl Serialize for Session {
         );
         map.serialize_entry("destinationIP", &dest_ip_helper)?;
         map.serialize_entry("destinationPort", &self.destination.port())?;
-        map.serialize_entry("host", &self.destination.host())?;
+        map.serialize_entry("host", self.destination.host_cow().as_ref())?;
         map.serialize_entry("asn", &self.asn)?;
         map.serialize_entry("country", &self.country)?;
         map.serialize_entry("traffic_stats", &self.traffic_stats)?;

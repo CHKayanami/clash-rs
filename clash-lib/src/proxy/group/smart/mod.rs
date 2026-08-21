@@ -202,7 +202,7 @@ impl Handler {
             return None;
         }
 
-        let site = sess.destination.host();
+        let site = sess.destination.host_cow();
         let dest_ip = sess.destination.ip().map(|ip| ip.to_string());
 
         debug!(
@@ -442,7 +442,7 @@ impl Handler {
         sess: &Session,
         resolver: &ThreadSafeDNSResolver,
     ) -> io::Result<BoxedChainedStream> {
-        let site = sess.destination.host();
+        let site = sess.destination.host_cow();
         let dest_ip = sess.destination.ip().map(|ip| ip.to_string());
         let mut tried = HashSet::new();
         let mut retry_delay = 100; // Initial retry delay in ms

@@ -1,5 +1,5 @@
 use crate::Packet;
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 use log::trace;
 use std::net::SocketAddr;
 use tokio::sync::mpsc;
@@ -300,7 +300,7 @@ impl SplitWrite {
             packet.remote_addr
         );
 
-        let bytes = self.buf.split().freeze();
+        let bytes = Bytes::copy_from_slice(&self.buf);
 
         // UDP is inherently unreliable — drop the packet if the outbound
         // channel is full rather than blocking the UDP handler task.

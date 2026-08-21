@@ -321,7 +321,10 @@ impl RuleProvider for RuleProviderImpl {
     fn search(&self, sess: &Session) -> bool {
         let inner = self.inner.read().unwrap();
         match &inner.content {
-            RuleContent::Domain(set) => set.has(&sess.destination.host()),
+            RuleContent::Domain(set) => match sess.destination.domain() {
+                Some(domain) => set.has(domain),
+                None => false,
+            },
             // mirror the standalone IP-CIDR rule: prefer the locally resolved
             // IP, and never fall back to a placeholder address — doing so made
             // every domain connection match a provider containing 0.0.0.0/8.
