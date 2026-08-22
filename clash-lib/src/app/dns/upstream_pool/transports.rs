@@ -67,8 +67,14 @@ impl UpstreamPool {
     ) -> anyhow::Result<PooledTransport> {
         let dial = self.dial_context(entry, outbound);
         Ok(match entry.protocol {
-            DnsProtocol::Udp | DnsProtocol::Tcp => PooledTransport::Tcp(TcpPool::new(dial)),
-            DnsProtocol::Tls => PooledTransport::Dot(DotPool::new(dial)?),
+            DnsProtocol::Udp | DnsProtocol::Tcp => PooledTransport::Tcp(TcpPool::new_tracked(
+                dial,
+                Arc::clone(&self.active_transport_tasks),
+            )),
+            DnsProtocol::Tls => PooledTransport::Dot(DotPool::new_tracked(
+                dial,
+                Arc::clone(&self.active_transport_tasks),
+            )?),
             DnsProtocol::Https => PooledTransport::Doh(DohClient::new_tracked(
                 dial,
                 Arc::clone(&self.active_transport_tasks),

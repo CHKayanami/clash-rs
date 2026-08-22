@@ -2,6 +2,7 @@ use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use arc_swap::ArcSwapOption;
 use parking_lot::Mutex;
 use tokio::sync::Notify;
 
@@ -22,6 +23,7 @@ mod guards {
         }
 
         pub fn complete(mut self) {
+            self.slot.active.store(None);
             {
                 let mut inner = self.slot.inner.lock();
                 inner.state = SlotState::Closed;
@@ -37,6 +39,7 @@ mod guards {
             if !self.armed {
                 return;
             }
+            self.slot.active.store(None);
             {
                 let mut inner = self.slot.inner.lock();
                 if let SlotState::Closing { owner, .. } = &mut inner.state {
@@ -68,6 +71,7 @@ mod guards {
                 let mut inner = self.slot.inner.lock();
                 inner.state = SlotState::Ready(Arc::clone(&value));
             }
+            self.slot.active.store(Some(Arc::clone(&value)));
             self.armed = false;
             self.slot.changed.notify_waiters();
             value
@@ -79,6 +83,7 @@ mod guards {
         }
 
         fn record_failure(&self, message: Arc<str>) {
+            self.slot.active.store(None);
             {
                 let mut inner = self.slot.inner.lock();
                 if matches!(
@@ -126,6 +131,7 @@ struct SlotInner<T> {
 }
 
 pub struct LifecycleSlot<T> {
+    active: ArcSwapOption<T>,
     inner: Mutex<SlotInner<T>>,
     changed: Notify,
     init_count: AtomicUsize,
@@ -141,6 +147,7 @@ impl<T> Default for LifecycleSlot<T> {
 impl<T> LifecycleSlot<T> {
     pub fn new() -> Self {
         Self {
+            active: ArcSwapOption::new(None),
             inner: Mutex::new(SlotInner {
                 state: SlotState::Closed,
                 generation: 0,
@@ -165,6 +172,10 @@ impl<T> LifecycleSlot<T> {
         F: FnOnce() -> Fut,
         Fut: Future<Output = anyhow::Result<T>>,
     {
+        if let Some(ready) = self.active.load_full() {
+            return Ok(ready);
+        }
+
         let mut build = Some(build);
         let mut waited_generation = None;
         loop {
@@ -178,7 +189,11 @@ impl<T> LifecycleSlot<T> {
                     return Err(anyhow::anyhow!("{}", failure.message));
                 }
                 match &inner.state {
-                    SlotState::Ready(value) => return Ok(Arc::clone(value)),
+                    SlotState::Ready(value) => {
+                        let value = Arc::clone(value);
+                        self.active.store(Some(Arc::clone(&value)));
+                        return Ok(value);
+                    }
                     SlotState::Building { generation } => {
                         waited_generation = Some(*generation);
                         None
@@ -219,6 +234,7 @@ impl<T> LifecycleSlot<T> {
         F: FnOnce(Arc<T>) -> Fut,
         Fut: Future<Output = ()>,
     {
+        self.active.store(None);
         let mut close = Some(close);
         loop {
             let notified = self.changed.notified();
@@ -255,5 +271,73 @@ impl<T> LifecycleSlot<T> {
             guard.complete();
             return;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    use super::LifecycleSlot;
+
+    #[tokio::test]
+    async fn test_lifecycle_slot_fast_path_and_deduplication() {
+        let slot = Arc::new(LifecycleSlot::<String>::new());
+        let build_count = Arc::new(AtomicUsize::new(0));
+
+        let mut handles = Vec::new();
+        for _ in 0..10 {
+            let slot = Arc::clone(&slot);
+            let build_count = Arc::clone(&build_count);
+            handles.push(tokio::spawn(async move {
+                slot.acquire(|| async {
+                    build_count.fetch_add(1, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    Ok("connected".to_string())
+                })
+                .await
+            }));
+        }
+
+        for h in handles {
+            let res = h.await.unwrap().unwrap();
+            assert_eq!(*res, "connected");
+        }
+
+        // Only 1 build should have occurred (Singleflight)
+        assert_eq!(build_count.load(Ordering::SeqCst), 1);
+        assert_eq!(slot.init_count(), 1);
+
+        // Fast-path test: acquiring again should return immediately without calling initializer
+        let res = slot
+            .acquire(|| async { panic!("Should hit fast-path!") })
+            .await
+            .unwrap();
+        assert_eq!(*res, "connected");
+
+        // Close test
+        let closed = Arc::new(AtomicUsize::new(0));
+        let closed_clone = Arc::clone(&closed);
+        slot.close(|val| async move {
+            assert_eq!(*val, "connected");
+            closed_clone.fetch_add(1, Ordering::SeqCst);
+        })
+        .await;
+
+        assert_eq!(closed.load(Ordering::SeqCst), 1);
+        assert_eq!(slot.close_count(), 1);
+
+        // Next acquire should trigger re-initialization
+        let res = slot
+            .acquire(|| async {
+                build_count.fetch_add(1, Ordering::SeqCst);
+                Ok("reconnected".to_string())
+            })
+            .await
+            .unwrap();
+        assert_eq!(*res, "reconnected");
+        assert_eq!(build_count.load(Ordering::SeqCst), 2);
     }
 }
