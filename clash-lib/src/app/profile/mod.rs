@@ -35,9 +35,13 @@ impl ThreadSafeCacheFile {
                 let store = store_clone;
                 loop {
                     tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
-                    let r = store.read().await;
-                    let db = r.db.clone();
-                    drop(r);
+                    let mut g = store.write().await;
+                    if !g.is_dirty() {
+                        continue;
+                    }
+                    let db = g.db.clone();
+                    g.set_dirty(false);
+                    drop(g);
 
                     let s = match serde_yaml::to_string(&db) {
                         Ok(s) => s,
@@ -128,6 +132,7 @@ struct CacheFile {
     db: Db,
 
     store_selected: bool,
+    dirty: bool,
 }
 
 impl CacheFile {
@@ -161,7 +166,19 @@ impl CacheFile {
             }
         };
 
-        Self { db, store_selected }
+        Self {
+            db,
+            store_selected,
+            dirty: false,
+        }
+    }
+
+    pub fn is_dirty(&self) -> bool {
+        self.dirty
+    }
+
+    pub fn set_dirty(&mut self, dirty: bool) {
+        self.dirty = dirty;
     }
 
     pub fn store_selected(&self) -> bool {
@@ -172,6 +189,7 @@ impl CacheFile {
         self.db
             .selected
             .insert(group.to_string(), server.to_string());
+        self.dirty = true;
     }
 
     pub fn get_selected_map(&self) -> HashMap<String, String> {
@@ -180,10 +198,12 @@ impl CacheFile {
 
     pub fn set_ip_to_host(&mut self, ip: &str, host: &str) {
         self.db.ip_to_host.insert(ip.to_string(), host.to_string());
+        self.dirty = true;
     }
 
     pub fn set_host_to_ip(&mut self, host: &str, ip: &str) {
         self.db.host_to_ip.insert(host.to_string(), ip.to_string());
+        self.dirty = true;
     }
 
     pub fn get_fake_ip(&self, ip_or_host: &str) -> Option<String> {
@@ -197,6 +217,7 @@ impl CacheFile {
     pub fn delete_fake_ip_pair(&mut self, ip: &str, host: &str) {
         self.db.ip_to_host.remove(ip);
         self.db.host_to_ip.remove(host);
+        self.dirty = true;
     }
 
     pub fn set_smart_stats(
@@ -205,6 +226,7 @@ impl CacheFile {
         stats: crate::proxy::group::smart::state::SmartStateData,
     ) {
         self.db.smart_stats.insert(group_name.to_string(), stats);
+        self.dirty = true;
     }
 
     pub fn get_smart_stats(

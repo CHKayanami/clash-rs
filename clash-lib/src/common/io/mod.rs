@@ -7,7 +7,7 @@ use std::{
     time::Duration,
 };
 
-use bytes::BytesMut;
+use bytes::{Buf, Bytes, BytesMut};
 use futures::ready;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
@@ -57,156 +57,42 @@ impl From<std::io::Error> for CopyBidirectionalError {
     }
 }
 
-const SMALL_BUFFER_THRESHOLD: usize = 16 * 1024;
-const INITIAL_COPY_BUFFER_SIZE: usize = 8 * 1024;
-const POOL_SHARDS: usize = 16;
-const BUFFER_POOL_MAX_SIZE_PER_SHARD: usize = 16;
-
-static SMALL_BUFFER_POOLS: std::sync::LazyLock<[std::sync::Mutex<Vec<BytesMut>>; POOL_SHARDS]> =
-    std::sync::LazyLock::new(|| std::array::from_fn(|_| std::sync::Mutex::new(Vec::new())));
-
-static LARGE_BUFFER_POOLS: std::sync::LazyLock<[std::sync::Mutex<Vec<BytesMut>>; POOL_SHARDS]> =
-    std::sync::LazyLock::new(|| std::array::from_fn(|_| std::sync::Mutex::new(Vec::new())));
+const TCP_RECV_CHUNK_SIZE: usize = 256 * 1024;
+const MIN_TCP_RECV_SIZE: usize = 16 * 1024;
 
 thread_local! {
-    static TLS_THREAD_SHARD: usize = {
-        static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % POOL_SHARDS
-    };
+    static TCP_RECV_CHUNK_BUF: std::cell::RefCell<BytesMut> = std::cell::RefCell::new(BytesMut::new());
 }
 
 #[inline]
-fn get_shard_index() -> usize {
-    TLS_THREAD_SHARD.with(|&idx| idx)
-}
-
-/// Pooled buffer that returns to pool on drop instead of deallocating (shoes-style RAII).
-#[derive(Debug)]
-pub struct PooledBuffer {
-    buffer: BytesMut,
-    shard: usize,
-    is_large: bool,
-}
-
-impl PooledBuffer {
-    /// Get a buffer from the pool or create a new one.
-    pub fn with_capacity(cap: usize) -> Self {
-        let is_large = cap > SMALL_BUFFER_THRESHOLD;
-        let shard = get_shard_index();
-        let pool_ref = if is_large {
-            &LARGE_BUFFER_POOLS[shard]
-        } else {
-            &SMALL_BUFFER_POOLS[shard]
-        };
-
-        if let Ok(mut pool) = pool_ref.lock() {
-            if let Some(mut buffer) = pool.pop() {
-                if buffer.capacity() < cap {
-                    buffer.reserve(cap - buffer.capacity());
-                }
-                unsafe {
-                    buffer.set_len(cap);
-                }
-                return Self {
-                    buffer,
-                    shard,
-                    is_large,
-                };
-            }
-        }
-        let mut buffer = BytesMut::with_capacity(cap);
-        unsafe {
-            buffer.set_len(cap);
-        }
-        Self {
-            buffer,
-            shard,
-            is_large,
-        }
-    }
-
-    #[inline]
-    #[allow(dead_code)]
-    pub fn len(&self) -> usize {
-        self.buffer.len()
-    }
-
-    #[inline]
-    #[allow(dead_code)]
-    pub fn is_empty(&self) -> bool {
-        self.buffer.is_empty()
+fn ensure_tcp_chunk_capacity(chunk_buf: &mut BytesMut, min_capacity: usize) {
+    if chunk_buf.capacity() - chunk_buf.len() < min_capacity {
+        *chunk_buf = BytesMut::with_capacity(TCP_RECV_CHUNK_SIZE.max(min_capacity));
     }
 }
 
-impl std::ops::Deref for PooledBuffer {
-    type Target = [u8];
-
-    #[inline]
-    fn deref(&self) -> &Self::Target {
-        &self.buffer[..]
-    }
-}
-
-impl std::ops::DerefMut for PooledBuffer {
-    #[inline]
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.buffer[..]
-    }
-}
-
-impl Drop for PooledBuffer {
-    fn drop(&mut self) {
-        let pool_ref = if self.is_large {
-            &LARGE_BUFFER_POOLS[self.shard]
-        } else {
-            &SMALL_BUFFER_POOLS[self.shard]
-        };
-
-        if let Ok(mut pool) = pool_ref.lock() {
-            if pool.len() < BUFFER_POOL_MAX_SIZE_PER_SHARD {
-                let mut buffer = std::mem::replace(&mut self.buffer, BytesMut::new());
-                buffer.clear();
-                pool.push(buffer);
-            }
-        }
-    }
-}
-
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct CopyBuffer {
     read_done: bool,
     need_flush: bool,
-    pos: usize,
-    cap: usize,
     amt: u64,
     target_cap: usize,
-    buf: PooledBuffer,
+    pending_write: Bytes,
 }
 
 impl CopyBuffer {
     #[allow(unused)]
     pub fn new() -> Self {
-        Self {
-            read_done: false,
-            need_flush: false,
-            pos: 0,
-            cap: 0,
-            amt: 0,
-            target_cap: 2 * 1024,
-            buf: PooledBuffer::with_capacity(2 * 1024),
-        }
+        Self::new_with_capacity(64 * 1024).unwrap()
     }
 
     pub fn new_with_capacity(target_cap: usize) -> Result<Self, std::io::Error> {
-        let initial_size = target_cap.min(INITIAL_COPY_BUFFER_SIZE);
         Ok(Self {
             read_done: false,
             need_flush: false,
-            pos: 0,
-            cap: 0,
             amt: 0,
             target_cap,
-            buf: PooledBuffer::with_capacity(initial_size),
+            pending_write: Bytes::new(),
         })
     }
 
@@ -226,57 +112,75 @@ impl CopyBuffer {
         W: AsyncWrite + ?Sized,
     {
         loop {
-            // If our buffer is empty, then we need to read some data to
-            // continue.
-            if self.pos == self.cap && !self.read_done {
-                // If previous read filled the entire buffer, jump directly to target_cap in a single step
-                if self.cap == self.buf.len() && self.buf.len() < self.target_cap {
-                    self.buf = PooledBuffer::with_capacity(self.target_cap);
-                }
+            // 1. If our buffer has no pending write data, read more from the reader.
+            if self.pending_write.is_empty() && !self.read_done {
+                let target_cap = self.target_cap.max(MIN_TCP_RECV_SIZE);
 
-                let me = &mut *self;
-                let mut buf = ReadBuf::new(&mut me.buf[..]);
+                // Take the chunk buf out of TLS so the borrow doesn't span
+                // across poll_read (avoids RefCell panic on accidental re-entry).
+                let mut chunk_buf = TCP_RECV_CHUNK_BUF.with(|cell| cell.replace(BytesMut::new()));
+                ensure_tcp_chunk_capacity(&mut chunk_buf, target_cap);
 
-                match reader.as_mut().poll_read(cx, &mut buf) {
-                    Poll::Ready(Ok(_)) => (),
+                debug_assert_eq!(
+                    chunk_buf.len(), 0,
+                    "TCP_RECV_CHUNK_BUF invariant violated: len must be 0 before read"
+                );
+
+                let unfilled = chunk_buf.spare_capacity_mut();
+                let mut buf = ReadBuf::uninit(unfilled);
+
+                let read_result = match reader.as_mut().poll_read(cx, &mut buf) {
+                    Poll::Ready(Ok(())) => {
+                        let n = buf.filled().len();
+                        if n == 0 {
+                            Poll::Ready(Ok(None))
+                        } else {
+                            unsafe {
+                                chunk_buf.set_len(n);
+                            }
+                            let data = chunk_buf.split_to(n).freeze();
+                            Poll::Ready(Ok(Some(data)))
+                        }
+                    }
+                    Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
+                    Poll::Pending => Poll::Pending,
+                };
+
+                // Put the chunk buf back into TLS.
+                TCP_RECV_CHUNK_BUF.with(|cell| cell.replace(chunk_buf));
+
+                match read_result {
+                    Poll::Ready(Ok(Some(data))) => {
+                        self.pending_write = data;
+                        if let Some(last_active) = last_active.as_mut() {
+                            **last_active = tokio::time::Instant::now();
+                        }
+                    }
+                    Poll::Ready(Ok(None)) => {
+                        self.read_done = true;
+                    }
                     Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
                     Poll::Pending => {
-                        // Try flushing when the reader has no progress to avoid
-                        // deadlock when the reader
-                        // depends on buffered writer.
+                        // Flush buffered writer to avoid potential deadlock
                         if self.need_flush {
                             ready!(writer.as_mut().poll_flush(cx))?;
                             self.need_flush = false;
                         }
-
                         return Poll::Pending;
-                    }
-                }
-
-                let n = buf.filled().len();
-                if n == 0 {
-                    self.read_done = true;
-                } else {
-                    self.pos = 0;
-                    self.cap = n;
-                    if let Some(last_active) = last_active.as_mut() {
-                        **last_active = tokio::time::Instant::now();
                     }
                 }
             }
 
-            // If our buffer has some data, let's write it out!
-            while self.pos < self.cap {
-                let me = &mut *self;
-                let i =
-                    ready!(writer.as_mut().poll_write(cx, &me.buf[me.pos..me.cap]))?;
+            // 2. If we have pending slice to write, stream it out.
+            while !self.pending_write.is_empty() {
+                let i = ready!(writer.as_mut().poll_write(cx, &self.pending_write))?;
                 if i == 0 {
                     return Poll::Ready(Err(io::Error::new(
                         io::ErrorKind::WriteZero,
                         "write zero byte into writer",
                     )));
                 } else {
-                    self.pos += i;
+                    self.pending_write.advance(i);
                     self.amt += i as u64;
                     self.need_flush = true;
                     if let Some(last_active) = last_active.as_mut() {
@@ -285,17 +189,8 @@ impl CopyBuffer {
                 }
             }
 
-            // If pos larger than cap, this loop will never stop.
-            // In particular, user's wrong poll_write implementation returning
-            // incorrect written length may lead to thread blocking.
-            debug_assert!(
-                self.pos <= self.cap,
-                "writer returned length larger than input slice"
-            );
-
-            // If we've written all the data and we've seen EOF, flush out the
-            // data and finish the transfer.
-            if self.pos == self.cap && self.read_done {
+            // 3. If we've written all data and seen EOF, flush and complete transfer.
+            if self.pending_write.is_empty() && self.read_done {
                 ready!(writer.as_mut().poll_flush(cx))?;
                 return Poll::Ready(Ok(self.amt));
             }
@@ -627,24 +522,23 @@ mod tests {
     use std::io::Cursor;
 
     #[test]
-    fn test_copy_buffer_initial_capacity() {
+    fn test_copy_buffer_initialization() {
         let small = CopyBuffer::new_with_capacity(4096).unwrap();
-        assert_eq!(small.buf.len(), 4096);
         assert_eq!(small.target_cap, 4096);
+        assert_eq!(small.amount_transferred(), 0);
 
         let large = CopyBuffer::new_with_capacity(128 * 1024).unwrap();
-        assert_eq!(large.buf.len(), INITIAL_COPY_BUFFER_SIZE);
         assert_eq!(large.target_cap, 128 * 1024);
+        assert_eq!(large.amount_transferred(), 0);
     }
 
     #[tokio::test]
-    async fn test_copy_buffer_adaptive_grow() {
+    async fn test_copy_buffer_transfer() {
         let test_data = vec![0x42_u8; 64 * 1024];
         let mut reader = Cursor::new(test_data.clone());
         let mut writer = Vec::new();
 
         let mut copy_buf = CopyBuffer::new_with_capacity(64 * 1024).unwrap();
-        assert_eq!(copy_buf.buf.len(), 8192);
 
         let res = futures::future::poll_fn(|cx| {
             copy_buf.poll_copy(
@@ -659,21 +553,6 @@ mod tests {
         assert!(res.is_ok());
         assert_eq!(res.unwrap(), 64 * 1024);
         assert_eq!(writer, test_data);
-        // After transferring data larger than 8KB in full reads, buffer should have grown to target_cap
-        assert_eq!(copy_buf.buf.len(), 64 * 1024);
         assert_eq!(copy_buf.amount_transferred(), 64 * 1024);
-    }
-
-    #[test]
-    fn test_pooled_buffer_recycle() {
-        let buf = PooledBuffer::with_capacity(32 * 1024);
-        assert_eq!(buf.len(), 32 * 1024);
-        assert!(buf.buffer.capacity() >= 32 * 1024);
-        drop(buf);
-
-        // Can acquire again seamlessly
-        let buf2 = PooledBuffer::with_capacity(16 * 1024);
-        assert_eq!(buf2.len(), 16 * 1024);
-        drop(buf2);
     }
 }

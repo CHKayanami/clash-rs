@@ -508,79 +508,45 @@ impl Runner for TunRunner {
             let nat = system_nat.clone();
             let enable_tcp = cfg.enable_tcp;
             let mut fut_tun_dispatcher = async || {
-                while let Some(pkt) = tun_stream.next().await {
-                    match pkt {
-                        Ok(pkt) => {
-                            let packets: Vec<bytes::BytesMut> =
-                                if gso_enabled && pkt.len() > stack_mtu {
-                                    super::gso::split_gso_packet(pkt.into(), stack_mtu)
-                                } else {
-                                    vec![pkt]
-                                };
-
-                            for mut single_pkt in packets {
-                                if smoltcp::wire::IpVersion::of_packet(&single_pkt)
-                                    .is_ok()
-                                {
-                                    let is_tcp = match smoltcp::wire::IpVersion::of_packet(
-                                        &single_pkt,
-                                    )
-                                    .unwrap()
-                                    {
-                                        smoltcp::wire::IpVersion::Ipv4 => {
-                                            smoltcp::wire::Ipv4Packet::new_checked(
-                                                &single_pkt[..],
-                                            )
-                                            .map(|p| {
-                                                p.next_header()
-                                                    == smoltcp::wire::IpProtocol::Tcp
-                                            })
-                                            .unwrap_or(false)
-                                        }
-                                        smoltcp::wire::IpVersion::Ipv6 => {
-                                            smoltcp::wire::Ipv6Packet::new_checked(
-                                                &single_pkt[..],
-                                            )
-                                            .map(|p| {
-                                                p.next_header()
-                                                    == smoltcp::wire::IpProtocol::Tcp
-                                            })
-                                            .unwrap_or(false)
-                                        }
-                                    };
-
-                                    if is_tcp {
-                                        if !enable_tcp {
-                                            // TCP is disabled on TUN, drop incoming TCP packet
-                                            continue;
-                                        }
-
-                                        if use_system_stack {
-                                            if let Some(true) =
-                                                super::system_stack::process_system_tcp_packet(
-                                                    &mut single_pkt,
-                                                    v4_nat_info,
-                                                    v6_nat_info,
-                                                    &nat,
-                                                )
-                                            {
-                                                if let Err(e) = tun_tx_for_system_tcp
-                                                    .send(single_pkt.freeze())
-                                                    .await
-                                                {
-                                                    error!(
-                                                        "failed to write system TCP packet to tun channel: {}",
-                                                        e
-                                                    );
-                                                    break;
-                                                }
-                                                continue;
-                                            }
-                                        }
-                                    }
+                macro_rules! dispatch_pkt {
+                    ($single_pkt:expr) => {{
+                        let mut single_pkt = $single_pkt;
+                        if let Ok(version) = smoltcp::wire::IpVersion::of_packet(&single_pkt) {
+                            let is_tcp = match version {
+                                smoltcp::wire::IpVersion::Ipv4 => {
+                                    smoltcp::wire::Ipv4Packet::new_checked(&single_pkt[..])
+                                        .map(|p| p.next_header() == smoltcp::wire::IpProtocol::Tcp)
+                                        .unwrap_or(false)
                                 }
+                                smoltcp::wire::IpVersion::Ipv6 => {
+                                    smoltcp::wire::Ipv6Packet::new_checked(&single_pkt[..])
+                                        .map(|p| p.next_header() == smoltcp::wire::IpProtocol::Tcp)
+                                        .unwrap_or(false)
+                                }
+                            };
 
-                                if let Err(e) = stack_sink
+                            if is_tcp {
+                                if !enable_tcp {
+                                    // TCP disabled on TUN, drop incoming TCP packet
+                                } else if use_system_stack
+                                    && super::system_stack::process_system_tcp_packet(
+                                        &mut single_pkt,
+                                        v4_nat_info,
+                                        v6_nat_info,
+                                        &nat,
+                                    ) == Some(true)
+                                {
+                                    if let Err(e) = tun_tx_for_system_tcp
+                                        .send(single_pkt.freeze())
+                                        .await
+                                    {
+                                        error!(
+                                            "failed to write system TCP packet to tun channel: {}",
+                                            e
+                                        );
+                                        break;
+                                    }
+                                } else if let Err(e) = stack_sink
                                     .send(watfaq_netstack::Packet::new(single_pkt.freeze()))
                                     .await
                                 {
@@ -589,6 +555,38 @@ impl Runner for TunRunner {
                                         "tun stopped unexpectedly 1".to_string(),
                                     ));
                                 }
+                            } else if let Err(e) = stack_sink
+                                .send(watfaq_netstack::Packet::new(single_pkt.freeze()))
+                                .await
+                            {
+                                error!("failed to send pkt to stack: {}", e);
+                                return Err(Error::Operation(
+                                    "tun stopped unexpectedly 1".to_string(),
+                                ));
+                            }
+                        } else if let Err(e) = stack_sink
+                            .send(watfaq_netstack::Packet::new(single_pkt.freeze()))
+                            .await
+                        {
+                            error!("failed to send pkt to stack: {}", e);
+                            return Err(Error::Operation(
+                                "tun stopped unexpectedly 1".to_string(),
+                            ));
+                        }
+                    }};
+                }
+
+                while let Some(pkt) = tun_stream.next().await {
+                    match pkt {
+                        Ok(pkt) => {
+                            if gso_enabled && pkt.len() > stack_mtu {
+                                for single_pkt in
+                                    super::gso::split_gso_packet(pkt.into(), stack_mtu)
+                                {
+                                    dispatch_pkt!(single_pkt);
+                                }
+                            } else {
+                                dispatch_pkt!(pkt);
                             }
                         }
                         Err(e) => {
