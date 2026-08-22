@@ -4,19 +4,17 @@ use tracing::warn;
 use crate::{
     app::router::{GeoSiteMatcher, Router, RuleMatcher, ThreadSafeRuleProvider},
     common::trie,
-    dns::ThreadSafeDNSClient,
     session::{Session, SocksAddr},
 };
 
 pub struct NameServerPolicyContainer {
-    static_trie: trie::StringTrie<Vec<ThreadSafeDNSClient>>,
-    geosite_entries: Vec<(String, Vec<ThreadSafeDNSClient>)>,
-    ruleset_entries: Vec<(String, Vec<ThreadSafeDNSClient>)>,
+    static_trie: trie::StringTrie<Vec<String>>,
+    geosite_entries: Vec<(String, Vec<String>)>,
+    ruleset_entries: Vec<(String, Vec<String>)>,
     has_entries: bool,
 
-    geosite_matchers: OnceLock<Vec<(GeoSiteMatcher, Vec<ThreadSafeDNSClient>)>>,
-    bound_rule_providers:
-        OnceLock<Vec<(ThreadSafeRuleProvider, Vec<ThreadSafeDNSClient>)>>,
+    geosite_matchers: OnceLock<Vec<(GeoSiteMatcher, Vec<String>)>>,
+    bound_rule_providers: OnceLock<Vec<(ThreadSafeRuleProvider, Vec<String>)>>,
 }
 
 impl Default for NameServerPolicyContainer {
@@ -37,8 +35,8 @@ impl NameServerPolicyContainer {
         }
     }
 
-    pub fn insert(&mut self, domain_key: &str, clients: Vec<ThreadSafeDNSClient>) {
-        let clients = Arc::new(clients);
+    pub fn insert(&mut self, domain_key: &str, upstreams: Vec<String>) {
+        let upstreams = Arc::new(upstreams);
         for sub in domain_key.split(',') {
             let sub = sub.trim();
             if sub.is_empty() {
@@ -48,12 +46,12 @@ impl NameServerPolicyContainer {
 
             if let Some(code) = sub.strip_prefix("geosite:") {
                 self.geosite_entries
-                    .push((code.to_owned(), (*clients).clone()));
+                    .push((code.to_owned(), (*upstreams).clone()));
             } else if let Some(rs_name) = sub.strip_prefix("rule-set:") {
                 self.ruleset_entries
-                    .push((rs_name.to_owned(), (*clients).clone()));
+                    .push((rs_name.to_owned(), (*upstreams).clone()));
             } else {
-                self.static_trie.insert(sub, clients.clone());
+                self.static_trie.insert(sub, upstreams.clone());
             }
         }
     }
@@ -66,13 +64,13 @@ impl NameServerPolicyContainer {
         if !self.geosite_entries.is_empty() {
             let mut matchers = Vec::new();
             if let Some(geodata) = router.geodata() {
-                for (code, clients) in &self.geosite_entries {
+                for (code, upstreams) in &self.geosite_entries {
                     match GeoSiteMatcher::new(
                         code.clone(),
                         format!("nameserver-policy geosite:{}", code),
                         Some(geodata),
                     ) {
-                        Ok(matcher) => matchers.push((matcher, clients.clone())),
+                        Ok(matcher) => matchers.push((matcher, upstreams.clone())),
                         Err(e) => {
                             warn!(
                                 "nameserver-policy failed to create geosite matcher for {}: {}",
@@ -92,9 +90,9 @@ impl NameServerPolicyContainer {
         if !self.ruleset_entries.is_empty() {
             let mut providers = Vec::new();
             let rp_map = router.get_rule_providers();
-            for (rs_name, clients) in &self.ruleset_entries {
+            for (rs_name, upstreams) in &self.ruleset_entries {
                 if let Some(rp) = rp_map.get(rs_name) {
-                    providers.push((rp.clone(), clients.clone()));
+                    providers.push((rp.clone(), upstreams.clone()));
                 } else {
                     warn!(
                         "nameserver-policy rule-set provider not found: {}",
@@ -106,30 +104,28 @@ impl NameServerPolicyContainer {
         }
     }
 
-    pub fn search(&self, domain: &str) -> Option<&Vec<ThreadSafeDNSClient>> {
-        if let Some(node) = self.static_trie.search(domain) {
-            if let Some(clients) = node.get_data() {
-                return Some(clients);
-            }
+    pub fn match_policy(&self, domain: &str) -> Option<&[String]> {
+        if let Some(res) = self.static_trie.search(domain) {
+            return res.get_data().map(|v| v.as_slice());
         }
 
         let sess = Session {
-            destination: SocksAddr::Domain(domain.to_owned(), 53),
+            destination: SocksAddr::Domain(domain.to_owned(), 0),
             ..Default::default()
         };
 
         if let Some(matchers) = self.geosite_matchers.get() {
-            for (matcher, clients) in matchers {
+            for (matcher, upstreams) in matchers {
                 if matcher.apply(&sess) {
-                    return Some(clients);
+                    return Some(upstreams.as_slice());
                 }
             }
         }
 
         if let Some(providers) = self.bound_rule_providers.get() {
-            for (rp, clients) in providers {
+            for (rp, upstreams) in providers {
                 if rp.search(&sess) {
-                    return Some(clients);
+                    return Some(upstreams.as_slice());
                 }
             }
         }
@@ -145,10 +141,12 @@ mod tests {
     #[test]
     fn test_nameserver_policy_container_basic() {
         let mut container = NameServerPolicyContainer::new();
-        container.insert("+.example.com, geosite:cn, rule-set:adblock", vec![]);
+        container.insert("+.example.com, geosite:cn, rule-set:adblock", vec!["8.8.8.8".to_string()]);
 
         assert!(!container.is_empty());
-        assert!(container.search("test.example.com").is_some());
-        assert!(container.search("other.com").is_none());
+        let matched = container.match_policy("test.example.com");
+        assert!(matched.is_some());
+        assert_eq!(matched.unwrap(), &["8.8.8.8".to_string()]);
+        assert!(container.match_policy("other.com").is_none());
     }
 }

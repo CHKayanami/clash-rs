@@ -1,4 +1,4 @@
-use tracing::{debug, trace, warn};
+use tracing::{debug, warn};
 
 use crate::app::dns::ThreadSafeDNSResolver;
 
@@ -32,43 +32,26 @@ pub async fn handle_tcp_dns(
             break;
         }
 
-        match hickory_proto::op::Message::from_vec(&query_buf) {
-            Ok(msg) => {
-                trace!("eBPF intercepted TCP DNS query: {:?}", msg);
-                match crate::app::dns::exchange_with_resolver(&resolver, &msg, true).await {
-                    Ok(mut resp) => {
-                        resp.metadata.id = msg.metadata.id;
-
-                        match resp.to_vec() {
-                            Ok(resp_bytes) => {
-                                let resp_len = (resp_bytes.len() as u16).to_be_bytes();
-                                if let Err(e) = stream.write_all(&resp_len).await {
-                                    debug!("failed to write TCP DNS response length: {e}");
-                                    break;
-                                }
-                                if let Err(e) = stream.write_all(&resp_bytes).await {
-                                    debug!("failed to write TCP DNS response body: {e}");
-                                    break;
-                                }
-                                if let Err(e) = stream.flush().await {
-                                    debug!("failed to flush TCP DNS response: {e}");
-                                    break;
-                                }
-                            }
-                            Err(e) => {
-                                warn!("failed to serialize TCP DNS response: {e}");
-                                break;
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        warn!("failed to exchange TCP DNS query with resolver: {e}");
-                        break;
-                    }
+        match crate::app::dns::exchange_with_resolver(&resolver, &query_buf, true)
+            .await
+        {
+            Ok(resp_bytes) => {
+                let resp_len = (resp_bytes.len() as u16).to_be_bytes();
+                if let Err(e) = stream.write_all(&resp_len).await {
+                    debug!("failed to write TCP DNS response length: {e}");
+                    break;
+                }
+                if let Err(e) = stream.write_all(&resp_bytes).await {
+                    debug!("failed to write TCP DNS response body: {e}");
+                    break;
+                }
+                if let Err(e) = stream.flush().await {
+                    debug!("failed to flush TCP DNS response: {e}");
+                    break;
                 }
             }
             Err(e) => {
-                warn!("failed to parse TCP DNS query message: {e}");
+                warn!("failed to exchange TCP DNS query with resolver: {e}");
                 break;
             }
         }

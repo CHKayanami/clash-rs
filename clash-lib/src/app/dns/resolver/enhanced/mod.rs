@@ -3,48 +3,42 @@ mod policy;
 #[cfg(test)]
 mod tests;
 
-pub use cache::{CacheLookup, DnsCache};
+pub use cache::{CacheLookup, DnsCache, SERVE_STALE_WIRE_TTL};
 pub use policy::NameServerPolicyContainer;
 
-use crate::{
-    Error,
-    app::{
-        dns::helper::build_dns_response_message, profile::ThreadSafeCacheFile,
-        router::Router,
-    },
-    common::trie,
-    config::def::DNSMode,
-    dns::{
-        ClashResolver, Config, DnsResolutionHook, ResolverKind, RuleDispatch,
-        ThreadSafeDNSClient, ThreadSafeDnsCollector,
-        fakeip::{self, FileStore, InMemStore, ThreadSafeFakeDns},
-        filters::{BlackDomainFilter, DomainFilter, FallbackFilter, PendingMmdb},
-        helper::make_clients,
-        parse_ip_literal,
-    },
-};
+use std::collections::HashMap;
+use std::net::{self, IpAddr, Ipv4Addr, Ipv6Addr};
+use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
+
 use anyhow::anyhow;
 use async_trait::async_trait;
-use futures::{FutureExt, TryFutureExt};
-use hickory_proto::{
-    op::{self, Message, Query, ResponseCode},
-    rr::{
-        self, RData, Record, RecordType,
-        rdata::{A, AAAA},
-    },
-};
-use rand::seq::IndexedRandom;
+use rand::seq::IteratorRandom;
+use tracing::{debug, instrument, trace};
 
-use std::{
-    net,
-    sync::{
-        Arc, OnceLock,
-        atomic::{AtomicBool, Ordering::Relaxed},
-    },
-    time::{Duration, Instant},
+use crate::app::dns::config::{Config, NameServer};
+use crate::app::dns::fakeip::{self, FileStore, InMemStore, ThreadSafeFakeDns};
+use crate::app::dns::filters::{BlackDomainFilter, DomainFilter, FallbackFilter, PendingMmdb};
+use crate::app::dns::query::{DnsName, QType, QueryContext, build_dns_query_wire};
+use crate::app::dns::response::{
+    ResponseTemplate, build_dns_ip_response, build_dns_nxdomain,
 };
-
-use tracing::{debug, error, instrument, trace, warn};
+use crate::app::dns::singleflight::{FlightKey, FlightRole, Singleflight};
+use crate::app::dns::upstream_pool::{UpstreamEntry, UpstreamPool};
+use crate::app::dns::wire::{
+    extract_ips_from_dns_response, extract_min_ttl_from_dns_response, rewrite_dns_response_ttl,
+};
+use crate::app::dns::{
+    ClashResolver, DnsResolutionHook, ResolverKind, RuleDispatch, ThreadSafeDnsCollector,
+    parse_ip_literal,
+};
+use crate::app::profile::ThreadSafeCacheFile;
+use crate::app::router::Router;
+use crate::common::trie;
+use crate::config::def::DNSMode;
+use crate::proxy::utils::OutboundHandlerRegistry;
+use crate::Error;
 
 #[derive(Clone)]
 pub struct EnhancedResolver {
@@ -61,15 +55,16 @@ impl std::ops::Deref for EnhancedResolver {
 pub struct EnhancedResolverInner {
     ipv6: AtomicBool,
     hosts: Option<trie::StringTrie<net::IpAddr>>,
-    main: Vec<ThreadSafeDNSClient>,
+    pool: Arc<UpstreamPool>,
+    main_upstreams: Vec<String>,
 
-    fallback: Option<Vec<ThreadSafeDNSClient>>,
+    fallback_upstreams: Option<Vec<String>>,
     fallback_filter: Option<FallbackFilter>,
 
     lru_cache: Option<DnsCache>,
     policy: Option<NameServerPolicyContainer>,
 
-    proxy_resolver: Option<Vec<ThreadSafeDNSClient>>,
+    proxy_upstreams: Option<Vec<String>>,
     proxy_server_domains: Option<trie::StringTrie<bool>>,
 
     fake_dns: Option<ThreadSafeFakeDns>,
@@ -79,506 +74,248 @@ pub struct EnhancedResolverInner {
     black_domain_filter: Option<BlackDomainFilter>,
     collector: Option<ThreadSafeDnsCollector>,
 
+    singleflight: Singleflight,
     optimistic_cache_ttl: u32,
     stale_cache_retention: Duration,
     fixed_domain_ttl: Option<trie::StringTrie<u32>>,
-    revalidate_inflight: Arc<dashmap::DashSet<String>>,
     resolution_hook: OnceLock<DnsResolutionHook>,
 }
 
 impl EnhancedResolver {
-    /// For testing purpose
-    #[cfg(test)]
-    pub async fn new_default() -> Self {
-        use std::net::Ipv4Addr;
-
-        use crate::app::dns::config::NameServer;
-        use crate::app::dns::dns_client::DNSNetMode;
-
-        Self {
-            inner: Arc::new(EnhancedResolverInner {
-                ipv6: AtomicBool::new(false),
-                hosts: None,
-                main: make_clients(
-                    vec![NameServer {
-                        net: DNSNetMode::Udp,
-                        host: url::Host::Ipv4(Ipv4Addr::from_octets([8, 8, 8, 8])),
-                        port: 53,
-                        interface: None,
-                        proxy: None,
-                    }],
-                    None,
-                    Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
-                    None,
-                    None,
-                    None,
-                )
-                .await,
-                fallback: None,
-                fallback_filter: None,
-                lru_cache: None,
-                policy: None,
-
-                proxy_resolver: None,
-                proxy_server_domains: None,
-
-                fake_dns: None,
-                fake_ip_ttl: 1,
-
-                reverse_lookup_cache: None,
-                black_domain_filter: None,
-                collector: None,
-
-                optimistic_cache_ttl: 0,
-                stale_cache_retention: Duration::from_secs(3600),
-                fixed_domain_ttl: None,
-                revalidate_inflight: Arc::new(dashmap::DashSet::new()),
-                resolution_hook: OnceLock::new(),
-            }),
-        }
-    }
-
-    #[cfg(test)]
-    pub async fn new_with_cache_for_test(cache: DnsCache) -> Self {
-        Self {
-            inner: Arc::new(EnhancedResolverInner {
-                ipv6: AtomicBool::new(false),
-                hosts: None,
-                main: vec![],
-                fallback: None,
-                fallback_filter: None,
-                lru_cache: Some(cache),
-                policy: None,
-                proxy_resolver: None,
-                proxy_server_domains: None,
-                fake_dns: None,
-                fake_ip_ttl: 1,
-                reverse_lookup_cache: None,
-                black_domain_filter: None,
-                collector: None,
-                optimistic_cache_ttl: 0,
-                stale_cache_retention: Duration::from_secs(3600),
-                fixed_domain_ttl: None,
-                revalidate_inflight: Arc::new(dashmap::DashSet::new()),
-                resolution_hook: OnceLock::new(),
-            }),
-        }
-    }
-
-    #[cfg(test)]
-    pub async fn new_fake_dns_for_test(fake_ip_ttl: u32, fake_dns: ThreadSafeFakeDns) -> Self {
-        Self {
-            inner: Arc::new(EnhancedResolverInner {
-                ipv6: AtomicBool::new(false),
-                hosts: None,
-                main: vec![],
-                fallback: None,
-                fallback_filter: None,
-                lru_cache: None,
-                policy: None,
-                proxy_resolver: None,
-                proxy_server_domains: None,
-                fake_dns: Some(fake_dns),
-                fake_ip_ttl,
-                reverse_lookup_cache: None,
-                black_domain_filter: None,
-                collector: None,
-                optimistic_cache_ttl: 0,
-                stale_cache_retention: Duration::from_secs(3600),
-                fixed_domain_ttl: None,
-                revalidate_inflight: Arc::new(dashmap::DashSet::new()),
-                resolution_hook: OnceLock::new(),
-            }),
-        }
-    }
-
     pub async fn new(
         cfg: Config,
         store: ThreadSafeCacheFile,
         mmdb: Option<PendingMmdb>,
-        outbounds: crate::proxy::utils::OutboundHandlerRegistry,
+        outbounds: OutboundHandlerRegistry,
         rule_dispatch: Option<Arc<RuleDispatch>>,
         collector: Option<ThreadSafeDnsCollector>,
     ) -> Self {
-        let edns_client_subnet = cfg.edns_client_subnet.clone();
+        let mut entries = HashMap::new();
 
-        let default_resolver = Arc::new(EnhancedResolver {
-            inner: Arc::new(EnhancedResolverInner {
-                ipv6: AtomicBool::new(false),
-                hosts: None,
-                main: make_clients(
-                    cfg.default_nameserver.clone(),
-                    None,
-                    Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
-                    edns_client_subnet.clone(),
-                    cfg.fw_mark,
-                    // default-nameserver is the bootstrap path used to resolve
-                    // DoH/DoT hostnames — it MUST NOT go through the rule engine.
-                    None,
-                )
-                .await,
-                fallback: None,
-                fallback_filter: None,
-                lru_cache: None,
-                policy: None,
-
-                proxy_resolver: None,
-                proxy_server_domains: None,
-
-                fake_dns: None,
-                fake_ip_ttl: cfg.fake_ip_ttl,
-
-                reverse_lookup_cache: None,
-                black_domain_filter: None,
-                collector: None,
-
-                optimistic_cache_ttl: 0,
-                stale_cache_retention: Duration::from_secs(3600),
-                fixed_domain_ttl: None,
-                revalidate_inflight: Arc::new(dashmap::DashSet::new()),
-                resolution_hook: OnceLock::new(),
-            }),
-        });
-
-        let proxy_resolver = if let Some(proxy_resolver) = cfg.proxy_server_nameserver {
-            let clients = make_clients(
-                proxy_resolver,
-                Some(default_resolver.clone()),
-                Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
-                edns_client_subnet.clone(),
-                cfg.fw_mark,
-                // proxy-server-nameserver resolves the proxies themselves;
-                // routing it through rules would create a bootstrap cycle.
-                None,
-            )
-            .await;
-            if clients.is_empty() {
-                warn!(
-                    "no usable proxy-server-nameserver clients were \
-                         initialized; proxy server domain resolution will fall \
-                         back to the main nameservers"
-                );
-                None
-            } else {
-                Some(clients)
+        let register_upstream = |ns: &NameServer, entries: &mut HashMap<String, UpstreamEntry>| -> Option<String> {
+            let key = ns.to_string();
+            if !entries.contains_key(&key) {
+                if let Ok(mut entry) = UpstreamEntry::from_nameserver(ns, None) {
+                    entry.ecs = cfg.edns_client_subnet.clone();
+                    entries.insert(key.clone(), entry);
+                }
             }
+            if entries.contains_key(&key) {
+                Some(key)
+            } else {
+                None
+            }
+        };
+
+        // 1. Default / Bootstrap resolver
+        let mut default_entries = HashMap::new();
+        let mut default_upstreams = Vec::new();
+        for ns in &cfg.default_nameserver {
+            if let Some(key) = register_upstream(ns, &mut default_entries) {
+                if !default_upstreams.contains(&key) {
+                    default_upstreams.push(key);
+                }
+            }
+        }
+        let bootstrap_resolver: Option<Arc<dyn ClashResolver>> = if !default_upstreams.is_empty() {
+            let default_pool = UpstreamPool::new(
+                default_entries,
+                outbounds.clone(),
+                None,
+                cfg.fw_mark,
+                None,
+                None,
+            );
+            Some(Arc::new(BootstrapResolver {
+                pool: default_pool,
+                upstreams: default_upstreams,
+            }))
         } else {
             None
         };
 
-        // Build proxy server domains trie for proxy-server-nameserver resolution.
-        // This happens before the OutboundManager is fully initialized, so we can
-        // only extract domains from plain outbounds.
+        // 2. Main nameservers
+        let mut main_upstreams = Vec::new();
+        for ns in &cfg.nameserver {
+            if let Some(key) = register_upstream(ns, &mut entries) {
+                if !main_upstreams.contains(&key) {
+                    main_upstreams.push(key);
+                }
+            }
+        }
+
+        // 3. Fallback nameservers
+        let mut fallback_upstreams = Vec::new();
+        for ns in &cfg.fallback {
+            if let Some(key) = register_upstream(ns, &mut entries) {
+                if !fallback_upstreams.contains(&key) {
+                    fallback_upstreams.push(key);
+                }
+            }
+        }
+
+        // 4. Policy nameservers
+        let mut policy_container = NameServerPolicyContainer::new();
+        for (domain, nss) in &cfg.nameserver_policy {
+            let mut policy_ups = Vec::new();
+            for ns in nss {
+                if let Some(key) = register_upstream(ns, &mut entries) {
+                    if !policy_ups.contains(&key) {
+                        policy_ups.push(key);
+                    }
+                }
+            }
+            if !policy_ups.is_empty() {
+                policy_container.insert(domain, policy_ups);
+            }
+        }
+
+        // 5. Proxy server nameservers
+        let mut proxy_upstreams = Vec::new();
+        if let Some(ref p_ns) = cfg.proxy_server_nameserver {
+            for ns in p_ns {
+                if let Some(key) = register_upstream(ns, &mut entries) {
+                    if !proxy_upstreams.contains(&key) {
+                        proxy_upstreams.push(key);
+                    }
+                }
+            }
+        }
+
         let proxy_server_domains = {
             let plain_outbounds = outbounds.read();
-            plain_outbounds
-                .values()
-                .filter_map(|x| x.server_name().map(|s| s.to_owned()))
-                .collect::<Vec<String>>()
-        };
-
-        let proxy_server_domains_trie =
-            if proxy_resolver.is_some() && !proxy_server_domains.is_empty() {
-                let mut domains = trie::StringTrie::new();
-                for server in &proxy_server_domains {
-                    domains.insert(server, Arc::new(true));
-                    debug!("added proxy server domain: {}", server);
+            let mut domains = trie::StringTrie::new();
+            let mut has_domain = false;
+            for x in plain_outbounds.values() {
+                if let Some(s) = x.server_name() {
+                    domains.insert(s, Arc::new(true));
+                    debug!("added proxy server domain: {}", s);
+                    has_domain = true;
                 }
+            }
+            if has_domain && !proxy_upstreams.is_empty() {
                 Some(domains)
             } else {
                 None
-            };
+            }
+        };
+
+        let pool = UpstreamPool::new(
+            entries,
+            outbounds.clone(),
+            bootstrap_resolver,
+            cfg.fw_mark,
+            None,
+            rule_dispatch,
+        );
+
+        let fake_dns = match cfg.enhance_mode {
+            DNSMode::FakeIp => Some(Arc::new(
+                fakeip::FakeDns::new(fakeip::Opts {
+                    ipnet: cfg.fake_ip_range,
+                    ipnet6: cfg.fake_ip_range6,
+                    domain_filter: if cfg.fake_ip_filter.is_empty() {
+                        None
+                    } else {
+                        Some(DomainFilter::new(cfg.fake_ip_filter))
+                    },
+                    filter_mode: cfg.fake_ip_filter_mode,
+                    store: if cfg.store_fake_ip {
+                        Box::new(FileStore::new(store))
+                    } else {
+                        Box::new(InMemStore::new(1000))
+                    },
+                })
+                .expect("failed to create fake ip"),
+            )),
+            _ => None,
+        };
+
+        let fallback_filter = {
+            let filter = FallbackFilter::new(
+                &cfg.fallback_filter.domain,
+                &cfg.fallback_filter.ip_cidr,
+                cfg.fallback_filter.geo_ip,
+                &cfg.fallback_filter.geo_ip_code,
+                mmdb,
+            );
+            if filter.is_empty() {
+                None
+            } else {
+                Some(filter)
+            }
+        };
+
+        let black_domain_filter = if !cfg.black_filter.is_empty() {
+            Some(BlackDomainFilter::new(cfg.black_filter))
+        } else {
+            None
+        };
+
+        let reverse_lookup_cache = match cfg.enhance_mode {
+            DNSMode::RedirHost => Some(
+                moka::future::Cache::builder()
+                    .max_capacity(4096)
+                    .time_to_idle(Duration::from_secs(300))
+                    .build(),
+            ),
+            _ => None,
+        };
+
+        let fixed_domain_ttl = if !cfg.fixed_domain_ttl.is_empty() {
+            let mut trie = trie::StringTrie::new();
+            for (domain, ttl) in cfg.fixed_domain_ttl {
+                trie.insert(&domain, Arc::new(ttl));
+            }
+            Some(trie)
+        } else {
+            None
+        };
 
         let inner = Arc::new(EnhancedResolverInner {
             ipv6: AtomicBool::new(cfg.ipv6),
-            main: make_clients(
-                cfg.nameserver.clone(),
-                Some(default_resolver.clone()),
-                outbounds.clone(),
-                edns_client_subnet.clone(),
-                cfg.fw_mark,
-                rule_dispatch.clone(),
-            )
-            .await,
             hosts: cfg.hosts,
-            fallback: if !cfg.fallback.is_empty() {
-                Some(
-                    make_clients(
-                        cfg.fallback.clone(),
-                        Some(default_resolver.clone()),
-                        outbounds.clone(),
-                        edns_client_subnet.clone(),
-                        cfg.fw_mark,
-                        rule_dispatch.clone(),
-                    )
-                    .await,
-                )
-            } else {
+            pool,
+            main_upstreams,
+            fallback_upstreams: if fallback_upstreams.is_empty() {
                 None
+            } else {
+                Some(fallback_upstreams)
             },
-            fallback_filter: {
-                let filter = FallbackFilter::new(
-                    &cfg.fallback_filter.domain,
-                    &cfg.fallback_filter.ip_cidr,
-                    cfg.fallback_filter.geo_ip,
-                    &cfg.fallback_filter.geo_ip_code,
-                    mmdb,
-                );
-                if filter.is_empty() {
-                    None
-                } else {
-                    Some(filter)
-                }
-            },
+            fallback_filter,
             lru_cache: Some(DnsCache::new(4096)),
-            policy: if !cfg.nameserver_policy.is_empty() {
-                let mut container = NameServerPolicyContainer::new();
-                for (domain, ns) in &cfg.nameserver_policy {
-                    let clients = make_clients(
-                        ns.clone(),
-                        Some(default_resolver.clone()),
-                        outbounds.clone(),
-                        edns_client_subnet.clone(),
-                        cfg.fw_mark,
-                        rule_dispatch.clone(),
-                    )
-                    .await;
-                    container.insert(domain, clients);
-                }
-                if container.is_empty() {
-                    None
-                } else {
-                    Some(container)
-                }
-            } else {
+            policy: if policy_container.is_empty() {
                 None
-            },
-            fake_dns: match cfg.enhance_mode {
-                DNSMode::FakeIp => Some(Arc::new(
-                    fakeip::FakeDns::new(fakeip::Opts {
-                        ipnet: cfg.fake_ip_range,
-                        ipnet6: cfg.fake_ip_range6,
-                        domain_filter: if !cfg.fake_ip_filter.is_empty() {
-                            Some(DomainFilter::new(&cfg.fake_ip_filter))
-                        } else {
-                            None
-                        },
-                        filter_mode: cfg.fake_ip_filter_mode,
-                        store: if cfg.store_fake_ip {
-                            Box::new(FileStore::new(store))
-                        } else {
-                            Box::new(InMemStore::new(1000))
-                        },
-                    })
-                    .unwrap(),
-                )),
-                _ => None,
-            },
-
-            proxy_resolver,
-            proxy_server_domains: proxy_server_domains_trie,
-
-            reverse_lookup_cache: Some(
-                moka::future::Cache::builder()
-                    .max_capacity(4096)
-                    .time_to_live(Duration::from_secs(3)) /* should be shorter than TTL so
-                                                          * client won't be connecting to a
-                                                          * different server after the ip is
-                                                          * reverse mapped to hostname and
-                                                          * being resolved again */
-                    .build(),
-            ),
-            black_domain_filter: if !cfg.black_filter.is_empty() {
-                Some(BlackDomainFilter::new(&cfg.black_filter))
             } else {
-                None
+                Some(policy_container)
             },
-            collector,
+            proxy_upstreams: if proxy_upstreams.is_empty() {
+                None
+            } else {
+                Some(proxy_upstreams)
+            },
+            proxy_server_domains,
+            fake_dns,
             fake_ip_ttl: cfg.fake_ip_ttl,
+            reverse_lookup_cache,
+            black_domain_filter,
+            collector,
+            singleflight: Singleflight::new(),
             optimistic_cache_ttl: cfg.optimistic_cache_ttl,
             stale_cache_retention: Duration::from_secs(cfg.stale_cache_retention as u64),
-            fixed_domain_ttl: if !cfg.fixed_domain_ttl.is_empty() {
-                let mut trie = trie::StringTrie::new();
-                for (domain, ttl) in &cfg.fixed_domain_ttl {
-                    trie.insert(domain, Arc::new(*ttl));
-                }
-                Some(trie)
-            } else {
-                None
-            },
-            revalidate_inflight: Arc::new(dashmap::DashSet::new()),
+            fixed_domain_ttl,
             resolution_hook: OnceLock::new(),
         });
 
         Self { inner }
     }
 
-    #[instrument(skip(message), level = "trace")]
-    pub async fn batch_exchange(
-        clients: &Vec<ThreadSafeDNSClient>,
-        message: &op::Message,
-    ) -> anyhow::Result<op::Message> {
-        if clients.is_empty() {
-            return Err(Error::DNSError("no DNS clients available for query".into()).into());
+    fn is_blacklisted(&self, host: &str) -> bool {
+        if let Some(bdf) = &self.black_domain_filter {
+            bdf.apply(host)
+        } else {
+            false
         }
-        let mut queries = Vec::new();
-        let domain = EnhancedResolver::domain_name_of_message(message).unwrap_or_default();
-        for c in clients {
-            let domain = domain.clone();
-            queries.push(
-                async move {
-                    c.exchange(message)
-                        .inspect_err(move |x| {
-                            error!(
-                                client = c.id(),
-                                domain = %domain,
-                                err = ?x,
-                                "resolve error");
-                        })
-                        .await
-                }
-                .boxed(),
-            )
-        }
-
-        let timeout = tokio::time::sleep(Duration::from_secs(5));
-
-        tokio::select! {
-            result = futures::future::select_ok(queries) => match result {
-                Ok(r) => Ok(r.0),
-                Err(e) => Err(e),
-            },
-            _ = timeout => Err(Error::DNSError("DNS query timeout".into()).into())
-        }
-    }
-
-    /// guaranteed to return at least 1 IP address when Ok
-    async fn lookup_ip(
-        &self,
-        host: &str,
-        record_type: RecordType,
-    ) -> anyhow::Result<Vec<net::IpAddr>> {
-        let mut m = Message::query();
-        let mut q = Query::new();
-        let name = rr::Name::from_str_relaxed(host)
-            .map_err(|_x| anyhow!("invalid domain: {}", host))?
-            .append_domain(&rr::Name::root())?; // makes it FQDN
-        q.set_name(name);
-        q.set_query_type(record_type);
-        m.add_query(q);
-        m.metadata.recursion_desired = true;
-
-        let result = self.exchange(&m).await?;
-        let ip_list = EnhancedResolver::ip_list_of_message(&result);
-        if ip_list.is_empty() {
-            return Err(anyhow!("no record for hostname: {}", host));
-        }
-        Ok(ip_list)
-    }
-
-    #[instrument(skip_all, level = "trace")]
-    async fn exchange(&self, message: &op::Message) -> anyhow::Result<op::Message> {
-        let q = message
-            .queries
-            .first()
-            .ok_or_else(|| anyhow!("invalid query"))?;
-
-        trace!(q = q.to_string(), "start");
-
-        let host = q.name().to_ascii().trim_end_matches('.').to_owned();
-        if self.is_blacklisted(&host) {
-            debug!("dns query domain in blacklist: {}", host);
-            let mut res = build_dns_response_message(message, true, false);
-            res.metadata.response_code = ResponseCode::NXDomain;
-            return Ok(res);
-        }
-
-        // Cache lookup with Fresh Hit & Stale-While-Revalidate support
-        if let Some(lru) = &self.lru_cache {
-            match lru.lookup(q, Instant::now()) {
-                CacheLookup::Hit(answers) => {
-                    trace!(
-                        q = q.to_string(),
-                        "cache hit for DNS query, returning cached response",
-                    );
-                    let mut reply = build_dns_response_message(message, true, false);
-                    reply.add_answers(answers);
-                    let ip_list = EnhancedResolver::ip_list_of_message(&reply);
-                    if !ip_list.is_empty() {
-                        if let Some(collector) = &self.collector {
-                            collector.record(&host, false);
-                        }
-                    }
-                    return Ok(reply);
-                }
-                CacheLookup::Stale(stale_answers) => {
-                    trace!(
-                        q = q.to_string(),
-                        "stale cache hit for DNS query, returning stale response and triggering background revalidation",
-                    );
-                    // Stale-While-Revalidate: singleflight background refresh
-                    let query_key = format!("{}:{:?}", q.name(), q.query_type());
-                    if !self.revalidate_inflight.contains(&query_key) {
-                        self.revalidate_inflight.insert(query_key.clone());
-                        let inflight = self.revalidate_inflight.clone();
-                        let key = query_key.clone();
-                        let this = self.clone();
-                        let msg_clone = message.clone();
-                        tokio::spawn(async move {
-                            trace!("Stale-While-Revalidate starting for {}", key);
-                            let _ = this.exchange_no_cache(&msg_clone).await;
-                            inflight.remove(&key);
-                            trace!("Stale-While-Revalidate completed for {}", key);
-                        });
-                    }
-
-                    let mut reply = build_dns_response_message(message, true, false);
-                    reply.add_answers(stale_answers);
-                    let ip_list = EnhancedResolver::ip_list_of_message(&reply);
-                    if !ip_list.is_empty() {
-                        if let Some(collector) = &self.collector {
-                            collector.record(&host, false);
-                        }
-                    }
-                    return Ok(reply);
-                }
-                CacheLookup::Miss => {}
-            }
-        }
-
-        trace!(q = q.to_string(), "querying resolver");
-        let res = match self.exchange_no_cache(message).await {
-            Ok(mut r) => {
-                if let Some(edns) = r.edns.as_mut() {
-                    // Remove only padding options, keep everything else
-                    edns.options_mut().remove(rr::rdata::opt::EdnsCode::Padding);
-                }
-                Ok(r)
-            }
-            Err(e) => {
-                // Serve-Stale fallback: if upstream query failed, degrade to stale cache if available
-                if let Some(lru) = &self.lru_cache
-                    && let Some(stale_answers) = lru.get_stale(q, Instant::now())
-                {
-                    warn!("upstream DNS exchange failed: {e}, degrading to serve-stale cache for {host}");
-                    let mut reply = build_dns_response_message(message, true, false);
-                    reply.add_answers(stale_answers);
-                    Ok(reply)
-                } else {
-                    Err(e)
-                }
-            }
-        };
-        trace!(q = q.to_string(), "query completed");
-        if let Ok(ref msg) = res {
-            let ip_list = EnhancedResolver::ip_list_of_message(msg);
-            if !ip_list.is_empty() {
-                if let Some(collector) = &self.collector {
-                    collector.record(&host, false);
-                }
-            }
-        }
-        res
     }
 
     fn match_fixed_domain_ttl(&self, domain: &str) -> Option<u32> {
@@ -589,173 +326,140 @@ impl EnhancedResolver {
             .copied()
     }
 
-    async fn exchange_no_cache(&self, message: &op::Message) -> anyhow::Result<op::Message> {
-        let q = message.queries.first().unwrap();
+    async fn batch_exchange(&self, upstreams: &[String], raw_query: &[u8]) -> anyhow::Result<Vec<u8>> {
+        if upstreams.is_empty() {
+            anyhow::bail!("no upstreams configured");
+        }
 
-        let query = async move {
-            if let (Some(proxy_resolver), Some(proxy_domains)) =
-                (&self.proxy_resolver, &self.proxy_server_domains)
-                && let Some(domain) = EnhancedResolver::domain_name_of_message(message)
-                && proxy_domains.search(&domain).is_some()
-            {
-                debug!(
-                    "using proxy-server-nameserver for proxy server domain: {}",
-                    domain
-                );
-                return EnhancedResolver::batch_exchange(proxy_resolver, message).await;
-            }
+        let queries = upstreams
+            .iter()
+            .map(|name| Box::pin(self.pool.query(name, raw_query)));
+        let (resp, _) = futures::future::select_ok(queries).await?;
+        Ok(resp)
+    }
 
-
-            if EnhancedResolver::is_ip_request(q) {
-                return self.ip_exchange(message).await;
-            }
-
-            if let Some(matched) = self.match_policy(message) {
-                return EnhancedResolver::batch_exchange(matched, message).await;
-            }
-
-            EnhancedResolver::batch_exchange(&self.main, message).await
+    async fn fallback_exchange(&self, query: &QueryContext, raw_query: &[u8]) -> anyhow::Result<Vec<u8>> {
+        let Some(ref fallback_upstreams) = self.fallback_upstreams else {
+            return self.batch_exchange(&self.main_upstreams, raw_query).await;
         };
 
-        let rv = query.await;
+        let filter = self.fallback_filter.as_ref();
+        let main_fut = self.batch_exchange(&self.main_upstreams, raw_query);
+        let fallback_fut = self.batch_exchange(fallback_upstreams, raw_query);
 
-        if let Ok(msg) = &rv
-            && let Some(lru) = &self.lru_cache
-            && !(q.query_type() == rr::RecordType::TXT
-                && q.name().to_ascii().starts_with("_acme-challenge."))
-            && !matches!(
-                msg.metadata.response_code,
-                op::ResponseCode::NXDomain | op::ResponseCode::ServFail
-            )
-            && {
-                let ips = EnhancedResolver::ip_list_of_message(msg);
-                ips.is_empty() || ips.iter().any(|ip| !ip.is_unspecified())
-            }
-        {
-            let host_clean = q.name().to_ascii().trim_end_matches('.').to_owned();
-            let fixed_ttl = self.match_fixed_domain_ttl(&host_clean);
-            lru.insert_with_policy(
-                q.clone(),
-                msg.answers.clone(),
-                self.optimistic_cache_ttl,
-                fixed_ttl,
-                self.stale_cache_retention,
-                Instant::now(),
-            );
+        let (main_res, fallback_res) = tokio::join!(main_fut, fallback_fut);
 
-            if let Some(hook) = self.resolution_hook.get() {
-                let ips = EnhancedResolver::ip_list_of_message(msg);
-                if !ips.is_empty() {
-                    let raw_min_ttl = msg.answers.iter().map(|r| r.ttl).min().unwrap_or(300).max(1);
-                    hook(&host_clean, &ips, Duration::from_secs(raw_min_ttl as u64));
+        if let Ok(main_bytes) = main_res {
+            if let Some(filter) = filter {
+                let ips = extract_ips_from_dns_response(&main_bytes);
+                let qname = query.qdomain().unwrap_or_default();
+                if filter.match_domain(qname) || ips.iter().any(|ip| filter.match_ip(ip)) {
+                    if let Ok(fallback_bytes) = fallback_res {
+                        return Ok(fallback_bytes);
+                    }
                 }
             }
+            return Ok(main_bytes);
         }
 
-        rv
+        fallback_res
     }
 
-    /// `nameserver-policy` stands on its own: it must not be gated on
-    /// `fallback` / `fallback-filter.domain` also being configured, otherwise a
-    /// config that only sets `nameserver-policy` builds the trie and then never
-    /// consults it.
-    fn match_policy(&self, m: &op::Message) -> Option<&Vec<ThreadSafeDNSClient>> {
-        if let Some(policy) = &self.policy
-            && let Some(domain) = EnhancedResolver::domain_name_of_message(m)
+    async fn lookup_ip(
+        &self,
+        host: &str,
+        is_v6: bool,
+    ) -> anyhow::Result<Vec<net::IpAddr>> {
+        let qtype = if is_v6 { QType::AAAA } else { QType::A };
+        let name = DnsName::from_domain(host)
+            .ok_or_else(|| anyhow!("invalid domain name: {host}"))?;
+
+        let query = build_dns_query_wire(&name, qtype);
+        let response = self.exchange(&query).await?;
+        let ips = extract_ips_from_dns_response(&response);
+        if ips.is_empty() {
+            return Err(anyhow!("no record for hostname: {}", host));
+        }
+        Ok(ips)
+    }
+
+    async fn exchange_no_cache(&self, query: &QueryContext, raw_query: &[u8]) -> anyhow::Result<Vec<u8>> {
+        let qname = query.qdomain().unwrap_or_default();
+
+        if let (Some(proxy_upstreams), Some(proxy_domains)) =
+            (&self.proxy_upstreams, &self.proxy_server_domains)
+            && proxy_domains.search(qname).is_some()
         {
-            return policy.search(&domain);
-        }
-        None
-    }
-
-    #[instrument(skip_all, level = "trace")]
-    async fn ip_exchange(&self, message: &op::Message) -> anyhow::Result<op::Message> {
-        if let Some(matched) = self.match_policy(message) {
-            return EnhancedResolver::batch_exchange(matched, message).await;
+            debug!(
+                domain = %qname,
+                "using proxy-server-nameserver for proxy server domain"
+            );
+            return self.batch_exchange(proxy_upstreams, raw_query).await;
         }
 
-        if self.should_only_query_fallback(message) {
-            return EnhancedResolver::batch_exchange(
-                self.fallback.as_ref().unwrap(),
-                message,
-            )
-            .await;
-        }
-
-        let main_query = EnhancedResolver::batch_exchange(&self.main, message);
-
-        if self.fallback.is_none() {
-            return main_query.await;
-        }
-
-        let fallback_query =
-            EnhancedResolver::batch_exchange(self.fallback.as_ref().unwrap(), message);
-
-        if let Ok(main_result) = main_query.await {
-            let ip_list = EnhancedResolver::ip_list_of_message(&main_result);
-            if !ip_list.is_empty() && !self.should_ip_fallback(&ip_list[0]) {
-                return Ok(main_result);
+        if let Some(policy) = &self.policy {
+            if let Some(upstreams) = policy.match_policy(qname) {
+                debug!(domain = %qname, ?upstreams, "DNS matched nameserver policy");
+                return self.batch_exchange(upstreams, raw_query).await;
             }
         }
 
-        fallback_query.await
+        trace!(domain = %qname, "DNS proceeding to main/fallback upstreams");
+        self.fallback_exchange(query, raw_query).await
     }
 
-    fn should_only_query_fallback(&self, message: &op::Message) -> bool {
-        if self.fallback.is_some()
-            && let Some(filter) = &self.fallback_filter
-            && let Some(domain) = EnhancedResolver::domain_name_of_message(message)
-        {
-            return filter.match_domain(&domain);
+    async fn process_fresh_response(
+        &self,
+        query: &QueryContext,
+        host: &str,
+        raw_resp: &[u8],
+        template_to_publish: Option<Arc<ResponseTemplate>>,
+    ) {
+        let ips = extract_ips_from_dns_response(raw_resp);
+        let fixed_ttl = self.match_fixed_domain_ttl(host);
+        let mut ttl = fixed_ttl
+            .or_else(|| extract_min_ttl_from_dns_response(raw_resp))
+            .unwrap_or(60);
+
+        if fixed_ttl.is_none() && self.optimistic_cache_ttl > 0 {
+            ttl = ttl.max(self.optimistic_cache_ttl);
         }
-        false
-    }
 
-    fn should_ip_fallback(&self, ip: &net::IpAddr) -> bool {
-        if let Some(filter) = &self.fallback_filter {
-            return filter.match_ip(ip);
+        debug!(
+            domain = %host,
+            ?ips,
+            ttl,
+            "DNS resolved response received"
+        );
+
+        // 1. Cache insertion (with ACME challenge, 0.0.0.0 pollution filtering, and fixed_ttl=0 never-cache)
+        if let (Some(template), Some(lru)) = (template_to_publish, &self.lru_cache) {
+            let is_acme = query.qtype() == Some(QType::TXT) && host.starts_with("_acme-challenge.");
+            let is_unspecified = !ips.is_empty() && ips.iter().all(|ip| ip.is_unspecified());
+            let never_cache = fixed_ttl == Some(0) || ttl == 0;
+
+            if !is_acme && !is_unspecified && !never_cache {
+                lru.insert(query, template, ttl, self.stale_cache_retention);
+            }
         }
-        false
-    }
 
-    // helpers
-    fn is_blacklisted(&self, host: &str) -> bool {
-        if let Some(black_filter) = &self.black_domain_filter {
-            black_filter.apply(host)
-        } else {
-            false
-        }
-    }
-    fn is_ip_request(q: &op::Query) -> bool {
-        q.query_class() == rr::DNSClass::IN
-            && (q.query_type() == rr::RecordType::A
-                || q.query_type() == rr::RecordType::AAAA)
-    }
-
-    fn domain_name_of_message(m: &op::Message) -> Option<String> {
-        m.queries
-            .first()
-            .map(|x| x.name().to_ascii().trim_end_matches('.').to_owned())
-    }
-
-    pub(crate) fn ip_list_of_message(m: &op::Message) -> Vec<net::IpAddr> {
-        m.answers
-            .iter()
-            .filter(|r| {
-                r.record_type() == rr::RecordType::A || r.record_type() == rr::RecordType::AAAA
-            })
-            .map(|r| match &r.data {
-                rr::RData::A(v4) => net::IpAddr::V4(**v4),
-                rr::RData::AAAA(v6) => net::IpAddr::V6(**v6),
-                _ => unreachable!("should be only A/AAAA"),
-            })
-            .collect()
-    }
-
-    async fn save_reverse_lookup(&self, ip: net::IpAddr, domain: String) {
+        // 2. Save reverse lookup cache (for RedirHost mode)
         if let Some(cache) = &self.reverse_lookup_cache {
-            trace!("reverse lookup cache insert: {} -> {}", ip, domain);
-            cache.insert(ip, domain).await;
+            for ip in &ips {
+                cache.insert(*ip, host.to_string()).await;
+            }
+        }
+
+        // 3. Trigger DNS resolution hook (e.g. for eBPF offloading)
+        if let Some(hook) = self.resolution_hook.get() {
+            if !ips.is_empty() {
+                hook(host, &ips, Duration::from_secs(ttl as u64));
+            }
+        }
+
+        // 4. Record DNS statistics
+        if let Some(collector) = &self.collector {
+            collector.record(host, false);
         }
     }
 }
@@ -766,179 +470,49 @@ impl ClashResolver for EnhancedResolver {
         let _ = self.resolution_hook.set(hook);
     }
 
-    #[instrument(skip(self), level = "trace")]
     async fn resolve(
         &self,
         host: &str,
         enhanced: bool,
     ) -> anyhow::Result<Option<net::IpAddr>> {
+        debug!(domain = %host, enhanced, "DNS resolve requested");
+        if self.is_blacklisted(host) {
+            debug!("dns resolve domain in blacklist: {}", host);
+            return Ok(None);
+        }
+
         if let Some(ip) = parse_ip_literal(host) {
             return Ok(Some(ip));
         }
 
-        match self.ipv6.load(Relaxed) {
-            true => {
-                let fut1 = self
-                    .resolve_v6(host, enhanced)
-                    .map(|x| x.map(|v6| v6.map(net::IpAddr::from)));
-                let fut2 = self
-                    .resolve_v4(host, enhanced)
-                    .map(|x| x.map(|v4| v4.map(net::IpAddr::from)));
-
-                let futs = vec![fut1.boxed(), fut2.boxed()];
-                let r = futures::future::select_ok(futs).await?;
-                if r.0.is_some() {
-                    return Ok(r.0);
-                }
-                let r = futures::future::select_all(r.1).await;
-                r.0
+        if let Some(hosts) = &self.hosts {
+            if let Some(h) = hosts.search(host).and_then(|h| h.get_data()) {
+                debug!(domain = %host, ip = ?h, "DNS matched hosts file");
+                return Ok(Some(*h));
             }
-            false => self
-                .resolve_v4(host, enhanced)
-                .await
-                .map(|ip| ip.map(net::IpAddr::from)),
         }
+
+        if enhanced && let Some(fake_dns) = &self.fake_dns {
+            if !fake_dns.should_skip(host) {
+                let ip = fake_dns.lookup(host).await;
+                debug!(domain = %host, ?ip, "DNS Fake-IP assigned");
+                if let Some(collector) = &self.collector {
+                    collector.record(host, true);
+                }
+                return Ok(Some(ip));
+            }
+        }
+
+        let is_v6 = self.ipv6();
+        let ips = self.lookup_ip(host, is_v6).await?;
+        if let Some(collector) = &self.collector {
+            collector.record(host, false);
+        }
+        let chosen = ips.into_iter().choose(&mut rand::rng());
+        debug!(domain = %host, ?chosen, "DNS resolve completed");
+        Ok(chosen)
     }
 
-    /// 终极整合版：直接接收 DNS 请求报文，内部完成策略路由与响应体组装，返回完整的 DNS 响应报文
-    #[instrument(skip(self), level = "trace")]
-    async fn exchange_all(&self, req: &op::Message) -> anyhow::Result<Message> {
-        // 1. 基础校验：如果没有 Query 记录，直接返回格式错误的 DNS 报文
-        let query = req
-            .queries
-            .first()
-            .ok_or_else(|| anyhow::anyhow!("malformed DNS query: zero queries"))?;
-
-        let qtype = query.query_type();
-        let name = query.name().clone();
-        let host = query.name().to_ascii().trim_end_matches('.').to_owned();
-
-        if self.is_blacklisted(&host) {
-            debug!("dns query domain in blacklist: {}", host);
-            let mut res = build_dns_response_message(req, true, false);
-            res.metadata.response_code = ResponseCode::NXDomain;
-            return Ok(res);
-        }
-
-        let mut current_ttl = 60; // 默认 TTL
-        let mut is_fake_ip = false;
-        // 2. 预先构建基础响应报文（带上 Transaction ID 并在头部标记为 Response）
-        let mut res = build_dns_response_message(req, true, false);
-
-        // 3. AAAA asked for while IPv6 is globally disabled. Answer NODATA
-        //    (NoError + zero answers), not NXDomain: NXDomain asserts that the
-        //    *name* does not exist, which makes stub resolvers cache the
-        //    negative result for every record type on that name — including A.
-        //    `watfaq_dns`'s own handler gets this right, but the TUN hijack
-        //    path (`proxy/tun/datagram.rs`) calls `exchange_with_resolver`
-        //    directly and reaches this branch.
-        if qtype == RecordType::AAAA && !self.ipv6.load(Relaxed) {
-            res.metadata.response_code = ResponseCode::NoError;
-            return Ok(res);
-        }
-
-        // 4. 路由核心：只有 A 和 AAAA 记录参与本地策略分配，其余一律转发给上游
-        if qtype != RecordType::A && qtype != RecordType::AAAA {
-            return self.exchange(req).await;
-        }
-
-        // --- 策略链开始 ---
-        let mut resolved_ips: Vec<net::IpAddr> = Vec::new();
-
-        // 策略 A: IP 字面量尝试解析 (例如直连 IP 查询)
-        if let Ok(ip) = host.parse::<net::IpAddr>() {
-            match (qtype, ip) {
-                (RecordType::A, net::IpAddr::V4(_)) => resolved_ips.push(ip),
-                (RecordType::AAAA, net::IpAddr::V6(_)) => resolved_ips.push(ip),
-                // The name parses as an IP literal of the other family: the
-                // name exists, it just has no record of the requested type.
-                // That is NODATA, not NXDomain.
-                _ => {
-                    res.metadata.response_code = ResponseCode::NoError;
-                    return Ok(res);
-                }
-            }
-        }
-
-        // 策略 B: 本地 Hosts 文件匹配
-        if resolved_ips.is_empty()
-            && let Some(hosts) = &self.hosts
-            && let Some(v) = hosts.search(&host)
-        {
-            if let Some(ip) = v.get_data() {
-                match (qtype, ip) {
-                    (RecordType::A, net::IpAddr::V4(_)) => resolved_ips.push(*ip),
-                    (RecordType::AAAA, net::IpAddr::V6(_)) => resolved_ips.push(*ip),
-                    _ => {}
-                }
-            }
-        }
-
-        // 策略 C: Fake IP 逻辑拦截
-        if resolved_ips.is_empty() && self.fake_ip_enabled() {
-            let fake_dns = self.fake_dns.as_ref().unwrap();
-            if !fake_dns.should_skip(&host) {
-                match qtype {
-                    RecordType::A => {
-                        let ip = fake_dns.lookup(&host).await;
-                        debug!("fake dns lookup_v4: {} -> {:?}", host, ip);
-                        resolved_ips.push(ip);
-                        current_ttl = self.fake_ip_ttl;
-                        is_fake_ip = true;
-                        if let Some(collector) = &self.collector {
-                            collector.record(&host, true);
-                        }
-                    }
-                    RecordType::AAAA => {
-                        let ip = fake_dns.lookupv6(&host).await;
-                        debug!("fake dns lookup_v6: {} -> {:?}", host, ip);
-                        resolved_ips.push(ip);
-                        current_ttl = self.fake_ip_ttl;
-                        is_fake_ip = true;
-                        if let Some(collector) = &self.collector {
-                            collector.record(&host, true);
-                        }
-                    }
-                    _ => {}
-                }
-            } else {
-                return self.exchange(req).await;
-            }
-        }
-
-        // --- 策略链结束，组装最终报文 ---
-        // Nothing was answered locally. This is reachable when fake-ip is off
-        // (`exchange_all` is part of the `ClashResolver` trait, so callers
-        // other than the DNS server can hit it) or when the only matching
-        // `hosts` entry was of the other family. Forward upstream rather than
-        // fabricating an NXDomain for a name we simply know nothing about.
-        if resolved_ips.is_empty() {
-            return self.exchange(req).await;
-        }
-
-        if !is_fake_ip {
-            if let Some(collector) = &self.collector {
-                collector.record(&host, false);
-            }
-        }
-        let records: Vec<Record> = resolved_ips
-            .into_iter()
-            .map(|ip| {
-                let rdata = match ip {
-                    net::IpAddr::V4(v4) => RData::A(A(v4)),
-                    net::IpAddr::V6(v6) => RData::AAAA(AAAA(v6)),
-                };
-                Record::from_rdata(name.clone(), current_ttl, rdata)
-            })
-            .collect();
-
-        res.metadata.response_code = ResponseCode::NoError;
-        res.add_answers(records);
-
-        Ok(res)
-    }
-
-    #[instrument(skip(self), level = "trace")]
     async fn resolve_v4(
         &self,
         host: &str,
@@ -948,70 +522,53 @@ impl ClashResolver for EnhancedResolver {
             debug!("dns resolve_v4 domain in blacklist: {}", host);
             return Ok(None);
         }
-        // A `hosts` entry for the other address family is not an error — it
-        // just means this name has no locally configured A record, so fall
-        // through to normal resolution. Note `Config::parse_hosts` always
-        // seeds `localhost -> 127.0.0.1`, so the mismatching case is reachable
-        // for every deployment with `dns.ipv6` enabled.
-        if enhanced
-            && let Some(hosts) = &self.hosts
-            && let Some(v) = hosts.search(host)
-            && let Some(net::IpAddr::V4(v4)) = v.get_data()
-        {
-            return Ok(Some(*v4));
+
+        if let Some(ip) = parse_ip_literal(host) {
+            match ip {
+                net::IpAddr::V4(v4) => return Ok(Some(v4)),
+                _ => return Ok(None),
+            }
         }
 
-        if let Ok(ip) = host.parse::<net::Ipv4Addr>() {
-            return Ok(Some(ip));
-        }
-
-        if enhanced && self.fake_ip_enabled() {
-            let fake_dns = self.fake_dns.as_ref().unwrap();
-            if !fake_dns.should_skip(host) {
-                let ip = fake_dns.lookup(host).await;
-                debug!("fake dns lookup: {} -> {:?}", host, ip);
-                match ip {
-                    net::IpAddr::V4(v4) => {
-                        if let Some(collector) = &self.collector {
-                            collector.record(host, true);
-                        }
-                        return Ok(Some(v4));
-                    }
-                    net::IpAddr::V6(v6) => {
-                        return Err(anyhow!(
-                            "fake ip store returned v6 address {} for an A \
-                             lookup of {}",
-                            v6,
-                            host
-                        ));
-                    }
+        if let Some(hosts) = &self.hosts {
+            if let Some(h) = hosts.search(host).and_then(|h| h.get_data()) {
+                match h {
+                    net::IpAddr::V4(v4) => return Ok(Some(*v4)),
+                    _ => return Ok(None),
                 }
             }
         }
 
-        let result = self.lookup_ip(host, rr::RecordType::A).await?;
-        // `ip_list_of_message` keeps both A and AAAA answers, so a broken or
-        // hostile upstream can put AAAA records in the answer section of an A
-        // query. Drop them instead of treating them as unreachable.
-        let v4s = result
+        if enhanced && let Some(fake_dns) = &self.fake_dns {
+            if !fake_dns.should_skip(host) {
+                if let net::IpAddr::V4(ip) = fake_dns.lookup(host).await {
+                    if let Some(collector) = &self.collector {
+                        collector.record(host, true);
+                    }
+                    return Ok(Some(ip));
+                }
+            }
+        }
+
+        let ips = self.lookup_ip(host, false).await?;
+        let v4s: Vec<Ipv4Addr> = ips
             .into_iter()
             .filter_map(|ip| match ip {
-                net::IpAddr::V4(v4) => Some(v4),
-                net::IpAddr::V6(_) => None,
+                IpAddr::V4(v4) => Some(v4),
+                _ => None,
             })
-            .collect::<Vec<_>>();
-        match v4s.choose(&mut rand::rng()) {
+            .collect();
+        match v4s.into_iter().choose(&mut rand::rng()) {
             Some(v4) => {
                 if let Some(collector) = &self.collector {
                     collector.record(host, false);
                 }
-                Ok(Some(*v4))
+                Ok(Some(v4))
             }
-            None => Err(anyhow!("no A record for hostname: {}", host)),
+            None => Ok(None),
         }
     }
 
-    #[instrument(skip(self), level = "trace")]
     async fn resolve_v6(
         &self,
         host: &str,
@@ -1021,102 +578,242 @@ impl ClashResolver for EnhancedResolver {
             debug!("dns resolve_v6 domain in blacklist: {}", host);
             return Ok(None);
         }
-        if let Some(std::net::IpAddr::V6(ip)) = parse_ip_literal(host) {
-            return Ok(Some(ip));
-        }
 
-        if !self.ipv6.load(Relaxed) {
+        if !self.ipv6() {
             return Err(Error::DNSError("ipv6 disabled".into()).into());
         }
 
-        // See the matching comment in `resolve_v4`: a `hosts` entry of the
-        // other family means "no local AAAA record", not "impossible".
-        if enhanced
-            && let Some(hosts) = &self.hosts
-            && let Some(v) = hosts.search(host)
-            && let Some(net::IpAddr::V6(v6)) = v.get_data()
-        {
-            return Ok(Some(*v6));
+        if let Some(ip) = parse_ip_literal(host) {
+            match ip {
+                net::IpAddr::V6(v6) => return Ok(Some(v6)),
+                _ => return Ok(None),
+            }
         }
 
-        if enhanced && self.fake_ip_enabled() {
-            let fake_dns = self.fake_dns.as_ref().unwrap();
-            if !fake_dns.should_skip(host) {
-                let ip = fake_dns.lookupv6(host).await;
-                debug!("fake dns lookupv6: {} -> {:?}", host, ip);
-                match ip {
-                    net::IpAddr::V6(v6) => {
-                        if let Some(collector) = &self.collector {
-                            collector.record(host, true);
-                        }
-                        return Ok(Some(v6));
-                    }
-                    net::IpAddr::V4(v4) => {
-                        return Err(anyhow!(
-                            "fake ip store returned v4 address {} for an AAAA \
-                             lookup of {}",
-                            v4,
-                            host
-                        ));
-                    }
+        if let Some(hosts) = &self.hosts {
+            if let Some(h) = hosts.search(host).and_then(|h| h.get_data()) {
+                match h {
+                    net::IpAddr::V6(v6) => return Ok(Some(*v6)),
+                    _ => return Ok(None),
                 }
             }
         }
 
-        let result = self.lookup_ip(host, rr::RecordType::AAAA).await?;
-        // Same as `resolve_v4`: tolerate A records showing up in the answer
-        // section of an AAAA query rather than panicking on them.
-        let v6s = result
+        if enhanced && let Some(fake_dns) = &self.fake_dns {
+            if !fake_dns.should_skip(host) {
+                if let net::IpAddr::V6(ip) = fake_dns.lookupv6(host).await {
+                    if let Some(collector) = &self.collector {
+                        collector.record(host, true);
+                    }
+                    return Ok(Some(ip));
+                }
+            }
+        }
+
+        let ips = self.lookup_ip(host, true).await?;
+        let v6s: Vec<Ipv6Addr> = ips
             .into_iter()
             .filter_map(|ip| match ip {
-                net::IpAddr::V6(v6) => Some(v6),
-                net::IpAddr::V4(_) => None,
+                IpAddr::V6(v6) => Some(v6),
+                _ => None,
             })
-            .collect::<Vec<_>>();
-        match v6s.choose(&mut rand::rng()) {
+            .collect();
+        match v6s.into_iter().choose(&mut rand::rng()) {
             Some(v6) => {
                 if let Some(collector) = &self.collector {
                     collector.record(host, false);
                 }
-                Ok(Some(*v6))
+                Ok(Some(v6))
             }
-            None => Err(anyhow!("no AAAA record for hostname: {}", host)),
+            None => Ok(None),
         }
     }
 
-    #[instrument(skip(self))]
     async fn cached_for(&self, ip: net::IpAddr) -> Option<String> {
-        if let Some(cache) = &self.reverse_lookup_cache
-            && let Some(cached) = cache.get(&ip).await
-        {
-            trace!("reverse lookup cache hit: {cached} -> {ip}");
-            return Some(cached);
+        if let Some(cache) = &self.reverse_lookup_cache {
+            cache.get(&ip).await
+        } else {
+            None
         }
-
-        None
     }
 
-    #[instrument(skip(self), level = "trace")]
-    async fn exchange(&self, message: &op::Message) -> anyhow::Result<op::Message> {
-        let rv = self.exchange(message).await?;
-        let hostname = message
-            .queries
-            .first()
-            .unwrap()
-            .name()
-            .to_utf8()
-            .trim_end_matches('.')
-            .to_owned();
-        let ip_list = EnhancedResolver::ip_list_of_message(&rv);
-        if !ip_list.is_empty() {
-            if let Some(collector) = &self.collector {
-                collector.record(&hostname, false);
-            }
-            for ip in ip_list {
-                self.save_reverse_lookup(ip, hostname.clone()).await;
+    #[instrument(skip_all, level = "trace")]
+    async fn exchange(&self, raw_query: &[u8]) -> anyhow::Result<Vec<u8>> {
+        let query = QueryContext::parse(raw_query)
+            .map_err(|e| anyhow!("invalid DNS query: {e:?}"))?;
+
+        let host = query.qdomain().unwrap_or_default();
+
+        let qtype = query.qtype().unwrap_or(QType::A);
+        debug!(domain = %host, ?qtype, "DNS exchange query received");
+
+        if self.is_blacklisted(host) {
+            debug!("dns query domain in blacklist: {}", host);
+            return Ok(build_dns_nxdomain(raw_query));
+        }
+
+        // AAAA asked for while IPv6 is globally disabled: answer NODATA (NoError + zero answers)
+        if qtype == QType::AAAA && !self.ipv6() {
+            debug!(domain = %host, "AAAA query while IPv6 disabled, returning NODATA");
+            return Ok(crate::app::dns::response::build_dns_nodata(raw_query));
+        }
+
+        // 1. Hosts match (takes precedence over Fake-IP when record type matches)
+        if let Some(hosts) = &self.hosts {
+            if let Some(host_ip) = hosts.search(host).and_then(|h| h.get_data()) {
+                let matches = match (qtype, host_ip) {
+                    (QType::A, net::IpAddr::V4(_)) | (QType::AAAA, net::IpAddr::V6(_)) => true,
+                    _ => false,
+                };
+                if matches {
+                    debug!(domain = %host, ip = ?host_ip, "DNS exchange matched hosts");
+                    if let Some(resp) = build_dns_ip_response(raw_query, &[*host_ip], 60) {
+                        return Ok(resp);
+                    }
+                }
+                // When the host entry is for the other family or query is non-A/AAAA (e.g. HTTPS/TXT),
+                // fall through to normal resolution rather than returning NODATA.
             }
         }
-        Ok(rv)
+
+        // 2. Fake-IP match
+        if let Some(fake_dns) = &self.fake_dns {
+            if !fake_dns.should_skip(host) {
+                if qtype == QType::A {
+                    let fake_ip = fake_dns.lookup(host).await;
+                    debug!(domain = %host, ?fake_ip, "DNS exchange assigned Fake-IP (A)");
+                    if let Some(resp) = build_dns_ip_response(raw_query, &[fake_ip], self.fake_ip_ttl) {
+                        return Ok(resp);
+                    }
+                } else if qtype == QType::AAAA && self.ipv6() {
+                    let fake_ip = fake_dns.lookupv6(host).await;
+                    debug!(domain = %host, ?fake_ip, "DNS exchange assigned Fake-IP (AAAA)");
+                    if let Some(resp) = build_dns_ip_response(raw_query, &[fake_ip], self.fake_ip_ttl) {
+                        return Ok(resp);
+                    }
+                }
+            }
+        }
+
+        // 3. Cache lookup
+        if let Some(lru) = &self.lru_cache {
+            match lru.lookup(&query, Instant::now()) {
+                CacheLookup::Hit(template, remaining_ttl) => {
+                    debug!(domain = %host, ?qtype, remaining_ttl, "DNS exchange cache hit");
+                    if let Ok(mut rendered) = template.render(&query) {
+                        rewrite_dns_response_ttl(&mut rendered, remaining_ttl);
+                        return Ok(rendered);
+                    }
+                }
+                CacheLookup::Stale(template) => {
+                    debug!(domain = %host, ?qtype, "DNS exchange cache stale, initiating background refresh");
+                    let raw_key = query.canonical_wire_arc();
+                    if let FlightRole::Leader(mut leader) = self.singleflight.acquire(FlightKey::Refresh(raw_key)) {
+                        let query_clone = query.clone();
+                        let raw_clone = raw_query.to_vec();
+                        let host_clone = host.to_string();
+                        let this = self.clone();
+
+                        tokio::spawn(async move {
+                            if let Ok(fresh_resp) = this.exchange_no_cache(&query_clone, &raw_clone).await {
+                                let fresh_template = ResponseTemplate::validate(&query_clone, &fresh_resp)
+                                    .ok()
+                                    .map(Arc::new);
+                                if let Some(ref tmpl) = fresh_template {
+                                    leader.publish(Arc::clone(tmpl));
+                                }
+                                this.process_fresh_response(
+                                    &query_clone,
+                                    &host_clone,
+                                    &fresh_resp,
+                                    fresh_template,
+                                )
+                                .await;
+                            }
+                        });
+                    }
+
+                    if let Ok(mut rendered) = template.render(&query) {
+                        rewrite_dns_response_ttl(&mut rendered, SERVE_STALE_WIRE_TTL);
+                        return Ok(rendered);
+                    }
+                }
+                CacheLookup::Miss => {}
+            }
+        }
+
+        // Singleflight execution
+        let flight_key = FlightKey::Query(query.canonical_wire_arc());
+        let (raw_resp, template_to_publish) = match self.singleflight.acquire(flight_key) {
+            FlightRole::Ready(template) => {
+                let rendered = template.render(&query)?;
+                return Ok(rendered);
+            }
+            FlightRole::Waiter(waiter) => {
+                if let Some(template) = waiter.receive().await {
+                    let rendered = template.render(&query)?;
+                    return Ok(rendered);
+                }
+                // Retry as leader if waiter didn't get response
+                let resp = self.exchange_no_cache(&query, raw_query).await?;
+                (resp, None)
+            }
+            FlightRole::Leader(mut leader) => {
+                let resp = self.exchange_no_cache(&query, raw_query).await?;
+                if let Ok(template) = ResponseTemplate::validate(&query, &resp) {
+                    let arc_template = Arc::new(template);
+                    leader.publish(Arc::clone(&arc_template));
+                    (resp, Some(arc_template))
+                } else {
+                    (resp, None)
+                }
+            }
+            FlightRole::Rejected => {
+                let resp = self.exchange_no_cache(&query, raw_query).await?;
+                (resp, None)
+            }
+        };
+
+        self.process_fresh_response(&query, host, &raw_resp, template_to_publish).await;
+
+        Ok(raw_resp)
+    }
+
+    async fn reverse_lookup(&self, ip: net::IpAddr) -> Option<String> {
+        if let Some(fake_dns) = &self.fake_dns {
+            if let Some(host) = fake_dns.reverse_lookup(ip).await {
+                return Some(host);
+            }
+        }
+        self.cached_for(ip).await
+    }
+
+    async fn is_fake_ip(&self, ip: net::IpAddr) -> bool {
+        if let Some(fake_dns) = &self.fake_dns {
+            fake_dns.is_fake_ip(ip).await
+        } else {
+            false
+        }
+    }
+
+    fn fake_ip_enabled(&self) -> bool {
+        self.fake_dns.is_some()
+    }
+
+    async fn after_router_inited(&self, r: Arc<Router>) {
+        let rp_map = r.get_rule_providers();
+        if let Some(policy) = &self.policy {
+            policy.add_rule_set(&r);
+        }
+        if let Some(fake_dns) = &self.fake_dns {
+            fake_dns.add_rule_set(&rp_map).await;
+        }
+        if let Some(black_filter) = &self.black_domain_filter {
+            black_filter.add_rule_set(&rp_map);
+        }
+        if let Some(fallback_filter) = &self.fallback_filter {
+            fallback_filter.add_rule_set(&rp_map);
+        }
     }
 
     fn ipv6(&self) -> bool {
@@ -1130,44 +827,123 @@ impl ClashResolver for EnhancedResolver {
     fn kind(&self) -> ResolverKind {
         ResolverKind::Clash
     }
+}
+
+pub struct BootstrapResolver {
+    pool: Arc<UpstreamPool>,
+    upstreams: Vec<String>,
+}
+
+#[async_trait]
+impl ClashResolver for BootstrapResolver {
+    async fn resolve(
+        &self,
+        host: &str,
+        _enhanced: bool,
+    ) -> anyhow::Result<Option<net::IpAddr>> {
+        if let Some(ip) = parse_ip_literal(host) {
+            return Ok(Some(ip));
+        }
+        if let Some(v4) = self.resolve_v4(host, false).await? {
+            return Ok(Some(net::IpAddr::V4(v4)));
+        }
+        if let Some(v6) = self.resolve_v6(host, false).await? {
+            return Ok(Some(net::IpAddr::V6(v6)));
+        }
+        Ok(None)
+    }
+
+    async fn resolve_v4(
+        &self,
+        host: &str,
+        _enhanced: bool,
+    ) -> anyhow::Result<Option<net::Ipv4Addr>> {
+        if let Some(ip) = parse_ip_literal(host) {
+            match ip {
+                net::IpAddr::V4(v4) => return Ok(Some(v4)),
+                _ => return Ok(None),
+            }
+        }
+        let name = DnsName::from_domain(host)
+            .ok_or_else(|| anyhow!("invalid domain name: {host}"))?;
+        let query = build_dns_query_wire(&name, QType::A);
+        let queries = self
+            .upstreams
+            .iter()
+            .map(|ns| Box::pin(self.pool.query(ns, &query)));
+        let (resp, _) = futures::future::select_ok(queries).await?;
+        let ips = extract_ips_from_dns_response(&resp);
+        for ip in ips {
+            if let net::IpAddr::V4(v4) = ip {
+                return Ok(Some(v4));
+            }
+        }
+        Ok(None)
+    }
+
+    async fn resolve_v6(
+        &self,
+        host: &str,
+        _enhanced: bool,
+    ) -> anyhow::Result<Option<net::Ipv6Addr>> {
+        if let Some(ip) = parse_ip_literal(host) {
+            match ip {
+                net::IpAddr::V6(v6) => return Ok(Some(v6)),
+                _ => return Ok(None),
+            }
+        }
+        let name = DnsName::from_domain(host)
+            .ok_or_else(|| anyhow!("invalid domain name: {host}"))?;
+        let query = build_dns_query_wire(&name, QType::AAAA);
+        let queries = self
+            .upstreams
+            .iter()
+            .map(|ns| Box::pin(self.pool.query(ns, &query)));
+        let (resp, _) = futures::future::select_ok(queries).await?;
+        let ips = extract_ips_from_dns_response(&resp);
+        for ip in ips {
+            if let net::IpAddr::V6(v6) = ip {
+                return Ok(Some(v6));
+            }
+        }
+        Ok(None)
+    }
+
+    async fn cached_for(&self, _ip: net::IpAddr) -> Option<String> {
+        None
+    }
+
+    async fn exchange(&self, message: &[u8]) -> anyhow::Result<Vec<u8>> {
+        let queries = self
+            .upstreams
+            .iter()
+            .map(|ns| Box::pin(self.pool.query(ns, message)));
+        let (resp, _) = futures::future::select_ok(queries).await?;
+        Ok(resp)
+    }
+
+    async fn reverse_lookup(&self, _ip: net::IpAddr) -> Option<String> {
+        None
+    }
+
+    async fn is_fake_ip(&self, _ip: net::IpAddr) -> bool {
+        false
+    }
 
     fn fake_ip_enabled(&self) -> bool {
-        self.fake_dns.is_some()
+        false
     }
 
-    async fn after_router_inited(&self, r: Arc<Router>) {
-        if self.fake_ip_enabled() {
-            self.fake_dns
-                .as_ref()
-                .unwrap()
-                .add_rule_set(r.get_rule_providers())
-                .await;
-        }
-        if let Some(black_filter) = &self.black_domain_filter {
-            black_filter.add_rule_set(r.get_rule_providers());
-        }
-        if let Some(fallback_filter) = &self.fallback_filter {
-            fallback_filter.add_rule_set(r.get_rule_providers());
-        }
-        if let Some(policy) = &self.policy {
-            policy.add_rule_set(r.as_ref());
-        }
+    async fn after_router_inited(&self, _r: Arc<Router>) {}
+
+    fn ipv6(&self) -> bool {
+        true
     }
 
-    async fn is_fake_ip(&self, ip: std::net::IpAddr) -> bool {
-        if !self.fake_ip_enabled() {
-            return false;
-        }
+    fn set_ipv6(&self, _enable: bool) {}
 
-        self.fake_dns.as_ref().unwrap().is_fake_ip(ip).await
-    }
-
-    async fn reverse_lookup(&self, ip: net::IpAddr) -> Option<String> {
-        debug!("reverse lookup: {}", ip);
-        if !self.fake_ip_enabled() {
-            return None;
-        }
-
-        self.fake_dns.as_ref().unwrap().reverse_lookup(ip).await
+    fn kind(&self) -> ResolverKind {
+        ResolverKind::Clash
     }
 }
+

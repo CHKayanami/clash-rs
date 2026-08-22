@@ -6,15 +6,14 @@ use axum::{
     response::IntoResponse,
     routing::get,
 };
-use hickory_proto::{
-    op::{Message, MessageType, OpCode},
-    rr::RecordType,
-};
 use http::StatusCode;
 use serde::Deserialize;
 use serde_json::{Map, Value};
 
-use crate::app::{api::AppState, dns::ThreadSafeDNSResolver};
+use crate::app::api::AppState;
+use crate::app::dns::ThreadSafeDNSResolver;
+use crate::app::dns::query::{DnsName, QType};
+use crate::app::dns::wire::parse_dns_response_records;
 
 #[derive(Clone)]
 struct DNSState {
@@ -32,7 +31,7 @@ pub fn routes(resolver: ThreadSafeDNSResolver) -> Router<Arc<AppState>> {
 struct DnsQuery {
     name: String,
     #[serde(rename = "type")]
-    typ: String,
+    typ: Option<String>,
 }
 
 async fn query_dns(
@@ -43,83 +42,67 @@ async fn query_dns(
         return (StatusCode::BAD_REQUEST, "Clash resolver is not enabled.")
             .into_response();
     }
-    let typ: RecordType = q.typ.parse().unwrap_or(RecordType::A);
-    let mut m = Message::new(0, MessageType::Query, OpCode::Query);
+    let name = match DnsName::from_domain(&q.name) {
+        Some(n) => n,
+        None => return (StatusCode::BAD_REQUEST, "Invalid domain name").into_response(),
+    };
 
-    let name = hickory_proto::rr::Name::from_str_relaxed(q.name.as_str());
+    let qtype = match q.typ.as_deref().unwrap_or("A").to_uppercase().as_str() {
+        "A" => QType::A,
+        "AAAA" => QType::AAAA,
+        "CNAME" => QType::CNAME,
+        "TXT" => QType::TXT,
+        "PTR" => QType::PTR,
+        "MX" => QType::MX,
+        "NS" => QType::NS,
+        "SRV" => QType::SRV,
+        "SOA" => QType::SOA,
+        _ => QType::A,
+    };
 
-    if name.is_err() {
-        return (StatusCode::BAD_REQUEST, "Invalid name").into_response();
-    }
+    let mut msg = vec![
+        0x00, 0x00, // ID
+        0x01, 0x00, // Flags: RD=1
+        0x00, 0x01, // QDCOUNT=1
+        0x00, 0x00, // ANCOUNT=0
+        0x00, 0x00, // NSCOUNT=0
+        0x00, 0x00, // ARCOUNT=0
+    ];
+    msg.extend_from_slice(name.as_wire());
+    msg.extend_from_slice(&qtype.get().to_be_bytes());
+    msg.extend_from_slice(&1u16.to_be_bytes()); // CLASS IN
 
-    m.add_query(hickory_proto::op::Query::query(name.unwrap(), typ));
-
-    match state.resolver.exchange(&m).await {
+    match state.resolver.exchange(&msg).await {
         Ok(response) => {
             let mut resp = Map::new();
-            resp.insert(
-                "Status".to_owned(),
-                response.metadata.response_code.low().into(),
-            );
-            resp.insert(
-                "Question".to_owned(),
-                response
-                    .queries
-                    .iter()
-                    .map(|x| {
-                        let mut data = Map::new();
-                        data.insert("name".to_owned(), x.name().to_string().into());
-                        data.insert(
-                            "qtype".to_owned(),
-                            u16::from(x.query_type()).into(),
-                        );
-                        data.insert(
-                            "qclass".to_owned(),
-                            u16::from(x.query_class()).into(),
-                        );
-                        data.into()
-                    })
-                    .collect::<Vec<Value>>()
-                    .into(),
-            );
-
-            resp.insert("TC".to_owned(), response.metadata.truncation.into());
-            resp.insert("RD".to_owned(), response.metadata.recursion_desired.into());
-            resp.insert(
-                "RA".to_owned(),
-                response.metadata.recursion_available.into(),
-            );
-            resp.insert("AD".to_owned(), response.metadata.authentic_data.into());
-            resp.insert("CD".to_owned(), response.metadata.checking_disabled.into());
-
-            let rr2json = |rr: &hickory_proto::rr::Record| -> Value {
-                let mut data = Map::new();
-                data.insert("name".to_owned(), rr.name.to_string().into());
-                data.insert("type".to_owned(), u16::from(rr.record_type()).into());
-                data.insert("ttl".to_owned(), rr.ttl.into());
-                data.insert("data".to_owned(), rr.data.to_string().into());
-                data.into()
+            let rcode = if response.len() >= 4 {
+                response[3] & 0x0F
+            } else {
+                0
             };
+            resp.insert("Status".to_owned(), rcode.into());
 
-            if !response.answers.is_empty() {
-                resp.insert(
-                    "Answer".to_owned(),
-                    response.answers.iter().map(rr2json).collect(),
-                );
-            }
+            let mut question_data = Map::new();
+            question_data.insert("name".to_owned(), q.name.clone().into());
+            question_data.insert("qtype".to_owned(), qtype.get().into());
+            question_data.insert("qclass".to_owned(), 1.into());
+            resp.insert("Question".to_owned(), vec![Value::Object(question_data)].into());
 
-            if !response.authorities.is_empty() {
-                resp.insert(
-                    "Authority".to_owned(),
-                    response.authorities.iter().map(rr2json).collect(),
-                );
-            }
-
-            if !response.additionals.is_empty() {
-                resp.insert(
-                    "Additional".to_owned(),
-                    response.additionals.iter().map(rr2json).collect(),
-                );
+            let records = parse_dns_response_records(&response);
+            if !records.is_empty() {
+                let answers: Vec<Value> = records
+                    .into_iter()
+                    .map(|r| {
+                        let mut data = Map::new();
+                        let record_name = if r.name.is_empty() { q.name.clone() } else { r.name };
+                        data.insert("name".to_owned(), record_name.into());
+                        data.insert("type".to_owned(), r.rtype.into());
+                        data.insert("ttl".to_owned(), r.ttl.into());
+                        data.insert("data".to_owned(), r.data.into());
+                        Value::Object(data)
+                    })
+                    .collect();
+                resp.insert("Answer".to_owned(), answers.into());
             }
 
             Json(resp).into_response()

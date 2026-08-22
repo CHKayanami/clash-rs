@@ -1,56 +1,10 @@
-use crate::{
-    DNSListenAddr, DnsMessageExchanger,
-    utils::{
-        load_cert_chain, load_default_cert, load_default_key, load_priv_key,
-        new_io_error,
-    },
-};
-use async_trait::async_trait;
-use hickory_proto::{
-    op::{
-        Header, HeaderCounts, Message, MessageType, Metadata, OpCode, ResponseCode,
-    },
-    rr::RecordType,
-};
-use hickory_server::{
-    Server,
-    net::runtime::Time,
-    server::{Request, RequestHandler, ResponseHandler, ResponseInfo},
-    zone_handler::MessageResponseBuilder,
-};
-use rustls::{server::AlwaysResolvesServerRawPublicKeys, sign::CertifiedKey};
-use std::{sync::Arc, time::Duration};
+use std::sync::Arc;
 use thiserror::Error;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, UdpSocket};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info};
 
-struct CertificateKeyPair {
-    certs: Vec<rustls::pki_types::CertificateDer<'static>>,
-    key: rustls::pki_types::PrivateKeyDer<'static>,
-}
-
-impl From<CertificateKeyPair> for Arc<dyn rustls::server::ResolvesServerCert> {
-    fn from(pair: CertificateKeyPair) -> Self {
-        Arc::new(AlwaysResolvesServerRawPublicKeys::new(Arc::new(
-            CertifiedKey::new(
-                pair.certs,
-                rustls::crypto::CryptoProvider::get_default()
-                    .expect("no default crypto provider installed")
-                    .key_provider
-                    .load_private_key(pair.key)
-                    .expect("unsupported private key type"),
-            ),
-        )))
-    }
-}
-
-struct DnsListener<H: RequestHandler> {
-    server: Server<H>,
-}
-
-struct DnsHandler<X> {
-    exchanger: X,
-}
+use crate::{DNSListenAddr, DnsMessageExchanger};
 
 #[derive(Error, Debug)]
 pub enum DNSError {
@@ -62,403 +16,142 @@ pub enum DNSError {
     QueryFailed(String),
 }
 
-impl<X> DnsHandler<X>
-where
-    X: DnsMessageExchanger,
-{
-    async fn handle<H: ResponseHandler>(
-        &self,
-        request: &Request,
-        mut response_handle: H,
-    ) -> Result<ResponseInfo, DNSError> {
-        if request.metadata.op_code != OpCode::Query {
-            return Err(DNSError::InvalidOpQuery(format!(
-                "invalid OP code: {}",
-                request.metadata.op_code
-            )));
-        }
-
-        if request.metadata.message_type != MessageType::Query {
-            return Err(DNSError::InvalidOpQuery(format!(
-                "invalid message type: {}",
-                request.metadata.message_type
-            )));
-        }
-
-        let mut metadata = Metadata::response_from_request(&request.metadata);
-
-        let query = request
-            .queries
-            .queries()
-            .first()
-            .ok_or(DNSError::QueryFailed("no query".to_string()))?;
-
-        if query.query_type() == RecordType::AAAA && !self.exchanger.ipv6() {
-            metadata.authoritative = true;
-
-            let resp = MessageResponseBuilder::from_message_request(request)
-                .build_no_records(metadata);
-            return response_handle
-                .send_response(resp)
-                .await
-                .map_err(|e| DNSError::QueryFailed(e.to_string()));
-        }
-
-        let mut m = Message::new(
-            request.metadata.id,
-            request.metadata.message_type,
-            request.metadata.op_code,
-        );
-        m.metadata.recursion_desired = request.metadata.recursion_desired;
-        m.metadata.checking_disabled = request.metadata.checking_disabled;
-        m.add_query(query.original().clone());
-        m.add_additionals(request.additionals.iter().cloned());
-        m.add_authorities(request.authorities.iter().cloned());
-        if let Some(edns) = &request.edns {
-            m.set_edns(edns.clone());
-        }
-
-        match self.exchanger.exchange(&m).await {
-            Ok(m) => {
-                metadata.recursion_available = m.metadata.recursion_available;
-                metadata.response_code = m.metadata.response_code;
-                metadata.authoritative = m.metadata.authoritative;
-                metadata.truncation = m.metadata.truncation;
-                metadata.authentic_data = m.metadata.authentic_data;
-                metadata.checking_disabled = m.metadata.checking_disabled;
-
-                let resp_edns = if request.edns.is_some() {
-                    m.edns.clone()
-                } else {
-                    None
-                };
-
-                let rv = MessageResponseBuilder::new(
-                    &request.queries,
-                    resp_edns.as_ref(),
-                )
-                .build(
-                    metadata,
-                    m.answers.iter(),
-                    m.authorities.iter(),
-                    std::iter::empty(),
-                    m.additionals.iter(),
-                );
-
-                debug!(
-                    "answering dns query {} with answer {:?}",
-                    query.name(),
-                    &m.answers,
-                );
-
-                Ok(response_handle
-                    .send_response(rv)
-                    .await
-                    .map_err(|e| DNSError::QueryFailed(e.to_string()))?)
-            }
-            Err(e) => {
-                debug!("dns resolve error: {}", e);
-                Err(DNSError::QueryFailed(e.to_string()))
-            }
-        }
-    }
-}
-
-#[async_trait]
-impl<X> RequestHandler for DnsHandler<X>
-where
-    X: DnsMessageExchanger + Unpin + Send + Sync + 'static,
-{
-    async fn handle_request<R: ResponseHandler, T: Time>(
-        &self,
-        request: &Request,
-        response_handle: R,
-    ) -> ResponseInfo {
-        debug!(
-            "got dns request [{}][{:?}][{:?}] from {}",
-            request.protocol(),
-            request.queries.queries().first().map(|x| x.query_type()),
-            request.queries.queries().first().map(|x| x.name()),
-            request.src()
-        );
-
-        self.handle(request, response_handle)
-            .await
-            .unwrap_or_else(|e| {
-                debug!("dns request error: {}", e);
-                let mut metadata =
-                    Metadata::response_from_request(&request.metadata);
-                metadata.response_code = ResponseCode::ServFail;
-                Header {
-                    metadata,
-                    counts: HeaderCounts::default(),
-                }
-                .into()
-            })
-    }
-}
-
-static DEFAULT_DNS_SERVER_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_CONCURRENT_UDP_QUERIES: usize = 4096;
 
 pub async fn get_dns_listener<X>(
     listen: DNSListenAddr,
     exchanger: X,
-    cwd: &std::path::Path,
-) -> Option<futures::future::BoxFuture<'static, Result<(), DNSError>>>
+) -> Result<impl std::future::Future<Output = ()>, DNSError>
 where
-    X: DnsMessageExchanger + Sync + Send + Unpin + 'static,
+    X: DnsMessageExchanger + Clone,
 {
-    let handler = DnsHandler { exchanger };
-    let mut s = Server::new(handler);
+    let mut tasks = Vec::new();
 
-    let mut has_server = false;
-
-    if let Some(addr) = listen.udp {
-        has_server = UdpSocket::bind(addr)
-            .await
-            .map(|x| {
-                info!("UDP dns server listening on: {}", addr);
-                s.register_socket(x);
-            })
-            .inspect_err(|x| {
-                error!("failed to listen UDP DNS server on {}: {}", addr, x);
-            })
-            .is_ok();
-    }
-    if let Some(addr) = listen.tcp {
-        has_server |= TcpListener::bind(addr)
-            .await
-            .map(|x| {
-                info!("TCP dns server listening on: {}", addr);
-                s.register_listener(x, DEFAULT_DNS_SERVER_TIMEOUT, 4096);
-            })
-            .inspect_err(|x| {
-                error!("failed to listen TCP DNS server on {}: {}", addr, x);
-            })
-            .is_ok();
-    }
-    if let Some(c) = listen.doh {
-        has_server |= TcpListener::bind(c.addr)
-            .await
-            .and_then(|x| {
-                if let (Some(k), Some(c)) = (&c.ca_key, &c.ca_cert) {
-                    debug!(
-                        "using custom key and cert for DoH: {:?}/{:?}",
-                        cwd.join(k),
-                        cwd.join(c)
-                    );
-                }
-
-                let server_key = c
-                    .ca_key
-                    .map(|x| load_priv_key(&cwd.join(x)))
-                    .transpose()?
-                    .unwrap_or(load_default_key());
-                let server_cert = c
-                    .ca_cert
-                    .map(|x| load_cert_chain(&cwd.join(x)))
-                    .transpose()?
-                    .unwrap_or(load_default_cert());
-                s.register_https_listener(
-                    x,
-                    DEFAULT_DNS_SERVER_TIMEOUT,
-                    CertificateKeyPair {
-                        certs: server_cert,
-                        key: server_key,
+    // 1. UDP Listener
+    if let Some(udp_addr) = listen.udp {
+        let socket = Arc::new(UdpSocket::bind(udp_addr).await?);
+        info!("DNS UDP server listening on {}", udp_addr);
+        let ex = exchanger.clone();
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_UDP_QUERIES));
+        tasks.push(tokio::spawn(async move {
+            let mut buf = [0u8; 4096];
+            loop {
+                match socket.recv_from(&mut buf).await {
+                    Ok((len, src)) => {
+                        let permit = match semaphore.clone().try_acquire_owned() {
+                            Ok(p) => p,
+                            Err(_) => {
+                                debug!("DNS UDP query dropped due to concurrency saturation");
+                                continue;
+                            }
+                        };
+                        let req = bytes::Bytes::copy_from_slice(&buf[..len]);
+                        let ex = ex.clone();
+                        let socket = Arc::clone(&socket);
+                        tokio::spawn(async move {
+                            let _permit = permit;
+                            match ex.exchange(&req).await {
+                                Ok(resp) => {
+                                    let _ = socket.send_to(&resp, src).await;
+                                }
+                                Err(e) => {
+                                    debug!("DNS UDP query from {} failed: {}", src, e);
+                                }
+                            }
+                        });
                     }
-                    .into(),
-                    c.hostname,
-                    "/dns-query".to_string(),
-                )?;
-                info!("DoH server listening on: {}", c.addr);
-                Ok(())
-            })
-            .inspect_err(|x| {
-                error!("failed to listen DoH server on {}: {}", c.addr, x);
-            })
-            .is_ok();
-    }
-    if let Some(c) = listen.dot {
-        has_server |= TcpListener::bind(c.addr)
-            .await
-            .and_then(|x| {
-                if let (Some(k), Some(c)) = (&c.ca_key, &c.ca_cert) {
-                    debug!(
-                        "using custom key and cert for DoT: {:?}/{:?}",
-                        cwd.join(k),
-                        cwd.join(c)
-                    );
-                }
-
-                let server_key = c
-                    .ca_key
-                    .map(|x| load_priv_key(&cwd.join(x)))
-                    .transpose()?
-                    .unwrap_or(load_default_key());
-                let server_cert = c
-                    .ca_cert
-                    .map(|x| load_cert_chain(&cwd.join(x)))
-                    .transpose()?
-                    .unwrap_or(load_default_cert());
-                s.register_tls_listener(
-                    x,
-                    DEFAULT_DNS_SERVER_TIMEOUT,
-                    CertificateKeyPair {
-                        certs: server_cert,
-                        key: server_key,
+                    Err(e) => {
+                        error!("DNS UDP socket recv error: {}", e);
+                        break;
                     }
-                    .into(),
-                )?;
-                info!("DoT dns server listening on: {}", c.addr);
-                Ok(())
-            })
-            .inspect_err(|x| {
-                error!("failed to listen DoT DNS server on {}: {}", c.addr, x);
-            })
-            .is_ok();
-    }
-
-    if let Some(c) = listen.doh3 {
-        has_server |= UdpSocket::bind(c.addr)
-            .await
-            .and_then(|x| {
-                if let (Some(k), Some(c)) = (&c.ca_key, &c.ca_cert) {
-                    debug!(
-                        "using custom key and cert for DoH3: {:?}/{:?}",
-                        cwd.join(k),
-                        cwd.join(c)
-                    );
                 }
+            }
+        }));
+    }
 
-                let server_key = c
-                    .ca_key
-                    .map(|x| load_priv_key(&cwd.join(x)))
-                    .transpose()?
-                    .unwrap_or(load_default_key());
-                let server_cert = c
-                    .ca_cert
-                    .map(|x| load_cert_chain(&cwd.join(x)))
-                    .transpose()?
-                    .unwrap_or(load_default_cert());
-                s.register_h3_listener(
-                    x,
-                    DEFAULT_DNS_SERVER_TIMEOUT,
-                    CertificateKeyPair {
-                        certs: server_cert,
-                        key: server_key,
+    // 2. TCP Listener
+    if let Some(tcp_addr) = listen.tcp {
+        let listener = TcpListener::bind(tcp_addr).await?;
+        info!("DNS TCP server listening on {}", tcp_addr);
+        let ex = exchanger.clone();
+        tasks.push(tokio::spawn(async move {
+            loop {
+                match listener.accept().await {
+                    Ok((mut stream, peer)) => {
+                        let ex = ex.clone();
+                        tokio::spawn(async move {
+                            let mut len_buf = [0u8; 2];
+                            let mut req_buf = Vec::with_capacity(512);
+                            let mut out_buf = Vec::with_capacity(512);
+                            while stream.read_exact(&mut len_buf).await.is_ok() {
+                                let msg_len = u16::from_be_bytes(len_buf) as usize;
+                                if msg_len == 0 {
+                                    break;
+                                }
+                                req_buf.resize(msg_len, 0);
+                                if stream.read_exact(&mut req_buf).await.is_err() {
+                                    break;
+                                }
+                                match ex.exchange(&req_buf).await {
+                                    Ok(resp) => {
+                                        let resp_len = resp.len() as u16;
+                                        out_buf.clear();
+                                        out_buf.extend_from_slice(&resp_len.to_be_bytes());
+                                        out_buf.extend_from_slice(&resp);
+                                        if stream.write_all(&out_buf).await.is_err() {
+                                            break;
+                                        }
+                                        if stream.flush().await.is_err() {
+                                            break;
+                                        }
+                                    }
+                                    Err(e) => {
+                                        debug!("DNS TCP query from {} failed: {}", peer, e);
+                                        break;
+                                    }
+                                }
+                            }
+                        });
                     }
-                    .into(),
-                    c.hostname,
-                )?;
-                info!("DoT3 dns server listening on: {}", c.addr);
-                Ok(())
-            })
-            .inspect_err(|x| {
-                error!("failed to listen DoH3 DNS server on {}: {}", c.addr, x);
-            })
-            .is_ok();
+                    Err(e) => {
+                        error!("DNS TCP accept error: {}", e);
+                        break;
+                    }
+                }
+            }
+        }));
     }
 
-    if !has_server {
-        return None;
-    }
-
-    let mut l = DnsListener { server: s };
-
-    Some(Box::pin(async move {
-        info!("starting DNS server");
-        l.server.block_until_done().await.map_err(|x| {
-            warn!("dns server error: {}", x);
-            DNSError::Io(new_io_error(format!("dns server error: {x}")))
-        })
-    }))
+    Ok(async move {
+        for task in tasks {
+            let _ = task.await;
+        }
+    })
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::{
-        DNSListenAddr, DoH3Config, DoHConfig, DoTConfig, MockDnsMessageExchanger,
-        tests::setup_default_crypto_provider,
-        tls::{self, global_root_store},
-    };
-    use futures::FutureExt;
-    use hickory_net::{
-        client::{Client, ClientHandle},
-        h2::HttpsClientStream,
-        h3::H3ClientStream,
-        runtime::TokioRuntimeProvider,
-        tcp::TcpClientStream,
-        tls::tls_client_connect,
-        udp::UdpClientStream,
-    };
-    use hickory_proto::rr::{DNSClass, Name, RData, RecordType};
-    use rustls::{ClientConfig, pki_types::ServerName};
-    use std::{sync::Arc, time::Duration};
-    use tokio::{
-        net::{TcpListener, UdpSocket},
-        task::JoinHandle,
-    };
+    use super::*;
+    use std::time::Duration;
 
-    async fn send_query(
-        client: &mut Client<TokioRuntimeProvider>,
-    ) -> anyhow::Result<()> {
-        let name = Name::from_ascii("www.example.com.").unwrap();
+    #[derive(Clone)]
+    struct EchoExchanger;
 
-        let mut retries = 3;
-        let response = loop {
-            match client
-                .query(name.clone(), DNSClass::IN, RecordType::A)
-                .await
-            {
-                Ok(v) => {
-                    break v;
-                }
-                Err(e) => {
-                    retries -= 1;
-                    if retries == 0 {
-                        anyhow::bail!(e)
-                    }
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                }
-            }
-        };
-
-        let answers = &response.answers;
-
-        if let RData::A(ip) = &answers[0].data {
-            assert_eq!(ip.0, std::net::Ipv4Addr::new(93, 184, 215, 14))
-        } else {
-            unreachable!("unexpected result")
+    impl DnsMessageExchanger for EchoExchanger {
+        fn ipv6(&self) -> bool {
+            false
         }
-        Ok(())
+        async fn exchange(&self, message: &[u8]) -> Result<Vec<u8>, DNSError> {
+            let mut resp = message.to_vec();
+            if resp.len() >= 4 {
+                resp[2] |= 0x80; // Set QR flag to indicate response
+            }
+            Ok(resp)
+        }
     }
 
     #[tokio::test]
-    async fn test_multiple_dns_server() -> anyhow::Result<()> {
-        setup_default_crypto_provider();
-        env_logger::init();
-
-        let mut mock_exchanger = MockDnsMessageExchanger::new();
-        mock_exchanger.expect_ipv6().returning(|| false);
-        mock_exchanger.expect_exchange().returning(|_| {
-            async {
-                let mut m = hickory_proto::op::Message::response(
-                    0,
-                    hickory_proto::op::OpCode::Query,
-                );
-                m.add_answer(hickory_proto::rr::Record::from_rdata(
-                    "www.example.com".parse().unwrap(),
-                    60,
-                    hickory_proto::rr::RData::A(hickory_proto::rr::rdata::A(
-                        std::net::Ipv4Addr::new(93, 184, 215, 14),
-                    )),
-                ));
-                Ok(m)
-            }
-            .boxed()
-        });
-
-        // Bind to port 0 to get OS-assigned available ports
+    async fn test_dns_listener_udp_and_tcp() -> anyhow::Result<()> {
         let udp_sock = UdpSocket::bind("127.0.0.1:0").await?;
         let udp_addr = udp_sock.local_addr()?;
         drop(udp_sock);
@@ -467,145 +160,49 @@ mod tests {
         let tcp_addr = tcp_sock.local_addr()?;
         drop(tcp_sock);
 
-        let dot_sock = TcpListener::bind("127.0.0.1:0").await?;
-        let dot_addr = dot_sock.local_addr()?;
-        drop(dot_sock);
-
-        let doh_sock = TcpListener::bind("127.0.0.1:0").await?;
-        let doh_addr = doh_sock.local_addr()?;
-        drop(doh_sock);
-
-        let doh3_sock = UdpSocket::bind("127.0.0.1:0").await?;
-        let doh3_addr = doh3_sock.local_addr()?;
-        drop(doh3_sock);
-
-        eprintln!(
-            "Test using ports - UDP:{}, TCP:{}, DoT:{}, DoH:{}, DoH3:{}",
-            udp_addr.port(),
-            tcp_addr.port(),
-            dot_addr.port(),
-            doh_addr.port(),
-            doh3_addr.port()
-        );
-
-        let cfg = DNSListenAddr {
+        let listen = DNSListenAddr {
             udp: Some(udp_addr),
             tcp: Some(tcp_addr),
-            dot: Some(DoTConfig {
-                addr: dot_addr,
-                ca_key: None,
-                ca_cert: None,
-            }),
-            doh: Some(DoHConfig {
-                addr: doh_addr,
-                hostname: Some("dns.example.com".to_string()),
-                ca_key: None,
-                ca_cert: None,
-            }),
-            doh3: Some(DoH3Config {
-                addr: doh3_addr,
-                hostname: Some("dns.example.com".to_string()),
-                ca_key: None,
-                ca_cert: None,
-            }),
+            dot: None,
+            doh: None,
+            doh3: None,
         };
 
-        let listener =
-            super::get_dns_listener(cfg, mock_exchanger, std::path::Path::new("."))
-                .await;
+        let listener_fut = get_dns_listener(listen, EchoExchanger).await?;
+        tokio::spawn(listener_fut);
 
-        assert!(listener.is_some());
-        let _: JoinHandle<anyhow::Result<()>> = tokio::spawn(async move {
-            listener.unwrap().await?;
-            Ok(())
-        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
 
-        // Wait for servers to start
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        // 1. Test UDP query
+        let client_udp = UdpSocket::bind("127.0.0.1:0").await?;
+        let query_data = vec![0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+        client_udp.send_to(&query_data, udp_addr).await?;
 
-        let stream =
-            UdpClientStream::builder(udp_addr, TokioRuntimeProvider::new()).build();
+        let mut buf = vec![0u8; 512];
+        let (len, _) = tokio::time::timeout(Duration::from_secs(2), client_udp.recv_from(&mut buf)).await??;
+        assert!(len >= 4);
+        assert_eq!(buf[0], 0x12);
+        assert_eq!(buf[1], 0x34);
+        assert_eq!(buf[2] & 0x80, 0x80); // Response bit set
 
-        let (mut client, bg) = Client::<TokioRuntimeProvider>::from_sender(stream);
-        tokio::spawn(bg);
+        // 2. Test TCP query
+        let mut client_tcp = tokio::net::TcpStream::connect(tcp_addr).await?;
+        let msg_len = (query_data.len() as u16).to_be_bytes();
+        client_tcp.write_all(&msg_len).await?;
+        client_tcp.write_all(&query_data).await?;
+        client_tcp.flush().await?;
 
-        send_query(&mut client).await?;
+        let mut len_buf = [0u8; 2];
+        tokio::time::timeout(Duration::from_secs(2), client_tcp.read_exact(&mut len_buf)).await??;
+        let resp_len = u16::from_be_bytes(len_buf) as usize;
+        assert_eq!(resp_len, query_data.len());
 
-        let (stream_future, sender) =
-            TcpClientStream::new(tcp_addr, None, None, TokioRuntimeProvider::new());
-        let stream = stream_future.await?;
-        let (mut client, bg) = Client::<TokioRuntimeProvider>::new(stream, sender);
-        tokio::spawn(bg);
+        let mut resp_buf = vec![0u8; resp_len];
+        tokio::time::timeout(Duration::from_secs(2), client_tcp.read_exact(&mut resp_buf)).await??;
+        assert_eq!(resp_buf[0], 0x12);
+        assert_eq!(resp_buf[1], 0x34);
+        assert_eq!(resp_buf[2] & 0x80, 0x80);
 
-        send_query(&mut client).await?;
-
-        let mut tls_config = ClientConfig::builder()
-            .with_root_certificates(global_root_store().clone())
-            .with_no_client_auth();
-        tls_config.alpn_protocols = vec!["dot".into()];
-        tls_config
-            .dangerous()
-            .set_certificate_verifier(Arc::new(tls::DummyTlsVerifier::new()));
-
-        let server_name = ServerName::try_from("dns.example.com").unwrap();
-        let (stream_future, sender) = tls_client_connect(
-            dot_addr,
-            server_name,
-            Arc::new(tls_config),
-            TokioRuntimeProvider::new(),
-        );
-
-        let stream = stream_future.await.inspect_err(|e| {
-            assert!(false, "Failed to connect to DoT server: {}", e);
-        })?;
-        let (mut client, bg) = Client::<TokioRuntimeProvider>::with_timeout(
-            stream,
-            sender,
-            Duration::from_secs(5),
-        );
-        tokio::spawn(bg);
-
-        send_query(&mut client).await?;
-
-        let mut tls_config = ClientConfig::builder()
-            .with_root_certificates(global_root_store().clone())
-            .with_no_client_auth();
-        tls_config.alpn_protocols = vec!["h2".into()];
-
-        tls_config
-            .dangerous()
-            .set_certificate_verifier(Arc::new(tls::DummyTlsVerifier::new()));
-
-        let stream = HttpsClientStream::builder(
-            Arc::new(tls_config),
-            TokioRuntimeProvider::new(),
-        )
-        .build(doh_addr, "dns.example.com".into(), "/dns-query".into())
-        .await?;
-
-        let (mut client, bg) = Client::<TokioRuntimeProvider>::from_sender(stream);
-        tokio::spawn(bg);
-
-        send_query(&mut client).await?;
-
-        let mut tls_config = ClientConfig::builder()
-            .with_root_certificates(global_root_store().clone())
-            .with_no_client_auth();
-        tls_config.alpn_protocols = vec!["h3".into()];
-
-        tls_config
-            .dangerous()
-            .set_certificate_verifier(Arc::new(tls::DummyTlsVerifier::new()));
-
-        let stream = H3ClientStream::builder()
-            .crypto_config(tls_config)
-            .build(doh3_addr, "dns.example.com".into(), "/dns-query".into())
-            .await?;
-
-        let (mut client, bg) = Client::<TokioRuntimeProvider>::from_sender(stream);
-        tokio::spawn(bg);
-
-        send_query(&mut client).await?;
         Ok(())
     }
 }

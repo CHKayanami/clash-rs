@@ -1,21 +1,22 @@
 use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 
 use async_trait::async_trait;
-use hickory_resolver::TokioResolver;
 use rand::seq::IteratorRandom;
+use tracing::{debug, warn};
 
 use crate::app::dns::{ClashResolver, ResolverKind, parse_ip_literal};
+use crate::app::router::Router;
+use crate::Error;
 
 pub struct SystemResolver {
-    inner: TokioResolver,
     ipv6: AtomicBool,
 }
 
-/// Bug in libc, use tokio impl instead: https://sourceware.org/bugzilla/show_bug.cgi?id=10652
 impl SystemResolver {
     pub fn new(ipv6: bool) -> anyhow::Result<Self> {
+        debug!("creating system resolver with ipv6={}", ipv6);
         Ok(Self {
-            inner: TokioResolver::builder_tokio()?.build()?,
             ipv6: AtomicBool::new(ipv6),
         })
     }
@@ -32,11 +33,22 @@ impl ClashResolver for SystemResolver {
             return Ok(Some(ip));
         }
 
-        let response = self.inner.lookup_ip(host).await?;
-        Ok(response
-            .iter()
-            .filter(|x| self.ipv6() || x.is_ipv4())
-            .choose(&mut rand::rng()))
+        let response = tokio::net::lookup_host(format!("{host}:0"))
+            .await?
+            .filter_map(|x| {
+                if self.ipv6() || x.is_ipv4() {
+                    Some(x.ip())
+                } else {
+                    warn!(
+                        "resolved v6 address {} for {} but ipv6 is disabled",
+                        x.ip(),
+                        host
+                    );
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        Ok(response.into_iter().choose(&mut rand::rng()))
     }
 
     async fn resolve_v4(
@@ -44,15 +56,14 @@ impl ClashResolver for SystemResolver {
         host: &str,
         _: bool,
     ) -> anyhow::Result<Option<std::net::Ipv4Addr>> {
-        let response = self.inner.ipv4_lookup(host).await?;
-        Ok(response
-            .answers()
-            .iter()
-            .filter_map(|r| match &r.data {
-                hickory_proto::rr::RData::A(a) => Some(a.0),
+        let response = tokio::net::lookup_host(format!("{host}:0"))
+            .await?
+            .filter_map(|ip| match ip.ip() {
+                std::net::IpAddr::V4(ip) => Some(ip),
                 _ => None,
             })
-            .choose(&mut rand::rng()))
+            .collect::<Vec<_>>();
+        Ok(response.into_iter().choose(&mut rand::rng()))
     }
 
     async fn resolve_v6(
@@ -60,15 +71,17 @@ impl ClashResolver for SystemResolver {
         host: &str,
         _: bool,
     ) -> anyhow::Result<Option<std::net::Ipv6Addr>> {
-        let response = self.inner.ipv6_lookup(host).await?;
-        Ok(response
-            .answers()
-            .iter()
-            .filter_map(|r| match &r.data {
-                hickory_proto::rr::RData::AAAA(aaaa) => Some(aaaa.0),
+        if !self.ipv6() {
+            return Err(Error::DNSError("ipv6 disabled".into()).into());
+        }
+        let response = tokio::net::lookup_host(format!("{host}:0"))
+            .await?
+            .filter_map(|x| match x.ip() {
+                std::net::IpAddr::V6(ip) => Some(ip),
                 _ => None,
             })
-            .choose(&mut rand::rng()))
+            .collect::<Vec<_>>();
+        Ok(response.into_iter().choose(&mut rand::rng()))
     }
 
     async fn cached_for(&self, _: std::net::IpAddr) -> Option<String> {
@@ -77,8 +90,8 @@ impl ClashResolver for SystemResolver {
 
     async fn exchange(
         &self,
-        _: &hickory_proto::op::Message,
-    ) -> anyhow::Result<hickory_proto::op::Message> {
+        _: &[u8],
+    ) -> anyhow::Result<Vec<u8>> {
         Err(anyhow::anyhow!("unsupported"))
     }
 
@@ -105,16 +118,18 @@ impl ClashResolver for SystemResolver {
     async fn reverse_lookup(&self, _: std::net::IpAddr) -> Option<String> {
         None
     }
+
+    async fn after_router_inited(&self, _: Arc<Router>) {}
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::app::dns::{ClashResolver, SystemResolver};
+    use super::*;
 
     #[tokio::test]
     async fn test_system_resolver_default_config() {
         let resolver = SystemResolver::new(false).unwrap();
-        let response = resolver.resolve("www.google.com", false).await.unwrap();
-        assert!(response.is_some());
+        let response = resolver.resolve("127.0.0.1", false).await.unwrap();
+        assert_eq!(response, Some(std::net::IpAddr::V4("127.0.0.1".parse().unwrap())));
     }
 }

@@ -1,11 +1,10 @@
-use hickory_proto::op::Message;
+#![allow(dead_code)]
+
 use serde::Deserialize;
 use std::{future::Future, net::SocketAddr};
 
 mod dummy_keys;
-
 mod handler;
-
 #[cfg(test)]
 mod tls;
 mod utils;
@@ -51,12 +50,12 @@ pub struct DNSListenAddr {
 }
 
 #[cfg_attr(test, mockall::automock)]
-pub trait DnsMessageExchanger {
+pub trait DnsMessageExchanger: Send + Sync + 'static {
     fn ipv6(&self) -> bool;
     fn exchange(
         &self,
-        message: &Message,
-    ) -> impl Future<Output = Result<Message, DNSError>> + Send;
+        message: &[u8],
+    ) -> impl Future<Output = Result<Vec<u8>, DNSError>> + Send;
 }
 
 #[cfg(test)]
@@ -69,8 +68,7 @@ pub(crate) mod tests {
         CRYPTO_PROVIDER_LOCK.get_or_init(|| {
             #[cfg(feature = "aws-lc-rs")]
             {
-                let _ =
-                    rustls::crypto::aws_lc_rs::default_provider().install_default();
+                let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
             }
             #[cfg(feature = "ring")]
             {

@@ -148,6 +148,34 @@ impl EbpfInbound {
             .cloned()
     }
 
+    pub async fn init(&self) -> std::io::Result<()> {
+        #[cfg(target_os = "linux")]
+        {
+            let _ = self.get_or_init_listener().await?;
+            if self.config.auto_direct_offload {
+                let offloader = self.get_or_init_offloader().await;
+                let router = self.dispatcher.router().clone();
+                let hook = Arc::new(move |domain: &str, ips: &[IpAddr], ttl: Duration| {
+                    let offloader = offloader.clone();
+                    let router = router.clone();
+                    let domain = domain.to_string();
+                    let ips = ips.to_vec();
+                    tokio::spawn(async move {
+                        let is_direct = router.is_domain_direct(&domain).await;
+                        let action = if is_direct {
+                            RoutingAction::Direct
+                        } else {
+                            RoutingAction::Proxy
+                        };
+                        offloader.observe(domain, ips, action, ttl).await;
+                    });
+                });
+                self.dns_resolver.register_resolution_hook(hook);
+            }
+        }
+        Ok(())
+    }
+
     pub async fn stop(&self) {
         #[cfg(target_os = "linux")]
         {
@@ -182,26 +210,6 @@ impl InboundHandlerTrait for EbpfInbound {
             use crate::session::{Network, Session, Type};
 
             let listener = self.get_or_init_listener().await?;
-            if self.config.auto_direct_offload {
-                let offloader = self.get_or_init_offloader().await;
-                let router = self.dispatcher.router().clone();
-                let hook = Arc::new(move |domain: &str, ips: &[IpAddr], ttl: Duration| {
-                    let offloader = offloader.clone();
-                    let router = router.clone();
-                    let domain = domain.to_string();
-                    let ips = ips.to_vec();
-                    tokio::spawn(async move {
-                        let is_direct = router.is_domain_direct(&domain).await;
-                        let action = if is_direct {
-                            RoutingAction::Direct
-                        } else {
-                            RoutingAction::Proxy
-                        };
-                        offloader.observe(domain, ips, action, ttl).await;
-                    });
-                });
-                self.dns_resolver.register_resolution_hook(hook);
-            }
             info!("clash-ebpf TCP inbound worker running");
 
             loop {
@@ -393,71 +401,45 @@ async fn udp_listener_loop(
                 let data = &buf[..n];
                 // 1. Intercept UDP port 53 (DNS)
                 if dst.port() == 53 {
-                    if let Ok(msg) = hickory_proto::op::Message::from_vec(data) {
-                        let q_info = msg
-                            .queries
-                            .first()
-                            .map(|q| format!("{}({:?})", q.name(), q.query_type()))
-                            .unwrap_or_default();
-                        info!(
-                            "[eBPF DNS] Intercepted DNS query {} from {} to {}",
-                            q_info, src, dst
-                        );
-
-                        let resolver = resolver.clone();
-                        let listener_for_dns = listener_for_dns.clone();
-                        tokio::spawn(async move {
-                            match crate::app::dns::exchange_with_resolver(&resolver, &msg, true)
-                                .await
-                            {
-                                Ok(mut resp) => {
-                                    resp.metadata.id = msg.metadata.id;
-
-                                    match resp.to_vec() {
-                                        Ok(resp_bytes) => {
-                                            match listener_for_dns
-                                                .send_dns_reply(&resp_bytes, dst, src)
-                                                .await
-                                            {
-                                                Ok(_) => {
-                                                    tracing::info!(
-                                                        "[eBPF DNS] Replied {} -> {}",
-                                                        dst,
-                                                        src
-                                                    );
-                                                }
-                                                Err(e) => {
-                                                    tracing::warn!(
-                                                        "[eBPF DNS] send_dns_reply {} -> {} failed: {}",
-                                                        dst,
-                                                        src,
-                                                        e
-                                                    );
-                                                }
-                                            }
-                                        }
-                                        Err(e) => {
-                                            tracing::warn!(
-                                                "[eBPF DNS] failed to serialize DNS response for {}: {}",
-                                                q_info,
-                                                e
-                                            );
-                                        }
+                    let req_bytes = data.to_vec();
+                    let resolver = resolver.clone();
+                    let listener_for_dns = listener_for_dns.clone();
+                    tokio::spawn(async move {
+                        match crate::app::dns::exchange_with_resolver(&resolver, &req_bytes, true)
+                            .await
+                        {
+                            Ok(resp_bytes) => {
+                                match listener_for_dns
+                                    .send_dns_reply(&resp_bytes, dst, src)
+                                    .await
+                                {
+                                    Ok(_) => {
+                                        tracing::info!(
+                                            "[eBPF DNS] Replied {} -> {}",
+                                            dst,
+                                            src
+                                        );
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            "[eBPF DNS] Failed to send UDP DNS reply {} -> {}: {}",
+                                            dst,
+                                            src,
+                                            e
+                                        );
                                     }
                                 }
-                                Err(e) => {
-                                    tracing::warn!(
-                                        "[eBPF DNS] Resolution failed for {}: {}",
-                                        q_info,
-                                        e
-                                    );
-                                }
                             }
-                        });
-                        continue;
-                    } else {
-                        info!("[eBPF DNS] Intercepted raw DNS from {} to {}", src, dst);
-                    }
+                            Err(e) => {
+                                tracing::warn!(
+                                    "[eBPF DNS] DNS resolution failed for query from {}: {}",
+                                    src,
+                                    e
+                                );
+                            }
+                        }
+                    });
+                    continue;
                 }
 
                 // 2. Regular UDP packet -> Dispatcher

@@ -1,5 +1,4 @@
 use async_trait::async_trait;
-use hickory_proto::op;
 use std::io;
 use std::sync::Arc;
 
@@ -46,15 +45,7 @@ impl ClashResolver for NoopResolver {
     }
 
     /// Used for DNS Server
-    async fn exchange(&self, _message: &op::Message) -> anyhow::Result<op::Message> {
-        Err(anyhow::anyhow!("unsupported"))
-    }
-
-    /// Used for DNS Server
-    async fn exchange_all(
-        &self,
-        _message: &op::Message,
-    ) -> anyhow::Result<op::Message> {
+    async fn exchange(&self, _message: &[u8]) -> anyhow::Result<Vec<u8>> {
         Err(anyhow::anyhow!("unsupported"))
     }
     /// Only used for look up fake IP

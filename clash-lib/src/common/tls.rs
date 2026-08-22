@@ -197,9 +197,11 @@ impl ServerCertVerifier for DefaultTlsVerifier {
     }
 }
 
+#[allow(dead_code)]
 #[derive(Debug)]
 pub struct NoHostnameTlsVerifier(Arc<WebPkiServerVerifier>);
 
+#[allow(dead_code)]
 impl NoHostnameTlsVerifier {
     pub fn new() -> Self {
         Self(

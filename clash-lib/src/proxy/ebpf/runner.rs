@@ -48,6 +48,11 @@ impl Runner for EbpfRunner {
 
         tokio::spawn(async move {
             info!("starting eBPF inbound runner");
+            if let Err(err) = inbound.init().await {
+                error!("failed to initialize eBPF inbound: {err}");
+                return;
+            }
+
             let inbound_tcp = inbound.clone();
             let mut tcp_task = tokio::spawn(async move {
                 if let Err(err) = inbound_tcp.listen_tcp().await {

@@ -1,46 +1,37 @@
 use async_trait::async_trait;
-
-use std::fmt::Debug;
-
-use hickory_proto::op;
 use std::sync::Arc;
 
 #[cfg(test)]
 use mockall::automock;
 
-use hickory_proto::op::Message;
 pub mod collector;
 pub mod config;
-mod dhcp;
-mod dns_client;
+pub mod ecs;
+pub mod endpoint;
 mod fakeip;
-mod filters;
-mod helper;
+pub mod filters;
+pub mod framing;
+pub mod query;
 pub mod resolver;
+pub mod response;
 mod rule_dispatch;
-mod runtime;
-mod server;
+pub mod server;
+pub mod singleflight;
+pub mod transport;
+pub mod upstream_pool;
+pub mod wire;
+
 use crate::app::router::Router;
 pub use collector::{DnsCollector, ThreadSafeDnsCollector};
 pub use config::{Config, EdnsClientSubnet};
 
 pub use filters::PendingMmdb;
-pub use rule_dispatch::{PendingOutboundManager, PendingRouter, RuleDispatch};
-
 pub use resolver::{EnhancedResolver, SystemResolver, new as new_resolver};
+pub use rule_dispatch::{PendingOutboundManager, PendingRouter, RuleDispatch};
 
 pub use server::DnsRunner;
 #[cfg(any(feature = "tun", feature = "ebpf"))]
 pub use server::exchange_with_resolver;
-
-#[async_trait]
-pub trait Client: Sync + Send + Debug {
-    /// used to identify the client for logging
-    fn id(&self) -> String;
-    async fn exchange(&self, msg: &op::Message) -> anyhow::Result<op::Message>;
-}
-
-type ThreadSafeDNSClient = Arc<dyn Client>;
 
 pub enum ResolverKind {
     Clash,
@@ -51,10 +42,6 @@ pub type ThreadSafeDNSResolver = Arc<dyn ClashResolver>;
 
 pub type DnsResolutionHook = Arc<dyn Fn(&str, &[std::net::IpAddr], std::time::Duration) + Send + Sync>;
 
-/// A implementation of "anti-poisoning" Resolver
-/// it can hold multiple clients in different protocols
-/// each client can also hold a "default_resolver"
-/// in case they need to resolve DoH in domain names etc.
 #[cfg_attr(test, automock)]
 #[async_trait]
 pub trait ClashResolver: Sync + Send {
@@ -65,7 +52,6 @@ pub trait ClashResolver: Sync + Send {
         host: &str,
         enhanced: bool,
     ) -> anyhow::Result<Option<std::net::IpAddr>>;
-    async fn exchange_all(&self, req: &Message) -> anyhow::Result<Message>;
     async fn resolve_v4(
         &self,
         host: &str,
@@ -79,8 +65,8 @@ pub trait ClashResolver: Sync + Send {
 
     async fn cached_for(&self, ip: std::net::IpAddr) -> Option<String>;
 
-    /// Used for DNS Server
-    async fn exchange(&self, message: &op::Message) -> anyhow::Result<op::Message>;
+    /// Used for DNS Server / TUN / eBPF: accepts raw wire-format query bytes and returns raw response bytes
+    async fn exchange(&self, message: &[u8]) -> anyhow::Result<Vec<u8>>;
 
     /// Only used for look up fake IP
     async fn reverse_lookup(&self, ip: std::net::IpAddr) -> Option<String>;

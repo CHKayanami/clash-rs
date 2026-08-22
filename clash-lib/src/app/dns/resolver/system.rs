@@ -1,15 +1,14 @@
 use std::sync::atomic::AtomicBool;
-
-use crate::{
-    Error,
-    app::dns::{ClashResolver, ResolverKind, parse_ip_literal},
-    app::router::Router,
-};
-use async_trait::async_trait;
-use hickory_proto::op::Message;
-use rand::seq::IteratorRandom;
 use std::sync::Arc;
+
+use async_trait::async_trait;
+use rand::seq::IteratorRandom;
 use tracing::{debug, warn};
+
+use crate::app::dns::{ClashResolver, ResolverKind, parse_ip_literal};
+use crate::app::router::Router;
+use crate::Error;
+
 pub struct SystemResolver {
     ipv6: AtomicBool,
 }
@@ -54,10 +53,6 @@ impl ClashResolver for SystemResolver {
         Ok(response.into_iter().choose(&mut rand::rng()))
     }
 
-    async fn exchange_all(&self, _req: &Message) -> anyhow::Result<Message> {
-        Err(anyhow::anyhow!("exchange_all is not implemented yet"))
-    }
-
     async fn resolve_v4(
         &self,
         host: &str,
@@ -97,8 +92,8 @@ impl ClashResolver for SystemResolver {
 
     async fn exchange(
         &self,
-        _: &hickory_proto::op::Message,
-    ) -> anyhow::Result<hickory_proto::op::Message> {
+        _: &[u8],
+    ) -> anyhow::Result<Vec<u8>> {
         Err(anyhow::anyhow!(
             "system resolver does not support advanced dns features, please enable \
              the dns server in your config"
@@ -109,24 +104,24 @@ impl ClashResolver for SystemResolver {
         self.ipv6.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    fn set_ipv6(&self, val: bool) {
-        self.ipv6.store(val, std::sync::atomic::Ordering::Relaxed);
+    fn set_ipv6(&self, enable: bool) {
+        self.ipv6.store(enable, std::sync::atomic::Ordering::Relaxed);
     }
 
     fn kind(&self) -> ResolverKind {
         ResolverKind::System
     }
 
-    fn fake_ip_enabled(&self) -> bool {
-        false
+    async fn reverse_lookup(&self, _: std::net::IpAddr) -> Option<String> {
+        None
     }
 
     async fn is_fake_ip(&self, _: std::net::IpAddr) -> bool {
         false
     }
 
-    async fn reverse_lookup(&self, _: std::net::IpAddr) -> Option<String> {
-        None
+    fn fake_ip_enabled(&self) -> bool {
+        false
     }
 
     async fn after_router_inited(&self, _: Arc<Router>) {}
@@ -134,12 +129,12 @@ impl ClashResolver for SystemResolver {
 
 #[cfg(test)]
 mod tests {
-    use crate::app::dns::{ClashResolver, resolver::SystemResolver};
+    use super::*;
 
     #[tokio::test]
     async fn test_system_resolver_default_config() {
         let resolver = SystemResolver::new(false).unwrap();
-        let response = resolver.resolve("www.google.com", false).await.unwrap();
-        assert!(response.is_some());
+        let response = resolver.resolve("127.0.0.1", false).await.unwrap();
+        assert_eq!(response, Some(std::net::IpAddr::V4("127.0.0.1".parse().unwrap())));
     }
 }

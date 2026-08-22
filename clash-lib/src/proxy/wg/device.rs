@@ -147,35 +147,28 @@ impl DeviceManager {
 
         #[async_recursion::async_recursion]
         async fn query(
-            rtype: hickory_proto::rr::RecordType,
+            is_v6: bool,
             host: &str,
             server: SocketAddr,
             mut socket: UdpPair,
         ) -> Option<IpAddr> {
-            let mut msg = hickory_proto::op::Message::query();
+            let name = crate::app::dns::query::DnsName::from_domain(host)?;
+            let qtype = if is_v6 {
+                crate::app::dns::query::QType::AAAA
+            } else {
+                crate::app::dns::query::QType::A
+            };
 
-            msg.add_query({
-                let mut q = hickory_proto::op::Query::new();
-                let name = hickory_proto::rr::Name::from_str_relaxed(host)
-                    .unwrap()
-                    .append_domain(&hickory_proto::rr::Name::root())
-                    .unwrap();
-                q.set_name(name);
-                q.set_query_type(rtype);
-                q
-            });
-
-            msg.metadata.recursion_desired = true;
+            let msg = crate::app::dns::query::build_dns_query_wire(&name, qtype);
 
             let pkt = UdpPacket::new(
-                msg.to_vec().unwrap().into(),
+                msg.into(),
                 SocksAddr::any_ipv4(),
                 server.into(),
             );
 
             socket.feed(pkt).await.ok()?;
             socket.flush().await.ok()?;
-            trace!("sent dns query: {:?}", msg);
 
             let pkt =
                 match tokio::time::timeout(Duration::from_secs(5), socket.next())
@@ -188,49 +181,22 @@ impl DeviceManager {
                     }
                 };
 
-            let msg = hickory_proto::op::Message::from_vec(&pkt.data).ok()?;
-            trace!("got dns response: {:?}", msg);
-            for ans in msg.answers.iter() {
-                if ans.record_type() == rtype {
-                    match (rtype, &ans.data) {
-                        (_, hickory_proto::rr::RData::CNAME(cname)) => {
-                            debug!(
-                                "{} resolved to CNAME {}, asking recursively",
-                                host, cname.0
-                            );
-                            return query(
-                                rtype,
-                                &cname.0.to_ascii(),
-                                server,
-                                socket,
-                            )
-                            .await;
-                        }
-                        (
-                            hickory_proto::rr::RecordType::A,
-                            hickory_proto::rr::RData::A(addr),
-                        ) => {
-                            return Some(std::net::IpAddr::V4(addr.0));
-                        }
-                        (
-                            hickory_proto::rr::RecordType::AAAA,
-                            hickory_proto::rr::RData::AAAA(addr),
-                        ) => {
-                            return Some(std::net::IpAddr::V6(addr.0));
-                        }
-                        _ => return None,
-                    }
+            let ips = crate::app::dns::wire::extract_ips_from_dns_response(&pkt.data);
+            for ip in ips {
+                if is_v6 && ip.is_ipv6() {
+                    return Some(ip);
+                } else if !is_v6 && ip.is_ipv4() {
+                    return Some(ip);
                 }
             }
             None
         }
 
         let socket = self.new_udp_socket().await;
-        let v4_query = query(hickory_proto::rr::RecordType::A, host, server, socket);
+        let v4_query = query(false, host, server, socket);
         if self.addr_v6.is_some() {
             let socket = self.new_udp_socket().await;
-            let v6_query =
-                query(hickory_proto::rr::RecordType::AAAA, host, server, socket);
+            let v6_query = query(true, host, server, socket);
             match tokio::time::timeout(
                 Duration::from_secs(5),
                 futures::future::join(v4_query, v6_query),

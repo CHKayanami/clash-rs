@@ -1,6 +1,6 @@
 use std::{net::SocketAddr, sync::Arc};
 
-use tracing::{debug, warn};
+use tracing::debug;
 
 use crate::{
     app::{
@@ -115,42 +115,27 @@ async fn handle_tcp_dns_hijack<S: ProxyStream + 'static>(
             break;
         }
 
-        match hickory_proto::op::Message::from_vec(&msg_buf) {
-            Ok(msg) => match exchange_with_resolver(&resolver, &msg, true).await {
-                Ok(mut resp) => {
-                    resp.metadata.id = msg.metadata.id;
-                    match resp.to_vec() {
-                        Ok(resp_bytes) => {
-                            let resp_len = (resp_bytes.len() as u16).to_be_bytes();
-                            if let Err(e) = stream.write_all(&resp_len).await {
-                                debug!(
-                                    "failed to write TCP DNS response length: {}",
-                                    e
-                                );
-                                break;
-                            }
-                            if let Err(e) = stream.write_all(&resp_bytes).await {
-                                debug!("failed to write TCP DNS response body: {}", e);
-                                break;
-                            }
-                            if let Err(e) = stream.flush().await {
-                                debug!("failed to flush TCP DNS response: {}", e);
-                                break;
-                            }
-                        }
-                        Err(e) => {
-                            warn!("failed to serialize TCP DNS response: {}", e);
-                            break;
-                        }
-                    }
-                }
-                Err(e) => {
-                    warn!("failed to exchange TCP DNS message with resolver: {}", e);
+        match exchange_with_resolver(&resolver, &msg_buf, true).await {
+            Ok(resp_bytes) => {
+                let resp_len = (resp_bytes.len() as u16).to_be_bytes();
+                if let Err(e) = stream.write_all(&resp_len).await {
+                    debug!(
+                        "failed to write TCP DNS response length: {}",
+                        e
+                    );
                     break;
                 }
-            },
+                if let Err(e) = stream.write_all(&resp_bytes).await {
+                    debug!("failed to write TCP DNS response body: {}", e);
+                    break;
+                }
+                if let Err(e) = stream.flush().await {
+                    debug!("failed to flush TCP DNS response: {}", e);
+                    break;
+                }
+            }
             Err(e) => {
-                warn!("failed to parse TCP DNS message: {}", e);
+                debug!("failed to exchange TCP DNS message: {}", e);
                 break;
             }
         }

@@ -1,4 +1,3 @@
-pub use super::dns_client::DNSNetMode;
 use crate::{
     Error,
     app::net::{OutboundInterface, get_interface_by_name, get_outbound_interface},
@@ -7,6 +6,50 @@ use crate::{
         DNSListen, DNSMode, EdnsClientSubnet as DefEdnsClientSubnet, FakeIpFilterMode,
     },
 };
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DNSNetMode {
+    Udp,
+    Tcp,
+    Tls,
+    Https,
+    Dhcp,
+    Quic,
+    H3,
+}
+
+impl std::fmt::Display for DNSNetMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Udp => write!(f, "udp"),
+            Self::Tcp => write!(f, "tcp"),
+            Self::Tls => write!(f, "tls"),
+            Self::Https => write!(f, "https"),
+            Self::Dhcp => write!(f, "dhcp"),
+            Self::Quic => write!(f, "quic"),
+            Self::H3 => write!(f, "h3"),
+        }
+    }
+}
+
+impl std::str::FromStr for DNSNetMode {
+    type Err = crate::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "udp" => Ok(Self::Udp),
+            "tcp" => Ok(Self::Tcp),
+            "tls" | "dot" => Ok(Self::Tls),
+            "https" | "doh" => Ok(Self::Https),
+            "dhcp" => Err(crate::Error::InvalidConfig(
+                "DHCP DNS is not supported".to_string(),
+            )),
+            "quic" | "doq" => Ok(Self::Quic),
+            "h3" | "doh3" => Ok(Self::H3),
+            _ => Err(crate::Error::InvalidConfig(format!("unsupported DNS protocol: {s}"))),
+        }
+    }
+}
 use ipnet::{AddrParseError, Ipv4Net, Ipv6Net};
 use std::{
     collections::HashMap,
@@ -23,6 +66,7 @@ pub struct NameServer {
     pub net: DNSNetMode,
     pub host: url::Host<String>,
     pub port: u16,
+    pub path: Option<String>,
     pub interface: Option<OutboundInterface>,
     pub proxy: Option<String>,
 }
@@ -30,8 +74,13 @@ impl Display for NameServer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{}://{}:{}#{:?}",
-            self.net, self.host, self.port, self.interface,
+            "{}://{}:{}{}#proxy={:?}#iface={:?}",
+            self.net,
+            self.host,
+            self.port,
+            self.path.as_deref().unwrap_or(""),
+            self.proxy,
+            self.interface,
         )
     }
 }
@@ -139,13 +188,21 @@ impl Config {
                     port = url.port().unwrap_or(53);
                     net = "TCP";
                 }
-                "tls" => {
+                "tls" | "dot" => {
                     port = url.port().unwrap_or(853);
                     net = "DoT";
                 }
-                "https" => {
+                "https" | "doh" => {
                     port = url.port().unwrap_or(443);
                     net = "DoH";
+                }
+                "quic" | "doq" => {
+                    port = url.port().unwrap_or(853);
+                    net = "DoQ";
+                }
+                "h3" | "doh3" => {
+                    port = url.port().unwrap_or(443);
+                    net = "DoH3";
                 }
                 "dhcp" => {
                     port = url.port().unwrap_or(0);
@@ -161,10 +218,23 @@ impl Config {
                 }
             }
 
+            let path = match url.scheme() {
+                "https" | "doh" | "h3" | "doh3" => {
+                    let p = url.path();
+                    if !p.is_empty() && p != "/" {
+                        Some(p.to_string())
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            };
+
             let net = net.parse()?;
             nameservers.push(NameServer {
                 host: host.to_owned(),
                 port,
+                path,
                 net,
                 interface: iface
                     .map(|x| match x.as_str() {
