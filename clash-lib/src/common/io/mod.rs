@@ -7,7 +7,7 @@ use std::{
     time::Duration,
 };
 
-use bytes::{Buf, Bytes, BytesMut};
+use bytes::BytesMut;
 use futures::ready;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
@@ -15,6 +15,9 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 mod splice;
 #[cfg(all(target_os = "linux", feature = "zero_copy"))]
 pub use splice::zero_copy_bidirectional;
+
+pub mod slide_buffer;
+pub use slide_buffer::SlideBuffer;
 
 use crate::{app::dispatcher::TrackedStream, proxy::ClientStream};
 
@@ -57,47 +60,52 @@ impl From<std::io::Error> for CopyBidirectionalError {
     }
 }
 
-const TCP_RECV_CHUNK_SIZE: usize = 256 * 1024;
-const MIN_TCP_RECV_SIZE: usize = 16 * 1024;
+pub const DEFAULT_BUF_SIZE: usize = 16 * 1024;
 
-thread_local! {
-    static TCP_RECV_CHUNK_BUF: std::cell::RefCell<BytesMut> = std::cell::RefCell::new(BytesMut::new());
-}
-
-#[inline]
-fn ensure_tcp_chunk_capacity(chunk_buf: &mut BytesMut, min_capacity: usize) {
-    if chunk_buf.capacity() - chunk_buf.len() < min_capacity {
-        *chunk_buf = BytesMut::with_capacity(TCP_RECV_CHUNK_SIZE.max(min_capacity));
-    }
-}
-
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct CopyBuffer {
     read_done: bool,
     need_flush: bool,
     amt: u64,
-    target_cap: usize,
-    pending_write: Bytes,
+    start_index: usize,
+    cache_length: usize,
+    size: usize,
+    buf: Box<[u8]>,
+}
+
+impl Default for CopyBuffer {
+    fn default() -> Self {
+        Self::new_with_capacity(DEFAULT_BUF_SIZE).unwrap()
+    }
 }
 
 impl CopyBuffer {
     #[allow(unused)]
     pub fn new() -> Self {
-        Self::new_with_capacity(64 * 1024).unwrap()
+        Self::default()
     }
 
-    pub fn new_with_capacity(target_cap: usize) -> Result<Self, std::io::Error> {
+    pub fn new_with_capacity(size: usize) -> Result<Self, std::io::Error> {
+        let size = size.max(1024);
+        let buf = vec![0u8; size].into_boxed_slice();
         Ok(Self {
             read_done: false,
             need_flush: false,
             amt: 0,
-            target_cap,
-            pending_write: Bytes::new(),
+            start_index: 0,
+            cache_length: 0,
+            size,
+            buf,
         })
     }
 
     pub fn amount_transferred(&self) -> u64 {
         self.amt
+    }
+
+    #[allow(unused)]
+    pub fn capacity(&self) -> usize {
+        self.size
     }
 
     pub fn poll_copy<R, W>(
@@ -112,87 +120,94 @@ impl CopyBuffer {
         W: AsyncWrite + ?Sized,
     {
         loop {
-            // 1. If our buffer has no pending write data, read more from the reader.
-            if self.pending_write.is_empty() && !self.read_done {
-                let target_cap = self.target_cap.max(MIN_TCP_RECV_SIZE);
+            let mut read_pending = false;
+            let mut write_pending = false;
 
-                // Take the chunk buf out of TLS so the borrow doesn't span
-                // across poll_read (avoids RefCell panic on accidental re-entry).
-                let mut chunk_buf = TCP_RECV_CHUNK_BUF.with(|cell| cell.replace(BytesMut::new()));
-                ensure_tcp_chunk_capacity(&mut chunk_buf, target_cap);
+            // 1. Read as much as possible into the circular buffer.
+            while !self.read_done && self.cache_length < self.size {
+                let unused_start_index = (self.start_index + self.cache_length) % self.size;
+                let unused_end_index_exclusive = if unused_start_index < self.start_index {
+                    self.start_index
+                } else {
+                    self.size
+                };
 
-                debug_assert_eq!(
-                    chunk_buf.len(), 0,
-                    "TCP_RECV_CHUNK_BUF invariant violated: len must be 0 before read"
-                );
-
-                let unfilled = chunk_buf.spare_capacity_mut();
-                let mut buf = ReadBuf::uninit(unfilled);
-
-                let read_result = match reader.as_mut().poll_read(cx, &mut buf) {
+                let me = &mut *self;
+                let mut buf =
+                    ReadBuf::new(&mut me.buf[unused_start_index..unused_end_index_exclusive]);
+                match reader.as_mut().poll_read(cx, &mut buf) {
                     Poll::Ready(Ok(())) => {
                         let n = buf.filled().len();
                         if n == 0 {
-                            Poll::Ready(Ok(None))
+                            self.read_done = true;
                         } else {
-                            unsafe {
-                                chunk_buf.set_len(n);
+                            self.cache_length += n;
+                            if let Some(last_active) = last_active.as_mut() {
+                                **last_active = tokio::time::Instant::now();
                             }
-                            let data = chunk_buf.split_to(n).freeze();
-                            Poll::Ready(Ok(Some(data)))
                         }
-                    }
-                    Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
-                    Poll::Pending => Poll::Pending,
-                };
-
-                // Put the chunk buf back into TLS.
-                TCP_RECV_CHUNK_BUF.with(|cell| cell.replace(chunk_buf));
-
-                match read_result {
-                    Poll::Ready(Ok(Some(data))) => {
-                        self.pending_write = data;
-                        if let Some(last_active) = last_active.as_mut() {
-                            **last_active = tokio::time::Instant::now();
-                        }
-                    }
-                    Poll::Ready(Ok(None)) => {
-                        self.read_done = true;
                     }
                     Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
                     Poll::Pending => {
-                        // Flush buffered writer to avoid potential deadlock
-                        if self.need_flush {
-                            ready!(writer.as_mut().poll_flush(cx))?;
-                            self.need_flush = false;
+                        read_pending = true;
+                        break;
+                    }
+                }
+            }
+
+            // 2. Write out buffered data from the circular buffer.
+            while self.cache_length > 0 {
+                let used_start_index = self.start_index;
+                let used_end_index_exclusive =
+                    std::cmp::min(self.start_index + self.cache_length, self.size);
+
+                let me = &mut *self;
+                match writer
+                    .as_mut()
+                    .poll_write(cx, &me.buf[used_start_index..used_end_index_exclusive])
+                {
+                    Poll::Ready(Ok(written)) => {
+                        if written == 0 {
+                            return Poll::Ready(Err(io::Error::new(
+                                io::ErrorKind::WriteZero,
+                                "write zero byte into writer",
+                            )));
+                        } else {
+                            self.cache_length -= written;
+                            if self.cache_length == 0 {
+                                self.start_index = 0;
+                            } else {
+                                self.start_index = (self.start_index + written) % self.size;
+                            }
+                            self.amt += written as u64;
+                            self.need_flush = true;
+                            if let Some(last_active) = last_active.as_mut() {
+                                **last_active = tokio::time::Instant::now();
+                            }
                         }
-                        return Poll::Pending;
+                    }
+                    Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+                    Poll::Pending => {
+                        write_pending = true;
+                        break;
                     }
                 }
             }
 
-            // 2. If we have pending slice to write, stream it out.
-            while !self.pending_write.is_empty() {
-                let i = ready!(writer.as_mut().poll_write(cx, &self.pending_write))?;
-                if i == 0 {
-                    return Poll::Ready(Err(io::Error::new(
-                        io::ErrorKind::WriteZero,
-                        "write zero byte into writer",
-                    )));
-                } else {
-                    self.pending_write.advance(i);
-                    self.amt += i as u64;
-                    self.need_flush = true;
-                    if let Some(last_active) = last_active.as_mut() {
-                        **last_active = tokio::time::Instant::now();
-                    }
-                }
-            }
-
-            // 3. If we've written all data and seen EOF, flush and complete transfer.
-            if self.pending_write.is_empty() && self.read_done {
+            // 3. Flush if needed
+            if self.need_flush {
                 ready!(writer.as_mut().poll_flush(cx))?;
+                self.need_flush = false;
+            }
+
+            // 4. If all data is written and EOF is reached, complete transfer.
+            if self.read_done && self.cache_length == 0 {
                 return Poll::Ready(Ok(self.amt));
+            }
+
+            // 5. If waiting for I/O, yield control to executor.
+            if read_pending || write_pending {
+                return Poll::Pending;
             }
         }
     }
@@ -516,6 +531,54 @@ impl<T: ReadExactBase> ReadExt for T {
     }
 }
 
+pub trait ReadExactSlideBase {
+    /// inner stream to be polled
+    type I: AsyncRead + Unpin;
+    /// prepare the inner stream and slide buffer
+    fn decompose(&mut self) -> (&mut Self::I, &mut SlideBuffer);
+}
+
+pub trait ReadExactSlideExt: ReadExactSlideBase {
+    fn poll_read_exact(
+        &mut self,
+        cx: &mut std::task::Context,
+        size: usize,
+    ) -> Poll<std::io::Result<()>>;
+}
+
+impl<T: ReadExactSlideBase> ReadExactSlideExt for T {
+    fn poll_read_exact(
+        &mut self,
+        cx: &mut std::task::Context,
+        size: usize,
+    ) -> Poll<std::io::Result<()>> {
+        let (raw, buf) = self.decompose();
+        if buf.capacity() < size {
+            buf.ensure_capacity(size);
+        }
+        loop {
+            if buf.len() < size {
+                let want = size - buf.len();
+                if buf.remaining_capacity() < want {
+                    buf.compact();
+                }
+                let mut read_buf = ReadBuf::new(&mut buf.write_slice()[..want]);
+                ready!(Pin::new(&mut *raw).poll_read(cx, &mut read_buf))?;
+                let read = read_buf.filled().len();
+                if read == 0 {
+                    return Poll::Ready(Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "unexpected eof",
+                    )));
+                }
+                buf.advance_write(read);
+            } else {
+                return Poll::Ready(Ok(()));
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -524,11 +587,14 @@ mod tests {
     #[test]
     fn test_copy_buffer_initialization() {
         let small = CopyBuffer::new_with_capacity(4096).unwrap();
-        assert_eq!(small.target_cap, 4096);
+        assert_eq!(small.capacity(), 4096);
         assert_eq!(small.amount_transferred(), 0);
 
+        let default_buf = CopyBuffer::new();
+        assert_eq!(default_buf.capacity(), DEFAULT_BUF_SIZE);
+
         let large = CopyBuffer::new_with_capacity(128 * 1024).unwrap();
-        assert_eq!(large.target_cap, 128 * 1024);
+        assert_eq!(large.capacity(), 128 * 1024);
         assert_eq!(large.amount_transferred(), 0);
     }
 
@@ -538,7 +604,7 @@ mod tests {
         let mut reader = Cursor::new(test_data.clone());
         let mut writer = Vec::new();
 
-        let mut copy_buf = CopyBuffer::new_with_capacity(64 * 1024).unwrap();
+        let mut copy_buf = CopyBuffer::new_with_capacity(16 * 1024).unwrap();
 
         let res = futures::future::poll_fn(|cx| {
             copy_buf.poll_copy(
@@ -554,5 +620,68 @@ mod tests {
         assert_eq!(res.unwrap(), 64 * 1024);
         assert_eq!(writer, test_data);
         assert_eq!(copy_buf.amount_transferred(), 64 * 1024);
+    }
+
+    #[tokio::test]
+    async fn test_copy_buffer_wrap_around_multi_mb() {
+        // Transfer 1MB of pseudo-random data through a small 8KB circular buffer
+        let test_data: Vec<u8> = (0..(1024 * 1024)).map(|i| (i % 251) as u8).collect();
+        let mut reader = Cursor::new(test_data.clone());
+        let mut writer = Vec::new();
+
+        let mut copy_buf = CopyBuffer::new_with_capacity(8 * 1024).unwrap();
+
+        let res = futures::future::poll_fn(|cx| {
+            copy_buf.poll_copy(
+                cx,
+                Pin::new(&mut reader),
+                Pin::new(&mut writer),
+                None,
+            )
+        })
+        .await;
+
+        assert!(res.is_ok());
+        assert_eq!(res.unwrap(), 1024 * 1024);
+        assert_eq!(writer, test_data);
+        assert_eq!(copy_buf.amount_transferred(), 1024 * 1024);
+    }
+
+    struct MockSlideStream<R> {
+        reader: R,
+        buf: SlideBuffer,
+    }
+
+    impl<R: AsyncRead + Unpin> ReadExactSlideBase for MockSlideStream<R> {
+        type I = R;
+        fn decompose(&mut self) -> (&mut Self::I, &mut SlideBuffer) {
+            (&mut self.reader, &mut self.buf)
+        }
+    }
+
+    #[tokio::test]
+    async fn test_read_exact_slide() {
+        let data = b"hello beautiful world";
+        let mut stream = MockSlideStream {
+            reader: Cursor::new(data.to_vec()),
+            buf: SlideBuffer::new(8),
+        };
+
+        futures::future::poll_fn(|cx| stream.poll_read_exact(cx, 5))
+            .await
+            .unwrap();
+        assert_eq!(stream.buf.as_slice(), b"hello");
+        stream.buf.consume(5);
+
+        futures::future::poll_fn(|cx| stream.poll_read_exact(cx, 10))
+            .await
+            .unwrap();
+        assert_eq!(stream.buf.as_slice(), b" beautiful");
+        stream.buf.consume(10);
+
+        futures::future::poll_fn(|cx| stream.poll_read_exact(cx, 6))
+            .await
+            .unwrap();
+        assert_eq!(stream.buf.as_slice(), b" world");
     }
 }

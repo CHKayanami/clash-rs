@@ -6,7 +6,7 @@ use std::{
     task::{Context, Poll},
 };
 
-use bytes::BytesMut;
+use bytes::Bytes;
 use futures::{
     Sink, SinkExt, Stream, StreamExt, ready,
     stream::{SplitSink, SplitStream},
@@ -34,20 +34,12 @@ use crate::{
 /// stale key, or anything else that can reach the socket — and must not end the
 /// session, but a permanently broken socket still has to terminate.
 const MAX_CONSECUTIVE_RECV_ERRORS: usize = 32;
-const UDP_RECV_CHUNK_SIZE: usize = 256 * 1024;
 const MAX_UDP_DATAGRAM_SIZE: usize = 65535;
 
 use std::cell::RefCell;
 
 thread_local! {
-    static UDP_CHUNK_BUF: RefCell<BytesMut> = RefCell::new(BytesMut::new());
-}
-
-#[inline]
-fn ensure_chunk_capacity(chunk_buf: &mut BytesMut) {
-    if chunk_buf.capacity() - chunk_buf.len() < MAX_UDP_DATAGRAM_SIZE {
-        *chunk_buf = BytesMut::with_capacity(UDP_RECV_CHUNK_SIZE);
-    }
+    static UDP_RECV_BUF: RefCell<Box<[u8]>> = RefCell::new(vec![0u8; MAX_UDP_DATAGRAM_SIZE].into_boxed_slice());
 }
 
 pub struct OutboundDatagramShadowsocks<S> {
@@ -197,12 +189,9 @@ where
     ) -> Poll<Option<Self::Item>> {
         let me = self.get_mut();
 
-        UDP_CHUNK_BUF.with_borrow_mut(|chunk_buf| {
+        UDP_RECV_BUF.with_borrow_mut(|recv_buf| {
             loop {
-                ensure_chunk_capacity(chunk_buf);
-
-                let unfilled = chunk_buf.spare_capacity_mut();
-                let mut read_buf = ReadBuf::uninit(unfilled);
+                let mut read_buf = ReadBuf::new(recv_buf.as_mut());
 
                 let rv = ready!(me.inner.poll_recv(cx, &mut read_buf));
                 debug!("recv udp packet from remote ss server: {:?}", rv);
@@ -210,11 +199,7 @@ where
                 match rv {
                     Ok((n, src, ..)) => {
                         me.consecutive_recv_errors = 0;
-                        unsafe {
-                            let new_len = chunk_buf.len() + n;
-                            chunk_buf.set_len(new_len);
-                        }
-                        let data = chunk_buf.split_to(n).freeze();
+                        let data = Bytes::copy_from_slice(&recv_buf[..n]);
                         return Poll::Ready(Some(UdpPacket {
                             data,
                             src_addr: match src {

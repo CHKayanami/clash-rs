@@ -3,7 +3,6 @@ pub mod quic;
 pub mod stream;
 pub mod tls;
 
-use bytes::BytesMut;
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -12,6 +11,7 @@ use std::time::{Duration, Instant};
 use tokio::io::AsyncReadExt;
 use tracing::{debug, trace};
 
+use crate::common::io::SlideBuffer;
 use crate::proxy::ClientStream;
 use crate::session::{Session, SocksAddr};
 
@@ -280,22 +280,22 @@ impl Sniffer {
         }
 
         // Bounded prefetch with smart length requirement
-        let mut buf = BytesMut::with_capacity(MAX_SNIFF_BUFFER_SIZE);
+        let mut buf = SlideBuffer::new(MAX_SNIFF_BUFFER_SIZE);
         let deadline = tokio::time::Instant::now() + DEFAULT_SNIFF_TIMEOUT;
 
         loop {
-            let required = sniff_required_len(&buf);
+            let required = sniff_required_len(buf.as_slice());
             if required <= buf.len() || buf.len() >= MAX_SNIFF_BUFFER_SIZE {
                 break;
             }
 
-            let mut chunk = [0u8; 512];
-            let want = (required - buf.len()).min(chunk.len());
-            match tokio::time::timeout_at(deadline, stream.read(&mut chunk[..want]))
+            let want = (required - buf.len()).min(buf.remaining_capacity());
+            let write_slice = &mut buf.write_slice()[..want];
+            match tokio::time::timeout_at(deadline, stream.read(write_slice))
                 .await
             {
                 Ok(Ok(0)) => break,
-                Ok(Ok(n)) => buf.extend_from_slice(&chunk[..n]),
+                Ok(Ok(n)) => buf.advance_write(n),
                 Ok(Err(e)) => {
                     trace!("sniff stream read error for {}: {}", sess, e);
                     break;
@@ -307,11 +307,9 @@ impl Sniffer {
             }
         }
 
-        let prefix_bytes = buf.freeze();
-
         // 1. Try TLS SNI
         if tls_enabled {
-            if let Some(domain) = tls::parse_tls_sni(&prefix_bytes) {
+            if let Some(domain) = tls::parse_tls_sni(buf.as_slice()) {
                 if !self.is_domain_skipped(&domain) {
                     debug!("sniffed TLS SNI domain `{}` for {}", domain, sess);
                     if let Some(addr) = ip_target {
@@ -324,7 +322,7 @@ impl Sniffer {
                         .and_then(|c| c.override_destination)
                         .unwrap_or(self.config.override_destination);
                     let wrapped =
-                        Box::new(PrefixedStream::new(prefix_bytes, stream));
+                        Box::new(PrefixedStream::new(buf, stream));
                     return (Some(domain), wrapped, override_dest);
                 }
             }
@@ -332,7 +330,7 @@ impl Sniffer {
 
         // 2. Try HTTP Host
         if http_enabled {
-            if let Some(domain) = http::parse_http_host(&prefix_bytes) {
+            if let Some(domain) = http::parse_http_host(buf.as_slice()) {
                 if !self.is_domain_skipped(&domain) {
                     debug!("sniffed HTTP Host domain `{}` for {}", domain, sess);
                     if let Some(addr) = ip_target {
@@ -345,7 +343,7 @@ impl Sniffer {
                         .and_then(|c| c.override_destination)
                         .unwrap_or(self.config.override_destination);
                     let wrapped =
-                        Box::new(PrefixedStream::new(prefix_bytes, stream));
+                        Box::new(PrefixedStream::new(buf, stream));
                     return (Some(domain), wrapped, override_dest);
                 }
             }
@@ -356,7 +354,7 @@ impl Sniffer {
             self.tcp_neg_cache.lock().note_failure(addr, now);
         }
 
-        let wrapped = Box::new(PrefixedStream::new(prefix_bytes, stream));
+        let wrapped = Box::new(PrefixedStream::new(buf, stream));
         (None, wrapped, false)
     }
 

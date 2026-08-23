@@ -1,5 +1,4 @@
 use crate::Packet;
-use bytes::BytesMut;
 use log::trace;
 use std::net::SocketAddr;
 use tokio::sync::mpsc;
@@ -156,7 +155,6 @@ impl UdpSocket {
         let read = SplitRead { recv: self.inbound };
         let write = SplitWrite {
             send: self.outbound,
-            buf: BytesMut::with_capacity(65536),
         };
         (read, write)
     }
@@ -185,7 +183,6 @@ impl SplitRead {
 #[derive(Clone)]
 pub struct SplitWrite {
     send: mpsc::Sender<Packet>,
-    buf: BytesMut,
 }
 
 impl SplitWrite {
@@ -217,9 +214,7 @@ impl SplitWrite {
             ));
         }
 
-        if self.buf.capacity() < total_len {
-            self.buf.reserve((128 * 1024).max(total_len));
-        }
+        let mut buf = crate::ring_buffer::PooledBuffer::acquire(total_len);
 
         if is_v4 {
             let SocketAddr::V4(src) = packet.local_addr else {
@@ -257,9 +252,9 @@ impl SplitWrite {
             );
             udp_hdr[6..8].copy_from_slice(&udp_csum.to_be_bytes());
 
-            self.buf.extend_from_slice(&ip_hdr);
-            self.buf.extend_from_slice(&udp_hdr);
-            self.buf.extend_from_slice(payload);
+            buf.extend_from_slice(&ip_hdr);
+            buf.extend_from_slice(&udp_hdr);
+            buf.extend_from_slice(payload);
         } else {
             let SocketAddr::V6(src) = packet.local_addr else {
                 unreachable!()
@@ -291,9 +286,9 @@ impl SplitWrite {
             );
             udp_hdr[6..8].copy_from_slice(&udp_csum.to_be_bytes());
 
-            self.buf.extend_from_slice(&ip_hdr);
-            self.buf.extend_from_slice(&udp_hdr);
-            self.buf.extend_from_slice(payload);
+            buf.extend_from_slice(&ip_hdr);
+            buf.extend_from_slice(&udp_hdr);
+            buf.extend_from_slice(payload);
         }
 
         trace!(
@@ -301,11 +296,9 @@ impl SplitWrite {
             packet.remote_addr
         );
 
-        let bytes = self.buf.split_to(total_len).freeze();
-
         // UDP is inherently unreliable — drop the packet if the outbound
         // channel is full rather than blocking the UDP handler task.
-        match self.send.try_send(Packet::new(bytes)) {
+        match self.send.try_send(Packet::from_pooled(buf)) {
             Ok(()) => Ok(()),
             Err(mpsc::error::TrySendError::Full(_)) => Ok(()),
             Err(mpsc::error::TrySendError::Closed(_)) => {

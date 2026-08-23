@@ -4,18 +4,19 @@ use std::{
     task::{Context, Poll},
 };
 
-use bytes::{BufMut, Bytes, BytesMut};
+use bytes::Bytes;
 use futures::{ready, Sink, Stream};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tracing::{debug, trace};
 
 use crate::{
+    common::io::SlideBuffer,
     proxy::{datagram::UdpPacket, AnyStream},
     session::SocksAddr,
 };
 
 const MAX_PACKET_LENGTH: usize = u16::MAX as usize;
-const RECV_CHUNK_SIZE: usize = 64 * 1024;
+const BUFFER_SIZE: usize = MAX_PACKET_LENGTH + 2;
 
 pub struct OutboundDatagramUotV2 {
     inner: AnyStream,
@@ -29,10 +30,8 @@ pub struct OutboundDatagramUotV2 {
     flushed: bool,
 
     // Read state
-    header_read: usize,
-    packet_len: Option<usize>,
-    packet_buf: BytesMut,
-    length_buf: [u8; 2],
+    read_buf: SlideBuffer,
+    is_eof: bool,
 }
 
 impl OutboundDatagramUotV2 {
@@ -45,10 +44,8 @@ impl OutboundDatagramUotV2 {
             payload_buf: None,
             payload_written: 0,
             flushed: true,
-            header_read: 0,
-            packet_len: None,
-            packet_buf: BytesMut::new(),
-            length_buf: [0; 2],
+            read_buf: SlideBuffer::new(BUFFER_SIZE),
+            is_eof: false,
         }
     }
 }
@@ -165,86 +162,61 @@ impl Stream for OutboundDatagramUotV2 {
         cx: &mut Context<'_>,
     ) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
+
+        if this.is_eof {
+            return Poll::Ready(None);
+        }
+
         let mut inner = Pin::new(&mut this.inner);
 
         loop {
-            if this.packet_len.is_none() {
-                let mut length_read_buf =
-                    ReadBuf::new(&mut this.length_buf[this.header_read..]);
-                match ready!(inner.as_mut().poll_read(cx, &mut length_read_buf)) {
-                    Ok(()) => {
-                        let read = length_read_buf.filled().len();
-                        if read == 0 {
-                            return Poll::Ready(None);
-                        }
+            // Try to parse a full packet from buffered data
+            let slice = this.read_buf.as_slice();
+            if slice.len() >= 2 {
+                let packet_len = u16::from_be_bytes([slice[0], slice[1]]) as usize;
+                let total_len = 2 + packet_len;
 
-                        this.header_read += read;
-                        if this.header_read < this.length_buf.len() {
-                            continue;
-                        }
+                if slice.len() >= total_len {
+                    let data = Bytes::copy_from_slice(&slice[2..total_len]);
+                    this.read_buf.consume(total_len);
 
-                        let packet_len =
-                            u16::from_be_bytes(this.length_buf) as usize;
-                        this.header_read = 0;
-                        if packet_len > MAX_PACKET_LENGTH {
-                            debug!(
-                                "invalid uot v2 udp packet length: {}",
-                                packet_len
-                            );
-                            return Poll::Ready(None);
-                        }
-
-                        if packet_len == 0 {
-                            return Poll::Ready(Some(UdpPacket {
-                                data: Bytes::new(),
-                                src_addr: this.target_addr.clone(),
-                                dst_addr: this.target_addr.clone(),
-                                inbound_user: None,
-                            }));
-                        }
-
-                        this.packet_len = Some(packet_len);
-                        if this.packet_buf.capacity() < packet_len {
-                            let reserve_size =
-                                std::cmp::max(RECV_CHUNK_SIZE, packet_len);
-                            this.packet_buf.reserve(reserve_size);
-                        }
-                    }
-                    Err(err) => {
-                        debug!("failed to read uot v2 udp length header: {}", err);
-                        return Poll::Ready(None);
-                    }
-                }
-            }
-
-            if let Some(packet_len) = this.packet_len {
-                let remaining = packet_len - this.packet_buf.len();
-                let n = {
-                    let spare = this.packet_buf.spare_capacity_mut();
-                    let mut read_buf = ReadBuf::uninit(&mut spare[..remaining]);
-                    match inner.as_mut().poll_read(cx, &mut read_buf) {
-                        Poll::Pending => return Poll::Pending,
-                        Poll::Ready(Err(err)) => {
-                            debug!("failed to read uot v2 udp payload: {}", err);
-                            return Poll::Ready(None);
-                        }
-                        Poll::Ready(Ok(())) => read_buf.filled().len(),
-                    }
-                };
-                if n == 0 {
-                    return Poll::Ready(None);
-                }
-                unsafe { this.packet_buf.advance_mut(n) };
-
-                if this.packet_buf.len() == packet_len {
-                    let data = this.packet_buf.split_to(packet_len).freeze();
-                    this.packet_len = None;
                     return Poll::Ready(Some(UdpPacket {
                         data,
                         src_addr: this.target_addr.clone(),
                         dst_addr: this.target_addr.clone(),
                         inbound_user: None,
                     }));
+                }
+            }
+
+            // Incomplete packet in buffer, compact if necessary before reading more
+            this.read_buf.maybe_compact(4096);
+
+            let write_slice = this.read_buf.write_slice();
+            if write_slice.is_empty() {
+                debug!("uot v2 read buffer full but no complete packet");
+                return Poll::Ready(None);
+            }
+
+            let mut read_buf = ReadBuf::new(write_slice);
+            match inner.as_mut().poll_read(cx, &mut read_buf) {
+                Poll::Ready(Ok(())) => {
+                    let n = read_buf.filled().len();
+                    if n == 0 {
+                        this.is_eof = true;
+                        if this.read_buf.is_empty() {
+                            return Poll::Ready(None);
+                        } else {
+                            debug!("uot v2 EOF reached in the middle of a packet");
+                            return Poll::Ready(None);
+                        }
+                    }
+                    this.read_buf.advance_write(n);
+                }
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Err(err)) => {
+                    debug!("failed to read uot v2 udp stream: {}", err);
+                    return Poll::Ready(None);
                 }
             }
         }

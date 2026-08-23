@@ -1,6 +1,6 @@
 use bytes::BytesMut;
 use std::{
-    cell::UnsafeCell,
+    cell::{RefCell, UnsafeCell},
     ops::{Deref, DerefMut},
     sync::{
         LazyLock, Mutex,
@@ -18,6 +18,12 @@ pub fn max_pooled_buffers() -> usize {
     MAX_POOLED_BUFFERS.load(Ordering::Relaxed)
 }
 
+const LOCAL_POOL_CAPACITY: usize = 16;
+
+thread_local! {
+    static LOCAL_POOL: RefCell<Vec<BytesMut>> = const { RefCell::new(Vec::new()) };
+}
+
 static BUFFER_POOL: LazyLock<Mutex<Vec<BytesMut>>> =
     LazyLock::new(|| Mutex::new(Vec::new()));
 
@@ -30,6 +36,17 @@ pub struct PooledBuffer {
 impl PooledBuffer {
     /// Get a buffer from the pool or create a new one with requested working capacity.
     pub fn with_capacity(cap: usize) -> Self {
+        // 1. Try thread-local pool first (lock-free)
+        let from_local = LOCAL_POOL.with_borrow_mut(|local| local.pop());
+        if let Some(mut buffer) = from_local {
+            if buffer.capacity() < cap {
+                buffer.reserve(cap - buffer.capacity());
+            }
+            buffer.resize(cap, 0);
+            return Self { buffer };
+        }
+
+        // 2. Fall back to global pool
         if let Ok(mut pool) = BUFFER_POOL.lock() {
             if let Some(mut buffer) = pool.pop() {
                 if buffer.capacity() < cap {
@@ -42,6 +59,44 @@ impl PooledBuffer {
         let mut buffer = BytesMut::with_capacity(cap);
         buffer.resize(cap, 0);
         Self { buffer }
+    }
+
+    /// Acquire a clear buffer from the pool with at least `cap` capacity.
+    pub fn acquire(cap: usize) -> Self {
+        // 1. Try thread-local pool first (lock-free)
+        let from_local = LOCAL_POOL.with_borrow_mut(|local| local.pop());
+        if let Some(mut buffer) = from_local {
+            buffer.clear();
+            if buffer.capacity() < cap {
+                buffer.reserve(cap - buffer.capacity());
+            }
+            return Self { buffer };
+        }
+
+        // 2. Fall back to global pool
+        if let Ok(mut pool) = BUFFER_POOL.lock() {
+            if let Some(mut buffer) = pool.pop() {
+                buffer.clear();
+                if buffer.capacity() < cap {
+                    buffer.reserve(cap - buffer.capacity());
+                }
+                return Self { buffer };
+            }
+        }
+        Self {
+            buffer: BytesMut::with_capacity(cap),
+        }
+    }
+
+    #[inline]
+    pub fn extend_from_slice(&mut self, extend: &[u8]) {
+        self.buffer.extend_from_slice(extend);
+    }
+
+    pub fn into_bytes(mut self) -> bytes::Bytes {
+        let mut empty = BytesMut::new();
+        std::mem::swap(&mut self.buffer, &mut empty);
+        empty.freeze()
     }
 
     #[inline]
@@ -86,11 +141,25 @@ impl DerefMut for PooledBuffer {
 
 impl Drop for PooledBuffer {
     fn drop(&mut self) {
-        if let Ok(mut pool) = BUFFER_POOL.lock() {
-            if pool.len() < max_pooled_buffers() {
-                let mut buffer = std::mem::replace(&mut self.buffer, BytesMut::new());
-                buffer.clear();
-                pool.push(buffer);
+        let mut buffer = std::mem::replace(&mut self.buffer, BytesMut::new());
+        buffer.clear();
+
+        // 1. Try returning to thread-local pool first (lock-free)
+        let unreturned = LOCAL_POOL.with_borrow_mut(|local| {
+            if local.len() < LOCAL_POOL_CAPACITY {
+                local.push(buffer);
+                None
+            } else {
+                Some(buffer)
+            }
+        });
+
+        // 2. If thread-local pool is full, return to global pool
+        if let Some(buffer) = unreturned {
+            if let Ok(mut pool) = BUFFER_POOL.lock() {
+                if pool.len() < max_pooled_buffers() {
+                    pool.push(buffer);
+                }
             }
         }
     }
@@ -245,5 +314,20 @@ mod tests {
         let mut out2 = [0u8; 6];
         assert_eq!(rb2.dequeue_slice(&mut out2), 6);
         assert_eq!(&out2, b"reused");
+    }
+
+    #[test]
+    fn test_pooled_buffer_thread_local() {
+        let mut buf = PooledBuffer::acquire(1024);
+        buf.extend_from_slice(b"test-data");
+        assert_eq!(&buf[..], b"test-data");
+        drop(buf);
+
+        // Should be acquired from local pool with 0 allocations
+        let mut buf2 = PooledBuffer::acquire(512);
+        assert!(buf2.is_empty());
+        assert!(buf2.buffer.capacity() >= 1024);
+        buf2.extend_from_slice(b"new-data");
+        assert_eq!(&buf2[..], b"new-data");
     }
 }

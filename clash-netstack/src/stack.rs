@@ -67,30 +67,73 @@ pub struct NetStack {
     udp_outbound: mpsc::Receiver<Packet>,
 }
 
+use crate::ring_buffer::PooledBuffer;
+
+#[derive(Debug)]
+pub enum PacketData {
+    Bytes(Bytes),
+    Pooled(PooledBuffer),
+}
+
 pub struct Packet {
-    data: Bytes,
+    data: PacketData,
 }
 
 impl Packet {
     pub fn new(data: impl Into<Bytes>) -> Self {
-        Packet { data: data.into() }
+        Packet {
+            data: PacketData::Bytes(data.into()),
+        }
+    }
+
+    pub fn from_pooled(pooled: PooledBuffer) -> Self {
+        Packet {
+            data: PacketData::Pooled(pooled),
+        }
     }
 
     pub fn data(&self) -> &[u8] {
-        &self.data
+        match &self.data {
+            PacketData::Bytes(b) => b.as_ref(),
+            PacketData::Pooled(p) => p.as_ref(),
+        }
     }
 
     pub fn into_bytes(self) -> Bytes {
-        self.data
+        match self.data {
+            PacketData::Bytes(b) => b,
+            PacketData::Pooled(p) => p.into_bytes(),
+        }
     }
 }
 
-impl<T> From<T> for Packet
-where
-    T: Into<Bytes>,
-{
-    fn from(data: T) -> Self {
+impl From<Bytes> for Packet {
+    fn from(data: Bytes) -> Self {
         Packet::new(data)
+    }
+}
+
+impl From<Vec<u8>> for Packet {
+    fn from(data: Vec<u8>) -> Self {
+        Packet::new(Bytes::from(data))
+    }
+}
+
+impl From<&'static [u8]> for Packet {
+    fn from(data: &'static [u8]) -> Self {
+        Packet::new(Bytes::from_static(data))
+    }
+}
+
+impl From<bytes::BytesMut> for Packet {
+    fn from(data: bytes::BytesMut) -> Self {
+        Packet::new(data.freeze())
+    }
+}
+
+impl From<PooledBuffer> for Packet {
+    fn from(pooled: PooledBuffer) -> Self {
+        Packet::from_pooled(pooled)
     }
 }
 

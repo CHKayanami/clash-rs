@@ -1,23 +1,18 @@
-use bytes::{Buf, Bytes};
 use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
+use crate::common::io::SlideBuffer;
 use crate::proxy::ProxyStream;
 
 pub struct PrefixedStream<S> {
-    prefix: Option<Bytes>,
+    prefix: SlideBuffer,
     inner: S,
 }
 
 impl<S> PrefixedStream<S> {
-    pub fn new(prefix: Bytes, inner: S) -> Self {
-        let prefix = if prefix.is_empty() {
-            None
-        } else {
-            Some(prefix)
-        };
+    pub fn new(prefix: SlideBuffer, inner: S) -> Self {
         Self { prefix, inner }
     }
 
@@ -32,13 +27,10 @@ impl<S: AsyncRead + Unpin> AsyncRead for PrefixedStream<S> {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        if let Some(prefix) = self.prefix.as_mut() {
-            let to_read = std::cmp::min(prefix.len(), buf.remaining());
-            buf.put_slice(&prefix[..to_read]);
-            prefix.advance(to_read);
-            if prefix.is_empty() {
-                self.prefix = None;
-            }
+        if !self.prefix.is_empty() {
+            let to_read = std::cmp::min(self.prefix.len(), buf.remaining());
+            buf.put_slice(&self.prefix.as_slice()[..to_read]);
+            self.prefix.consume(to_read);
             return Poll::Ready(Ok(()));
         }
         Pin::new(&mut self.inner).poll_read(cx, buf)
@@ -72,7 +64,7 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for PrefixedStream<S> {
 impl<S: ProxyStream> ProxyStream for PrefixedStream<S> {
     #[cfg(all(target_os = "linux", feature = "zero_copy"))]
     fn underlying_socket(&mut self) -> Option<&mut tokio::net::TcpStream> {
-        if self.prefix.is_none() {
+        if self.prefix.is_empty() {
             self.inner.underlying_socket()
         } else {
             None
@@ -88,7 +80,8 @@ mod tests {
     #[tokio::test]
     async fn test_prefixed_stream() {
         let (client, mut server) = tokio::io::duplex(64);
-        let prefix = Bytes::from_static(b"hello ");
+        let mut prefix = SlideBuffer::new(64);
+        prefix.extend_from_slice(b"hello ");
         let mut prefixed = PrefixedStream::new(prefix, client);
 
         tokio::spawn(async move {

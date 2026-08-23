@@ -909,7 +909,7 @@ impl RealityClientConnection {
                     }
                 };
 
-            let mut record_slice =
+            let record_slice =
                 self.ciphertext_read_buf.split_to(total_record_len);
             let aad = [
                 record_slice[0],
@@ -919,9 +919,9 @@ impl RealityClientConnection {
                 record_slice[4],
             ];
 
-            let payload_slice = &mut record_slice[TLS_RECORD_HEADER_SIZE..];
+            let payload_slice = &record_slice[TLS_RECORD_HEADER_SIZE..];
             let decrypt_res = app_read_key
-                .open_in_place_slice(payload_slice, app_read_iv, self.read_seq, &aad);
+                .open(payload_slice, app_read_iv, self.read_seq, &aad);
 
             let decrypted = match decrypt_res {
                 Ok(d) => {
@@ -929,7 +929,7 @@ impl RealityClientConnection {
                     d
                 }
                 Err(_) => {
-                    // Decryption failed. Put the record back to ciphertext_read_buf.
+                    // Decryption failed. Put the untouched record back to ciphertext_read_buf.
                     // If we already have decrypted plaintext in plaintext_read_buf,
                     // return Ok(()) so the caller (e.g. SplicableTlsStream / VisionStream)
                     // can consume the plaintext (which may trigger the XTLS-splice transition

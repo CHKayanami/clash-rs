@@ -9,7 +9,7 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tracing::{debug, error};
 
 use crate::{
-    common::io::{ReadExactBase, ReadExt},
+    common::io::{ReadExactSlideBase, ReadExactSlideExt, SlideBuffer},
     proxy::AnyStream,
     session::SocksAddr,
 };
@@ -39,8 +39,7 @@ pub struct VlessStream {
     destination: SocksAddr,
     command: u8,
     addon_bytes: Option<Vec<u8>>,
-    response_buf: BytesMut,
-    read_pos: usize,
+    response_buf: SlideBuffer,
     response_state: ResponseState,
     write_buf: BytesMut,
     first_write_len: usize,
@@ -72,8 +71,7 @@ impl VlessStream {
             destination: destination.clone(),
             command,
             addon_bytes: flow.map(build_addon_bytes),
-            response_buf: BytesMut::with_capacity(64),
-            read_pos: 0,
+            response_buf: SlideBuffer::new(64),
             response_state: ResponseState::WaitingHeader,
             write_buf: BytesMut::new(),
             first_write_len: 0,
@@ -113,14 +111,6 @@ impl VlessStream {
         buf
     }
 
-    /// Drive the buffered request header (plus its first payload) out to the
-    /// wire, marking the handshake sent once it has fully drained.
-    ///
-    /// Shared by the write, flush and read paths so that no matter which one
-    /// first observes a pending handshake, `handshake_sent` ends up set. It
-    /// used to be possible to send the header from `poll_flush` and leave the
-    /// flag false, which both re-sent the whole header on the next write and
-    /// leaked the server's response header to the caller as payload.
     fn poll_send_pending_handshake(
         &mut self,
         cx: &mut Context<'_>,
@@ -162,11 +152,11 @@ impl VlessStream {
     }
 }
 
-impl ReadExactBase for VlessStream {
+impl ReadExactSlideBase for VlessStream {
     type I = AnyStream;
 
-    fn decompose(&mut self) -> (&mut Self::I, &mut BytesMut, &mut usize) {
-        (&mut self.inner, &mut self.response_buf, &mut self.read_pos)
+    fn decompose(&mut self) -> (&mut Self::I, &mut SlideBuffer) {
+        (&mut self.inner, &mut self.response_buf)
     }
 }
 
@@ -202,6 +192,7 @@ impl AsyncRead for VlessStream {
                             )));
                         }
                         let additional_info_len = this.response_buf[1] as usize;
+                        this.response_buf.consume(2);
                         if additional_info_len > 0 {
                             this.response_state =
                                 ResponseState::WaitingPayload(additional_info_len);
@@ -209,7 +200,6 @@ impl AsyncRead for VlessStream {
                             this.response_state = ResponseState::Done;
                             this.response_received = true;
                             this.handshake_done = true;
-                            this.response_buf = BytesMut::new();
                             debug!("VLESS handshake completed successfully");
                             break;
                         }
@@ -221,10 +211,10 @@ impl AsyncRead for VlessStream {
                             len,
                             &this.response_buf[..len.min(32)],
                         );
+                        this.response_buf.consume(len);
                         this.response_state = ResponseState::Done;
                         this.response_received = true;
                         this.handshake_done = true;
-                        this.response_buf = BytesMut::new();
                         debug!("VLESS handshake completed successfully");
                         break;
                     }

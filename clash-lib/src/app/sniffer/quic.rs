@@ -434,7 +434,7 @@ pub struct UdpFlowKey {
 }
 
 const SNIFFER_TTL: std::time::Duration = std::time::Duration::from_secs(5);
-const NO_SNI_THRESHOLD: u32 = 4;
+const NO_SNI_THRESHOLD: u32 = 3;
 const FAILED_DCID_TTL: std::time::Duration = std::time::Duration::from_secs(1);
 const MAX_INITIAL_SNIFF_PACKETS: u32 = 8;
 
