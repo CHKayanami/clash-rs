@@ -25,15 +25,18 @@ pub async fn handle(
     })
     .on_upgrade(move |mut socket| async move {
         let mgr = state.statistics_manager.clone();
+        let mut buf = Vec::with_capacity(64);
         loop {
             let (up, down) = mgr.now();
             let res = TrafficResponse { up, down };
-            let j_str = match serde_json::to_string(&res) {
-                Ok(s) => s,
-                Err(e) => {
-                    warn!("Failed to serialize traffic stats: {}", e);
-                    continue;
-                }
+            buf.clear();
+            if let Err(e) = serde_json::to_writer(&mut buf, &res) {
+                warn!("Failed to serialize traffic stats: {}", e);
+                continue;
+            }
+
+            let Ok(j_str) = std::str::from_utf8(&buf) else {
+                continue;
             };
 
             if let Err(e) = socket.send(Message::Text(j_str.into())).await {

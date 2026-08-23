@@ -1549,6 +1549,7 @@ dependencies = [
  "hyperlocal",
  "ip_network_table-deps-treebitmap",
  "ipnet",
+ "itoa",
  "libc",
  "maxminddb",
  "md-5",

@@ -24,8 +24,16 @@ use super::types::{
     Command, FRAME_HEADER_SIZE, Frame, FrameCodec, MAX_FRAME_DATA_SIZE, StringMap,
 };
 
+/// Capacity of the shared outgoing message channel.
+///
+/// This bounds total in-flight messages across all streams on a session,
+/// providing backpressure when the TLS writer cannot keep up. Sized to
+/// match the old per-stream budget (STREAM_CHANNEL_BUFFER) times the
+/// default max streams per connection.
+const OUTGOING_CHANNEL_BUFFER: usize = STREAM_CHANNEL_BUFFER * 8;
+
 /// Outgoing message types for the unified writer channel
-enum OutgoingMessage {
+pub(super) enum OutgoingMessage {
     /// Buffered frames (Settings + SYN + destination) - sent as single TLS record
     Buffered { data: Bytes },
     /// Control frame (Settings, SYN, etc.)
@@ -48,8 +56,9 @@ pub struct AnyTlsClientSession {
     active_streams: AtomicUsize,
     stream_id_counter: AtomicU32,
 
-    /// Channel for all outgoing messages (control and data)
-    outgoing_tx: mpsc::UnboundedSender<OutgoingMessage>,
+    /// Channel for all outgoing messages (control and data).
+    /// Bounded to provide backpressure when the writer cannot keep up.
+    outgoing_tx: mpsc::Sender<OutgoingMessage>,
 
     /// Session closure flag
     is_closed: Arc<AtomicBool>,
@@ -112,7 +121,7 @@ impl AnyTlsClientSession {
         // Send authentication packet (packet 0)
         Self::send_auth(&mut transport, password_hash.as_slice(), &padding).await?;
 
-        let (outgoing_tx, outgoing_rx) = mpsc::unbounded_channel();
+        let (outgoing_tx, outgoing_rx) = mpsc::channel(OUTGOING_CHANNEL_BUFFER);
         let initial_buffer = Self::create_initial_buffer(&padding);
 
         let session = Arc::new(Self {
@@ -212,7 +221,7 @@ impl AnyTlsClientSession {
         data: Bytes,
     ) -> io::Result<()> {
         self.outgoing_tx
-            .send(OutgoingMessage::Control {
+            .try_send(OutgoingMessage::Control {
                 cmd,
                 stream_id,
                 data,
@@ -225,7 +234,7 @@ impl AnyTlsClientSession {
     /// Send buffered initial frames
     fn send_buffered(&self, data: Bytes) -> io::Result<()> {
         self.outgoing_tx
-            .send(OutgoingMessage::Buffered { data })
+            .try_send(OutgoingMessage::Buffered { data })
             .map_err(|_| {
                 io::Error::new(io::ErrorKind::BrokenPipe, "Session writer closed")
             })
@@ -236,7 +245,7 @@ impl AnyTlsClientSession {
         session: Arc<Self>,
         reader: R,
         writer: W,
-        outgoing_rx: mpsc::UnboundedReceiver<OutgoingMessage>,
+        outgoing_rx: mpsc::Receiver<OutgoingMessage>,
     ) where
         R: AsyncRead + Send + Unpin + 'static,
         W: AsyncWrite + Send + Unpin + 'static,
@@ -271,7 +280,7 @@ impl AnyTlsClientSession {
     async fn writer_loop<W>(
         session_weak: std::sync::Weak<Self>,
         mut writer: W,
-        mut outgoing_rx: mpsc::UnboundedReceiver<OutgoingMessage>,
+        mut outgoing_rx: mpsc::Receiver<OutgoingMessage>,
         close_notify: Arc<tokio::sync::Notify>,
     ) -> io::Result<()>
     where
@@ -544,7 +553,7 @@ impl AnyTlsClientSession {
                 trace!("AnyTLS heartbeat request, replying");
                 if self
                     .outgoing_tx
-                    .send(OutgoingMessage::Control {
+                    .try_send(OutgoingMessage::Control {
                         cmd: Command::HeartResponse,
                         stream_id: frame.stream_id,
                         data: Bytes::new(),
@@ -620,34 +629,10 @@ impl AnyTlsClientSession {
             self.send_control_frame(Command::Psh, stream_id, dest_bytes)?;
         }
 
-        let (stream_write_tx, mut stream_write_rx) =
-            mpsc::channel::<(u32, Bytes)>(STREAM_CHANNEL_BUFFER);
-
-        let outgoing_tx = self.outgoing_tx.clone();
-        let is_closed = Arc::clone(&self.is_closed);
-        tokio::spawn(async move {
-            while let Some((sid, data)) = stream_write_rx.recv().await {
-                if is_closed.load(Ordering::Relaxed) {
-                    break;
-                }
-                let msg = if data.is_empty() {
-                    OutgoingMessage::Fin { stream_id: sid }
-                } else {
-                    OutgoingMessage::Data {
-                        stream_id: sid,
-                        data,
-                    }
-                };
-                if outgoing_tx.send(msg).is_err() {
-                    break;
-                }
-            }
-        });
-
         let stream = AnyTlsStream::with_keepalive(
             stream_id,
             data_rx,
-            stream_write_tx,
+            self.outgoing_tx.clone(),
             Arc::clone(&self.is_closed),
             Arc::clone(self),
         );

@@ -596,6 +596,8 @@ pub mod linux {
                 return Err("eBPF not loaded".to_string());
             };
 
+            static ONES: [u8; 1024] = [1u8; 1024];
+
             // 1. IPv4 Dynamic Bypass
             if !add_v4.is_empty() || !remove_v4.is_empty() {
                 let map = bpf
@@ -604,29 +606,49 @@ pub mod linux {
                 let raw_fd = map_raw_fd(map);
 
                 if !add_v4.is_empty() {
-                    let keys: Vec<u32> = add_v4.iter().map(|ip| u32::from_ne_bytes(ip.octets())).collect();
-                    let values: Vec<u8> = vec![1u8; keys.len()];
-                    let handled = bpf_update_batch_raw(&self.cap_batch_update, raw_fd, &keys, &values)?;
+                    let mut handled = false;
+                    if !self.cap_batch_update.is_unsupported() {
+                        let mut keys = Vec::with_capacity(add_v4.len());
+                        for ip in add_v4 {
+                            keys.push(u32::from_ne_bytes(ip.octets()));
+                        }
+                        let values = if keys.len() <= ONES.len() {
+                            &ONES[..keys.len()]
+                        } else {
+                            &vec![1u8; keys.len()][..]
+                        };
+                        handled = bpf_update_batch_raw(&self.cap_batch_update, raw_fd, &keys, values)?;
+                        if handled {
+                            debug!("Batch updated {} dynamic bypass IPv4s via BPF_MAP_UPDATE_BATCH", add_v4.len());
+                        }
+                    }
                     if !handled {
-                        for (k, ip) in keys.iter().zip(add_v4.iter()) {
-                            if let Err(e) = bpf_update_elem_raw(raw_fd, k, &1u8) {
+                        for ip in add_v4 {
+                            let k = u32::from_ne_bytes(ip.octets());
+                            if let Err(e) = bpf_update_elem_raw(raw_fd, &k, &1u8) {
                                 debug!("Failed to insert dynamic bypass IPv4 {}: errno={}", ip, e);
                             }
                         }
-                    } else {
-                        debug!("Batch updated {} dynamic bypass IPv4s via BPF_MAP_UPDATE_BATCH", add_v4.len());
                     }
                 }
 
                 if !remove_v4.is_empty() {
-                    let keys: Vec<u32> = remove_v4.iter().map(|ip| u32::from_ne_bytes(ip.octets())).collect();
-                    let handled = bpf_delete_batch_raw(&self.cap_batch_delete, raw_fd, &keys)?;
-                    if !handled {
-                        for k in &keys {
-                            let _ = bpf_delete_elem_raw(raw_fd, k);
+                    let mut handled = false;
+                    if !self.cap_batch_delete.is_unsupported() {
+                        let mut keys = Vec::with_capacity(remove_v4.len());
+                        for ip in remove_v4 {
+                            keys.push(u32::from_ne_bytes(ip.octets()));
                         }
-                    } else {
-                        debug!("Batch removed {} dynamic bypass IPv4s via BPF_MAP_DELETE_BATCH", remove_v4.len());
+                        handled = bpf_delete_batch_raw(&self.cap_batch_delete, raw_fd, &keys)?;
+                        if handled {
+                            debug!("Batch removed {} dynamic bypass IPv4s via BPF_MAP_DELETE_BATCH", remove_v4.len());
+                        }
+                    }
+                    if !handled {
+                        for ip in remove_v4 {
+                            let k = u32::from_ne_bytes(ip.octets());
+                            let _ = bpf_delete_elem_raw(raw_fd, &k);
+                        }
                     }
                 }
             }
@@ -639,29 +661,47 @@ pub mod linux {
                 let raw_fd = map_raw_fd(map);
 
                 if !add_v6.is_empty() {
-                    let keys: Vec<[u8; 16]> = add_v6.iter().map(|ip| ip.octets()).collect();
-                    let values: Vec<u8> = vec![1u8; keys.len()];
-                    let handled = bpf_update_batch_raw(&self.cap_batch_update, raw_fd, &keys, &values)?;
+                    let mut handled = false;
+                    if !self.cap_batch_update.is_unsupported() {
+                        let keys: &[[u8; 16]] = unsafe {
+                            std::slice::from_raw_parts(add_v6.as_ptr() as *const [u8; 16], add_v6.len())
+                        };
+                        let values = if keys.len() <= ONES.len() {
+                            &ONES[..keys.len()]
+                        } else {
+                            &vec![1u8; keys.len()][..]
+                        };
+                        handled = bpf_update_batch_raw(&self.cap_batch_update, raw_fd, keys, values)?;
+                        if handled {
+                            debug!("Batch updated {} dynamic bypass IPv6s via BPF_MAP_UPDATE_BATCH", add_v6.len());
+                        }
+                    }
                     if !handled {
-                        for (k, ip) in keys.iter().zip(add_v6.iter()) {
-                            if let Err(e) = bpf_update_elem_raw(raw_fd, k, &1u8) {
+                        for ip in add_v6 {
+                            let k = ip.octets();
+                            if let Err(e) = bpf_update_elem_raw(raw_fd, &k, &1u8) {
                                 debug!("Failed to insert dynamic bypass IPv6 {}: errno={}", ip, e);
                             }
                         }
-                    } else {
-                        debug!("Batch updated {} dynamic bypass IPv6s via BPF_MAP_UPDATE_BATCH", add_v6.len());
                     }
                 }
 
                 if !remove_v6.is_empty() {
-                    let keys: Vec<[u8; 16]> = remove_v6.iter().map(|ip| ip.octets()).collect();
-                    let handled = bpf_delete_batch_raw(&self.cap_batch_delete, raw_fd, &keys)?;
-                    if !handled {
-                        for k in &keys {
-                            let _ = bpf_delete_elem_raw(raw_fd, k);
+                    let mut handled = false;
+                    if !self.cap_batch_delete.is_unsupported() {
+                        let keys: &[[u8; 16]] = unsafe {
+                            std::slice::from_raw_parts(remove_v6.as_ptr() as *const [u8; 16], remove_v6.len())
+                        };
+                        handled = bpf_delete_batch_raw(&self.cap_batch_delete, raw_fd, keys)?;
+                        if handled {
+                            debug!("Batch removed {} dynamic bypass IPv6s via BPF_MAP_DELETE_BATCH", remove_v6.len());
                         }
-                    } else {
-                        debug!("Batch removed {} dynamic bypass IPv6s via BPF_MAP_DELETE_BATCH", remove_v6.len());
+                    }
+                    if !handled {
+                        for ip in remove_v6 {
+                            let k = ip.octets();
+                            let _ = bpf_delete_elem_raw(raw_fd, &k);
+                        }
                     }
                 }
             }

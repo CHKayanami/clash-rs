@@ -3,7 +3,7 @@
 //! A Stream represents a single multiplexed connection within an AnyTLS Session.
 //! It implements AsyncRead and AsyncWrite for transparent integration into clash-rs.
 
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -13,10 +13,8 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::mpsc;
 use tokio_util::sync::PollSender;
 
+use super::session::OutgoingMessage;
 use super::types::MAX_FRAME_DATA_SIZE;
-
-/// Default capacity for outbound stream write chunk buffer (64 KB)
-const WRITE_BUFFER_CHUNK_SIZE: usize = 64 * 1024;
 
 /// Buffer size for bounded channels (number of messages, not bytes)
 pub const STREAM_CHANNEL_BUFFER: usize = 16;
@@ -35,11 +33,10 @@ pub struct AnyTlsStream {
     /// Offset into read_buffer for partial consumption
     read_offset: usize,
 
-    /// Chunk buffer for outgoing writes to avoid per-write heap allocation
-    write_buf: BytesMut,
-
-    /// Poll-based sender for outgoing data to session (bounded with backpressure)
-    data_tx: PollSender<(u32, Bytes)>,
+    /// Poll-based sender for outgoing messages to the session writer.
+    /// Wraps the session's bounded channel to provide poll-compatible
+    /// backpressure without an intermediate forwarder task.
+    outgoing_tx: PollSender<OutgoingMessage>,
 
     /// Shared flag indicating session closure
     session_closed: Arc<AtomicBool>,
@@ -61,10 +58,10 @@ impl crate::proxy::ProxyStream for AnyTlsStream {}
 
 impl AnyTlsStream {
     /// Create a new AnyTlsStream with a session keepalive reference
-    pub fn with_keepalive<S: Send + Sync + 'static>(
+    pub(super) fn with_keepalive<S: Send + Sync + 'static>(
         id: u32,
         data_rx: mpsc::Receiver<Bytes>,
-        data_tx: mpsc::Sender<(u32, Bytes)>,
+        outgoing_tx: mpsc::Sender<OutgoingMessage>,
         session_closed: Arc<AtomicBool>,
         session: Arc<S>,
     ) -> Self {
@@ -73,8 +70,7 @@ impl AnyTlsStream {
             data_rx,
             read_buffer: Bytes::new(),
             read_offset: 0,
-            write_buf: BytesMut::with_capacity(WRITE_BUFFER_CHUNK_SIZE),
-            data_tx: PollSender::new(data_tx),
+            outgoing_tx: PollSender::new(outgoing_tx),
             session_closed,
             stream_closed: false,
             shutdown_in_progress: false,
@@ -91,8 +87,10 @@ impl AnyTlsStream {
 
     /// Best-effort FIN send for Drop
     fn send_fin_best_effort(&mut self) {
-        if let Some(sender) = self.data_tx.get_ref() {
-            let _ = sender.try_send((self.id, Bytes::new()));
+        if let Some(sender) = self.outgoing_tx.get_ref() {
+            let _ = sender.try_send(OutgoingMessage::Fin {
+                stream_id: self.id,
+            });
         }
     }
 }
@@ -181,16 +179,15 @@ impl AsyncWrite for AnyTlsStream {
             )));
         }
 
-        match self.data_tx.poll_reserve(cx) {
+        match self.outgoing_tx.poll_reserve(cx) {
             Poll::Ready(Ok(())) => {
                 let write_len = buf.len().min(MAX_FRAME_DATA_SIZE);
-                if self.write_buf.capacity() < write_len {
-                    self.write_buf.reserve(WRITE_BUFFER_CHUNK_SIZE.max(write_len));
-                }
-                self.write_buf.extend_from_slice(&buf[..write_len]);
-                let data = self.write_buf.split().freeze();
+                let data = Bytes::copy_from_slice(&buf[..write_len]);
                 let id = self.id;
-                match self.data_tx.send_item((id, data)) {
+                match self.outgoing_tx.send_item(OutgoingMessage::Data {
+                    stream_id: id,
+                    data,
+                }) {
                     Ok(()) => Poll::Ready(Ok(write_len)),
                     Err(_) => Poll::Ready(Err(io::Error::new(
                         io::ErrorKind::BrokenPipe,
@@ -234,10 +231,12 @@ impl AsyncWrite for AnyTlsStream {
 
         self.shutdown_in_progress = true;
 
-        match self.data_tx.poll_reserve(cx) {
+        match self.outgoing_tx.poll_reserve(cx) {
             Poll::Ready(Ok(())) => {
                 let id = self.id;
-                match self.data_tx.send_item((id, Bytes::new())) {
+                match self.outgoing_tx.send_item(OutgoingMessage::Fin {
+                    stream_id: id,
+                }) {
                     Ok(()) => {
                         self.stream_closed = true;
                         Poll::Ready(Ok(()))

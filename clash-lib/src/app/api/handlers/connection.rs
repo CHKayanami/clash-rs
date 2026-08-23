@@ -60,17 +60,19 @@ async fn get_connections(
     })
     .on_upgrade(move |mut socket| async move {
         let interval = q.interval;
-
         let mgr = state.statistics_manager.clone();
+        let mut buf = Vec::with_capacity(8192);
 
         loop {
             let snapshot = mgr.snapshot().await;
-            let body = match serde_json::to_string(&snapshot) {
-                Ok(s) => s,
-                Err(e) => {
-                    warn!("Failed to serialize connection snapshot: {}", e);
-                    continue;
-                }
+            buf.clear();
+            if let Err(e) = serde_json::to_writer(&mut buf, &snapshot) {
+                warn!("Failed to serialize connection snapshot: {}", e);
+                continue;
+            }
+
+            let Ok(body) = std::str::from_utf8(&buf) else {
+                continue;
             };
 
             if let Err(e) = socket.send(Message::Text(body.into())).await {

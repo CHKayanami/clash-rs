@@ -674,10 +674,13 @@ impl AsyncWrite for VisionStream {
         if this.write_buf_app_data {
             this.write_direct = true;
             this.write_buf_app_data = false;
-            if this.filter.supports_xtls()
-                && let Some(flag) = &this.write_splice_flag
-            {
-                flag.store(true, Ordering::Release);
+            if this.filter.supports_xtls() {
+                if let Some(flag) = &this.write_splice_flag {
+                    flag.store(true, Ordering::Release);
+                }
+                if let Some(flag) = &this.read_splice_flag {
+                    flag.store(true, Ordering::Release);
+                }
             }
         }
         this.write_buf_consumed = 0;

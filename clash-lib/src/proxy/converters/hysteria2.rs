@@ -244,7 +244,6 @@ impl Handler {
 mod tests {
     use super::*;
     use crate::proxy::OutboundHandler;
-    use std::sync::Arc;
 
     #[test]
     fn test_port_gen() {
@@ -259,10 +258,10 @@ mod tests {
     #[test]
     fn test_hysteria2_url_parse() {
         crate::tests::initialize();
-        let url_str = "hysteria2://51e322ae-88ad-42c6-960a-0309448b88e2@192.168.10.106:60747?alpn=h3&insecure=1&allowInsecure=1&pinSHA256=A400A045BC82C4EDCB82D2DA0508EDC3351A5C4EFCB71DAA72C2A877D1B92C7C";
+        let url_str = "hysteria2://51e322ae-88ad-42c6-960a-0309448b88e2@example.com:60747?alpn=h3&insecure=1&allowInsecure=1&pinSHA256=A400A045BC82C4EDCB82D2DA0508EDC3351A5C4EFCB71DAA72C2A877D1B92C7C";
         let outbound: OutboundHysteria2 =
             url_str.parse().expect("failed to parse hysteria2 url");
-        assert_eq!(outbound.server, "192.168.10.106");
+        assert_eq!(outbound.server, "example.com");
         assert_eq!(outbound.port, 60747);
         assert_eq!(outbound.password, "51e322ae-88ad-42c6-960a-0309448b88e2");
         assert_eq!(outbound.alpn.as_deref(), Some(&["h3".to_string()][..]));
@@ -275,128 +274,5 @@ mod tests {
         let handler = Handler::try_from(outbound)
             .expect("failed to build handler from outbound");
         assert_eq!(handler.name(), "hysteria2");
-    }
-
-    #[tokio::test]
-    async fn test_hysteria2_client_live_connection() {
-        crate::tests::initialize();
-        use crate::app::dns::ThreadSafeDNSResolver;
-        use crate::session::{Session, SocksAddr};
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-        let url_str = "hysteria2://51e322ae-88ad-42c6-960a-0309448b88e2@192.168.10.106:60747?alpn=h3&insecure=1&allowInsecure=1&pinSHA256=A400A045BC82C4EDCB82D2DA0508EDC3351A5C4EFCB71DAA72C2A877D1B92C7C";
-        let handler = std::sync::Arc::new(
-            Handler::try_from_url(url_str)
-                .expect("failed to parse and create hysteria2 handler"),
-        );
-
-        let sess = Session {
-            destination: SocksAddr::Domain("www.baidu.com".to_string(), 80),
-            ..Default::default()
-        };
-        let dummy_resolver =
-            Arc::new(crate::app::dns::SystemResolver::new(true).unwrap())
-                as ThreadSafeDNSResolver;
-
-        println!(
-            "Testing Hysteria2 client connection to www.baidu.com:80 via 192.168.10.106:60747..."
-        );
-        let mut stream = handler
-            .connect_stream(&sess, dummy_resolver)
-            .await
-            .expect("Failed to connect stream via Hysteria2");
-
-        let request = b"GET / HTTP/1.1\r\nHost: www.baidu.com\r\nUser-Agent: curl/7.68.0\r\nConnection: close\r\n\r\n";
-        stream
-            .write_all(request)
-            .await
-            .expect("Failed to write request to Hysteria2 stream");
-
-        let mut response = Vec::new();
-        stream
-            .read_to_end(&mut response)
-            .await
-            .expect("Failed to read response from Hysteria2 stream");
-
-        let response_str = String::from_utf8_lossy(&response);
-        println!(
-            "Received response from www.baidu.com:\n{}",
-            &response_str[..response_str.len().min(500)]
-        );
-        assert!(
-            response_str.contains("200 OK")
-                || response_str.contains("302")
-                || response_str.contains("baidu"),
-            "Unexpected response: {}",
-            response_str
-        );
-    }
-
-    #[tokio::test]
-    async fn test_hysteria2_client_live_https_connection() {
-        crate::tests::initialize();
-        use crate::app::dns::ThreadSafeDNSResolver;
-        use crate::common::tls::{DefaultTlsVerifier, build_tls_client_config};
-        use crate::session::{Session, SocksAddr};
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-        let url_str = "hysteria2://51e322ae-88ad-42c6-960a-0309448b88e2@192.168.10.106:60747?alpn=h3&insecure=1&allowInsecure=1&pinSHA256=A400A045BC82C4EDCB82D2DA0508EDC3351A5C4EFCB71DAA72C2A877D1B92C7C";
-        let handler = std::sync::Arc::new(
-            Handler::try_from_url(url_str)
-                .expect("failed to parse and create hysteria2 handler"),
-        );
-
-        let sess = Session {
-            destination: SocksAddr::Domain("www.baidu.com".to_string(), 443),
-            ..Default::default()
-        };
-        let dummy_resolver =
-            Arc::new(crate::app::dns::SystemResolver::new(true).unwrap())
-                as ThreadSafeDNSResolver;
-
-        println!(
-            "Testing Hysteria2 client HTTPS connection to https://www.baidu.com:443 via 192.168.10.106:60747..."
-        );
-        let stream = handler
-            .connect_stream(&sess, dummy_resolver)
-            .await
-            .expect("Failed to connect stream via Hysteria2");
-
-        let verifier = Arc::new(DefaultTlsVerifier::new(None, true));
-        let tls_config = build_tls_client_config(verifier, None, None)
-            .expect("failed to build tls config");
-        let connector = tokio_rustls::TlsConnector::from(Arc::new(tls_config));
-        let domain = rustls::pki_types::ServerName::try_from("www.baidu.com")
-            .expect("invalid domain");
-
-        let mut tls_stream = connector
-            .connect(domain, stream)
-            .await
-            .expect("Failed to establish TLS session over Hysteria2 stream");
-
-        let request = b"GET / HTTP/1.1\r\nHost: www.baidu.com\r\nUser-Agent: curl/7.68.0\r\nConnection: close\r\n\r\n";
-        tls_stream
-            .write_all(request)
-            .await
-            .expect("Failed to write request to Hysteria2 TLS stream");
-
-        let mut response = Vec::new();
-        tls_stream
-            .read_to_end(&mut response)
-            .await
-            .expect("Failed to read response from Hysteria2 TLS stream");
-
-        let response_str = String::from_utf8_lossy(&response);
-        println!(
-            "Received HTTPS response from www.baidu.com:\n{}",
-            &response_str[..response_str.len().min(500)]
-        );
-        assert!(
-            response_str.contains("200 OK")
-                || response_str.contains("302")
-                || response_str.contains("baidu"),
-            "Unexpected response: {}",
-            response_str
-        );
     }
 }

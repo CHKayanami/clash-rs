@@ -17,7 +17,6 @@ use crate::{
         dns::ThreadSafeDNSResolver,
     },
     impl_default_connector,
-    proxy::vless::datagram::OutboundDatagramVless,
     session::Session,
 };
 use async_trait::async_trait;
@@ -25,7 +24,6 @@ use erased_serde::Serialize as ErasedSerialize;
 use std::{collections::HashMap, io, sync::Arc};
 use tracing::debug;
 
-mod datagram;
 mod stream;
 mod vision;
 pub mod xudp;
@@ -49,6 +47,7 @@ pub struct Handler {
     opts: HandlerOptions,
     connector: Option<Arc<dyn RemoteConnector>>,
     mux_pool: Option<Arc<H2MuxPool>>,
+    xudp_pool: Arc<xudp::XudpPool>,
 }
 
 impl std::fmt::Debug for Handler {
@@ -62,17 +61,22 @@ impl std::fmt::Debug for Handler {
 impl_default_connector!(Handler);
 
 impl Handler {
-    pub fn new(opts: HandlerOptions, connector: Option<Arc<dyn RemoteConnector>>) -> Self {
+    pub fn new(
+        opts: HandlerOptions,
+        connector: Option<Arc<dyn RemoteConnector>>,
+    ) -> Self {
         let mux_pool = opts
             .smux
             .as_ref()
             .filter(|s| s.enable)
             .map(|s| H2MuxPool::new(s.clone()));
+        let xudp_pool = xudp::XudpPool::new(4, 256);
 
         Self {
             opts,
             connector,
             mux_pool,
+            xudp_pool,
         }
     }
 
@@ -246,24 +250,28 @@ impl OutboundHandler for Handler {
         resolver: ThreadSafeDNSResolver,
         connector: &dyn RemoteConnector,
     ) -> io::Result<BoxedChainedDatagram> {
-        let stream = connector
-            .connect_stream(
-                resolver,
-                self.opts.server.as_str(),
-                self.opts.port,
-                self.opts.common_opts.tfo,
-                sess.iface.as_ref(),
-                #[cfg(target_os = "linux")]
-                sess.so_mark,
-            )
+        let dial_carrier = || async {
+            let stream = connector
+                .connect_stream(
+                    resolver.clone(),
+                    self.opts.server.as_str(),
+                    self.opts.port,
+                    self.opts.common_opts.tfo,
+                    sess.iface.as_ref(),
+                    #[cfg(target_os = "linux")]
+                    sess.so_mark,
+                )
+                .await?;
+            self.inner_proxy_stream(stream, sess, VLESS_COMMAND_MUX)
+                .await
+        };
+
+        let child_dgram = self
+            .xudp_pool
+            .open_stream(&sess.destination, dial_carrier)
             .await?;
 
-        let stream = self
-            .inner_proxy_stream(stream, sess, VLESS_COMMAND_MUX)
-            .await?;
-        let d = OutboundDatagramVless::new(stream, sess.destination.clone(), true);
-
-        let chained = ChainedDatagramWrapper::new(d);
+        let chained = ChainedDatagramWrapper::new(child_dgram);
         chained.append_to_chain(self.name()).await;
         Ok(Box::new(chained))
     }
@@ -849,4 +857,3 @@ rules:
             .await
     }
 }
-

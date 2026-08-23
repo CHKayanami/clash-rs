@@ -158,7 +158,7 @@ impl EbpfInbound {
                 let hook = Arc::new(move |domain: &str, ips: &[IpAddr], ttl: Duration| {
                     let offloader = offloader.clone();
                     let router = router.clone();
-                    let domain = domain.to_string();
+                    let domain: Arc<str> = Arc::from(domain);
                     let ips = ips.to_vec();
                     tokio::spawn(async move {
                         let is_direct = router.is_domain_direct(&domain).await;

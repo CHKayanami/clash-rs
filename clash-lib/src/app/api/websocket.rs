@@ -38,17 +38,21 @@ pub async fn connections(
     let callback = async move |mut socket: WebSocket| {
         let interval = query.interval.unwrap_or(1);
         let mut interval = tokio::time::interval(Duration::from_secs(interval));
+        let mut buf = Vec::with_capacity(8192);
 
         loop {
             interval.tick().await;
             let snapshot = state.statistics_manager.snapshot().await;
 
-            let body = match serde_json::to_string(&snapshot) {
-                Ok(body) => body,
-                Err(e) => {
-                    debug!("failed to serialize snapshot for ws connection: {}", e);
-                    break;
-                }
+            buf.clear();
+            if let Err(e) = serde_json::to_writer(&mut buf, &snapshot) {
+                debug!("failed to serialize snapshot for ws connection: {}", e);
+                break;
+            }
+
+            let Ok(body) = std::str::from_utf8(&buf) else {
+                debug!("failed to parse utf-8 for ws connection");
+                break;
             };
 
             if let Err(e) = socket.send(Message::Text(body.into())).await {
@@ -71,11 +75,18 @@ pub async fn traffic(
 ) -> impl IntoResponse {
     let callback = async move |mut socket: WebSocket| {
         let mut interval = tokio::time::interval(Duration::from_secs(1));
+        let mut buf = Vec::with_capacity(64);
 
         loop {
             interval.tick().await;
             let (up, down) = state.statistics_manager.now();
-            let response = format!(r#"{{"up":{up},"down":{down}}}"#);
+            buf.clear();
+            use std::io::Write;
+            let _ = write!(&mut buf, r#"{{"up":{up},"down":{down}}}"#);
+
+            let Ok(response) = std::str::from_utf8(&buf) else {
+                break;
+            };
 
             if let Err(e) = socket.send(Message::Text(response.into())).await {
                 debug!("ws connection closed with error: {}", e);
@@ -99,11 +110,18 @@ pub async fn memory(
     let callback = async move |mut socket: WebSocket| {
         let interval = query.interval.unwrap_or(1).max(1);
         let mut interval = tokio::time::interval(Duration::from_secs(interval));
+        let mut buf = Vec::with_capacity(64);
 
         loop {
             interval.tick().await;
             let inuse = state.statistics_manager.memory_usage();
-            let body = format!(r#"{{"inuse":{inuse},"oslimit":0}}"#);
+            buf.clear();
+            use std::io::Write;
+            let _ = write!(&mut buf, r#"{{"inuse":{inuse},"oslimit":0}}"#);
+
+            let Ok(body) = std::str::from_utf8(&buf) else {
+                break;
+            };
 
             if let Err(e) = socket.send(Message::Text(body.into())).await {
                 debug!("ws connection closed with error: {}", e);
@@ -128,13 +146,16 @@ pub async fn log(
     })
     .on_upgrade(move |mut socket| async move {
         let mut rx = state.log_source_tx.subscribe();
+        let mut buf = Vec::with_capacity(512);
         while let Ok(evt) = rx.recv().await {
-            let res = match serde_json::to_string(&evt) {
-                Ok(s) => s,
-                Err(e) => {
-                    warn!("Failed to serialize log event: {}", e);
-                    continue;
-                }
+            buf.clear();
+            if let Err(e) = serde_json::to_writer(&mut buf, &evt) {
+                warn!("Failed to serialize log event: {}", e);
+                continue;
+            }
+
+            let Ok(res) = std::str::from_utf8(&buf) else {
+                continue;
             };
 
             if let Err(e) = socket.send(Message::Text(res.into())).await {

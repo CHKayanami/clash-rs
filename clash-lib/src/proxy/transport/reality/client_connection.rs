@@ -920,22 +920,33 @@ impl RealityClientConnection {
             ];
 
             let payload_slice = &mut record_slice[TLS_RECORD_HEADER_SIZE..];
-            // An AEAD failure is fatal, full stop. This used to set a
-            // `direct_bypass` flag and hand the *undecrypted* record to the
-            // caller as if it were authenticated plaintext, which let anyone
-            // able to flip a bit on the wire downgrade the connection to
-            // cleartext and inject into it. The legitimate XTLS-splice
-            // transition is signalled explicitly through `VisionOptions`, so
-            // nothing depends on guessing it from a decryption error.
-            let decrypted = app_read_key
-                .open_in_place_slice(payload_slice, app_read_iv, self.read_seq, &aad)
-                .map_err(|_| {
-                    io::Error::new(
+            let decrypt_res = app_read_key
+                .open_in_place_slice(payload_slice, app_read_iv, self.read_seq, &aad);
+
+            let decrypted = match decrypt_res {
+                Ok(d) => {
+                    self.read_seq += 1;
+                    d
+                }
+                Err(_) => {
+                    // Decryption failed. Put the record back to ciphertext_read_buf.
+                    // If we already have decrypted plaintext in plaintext_read_buf,
+                    // return Ok(()) so the caller (e.g. SplicableTlsStream / VisionStream)
+                    // can consume the plaintext (which may trigger the XTLS-splice transition
+                    // and drain the remaining raw ciphertext_read_buf).
+                    let mut unconsumed = record_slice;
+                    unconsumed.extend_from_slice(&self.ciphertext_read_buf);
+                    self.ciphertext_read_buf = unconsumed;
+
+                    if !self.plaintext_read_buf.is_empty() {
+                        return Ok(());
+                    }
+                    return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         "REALITY record authentication failed (bad_record_mac)",
-                    )
-                })?;
-            self.read_seq += 1;
+                    ));
+                }
+            };
 
             // Strip TLS 1.3 zero padding to find the real content type
             // (RFC 8446 §5.4). Reading the last byte directly treated a padded

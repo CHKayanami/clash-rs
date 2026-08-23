@@ -6,7 +6,6 @@ use std::{
 };
 
 use blake2::{Blake2b, Digest};
-use bytes::{BufMut, Bytes, BytesMut};
 use futures::ready;
 use generic_array::typenum::U32;
 use quinn::{
@@ -15,39 +14,30 @@ use quinn::{
 };
 type Blake2b256 = Blake2b<U32>;
 
+std::thread_local! {
+    static SEND_BUF: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
 struct SalamanderObfs {
-    key: Vec<u8>,
+    hasher: Blake2b256,
 }
 
 impl SalamanderObfs {
     /// create a new obfs
-    ///
-    /// new() should init a blake2b256 hasher with key to reduce calculation,
-    /// but rust-analyzer can't recognize its type
     pub fn new(key: Vec<u8>) -> Self {
-        Self { key }
+        let mut hasher = Blake2b256::new();
+        hasher.update(&key);
+        Self { hasher }
     }
 
-    pub fn obfs(&self, sale: &[u8], data: &mut [u8]) {
-        let mut hasher = Blake2b256::new();
-        hasher.update(&self.key);
-        hasher.update(sale);
+    pub fn obfs(&self, salt: &[u8], data: &mut [u8]) {
+        let mut hasher = self.hasher.clone();
+        hasher.update(salt);
         let res: [u8; 32] = hasher.finalize().into();
 
         data.iter_mut().enumerate().for_each(|(i, v)| {
             *v ^= res[i % 32];
         });
-    }
-
-    fn encrypt_contents(&self, data: &[u8]) -> Bytes {
-        let salt: [u8; 8] = rand::random::<[u8; 8]>();
-
-        let mut res = BytesMut::with_capacity(8 + data.len());
-        res.put_slice(&salt);
-        res.put_slice(data);
-        self.obfs(&salt, &mut res[8..]);
-
-        res.freeze()
     }
 
     fn decrypt(&self, data: &mut [u8]) {
@@ -99,10 +89,19 @@ impl AsyncUdpSocket for Salamander {
     }
 
     fn try_send(&self, transmit: &Transmit) -> std::io::Result<()> {
-        let mut v = transmit.to_owned();
-        let x = self.obfs.encrypt_contents(&v.contents);
-        v.contents = &x;
-        self.inner.try_send(&v)
+        SEND_BUF.with_borrow_mut(|buf| {
+            let total_len = 8 + transmit.contents.len();
+            buf.clear();
+            buf.reserve(total_len);
+            let salt: [u8; 8] = rand::random::<[u8; 8]>();
+            buf.extend_from_slice(&salt);
+            buf.extend_from_slice(transmit.contents);
+            self.obfs.obfs(&salt, &mut buf[8..]);
+
+            let mut v = transmit.to_owned();
+            v.contents = buf.as_slice();
+            self.inner.try_send(&v)
+        })
     }
 
     fn poll_recv(
@@ -273,11 +272,18 @@ fn test_skip() {
 fn test_obfs() {
     let obfs = SalamanderObfs::new(b"obfs".to_vec());
     let data = b"hhh";
-    let x = obfs.encrypt_contents(data);
-    let mut x = x.to_vec();
+    let salt: [u8; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
 
-    let res = &mut IoSliceMut::new(&mut x);
+    // Simulate encrypt: salt || obfs(data)
+    let mut buf = Vec::with_capacity(8 + data.len());
+    buf.extend_from_slice(&salt);
+    buf.extend_from_slice(data);
+    obfs.obfs(&salt, &mut buf[8..]);
+
+    // Decrypt in place (same as poll_recv path)
+    let res = &mut IoSliceMut::new(&mut buf);
     obfs.decrypt(res);
 
     assert!(std::str::from_utf8(res[8..].as_ref()).unwrap() == "hhh");
 }
+

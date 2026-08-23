@@ -1,5 +1,5 @@
 use std::cmp::Reverse;
-use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::net::IpAddr;
 use std::sync::Arc;
 use tokio::time::Instant;
@@ -29,7 +29,7 @@ pub enum RoutingAction {
 #[allow(dead_code)]
 #[derive(Debug)]
 pub struct DomainOwner {
-    pub ips: BTreeSet<IpAddr>,
+    pub ips: HashSet<IpAddr>,
     pub action: RoutingAction,
     pub expires_at: Instant,
     pub sequence: u64,
@@ -49,12 +49,12 @@ pub struct DeadlineEntry {
 #[allow(dead_code)]
 pub struct OffloadDesiredState {
     pub sequence: u64,
-    pub owners: BTreeMap<DomainKey, DomainOwner>,
-    pub reverse: BTreeMap<IpAddr, BTreeSet<DomainKey>>,
-    pub desired: BTreeMap<IpAddr, bool>,
-    pub applied: BTreeSet<IpAddr>,
-    pub dirty_ips: BTreeSet<IpAddr>,
-    pub revisions: BTreeMap<IpAddr, u64>,
+    pub owners: HashMap<DomainKey, DomainOwner>,
+    pub reverse: HashMap<IpAddr, HashSet<DomainKey>>,
+    pub desired: HashMap<IpAddr, bool>,
+    pub applied: HashSet<IpAddr>,
+    pub dirty_ips: HashSet<IpAddr>,
+    pub revisions: HashMap<IpAddr, u64>,
     pub expiry_deadlines: BinaryHeap<Reverse<DeadlineEntry>>,
 }
 
@@ -69,12 +69,12 @@ impl OffloadDesiredState {
     pub fn new() -> Self {
         Self {
             sequence: 0,
-            owners: BTreeMap::new(),
-            reverse: BTreeMap::new(),
-            desired: BTreeMap::new(),
-            applied: BTreeSet::new(),
-            dirty_ips: BTreeSet::new(),
-            revisions: BTreeMap::new(),
+            owners: HashMap::new(),
+            reverse: HashMap::new(),
+            desired: HashMap::new(),
+            applied: HashSet::new(),
+            dirty_ips: HashSet::new(),
+            revisions: HashMap::new(),
             expiry_deadlines: BinaryHeap::new(),
         }
     }
@@ -82,7 +82,7 @@ impl OffloadDesiredState {
     /// Observe a new DNS resolution outcome for a domain.
     pub fn observe(
         &mut self,
-        domain: &str,
+        domain: impl Into<DomainKey>,
         ips: &[IpAddr],
         action: RoutingAction,
         ttl: std::time::Duration,
@@ -93,11 +93,14 @@ impl OffloadDesiredState {
         self.sequence = self.sequence.wrapping_add(1);
         let seq = self.sequence;
         let expires_at = now + ttl;
-        let domain_key: DomainKey = Arc::from(domain);
-        let new_ips = ips.iter().copied().collect::<BTreeSet<_>>();
+        let domain_key: DomainKey = domain.into();
+        let mut new_ips = HashSet::with_capacity(ips.len());
+        for &ip in ips {
+            new_ips.insert(ip);
+        }
 
-        let mut affected_ips = Vec::new();
-        let mut final_ips = BTreeSet::new();
+        let mut affected_ips = Vec::with_capacity(ips.len() + 4);
+        let mut final_ips = HashSet::with_capacity(ips.len() + 2);
         let incoming_has_v4 = ips.iter().any(|ip| ip.is_ipv4());
         let incoming_has_v6 = ips.iter().any(|ip| ip.is_ipv6());
 
@@ -256,7 +259,7 @@ impl OffloadDesiredState {
 #[allow(dead_code)]
 #[derive(Debug)]
 pub struct DnsObservation {
-    pub domain: String,
+    pub domain: DomainKey,
     pub ips: Vec<IpAddr>,
     pub action: RoutingAction,
     pub ttl: std::time::Duration,
@@ -283,16 +286,21 @@ impl DirectOffloader {
         tokio::spawn(async move {
             let mut state = OffloadDesiredState::new();
 
+            let mut add_v4 = Vec::new();
+            let mut add_v6 = Vec::new();
+            let mut del_v4 = Vec::new();
+            let mut del_v6 = Vec::new();
+
             loop {
                 let now = Instant::now();
                 state.expire(now);
 
                 // Flush dirty IPs to eBPF manager in batch
                 if !state.dirty_ips.is_empty() {
-                    let mut add_v4 = Vec::new();
-                    let mut add_v6 = Vec::new();
-                    let mut del_v4 = Vec::new();
-                    let mut del_v6 = Vec::new();
+                    add_v4.clear();
+                    add_v6.clear();
+                    del_v4.clear();
+                    del_v6.clear();
 
                     for ip in &state.dirty_ips {
                         let desired = state.desired.get(ip).copied();
@@ -356,9 +364,9 @@ impl DirectOffloader {
                 tokio::select! {
                     Some(obs) = rx.recv() => {
                         let now = Instant::now();
-                        state.observe(&obs.domain, &obs.ips, obs.action, obs.ttl, now);
+                        state.observe(obs.domain, &obs.ips, obs.action, obs.ttl, now);
                         while let Ok(obs) = rx.try_recv() {
-                            state.observe(&obs.domain, &obs.ips, obs.action, obs.ttl, now);
+                            state.observe(obs.domain, &obs.ips, obs.action, obs.ttl, now);
                         }
                     }
                     _ = async {
@@ -383,12 +391,12 @@ impl DirectOffloader {
 
     pub async fn observe(
         &self,
-        domain: String,
+        domain: DomainKey,
         ips: Vec<IpAddr>,
         action: RoutingAction,
         ttl: std::time::Duration,
     ) {
-        let mut valid_ips = Vec::new();
+        let mut valid_ips = Vec::with_capacity(ips.len());
         for ip in ips {
             if !is_reserved_ip(ip) && !self.resolver.is_fake_ip(ip).await {
                 valid_ips.push(ip);
@@ -414,7 +422,7 @@ pub struct DirectOffloader;
 impl DirectOffloader {
     pub async fn observe(
         &self,
-        _domain: String,
+        _domain: DomainKey,
         _ips: Vec<IpAddr>,
         _action: RoutingAction,
         _ttl: std::time::Duration,

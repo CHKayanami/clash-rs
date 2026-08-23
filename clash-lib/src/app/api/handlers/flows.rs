@@ -297,17 +297,19 @@ pub async fn ws_handle(
 
     let callback = async move |mut socket: axum::extract::ws::WebSocket| {
         let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs));
+        let mut buf = Vec::with_capacity(4096);
         loop {
             ticker.tick().await;
             let records =
                 build_flow_records(&state.statistics_manager, top, include_closed)
                     .await;
-            let body = match serde_json::to_string(&records) {
-                Ok(s) => s,
-                Err(e) => {
-                    warn!("failed to serialize flow records: {}", e);
-                    break;
-                }
+            buf.clear();
+            if let Err(e) = serde_json::to_writer(&mut buf, &records) {
+                warn!("failed to serialize flow records: {}", e);
+                break;
+            }
+            let Ok(body) = std::str::from_utf8(&buf) else {
+                break;
             };
             if let Err(e) = socket.send(Message::Text(body.into())).await {
                 debug!("ws/flows send error: {}", e);

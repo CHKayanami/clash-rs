@@ -196,6 +196,51 @@ impl Decoder for Hy2TcpCodec {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct EncodedAddr {
+    buf: [u8; MAX_ADDR_LEN],
+    len: u16,
+}
+
+impl EncodedAddr {
+    pub fn from_socksaddr(addr: &SocksAddr) -> Self {
+        let mut buf = [0u8; MAX_ADDR_LEN];
+        let len = match addr {
+            SocksAddr::Domain(domain, port) => {
+                let domain_bytes = domain.as_bytes();
+                let d_len = domain_bytes.len();
+                buf[..d_len].copy_from_slice(domain_bytes);
+                buf[d_len] = b':';
+                let mut itoa_buf = itoa::Buffer::new();
+                let port_str = itoa_buf.format(*port);
+                let p_len = port_str.len();
+                buf[d_len + 1..d_len + 1 + p_len].copy_from_slice(port_str.as_bytes());
+                d_len + 1 + p_len
+            }
+            SocksAddr::Ip(socket_addr) => {
+                let mut cursor = std::io::Cursor::new(&mut buf[..]);
+                std::io::Write::write_fmt(&mut cursor, format_args!("{}", socket_addr))
+                    .expect("SocketAddr Display should never exceed MAX_ADDR_LEN");
+                cursor.position() as usize
+            }
+        };
+        Self {
+            buf,
+            len: len as u16,
+        }
+    }
+
+    #[inline]
+    pub fn as_slice(&self) -> &[u8] {
+        &self.buf[..self.len as usize]
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.len as usize
+    }
+}
+
 #[inline]
 pub fn padding(range: std::ops::RangeInclusive<u32>) -> Vec<u8> {
     let len = rand::random_range(range) as usize;
@@ -215,27 +260,29 @@ impl Encoder<&'_ SocksAddr> for Hy2TcpCodec {
     ) -> Result<(), Self::Error> {
         const REQ_ID: VarInt = VarInt::from_u32(0x401);
 
-        let padding = padding(64..=512);
-        let padding_var = VarInt::from_u32(padding.len() as u32);
+        let encoded_addr = EncodedAddr::from_socksaddr(item);
+        let addr_var = VarInt::from_u32(encoded_addr.len() as u32);
 
-        let addr = item.to_string().into_bytes();
-        let addr_var = VarInt::from_u32(addr.len() as u32);
+        let pad_len = rand::random_range(64..=512) as usize;
+        let padding_var = VarInt::from_u32(pad_len as u32);
 
         buf.reserve(
             var_size(REQ_ID)
                 + var_size(padding_var)
                 + var_size(addr_var)
-                + addr.len()
-                + padding.len(),
+                + encoded_addr.len()
+                + pad_len,
         );
 
         REQ_ID.encode(buf);
 
         addr_var.encode(buf);
-        buf.put_slice(&addr);
+        buf.put_slice(encoded_addr.as_slice());
 
         padding_var.encode(buf);
-        buf.put_slice(&padding);
+        for b in rand::distr::Alphanumeric.sample_iter(rand::rng()).take(pad_len) {
+            buf.put_u8(b);
+        }
 
         Ok(())
     }
@@ -310,14 +357,16 @@ impl HysUdpPacket {
                 buf.remaining()
             ));
         }
-        let addr: Vec<u8> = buf.split_to(addr_len as usize).into();
+        let addr_len = addr_len as usize;
+        let addr = to_socksaddr(&buf[..addr_len])?;
+        buf.advance(addr_len);
         let data = buf.split().freeze();
         Ok(Self {
             session_id,
             pkt_id,
             frag_id,
             frag_count,
-            addr: to_socksaddr(&addr)?,
+            addr,
             data,
         })
     }
@@ -366,7 +415,7 @@ fn to_socksaddr(bytes: &[u8]) -> std::io::Result<SocksAddr> {
 pub struct Fragments<'a, P> {
     session_id: u32,
     pkt_id: u16,
-    addr: (Vec<u8>, VarInt),
+    addr: (EncodedAddr, VarInt),
     frag_total: u8,
     next_frag_id: u8,
     next_frag_start: usize,
@@ -388,7 +437,7 @@ where
         max_pkt_size: usize,
         payload: P,
     ) -> anyhow::Result<Self> {
-        let addr = addr.to_string().into_bytes();
+        let addr = EncodedAddr::from_socksaddr(&addr);
         let addr_var = VarInt::from_u32(addr.len() as u32);
 
         let fixed_size = 4 + 2 + 1 + 1 + addr.len() + var_size(addr_var);
@@ -562,3 +611,37 @@ fn test_decode_addr() {
     let decoded_addr = to_socksaddr(&addr_bytes).unwrap();
     assert_eq!(addr, decoded_addr);
 }
+
+#[test]
+fn test_encoded_addr() {
+    let addr1 = SocksAddr::Ip("1.2.3.4:443".parse().unwrap());
+    let encoded1 = EncodedAddr::from_socksaddr(&addr1);
+    assert_eq!(encoded1.as_slice(), b"1.2.3.4:443");
+
+    let addr2 = SocksAddr::Domain("test.example.com".to_string(), 8443);
+    let encoded2 = EncodedAddr::from_socksaddr(&addr2);
+    assert_eq!(encoded2.as_slice(), b"test.example.com:8443");
+
+    let addr3 = SocksAddr::Ip("[2001:db8::1]:8443".parse().unwrap());
+    let encoded3 = EncodedAddr::from_socksaddr(&addr3);
+    assert_eq!(encoded3.as_slice(), b"[2001:db8::1]:8443");
+}
+
+#[test]
+fn test_udp_roundtrip() {
+    let addr = SocksAddr::Domain("example.com".to_string(), 1234);
+    let payload = Bytes::from_static(b"hello world hysteria2");
+    let mut frags = Fragments::new(0x12345678, 42, addr.clone(), 1500, payload.clone()).unwrap();
+    let frag_bytes = frags.next().unwrap();
+
+    let mut buf = BytesMut::from(frag_bytes.as_ref());
+    let decoded = HysUdpPacket::decode(&mut buf).unwrap();
+
+    assert_eq!(decoded.session_id, 0x12345678);
+    assert_eq!(decoded.pkt_id, 42);
+    assert_eq!(decoded.frag_id, 0);
+    assert_eq!(decoded.frag_count, 1);
+    assert_eq!(decoded.addr, addr);
+    assert_eq!(decoded.data, payload);
+}
+
