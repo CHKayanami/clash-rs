@@ -9,7 +9,7 @@ use crate::{
 };
 
 use async_trait::async_trait;
-use bytes::BytesMut;
+use bytes::Bytes;
 use std::{
     io,
     net::SocketAddr,
@@ -304,7 +304,6 @@ async fn handle_inbound_datagram(
     // tproxy -> dispatcher
     let fut2 = async move {
         let mut buf = vec![0_u8; 1024 * 64];
-        let mut chunk_buf = BytesMut::with_capacity(1024 * 64);
         let mut consecutive_errors = 0usize;
         let mut dropped = 0u64;
 
@@ -372,20 +371,20 @@ async fn handle_inbound_datagram(
                 continue;
             }
 
-            if chunk_buf.capacity() < len {
-                chunk_buf.reserve((1024 * 64).max(len));
-            }
-            chunk_buf.extend_from_slice(&buf[0..len]);
-            let full_bytes = chunk_buf.split().freeze();
+            let full_bytes = Bytes::copy_from_slice(&buf[0..len]);
 
             let src_canonical = meta.addr.to_canonical();
             let dst_canonical = orig_dst.to_canonical();
 
             let num_chunks = len.div_ceil(chunk_size);
             for chunk_idx in 0..num_chunks {
-                let start = chunk_idx * chunk_size;
-                let end = (start + chunk_size).min(len);
-                let chunk_data = full_bytes.slice(start..end);
+                let chunk_data = if num_chunks == 1 {
+                    full_bytes.clone()
+                } else {
+                    let start = chunk_idx * chunk_size;
+                    let end = (start + chunk_size).min(len);
+                    full_bytes.slice(start..end)
+                };
 
                 let pkt = UdpPacket {
                     data: chunk_data,

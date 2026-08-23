@@ -41,8 +41,8 @@ thread_local! {
 
 #[inline]
 fn ensure_chunk_capacity(chunk_buf: &mut BytesMut) {
-    if chunk_buf.capacity() - chunk_buf.len() < MAX_UDP_DATAGRAM_SIZE {
-        *chunk_buf = BytesMut::with_capacity(UDP_RECV_CHUNK_SIZE);
+    if chunk_buf.capacity() < MAX_UDP_DATAGRAM_SIZE {
+        chunk_buf.reserve(UDP_RECV_CHUNK_SIZE);
     }
 }
 

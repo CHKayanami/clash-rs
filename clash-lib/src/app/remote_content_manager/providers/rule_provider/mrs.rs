@@ -228,7 +228,6 @@ fn read_u64_vec<R: Read>(
         remaining -= to_read;
         idx += to_read;
     }
-    vec.shrink_to_fit();
     Ok(vec)
 }
 
@@ -246,10 +245,17 @@ fn read_byte_vec<R: Read>(
             MAX_BYTE_VEC_LEN
         );
     }
-    let mut vec = vec![0u8; len];
+    let mut vec = Vec::with_capacity(len);
     reader
-        .read_exact(&mut vec)
+        .take(len as u64)
+        .read_to_end(&mut vec)
         .with_context(|| format!("Failed to read {field_name} data ({len} bytes)"))?;
+    if vec.len() != len {
+        bail!(
+            "Unexpected EOF reading {field_name} data: expected {len} bytes, got {}",
+            vec.len()
+        );
+    }
     Ok(vec)
 }
 

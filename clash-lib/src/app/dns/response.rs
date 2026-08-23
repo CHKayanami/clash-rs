@@ -178,7 +178,10 @@ fn validate_layout(
         (Section::Authority, read_u16(response, 8)?),
         (Section::Additional, read_u16(response, 10)?),
     ];
-    let mut records = Vec::new();
+    let total_records = usize::from(sections[0].1)
+        + usize::from(sections[1].1)
+        + usize::from(sections[2].1);
+    let mut records = Vec::with_capacity(total_records);
     for (section, count) in sections {
         for _ in 0..count {
             let start = cursor;

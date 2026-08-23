@@ -217,8 +217,8 @@ impl SplitWrite {
             ));
         }
 
-        if self.buf.capacity() - self.buf.len() < total_len {
-            self.buf = BytesMut::with_capacity(128 * 1024);
+        if self.buf.capacity() < total_len {
+            self.buf.reserve((128 * 1024).max(total_len));
         }
 
         if is_v4 {
