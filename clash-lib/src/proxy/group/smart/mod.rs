@@ -124,7 +124,7 @@ impl Handler {
 
         info!("{} attempting to load smart stats from cache", group_name);
         let stored_data: Option<state::SmartStateData> =
-            cache_store.get_smart_stats(&group_name).await;
+            cache_store.get_smart_stats(&group_name);
 
         if stored_data.is_some() {
             info!("{} successfully loaded smart stats from cache", group_name);
@@ -158,11 +158,8 @@ impl Handler {
                 let data_to_save = state_guard.export_data();
                 drop(state_guard);
 
-                let save_stats_fut = cache_store_clone
+                cache_store_clone
                     .set_smart_stats(&group_name_clone, data_to_save);
-
-                // Execute save
-                save_stats_fut.await;
             }
         });
 

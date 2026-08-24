@@ -200,7 +200,7 @@ pub struct DnsRecordInfo {
 
 /// Extract a domain name string from wire data with compression pointer expansion.
 pub fn parse_dns_name_to_string(data: &[u8], pos: usize) -> Option<String> {
-    let mut labels = Vec::new();
+    let mut domain = String::with_capacity(32);
     let mut cursor = pos;
     let mut jumps = 0;
     loop {
@@ -224,10 +224,28 @@ pub fn parse_dns_name_to_string(data: &[u8], pos: usize) -> Option<String> {
             return None;
         }
         let label = std::str::from_utf8(&data[cursor + 1..cursor + 1 + len as usize]).ok()?;
-        labels.push(label);
+        if !domain.is_empty() {
+            domain.push('.');
+        }
+        domain.push_str(label);
+        if domain.len() > 255 {
+            return None;
+        }
         cursor += 1 + len as usize;
     }
-    Some(labels.join("."))
+    Some(domain)
+}
+
+/// Extract the question domain name from a wire-format DNS query.
+pub fn extract_domain_from_dns_query(query: &[u8]) -> Option<String> {
+    if query.len() < 12 {
+        return None;
+    }
+    let qdcount = u16::from_be_bytes([query[4], query[5]]);
+    if qdcount == 0 {
+        return None;
+    }
+    parse_dns_name_to_string(query, 12).map(|s| if s.is_empty() { ".".to_string() } else { s })
 }
 
 /// Parse all Answer section records for UI/API display.
@@ -424,5 +442,43 @@ mod tests {
         rewrite_dns_response_ttl(&mut resp, 30);
         let after = extract_ips_with_ttl(&resp);
         assert_eq!(after[0].1, 30);
+    }
+
+    #[test]
+    fn test_extract_domain_from_dns_query() {
+        let mut query = vec![
+            0x12, 0x34, // ID
+            0x01, 0x00, // flags
+            0x00, 0x01, // QDCOUNT = 1
+            0x00, 0x00, // ANCOUNT
+            0x00, 0x00, // NSCOUNT
+            0x00, 0x00, // ARCOUNT
+            0x06, b'g', b'o', b'o', b'g', b'l', b'e',
+            0x03, b'c', b'o', b'm',
+            0x00,
+            0x00, 0x01, // QTYPE A
+            0x00, 0x01, // QCLASS IN
+        ];
+        assert_eq!(
+            extract_domain_from_dns_query(&query),
+            Some("google.com".to_string())
+        );
+
+        // Root query
+        let root_query = vec![
+            0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x01,
+        ];
+        assert_eq!(
+            extract_domain_from_dns_query(&root_query),
+            Some(".".to_string())
+        );
+
+        // QDCOUNT = 0
+        query[4] = 0;
+        query[5] = 0;
+        assert_eq!(extract_domain_from_dns_query(&query), None);
+
+        // Truncated
+        assert_eq!(extract_domain_from_dns_query(&[0u8; 5]), None);
     }
 }

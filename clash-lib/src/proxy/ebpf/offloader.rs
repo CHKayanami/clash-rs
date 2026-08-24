@@ -398,7 +398,7 @@ impl DirectOffloader {
     ) {
         let mut valid_ips = Vec::with_capacity(ips.len());
         for ip in ips {
-            if !is_reserved_ip(ip) && !self.resolver.is_fake_ip(ip).await {
+            if !is_reserved_ip(ip) && !self.resolver.is_fake_ip(ip) {
                 valid_ips.push(ip);
             }
         }

@@ -521,7 +521,7 @@ impl OutboundManager {
         let pd: ArcProxyProvider =
             Arc::new(PlainProvider::new(PROXY_GLOBAL.to_owned(), g, hc)?);
 
-        let stored_selection = cache_store.get_selected(PROXY_GLOBAL).await;
+        let stored_selection = cache_store.get_selected(PROXY_GLOBAL);
         let mut providers: Vec<ArcProxyProvider> = vec![pd.clone()];
         for p in self.proxy_providers.values() {
             let vehicle_type = p.vehicle_type();
@@ -853,7 +853,7 @@ impl OutboundManager {
                     }
 
                     let stored_selection =
-                        cache_store.get_selected(&proto.name).await;
+                        cache_store.get_selected(&proto.name);
 
                     let selector = selector::Handler::new(
                         selector::HandlerOptions {

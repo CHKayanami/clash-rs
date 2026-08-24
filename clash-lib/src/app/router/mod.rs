@@ -150,6 +150,7 @@ impl Router {
             // Resolve IP when needed
             if sess.destination.is_domain()
                 && r.should_resolve_ip()
+                && sess.resolved_ip.is_none()
                 && !sess_resolved
             {
                 sess_resolved = true;

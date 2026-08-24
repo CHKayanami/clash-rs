@@ -155,6 +155,14 @@ impl Default for SnifferConfig {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SniffUdpOutcome {
+    NotMatched,
+    Incomplete,
+    CompleteNoDomain,
+    Domain(String, bool),
+}
+
 pub struct Sniffer {
     pub config: SnifferConfig,
     pub tcp_neg_cache: Mutex<TcpSniffNegCache>,
@@ -240,14 +248,19 @@ impl Sniffer {
         }
 
         let port = sess.destination.port();
-        let is_ip = !sess.destination.is_domain();
-        let force = self.should_force_sniff(&sess.destination);
+        let orig_dest = sess.orig_destination.as_ref().unwrap_or(&sess.destination);
+        // If sess.destination is already a domain (from reverse lookup or domain inbound),
+        // it is not treated as a pure IP. Reverse lookup takes precedence over sniffing
+        // unless explicitly forced via force_domains.
+        let is_pure_ip = !sess.destination.is_domain();
+        let force = self.should_force_sniff(&sess.destination)
+            || self.should_force_sniff(orig_dest);
 
-        if is_ip && !self.config.parse_pure_ip && !force {
-            return (None, stream, false);
-        }
-
-        if !is_ip && !force {
+        if is_pure_ip {
+            if !self.config.parse_pure_ip && !force {
+                return (None, stream, false);
+            }
+        } else if !force {
             return (None, stream, false);
         }
 
@@ -267,9 +280,12 @@ impl Sniffer {
         }
 
         let now = Instant::now();
-        let ip_target = match sess.destination {
-            SocksAddr::Ip(addr) => Some(addr),
-            _ => None,
+        let ip_target = match orig_dest {
+            SocksAddr::Ip(addr) => Some(*addr),
+            _ => match sess.destination {
+                SocksAddr::Ip(addr) => Some(addr),
+                _ => None,
+            },
         };
 
         if let Some(addr) = ip_target {
@@ -358,6 +374,47 @@ impl Sniffer {
         (None, wrapped, false)
     }
 
+    /// Sniff a UDP packet (QUIC) with flow session and DCID negative cache, returning full outcome.
+    pub fn sniff_udp_datagram_full(
+        &self,
+        src: SocketAddr,
+        dst: SocketAddr,
+        data: &[u8],
+    ) -> SniffUdpOutcome {
+        if !self.config.enable {
+            return SniffUdpOutcome::NotMatched;
+        }
+
+        let quic_cfg = match self.config.quic.as_ref() {
+            Some(cfg) => cfg,
+            None => return SniffUdpOutcome::NotMatched,
+        };
+        if !quic_cfg.ports.contains(dst.port()) {
+            return SniffUdpOutcome::NotMatched;
+        }
+
+        let outcome = self.quic_pool.feed_quic_datagram(src, dst, data);
+        match outcome {
+            quic::QuicSniffOutcome::Domain(domain) => {
+                if !self.is_domain_skipped(&domain) {
+                    debug!(
+                        "sniffed QUIC SNI domain `{}` for {} -> {}",
+                        domain, src, dst
+                    );
+                    let override_dest = quic_cfg
+                        .override_destination
+                        .unwrap_or(self.config.override_destination);
+                    SniffUdpOutcome::Domain(domain, override_dest)
+                } else {
+                    SniffUdpOutcome::CompleteNoDomain
+                }
+            }
+            quic::QuicSniffOutcome::Incomplete => SniffUdpOutcome::Incomplete,
+            quic::QuicSniffOutcome::CompleteNoDomain => SniffUdpOutcome::CompleteNoDomain,
+            quic::QuicSniffOutcome::NotQuic => SniffUdpOutcome::NotMatched,
+        }
+    }
+
     /// Sniff a UDP packet (QUIC) with flow session and DCID negative cache.
     /// Returns: `Option<(sniffed_domain, override_destination)>`
     pub fn sniff_udp_datagram(
@@ -366,30 +423,10 @@ impl Sniffer {
         dst: SocketAddr,
         data: &[u8],
     ) -> Option<(String, bool)> {
-        if !self.config.enable {
-            return None;
+        match self.sniff_udp_datagram_full(src, dst, data) {
+            SniffUdpOutcome::Domain(domain, override_dest) => Some((domain, override_dest)),
+            _ => None,
         }
-
-        let quic_cfg = self.config.quic.as_ref()?;
-        if !quic_cfg.ports.contains(dst.port()) {
-            return None;
-        }
-
-        let outcome = self.quic_pool.feed_quic_datagram(src, dst, data);
-        if let quic::QuicSniffOutcome::Domain(domain) = outcome {
-            if !self.is_domain_skipped(&domain) {
-                debug!(
-                    "sniffed QUIC SNI domain `{}` for {} -> {}",
-                    domain, src, dst
-                );
-                let override_dest = quic_cfg
-                    .override_destination
-                    .unwrap_or(self.config.override_destination);
-                return Some((domain, override_dest));
-            }
-        }
-
-        None
     }
 
     /// Sniff a single UDP packet (QUIC).

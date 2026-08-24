@@ -104,7 +104,7 @@ async fn update_proxy(
         Some(ctrl) => match ctrl.select(&payload.name).await {
             Ok(_) => {
                 let cache_store = state.cache_store;
-                cache_store.set_selected(proxy.name(), &payload.name).await;
+                cache_store.set_selected(proxy.name(), &payload.name);
                 (
                     StatusCode::ACCEPTED,
                     axum::response::Json(json!({

@@ -145,10 +145,14 @@ impl UpstreamPool {
             raw_query
         };
 
+        let domain = crate::app::dns::wire::extract_domain_from_dns_query(raw_query);
+        let domain_str = domain.as_deref().unwrap_or("<unknown>");
+
         debug!(
             upstream = %entry.name,
             protocol = ?entry.protocol,
             outbound = ?effective_outbound,
+            domain = %domain_str,
             ecs = ecs_query.is_some(),
             "querying DNS upstream"
         );
@@ -169,6 +173,7 @@ impl UpstreamPool {
                             upstream = %entry.name,
                             %address,
                             outbound = ?effective_outbound,
+                            domain = %domain_str,
                             "failed to initialize UDP pool: {error}"
                         );
                         last_error = Some(error);
@@ -182,6 +187,7 @@ impl UpstreamPool {
                             upstream = %entry.name,
                             %address,
                             outbound = ?effective_outbound,
+                            domain = %domain_str,
                             elapsed_ms = elapsed.as_millis(),
                             "DNS upstream query succeeded"
                         );
@@ -194,6 +200,7 @@ impl UpstreamPool {
                             upstream = %entry.name,
                             %address,
                             outbound = ?effective_outbound,
+                            domain = %domain_str,
                             "UDP DNS query to upstream address failed: {error}"
                         );
                         last_error = Some(error);
@@ -213,6 +220,7 @@ impl UpstreamPool {
                         upstream = %entry.name,
                         protocol = ?entry.protocol,
                         outbound = ?effective_outbound,
+                        domain = %domain_str,
                         elapsed_ms = elapsed.as_millis(),
                         "DNS upstream query succeeded"
                     );
@@ -223,6 +231,7 @@ impl UpstreamPool {
                         upstream = %entry.name,
                         protocol = ?entry.protocol,
                         outbound = ?effective_outbound,
+                        domain = %domain_str,
                         "DNS upstream query failed: {error}"
                     );
                     return Err(error);
@@ -236,6 +245,7 @@ impl UpstreamPool {
                 Err(error) => {
                     warn!(
                         upstream = %entry.name,
+                        domain = %domain_str,
                         "failed to restore ECS response: {error}"
                     );
                     Err(anyhow::anyhow!("failed to restore ECS response: {error}"))

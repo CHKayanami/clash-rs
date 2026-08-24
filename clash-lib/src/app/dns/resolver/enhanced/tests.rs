@@ -259,7 +259,7 @@ async fn test_fake_ip_exchange() {
     let resp = resolver.exchange(&query_wire).await.expect("fake ip exchange should succeed");
     let ips = crate::app::dns::wire::extract_ips_from_dns_response(&resp);
     assert_eq!(ips.len(), 1);
-    assert!(resolver.is_fake_ip(ips[0]).await);
+    assert!(resolver.is_fake_ip(ips[0]));
 }
 
 #[tokio::test]
@@ -384,5 +384,61 @@ async fn test_optimistic_cache_ttl_and_never_cache() {
     // fixed_domain_ttl == Some(0) returns 0 for never-cache.com
     assert_eq!(resolver.match_fixed_domain_ttl("never-cache.com"), Some(0));
 }
+
+#[tokio::test]
+async fn test_reverse_lookup_cache_integration_and_conflict() {
+    use crate::app::dns::config::Config;
+    use crate::app::dns::query::{build_dns_query_wire_with_id, DnsName, QType, QueryContext};
+    use crate::app::dns::response::build_dns_ip_response;
+    use crate::app::profile::ThreadSafeCacheFile;
+    use crate::config::def::DNSMode;
+    use std::collections::HashMap;
+
+    let dir = tempfile::tempdir().unwrap();
+    let cache_path = dir.path().join("cache.db");
+    let store = ThreadSafeCacheFile::new(cache_path.to_str().unwrap(), true);
+
+    let cfg = Config {
+        enable: true,
+        enhance_mode: DNSMode::FakeIp,
+        nameserver: Config::parse_nameserver(&["114.114.114.114".to_string()]).unwrap(),
+        default_nameserver: Config::parse_nameserver(&["114.114.114.114".to_string()]).unwrap(),
+        ..Default::default()
+    };
+
+    let resolver = EnhancedResolver::new(
+        cfg,
+        store,
+        None,
+        Arc::new(parking_lot::RwLock::new(HashMap::new())),
+        None,
+        None,
+    )
+    .await;
+
+    // 1. Process fresh real DNS response for domain-a.com -> 1.2.3.4 (TTL 120)
+    let ip: std::net::IpAddr = "1.2.3.4".parse().unwrap();
+    let name_a = DnsName::from_domain("domain-a.com").unwrap();
+    let query_wire_a = build_dns_query_wire_with_id(0x1234, &name_a, QType::A);
+    let resp_a = build_dns_ip_response(&query_wire_a, &[ip], 120).unwrap();
+    let query_a = QueryContext::parse(&query_wire_a).unwrap();
+
+    resolver.process_fresh_response(&query_a, "domain-a.com", &resp_a, None).await;
+
+    // Reverse lookup in Fake-IP mode for non-fake IP should hit reverse cache
+    assert_eq!(resolver.reverse_lookup(ip), Some("domain-a.com".to_string()));
+
+    // 2. Now process another real DNS response for domain-b.com -> 1.2.3.4 (same IP, different domain)
+    let name_b = DnsName::from_domain("domain-b.com").unwrap();
+    let query_wire_b = build_dns_query_wire_with_id(0x5678, &name_b, QType::A);
+    let resp_b = build_dns_ip_response(&query_wire_b, &[ip], 120).unwrap();
+    let query_b = QueryContext::parse(&query_wire_b).unwrap();
+
+    resolver.process_fresh_response(&query_b, "domain-b.com", &resp_b, None).await;
+
+    // Since domain-b.com and domain-a.com share 1.2.3.4, it should be marked as ambiguous -> None
+    assert_eq!(resolver.reverse_lookup(ip), None);
+}
+
 
 

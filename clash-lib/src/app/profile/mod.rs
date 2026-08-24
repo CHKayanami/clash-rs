@@ -18,11 +18,11 @@ struct Db {
 }
 
 #[derive(Clone)]
-pub struct ThreadSafeCacheFile(Arc<tokio::sync::RwLock<CacheFile>>);
+pub struct ThreadSafeCacheFile(Arc<parking_lot::RwLock<CacheFile>>);
 
 impl ThreadSafeCacheFile {
     pub fn new(path: &str, store_selected: bool) -> Self {
-        let store = Arc::new(tokio::sync::RwLock::new(CacheFile::new(
+        let store = Arc::new(parking_lot::RwLock::new(CacheFile::new(
             path,
             store_selected,
         )));
@@ -35,14 +35,20 @@ impl ThreadSafeCacheFile {
                 let store = store_clone;
                 loop {
                     tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
-                    let mut g = store.write().await;
-                    if !g.is_dirty() {
+                    let (db, is_dirty) = {
+                        let mut g = store.write();
+                        if !g.is_dirty() {
+                            (None, false)
+                        } else {
+                            let db = g.db.clone();
+                            g.set_dirty(false);
+                            (Some(db), true)
+                        }
+                    };
+                    if !is_dirty {
                         continue;
                     }
-                    let db = g.db.clone();
-                    g.set_dirty(false);
-                    drop(g);
-
+                    let db = db.unwrap();
                     let s = match serde_yaml::to_string(&db) {
                         Ok(s) => s,
                         Err(e) => {
@@ -66,15 +72,15 @@ impl ThreadSafeCacheFile {
         Self(store)
     }
 
-    pub async fn set_selected(&self, group: &str, server: &str) {
-        let mut g = self.0.write().await;
+    pub fn set_selected(&self, group: &str, server: &str) {
+        let mut g = self.0.write();
         if g.store_selected() {
             g.set_selected(group, server);
         }
     }
 
-    pub async fn get_selected(&self, group: &str) -> Option<String> {
-        let g = self.0.read().await;
+    pub fn get_selected(&self, group: &str) -> Option<String> {
+        let g = self.0.read();
         if g.store_selected() {
             g.db.selected.get(group).cloned()
         } else {
@@ -83,8 +89,8 @@ impl ThreadSafeCacheFile {
     }
 
     #[allow(dead_code)]
-    pub async fn get_selected_map(&self) -> HashMap<String, String> {
-        let g = self.0.read().await;
+    pub fn get_selected_map(&self) -> HashMap<String, String> {
+        let g = self.0.read();
         if g.store_selected() {
             g.get_selected_map()
         } else {
@@ -92,38 +98,38 @@ impl ThreadSafeCacheFile {
         }
     }
 
-    pub async fn set_ip_to_host(&self, ip: &str, host: &str) {
-        self.0.write().await.set_ip_to_host(ip, host);
+    pub fn set_ip_to_host(&self, ip: &str, host: &str) {
+        self.0.write().set_ip_to_host(ip, host);
     }
 
-    pub async fn set_host_to_ip(&self, host: &str, ip: &str) {
-        self.0.write().await.set_host_to_ip(host, ip);
+    pub fn set_host_to_ip(&self, host: &str, ip: &str) {
+        self.0.write().set_host_to_ip(host, ip);
     }
 
-    pub async fn get_fake_ip(&self, ip_or_host: &str) -> Option<String> {
-        self.0.read().await.get_fake_ip(ip_or_host)
+    pub fn get_fake_ip(&self, ip_or_host: &str) -> Option<String> {
+        self.0.read().get_fake_ip(ip_or_host)
     }
 
-    pub async fn delete_fake_ip_pair(&self, ip: &str, host: &str) {
-        self.0.write().await.delete_fake_ip_pair(ip, host);
+    pub fn delete_fake_ip_pair(&self, ip: &str, host: &str) {
+        self.0.write().delete_fake_ip_pair(ip, host);
     }
 
     /// Store smart proxy group statistics
-    pub async fn set_smart_stats(
+    pub fn set_smart_stats(
         &self,
         group_name: &str,
         stats: crate::proxy::group::smart::state::SmartStateData,
     ) {
-        let mut g = self.0.write().await;
+        let mut g = self.0.write();
         g.set_smart_stats(group_name, stats);
     }
 
     /// Get smart proxy group statistics
-    pub async fn get_smart_stats(
+    pub fn get_smart_stats(
         &self,
         group_name: &str,
     ) -> Option<crate::proxy::group::smart::state::SmartStateData> {
-        let g = self.0.read().await;
+        let g = self.0.read();
         g.get_smart_stats(group_name)
     }
 }

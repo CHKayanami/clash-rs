@@ -551,18 +551,6 @@ impl PacketSnifferPool {
         let fragments = match fragments {
             Some(f) => f,
             None => {
-                let is_grease_or_vn = if data.len() >= 5 && (data[0] & 0x80) != 0 && (data[0] & 0x40) != 0 {
-                    let ver = u32::from_be_bytes([data[1], data[2], data[3], data[4]]);
-                    ver == 0 || is_grease_version(ver)
-                } else {
-                    false
-                };
-
-                if is_grease_or_vn {
-                    drop(sessions);
-                    return QuicSniffOutcome::Incomplete;
-                }
-
                 session.error_count += 1;
                 let failed = session.error_count >= NO_SNI_THRESHOLD;
                 if failed {

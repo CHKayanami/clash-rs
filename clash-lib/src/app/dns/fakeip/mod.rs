@@ -7,7 +7,6 @@ use std::{
     },
 };
 
-use async_trait::async_trait;
 use portable_atomic::AtomicU128;
 use tracing::debug;
 
@@ -31,17 +30,16 @@ pub struct Opts {
     pub store: Box<dyn Store>,
 }
 
-#[async_trait]
 pub trait Store: Sync + Send {
-    async fn get_by_host(&self, host: &str) -> Option<net::IpAddr>;
-    async fn get_v6_by_host(&self, host: &str) -> Option<net::IpAddr>;
+    fn get_by_host(&self, host: &str) -> Option<net::IpAddr>;
+    fn get_v6_by_host(&self, host: &str) -> Option<net::IpAddr>;
 
-    async fn put_by_host(&self, host: &str, ip: net::IpAddr);
-    async fn get_by_ip(&self, ip: net::IpAddr) -> Option<String>;
-    async fn put_by_ip(&self, ip: net::IpAddr, host: &str);
-    async fn del_by_ip(&self, ip: net::IpAddr);
-    async fn exist(&self, ip: net::IpAddr) -> bool;
-    async fn copy_to(&self, store: &dyn Store);
+    fn put_by_host(&self, host: &str, ip: net::IpAddr);
+    fn get_by_ip(&self, ip: net::IpAddr) -> Option<String>;
+    fn put_by_ip(&self, ip: net::IpAddr, host: &str);
+    fn del_by_ip(&self, ip: net::IpAddr);
+    fn exist(&self, ip: net::IpAddr) -> bool;
+    fn copy_to(&self, store: &dyn Store);
 }
 
 pub type ThreadSafeFakeDns = Arc<FakeDns>;
@@ -129,28 +127,28 @@ impl FakeDns {
         })
     }
 
-    pub async fn lookup(&self, host: &str) -> net::IpAddr {
-        if let Some(ip) = self.store.get_by_host(host).await {
+    pub fn lookup(&self, host: &str) -> net::IpAddr {
+        if let Some(ip) = self.store.get_by_host(host) {
             return ip;
         }
 
-        let ip = self.get(host).await;
-        self.store.put_by_host(host, ip).await;
+        let ip = self.get(host);
+        self.store.put_by_host(host, ip);
         ip
     }
 
-    pub async fn lookupv6(&self, host: &str) -> net::IpAddr {
-        if let Some(ip) = self.store.get_v6_by_host(host).await {
+    pub fn lookupv6(&self, host: &str) -> net::IpAddr {
+        if let Some(ip) = self.store.get_v6_by_host(host) {
             return ip;
         }
 
-        let ip = self.getv6(host).await;
-        self.store.put_by_host(host, ip).await;
+        let ip = self.getv6(host);
+        self.store.put_by_host(host, ip);
         ip
     }
 
-    pub async fn reverse_lookup(&self, ip: net::IpAddr) -> Option<String> {
-        self.store.get_by_ip(ip).await
+    pub fn reverse_lookup(&self, ip: net::IpAddr) -> Option<String> {
+        self.store.get_by_ip(ip)
     }
 
     pub async fn add_rule_set(
@@ -212,11 +210,11 @@ impl FakeDns {
     }
 
     #[allow(dead_code)]
-    pub async fn exist(&self, ip: net::IpAddr) -> bool {
-        self.store.exist(ip).await
+    pub fn exist(&self, ip: net::IpAddr) -> bool {
+        self.store.exist(ip)
     }
 
-    pub async fn is_fake_ip(&self, ip: net::IpAddr) -> bool {
+    pub fn is_fake_ip(&self, ip: net::IpAddr) -> bool {
         match ip {
             IpAddr::V4(v4) => {
                 if v4.is_broadcast() || v4.is_multicast() {
@@ -254,15 +252,15 @@ impl FakeDns {
                 }
             }
         }
-        self.store.exist(ip).await
+        self.store.exist(ip)
     }
 
     #[allow(dead_code)]
-    pub async fn copy_from(&self, src: &Self) {
-        src.store.copy_to(&*self.store).await;
+    pub fn copy_from(&self, src: &Self) {
+        src.store.copy_to(&*self.store);
     }
 
-    async fn get(&self, host: &str) -> net::IpAddr {
+    fn get(&self, host: &str) -> net::IpAddr {
         let mut allocated_v4 = None;
         if let Some(pool) = &self.v4_pool {
             let pool_size = pool.max - pool.min + 1;
@@ -277,11 +275,11 @@ impl FakeDns {
                 let ip = Ipv4Addr::from(pool.min + candidate_offset);
                 let ip_addr = IpAddr::V4(ip);
                 if current_try >= pool_size {
-                    self.store.del_by_ip(ip_addr).await;
+                    self.store.del_by_ip(ip_addr);
                     allocated_v4 = Some(ip);
                     break;
                 }
-                if !self.store.exist(ip_addr).await {
+                if !self.store.exist(ip_addr) {
                     allocated_v4 = Some(ip);
                     break;
                 }
@@ -291,7 +289,7 @@ impl FakeDns {
 
         if let Some(v4) = allocated_v4 {
             let ip = IpAddr::V4(v4);
-            self.store.put_by_ip(ip, host).await;
+            self.store.put_by_ip(ip, host);
             ip
         } else {
             panic!("IPv4 subnet not configured");
@@ -301,7 +299,7 @@ impl FakeDns {
     /// ----------------------------------------
     /// 2. 仅分配/查询 IPv6 Fake IP (应对 AAAA 记录)
     /// ----------------------------------------
-    pub async fn getv6(&self, host: &str) -> IpAddr {
+    pub fn getv6(&self, host: &str) -> IpAddr {
         let pool = self.v6_pool.as_ref().unwrap();
         let pool_size = pool.max_host - pool.min_host + 1;
         let mut current_try = 0;
@@ -322,11 +320,11 @@ impl FakeDns {
 
             if current_try >= pool_size {
                 // 撞圈，淘汰最老的一个
-                self.store.del_by_ip(ip_addr).await;
+                self.store.del_by_ip(ip_addr);
                 allocated_ip = Some(ip);
                 break;
             }
-            if !self.store.exist(ip_addr).await {
+            if !self.store.exist(ip_addr) {
                 allocated_ip = Some(ip);
                 break;
             }
@@ -336,7 +334,7 @@ impl FakeDns {
         // 3. 写入存储
         if let Some(ip) = allocated_ip {
             let ip_addr = IpAddr::V6(ip);
-            self.store.put_by_ip(ip_addr, host).await;
+            self.store.put_by_ip(ip_addr, host);
             ip_addr
         } else {
             panic!("IPv6 subnet not configured");
@@ -394,22 +392,22 @@ mod tests {
         })
         .unwrap();
 
-        let first = pool.lookup("foo.com").await;
-        let last = pool.lookup("bar.com").await;
+        let first = pool.lookup("foo.com");
+        let last = pool.lookup("bar.com");
 
-        let bar = pool.reverse_lookup(last).await;
+        let bar = pool.reverse_lookup(last);
 
         assert_eq!(first, net::IpAddr::from([192, 168, 0, 2]));
         assert_eq!(
-            pool.lookup("foo.com").await,
+            pool.lookup("foo.com"),
             net::IpAddr::from([192, 168, 0, 2])
         );
         assert_eq!(last, net::IpAddr::from([192, 168, 0, 3]));
         assert!(bar.is_some());
         assert_eq!(bar, Some("bar.com".into()));
-        assert!(pool.exist(net::IpAddr::from([192, 168, 0, 3])).await);
-        assert!(!pool.exist(net::IpAddr::from([192, 168, 0, 4])).await);
-        assert!(!pool.exist("::1".parse().unwrap()).await);
+        assert!(pool.exist(net::IpAddr::from([192, 168, 0, 3])));
+        assert!(!pool.exist(net::IpAddr::from([192, 168, 0, 4])));
+        assert!(!pool.exist("::1".parse().unwrap()));
     }
 
     #[tokio::test]
@@ -431,15 +429,15 @@ mod tests {
         })
         .unwrap();
 
-        let foo = pool.lookup("foo.com").await;
-        let bar = pool.lookup("bar.com").await;
+        let foo = pool.lookup("foo.com");
+        let bar = pool.lookup("bar.com");
 
         for i in 0..4 {
-            pool.lookup(&format!("{}.com", i)).await;
+            pool.lookup(&format!("{}.com", i));
         }
 
-        let baz = pool.lookup("baz.com").await;
-        let next = pool.lookup("foo.com").await;
+        let baz = pool.lookup("baz.com");
+        let next = pool.lookup("foo.com");
         assert_eq!(foo, baz);
         assert_eq!(next, bar);
     }
@@ -573,12 +571,12 @@ mod tests {
         })
         .unwrap();
 
-        let first = pool.lookup("foo.com").await;
+        let first = pool.lookup("foo.com");
 
         for i in 0..10 {
-            pool.lookup(&format!("domain{i}.com")).await;
+            pool.lookup(&format!("domain{i}.com"));
         }
-        let next = pool.lookup("foo.com").await;
+        let next = pool.lookup("foo.com");
 
         assert_ne!(first, next);
     }
@@ -603,8 +601,8 @@ mod tests {
         })
         .unwrap();
 
-        let first = pool.lookup("foo.com").await;
-        let last = pool.lookup("bar.com").await;
+        let first = pool.lookup("foo.com");
+        let last = pool.lookup("bar.com");
         assert_eq!(first, net::IpAddr::from([192, 168, 0, 2]));
         assert_eq!(last, net::IpAddr::from([192, 168, 0, 3]));
 
@@ -624,10 +622,10 @@ mod tests {
         })
         .unwrap();
 
-        new_pool.copy_from(&pool).await;
+        new_pool.copy_from(&pool);
 
-        assert!(new_pool.reverse_lookup(first).await.is_some());
-        assert!(new_pool.reverse_lookup(last).await.is_some());
+        assert!(new_pool.reverse_lookup(first).is_some());
+        assert!(new_pool.reverse_lookup(last).is_some());
     }
 
     #[tokio::test]
@@ -650,9 +648,9 @@ mod tests {
         .unwrap();
 
         // Allocate one real fake IP.
-        let allocated = pool.lookup("foo.com").await;
+        let allocated = pool.lookup("foo.com");
         assert!(
-            pool.is_fake_ip(allocated).await,
+            pool.is_fake_ip(allocated),
             "allocated IP must be fake"
         );
 
@@ -660,28 +658,28 @@ mod tests {
         // allocated, yet it falls inside the /16 range.
         let directed_broadcast: net::IpAddr = "198.18.0.255".parse().unwrap();
         assert!(
-            !pool.is_fake_ip(directed_broadcast).await,
+            !pool.is_fake_ip(directed_broadcast),
             "directed broadcast must not be treated as a fake IP"
         );
 
         // Global broadcast must never be a fake IP.
         let global_broadcast: net::IpAddr = "255.255.255.255".parse().unwrap();
         assert!(
-            !pool.is_fake_ip(global_broadcast).await,
+            !pool.is_fake_ip(global_broadcast),
             "255.255.255.255 must not be a fake IP"
         );
 
         // A multicast address must never be a fake IP.
         let multicast: net::IpAddr = "224.0.0.1".parse().unwrap();
         assert!(
-            !pool.is_fake_ip(multicast).await,
+            !pool.is_fake_ip(multicast),
             "multicast must not be a fake IP"
         );
 
         // An IP in the range that was never allocated must not be fake.
         let unallocated: net::IpAddr = "198.18.1.1".parse().unwrap();
         assert!(
-            !pool.is_fake_ip(unallocated).await,
+            !pool.is_fake_ip(unallocated),
             "unallocated in-range IP must not be treated as a fake IP"
         );
     }
@@ -710,43 +708,43 @@ mod tests {
         .unwrap();
 
         // 1. Resolve host and get IPv4
-        let first = pool.lookup("foo.com").await;
+        let first = pool.lookup("foo.com");
         // 2. Resolve host and get IPv6
-        let first_v6 = pool.lookupv6("foo.com").await;
+        let first_v6 = pool.lookupv6("foo.com");
 
         assert_eq!(first, net::IpAddr::from([192, 168, 0, 2]));
         assert!(first_v6.is_ipv6());
 
         // 3. Query back
-        let ip_v4 = pool.store.get_by_host("foo.com").await;
-        let ip_v6 = pool.store.get_v6_by_host("foo.com").await;
+        let ip_v4 = pool.store.get_by_host("foo.com");
+        let ip_v6 = pool.store.get_v6_by_host("foo.com");
 
         assert_eq!(ip_v4, Some(first));
         assert_eq!(ip_v6, Some(first_v6));
 
         // 4. Reverse lookups should return original host
         assert_eq!(
-            pool.reverse_lookup(first).await,
+            pool.reverse_lookup(first),
             Some("foo.com".to_string())
         );
         assert_eq!(
-            pool.reverse_lookup(first_v6).await,
+            pool.reverse_lookup(first_v6),
             Some("foo.com".to_string())
         );
 
         // 5. Test existence
-        assert!(pool.exist(first).await);
-        assert!(pool.exist(first_v6).await);
+        assert!(pool.exist(first));
+        assert!(pool.exist(first_v6));
 
         // 6. Test delete
-        pool.store.del_by_ip(first).await;
-        assert!(!pool.exist(first).await);
-        assert!(pool.exist(first_v6).await);
+        pool.store.del_by_ip(first);
+        assert!(!pool.exist(first));
+        assert!(pool.exist(first_v6));
 
         // v4 lookup should be None now
-        assert_eq!(pool.store.get_by_host("foo.com").await, None);
+        assert_eq!(pool.store.get_by_host("foo.com"), None);
         // v6 lookup should still be there
-        assert_eq!(pool.store.get_v6_by_host("foo.com").await, Some(first_v6));
+        assert_eq!(pool.store.get_v6_by_host("foo.com"), Some(first_v6));
     }
 
     #[tokio::test]
@@ -762,27 +760,27 @@ mod tests {
         let ip_v6_str = "fdfe:5a70:6451:982b::2";
 
         // Insert directly using cache_store set_host_to_ip
-        cache_store.set_host_to_ip(host, ip_v4_str).await;
+        cache_store.set_host_to_ip(host, ip_v4_str);
 
         let store = FileStore::new(cache_store.clone());
 
         // Test fallback lookup v4
-        let res_v4 = store.get_by_host(host).await;
+        let res_v4 = store.get_by_host(host);
         assert_eq!(res_v4, Some(ip_v4_str.parse().unwrap()));
 
         // Lookup v6 for old-style.com should be None because the stored IP is v4
-        let res_v6 = store.get_v6_by_host(host).await;
+        let res_v6 = store.get_v6_by_host(host);
         assert_eq!(res_v6, None);
 
         // Now change it to store IPv6 in the old format
-        cache_store.set_host_to_ip(host, ip_v6_str).await;
+        cache_store.set_host_to_ip(host, ip_v6_str);
 
         // Test fallback lookup v6
-        let res_v6_new = store.get_v6_by_host(host).await;
+        let res_v6_new = store.get_v6_by_host(host);
         assert_eq!(res_v6_new, Some(ip_v6_str.parse().unwrap()));
 
         // Lookup v4 should now be None
-        let res_v4_new = store.get_by_host(host).await;
+        let res_v4_new = store.get_by_host(host);
         assert_eq!(res_v4_new, None);
     }
 }

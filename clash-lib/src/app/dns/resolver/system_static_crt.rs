@@ -84,7 +84,7 @@ impl ClashResolver for SystemResolver {
         Ok(response.into_iter().choose(&mut rand::rng()))
     }
 
-    async fn cached_for(&self, _: std::net::IpAddr) -> Option<String> {
+    fn cached_for(&self, _: std::net::IpAddr) -> Option<String> {
         None
     }
 
@@ -111,11 +111,11 @@ impl ClashResolver for SystemResolver {
         false
     }
 
-    async fn is_fake_ip(&self, _: std::net::IpAddr) -> bool {
+    fn is_fake_ip(&self, _: std::net::IpAddr) -> bool {
         false
     }
 
-    async fn reverse_lookup(&self, _: std::net::IpAddr) -> Option<String> {
+    fn reverse_lookup(&self, _: std::net::IpAddr) -> Option<String> {
         None
     }
 

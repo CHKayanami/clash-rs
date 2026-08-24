@@ -1,10 +1,12 @@
 mod cache;
 mod policy;
+mod reverse_cache;
 #[cfg(test)]
 mod tests;
 
 pub use cache::{CacheLookup, DnsCache, SERVE_STALE_WIRE_TTL};
 pub use policy::NameServerPolicyContainer;
+pub use reverse_cache::ReverseLookupCache;
 
 use std::collections::HashMap;
 use std::net::{self, IpAddr, Ipv4Addr, Ipv6Addr};
@@ -70,7 +72,7 @@ pub struct EnhancedResolverInner {
     fake_dns: Option<ThreadSafeFakeDns>,
     fake_ip_ttl: u32,
 
-    reverse_lookup_cache: Option<moka::future::Cache<net::IpAddr, String>>,
+    reverse_lookup_cache: Option<ReverseLookupCache>,
     black_domain_filter: Option<BlackDomainFilter>,
     collector: Option<ThreadSafeDnsCollector>,
 
@@ -252,15 +254,7 @@ impl EnhancedResolver {
             None
         };
 
-        let reverse_lookup_cache = match cfg.enhance_mode {
-            DNSMode::RedirHost => Some(
-                moka::future::Cache::builder()
-                    .max_capacity(4096)
-                    .time_to_idle(Duration::from_secs(300))
-                    .build(),
-            ),
-            _ => None,
-        };
+        let reverse_lookup_cache = Some(ReverseLookupCache::new(4096));
 
         let fixed_domain_ttl = if !cfg.fixed_domain_ttl.is_empty() {
             let mut trie = trie::StringTrie::new();
@@ -338,31 +332,86 @@ impl EnhancedResolver {
         Ok(resp)
     }
 
-    async fn fallback_exchange(&self, query: &QueryContext, raw_query: &[u8]) -> anyhow::Result<Vec<u8>> {
+    async fn fallback_exchange(
+        &self,
+        query: &QueryContext,
+        raw_query: &[u8],
+    ) -> anyhow::Result<Vec<u8>> {
         let Some(ref fallback_upstreams) = self.fallback_upstreams else {
             return self.batch_exchange(&self.main_upstreams, raw_query).await;
         };
 
+        let qname = query.qdomain().unwrap_or_default();
         let filter = self.fallback_filter.as_ref();
+
+        // 1. If the domain is explicitly matched by fallback-filter.domain (e.g. +google.com),
+        // query fallback upstreams directly without querying main nameservers.
+        if let Some(filter) = filter {
+            if filter.match_domain(qname) {
+                debug!(
+                    domain = %qname,
+                    "DNS domain matched fallback-filter, querying fallback upstreams directly"
+                );
+                return self.batch_exchange(fallback_upstreams, raw_query).await;
+            }
+        }
+
+        // 2. Concurrently query both main and fallback upstreams
         let main_fut = self.batch_exchange(&self.main_upstreams, raw_query);
         let fallback_fut = self.batch_exchange(fallback_upstreams, raw_query);
 
-        let (main_res, fallback_res) = tokio::join!(main_fut, fallback_fut);
+        tokio::pin!(main_fut);
+        tokio::pin!(fallback_fut);
 
-        if let Ok(main_bytes) = main_res {
-            if let Some(filter) = filter {
+        let mut fallback_res = None;
+
+        // Drive main query and fallback concurrently
+        let main_res = tokio::select! {
+            res = &mut main_fut => res,
+            res = &mut fallback_fut => {
+                fallback_res = Some(res);
+                main_fut.await
+            }
+        };
+
+        match main_res {
+            Ok(main_bytes) => {
                 let ips = extract_ips_from_dns_response(&main_bytes);
-                let qname = query.qdomain().unwrap_or_default();
-                if filter.match_domain(qname) || ips.iter().any(|ip| filter.match_ip(ip)) {
-                    if let Ok(fallback_bytes) = fallback_res {
+                let should_fallback = if ips.is_empty() {
+                    // No IP records in main response: try fallback
+                    true
+                } else if let Some(filter) = filter {
+                    // Check if any returned IP matches the filter (e.g. not CN, or in poisoned ipcidr)
+                    ips.iter().any(|ip| filter.match_ip(ip))
+                } else {
+                    false
+                };
+
+                if should_fallback {
+                    let fb_res = match fallback_res {
+                        Some(res) => res,
+                        None => fallback_fut.await,
+                    };
+                    if let Ok(fallback_bytes) = fb_res {
                         return Ok(fallback_bytes);
                     }
                 }
-            }
-            return Ok(main_bytes);
-        }
 
-        fallback_res
+                Ok(main_bytes)
+            }
+            Err(e) => {
+                // Main query failed: await fallback
+                let fb_res = match fallback_res {
+                    Some(res) => res,
+                    None => fallback_fut.await,
+                };
+                fb_res.map_err(|fb_err| {
+                    anyhow!(
+                        "both main and fallback DNS queries failed: main={e}, fallback={fb_err}"
+                    )
+                })
+            }
+        }
     }
 
     async fn lookup_ip(
@@ -425,7 +474,7 @@ impl EnhancedResolver {
             ttl = ttl.max(self.optimistic_cache_ttl);
         }
 
-        debug!(
+        trace!(
             domain = %host,
             ?ips,
             ttl,
@@ -443,10 +492,15 @@ impl EnhancedResolver {
             }
         }
 
-        // 2. Save reverse lookup cache (for RedirHost mode)
+        // 2. Save reverse lookup cache (with same TTL and conflict detection)
         if let Some(cache) = &self.reverse_lookup_cache {
-            for ip in &ips {
-                cache.insert(*ip, host.to_string()).await;
+            let never_cache = fixed_ttl == Some(0) || ttl == 0;
+            if !never_cache {
+                for ip in &ips {
+                    if !ip.is_unspecified() {
+                        cache.insert(*ip, host, ttl);
+                    }
+                }
             }
         }
 
@@ -494,7 +548,7 @@ impl ClashResolver for EnhancedResolver {
 
         if enhanced && let Some(fake_dns) = &self.fake_dns {
             if !fake_dns.should_skip(host) {
-                let ip = fake_dns.lookup(host).await;
+                let ip = fake_dns.lookup(host);
                 debug!(domain = %host, ?ip, "DNS Fake-IP assigned");
                 if let Some(collector) = &self.collector {
                     collector.record(host, true);
@@ -541,7 +595,7 @@ impl ClashResolver for EnhancedResolver {
 
         if enhanced && let Some(fake_dns) = &self.fake_dns {
             if !fake_dns.should_skip(host) {
-                if let net::IpAddr::V4(ip) = fake_dns.lookup(host).await {
+                if let net::IpAddr::V4(ip) = fake_dns.lookup(host) {
                     if let Some(collector) = &self.collector {
                         collector.record(host, true);
                     }
@@ -601,7 +655,7 @@ impl ClashResolver for EnhancedResolver {
 
         if enhanced && let Some(fake_dns) = &self.fake_dns {
             if !fake_dns.should_skip(host) {
-                if let net::IpAddr::V6(ip) = fake_dns.lookupv6(host).await {
+                if let net::IpAddr::V6(ip) = fake_dns.lookupv6(host) {
                     if let Some(collector) = &self.collector {
                         collector.record(host, true);
                     }
@@ -629,12 +683,10 @@ impl ClashResolver for EnhancedResolver {
         }
     }
 
-    async fn cached_for(&self, ip: net::IpAddr) -> Option<String> {
-        if let Some(cache) = &self.reverse_lookup_cache {
-            cache.get(&ip).await
-        } else {
-            None
-        }
+    fn cached_for(&self, ip: net::IpAddr) -> Option<String> {
+        self.reverse_lookup_cache
+            .as_ref()
+            .and_then(|cache| cache.lookup(&ip))
     }
 
     #[instrument(skip_all, level = "trace")]
@@ -680,13 +732,13 @@ impl ClashResolver for EnhancedResolver {
         if let Some(fake_dns) = &self.fake_dns {
             if !fake_dns.should_skip(host) {
                 if qtype == QType::A {
-                    let fake_ip = fake_dns.lookup(host).await;
+                    let fake_ip = fake_dns.lookup(host);
                     debug!(domain = %host, ?fake_ip, "DNS exchange assigned Fake-IP (A)");
                     if let Some(resp) = build_dns_ip_response(raw_query, &[fake_ip], self.fake_ip_ttl) {
                         return Ok(resp);
                     }
                 } else if qtype == QType::AAAA && self.ipv6() {
-                    let fake_ip = fake_dns.lookupv6(host).await;
+                    let fake_ip = fake_dns.lookupv6(host);
                     debug!(domain = %host, ?fake_ip, "DNS exchange assigned Fake-IP (AAAA)");
                     if let Some(resp) = build_dns_ip_response(raw_query, &[fake_ip], self.fake_ip_ttl) {
                         return Ok(resp);
@@ -779,18 +831,18 @@ impl ClashResolver for EnhancedResolver {
         Ok(raw_resp)
     }
 
-    async fn reverse_lookup(&self, ip: net::IpAddr) -> Option<String> {
+    fn reverse_lookup(&self, ip: net::IpAddr) -> Option<String> {
         if let Some(fake_dns) = &self.fake_dns {
-            if let Some(host) = fake_dns.reverse_lookup(ip).await {
-                return Some(host);
+            if fake_dns.is_fake_ip(ip) {
+                return fake_dns.reverse_lookup(ip);
             }
         }
-        self.cached_for(ip).await
+        self.cached_for(ip)
     }
 
-    async fn is_fake_ip(&self, ip: net::IpAddr) -> bool {
+    fn is_fake_ip(&self, ip: net::IpAddr) -> bool {
         if let Some(fake_dns) = &self.fake_dns {
-            fake_dns.is_fake_ip(ip).await
+            fake_dns.is_fake_ip(ip)
         } else {
             false
         }
@@ -909,7 +961,7 @@ impl ClashResolver for BootstrapResolver {
         Ok(None)
     }
 
-    async fn cached_for(&self, _ip: net::IpAddr) -> Option<String> {
+    fn cached_for(&self, _ip: net::IpAddr) -> Option<String> {
         None
     }
 
@@ -922,11 +974,11 @@ impl ClashResolver for BootstrapResolver {
         Ok(resp)
     }
 
-    async fn reverse_lookup(&self, _ip: net::IpAddr) -> Option<String> {
+    fn reverse_lookup(&self, _ip: net::IpAddr) -> Option<String> {
         None
     }
 
-    async fn is_fake_ip(&self, _ip: net::IpAddr) -> bool {
+    fn is_fake_ip(&self, _ip: net::IpAddr) -> bool {
         false
     }
 

@@ -63,14 +63,14 @@ pub trait ClashResolver: Sync + Send {
         enhanced: bool,
     ) -> anyhow::Result<Option<std::net::Ipv6Addr>>;
 
-    async fn cached_for(&self, ip: std::net::IpAddr) -> Option<String>;
+    fn cached_for(&self, ip: std::net::IpAddr) -> Option<String>;
 
     /// Used for DNS Server / TUN / eBPF: accepts raw wire-format query bytes and returns raw response bytes
     async fn exchange(&self, message: &[u8]) -> anyhow::Result<Vec<u8>>;
 
     /// Only used for look up fake IP
-    async fn reverse_lookup(&self, ip: std::net::IpAddr) -> Option<String>;
-    async fn is_fake_ip(&self, ip: std::net::IpAddr) -> bool;
+    fn reverse_lookup(&self, ip: std::net::IpAddr) -> Option<String>;
+    fn is_fake_ip(&self, ip: std::net::IpAddr) -> bool;
     fn fake_ip_enabled(&self) -> bool;
 
     async fn after_router_inited(&self, r: Arc<Router>);

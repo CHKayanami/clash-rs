@@ -40,7 +40,7 @@ impl ClashResolver for NoopResolver {
         Ok(None)
     }
 
-    async fn cached_for(&self, _ip: std::net::IpAddr) -> Option<String> {
+    fn cached_for(&self, _ip: std::net::IpAddr) -> Option<String> {
         None
     }
 
@@ -49,11 +49,11 @@ impl ClashResolver for NoopResolver {
         Err(anyhow::anyhow!("unsupported"))
     }
     /// Only used for look up fake IP
-    async fn reverse_lookup(&self, _ip: std::net::IpAddr) -> Option<String> {
+    fn reverse_lookup(&self, _ip: std::net::IpAddr) -> Option<String> {
         None
     }
 
-    async fn is_fake_ip(&self, _ip: std::net::IpAddr) -> bool {
+    fn is_fake_ip(&self, _ip: std::net::IpAddr) -> bool {
         false
     }
 

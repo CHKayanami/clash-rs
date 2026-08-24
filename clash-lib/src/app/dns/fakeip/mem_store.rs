@@ -1,6 +1,5 @@
 use std::net::IpAddr;
 
-use async_trait::async_trait;
 use quick_cache::sync::Cache;
 
 use super::Store;
@@ -27,9 +26,8 @@ impl InMemStore {
     }
 }
 
-#[async_trait]
 impl Store for InMemStore {
-    async fn get_by_host(&self, host: &str) -> Option<std::net::IpAddr> {
+    fn get_by_host(&self, host: &str) -> Option<std::net::IpAddr> {
         let v4_key = Self::make_host_key(host, false);
         if let Some(ip) = self.htoi.get(&v4_key) {
             let _ = self.itoh.get(&ip);
@@ -38,7 +36,7 @@ impl Store for InMemStore {
         None
     }
 
-    async fn get_v6_by_host(&self, host: &str) -> Option<std::net::IpAddr> {
+    fn get_v6_by_host(&self, host: &str) -> Option<std::net::IpAddr> {
         let v6_key = Self::make_host_key(host, true);
         if let Some(ip) = self.htoi.get(&v6_key) {
             let _ = self.itoh.get(&ip);
@@ -47,13 +45,13 @@ impl Store for InMemStore {
         None
     }
 
-    async fn put_by_host(&self, host: &str, ip: std::net::IpAddr) {
+    fn put_by_host(&self, host: &str, ip: std::net::IpAddr) {
         let key = Self::make_host_key(host, ip.is_ipv6());
         self.htoi.insert(key, ip);
         self.itoh.insert(ip, host.to_string());
     }
 
-    async fn get_by_ip(&self, ip: std::net::IpAddr) -> Option<String> {
+    fn get_by_ip(&self, ip: std::net::IpAddr) -> Option<String> {
         if let Some(h) = self.itoh.get(&ip) {
             let key = Self::make_host_key(&h, ip.is_ipv6());
             let _ = self.htoi.get(&key);
@@ -62,13 +60,13 @@ impl Store for InMemStore {
         None
     }
 
-    async fn put_by_ip(&self, ip: std::net::IpAddr, host: &str) {
+    fn put_by_ip(&self, ip: std::net::IpAddr, host: &str) {
         let key = Self::make_host_key(host, ip.is_ipv6());
         self.itoh.insert(ip, host.to_string());
         self.htoi.insert(key, ip);
     }
 
-    async fn del_by_ip(&self, ip: std::net::IpAddr) {
+    fn del_by_ip(&self, ip: std::net::IpAddr) {
         if let Some(host) = self.itoh.get(&ip) {
             self.itoh.remove(&ip);
             let key = Self::make_host_key(&host, ip.is_ipv6());
@@ -76,11 +74,11 @@ impl Store for InMemStore {
         }
     }
 
-    async fn exist(&self, ip: std::net::IpAddr) -> bool {
+    fn exist(&self, ip: std::net::IpAddr) -> bool {
         self.itoh.peek(&ip).is_some()
     }
 
-    async fn copy_to(&self, #[allow(unused)] store: &dyn Store) {
+    fn copy_to(&self, #[allow(unused)] store: &dyn Store) {
         // TODO: copy
         // NOTE: use file based persistence store
     }
@@ -90,28 +88,28 @@ impl Store for InMemStore {
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn test_in_mem_store_basic() {
+    #[test]
+    fn test_in_mem_store_basic() {
         let store = InMemStore::new(100);
         let host = "example.com";
         let ip_v4: IpAddr = "192.168.1.1".parse().unwrap();
         let ip_v6: IpAddr = "fd00::1".parse().unwrap();
 
-        store.put_by_host(host, ip_v4).await;
-        store.put_by_host(host, ip_v6).await;
+        store.put_by_host(host, ip_v4);
+        store.put_by_host(host, ip_v6);
 
-        assert_eq!(store.get_by_host(host).await, Some(ip_v4));
-        assert_eq!(store.get_v6_by_host(host).await, Some(ip_v6));
+        assert_eq!(store.get_by_host(host), Some(ip_v4));
+        assert_eq!(store.get_v6_by_host(host), Some(ip_v6));
 
-        assert_eq!(store.get_by_ip(ip_v4).await, Some(host.to_string()));
-        assert_eq!(store.get_by_ip(ip_v6).await, Some(host.to_string()));
+        assert_eq!(store.get_by_ip(ip_v4), Some(host.to_string()));
+        assert_eq!(store.get_by_ip(ip_v6), Some(host.to_string()));
 
-        assert!(store.exist(ip_v4).await);
-        assert!(store.exist(ip_v6).await);
+        assert!(store.exist(ip_v4));
+        assert!(store.exist(ip_v6));
 
-        store.del_by_ip(ip_v4).await;
-        assert!(!store.exist(ip_v4).await);
-        assert_eq!(store.get_by_host(host).await, None);
-        assert_eq!(store.get_v6_by_host(host).await, Some(ip_v6));
+        store.del_by_ip(ip_v4);
+        assert!(!store.exist(ip_v4));
+        assert_eq!(store.get_by_host(host), None);
+        assert_eq!(store.get_v6_by_host(host), Some(ip_v6));
     }
 }
