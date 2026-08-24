@@ -475,7 +475,11 @@ pub fn map_rule_type(
             target,
             name_only: false,
         }),
-        RuleType::RuleSet { rule_set, target } => match rule_provider_registry {
+        RuleType::RuleSet {
+            rule_set,
+            target,
+            no_resolve,
+        } => match rule_provider_registry {
             Some(rule_provider_registry) => Box::new(RuleSet::new(
                 rule_set.clone(),
                 target,
@@ -485,6 +489,7 @@ pub fn map_rule_type(
                         print_and_exit!("rule provider {} not found", rule_set)
                     })
                     .clone(),
+                no_resolve,
             )),
             None => {
                 // this is called in remote rule provider with no rule provider

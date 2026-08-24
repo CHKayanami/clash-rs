@@ -56,6 +56,7 @@ pub enum RuleType {
     RuleSet {
         rule_set: String,
         target: String,
+        no_resolve: bool,
     },
     Match {
         target: String,
@@ -200,6 +201,11 @@ impl RuleType {
             "RULE-SET" => Ok(RuleType::RuleSet {
                 rule_set: payload.to_string(),
                 target: target.to_string(),
+                no_resolve: if let Some(params) = params {
+                    params.contains(&"no-resolve")
+                } else {
+                    false
+                },
             }),
             "MATCH" => Ok(RuleType::Match {
                 target: target.to_string(),
@@ -327,5 +333,35 @@ mod tests {
         // Test invalid network type
         let rule = RuleType::try_from("NETWORK,INVALID,PROXY".to_string());
         assert!(rule.is_err());
+
+        // Test RULE-SET without no-resolve
+        let rule = RuleType::try_from("RULE-SET,my-rules,PROXY".to_string()).unwrap();
+        match rule {
+            RuleType::RuleSet {
+                rule_set,
+                target,
+                no_resolve,
+            } => {
+                assert_eq!(rule_set, "my-rules");
+                assert_eq!(target, "PROXY");
+                assert!(!no_resolve);
+            }
+            _ => panic!("Expected RuleSet rule"),
+        }
+
+        // Test RULE-SET with no-resolve
+        let rule = RuleType::try_from("RULE-SET,my-rules,PROXY,no-resolve".to_string()).unwrap();
+        match rule {
+            RuleType::RuleSet {
+                rule_set,
+                target,
+                no_resolve,
+            } => {
+                assert_eq!(rule_set, "my-rules");
+                assert_eq!(target, "PROXY");
+                assert!(no_resolve);
+            }
+            _ => panic!("Expected RuleSet rule"),
+        }
     }
 }

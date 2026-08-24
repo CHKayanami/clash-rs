@@ -181,10 +181,12 @@ impl Dispatcher {
         }
 
         // Set resolved_ip if original destination was a real IP (not a Fake-IP)
-        if let Some(ip) = orig_dest.ip() {
-            if !self.resolver.is_fake_ip(ip) {
-                sess.resolved_ip = Some(ip);
-            }
+        let is_real_ip = match orig_dest.ip() {
+            Some(ip) => !self.resolver.is_fake_ip(ip),
+            None => false,
+        };
+        if is_real_ip {
+            sess.resolved_ip = orig_dest.ip();
         }
 
         let mode = self.get_mode();
@@ -196,7 +198,7 @@ impl Dispatcher {
 
         // If override_destination is not requested and original destination was a real IP,
         // restore original destination for outbound connection
-        if !override_dest && sess.resolved_ip.is_some() {
+        if !override_dest && is_real_ip {
             sess.destination = orig_dest.clone();
         }
 
@@ -787,10 +789,12 @@ async fn establish_outbound_session(
     sess.sniffed_domain = sniffed_domain;
 
     let orig_dst_ip = orig_inbound_dst.ip();
-    if let Some(ip) = orig_dst_ip {
-        if !resolver.is_fake_ip(ip) {
-            sess.resolved_ip = Some(ip);
-        }
+    let is_real_ip = match orig_dst_ip {
+        Some(ip) => !resolver.is_fake_ip(ip),
+        None => false,
+    };
+    if is_real_ip {
+        sess.resolved_ip = orig_dst_ip;
     }
 
     let mode = decode_mode(mode.load(Ordering::Relaxed));
@@ -800,7 +804,7 @@ async fn establish_outbound_session(
         RunMode::Direct => (PROXY_DIRECT, None),
     };
 
-    if !override_dest && sess.resolved_ip.is_some() {
+    if !override_dest && is_real_ip {
         sess.destination = orig_inbound_dst.clone();
     }
 
