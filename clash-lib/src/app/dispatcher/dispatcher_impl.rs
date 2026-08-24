@@ -39,7 +39,7 @@ use crate::app::sniffer::ArcSniffer;
 // buffer smaller than that forces the cipher to split every full packet into
 // multiple smaller encrypted chunks, multiplying encrypt/decrypt overhead.
 // Classic AEAD ciphers cap at 0x3FFF (16383 bytes) so they are unaffected.
-const DEFAULT_BUFFER_SIZE: usize = 64 * 1024;
+const DEFAULT_BUFFER_SIZE: usize = 16 * 1024;
 const DEFAULT_UDP_SESSION_TIMEOUT_SECS: u64 = 60;
 const UDP_CHANNEL_CAPACITY: usize = 1024;
 

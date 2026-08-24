@@ -10,7 +10,7 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tracing::{debug, trace};
 
 use crate::{
-    common::io::SlideBuffer,
+    common::io::{PooledBuffer, SlideBuffer},
     proxy::{datagram::UdpPacket, AnyStream},
     session::SocksAddr,
 };
@@ -177,7 +177,9 @@ impl Stream for OutboundDatagramUotV2 {
                 let total_len = 2 + packet_len;
 
                 if slice.len() >= total_len {
-                    let data = Bytes::copy_from_slice(&slice[2..total_len]);
+                    let mut pooled = PooledBuffer::acquire(packet_len);
+                    pooled.extend_from_slice(&slice[2..total_len]);
+                    let data = pooled.into_bytes();
                     this.read_buf.consume(total_len);
 
                     return Poll::Ready(Some(UdpPacket {

@@ -1452,6 +1452,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
+name = "clash-common"
+version = "0.10.7"
+dependencies = [
+ "bytes",
+ "tokio",
+]
+
+[[package]]
 name = "clash-doc"
 version = "0.10.7"
 dependencies = [
@@ -1520,6 +1528,7 @@ dependencies = [
  "cfb-mode",
  "chacha20poly1305 0.11.0",
  "chrono",
+ "clash-common",
  "clash-ebpf",
  "clash-shadowsocks",
  "console-subscriber",
@@ -11753,6 +11762,7 @@ name = "watfaq-netstack"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "clash-common",
  "env_logger",
  "futures",
  "ipnet",

@@ -50,7 +50,7 @@ impl SlideBuffer {
     pub fn new(capacity: usize) -> Self {
         let cap = capacity.max(1);
         Self {
-            data: vec![0u8; cap].into_boxed_slice(),
+            data: crate::allocate_boxed_slice(cap),
             start: 0,
             end: 0,
         }
@@ -116,7 +116,7 @@ impl SlideBuffer {
     pub fn ensure_capacity(&mut self, min_capacity: usize) {
         if self.data.len() < min_capacity {
             let new_cap = min_capacity.next_power_of_two();
-            let mut new_data = vec![0u8; new_cap].into_boxed_slice();
+            let mut new_data = crate::allocate_boxed_slice(new_cap);
             let len = self.len();
             if len > 0 {
                 new_data[..len].copy_from_slice(self.as_slice());

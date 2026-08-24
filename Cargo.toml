@@ -4,6 +4,7 @@ resolver = "3"
 members = [
     "clash-bin",
     "clash-lib",
+    "clash-common",
     "clash-doc",
     "clash-ffi",
     "clash-dns",

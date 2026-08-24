@@ -151,6 +151,12 @@ impl AnyTlsClientSession {
         self.is_closed.load(Ordering::Relaxed)
     }
 
+    /// Explicitly mark session as closed and notify all listeners
+    pub fn mark_closed(&self) {
+        self.is_closed.store(true, Ordering::Relaxed);
+        self.close_notify.notify_waiters();
+    }
+
     /// Get current active streams count (lock-free atomic load)
     pub fn active_streams_count(&self) -> usize {
         self.active_streams.load(Ordering::Relaxed)
@@ -220,24 +226,36 @@ impl AnyTlsClientSession {
         stream_id: u32,
         data: Bytes,
     ) -> io::Result<()> {
-        self.outgoing_tx
-            .try_send(OutgoingMessage::Control {
-                cmd,
-                stream_id,
-                data,
-            })
-            .map_err(|_| {
-                io::Error::new(io::ErrorKind::BrokenPipe, "Session writer closed")
-            })
+        match self.outgoing_tx.try_send(OutgoingMessage::Control {
+            cmd,
+            stream_id,
+            data,
+        }) {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                self.is_closed.store(true, Ordering::Relaxed);
+                self.close_notify.notify_waiters();
+                Err(io::Error::new(io::ErrorKind::BrokenPipe, "Session writer closed"))
+            }
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                Err(io::Error::new(io::ErrorKind::WouldBlock, "Session writer queue full"))
+            }
+        }
     }
 
     /// Send buffered initial frames
     fn send_buffered(&self, data: Bytes) -> io::Result<()> {
-        self.outgoing_tx
-            .try_send(OutgoingMessage::Buffered { data })
-            .map_err(|_| {
-                io::Error::new(io::ErrorKind::BrokenPipe, "Session writer closed")
-            })
+        match self.outgoing_tx.try_send(OutgoingMessage::Buffered { data }) {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                self.is_closed.store(true, Ordering::Relaxed);
+                self.close_notify.notify_waiters();
+                Err(io::Error::new(io::ErrorKind::BrokenPipe, "Session writer closed"))
+            }
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                Err(io::Error::new(io::ErrorKind::WouldBlock, "Session writer queue full"))
+            }
+        }
     }
 
     /// Spawn background reader and writer tasks
@@ -254,7 +272,7 @@ impl AnyTlsClientSession {
         let close_notify_w = Arc::clone(&session.close_notify);
         tokio::spawn(async move {
             if let Err(e) = Self::writer_loop(
-                session_weak_w,
+                session_weak_w.clone(),
                 writer,
                 outgoing_rx,
                 close_notify_w,
@@ -263,15 +281,23 @@ impl AnyTlsClientSession {
             {
                 debug!("AnyTLS client writer ended: {}", e);
             }
+            if let Some(session) = session_weak_w.upgrade() {
+                session.is_closed.store(true, Ordering::Relaxed);
+                session.close_notify.notify_waiters();
+            }
         });
 
         let session_weak_r = Arc::downgrade(&session);
         let close_notify_r = Arc::clone(&session.close_notify);
         tokio::spawn(async move {
             if let Err(e) =
-                Self::reader_loop(session_weak_r, reader, close_notify_r).await
+                Self::reader_loop(session_weak_r.clone(), reader, close_notify_r).await
             {
                 debug!("AnyTLS client reader ended: {}", e);
+            }
+            if let Some(session) = session_weak_r.upgrade() {
+                session.is_closed.store(true, Ordering::Relaxed);
+                session.close_notify.notify_waiters();
             }
         });
     }

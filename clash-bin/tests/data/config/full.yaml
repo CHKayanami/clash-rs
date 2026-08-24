@@ -289,7 +289,7 @@ tun:
   #   "utun1989"       — macOS (utun prefix required by OS)
   #   "dev://tun0"     — Linux explicit device (alias: "tun0")
   #   "fd://3"         — use an existing open file descriptor
-  device: "dev://utun1989"
+  device: "utun1989"
   # device-id: "dev://utun1989"     # Legacy alias for device
 
   # TUN interface IP addresses and CIDR masks:

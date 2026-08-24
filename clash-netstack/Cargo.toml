@@ -28,6 +28,7 @@ tokio = { version = "1.52", features = ["full"] }
 futures = "0.3"
 log = "0.4"
 rand = "0.10"
+clash-common = { path = "../clash-common" }
 
 
 [dev-dependencies]

@@ -81,24 +81,13 @@ impl Handler {
         }
     }
 
-    /// Get or create an active multiplexed AnyTLS session using the connection pool
-    async fn get_or_create_session(
+    /// Create a fresh session and add it to the pool
+    async fn create_fresh_session(
         &self,
         resolver: ThreadSafeDNSResolver,
         connector: &dyn RemoteConnector,
         sess: &Session,
     ) -> io::Result<Arc<AnyTlsClientSession>> {
-        if let Some(session) = self.session_pool.get_available_session().await {
-            return Ok(session);
-        }
-
-        // Only one dial at a time; whoever loses the race re-checks the pool
-        // and will usually find the session the winner just added.
-        let _creating = self.session_create_lock.lock().await;
-        if let Some(session) = self.session_pool.get_available_session().await {
-            return Ok(session);
-        }
-
         let stream = connector
             .connect_stream(
                 resolver,
@@ -134,6 +123,58 @@ impl Handler {
         Ok(session_arc)
     }
 
+    /// Get or create an active multiplexed AnyTLS session using the connection pool
+    async fn get_or_create_session(
+        &self,
+        resolver: ThreadSafeDNSResolver,
+        connector: &dyn RemoteConnector,
+        sess: &Session,
+    ) -> io::Result<Arc<AnyTlsClientSession>> {
+        if let Some(session) = self.session_pool.get_available_session().await {
+            return Ok(session);
+        }
+
+        // Only one dial at a time; whoever loses the race re-checks the pool
+        // and will usually find the session the winner just added.
+        let _creating = self.session_create_lock.lock().await;
+        if let Some(session) = self.session_pool.get_available_session().await {
+            return Ok(session);
+        }
+
+        self.create_fresh_session(resolver, connector, sess).await
+    }
+
+    /// Open a multiplexed AnyTLS stream with auto-retry on stale/broken pooled sessions
+    async fn open_stream_with_retry(
+        &self,
+        resolver: ThreadSafeDNSResolver,
+        connector: &dyn RemoteConnector,
+        sess: &Session,
+        dest: &SocksAddr,
+    ) -> io::Result<crate::proxy::anytls::stream::AnyTlsStream> {
+        let session = self
+            .get_or_create_session(resolver.clone(), connector, sess)
+            .await?;
+
+        match session.open_stream(dest).await {
+            Ok(stream) => Ok(stream),
+            Err(err) if is_session_broken_err(&err) => {
+                debug!(
+                    "AnyTLS pooled session broken ({:?}), retrying with fresh connection",
+                    err
+                );
+                session.mark_closed();
+                self.session_pool.prune_sessions();
+
+                let fresh_session = self
+                    .create_fresh_session(resolver, connector, sess)
+                    .await?;
+                fresh_session.open_stream(dest).await
+            }
+            Err(err) => Err(err),
+        }
+    }
+
     /// Helper method for raw stream creation (used in unit tests / fallback)
     #[allow(dead_code)]
     async fn open_anytls_stream(
@@ -150,6 +191,16 @@ impl Handler {
         let stream = session.open_stream(destination).await?;
         Ok(Box::new(stream))
     }
+}
+
+fn is_session_broken_err(err: &io::Error) -> bool {
+    matches!(
+        err.kind(),
+        io::ErrorKind::BrokenPipe
+            | io::ErrorKind::NotConnected
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionAborted
+    ) || err.to_string().contains("closed")
 }
 
 #[async_trait]
@@ -218,10 +269,9 @@ impl OutboundHandler for Handler {
         resolver: ThreadSafeDNSResolver,
         connector: &dyn RemoteConnector,
     ) -> io::Result<BoxedChainedStream> {
-        let session = self
-            .get_or_create_session(resolver, connector, sess)
+        let stream = self
+            .open_stream_with_retry(resolver, connector, sess, &sess.destination)
             .await?;
-        let stream = session.open_stream(&sess.destination).await?;
 
         let chained =
             crate::app::dispatcher::ChainedStreamWrapper::new(Box::new(stream));
@@ -238,10 +288,9 @@ impl OutboundHandler for Handler {
         let uot_dest =
             SocksAddr::try_from((crate::proxy::transport::uot::UDP_OVER_TCP_V2_MAGIC_HOST.to_owned(), 0))?;
 
-        let session = self
-            .get_or_create_session(resolver, connector, sess)
+        let mut stream = self
+            .open_stream_with_retry(resolver, connector, sess, &uot_dest)
             .await?;
-        let mut stream = session.open_stream(&uot_dest).await?;
 
         let request = crate::proxy::transport::uot::encode_uot_connect_request(&sess.destination);
         stream.write_all(&request).await?;

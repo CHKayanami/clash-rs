@@ -52,6 +52,7 @@ telemetry = ["tokio/tracing", "dep:tracing-opentelemetry", "dep:tracing-chrome",
 dashboard = ["dep:rust-embed"]
 
 [dependencies]
+clash-common = { path = "../clash-common" }
 # Async
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["net", "codec", "io", "compat", "time"] }

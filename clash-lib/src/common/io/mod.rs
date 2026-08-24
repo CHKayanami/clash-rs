@@ -16,8 +16,7 @@ mod splice;
 #[cfg(all(target_os = "linux", feature = "zero_copy"))]
 pub use splice::zero_copy_bidirectional;
 
-pub mod slide_buffer;
-pub use slide_buffer::SlideBuffer;
+pub use clash_common::{PooledBuffer, SlideBuffer};
 
 use crate::{app::dispatcher::TrackedStream, proxy::ClientStream};
 
@@ -87,7 +86,7 @@ impl CopyBuffer {
 
     pub fn new_with_capacity(size: usize) -> Result<Self, std::io::Error> {
         let size = size.max(1024);
-        let buf = vec![0u8; size].into_boxed_slice();
+        let buf = clash_common::allocate_boxed_slice(size);
         Ok(Self {
             read_done: false,
             need_flush: false,
