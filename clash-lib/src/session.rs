@@ -7,13 +7,36 @@ use std::{
     io,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     str::FromStr,
+    sync::Arc,
 };
 use tokio::io::{AsyncRead, AsyncReadExt};
 
-#[derive(Debug, PartialEq, Eq, Hash, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum SocksAddr {
     Ip(SocketAddr),
-    Domain(String, u16),
+    Domain(Arc<str>, u16),
+}
+
+impl Serialize for SocksAddr {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        use serde::ser::SerializeTupleVariant;
+        match self {
+            SocksAddr::Ip(addr) => {
+                let mut s = serializer.serialize_tuple_variant("SocksAddr", 0, "Ip", 1)?;
+                s.serialize_field(addr)?;
+                s.end()
+            }
+            SocksAddr::Domain(domain, port) => {
+                let mut s = serializer.serialize_tuple_variant("SocksAddr", 1, "Domain", 2)?;
+                s.serialize_field(domain.as_ref())?;
+                s.serialize_field(port)?;
+                s.end()
+            }
+        }
+    }
 }
 
 impl FromStr for SocksAddr {
@@ -30,7 +53,7 @@ impl FromStr for SocksAddr {
                 let tokens: Vec<_> = s.split(':').collect();
                 if tokens.len() == 2 {
                     let port: u16 = tokens.get(1).unwrap().parse()?;
-                    Ok(Self::Domain(tokens.first().unwrap().to_string(), port))
+                    Ok(Self::Domain(tokens.first().unwrap().to_string().into(), port))
                 } else {
                     Err(anyhow!("SocksAddr parse error, value: {s}"))
                 }
@@ -119,10 +142,14 @@ impl SocksAddr {
         }
     }
 
+    pub fn domain_name(domain: impl Into<Arc<str>>, port: u16) -> Self {
+        Self::Domain(domain.into(), port)
+    }
+
     pub fn domain(&self) -> Option<&str> {
         match self {
             SocksAddr::Ip(_) => None,
-            SocksAddr::Domain(domain, _) => Some(domain.as_str()),
+            SocksAddr::Domain(domain, _) => Some(domain.as_ref()),
         }
     }
 
@@ -150,7 +177,7 @@ impl SocksAddr {
     pub fn host_cow(&self) -> std::borrow::Cow<'_, str> {
         match self {
             SocksAddr::Ip(ip) => std::borrow::Cow::Owned(ip.ip().to_string()),
-            SocksAddr::Domain(domain, _) => std::borrow::Cow::Borrowed(domain.as_str()),
+            SocksAddr::Domain(domain, _) => std::borrow::Cow::Borrowed(domain.as_ref()),
         }
     }
 
@@ -218,7 +245,7 @@ impl SocksAddr {
                 let port = cur.get_u16();
                 let domain_name =
                     String::from_utf8(buf).map_err(|_x| invalid_domain())?;
-                Ok(Self::Domain(domain_name, port))
+                Ok(Self::Domain(domain_name.into(), port))
             }
             _ => Err(invalid_atyp()),
         }
@@ -245,20 +272,9 @@ impl SocksAddr {
                 }
                 let domain = String::from_utf8(buf).map_err(|_| invalid_domain())?;
                 let port = r.read_u16().await?;
-                Ok(Self::Domain(domain, port))
+                Ok(Self::Domain(domain.into(), port))
             }
             _ => Err(invalid_atyp()),
-        }
-    }
-}
-
-impl Clone for SocksAddr {
-    fn clone(&self) -> Self {
-        match self {
-            SocksAddr::Ip(a) => Self::from(a.to_owned()),
-            SocksAddr::Domain(domain, port) => {
-                Self::try_from((domain.clone(), *port)).unwrap()
-            }
         }
     }
 }
@@ -291,6 +307,34 @@ impl TryFrom<(String, u16)> for SocksAddr {
     type Error = io::Error;
 
     fn try_from(value: (String, u16)) -> Result<Self, Self::Error> {
+        if let Ok(ip) = value.0.parse::<IpAddr>() {
+            return Ok(Self::from((ip, value.1)));
+        }
+        if value.0.len() > 0xff {
+            return Err(io::Error::other("domain too long"));
+        }
+        Ok(Self::Domain(value.0.into(), value.1))
+    }
+}
+
+impl TryFrom<(&str, u16)> for SocksAddr {
+    type Error = io::Error;
+
+    fn try_from(value: (&str, u16)) -> Result<Self, Self::Error> {
+        if let Ok(ip) = value.0.parse::<IpAddr>() {
+            return Ok(Self::from((ip, value.1)));
+        }
+        if value.0.len() > 0xff {
+            return Err(io::Error::other("domain too long"));
+        }
+        Ok(Self::Domain(Arc::from(value.0), value.1))
+    }
+}
+
+impl TryFrom<(Arc<str>, u16)> for SocksAddr {
+    type Error = io::Error;
+
+    fn try_from(value: (Arc<str>, u16)) -> Result<Self, Self::Error> {
         if let Ok(ip) = value.0.parse::<IpAddr>() {
             return Ok(Self::from((ip, value.1)));
         }
@@ -353,7 +397,7 @@ impl TryFrom<&[u8]> for SocksAddr {
                 let mut port_bytes = [0u8; 2];
                 (port_bytes).copy_from_slice(&buf[domain_len + 2..domain_len + 4]);
                 let port = u16::from_be_bytes(port_bytes);
-                Ok(Self::Domain(domain, port))
+                Ok(Self::Domain(domain.into(), port))
             }
 
             _ => Err(io::Error::other("invalid ATYP")),
@@ -640,7 +684,7 @@ fn test_session_serialize() {
     assert_eq!(val2["destinationIP"], "1.1.1.1");
 
     s.resolved_ip = None;
-    s.destination = SocksAddr::Domain("example.com".to_string(), 80);
+    s.destination = SocksAddr::Domain("example.com".into(), 80);
     let val3: serde_json::Value = serde_json::to_value(&s).unwrap();
     assert_eq!(val3["destinationIP"], "");
 }

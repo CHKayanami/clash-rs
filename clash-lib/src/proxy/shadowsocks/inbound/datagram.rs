@@ -185,7 +185,7 @@ impl futures::Stream for InboundShadowsocksDatagram {
                             shadowsocks::relay::Address::DomainNameAddress(
                                 domain,
                                 port,
-                            ) => SocksAddr::Domain(domain, port),
+                            ) => SocksAddr::Domain(domain.into(), port),
                         },
                         inbound_user: ctrl
                             .and_then(|c| c.user)
@@ -269,7 +269,7 @@ impl futures::Sink<UdpPacket> for InboundShadowsocksDatagram {
                 }
                 SocksAddr::Domain(host, port) => {
                     shadowsocks::relay::Address::DomainNameAddress(
-                        host.clone(),
+                        host.to_string(),
                         *port,
                     )
                 }

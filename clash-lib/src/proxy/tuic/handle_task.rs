@@ -129,7 +129,7 @@ impl TuicConnection {
                 let remote_addr = match remote_addr {
                     Address::None => unreachable!(),
                     Address::DomainAddress(domain, port) => {
-                        ClashSocksAddr::Domain(domain, port)
+                        ClashSocksAddr::Domain(domain.into(), port)
                     }
                     Address::SocketAddress(socket) => ClashSocksAddr::Ip(socket),
                 };

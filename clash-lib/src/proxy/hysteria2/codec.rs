@@ -407,7 +407,7 @@ fn to_socksaddr(bytes: &[u8]) -> std::io::Result<SocksAddr> {
         ));
     }
 
-    Ok(SocksAddr::Domain(host.to_string(), port))
+    Ok(SocksAddr::Domain(host.into(), port))
 }
 
 /// Iterator over fragments of a packet
@@ -606,7 +606,7 @@ fn test_decode_addr() {
     let decoded_addr = to_socksaddr(&addr_bytes).unwrap();
     assert_eq!(addr, decoded_addr);
 
-    let addr = SocksAddr::Domain("example.com".to_string(), 80);
+    let addr = SocksAddr::Domain("example.com".into(), 80);
     let addr_bytes = addr.to_string().into_bytes();
     let decoded_addr = to_socksaddr(&addr_bytes).unwrap();
     assert_eq!(addr, decoded_addr);
@@ -618,7 +618,7 @@ fn test_encoded_addr() {
     let encoded1 = EncodedAddr::from_socksaddr(&addr1);
     assert_eq!(encoded1.as_slice(), b"1.2.3.4:443");
 
-    let addr2 = SocksAddr::Domain("test.example.com".to_string(), 8443);
+    let addr2 = SocksAddr::Domain("test.example.com".into(), 8443);
     let encoded2 = EncodedAddr::from_socksaddr(&addr2);
     assert_eq!(encoded2.as_slice(), b"test.example.com:8443");
 
@@ -629,7 +629,7 @@ fn test_encoded_addr() {
 
 #[test]
 fn test_udp_roundtrip() {
-    let addr = SocksAddr::Domain("example.com".to_string(), 1234);
+    let addr = SocksAddr::Domain("example.com".into(), 1234);
     let payload = Bytes::from_static(b"hello world hysteria2");
     let mut frags = Fragments::new(0x12345678, 42, addr.clone(), 1500, payload.clone()).unwrap();
     let frag_bytes = frags.next().unwrap();

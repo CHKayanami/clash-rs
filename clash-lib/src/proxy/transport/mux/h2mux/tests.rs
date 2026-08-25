@@ -40,7 +40,7 @@ fn test_stream_request_encoding() {
     let bytes_ip = req_ip.encode().unwrap();
     assert_eq!(&bytes_ip[..3], &[0x00, 0x00, 0x01]); // flags=0, type=1 (ipv4)
 
-    let req_domain = StreamRequest::new(SocksAddr::Domain("example.com".to_string(), 443), false);
+    let req_domain = StreamRequest::new(SocksAddr::Domain("example.com".into(), 443), false);
     let bytes_domain = req_domain.encode().unwrap();
     assert_eq!(&bytes_domain[..4], &[0x00, 0x00, 0x03, 11]); // flags=0, type=3, len=11
 }

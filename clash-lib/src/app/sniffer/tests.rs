@@ -347,7 +347,7 @@ async fn test_sniffer_tcp_negative_cache() {
     });
 
     let force_sess = Session {
-        destination: SocksAddr::Domain("recovered.org".to_string(), 443),
+        destination: SocksAddr::Domain("recovered.org".into(), 443),
         ..Default::default()
     };
     // Force sniffing ignores negative cache

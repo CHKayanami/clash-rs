@@ -328,12 +328,8 @@ impl Runner for TunRunner {
                         }
                     })?;
 
-            let framed = tun_rs::async_framed::DeviceFramed::new(
-                tun,
-                tun_rs::async_framed::BytesCodec::new(),
-            );
-
-            let (mut tun_sink, mut tun_stream) = framed.split::<bytes::Bytes>();
+            let tun = Arc::new(tun);
+            let tun_for_writer = tun.clone();
             let (mut stack_sink, mut stack_stream) = stack.split();
 
             let auto_detect_cancel = cancellation_token.clone();
@@ -380,7 +376,7 @@ impl Runner for TunRunner {
 
             let mut fut_tun_writer = async || {
                 while let Some(pkt) = tun_rx.recv().await {
-                    if let Err(e) = tun_sink.send(pkt).await {
+                    if let Err(e) = tun_for_writer.send(&pkt).await {
                         if e.kind() == std::io::ErrorKind::TimedOut
                             || e.kind() == std::io::ErrorKind::WouldBlock
                             || e.kind() == std::io::ErrorKind::InvalidInput
@@ -508,7 +504,7 @@ impl Runner for TunRunner {
             let nat = system_nat.clone();
             let enable_tcp = cfg.enable_tcp;
             let mut fut_tun_dispatcher = async || {
-                macro_rules! dispatch_pkt {
+                macro_rules! dispatch_bytes_mut {
                     ($single_pkt:expr) => {{
                         let mut single_pkt = $single_pkt;
                         if let Ok(version) = smoltcp::wire::IpVersion::of_packet(&single_pkt) {
@@ -576,21 +572,98 @@ impl Runner for TunRunner {
                     }};
                 }
 
-                while let Some(pkt) = tun_stream.next().await {
-                    match pkt {
-                        Ok(pkt) => {
-                            if gso_enabled && pkt.len() > stack_mtu {
-                                for single_pkt in
-                                    super::gso::split_gso_packet(pkt.into(), stack_mtu)
+                macro_rules! dispatch_pooled {
+                    ($pooled:expr) => {{
+                        let mut pooled = $pooled;
+                        if let Ok(version) = smoltcp::wire::IpVersion::of_packet(pooled.as_ref()) {
+                            let is_tcp = match version {
+                                smoltcp::wire::IpVersion::Ipv4 => {
+                                    smoltcp::wire::Ipv4Packet::new_checked(pooled.as_ref())
+                                        .map(|p| p.next_header() == smoltcp::wire::IpProtocol::Tcp)
+                                        .unwrap_or(false)
+                                }
+                                smoltcp::wire::IpVersion::Ipv6 => {
+                                    smoltcp::wire::Ipv6Packet::new_checked(pooled.as_ref())
+                                        .map(|p| p.next_header() == smoltcp::wire::IpProtocol::Tcp)
+                                        .unwrap_or(false)
+                                }
+                            };
+
+                            if is_tcp {
+                                if !enable_tcp {
+                                    // TCP disabled on TUN, drop incoming TCP packet
+                                } else if use_system_stack
+                                    && super::system_stack::process_system_tcp_packet(
+                                        pooled.as_mut_slice(),
+                                        v4_nat_info,
+                                        v6_nat_info,
+                                        &nat,
+                                    ) == Some(true)
                                 {
-                                    dispatch_pkt!(single_pkt);
+                                    if let Err(e) = tun_tx_for_system_tcp
+                                        .send(pooled.into_bytes())
+                                        .await
+                                    {
+                                        error!(
+                                            "failed to write system TCP packet to tun channel: {}",
+                                            e
+                                        );
+                                        break;
+                                    }
+                                } else if let Err(e) = stack_sink
+                                    .send(watfaq_netstack::Packet::new(pooled.into_bytes()))
+                                    .await
+                                {
+                                    error!("failed to send pkt to stack: {}", e);
+                                    return Err(Error::Operation(
+                                        "tun stopped unexpectedly 1".to_string(),
+                                    ));
+                                }
+                            } else if let Err(e) = stack_sink
+                                .send(watfaq_netstack::Packet::new(pooled.into_bytes()))
+                                .await
+                            {
+                                error!("failed to send pkt to stack: {}", e);
+                                return Err(Error::Operation(
+                                    "tun stopped unexpectedly 1".to_string(),
+                                ));
+                            }
+                        } else if let Err(e) = stack_sink
+                            .send(watfaq_netstack::Packet::new(pooled.into_bytes()))
+                            .await
+                        {
+                            error!("failed to send pkt to stack: {}", e);
+                            return Err(Error::Operation(
+                                "tun stopped unexpectedly 1".to_string(),
+                            ));
+                        }
+                    }};
+                }
+
+                let read_cap = if gso_enabled { 65535 } else { stack_mtu.max(2048) };
+                loop {
+                    let mut pooled = crate::common::io::PooledBuffer::acquire(read_cap);
+                    pooled.resize(read_cap, 0);
+                    match tun.recv(pooled.as_mut_slice()).await {
+                        Ok(0) => {
+                            info!("tun reader reached EOF");
+                            break;
+                        }
+                        Ok(n) => {
+                            pooled.truncate(n);
+                            if gso_enabled && pooled.len() > stack_mtu {
+                                let pkt = pooled.into_bytes();
+                                for single_pkt in
+                                    super::gso::split_gso_packet(pkt, stack_mtu)
+                                {
+                                    dispatch_bytes_mut!(single_pkt);
                                 }
                             } else {
-                                dispatch_pkt!(pkt);
+                                dispatch_pooled!(pooled);
                             }
                         }
                         Err(e) => {
-                            error!("tun stream error: {}", e);
+                            error!("tun stream recv error: {}", e);
                             break;
                         }
                     }

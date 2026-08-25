@@ -382,7 +382,7 @@ mod tests {
 
     fn create_test_session(domain: &str, port: u16, network: Network) -> Session {
         Session {
-            destination: SocksAddr::Domain(domain.to_string(), port),
+            destination: SocksAddr::Domain(domain.into(), port),
             network,
             ..Default::default()
         }

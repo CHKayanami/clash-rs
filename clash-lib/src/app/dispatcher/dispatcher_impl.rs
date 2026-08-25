@@ -175,7 +175,7 @@ impl Dispatcher {
             if let Some(domain) = sniffed_domain {
                 let port = sess.destination.port();
                 sess.sniffed_domain = Some(domain.clone());
-                sess.destination = SocksAddr::Domain(domain, port);
+                sess.destination = SocksAddr::Domain(domain.into(), port);
                 override_dest = should_override;
             }
         }
@@ -386,7 +386,7 @@ impl Dispatcher {
                                     let buffered_packets = connecting_sessions.remove(&session_key).unwrap_or_default();
 
                                     for packet in buffered_packets {
-                                        forward_to_remote(&established.sender, packet, established.dest.clone(), &sess);
+                                        forward_to_remote(&established.sender, packet, established.dest.clone(), established.sess_id);
                                     }
 
                                     let delay_key = delay_queue.insert(
@@ -462,8 +462,6 @@ impl Dispatcher {
                                 }
                             };
 
-                            let mut sess = sess.clone();
-
                             if let SocksAddr::Ip(addr) = &mut packet.dst_addr {
                                 addr.set_ip(addr.ip().to_canonical());
                             }
@@ -471,8 +469,10 @@ impl Dispatcher {
                                 addr.set_ip(addr.ip().to_canonical());
                             }
 
-                            let Some(src_addr) = packet.src_addr.clone().try_into_socket_addr()
-                            else {
+                            let Some(src_addr) = (match packet.src_addr {
+                                SocksAddr::Ip(addr) => Some(addr),
+                                SocksAddr::Domain(..) => None,
+                            }) else {
                                 warn!(
                                     "dropping inbound udp packet with non-ip source {}",
                                     packet.src_addr
@@ -485,15 +485,9 @@ impl Dispatcher {
 
                             // Fast-path: Check if an active session already exists for this exact flow
                             if let Some(session) = sessions.get_mut(&session_key) {
-                                sess.source = src_addr;
-                                sess.destination = session.dest.clone();
-                                sess.orig_destination = Some(orig_inbound_dst.clone());
-                                sess.inbound_user = packet.inbound_user.clone();
-                                sess.id = session.id;
-
-                                debug!("reusing {} sent to remote {}", sess, session.dest);
+                                debug!("reusing session #{} sent to remote {}", session.id, session.dest);
                                 delay_queue.reset(&session.delay_key, timeout_duration);
-                                forward_to_remote(&session.sender, packet, session.dest.clone(), &sess);
+                                forward_to_remote(&session.sender, packet, session.dest.clone(), session.id);
                                 continue;
                             }
 
@@ -549,7 +543,7 @@ impl Dispatcher {
                                     crate::app::sniffer::SniffUdpOutcome::Domain(domain, should_override) => {
                                         let pending = pending_sniff_sessions.remove(&session_key).unwrap();
                                         delay_queue.remove(&pending.delay_key);
-                                        let dest = SocksAddr::Domain(domain.clone(), orig_inbound_dst.port());
+                                        let dest = SocksAddr::Domain(domain.clone().into(), orig_inbound_dst.port());
                                         let mut packets = pending.packets;
                                         packets.push(packet);
                                         let inbound_user = packets.first().and_then(|p| p.inbound_user.clone());
@@ -664,7 +658,7 @@ impl Dispatcher {
                                     }
                                     crate::app::sniffer::SniffUdpOutcome::Domain(domain, should_override) => {
                                         sniffed_domain = Some(domain.clone());
-                                        final_dest = SocksAddr::Domain(domain, packet.dst_addr.port());
+                                        final_dest = SocksAddr::Domain(domain.into(), packet.dst_addr.port());
                                         override_dest = should_override;
                                     }
                                     _ => {}
@@ -958,15 +952,15 @@ fn forward_to_remote(
     sender: &OutboundPacketSender,
     packet: UdpPacket,
     dest: SocksAddr,
-    sess: &Session,
+    sess_id: u64,
 ) {
     match sender.try_send((packet, dest)) {
         Ok(_) => {}
         Err(TrySendError::Full(_)) => {
-            debug!("[UDP] outbound queue full, dropping packet for {}", sess);
+            debug!("[UDP] outbound queue full, dropping packet for session #{}", sess_id);
         }
         Err(TrySendError::Closed(_)) => {
-            debug!("[UDP] outbound relay gone, dropping packet for {}", sess);
+            debug!("[UDP] outbound relay gone, dropping packet for session #{}", sess_id);
         }
     }
 }
@@ -1015,7 +1009,7 @@ fn reverse_lookup(
                 (*socket_addr).into()
             }
         }
-        SocksAddr::Domain(host, port) => to_addr(host.to_owned(), *port)?,
+        SocksAddr::Domain(host, port) => SocksAddr::Domain(host.clone(), *port),
     };
     Some(dst)
 }

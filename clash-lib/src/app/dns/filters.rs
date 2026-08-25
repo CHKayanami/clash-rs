@@ -145,7 +145,7 @@ impl DomainFilter {
 
         if let Some(rps) = self.rule_providers.get() {
             let sess = Session {
-                destination: SocksAddr::Domain(domain.to_owned(), 443),
+                destination: SocksAddr::Domain(domain.into(), 443),
                 ..Default::default()
             };
             return rps.iter().any(|rp| rp.search(&sess));

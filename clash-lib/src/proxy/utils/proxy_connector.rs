@@ -147,7 +147,7 @@ impl RemoteConnector for ProxyConnector {
         let sess = Session {
             network: Network::Tcp,
             typ: Type::Ignore,
-            destination: SocksAddr::Domain(address.to_owned(), port),
+            destination: SocksAddr::Domain(address.into(), port),
             iface: iface.cloned(),
             #[cfg(target_os = "linux")]
             so_mark,

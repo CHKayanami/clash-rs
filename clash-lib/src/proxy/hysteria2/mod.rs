@@ -215,7 +215,7 @@ impl Handler {
             SocksAddr::Ip(ip) => ip,
             SocksAddr::Domain(d, port) => {
                 let ip = resolver
-                    .resolve(d.as_str(), true)
+                    .resolve(d.as_ref(), true)
                     .await?
                     .ok_or_else(|| anyhow!("resolve domain {} failed", d))?;
                 SocketAddr::new(ip, port)
@@ -489,7 +489,7 @@ impl PlainProxyAPIResponse for Handler {
             crate::session::SocksAddr::Ip(addr) => {
                 (addr.ip().to_string(), addr.port())
             }
-            crate::session::SocksAddr::Domain(host, port) => (host.clone(), *port),
+            crate::session::SocksAddr::Domain(host, port) => (host.to_string(), *port),
         };
         m.insert("server".to_owned(), Box::new(server) as _);
         m.insert("port".to_owned(), Box::new(port) as _);

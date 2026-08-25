@@ -240,7 +240,7 @@ impl PlainProxyAPIResponse for Handler {
 fn to_sq_socks_addr(x: SocksAddr) -> SQAddr {
     match x {
         SocksAddr::Ip(socket_addr) => SQAddr::from(socket_addr),
-        SocksAddr::Domain(host, port) => SQAddr::from_domain(host, port),
+        SocksAddr::Domain(host, port) => SQAddr::from_domain(host.to_string(), port),
     }
 }
 fn to_clash_socks_addr(x: SQAddr) -> SocksAddr {
@@ -252,7 +252,7 @@ fn to_clash_socks_addr(x: SQAddr) -> SocksAddr {
             SocksAddr::Ip(SocketAddr::new(ip.into(), x.port))
         }
         shadowquic::msgs::socks5::AddrOrDomain::Domain(domain) => {
-            SocksAddr::Domain(String::from_utf8(domain.contents).unwrap(), x.port)
+            SocksAddr::Domain(String::from_utf8(domain.contents).unwrap().into(), x.port)
         }
     }
 }

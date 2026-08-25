@@ -110,7 +110,7 @@ impl NameServerPolicyContainer {
         }
 
         let sess = Session {
-            destination: SocksAddr::Domain(domain.to_owned(), 0),
+            destination: SocksAddr::Domain(domain.into(), 0),
             ..Default::default()
         };
 

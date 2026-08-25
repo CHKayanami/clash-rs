@@ -297,7 +297,7 @@ impl SocketAdderTrans for crate::session::SocksAddr {
         match self {
             SocksAddr::Ip(addr) => tuic_core::Address::SocketAddress(addr),
             SocksAddr::Domain(domain, port) => {
-                tuic_core::Address::DomainAddress(domain, port)
+                tuic_core::Address::DomainAddress(domain.to_string(), port)
             }
         }
     }

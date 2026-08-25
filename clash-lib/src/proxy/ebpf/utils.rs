@@ -96,6 +96,7 @@ impl RotatingBloomFilter {
 }
 
 /// Check if an IP is in the standard reserved/loopback/broadcast range.
+#[allow(dead_code)]
 pub fn is_reserved_ip(ip: std::net::IpAddr) -> bool {
     match ip {
         std::net::IpAddr::V4(v4) => {

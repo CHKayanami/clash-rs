@@ -220,7 +220,7 @@ impl InboundHandlerTrait for ShadowsocksInbound {
                             destination: match target {
                                 Address::SocketAddress(addr) => SocksAddr::Ip(addr),
                                 Address::DomainNameAddress(domain, port) => {
-                                    SocksAddr::Domain(domain, port)
+                                    SocksAddr::Domain(domain.into(), port)
                                 }
                             },
                             inbound_user,

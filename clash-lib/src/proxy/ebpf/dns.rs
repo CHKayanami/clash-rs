@@ -1,5 +1,7 @@
+#[allow(unused_imports)]
 use tracing::{debug, warn};
 
+#[allow(unused_imports)]
 use crate::app::dns::ThreadSafeDNSResolver;
 
 /// Handle intercepted TCP DNS stream in eBPF transparent proxy.

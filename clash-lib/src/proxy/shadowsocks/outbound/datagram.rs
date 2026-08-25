@@ -209,7 +209,7 @@ where
                                 shadowsocks::relay::Address::DomainNameAddress(
                                     domain,
                                     port,
-                                ) => SocksAddr::Domain(domain, port),
+                                ) => SocksAddr::Domain(domain.into(), port),
                             },
                             // overwritten by the dispatcher with the original client
                             // address on the reply path

@@ -110,7 +110,7 @@ impl Router {
         let mut sess = Session {
             id: 0,
             typ: crate::session::Type::RouteProbe,
-            destination: crate::session::SocksAddr::Domain(domain.to_string(), 80),
+            destination: crate::session::SocksAddr::Domain(domain.into(), 80),
             ..Default::default()
         };
         let (outbound, _) = self.match_route(&mut sess).await;
@@ -649,7 +649,7 @@ mod tests {
                 router
                     .match_route(&mut Session {
                         destination: crate::session::SocksAddr::Domain(
-                             domain.to_string(),
+                             domain.into(),
                             1111
                         ),
                         ..Default::default()
@@ -696,7 +696,7 @@ mod tests {
         let mut tcp_session = Session {
             network: crate::session::Network::Tcp,
             destination: crate::session::SocksAddr::Domain(
-                "example.com".to_string(),
+                "example.com".into(),
                 443,
             ),
             ..Default::default()
@@ -711,7 +711,7 @@ mod tests {
         let mut udp_session = Session {
             network: crate::session::Network::Udp,
             destination: crate::session::SocksAddr::Domain(
-                "example.com".to_string(),
+                "example.com".into(),
                 53,
             ),
             ..Default::default()

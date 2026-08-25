@@ -117,7 +117,7 @@ impl HttpClient {
         let sess = Session {
             network: crate::session::Network::Tcp,
             typ: crate::session::Type::Ignore,
-            destination: crate::session::SocksAddr::Domain(host.clone(), port),
+            destination: crate::session::SocksAddr::Domain(host.clone().into(), port),
             ..Default::default()
         };
         let stream = tokio::time::timeout(

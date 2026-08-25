@@ -419,7 +419,9 @@ impl DirectOffloader {
 pub struct DirectOffloader;
 
 #[cfg(not(target_os = "linux"))]
+#[allow(dead_code)]
 impl DirectOffloader {
+    #[allow(dead_code)]
     pub async fn observe(
         &self,
         _domain: DomainKey,

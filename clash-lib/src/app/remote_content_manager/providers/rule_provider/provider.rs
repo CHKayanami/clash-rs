@@ -606,7 +606,7 @@ mod tests {
         assert_ok!(provider.initialize().await);
 
         let sess = Session {
-            destination: SocksAddr::Domain("test.google.com".to_owned(), 443),
+            destination: SocksAddr::Domain("test.google.com".into(), 443),
             ..Default::default()
         };
         assert!(provider.search(&sess));
@@ -652,7 +652,7 @@ mod tests {
         assert_ok!(provider.initialize().await);
 
         assert!(provider.search(&Session {
-            destination: SocksAddr::Domain("test.google.com".to_owned(), 443),
+            destination: SocksAddr::Domain("test.google.com".into(), 443),
             ..Default::default()
         }));
     }

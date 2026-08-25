@@ -155,7 +155,7 @@ pub fn read_addr_port_vmess_sync(
                     io::Error::new(io::ErrorKind::InvalidData, "invalid domain")
                 })?
                 .to_string();
-            Ok(SocksAddr::Domain(domain, port))
+            Ok(SocksAddr::Domain(domain.into(), port))
         }
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidData,

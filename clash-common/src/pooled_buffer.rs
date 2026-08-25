@@ -91,6 +91,24 @@ impl PooledBuffer {
         self.buffer.extend_from_slice(extend);
     }
 
+    /// Resize the buffer in-place to `new_len`, initializing any newly exposed bytes to `value`.
+    #[inline]
+    pub fn resize(&mut self, new_len: usize, value: u8) {
+        self.buffer.resize(new_len, value);
+    }
+
+    /// Shorten the buffer, keeping the first `len` bytes and dropping the rest.
+    #[inline]
+    pub fn truncate(&mut self, len: usize) {
+        self.buffer.truncate(len);
+    }
+
+    /// Clear the buffer, setting length to 0 while keeping capacity.
+    #[inline]
+    pub fn clear(&mut self) {
+        self.buffer.clear();
+    }
+
     /// Wrap this `PooledBuffer` into a standard `bytes::Bytes` using `Bytes::from_owner`.
     /// When the resulting `Bytes` is dropped, this `PooledBuffer` will be dropped and
     /// automatically returned to the memory pool!
@@ -108,6 +126,11 @@ impl PooledBuffer {
     #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.buffer.is_empty()
+    }
+
+    #[inline]
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        &mut self.buffer[..]
     }
 
     #[inline]
@@ -207,5 +230,17 @@ mod tests {
         let buf2 = PooledBuffer::acquire(512);
         assert!(buf2.is_empty());
         assert!(buf2.buffer.capacity() >= 1024);
+    }
+
+    #[test]
+    fn test_pooled_buffer_resize_and_truncate() {
+        let mut buf = PooledBuffer::acquire(2048);
+        buf.resize(1500, 0);
+        assert_eq!(buf.len(), 1500);
+        buf.as_mut_slice()[0..5].copy_from_slice(b"hello");
+        buf.truncate(5);
+        assert_eq!(buf.len(), 5);
+        let bytes = buf.into_bytes();
+        assert_eq!(&bytes[..], b"hello");
     }
 }

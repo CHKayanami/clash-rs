@@ -1,6 +1,8 @@
 use async_trait::async_trait;
+#[allow(unused_imports)]
 use std::net::IpAddr;
 use std::sync::Arc;
+#[allow(unused_imports)]
 use std::time::Duration;
 
 #[allow(unused_imports)]

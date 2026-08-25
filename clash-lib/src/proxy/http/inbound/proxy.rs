@@ -41,7 +41,7 @@ pub fn maybe_socks_addr(r: &Uri) -> Option<SocksAddr> {
         if let Ok(ip) = x.parse::<IpAddr>() {
             SocksAddr::Ip((ip, port).into())
         } else {
-            SocksAddr::Domain(x.to_string(), port)
+            SocksAddr::Domain(x.into(), port)
         }
     })
 }

@@ -46,7 +46,7 @@ impl RuleDispatch {
         let dst = if let Ok(ip) = endpoint.host.parse::<IpAddr>() {
             SocksAddr::from((ip, endpoint.port))
         } else {
-            SocksAddr::Domain(endpoint.host.clone(), endpoint.port)
+            SocksAddr::Domain(endpoint.host.clone().into(), endpoint.port)
         };
 
         let mut sess = Session {

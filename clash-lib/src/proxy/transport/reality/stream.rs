@@ -8,13 +8,12 @@ use futures::ready;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use super::client_connection::RealityClientConnection;
-use crate::proxy::AnyStream;
+use crate::{common::io::SlideBuffer, proxy::AnyStream};
 
 pub struct RealityTlsStream {
     io: AnyStream,
     conn: RealityClientConnection,
-    pending_write: Vec<u8>,
-    pending_write_offset: usize,
+    pending_write: SlideBuffer,
 }
 
 impl crate::proxy::ProxyStream for RealityTlsStream {}
@@ -24,8 +23,7 @@ impl RealityTlsStream {
         Self {
             io,
             conn,
-            pending_write: Vec::new(),
-            pending_write_offset: 0,
+            pending_write: SlideBuffer::new(16384),
         }
     }
 
@@ -34,22 +32,19 @@ impl RealityTlsStream {
     }
 
     fn flush_pending_write(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        while self.pending_write_offset < self.pending_write.len() {
-            let n =
-                ready!(Pin::new(&mut self.io).poll_write(
-                    cx,
-                    &self.pending_write[self.pending_write_offset..]
-                ))?;
+        while !self.pending_write.is_empty() {
+            let n = ready!(Pin::new(&mut self.io).poll_write(
+                cx,
+                self.pending_write.as_slice()
+            ))?;
             if n == 0 {
                 return Poll::Ready(Err(io::Error::new(
                     io::ErrorKind::WriteZero,
                     "failed to write TLS bytes",
                 )));
             }
-            self.pending_write_offset += n;
+            self.pending_write.consume(n);
         }
-        self.pending_write.clear();
-        self.pending_write_offset = 0;
         Poll::Ready(Ok(()))
     }
 
@@ -61,8 +56,7 @@ impl RealityTlsStream {
                 break;
             }
 
-            self.pending_write.clear();
-            self.pending_write_offset = 0;
+            self.pending_write.maybe_compact(4096);
             let _ = self.conn.write_tls(&mut self.pending_write);
             if self.pending_write.is_empty() {
                 break;

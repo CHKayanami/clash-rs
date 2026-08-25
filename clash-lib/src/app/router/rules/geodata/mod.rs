@@ -102,7 +102,7 @@ impl RuleMatcher for GeoSiteMatcher {
                 if domain.bytes().any(|b| b.is_ascii_uppercase()) {
                     self.matcher.apply(&domain.to_ascii_lowercase())
                 } else {
-                    self.matcher.apply(domain.as_str())
+                    self.matcher.apply(domain.as_ref())
                 }
             }
         }

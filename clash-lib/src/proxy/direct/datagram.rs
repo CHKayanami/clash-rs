@@ -431,7 +431,7 @@ mod tests {
         let echo_port = spawn_echo_server().await;
         let mut datagram = make_datagram().await;
 
-        let dst = SocksAddr::Domain("echo.test".to_owned(), echo_port);
+        let dst = SocksAddr::Domain("echo.test".into(), echo_port);
         datagram
             .send(UdpPacket {
                 data: bytes::Bytes::from_static(b"hello"),
@@ -458,8 +458,8 @@ mod tests {
         let port_b = spawn_echo_server().await;
         let mut datagram = make_datagram().await;
 
-        let dst_a = SocksAddr::Domain("echo1.test".to_owned(), port_a);
-        let dst_b = SocksAddr::Domain("echo2.test".to_owned(), port_b);
+        let dst_a = SocksAddr::Domain("echo1.test".into(), port_a);
+        let dst_b = SocksAddr::Domain("echo2.test".into(), port_b);
 
         // One socket, two destinations — 1→N.
         datagram
@@ -517,7 +517,7 @@ mod tests {
         let mut datagram = OutboundDatagramImpl::new(udp, Arc::new(resolver));
 
         let echo_port = spawn_echo_server().await;
-        let dst = SocksAddr::Domain("fail.test".to_owned(), echo_port);
+        let dst = SocksAddr::Domain("fail.test".into(), echo_port);
 
         // First send: DNS fails — must return Err, not panic.
         let result = datagram
@@ -556,7 +556,7 @@ mod tests {
         };
 
         // Establish a session to the echo server so ip_to_logical is populated.
-        let dst = SocksAddr::Domain("echo.test".to_owned(), echo_port);
+        let dst = SocksAddr::Domain("echo.test".into(), echo_port);
         datagram
             .send(UdpPacket {
                 data: bytes::Bytes::from_static(b"establish"),
@@ -630,7 +630,7 @@ mod tests {
         let echo_port = spawn_echo_server().await;
         let mut datagram = make_datagram().await;
 
-        let dst = SocksAddr::Domain("echo.test".to_owned(), echo_port);
+        let dst = SocksAddr::Domain("echo.test".into(), echo_port);
 
         // Send 5 packets in a burst
         for i in 0..5 {

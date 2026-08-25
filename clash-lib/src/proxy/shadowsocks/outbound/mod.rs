@@ -255,7 +255,7 @@ impl OutboundHandler for Handler {
                 let carrier_sess = Session {
                     destination: SocksAddr::Domain(
                         crate::proxy::transport::mux::h2mux::protocol::MUX_DESTINATION_HOST
-                            .to_string(),
+                            .into(),
                         crate::proxy::transport::mux::h2mux::protocol::MUX_DESTINATION_PORT,
                     ),
                     ..sess.clone()
