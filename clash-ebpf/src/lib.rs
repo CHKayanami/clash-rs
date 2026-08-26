@@ -12,7 +12,8 @@ pub mod session;
 
 
 
-pub use config::EbpfConfig;
+pub use clash_ebpf_common::DAE_BYPASS_MARK;
+pub use config::{EbpfConfig, EbpfHostConfig, EbpfLanConfig, EbpfTargetConfig};
 pub use listener::EbpfListener;
 pub use manager::{EbpfError, EbpfManager};
 pub use session::{EbpfSession, TransportProtocol, get_original_dst};

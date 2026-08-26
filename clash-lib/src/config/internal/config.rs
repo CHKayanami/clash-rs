@@ -50,6 +50,11 @@ pub struct Config {
 
 impl Config {
     pub fn validate(self) -> Result<Self, crate::Error> {
+        if self.tun.enable && self.ebpf.as_ref().is_some_and(|e| e.enable) {
+            return Err(Error::InvalidConfig(
+                "TUN and eBPF cannot be enabled at the same time".to_string(),
+            ));
+        }
         for r in self.rules.iter() {
             if !self.proxies.contains_key(r.target())
                 && !self.proxy_groups.contains_key(r.target())
@@ -486,5 +491,44 @@ mod tests {
         assert!(
             !hijack_all.is_hijacked(Network::Udp, &"9.9.9.9:80".parse().unwrap())
         );
+    }
+
+    #[test]
+    fn test_validate_tun_and_ebpf_conflict() {
+        let yaml = r#"
+tun:
+  enable: true
+ebpf:
+  enable: true
+"#;
+        let def_cfg: def::Config = serde_yaml::from_str(yaml).unwrap();
+        let res: Result<super::Config, _> = def_cfg.try_into();
+        match res {
+            Err(e) => {
+                let err_msg = e.to_string();
+                assert!(err_msg.contains("TUN and eBPF cannot be enabled at the same time"));
+            }
+            Ok(_) => panic!("expected validation error when both TUN and eBPF are enabled"),
+        }
+
+        let tun_only_yaml = r#"
+tun:
+  enable: true
+ebpf:
+  enable: false
+"#;
+        let def_cfg: def::Config = serde_yaml::from_str(tun_only_yaml).unwrap();
+        let res: Result<super::Config, _> = def_cfg.try_into();
+        assert!(res.is_ok());
+
+        let ebpf_only_yaml = r#"
+tun:
+  enable: false
+ebpf:
+  enable: true
+"#;
+        let def_cfg: def::Config = serde_yaml::from_str(ebpf_only_yaml).unwrap();
+        let res: Result<super::Config, _> = def_cfg.try_into();
+        assert!(res.is_ok());
     }
 }

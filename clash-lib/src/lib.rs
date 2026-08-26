@@ -595,6 +595,14 @@ async fn create_components(
         }
     }
 
+    #[cfg(feature = "ebpf")]
+    if let Some(ebpf_cfg) = &config.ebpf
+        && ebpf_cfg.enable
+    {
+        debug!("ebpf enabled, setting default outbound SO_MARK to DAE_BYPASS_MARK");
+        *crate::app::net::TUN_SOMARK.write().await = Some(clash_ebpf::DAE_BYPASS_MARK);
+    }
+
     let cancellation_token = tokio_util::sync::CancellationToken::new();
     let cwd_str = cwd.to_string_lossy().to_string();
 

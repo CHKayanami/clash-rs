@@ -56,6 +56,43 @@ impl Default for DnsHijack {
 
 #[derive(Serialize, Deserialize, Default, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
+pub struct EbpfLanConfig {
+    #[serde(default = "default_bypass_src_ports")]
+    pub bypass_src_ports: Vec<u16>,
+    #[serde(default)]
+    pub proxy_src_ports: Vec<u16>,
+    #[serde(default, alias = "bypass-clients")]
+    pub bypass_src_ips: Vec<String>,
+    #[serde(default, alias = "proxy-clients")]
+    pub proxy_src_ips: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize, Default, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub struct EbpfTargetConfig {
+    #[serde(default)]
+    pub bypass_dst_ports: Vec<u16>,
+    #[serde(default)]
+    pub proxy_dst_ports: Vec<u16>,
+    #[serde(default = "default_bypass_dst_ips")]
+    pub bypass_dst_ips: Vec<String>,
+    #[serde(default)]
+    pub proxy_dst_ips: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize, Default, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub struct EbpfHostConfig {
+    #[serde(default)]
+    pub proxy_local: bool,
+    #[serde(default, alias = "proxy-process")]
+    pub proxy_processes: Vec<String>,
+    #[serde(default, alias = "bypass-process")]
+    pub bypass_processes: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize, Default, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
 pub struct EbpfConfig {
     pub enable: bool,
     #[serde(default)]
@@ -66,41 +103,19 @@ pub struct EbpfConfig {
     pub tproxy_port: u16,
     #[serde(default = "default_tproxy_port")]
     pub tproxy_udp_port: u16,
-    #[serde(default = "default_bypass_ports")]
-    pub bypass_ports: Vec<u16>,
-    #[serde(default = "default_bypass_ports")]
-    pub bypass_src_ports: Vec<u16>,
-    #[serde(default)]
-    pub bypass_dst_ports: Vec<u16>,
-    #[serde(default)]
-    pub bypass_ips: Vec<String>,
-    #[serde(default)]
-    pub bypass_src_ips: Vec<String>,
-    #[serde(default = "default_bypass_dst_ips")]
-    pub bypass_dst_ips: Vec<String>,
-    #[serde(default)]
-    pub proxy_ports: Vec<u16>,
-    #[serde(default)]
-    pub proxy_src_ports: Vec<u16>,
-    #[serde(default)]
-    pub proxy_dst_ports: Vec<u16>,
-    #[serde(default)]
-    pub proxy_ips: Vec<String>,
-    #[serde(default)]
-    pub proxy_src_ips: Vec<String>,
-    #[serde(default)]
-    pub proxy_dst_ips: Vec<String>,
     #[serde(default = "default_true")]
     pub auto_direct_offload: bool,
-    #[serde(default = "default_true")]
-    pub proxy_local: bool,
-    #[serde(default, alias = "proxy-process")]
-    pub proxy_processes: Vec<String>,
-    #[serde(default, alias = "bypass-process")]
-    pub bypass_processes: Vec<String>,
+    #[serde(default, rename = "routing-mark")]
+    pub routing_mark: Option<u32>,
+    #[serde(default)]
+    pub lan: EbpfLanConfig,
+    #[serde(default)]
+    pub target: EbpfTargetConfig,
+    #[serde(default)]
+    pub host: EbpfHostConfig,
 }
 
-fn default_bypass_ports() -> Vec<u16> {
+fn default_bypass_src_ports() -> Vec<u16> {
     vec![22, 67, 68, 5353]
 }
 
@@ -111,7 +126,6 @@ fn default_bypass_dst_ips() -> Vec<String> {
         "224.0.0.0/4".to_string(),
         "::1/128".to_string(),
         "fe80::/10".to_string(),
-        "fc00::/7".to_string(),
         "ff00::/8".to_string(),
     ]
 }

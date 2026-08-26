@@ -367,6 +367,7 @@ tun:
 # ── eBPF Kernel Transparent Proxy (Linux Only) ───────────────────────────────
 # High-performance in-kernel transparent proxy engine powered by eBPF TC & Cgroup hooks.
 # Bypasses iptables/nftables completely, achieving near line-rate throughput and zero packet copy.
+# Automatically probes and bypasses host-local listening sockets (e.g. Web UI, SSH, Samba) via eBPF.
 # Requires Linux kernel >= 5.15 and CAP_NET_ADMIN / root permissions.
 ebpf:
   enable: false
@@ -383,84 +384,92 @@ ebpf:
   wan-interface: "auto"
 
   # Transparent proxy listener ports (default: 12345):
-  tproxy-port: 12345                  # TCP TProxy local port
-  tproxy-udp-port: 12345              # UDP TProxy local port
-
-  # ── Local Traffic & Process Filtering ─────────────────────────────────────
-  # Whether to proxy traffic originated from the local machine (default: true).
-  # Set to false to act solely as a router/gateway proxy for LAN devices without touching local host traffic.
-  proxy-local: true
-
-  # Process whitelist (matching comm name):
-  # If non-empty, ONLY traffic originating from these process names will be proxied on the local host.
-  # Other processes will bypass proxy directly. Alias: proxy-process
-  # proxy-processes:
-  #   - "curl"
-  #   - "chrome"
-  #   - "firefox"
-
-  # Process blacklist (matching comm name):
-  # Traffic originating from these process names will always bypass proxy directly.
-  # Useful for SSH server, background sync daemons, etc. Alias: bypass-process
-  # bypass-processes:
-  #   - "sshd"
-  #   - "rsync"
-
-  # ── Port-based Routing Rules ──────────────────────────────────────────────
-  # Bypass ports (applies to both source and destination ports):
-  # Default bypasses SSH (22), DHCP (67, 68), mDNS (5353).
-  bypass-ports:
-    - 22
-    - 67
-    - 68
-    - 5353
-
-  # Specific source ports to bypass (e.g. locally hosted service ports):
-  # bypass-src-ports:
-  #   - 80
-  #   - 443
-
-  # Specific destination ports to bypass (e.g. direct gaming/P2P ports):
-  # bypass-dst-ports:
-  #   - 123
-  #   - 500
-  #   - 4500
-
-  # Proxy port whitelists (if set, ONLY matching ports will be proxied):
-  # proxy-ports: [80, 443]
-  # proxy-src-ports: []
-  # proxy-dst-ports: [80, 443, 8080, 8443]
-
-  # ── IP-based Routing Rules ────────────────────────────────────────────────
-  # Bypass IP addresses and CIDR subnets (supports IPv4 and IPv6):
-  # bypass-ips:
-  #   - "192.168.0.0/16"
-  #   - "10.0.0.0/8"
-
-  # Specific source IPs/CIDRs to bypass:
-  # bypass-src-ips:
-  #   - "192.168.1.100"
-
-  # Specific destination IPs/CIDRs to bypass (defaults to private LAN, multicast, loopback):
-  # bypass-dst-ips:
-  #   - "192.168.0.0/16"
-  #   - "10.0.0.0/8"
-  #   - "172.16.0.0/12"
-  #   - "127.0.0.0/8"
-  #   - "224.0.0.0/4"
-  #   - "fc00::/7"
-  #   - "fe80::/10"
-
-  # Proxy IP whitelists (if set, ONLY traffic to/from matching IPs will be proxied):
-  # proxy-ips: []
-  # proxy-src-ips: []
-  # proxy-dst-ips: []
+  tproxy-port: 12345                  # TCP TProxy local port inside daens
+  tproxy-udp-port: 12345              # UDP TProxy local port inside daens
 
   # ── Automatic Fast Path Offload ───────────────────────────────────────────
   # Automatically offload DIRECT domain resolved IPs directly into eBPF LRU Map.
   # Once resolved as DIRECT by the routing engine, future TCP/UDP packets to those IPs
   # bypass user space completely and forward directly in kernel space at wire speed.
   auto-direct-offload: true
+
+  # ── 1. LAN Ingress Policies (针对局域网客户端设备的控制) ─────────────────────
+  lan:
+    # Source ports to bypass (e.g. locally hosted service ports, local SSH/DHCP):
+    # Default bypasses SSH (22), DHCP (67, 68), mDNS (5353).
+    # bypass-src-ports:
+    #   - 22
+    #   - 67
+    #   - 68
+    #   - 5353
+
+    # Source ports to proxy (if set, ONLY traffic from these source ports will be proxied):
+    # proxy-src-ports: []
+
+    # Specific LAN client IPs/CIDRs to bypass (direct connection, no proxy):
+    # (Alias: bypass-clients)
+    # bypass-src-ips:
+    #   - "192.168.1.100"
+
+    # Specific LAN client IPs/CIDRs to proxy (if set, ONLY these clients are proxied):
+    # (Alias: proxy-clients)
+    # proxy-src-ips:
+    #   - "192.168.1.0/24"
+
+  # ── 2. Target Destination Policies (访问目标服务/目的地控制，对 LAN 和 Host 均生效) ──
+  target:
+    # Destination ports to bypass (e.g. direct NTP, IPSec VPN, direct gaming):
+    # bypass-dst-ports:
+    #   - 123
+    #   - 500
+    #   - 4500
+
+    # Destination ports to proxy (if set, ONLY traffic to these ports will be proxied):
+    # proxy-dst-ports:
+    #   - 80
+    #   - 443
+    #   - 8080
+    #   - 8443
+
+    # Specific destination IPs/CIDRs to bypass (direct connection).
+    # Default bypasses:
+    #   - IPv4: 127.0.0.0/8 (loopback), 169.254.0.0/16 (link-local), 224.0.0.0/4 (multicast)
+    #   - IPv6: ::1/128 (loopback), fe80::/10 (link-local), ff00::/8 (multicast)
+    # (Note: fc00::/7 is NOT bypassed by default so that Fake-IP IPv6 works properly).
+    # bypass-dst-ips:
+    #   - "127.0.0.0/8"
+    #   - "169.254.0.0/16"
+    #   - "224.0.0.0/4"
+    #   - "::1/128"
+    #   - "fe80::/10"
+    #   - "ff00::/8"
+    #   - "192.168.0.0/16"
+    #   - "10.0.0.0/8"
+    #   - "172.16.0.0/12"
+
+    # Destination IP whitelists (if set, ONLY traffic to matching IPs will be proxied):
+    # proxy-dst-ips: []
+
+  # ── 3. Host Local Machine Policies (网关宿主机本机流量与进程控制) ─────────────
+  host:
+    # Whether to proxy traffic originated from the local host machine (default: false).
+    # Set to true to proxy local host traffic, or false to act solely as a gateway proxy for LAN devices.
+    # proxy-local: false
+
+    # Process whitelist (matching comm name):
+    # If non-empty, ONLY traffic originating from these process names will be proxied on the local host.
+    # Other processes will bypass proxy directly. Alias: proxy-process
+    # proxy-processes:
+    #   - "curl"
+    #   - "chrome"
+    #   - "firefox"
+
+    # Process blacklist (matching comm name):
+    # Traffic originating from these process names will always bypass proxy directly.
+    # Useful for SSH server, background sync daemons, etc. Alias: bypass-process
+    # bypass-processes:
+    #   - "sshd"
+    #   - "rsync"
 
 
 

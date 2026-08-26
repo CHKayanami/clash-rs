@@ -20,10 +20,10 @@ pub struct EbpfListener {
     tcp_listener_v6: Option<TcpListener>,
     udp_socket_v4: Arc<UdpSocket>,
     udp_socket_v6: Option<Arc<UdpSocket>>,
-    #[allow(dead_code)]
-    dns_reply_socket_v4: Option<Arc<UdpSocket>>,
-    #[allow(dead_code)]
-    dns_reply_socket_v6: Option<Arc<UdpSocket>>,
+    #[cfg(target_os = "linux")]
+    dns_reply_socket_v4: std::sync::Mutex<Option<Arc<UdpSocket>>>,
+    #[cfg(target_os = "linux")]
+    dns_reply_socket_v6: std::sync::Mutex<Option<Arc<UdpSocket>>>,
     #[allow(dead_code)]
     config: EbpfConfig,
     #[allow(dead_code)]
@@ -38,188 +38,166 @@ impl EbpfListener {
             use socket2::{Domain, Protocol, Socket, Type};
 
             // 1. TCP IPv4 Transparent Listener
-            let tcp_sock_v4 = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))?;
+            let tcp_sock_v4 =
+                Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))?;
+            tcp_sock_v4.set_nonblocking(true)?;
+            tcp_sock_v4.set_cloexec(true)?;
             tcp_sock_v4.set_reuse_address(true)?;
             #[cfg(target_os = "linux")]
             {
-                use std::os::fd::AsRawFd;
-                let opt: libc::c_int = 1;
-                unsafe {
-                    libc::setsockopt(
-                        tcp_sock_v4.as_raw_fd(),
-                        libc::SOL_IP,
-                        libc::IP_TRANSPARENT,
-                        &opt as *const _ as *const libc::c_void,
-                        std::mem::size_of_val(&opt) as libc::socklen_t,
-                    );
-                }
+                tcp_sock_v4.set_ip_transparent_v4(true)?;
+                let _ = nix::sys::socket::setsockopt(
+                    &tcp_sock_v4,
+                    nix::sys::socket::sockopt::Mark,
+                    &(clash_ebpf_common::DAE_BYPASS_MARK as u32),
+                );
             }
-            tcp_sock_v4.set_nonblocking(true)?;
-            let addr_v4 = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, config.tproxy_port));
+            let addr_v4 = SocketAddr::V4(SocketAddrV4::new(
+                Ipv4Addr::UNSPECIFIED,
+                config.tproxy_port,
+            ));
             tcp_sock_v4.bind(&addr_v4.into())?;
             tcp_sock_v4.listen(1024)?;
             let tcp_listener_v4 = TcpListener::from_std(tcp_sock_v4.into())?;
 
             // 2. TCP IPv6 Transparent Listener (Optional)
             let tcp_listener_v6 = match (|| -> std::io::Result<TcpListener> {
-                let tcp_sock_v6 = Socket::new(Domain::IPV6, Type::STREAM, Some(Protocol::TCP))?;
+                let tcp_sock_v6 =
+                    Socket::new(Domain::IPV6, Type::STREAM, Some(Protocol::TCP))?;
+                tcp_sock_v6.set_nonblocking(true)?;
+                tcp_sock_v6.set_cloexec(true)?;
                 tcp_sock_v6.set_reuse_address(true)?;
                 tcp_sock_v6.set_only_v6(true)?;
                 #[cfg(target_os = "linux")]
                 {
-                    use std::os::fd::AsRawFd;
-                    let opt: libc::c_int = 1;
-                    unsafe {
-                        libc::setsockopt(
-                            tcp_sock_v6.as_raw_fd(),
-                            libc::SOL_IPV6,
-                            libc::IPV6_TRANSPARENT,
-                            &opt as *const _ as *const libc::c_void,
-                            std::mem::size_of_val(&opt) as libc::socklen_t,
-                        );
-                    }
+                    tcp_sock_v6.set_ip_transparent_v6(true)?;
+                    let _ = nix::sys::socket::setsockopt(
+                        &tcp_sock_v6,
+                        nix::sys::socket::sockopt::Mark,
+                        &(clash_ebpf_common::DAE_BYPASS_MARK as u32),
+                    );
                 }
-                tcp_sock_v6.set_nonblocking(true)?;
-                let addr_v6 = SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, config.tproxy_port, 0, 0));
+                let addr_v6 = SocketAddr::V6(SocketAddrV6::new(
+                    Ipv6Addr::UNSPECIFIED,
+                    config.tproxy_port,
+                    0,
+                    0,
+                ));
                 tcp_sock_v6.bind(&addr_v6.into())?;
                 tcp_sock_v6.listen(1024)?;
                 TcpListener::from_std(tcp_sock_v6.into())
             })() {
                 Ok(l) => {
-                    tracing::info!("Bound TCP IPv6 transparent listener on port {}", config.tproxy_port);
+                    tracing::info!(
+                        "Bound TCP IPv6 transparent listener on port {}",
+                        config.tproxy_port
+                    );
                     Some(l)
                 }
                 Err(e) => {
-                    tracing::warn!("Failed to bind TCP IPv6 transparent listener: {e}");
+                    tracing::warn!(
+                        "Failed to bind TCP IPv6 transparent listener: {e}"
+                    );
                     None
                 }
             };
 
             // 3. UDP IPv4 Transparent Listener
-            let udp_sock_v4 = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+            let udp_sock_v4 =
+                Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+            udp_sock_v4.set_nonblocking(true)?;
+            udp_sock_v4.set_cloexec(true)?;
             udp_sock_v4.set_reuse_address(true)?;
+            let _ = udp_sock_v4.set_recv_buffer_size(8 << 20);
             #[cfg(target_os = "linux")]
             {
-                use std::os::fd::AsRawFd;
-                let opt: libc::c_int = 1;
-                unsafe {
-                    libc::setsockopt(
-                        udp_sock_v4.as_raw_fd(),
-                        libc::SOL_IP,
-                        libc::IP_TRANSPARENT,
-                        &opt as *const _ as *const libc::c_void,
-                        std::mem::size_of_val(&opt) as libc::socklen_t,
-                    );
-                    libc::setsockopt(
-                        udp_sock_v4.as_raw_fd(),
-                        libc::SOL_IP,
-                        libc::IP_RECVORIGDSTADDR,
-                        &opt as *const _ as *const libc::c_void,
-                        std::mem::size_of_val(&opt) as libc::socklen_t,
-                    );
-                }
+                let _ = udp_sock_v4.set_reuse_port(true);
+                udp_sock_v4.set_ip_transparent_v4(true)?;
+                let _ = nix::sys::socket::setsockopt(
+                    &udp_sock_v4,
+                    nix::sys::socket::sockopt::Ipv4OrigDstAddr,
+                    &true,
+                );
+                let _ = nix::sys::socket::setsockopt(
+                    &udp_sock_v4,
+                    nix::sys::socket::sockopt::Ipv4PacketInfo,
+                    &true,
+                );
+                let _ = nix::sys::socket::setsockopt(
+                    &udp_sock_v4,
+                    nix::sys::socket::sockopt::Mark,
+                    &(clash_ebpf_common::DAE_BYPASS_MARK as u32),
+                );
             }
-            udp_sock_v4.set_nonblocking(true)?;
-            let udp_addr_v4 = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, config.tproxy_udp_port));
+            let udp_addr_v4 = SocketAddr::V4(SocketAddrV4::new(
+                Ipv4Addr::UNSPECIFIED,
+                config.tproxy_udp_port,
+            ));
             udp_sock_v4.bind(&udp_addr_v4.into())?;
             let udp_socket_v4 = UdpSocket::from_std(udp_sock_v4.into())?;
 
             // 4. UDP IPv6 Transparent Listener (Optional)
             let udp_socket_v6 = match (|| -> std::io::Result<UdpSocket> {
-                let udp_sock_v6 = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
+                let udp_sock_v6 =
+                    Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
+                udp_sock_v6.set_nonblocking(true)?;
+                udp_sock_v6.set_cloexec(true)?;
                 udp_sock_v6.set_reuse_address(true)?;
                 udp_sock_v6.set_only_v6(true)?;
+                let _ = udp_sock_v6.set_recv_buffer_size(8 << 20);
                 #[cfg(target_os = "linux")]
                 {
-                    use std::os::fd::AsRawFd;
-                    let opt: libc::c_int = 1;
-                    unsafe {
-                        libc::setsockopt(
-                            udp_sock_v6.as_raw_fd(),
-                            libc::SOL_IPV6,
-                            libc::IPV6_TRANSPARENT,
-                            &opt as *const _ as *const libc::c_void,
-                            std::mem::size_of_val(&opt) as libc::socklen_t,
-                        );
-                        libc::setsockopt(
-                            udp_sock_v6.as_raw_fd(),
-                            libc::SOL_IPV6,
-                            libc::IPV6_RECVORIGDSTADDR,
-                            &opt as *const _ as *const libc::c_void,
-                            std::mem::size_of_val(&opt) as libc::socklen_t,
-                        );
-                    }
+                    let _ = udp_sock_v6.set_reuse_port(true);
+                    udp_sock_v6.set_ip_transparent_v6(true)?;
+                    let _ = nix::sys::socket::setsockopt(
+                        &udp_sock_v6,
+                        nix::sys::socket::sockopt::Ipv6OrigDstAddr,
+                        &true,
+                    );
+                    let _ = nix::sys::socket::setsockopt(
+                        &udp_sock_v6,
+                        nix::sys::socket::sockopt::Ipv6RecvPacketInfo,
+                        &true,
+                    );
+                    let _ = nix::sys::socket::setsockopt(
+                        &udp_sock_v6,
+                        nix::sys::socket::sockopt::Mark,
+                        &(clash_ebpf_common::DAE_BYPASS_MARK as u32),
+                    );
                 }
-                udp_sock_v6.set_nonblocking(true)?;
-                let udp_addr_v6 = SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, config.tproxy_udp_port, 0, 0));
+                let udp_addr_v6 = SocketAddr::V6(SocketAddrV6::new(
+                    Ipv6Addr::UNSPECIFIED,
+                    config.tproxy_udp_port,
+                    0,
+                    0,
+                ));
                 udp_sock_v6.bind(&udp_addr_v6.into())?;
                 UdpSocket::from_std(udp_sock_v6.into())
             })() {
                 Ok(s) => {
-                    tracing::info!("Bound UDP IPv6 transparent listener on port {}", config.tproxy_udp_port);
+                    tracing::info!(
+                        "Bound UDP IPv6 transparent listener on port {}",
+                        config.tproxy_udp_port
+                    );
                     Some(s)
                 }
                 Err(e) => {
-                    tracing::warn!("Failed to bind UDP IPv6 transparent listener: {e}");
+                    tracing::warn!(
+                        "Failed to bind UDP IPv6 transparent listener: {e}"
+                    );
                     None
                 }
             };
-
-            // 5. Dedicated cached transparent DNS reply sockets (bound to :53 in daens)
-            let dns_reply_socket_v4 = (|| -> std::io::Result<UdpSocket> {
-                let sock = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
-                sock.set_reuse_address(true)?;
-                #[cfg(target_os = "linux")]
-                {
-                    use std::os::fd::AsRawFd;
-                    let opt: libc::c_int = 1;
-                    unsafe {
-                        libc::setsockopt(
-                            sock.as_raw_fd(),
-                            libc::SOL_IP,
-                            libc::IP_TRANSPARENT,
-                            &opt as *const _ as *const libc::c_void,
-                            std::mem::size_of_val(&opt) as libc::socklen_t,
-                        );
-                    }
-                }
-                sock.set_nonblocking(true)?;
-                let bind_addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 53));
-                sock.bind(&bind_addr.into())?;
-                UdpSocket::from_std(sock.into())
-            })().ok();
-
-            let dns_reply_socket_v6 = (|| -> std::io::Result<UdpSocket> {
-                let sock = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
-                sock.set_reuse_address(true)?;
-                sock.set_only_v6(true)?;
-                #[cfg(target_os = "linux")]
-                {
-                    use std::os::fd::AsRawFd;
-                    let opt: libc::c_int = 1;
-                    unsafe {
-                        libc::setsockopt(
-                            sock.as_raw_fd(),
-                            libc::SOL_IPV6,
-                            libc::IPV6_TRANSPARENT,
-                            &opt as *const _ as *const libc::c_void,
-                            std::mem::size_of_val(&opt) as libc::socklen_t,
-                        );
-                    }
-                }
-                sock.set_nonblocking(true)?;
-                let bind_addr = SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 53, 0, 0));
-                sock.bind(&bind_addr.into())?;
-                UdpSocket::from_std(sock.into())
-            })().ok();
 
             Ok(Self {
                 tcp_listener_v4,
                 tcp_listener_v6,
                 udp_socket_v4: Arc::new(udp_socket_v4),
                 udp_socket_v6: udp_socket_v6.map(Arc::new),
-                dns_reply_socket_v4: dns_reply_socket_v4.map(Arc::new),
-                dns_reply_socket_v6: dns_reply_socket_v6.map(Arc::new),
+                #[cfg(target_os = "linux")]
+                dns_reply_socket_v4: std::sync::Mutex::new(None),
+                #[cfg(target_os = "linux")]
+                dns_reply_socket_v6: std::sync::Mutex::new(None),
                 config,
                 ns: ns_clone,
             })
@@ -227,31 +205,121 @@ impl EbpfListener {
         .map_err(ListenerError::Io)
     }
 
+    #[cfg(target_os = "linux")]
+    fn build_dns_reply_socket(&self, is_v6: bool) -> std::io::Result<UdpSocket> {
+        self.ns
+            .with_daens(|| -> std::io::Result<UdpSocket> {
+                use socket2::{Domain, Protocol, Socket, Type};
+                let domain = if is_v6 { Domain::IPV6 } else { Domain::IPV4 };
+                let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
+                socket.set_nonblocking(true)?;
+                socket.set_cloexec(true)?;
+                socket.set_reuse_address(true)?;
+                let _ = socket.set_reuse_port(true);
+                if is_v6 {
+                    socket.set_only_v6(true)?;
+                    socket.set_ip_transparent_v6(true)?;
+                } else {
+                    socket.set_ip_transparent_v4(true)?;
+                }
+                let bind_addr = if is_v6 {
+                    SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 53, 0, 0))
+                } else {
+                    SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 53))
+                };
+                socket.bind(&bind_addr.into())?;
+                UdpSocket::from_std(socket.into())
+            })
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?
+    }
+
+    #[cfg(target_os = "linux")]
+    fn get_or_create_dns_reply_socket(&self, is_v6: bool) -> std::io::Result<Arc<UdpSocket>> {
+        let cache = if is_v6 {
+            &self.dns_reply_socket_v6
+        } else {
+            &self.dns_reply_socket_v4
+        };
+        if let Some(sock) = cache.lock().unwrap().as_ref() {
+            return Ok(Arc::clone(sock));
+        }
+        let new_sock = Arc::new(self.build_dns_reply_socket(is_v6)?);
+        let mut guard = cache.lock().unwrap();
+        if let Some(sock) = guard.as_ref() {
+            return Ok(Arc::clone(sock));
+        }
+        *guard = Some(Arc::clone(&new_sock));
+        Ok(new_sock)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn replace_dns_reply_socket(
+        &self,
+        is_v6: bool,
+        old: &Arc<UdpSocket>,
+    ) -> std::io::Result<Arc<UdpSocket>> {
+        let cache = if is_v6 {
+            &self.dns_reply_socket_v6
+        } else {
+            &self.dns_reply_socket_v4
+        };
+        let mut guard = cache.lock().unwrap();
+        if let Some(cur) = guard.as_ref() {
+            if !Arc::ptr_eq(cur, old) {
+                return Ok(Arc::clone(cur));
+            }
+        }
+        let new_sock = Arc::new(self.build_dns_reply_socket(is_v6)?);
+        *guard = Some(Arc::clone(&new_sock));
+        Ok(new_sock)
+    }
+
     /// Sends a DNS reply datagram to `dst` with `src` (the original destination DNS server) as the source address
     /// via pktinfo ancillary data on the cached transparent socket bound to port 53.
     #[allow(unused_variables)]
-    pub async fn send_dns_reply(&self, data: &[u8], src: SocketAddr, dst: SocketAddr) -> std::io::Result<usize> {
+    pub async fn send_dns_reply(
+        &self,
+        data: &[u8],
+        src: SocketAddr,
+        dst: SocketAddr,
+    ) -> std::io::Result<usize> {
         #[cfg(target_os = "linux")]
         {
-            use tokio::io::Interest;
             use std::os::fd::AsRawFd;
+            use tokio::io::Interest;
 
             let is_v6 = src.is_ipv6();
-            let socket = if is_v6 {
-                self.dns_reply_socket_v6.as_ref().ok_or_else(|| {
-                    std::io::Error::new(std::io::ErrorKind::AddrNotAvailable, "IPv6 DNS reply socket not initialized")
-                })?
-            } else {
-                self.dns_reply_socket_v4.as_ref().ok_or_else(|| {
-                    std::io::Error::new(std::io::ErrorKind::AddrNotAvailable, "IPv4 DNS reply socket not initialized")
-                })?
-            };
 
-            socket
-                .async_io(Interest::WRITABLE, || {
-                    sendmsg_with_src(socket.as_raw_fd(), data, src.ip(), 0, dst)
-                })
-                .await
+            // 1. Try cached DNS reply socket (bound to port 53 in daens)
+            if let Ok(socket) = self.get_or_create_dns_reply_socket(is_v6) {
+                let first = socket
+                    .async_io(Interest::WRITABLE, || {
+                        sendmsg_with_src(socket.as_raw_fd(), data, src.ip(), 0, dst)
+                    })
+                    .await;
+                match first {
+                    Ok(n) => return Ok(n),
+                    Err(e) => {
+                        tracing::debug!(
+                            "cached DNS reply socket send failed ({e}); rebuilding once"
+                        );
+                    }
+                }
+                if let Ok(socket) = self.replace_dns_reply_socket(is_v6, &socket) {
+                    if let Ok(n) = socket
+                        .async_io(Interest::WRITABLE, || {
+                            sendmsg_with_src(socket.as_raw_fd(), data, src.ip(), 0, dst)
+                        })
+                        .await
+                    {
+                        return Ok(n);
+                    }
+                }
+            }
+
+            // 2. Fallback to one-shot dynamic transparent reply socket if cached path fails
+            let fallback_sock = self.create_reply_socket(src)?;
+            fallback_sock.send_to(data, dst).await
         }
 
         #[cfg(not(target_os = "linux"))]
@@ -262,37 +330,40 @@ impl EbpfListener {
 
     /// Creates a transparent UDP socket inside daens bound to `original_dst` for replying to clients.
     /// This ensures DNS (port 53) and proxied UDP replies preserve the source address the client queried.
-    pub fn create_reply_socket(&self, original_dst: SocketAddr) -> std::io::Result<UdpSocket> {
-        self.ns.with_daens(|| -> std::io::Result<UdpSocket> {
-            use socket2::{Domain, Protocol, Socket, Type};
-            let domain = if original_dst.is_ipv4() {
-                Domain::IPV4
-            } else {
-                Domain::IPV6
-            };
-            let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
-            socket.set_nonblocking(true)?;
-            socket.set_reuse_address(true)?;
-            #[cfg(target_os = "linux")]
-            {
-                let _ = socket.set_reuse_port(true);
-            }
-
-            #[cfg(target_os = "linux")]
-            {
-                if original_dst.is_ipv4() {
-                    socket.set_ip_transparent_v4(true)?;
+    pub fn create_reply_socket(
+        &self,
+        original_dst: SocketAddr,
+    ) -> std::io::Result<UdpSocket> {
+        self.ns
+            .with_daens(|| -> std::io::Result<UdpSocket> {
+                use socket2::{Domain, Protocol, Socket, Type};
+                let domain = if original_dst.is_ipv4() {
+                    Domain::IPV4
                 } else {
-                    socket.set_ip_transparent_v6(true)?;
+                    Domain::IPV6
+                };
+                let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
+                socket.set_nonblocking(true)?;
+                socket.set_cloexec(true)?;
+                socket.set_reuse_address(true)?;
+                #[cfg(target_os = "linux")]
+                {
+                    let _ = socket.set_reuse_port(true);
+                    if original_dst.is_ipv4() {
+                        socket.set_ip_transparent_v4(true)?;
+                    } else {
+                        socket.set_ip_transparent_v6(true)?;
+                    }
                 }
-            }
 
-            socket.bind(&original_dst.into())?;
+                socket.bind(&original_dst.into())?;
 
-            let udp_std: std::net::UdpSocket = socket.into();
-            UdpSocket::from_std(udp_std)
-        })
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?
+                let udp_std: std::net::UdpSocket = socket.into();
+                UdpSocket::from_std(udp_std)
+            })
+            .map_err(|e| {
+                std::io::Error::new(std::io::ErrorKind::Other, e.to_string())
+            })?
     }
 
     /// Returns the raw file descriptor of the TCP IPv4 listener socket.
@@ -334,6 +405,16 @@ impl EbpfListener {
             self.tcp_listener_v4.accept().await?
         };
 
+        #[cfg(target_os = "linux")]
+        {
+            // Clear inherited SO_MARK on accepted socket (honk parity)
+            let _ = nix::sys::socket::setsockopt(
+                &stream,
+                nix::sys::socket::sockopt::Mark,
+                &0u32,
+            );
+        }
+
         let dst_addr = get_original_dst(&stream)?;
 
         let session = EbpfSession {
@@ -342,7 +423,10 @@ impl EbpfListener {
             protocol: TransportProtocol::Tcp,
         };
 
-        debug!("eBPF TCP transparent connection: {} -> {}", src_addr, dst_addr);
+        debug!(
+            "eBPF TCP transparent connection: {} -> {}",
+            src_addr, dst_addr
+        );
         Ok((stream, session))
     }
 
@@ -361,11 +445,13 @@ impl EbpfListener {
                 iov_base: buf.as_mut_ptr() as *mut libc::c_void,
                 iov_len: buf.len(),
             };
-            let mut src_storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+            let mut src_storage: libc::sockaddr_storage =
+                unsafe { std::mem::zeroed() };
             let mut control_buf = [0u8; 512];
             let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
             msg.msg_name = &mut src_storage as *mut _ as *mut libc::c_void;
-            msg.msg_namelen = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+            msg.msg_namelen =
+                std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
             msg.msg_iov = &mut iov;
             msg.msg_iovlen = 1;
             msg.msg_control = control_buf.as_mut_ptr() as *mut libc::c_void;
@@ -378,13 +464,18 @@ impl EbpfListener {
 
             let src_addr = match src_storage.ss_family as libc::c_int {
                 libc::AF_INET => {
-                    let sin = unsafe { &*(&src_storage as *const _ as *const libc::sockaddr_in) };
-                    let ip = std::net::Ipv4Addr::from(sin.sin_addr.s_addr.to_ne_bytes());
+                    let sin = unsafe {
+                        &*(&src_storage as *const _ as *const libc::sockaddr_in)
+                    };
+                    let ip =
+                        std::net::Ipv4Addr::from(sin.sin_addr.s_addr.to_ne_bytes());
                     let port = u16::from_be(sin.sin_port);
                     SocketAddr::V4(SocketAddrV4::new(ip, port))
                 }
                 libc::AF_INET6 => {
-                    let sin6 = unsafe { &*(&src_storage as *const _ as *const libc::sockaddr_in6) };
+                    let sin6 = unsafe {
+                        &*(&src_storage as *const _ as *const libc::sockaddr_in6)
+                    };
                     let ip = std::net::Ipv6Addr::from(sin6.sin6_addr.s6_addr);
                     let port = u16::from_be(sin6.sin6_port);
                     SocketAddr::V6(std::net::SocketAddrV6::new(ip, port, 0, 0))
@@ -403,20 +494,29 @@ impl EbpfListener {
                 let level = unsafe { (*cmsg).cmsg_level };
                 let type_ = unsafe { (*cmsg).cmsg_type };
                 if level == libc::SOL_IP
-                    && (type_ == libc::IP_ORIGDSTADDR || type_ == libc::IP_RECVORIGDSTADDR)
+                    && (type_ == libc::IP_ORIGDSTADDR
+                        || type_ == libc::IP_RECVORIGDSTADDR)
                 {
-                    let sin = unsafe { &*(libc::CMSG_DATA(cmsg) as *const libc::sockaddr_in) };
-                    let ip = std::net::Ipv4Addr::from(sin.sin_addr.s_addr.to_ne_bytes());
+                    let sin = unsafe {
+                        &*(libc::CMSG_DATA(cmsg) as *const libc::sockaddr_in)
+                    };
+                    let ip =
+                        std::net::Ipv4Addr::from(sin.sin_addr.s_addr.to_ne_bytes());
                     let port = u16::from_be(sin.sin_port);
                     dst_addr = Some(SocketAddr::V4(SocketAddrV4::new(ip, port)));
                     break;
                 } else if level == libc::SOL_IPV6
-                    && (type_ == libc::IPV6_ORIGDSTADDR || type_ == libc::IPV6_RECVORIGDSTADDR)
+                    && (type_ == libc::IPV6_ORIGDSTADDR
+                        || type_ == libc::IPV6_RECVORIGDSTADDR)
                 {
-                    let sin6 = unsafe { &*(libc::CMSG_DATA(cmsg) as *const libc::sockaddr_in6) };
+                    let sin6 = unsafe {
+                        &*(libc::CMSG_DATA(cmsg) as *const libc::sockaddr_in6)
+                    };
                     let ip = std::net::Ipv6Addr::from(sin6.sin6_addr.s6_addr);
                     let port = u16::from_be(sin6.sin6_port);
-                    dst_addr = Some(SocketAddr::V6(std::net::SocketAddrV6::new(ip, port, 0, 0)));
+                    dst_addr = Some(SocketAddr::V6(std::net::SocketAddrV6::new(
+                        ip, port, 0, 0,
+                    )));
                     break;
                 }
                 cmsg = unsafe { libc::CMSG_NXTHDR(&msg, cmsg) };
@@ -439,7 +539,10 @@ impl EbpfListener {
     }
 
     /// Receives the next transparent UDP packet into `buf`, returning bytes read, source address and original destination.
-    pub async fn recv_udp(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr, SocketAddr)> {
+    pub async fn recv_udp(
+        &self,
+        buf: &mut [u8],
+    ) -> std::io::Result<(usize, SocketAddr, SocketAddr)> {
         Self::recv_from_socket(&self.udp_socket_v4, buf).await
     }
 
@@ -532,4 +635,3 @@ fn sendmsg_with_src(
         Ok(n as usize)
     }
 }
-

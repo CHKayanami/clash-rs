@@ -52,6 +52,11 @@ pub(super) fn convert(mut c: def::Config) -> Result<config::Config, crate::Error
     {
         tun.so_mark = c.routing_mark;
     }
+    if let Some(ebpf) = &mut c.ebpf
+        && ebpf.routing_mark.is_none()
+    {
+        ebpf.routing_mark = c.routing_mark;
+    }
     config::Config {
         general: general::convert(&c)?,
         dns: (&c).try_into()?,

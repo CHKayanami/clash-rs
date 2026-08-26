@@ -214,28 +214,23 @@ impl FakeDns {
         self.store.exist(ip)
     }
 
-    pub fn is_fake_ip(&self, ip: net::IpAddr) -> bool {
+    pub fn is_in_pool(&self, ip: net::IpAddr) -> bool {
         match ip {
             IpAddr::V4(v4) => {
                 if v4.is_broadcast() || v4.is_multicast() {
                     return false;
                 }
-                // 检查 v4 存储和网段
                 if let Some(pool) = &self.v4_pool {
                     let u = u32::from(v4);
-                    if u < pool.min || u > pool.max {
-                        return false;
-                    }
+                    u >= pool.min && u <= pool.max
                 } else {
-                    return false;
+                    false
                 }
             }
             IpAddr::V6(v6) => {
                 if v6.is_multicast() {
                     return false;
                 }
-                // Mirror the v4 arm: reject anything outside the configured
-                // pool before paying for a store lookup.
                 match &self.v6_pool {
                     Some(pool) => {
                         let u = u128::from(v6);
@@ -244,13 +239,17 @@ impl FakeDns {
                             return false;
                         }
                         let host_id = u & !mask;
-                        if host_id < pool.min_host || host_id > pool.max_host {
-                            return false;
-                        }
+                        host_id >= pool.min_host && host_id <= pool.max_host
                     }
-                    None => return false,
+                    None => false,
                 }
             }
+        }
+    }
+
+    pub fn is_fake_ip(&self, ip: net::IpAddr) -> bool {
+        if !self.is_in_pool(ip) {
+            return false;
         }
         self.store.exist(ip)
     }

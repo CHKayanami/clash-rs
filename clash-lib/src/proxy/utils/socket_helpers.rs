@@ -49,6 +49,27 @@ pub fn apply_tcp_options(s: &TcpStream) -> std::io::Result<()> {
     s.set_nodelay(true)
 }
 
+#[cfg(target_os = "linux")]
+#[inline]
+pub(crate) fn resolve_so_mark(so_mark: Option<u32>) -> Option<u32> {
+    if let Some(mark) = so_mark {
+        return Some(mark);
+    }
+    if let Ok(guard) = crate::app::net::TUN_SOMARK.try_read()
+        && let Some(mark) = *guard
+    {
+        return Some(mark);
+    }
+    #[cfg(feature = "ebpf")]
+    {
+        return Some(clash_ebpf::DAE_BYPASS_MARK);
+    }
+    #[cfg(not(feature = "ebpf"))]
+    {
+        None
+    }
+}
+
 /// Create and configure a `TcpSocket` with interface binding, keepalive, and
 /// nodelay. The returned socket is ready to call `.connect()` on.
 pub fn prepare_tcp_socket(
@@ -74,7 +95,7 @@ pub fn prepare_tcp_socket(
 
     #[cfg(not(target_os = "android"))]
     #[cfg(target_os = "linux")]
-    if let Some(so_mark) = so_mark {
+    if let Some(so_mark) = resolve_so_mark(so_mark) {
         socket.set_mark(so_mark)?;
     }
 
@@ -358,7 +379,7 @@ pub async fn new_udp_socket(
     }
 
     #[cfg(target_os = "linux")]
-    if let Some(so_mark) = so_mark {
+    if let Some(so_mark) = resolve_so_mark(so_mark) {
         socket.set_mark(so_mark)?;
     }
 
@@ -445,7 +466,7 @@ pub fn new_dual_stack_udp_socket(
     socket.bind(&bind_addr.into())?;
 
     #[cfg(target_os = "linux")]
-    if let Some(so_mark) = so_mark {
+    if let Some(so_mark) = resolve_so_mark(so_mark) {
         socket.set_mark(so_mark)?;
     }
 

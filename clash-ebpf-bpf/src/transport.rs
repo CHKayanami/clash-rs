@@ -52,11 +52,7 @@ pub fn is_pure_syn(tcph: &TcpHdr) -> bool {
 /// or `0` otherwise.
 #[inline(always)]
 pub fn tcp_listener_l4proto(tcph: &TcpHdr) -> u8 {
-    if is_pure_syn(tcph) {
-        IPPROTO_TCP
-    } else {
-        0
-    }
+    if is_pure_syn(tcph) { IPPROTO_TCP } else { 0 }
 }
 
 #[repr(C)]
@@ -97,7 +93,8 @@ pub const ERR_UNKNOWN_PROTO: c_long = -3;
 pub const PASS_UNSUPPORTED: c_long = 1;
 
 /// Destinations that must never enter proxy/conntrack: L2 broadcast/multicast,
-/// IPv4 limited broadcast + multicast + 0.0.0.0, IPv6 multicast.
+/// IPv4 loopback (127.0.0.0/8), 0.0.0.0/8, link-local (169.254.0.0/16), multicast (224.0.0.0/4),
+/// broadcast (255.255.255.255), IPv6 loopback (::1), unspecified (::), link-local (fe80::/10), multicast (ff00::/8).
 #[inline(always)]
 pub fn dst_is_special(pkt: &ParsedPacket, link_h_len: u32) -> bool {
     if link_h_len == ETH_HLEN && pkt.ethh.dst_addr[0] & 1 != 0 {
@@ -106,18 +103,31 @@ pub fn dst_is_special(pkt: &ParsedPacket, link_h_len: u32) -> bool {
     let dst = &pkt.tuples.five.dst_ip;
     if dst.is_v4_mapped() {
         let ip = u32::from_be(unsafe { dst.u6_addr32[3] });
-        // 0.0.0.0 / 255.255.255.255 / 224.0.0.0/4
-        ip == 0 || ip == 0xFFFFFFFF || (ip & 0xF0000000) == 0xE0000000
+        // 0.0.0.0/8, 127.0.0.0/8, 169.254.0.0/16, 224.0.0.0/4, 255.255.255.255
+        (ip & 0xFF000000) == 0
+            || (ip & 0xFF000000) == 0x7F000000
+            || (ip & 0xFFFF0000) == 0xA9FE0000
+            || (ip & 0xF0000000) == 0xE0000000
+            || ip == 0xFFFFFFFF
     } else {
-        // ff00::/8
-        (unsafe { dst.u6_addr8[0] }) == 0xFF
+        let ip_be = unsafe { dst.u6_addr8 };
+        // Loopback (::1/128) & Unspecified (::/128)
+        // Link-local unicast (fe80::/10) & Multicast (ff00::/8)
+        ip_be == [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]
+            || ip_be == [0; 16]
+            || (ip_be[0] == 0xfe && (ip_be[1] & 0xc0) == 0x80)
+            || ip_be[0] == 0xff
     }
 }
 
 /// 探测 UDP 载荷是否包含 QUIC Long Header（用于 QUIC Initial 握手与域名嗅探决策）。
 #[allow(dead_code)]
 #[inline(always)]
-pub fn udp_has_quic_long_header(ctx: &TcContext, link_h_len: u32, pkt: &ParsedPacket) -> bool {
+pub fn udp_has_quic_long_header(
+    ctx: &TcContext,
+    link_h_len: u32,
+    pkt: &ParsedPacket,
+) -> bool {
     if pkt.l4proto != IPPROTO_UDP {
         return false;
     }
@@ -128,7 +138,9 @@ pub fn udp_has_quic_long_header(ctx: &TcContext, link_h_len: u32, pkt: &ParsedPa
 
     if pkt.ethh.ether_type == ETH_P_IP.to_be() {
         let mut version_ihl = 0u8;
-        if unsafe { bpf_skb_load_bytes(skb, offset, &mut version_ihl as *mut u8 as *mut _, 1) } != 0
+        if unsafe {
+            bpf_skb_load_bytes(skb, offset, &mut version_ihl as *mut u8 as *mut _, 1)
+        } != 0
         {
             return false;
         }
@@ -138,7 +150,9 @@ pub fn udp_has_quic_long_header(ctx: &TcContext, link_h_len: u32, pkt: &ParsedPa
         }
         offset += ihl;
     } else if pkt.ethh.ether_type == ETH_P_IPV6.to_be() {
-        if unsafe { bpf_skb_load_bytes(skb, offset + 6, &mut nexthdr as *mut u8 as *mut _, 1) } != 0
+        if unsafe {
+            bpf_skb_load_bytes(skb, offset + 6, &mut nexthdr as *mut u8 as *mut _, 1)
+        } != 0
         {
             return false;
         }
@@ -207,15 +221,21 @@ pub fn udp_has_quic_long_header(ctx: &TcContext, link_h_len: u32, pkt: &ParsedPa
 }
 
 pub trait ParseTransportExt {
-    fn parse_fast(&mut self, ctx: &TcContext, link_h_len: u32) -> Result<(), c_long>;
-    fn parse_slow(&mut self, ctx: &TcContext, link_h_len: u32) -> Result<(), c_long>;
+    fn parse_fast(&mut self, ctx: &TcContext, link_h_len: u32)
+    -> Result<(), c_long>;
+    fn parse_slow(&mut self, ctx: &TcContext, link_h_len: u32)
+    -> Result<(), c_long>;
     fn parse(&mut self, ctx: &TcContext, link_h_len: u32) -> Result<(), c_long>;
     fn fill_tuples(&self, tuples: &mut Tuples);
 }
 
 impl ParseTransportExt for ParseTransportCtx {
     #[inline(always)]
-    fn parse_slow(&mut self, ctx: &TcContext, link_h_len: u32) -> Result<(), c_long> {
+    fn parse_slow(
+        &mut self,
+        ctx: &TcContext,
+        link_h_len: u32,
+    ) -> Result<(), c_long> {
         let skb_ptr = ctx.skb.skb as *mut _;
         let mut offset = 0u32;
 
@@ -383,7 +403,12 @@ impl ParseTransportExt for ParseTransportCtx {
                 {
                     let mut next = 0u8;
                     let r = unsafe {
-                        bpf_skb_load_bytes(skb_ptr, offset, &mut next as *mut _ as *mut _, 1)
+                        bpf_skb_load_bytes(
+                            skb_ptr,
+                            offset,
+                            &mut next as *mut _ as *mut _,
+                            1,
+                        )
                     };
                     if r != 0 {
                         return Err(ERR_MALFORMED);
@@ -462,7 +487,11 @@ impl ParseTransportExt for ParseTransportCtx {
     }
 
     #[inline(always)]
-    fn parse_fast(&mut self, ctx: &TcContext, link_h_len: u32) -> Result<(), c_long> {
+    fn parse_fast(
+        &mut self,
+        ctx: &TcContext,
+        link_h_len: u32,
+    ) -> Result<(), c_long> {
         if ctx.pull_data(HEADER_PULL_SIZE).is_err() {
             return Err(ERR_FALLBACK);
         }
@@ -495,7 +524,9 @@ impl ParseTransportExt for ParseTransportCtx {
 
         if self.ethh.ether_type == ETH_P_IP.to_be() {
             let iph_ptr = unsafe { data.add(offset as usize) as *const Ipv4Hdr };
-            if unsafe { data.add(offset as usize + mem::size_of::<Ipv4Hdr>()) } > data_end {
+            if unsafe { data.add(offset as usize + mem::size_of::<Ipv4Hdr>()) }
+                > data_end
+            {
                 return Err(ERR_FALLBACK);
             }
             let iph = unsafe { &*iph_ptr };
@@ -517,7 +548,9 @@ impl ParseTransportExt for ParseTransportCtx {
             match iph.proto {
                 IPPROTO_TCP => {
                     let tcph_ptr = unsafe { data.add(l4_offset) as *const TcpHdr };
-                    if unsafe { data.add(l4_offset + mem::size_of::<TcpHdr>()) } > data_end {
+                    if unsafe { data.add(l4_offset + mem::size_of::<TcpHdr>()) }
+                        > data_end
+                    {
                         return Err(ERR_FALLBACK);
                     }
                     let tcph = unsafe { &*tcph_ptr };
@@ -527,7 +560,9 @@ impl ParseTransportExt for ParseTransportCtx {
                 }
                 IPPROTO_UDP => {
                     let udph_ptr = unsafe { data.add(l4_offset) as *const UdpHdr };
-                    if unsafe { data.add(l4_offset + mem::size_of::<UdpHdr>()) } > data_end {
+                    if unsafe { data.add(l4_offset + mem::size_of::<UdpHdr>()) }
+                        > data_end
+                    {
                         return Err(ERR_FALLBACK);
                     }
                     self.udph = unsafe { ptr::read(udph_ptr) };
@@ -540,7 +575,9 @@ impl ParseTransportExt for ParseTransportCtx {
 
         if self.ethh.ether_type == ETH_P_IPV6.to_be() {
             let ipv6h_ptr = unsafe { data.add(offset as usize) as *const Ipv6Hdr };
-            if unsafe { data.add(offset as usize + mem::size_of::<Ipv6Hdr>()) } > data_end {
+            if unsafe { data.add(offset as usize + mem::size_of::<Ipv6Hdr>()) }
+                > data_end
+            {
                 return Err(ERR_FALLBACK);
             }
             let ipv6h = unsafe { &*ipv6h_ptr };
@@ -557,8 +594,12 @@ impl ParseTransportExt for ParseTransportCtx {
                     return Err(ERR_MALFORMED);
                 }
                 if nexthdr == IPPROTO_FRAGMENT {
-                    let fragh_ptr = unsafe { data.add(offset as usize) as *const FragHdr };
-                    if unsafe { data.add(offset as usize + mem::size_of::<FragHdr>()) } > data_end {
+                    let fragh_ptr =
+                        unsafe { data.add(offset as usize) as *const FragHdr };
+                    if unsafe {
+                        data.add(offset as usize + mem::size_of::<FragHdr>())
+                    } > data_end
+                    {
                         return Err(ERR_FALLBACK);
                     }
                     let fragh = unsafe { &*fragh_ptr };
@@ -590,8 +631,12 @@ impl ParseTransportExt for ParseTransportCtx {
             self.l4proto = nexthdr;
             match nexthdr {
                 IPPROTO_TCP => {
-                    let tcph_ptr = unsafe { data.add(offset as usize) as *const TcpHdr };
-                    if unsafe { data.add(offset as usize + mem::size_of::<TcpHdr>()) } > data_end {
+                    let tcph_ptr =
+                        unsafe { data.add(offset as usize) as *const TcpHdr };
+                    if unsafe {
+                        data.add(offset as usize + mem::size_of::<TcpHdr>())
+                    } > data_end
+                    {
                         return Err(ERR_FALLBACK);
                     }
                     let tcph = unsafe { &*tcph_ptr };
@@ -600,8 +645,12 @@ impl ParseTransportExt for ParseTransportCtx {
                     return Ok(());
                 }
                 IPPROTO_UDP => {
-                    let udph_ptr = unsafe { data.add(offset as usize) as *const UdpHdr };
-                    if unsafe { data.add(offset as usize + mem::size_of::<UdpHdr>()) } > data_end {
+                    let udph_ptr =
+                        unsafe { data.add(offset as usize) as *const UdpHdr };
+                    if unsafe {
+                        data.add(offset as usize + mem::size_of::<UdpHdr>())
+                    } > data_end
+                    {
                         return Err(ERR_FALLBACK);
                     }
                     self.udph = unsafe { ptr::read(udph_ptr) };
@@ -609,8 +658,11 @@ impl ParseTransportExt for ParseTransportCtx {
                     return Ok(());
                 }
                 IPPROTO_ICMPV6 => {
-                    let icmp6h_ptr = unsafe { data.add(offset as usize) as *const Icmpv6Hdr };
-                    if unsafe { data.add(offset as usize + mem::size_of::<Icmpv6Hdr>()) } > data_end
+                    let icmp6h_ptr =
+                        unsafe { data.add(offset as usize) as *const Icmpv6Hdr };
+                    if unsafe {
+                        data.add(offset as usize + mem::size_of::<Icmpv6Hdr>())
+                    } > data_end
                     {
                         return Err(ERR_FALLBACK);
                     }
@@ -634,7 +686,13 @@ impl ParseTransportExt for ParseTransportCtx {
 
     #[inline(always)]
     fn fill_tuples(&self, tuples: &mut Tuples) {
-        unsafe { ptr::write_bytes(tuples as *mut _ as *mut u8, 0, mem::size_of::<Tuples>()) };
+        unsafe {
+            ptr::write_bytes(
+                tuples as *mut _ as *mut u8,
+                0,
+                mem::size_of::<Tuples>(),
+            )
+        };
         tuples.five.l4proto = self.l4proto;
 
         if self.iph.version() == 4 {
@@ -663,7 +721,11 @@ impl ParseTransportExt for ParseTransportCtx {
 
 /// Parse the packet into `out` via the scratch-map-based fast/slow path.
 #[inline(always)]
-pub fn parse_packet(ctx: &TcContext, link_h_len: u32, out: &mut ParsedPacket) -> c_long {
+pub fn parse_packet(
+    ctx: &TcContext,
+    link_h_len: u32,
+    out: &mut ParsedPacket,
+) -> c_long {
     let scratch_key: u32 = 0;
     let tctx = match PARSE_CTX_MAP.get_ptr_mut(scratch_key) {
         Some(ptr) => unsafe { &mut *ptr },

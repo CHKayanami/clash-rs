@@ -69,6 +69,11 @@ pub mod linux {
             Ok(Self { host_ns, dae_ns })
         }
 
+        pub fn dae_file(&self) -> Result<File, NetNsError> {
+            let cloned = self.dae_ns.try_clone().map_err(NetNsError::Io)?;
+            Ok(File::from(cloned))
+        }
+
 
         /// Executes a synchronous closure within the isolated daens network namespace.
         pub fn with_daens<F, R>(&self, f: F) -> Result<R, NetNsError>
@@ -115,6 +120,10 @@ pub mod non_linux {
         }
 
         pub fn try_clone(&self) -> Result<Self, NetNsError> {
+            Err(NetNsError::UnsupportedPlatform)
+        }
+
+        pub fn dae_file(&self) -> Result<std::fs::File, NetNsError> {
             Err(NetNsError::UnsupportedPlatform)
         }
 

@@ -833,7 +833,7 @@ impl ClashResolver for EnhancedResolver {
 
     fn reverse_lookup(&self, ip: net::IpAddr) -> Option<String> {
         if let Some(fake_dns) = &self.fake_dns {
-            if fake_dns.is_fake_ip(ip) {
+            if fake_dns.is_in_pool(ip) {
                 return fake_dns.reverse_lookup(ip);
             }
         }
@@ -842,7 +842,7 @@ impl ClashResolver for EnhancedResolver {
 
     fn is_fake_ip(&self, ip: net::IpAddr) -> bool {
         if let Some(fake_dns) = &self.fake_dns {
-            fake_dns.is_fake_ip(ip)
+            fake_dns.is_in_pool(ip) || fake_dns.is_fake_ip(ip)
         } else {
             false
         }

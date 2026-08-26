@@ -187,6 +187,8 @@ impl EbpfManager {
 
                 // Netns sysctls
                 for (key, val) in [
+                    ("net.ipv4.ip_nonlocal_bind", "1"),
+                    ("net.ipv6.ip_nonlocal_bind", "1"),
                     ("net.ipv4.conf.all.rp_filter", "0"),
                     ("net.ipv4.conf.all.accept_local", "1"),
                     ("net.ipv4.conf.all.route_localnet", "1"),
@@ -222,7 +224,7 @@ impl EbpfManager {
                 effective_lan, effective_wan
             );
 
-            let mut all_dst_ips = self.config.bypass_dst_ips.clone();
+            let mut all_dst_ips = self.config.target.bypass_dst_ips.clone();
             let detected_ips = detect_interface_ips(&effective_lan, effective_wan.as_deref());
             let mut local_ip_u32 = 0u32;
             for ip in &detected_ips {
@@ -238,14 +240,14 @@ impl EbpfManager {
             }
             all_dst_ips = crate::config::aggregate_ip_cidrs(&all_dst_ips);
 
-            let has_proxy_src_ips = if !self.config.proxy_ips.is_empty() || !self.config.proxy_src_ips.is_empty() { 1 } else { 0 };
-            let has_proxy_dst_ips = if !self.config.proxy_ips.is_empty() || !self.config.proxy_dst_ips.is_empty() { 1 } else { 0 };
-            let has_proxy_src_ports = if !self.config.proxy_ports.is_empty() || !self.config.proxy_src_ports.is_empty() { 1 } else { 0 };
-            let has_proxy_dst_ports = if !self.config.proxy_ports.is_empty() || !self.config.proxy_dst_ports.is_empty() { 1 } else { 0 };
+            let has_proxy_src_ips = if !self.config.lan.proxy_src_ips.is_empty() { 1 } else { 0 };
+            let has_proxy_dst_ips = if !self.config.target.proxy_dst_ips.is_empty() { 1 } else { 0 };
+            let has_proxy_src_ports = if !self.config.lan.proxy_src_ports.is_empty() { 1 } else { 0 };
+            let has_proxy_dst_ports = if !self.config.target.proxy_dst_ports.is_empty() { 1 } else { 0 };
             let direct_offload_enabled = if self.config.auto_direct_offload { 1 } else { 0 };
-            let proxy_local = if self.config.proxy_local { 1 } else { 0 };
-            let has_proxy_processes = if !self.config.proxy_processes.is_empty() { 1 } else { 0 };
-            let has_bypass_processes = if !self.config.bypass_processes.is_empty() { 1 } else { 0 };
+            let proxy_local = if self.config.host.proxy_local { 1 } else { 0 };
+            let has_proxy_processes = if !self.config.host.proxy_processes.is_empty() { 1 } else { 0 };
+            let has_bypass_processes = if !self.config.host.bypass_processes.is_empty() { 1 } else { 0 };
 
             // Initialize eBPF programs and attach TC/cgroup hooks via Aya
             let bpf_param = clash_ebpf_common::DaeParam {
@@ -255,7 +257,7 @@ impl EbpfManager {
                 dae0peer_mac,
                 use_redirect_peer: 0,
                 proxy_local,
-                dae_socket_mark: clash_ebpf_common::DAE_BYPASS_MARK,
+                dae_socket_mark: self.config.routing_mark.unwrap_or(clash_ebpf_common::DAE_BYPASS_MARK),
                 control_plane_pid: std::process::id(),
                 local_ip: local_ip_u32,
                 has_proxy_src_ips,
@@ -273,20 +275,16 @@ impl EbpfManager {
                 &bpf_param,
                 &effective_lan,
                 effective_wan.as_deref(),
-                &self.config.bypass_ports,
-                &self.config.bypass_src_ports,
-                &self.config.bypass_dst_ports,
-                &self.config.bypass_ips,
-                &self.config.bypass_src_ips,
+                &self.config.lan.bypass_src_ports,
+                &self.config.target.bypass_dst_ports,
+                &self.config.lan.bypass_src_ips,
                 &all_dst_ips,
-                &self.config.proxy_ports,
-                &self.config.proxy_src_ports,
-                &self.config.proxy_dst_ports,
-                &self.config.proxy_ips,
-                &self.config.proxy_src_ips,
-                &self.config.proxy_dst_ips,
-                &self.config.proxy_processes,
-                &self.config.bypass_processes,
+                &self.config.lan.proxy_src_ports,
+                &self.config.target.proxy_dst_ports,
+                &self.config.lan.proxy_src_ips,
+                &self.config.target.proxy_dst_ips,
+                &self.config.host.proxy_processes,
+                &self.config.host.bypass_processes,
                 Some(&ns),
             ) {
                 tracing::warn!("eBPF hooks attachment: {e}");

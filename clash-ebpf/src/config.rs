@@ -1,5 +1,58 @@
 use serde::{Deserialize, Serialize};
 
+#[derive(Serialize, Deserialize, Default, Debug, Clone, PartialEq, Eq)]
+pub struct EbpfLanConfig {
+    /// Source ports to bypass (e.g., local sshd 22, dhcp 67/68, local web servers).
+    #[serde(default = "default_bypass_src_ports", rename = "bypass-src-ports")]
+    pub bypass_src_ports: Vec<u16>,
+
+    /// Source ports to proxy (only traffic from these source ports will be proxied).
+    #[serde(default, rename = "proxy-src-ports")]
+    pub proxy_src_ports: Vec<u16>,
+
+    /// Source IPs/CIDRs to bypass (e.g., specific LAN client IPs).
+    #[serde(default, rename = "bypass-src-ips", alias = "bypass-clients")]
+    pub bypass_src_ips: Vec<String>,
+
+    /// Source IPs/CIDRs to proxy (e.g., specific LAN client IPs to be proxied).
+    #[serde(default, rename = "proxy-src-ips", alias = "proxy-clients")]
+    pub proxy_src_ips: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize, Default, Debug, Clone, PartialEq, Eq)]
+pub struct EbpfTargetConfig {
+    /// Destination ports to bypass (e.g., direct dns 53, direct ntp 123).
+    #[serde(default, rename = "bypass-dst-ports")]
+    pub bypass_dst_ports: Vec<u16>,
+
+    /// Destination ports to proxy (e.g. 80, 443; only traffic to these ports will be proxied).
+    #[serde(default, rename = "proxy-dst-ports")]
+    pub proxy_dst_ports: Vec<u16>,
+
+    /// Destination IPs/CIDRs to bypass (e.g., local subnets, multicast).
+    #[serde(default = "default_bypass_dst_ips", rename = "bypass-dst-ips")]
+    pub bypass_dst_ips: Vec<String>,
+
+    /// Destination IPs/CIDRs to proxy (only traffic to these destination IPs will be proxied).
+    #[serde(default, rename = "proxy-dst-ips")]
+    pub proxy_dst_ips: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize, Default, Debug, Clone, PartialEq, Eq)]
+pub struct EbpfHostConfig {
+    /// Whether to proxy local machine originated traffic (default: false).
+    #[serde(default, rename = "proxy-local")]
+    pub proxy_local: bool,
+
+    /// Process names (comm) to proxy for local traffic. If non-empty, only matching processes will be proxied.
+    #[serde(default, rename = "proxy-processes", alias = "proxy-process")]
+    pub proxy_processes: Vec<String>,
+
+    /// Process names (comm) to bypass for local traffic. Matching processes will be bypassed directly.
+    #[serde(default, rename = "bypass-processes", alias = "bypass-process")]
+    pub bypass_processes: Vec<String>,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct EbpfConfig {
     #[serde(default)]
@@ -21,70 +74,25 @@ pub struct EbpfConfig {
     #[serde(default = "default_tproxy_port", rename = "tproxy-udp-port")]
     pub tproxy_udp_port: u16,
 
-
-    /// General bypass ports (applies to both source and dest).
-    #[serde(default = "default_bypass_ports", rename = "bypass-ports")]
-    pub bypass_ports: Vec<u16>,
-
-    /// Source ports to bypass (e.g., local sshd 22, dhcp 67/68, local web servers).
-    #[serde(default = "default_bypass_ports", rename = "bypass-src-ports")]
-    pub bypass_src_ports: Vec<u16>,
-
-    /// Destination ports to bypass (e.g., direct dns 53, direct ntp 123).
-    #[serde(default, rename = "bypass-dst-ports")]
-    pub bypass_dst_ports: Vec<u16>,
-
-    /// General bypass IPs/CIDRs or rulesets (applies to both source and dest).
-    #[serde(default, rename = "bypass-ips")]
-    pub bypass_ips: Vec<String>,
-
-    /// Source IPs/CIDRs or rulesets to bypass (e.g., specific LAN client IPs).
-    #[serde(default, rename = "bypass-src-ips")]
-    pub bypass_src_ips: Vec<String>,
-
-    /// Destination IPs/CIDRs or rulesets to bypass (e.g., local subnets, multicast).
-    #[serde(default = "default_bypass_dst_ips", rename = "bypass-dst-ips")]
-    pub bypass_dst_ips: Vec<String>,
-
-    /// General proxy whitelist ports (applies to both source and dest).
-    #[serde(default, rename = "proxy-ports")]
-    pub proxy_ports: Vec<u16>,
-
-    /// Source ports to proxy (only traffic with these source ports will be proxied).
-    #[serde(default, rename = "proxy-src-ports")]
-    pub proxy_src_ports: Vec<u16>,
-
-    /// Destination ports to proxy (e.g. 80, 443; only traffic to these ports will be proxied).
-    #[serde(default, rename = "proxy-dst-ports")]
-    pub proxy_dst_ports: Vec<u16>,
-
-    /// General proxy whitelist IPs/CIDRs or rulesets (applies to both source and dest).
-    #[serde(default, rename = "proxy-ips")]
-    pub proxy_ips: Vec<String>,
-
-    /// Source IPs/CIDRs or rulesets to proxy (e.g. specific LAN client IPs to be proxied).
-    #[serde(default, rename = "proxy-src-ips")]
-    pub proxy_src_ips: Vec<String>,
-
-    /// Destination IPs/CIDRs or rulesets to proxy (only traffic to these destination IPs will be proxied).
-    #[serde(default, rename = "proxy-dst-ips")]
-    pub proxy_dst_ips: Vec<String>,
-
     /// Automatically offload DIRECT domains/IPs to eBPF map for fast path forwarding.
     #[serde(default = "default_true", rename = "auto-direct-offload")]
     pub auto_direct_offload: bool,
 
-    /// Whether to proxy local machine originated traffic (default: true).
-    #[serde(default = "default_true", rename = "proxy-local")]
-    pub proxy_local: bool,
+    /// Optional routing mark for bypass detection (e.g. from routing-mark).
+    #[serde(default, rename = "routing-mark")]
+    pub routing_mark: Option<u32>,
 
-    /// Process names (comm) to proxy for local traffic. If non-empty, only matching processes will be proxied.
-    #[serde(default, rename = "proxy-processes", alias = "proxy-process")]
-    pub proxy_processes: Vec<String>,
+    /// LAN client configuration policies (TC Ingress on LAN interfaces).
+    #[serde(default)]
+    pub lan: EbpfLanConfig,
 
-    /// Process names (comm) to bypass for local traffic. Matching processes will be bypassed directly.
-    #[serde(default, rename = "bypass-processes", alias = "bypass-process")]
-    pub bypass_processes: Vec<String>,
+    /// Target destination configuration policies (both LAN and Host traffic).
+    #[serde(default)]
+    pub target: EbpfTargetConfig,
+
+    /// Host-local traffic configuration policies (TC Egress on WAN interface & cgroups).
+    #[serde(default)]
+    pub host: EbpfHostConfig,
 }
 
 fn default_tproxy_port() -> u16 {
@@ -95,7 +103,7 @@ fn default_true() -> bool {
     true
 }
 
-fn default_bypass_ports() -> Vec<u16> {
+fn default_bypass_src_ports() -> Vec<u16> {
     vec![22, 67, 68, 5353]
 }
 
@@ -106,7 +114,6 @@ fn default_bypass_dst_ips() -> Vec<String> {
         "224.0.0.0/4".to_string(),
         "::1/128".to_string(),
         "fe80::/10".to_string(),
-        "fc00::/7".to_string(),
         "ff00::/8".to_string(),
     ]
 }
@@ -119,22 +126,21 @@ impl Default for EbpfConfig {
             wan_interface: Some("auto".to_string()),
             tproxy_port: default_tproxy_port(),
             tproxy_udp_port: default_tproxy_port(),
-            bypass_ports: default_bypass_ports(),
-            bypass_src_ports: default_bypass_ports(),
-            bypass_dst_ports: Vec::new(),
-            bypass_ips: Vec::new(),
-            bypass_src_ips: Vec::new(),
-            bypass_dst_ips: default_bypass_dst_ips(),
-            proxy_ports: Vec::new(),
-            proxy_src_ports: Vec::new(),
-            proxy_dst_ports: Vec::new(),
-            proxy_ips: Vec::new(),
-            proxy_src_ips: Vec::new(),
-            proxy_dst_ips: Vec::new(),
             auto_direct_offload: true,
-            proxy_local: true,
-            proxy_processes: Vec::new(),
-            bypass_processes: Vec::new(),
+            routing_mark: None,
+            lan: EbpfLanConfig {
+                bypass_src_ports: default_bypass_src_ports(),
+                proxy_src_ports: Vec::new(),
+                bypass_src_ips: Vec::new(),
+                proxy_src_ips: Vec::new(),
+            },
+            target: EbpfTargetConfig {
+                bypass_dst_ports: Vec::new(),
+                proxy_dst_ports: Vec::new(),
+                bypass_dst_ips: default_bypass_dst_ips(),
+                proxy_dst_ips: Vec::new(),
+            },
+            host: EbpfHostConfig::default(),
         }
     }
 }

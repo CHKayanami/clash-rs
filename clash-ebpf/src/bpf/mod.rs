@@ -12,6 +12,7 @@ pub mod linux {
     use aya::maps::{Array, HashMap, LpmTrie, MapData, RingBuf, SockMap};
     use aya::programs::cgroup_sock::CgroupSockLink;
     use aya::programs::cgroup_sock_addr::CgroupSockAddrLink;
+    use aya::programs::sk_lookup::{SkLookup, SkLookupLink};
     use aya::programs::tc::SchedClassifierLink;
     use aya::programs::{
         CgroupAttachMode, CgroupSock, CgroupSockAddr, SchedClassifier, TcAttachType,
@@ -22,7 +23,7 @@ pub mod linux {
     use std::os::fd::{AsFd, AsRawFd, RawFd};
     use std::str::FromStr;
     use std::sync::atomic::{AtomicU8, Ordering};
-    use tracing::{debug, info, warn};
+    use tracing::{debug, error, info, warn};
 
     const BPF_MAP_UPDATE_ELEM: libc::c_long = 2;
     const BPF_MAP_DELETE_ELEM: libc::c_long = 3;
@@ -236,6 +237,7 @@ pub mod linux {
         tc_links: std::sync::Mutex<Vec<SchedClassifierLink>>,
         cgroup_sock_links: std::sync::Mutex<Vec<CgroupSockLink>>,
         cgroup_sock_addr_links: std::sync::Mutex<Vec<CgroupSockAddrLink>>,
+        sk_lookup_link: std::sync::Mutex<Option<SkLookupLink>>,
         event_abort: Option<tokio::task::AbortHandle>,
         cap_batch_update: BatchCapability,
         cap_batch_delete: BatchCapability,
@@ -248,6 +250,7 @@ pub mod linux {
                 tc_links: std::sync::Mutex::new(Vec::new()),
                 cgroup_sock_links: std::sync::Mutex::new(Vec::new()),
                 cgroup_sock_addr_links: std::sync::Mutex::new(Vec::new()),
+                sk_lookup_link: std::sync::Mutex::new(None),
                 event_abort: None,
                 cap_batch_update: BatchCapability::new(),
                 cap_batch_delete: BatchCapability::new(),
@@ -273,16 +276,12 @@ pub mod linux {
             param: &DaeParam,
             lan_interfaces: &[String],
             wan_interface: Option<&str>,
-            bypass_ports: &[u16],
             bypass_src_ports: &[u16],
             bypass_dst_ports: &[u16],
-            bypass_ips: &[String],
             bypass_src_ips: &[String],
             bypass_dst_ips: &[String],
-            proxy_ports: &[u16],
             proxy_src_ports: &[u16],
             proxy_dst_ports: &[u16],
-            proxy_ips: &[String],
             proxy_src_ips: &[String],
             proxy_dst_ips: &[String],
             proxy_processes: &[String],
@@ -312,10 +311,10 @@ pub mod linux {
             if let Some(map) = bpf.map_mut("BYPASS_SRC_PORTS") {
                 if let Ok(mut port_map) = HashMap::<_, u16, u8>::try_from(map) {
                     let _ = port_map.insert(param.tproxy_port as u16, 1, 0);
-                    for &port in bypass_ports.iter().chain(bypass_src_ports.iter()) {
+                    for &port in bypass_src_ports {
                         let _ = port_map.insert(port, 1, 0);
                     }
-                    debug!("Configured {} source bypass ports in BPF map", bypass_ports.len() + bypass_src_ports.len() + 1);
+                    debug!("Configured {} source bypass ports in BPF map", bypass_src_ports.len() + 1);
                 }
             }
 
@@ -323,17 +322,17 @@ pub mod linux {
             if let Some(map) = bpf.map_mut("BYPASS_DST_PORTS") {
                 if let Ok(mut port_map) = HashMap::<_, u16, u8>::try_from(map) {
                     let _ = port_map.insert(param.tproxy_port as u16, 1, 0);
-                    for &port in bypass_ports.iter().chain(bypass_dst_ports.iter()) {
+                    for &port in bypass_dst_ports {
                         let _ = port_map.insert(port, 1, 0);
                     }
-                    debug!("Configured {} dest bypass ports in BPF map", bypass_ports.len() + bypass_dst_ports.len() + 1);
+                    debug!("Configured {} dest bypass ports in BPF map", bypass_dst_ports.len() + 1);
                 }
             }
 
             // 4. Populate BYPASS_SRC_IPS and BYPASS_SRC_IP6S maps
             if let Some(map) = bpf.map_mut("BYPASS_SRC_IPS") {
                 if let Ok(mut ip_trie) = LpmTrie::<_, u32, u8>::try_from(map) {
-                    for ip_str in bypass_ips.iter().chain(bypass_src_ips.iter()) {
+                    for ip_str in bypass_src_ips {
                         if let Ok(net) = ipnet::Ipv4Net::from_str(ip_str) {
                             let ip_u32 = u32::from_ne_bytes(net.network().octets());
                             let key = Key::new(net.prefix_len() as u32, ip_u32);
@@ -344,12 +343,12 @@ pub mod linux {
                             let _ = ip_trie.insert(&key, 1, 0);
                         }
                     }
-                    debug!("Configured {} source bypass IPv4 IP/CIDRs in BPF Trie map", bypass_ips.len() + bypass_src_ips.len());
+                    debug!("Configured {} source bypass IPv4 IP/CIDRs in BPF Trie map", bypass_src_ips.len());
                 }
             }
             if let Some(map) = bpf.map_mut("BYPASS_SRC_IP6S") {
                 if let Ok(mut ip_trie) = LpmTrie::<_, [u8; 16], u8>::try_from(map) {
-                    for ip_str in bypass_ips.iter().chain(bypass_src_ips.iter()) {
+                    for ip_str in bypass_src_ips {
                         if let Ok(net) = ipnet::Ipv6Net::from_str(ip_str) {
                             let key = Key::new(net.prefix_len() as u32, net.network().octets());
                             let _ = ip_trie.insert(&key, 1, 0);
@@ -358,14 +357,14 @@ pub mod linux {
                             let _ = ip_trie.insert(&key, 1, 0);
                         }
                     }
-                    debug!("Configured {} source bypass IPv6 IP/CIDRs in BPF Trie map", bypass_ips.len() + bypass_src_ips.len());
+                    debug!("Configured {} source bypass IPv6 IP/CIDRs in BPF Trie map", bypass_src_ips.len());
                 }
             }
 
             // 5. Populate BYPASS_DST_IPS and BYPASS_DST_IP6S maps
             if let Some(map) = bpf.map_mut("BYPASS_DST_IPS") {
                 if let Ok(mut ip_trie) = LpmTrie::<_, u32, u8>::try_from(map) {
-                    for ip_str in bypass_ips.iter().chain(bypass_dst_ips.iter()) {
+                    for ip_str in bypass_dst_ips {
                         if let Ok(net) = ipnet::Ipv4Net::from_str(ip_str) {
                             let ip_u32 = u32::from_ne_bytes(net.network().octets());
                             let key = Key::new(net.prefix_len() as u32, ip_u32);
@@ -376,12 +375,12 @@ pub mod linux {
                             let _ = ip_trie.insert(&key, 1, 0);
                         }
                     }
-                    debug!("Configured {} dest bypass IPv4 IP/CIDRs in BPF Trie map", bypass_ips.len() + bypass_dst_ips.len());
+                    debug!("Configured {} dest bypass IPv4 IP/CIDRs in BPF Trie map", bypass_dst_ips.len());
                 }
             }
             if let Some(map) = bpf.map_mut("BYPASS_DST_IP6S") {
                 if let Ok(mut ip_trie) = LpmTrie::<_, [u8; 16], u8>::try_from(map) {
-                    for ip_str in bypass_ips.iter().chain(bypass_dst_ips.iter()) {
+                    for ip_str in bypass_dst_ips {
                         if let Ok(net) = ipnet::Ipv6Net::from_str(ip_str) {
                             let key = Key::new(net.prefix_len() as u32, net.network().octets());
                             let _ = ip_trie.insert(&key, 1, 0);
@@ -390,14 +389,14 @@ pub mod linux {
                             let _ = ip_trie.insert(&key, 1, 0);
                         }
                     }
-                    debug!("Configured {} dest bypass IPv6 IP/CIDRs in BPF Trie map", bypass_ips.len() + bypass_dst_ips.len());
+                    debug!("Configured {} dest bypass IPv6 IP/CIDRs in BPF Trie map", bypass_dst_ips.len());
                 }
             }
 
             // 6. Populate PROXY_SRC_PORTS map
             if let Some(map) = bpf.map_mut("PROXY_SRC_PORTS") {
                 if let Ok(mut port_map) = HashMap::<_, u16, u8>::try_from(map) {
-                    for &port in proxy_ports.iter().chain(proxy_src_ports.iter()) {
+                    for &port in proxy_src_ports {
                         let _ = port_map.insert(port, 1, 0);
                     }
                 }
@@ -406,7 +405,7 @@ pub mod linux {
             // 7. Populate PROXY_DST_PORTS map
             if let Some(map) = bpf.map_mut("PROXY_DST_PORTS") {
                 if let Ok(mut port_map) = HashMap::<_, u16, u8>::try_from(map) {
-                    for &port in proxy_ports.iter().chain(proxy_dst_ports.iter()) {
+                    for &port in proxy_dst_ports {
                         let _ = port_map.insert(port, 1, 0);
                     }
                 }
@@ -415,7 +414,7 @@ pub mod linux {
             // 8. Populate PROXY_SRC_IPS and PROXY_SRC_IP6S maps
             if let Some(map) = bpf.map_mut("PROXY_SRC_IPS") {
                 if let Ok(mut ip_trie) = LpmTrie::<_, u32, u8>::try_from(map) {
-                    for ip_str in proxy_ips.iter().chain(proxy_src_ips.iter()) {
+                    for ip_str in proxy_src_ips {
                         if let Ok(net) = ipnet::Ipv4Net::from_str(ip_str) {
                             let ip_u32 = u32::from_ne_bytes(net.network().octets());
                             let key = Key::new(net.prefix_len() as u32, ip_u32);
@@ -430,7 +429,7 @@ pub mod linux {
             }
             if let Some(map) = bpf.map_mut("PROXY_SRC_IP6S") {
                 if let Ok(mut ip_trie) = LpmTrie::<_, [u8; 16], u8>::try_from(map) {
-                    for ip_str in proxy_ips.iter().chain(proxy_src_ips.iter()) {
+                    for ip_str in proxy_src_ips {
                         if let Ok(net) = ipnet::Ipv6Net::from_str(ip_str) {
                             let key = Key::new(net.prefix_len() as u32, net.network().octets());
                             let _ = ip_trie.insert(&key, 1, 0);
@@ -445,7 +444,7 @@ pub mod linux {
             // 9. Populate PROXY_DST_IPS and PROXY_DST_IP6S maps
             if let Some(map) = bpf.map_mut("PROXY_DST_IPS") {
                 if let Ok(mut ip_trie) = LpmTrie::<_, u32, u8>::try_from(map) {
-                    for ip_str in proxy_ips.iter().chain(proxy_dst_ips.iter()) {
+                    for ip_str in proxy_dst_ips {
                         if let Ok(net) = ipnet::Ipv4Net::from_str(ip_str) {
                             let ip_u32 = u32::from_ne_bytes(net.network().octets());
                             let key = Key::new(net.prefix_len() as u32, ip_u32);
@@ -460,7 +459,7 @@ pub mod linux {
             }
             if let Some(map) = bpf.map_mut("PROXY_DST_IP6S") {
                 if let Ok(mut ip_trie) = LpmTrie::<_, [u8; 16], u8>::try_from(map) {
-                    for ip_str in proxy_ips.iter().chain(proxy_dst_ips.iter()) {
+                    for ip_str in proxy_dst_ips {
                         if let Ok(net) = ipnet::Ipv6Net::from_str(ip_str) {
                             let key = Key::new(net.prefix_len() as u32, net.network().octets());
                             let _ = ip_trie.insert(&key, 1, 0);
@@ -571,8 +570,11 @@ pub mod linux {
                 warn!("Failed to attach TC ingress on dae0: {}", e);
             }
 
-            // 17. Attach TC Ingress on dae0peer inside daens for PACKET_HOST acceptance
+            // 17. Attach sk_lookup and TC Ingress on dae0peer inside daens
             if let Some(ns) = netns {
+                if let Err(e) = self.attach_sk_lookup(ns) {
+                    warn!("Failed to attach sk_lookup in daens: {}", e);
+                }
                 let _ = ns.with_daens(|| -> Result<(), String> {
                     if let Err(e) = self.attach_tc_interface("dae0peer", true, "dae0peer_ingress") {
                         warn!("Failed to attach TC ingress on dae0peer inside daens: {}", e);
@@ -768,26 +770,54 @@ pub mod linux {
             };
 
             let Some(cgroup_path) = Self::detect_cgroup_path() else {
-                warn!("cgroup2 not mounted; cgroup bypass hooks skipped");
+                warn!("cgroup2 not mounted; cgroup bypass & process tracking hooks skipped");
                 return Ok(());
             };
 
             let cgroup_file = File::open(&cgroup_path)
                 .map_err(|e| format!("Failed to open cgroup {}: {e}", cgroup_path))?;
 
+            let mut attached_count = 0;
+
             for name in &["tproxy_wan_cg_sock_create", "tproxy_wan_cg_sock_release"] {
-                if let Some(prog) = bpf.program_mut(name) {
-                    if let Ok(p) = <&mut CgroupSock>::try_from(prog) {
-                        if p.load().is_ok() {
-                            if let Ok(link_id) = p.attach(&cgroup_file, CgroupAttachMode::Single) {
-                                if let Ok(link) = p.take_link(link_id) {
-                                    if let Ok(mut guard) = self.cgroup_sock_links.lock() {
-                                        guard.push(link);
-                                    }
-                                    debug!("Attached cgroup hook '{}'", name);
-                                }
-                            }
+                let Some(prog) = bpf.program_mut(name) else {
+                    error!("Cgroup program '{}' not found in eBPF object", name);
+                    continue;
+                };
+                let p: &mut CgroupSock = match prog.try_into() {
+                    Ok(p) => p,
+                    Err(e) => {
+                        error!("Failed to convert program '{}' to CgroupSock: {e}", name);
+                        continue;
+                    }
+                };
+                if let Err(e) = p.load() {
+                    error!("Failed to load cgroup program '{}': {e}", name);
+                    continue;
+                }
+                let (link_id, mode_name) = match p.attach(&cgroup_file, CgroupAttachMode::AllowMultiple) {
+                    Ok(id) => (id, "AllowMultiple"),
+                    Err(e1) => match p.attach(&cgroup_file, CgroupAttachMode::Single) {
+                        Ok(id) => (id, "Single"),
+                        Err(e2) => {
+                            error!(
+                                "Failed to attach cgroup hook '{}' (AllowMultiple: {e1}, Single: {e2})",
+                                name
+                            );
+                            continue;
                         }
+                    },
+                };
+                match p.take_link(link_id) {
+                    Ok(link) => {
+                        if let Ok(mut guard) = self.cgroup_sock_links.lock() {
+                            guard.push(link);
+                        }
+                        attached_count += 1;
+                        info!("Attached cgroup hook '{}' (mode: {})", name, mode_name);
+                    }
+                    Err(e) => {
+                        error!("Failed to take link for cgroup hook '{}': {e}", name);
                     }
                 }
             }
@@ -798,23 +828,54 @@ pub mod linux {
                 "tproxy_wan_cg_sendmsg4",
                 "tproxy_wan_cg_sendmsg6",
             ] {
-                if let Some(prog) = bpf.program_mut(name) {
-                    if let Ok(p) = <&mut CgroupSockAddr>::try_from(prog) {
-                        if p.load().is_ok() {
-                            if let Ok(link_id) = p.attach(&cgroup_file, CgroupAttachMode::Single) {
-                                if let Ok(link) = p.take_link(link_id) {
-                                    if let Ok(mut guard) = self.cgroup_sock_addr_links.lock() {
-                                        guard.push(link);
-                                    }
-                                    debug!("Attached cgroup hook '{}'", name);
-                                }
-                            }
+                let Some(prog) = bpf.program_mut(name) else {
+                    error!("Cgroup program '{}' not found in eBPF object", name);
+                    continue;
+                };
+                let p: &mut CgroupSockAddr = match prog.try_into() {
+                    Ok(p) => p,
+                    Err(e) => {
+                        error!("Failed to convert program '{}' to CgroupSockAddr: {e}", name);
+                        continue;
+                    }
+                };
+                if let Err(e) = p.load() {
+                    error!("Failed to load cgroup program '{}': {e}", name);
+                    continue;
+                }
+                let (link_id, mode_name) = match p.attach(&cgroup_file, CgroupAttachMode::AllowMultiple) {
+                    Ok(id) => (id, "AllowMultiple"),
+                    Err(e1) => match p.attach(&cgroup_file, CgroupAttachMode::Single) {
+                        Ok(id) => (id, "Single"),
+                        Err(e2) => {
+                            error!(
+                                "Failed to attach cgroup hook '{}' (AllowMultiple: {e1}, Single: {e2})",
+                                name
+                            );
+                            continue;
                         }
+                    },
+                };
+                match p.take_link(link_id) {
+                    Ok(link) => {
+                        if let Ok(mut guard) = self.cgroup_sock_addr_links.lock() {
+                            guard.push(link);
+                        }
+                        attached_count += 1;
+                        info!("Attached cgroup hook '{}' (mode: {})", name, mode_name);
+                    }
+                    Err(e) => {
+                        error!("Failed to take link for cgroup hook '{}': {e}", name);
                     }
                 }
             }
 
-            info!("Attached cgroup bypass & process tracking hooks to {}", cgroup_path);
+            if attached_count > 0 {
+                info!("Successfully attached {attached_count} cgroup programs to {}", cgroup_path);
+            } else {
+                warn!("No cgroup programs were successfully attached to {}", cgroup_path);
+            }
+
             Ok(())
         }
         /// Check whether a network interface is an Ethernet device (ARPHRD_ETHER = 1).
@@ -867,6 +928,42 @@ pub mod linux {
             Ok(())
         }
 
+        /// Attach sk_lookup program to daens namespace for transparent listener routing.
+        fn attach_sk_lookup(&mut self, netns: &crate::netns::DaeNs) -> Result<(), String> {
+            let Some(bpf) = self.bpf.as_mut() else {
+                return Err("eBPF not loaded".to_string());
+            };
+
+            let Some(prog) = bpf.program_mut("tproxy_sk_lookup") else {
+                return Err("Program 'tproxy_sk_lookup' not found in eBPF object".to_string());
+            };
+
+            let p: &mut SkLookup = prog
+                .try_into()
+                .map_err(|e| format!("Program 'tproxy_sk_lookup' is not a SkLookup: {e}"))?;
+
+            p.load()
+                .map_err(|e| format!("Failed to load 'tproxy_sk_lookup': {e}"))?;
+
+            let netns_file = netns
+                .dae_file()
+                .map_err(|e| format!("Failed to get daens fd: {e}"))?;
+
+            let link_id = p
+                .attach(&netns_file)
+                .map_err(|e| format!("Failed to attach sk_lookup to daens: {e}"))?;
+
+            let link = p
+                .take_link(link_id)
+                .map_err(|e| format!("Failed to take sk_lookup link: {e}"))?;
+
+            if let Ok(mut guard) = self.sk_lookup_link.lock() {
+                *guard = Some(link);
+            }
+            info!("Attached sk_lookup program 'tproxy_sk_lookup' to daens namespace");
+            Ok(())
+        }
+
         /// Detach all active TC and cgroup links and stop event consumer.
         pub fn unload(&self) {
             info!("Unloading all eBPF TC and cgroup links...");
@@ -881,6 +978,9 @@ pub mod linux {
             }
             if let Ok(mut guard) = self.cgroup_sock_addr_links.lock() {
                 guard.clear();
+            }
+            if let Ok(mut guard) = self.sk_lookup_link.lock() {
+                *guard = None;
             }
             info!("All eBPF links detached successfully");
         }
@@ -959,8 +1059,14 @@ pub mod linux {
 
                     match ev.type_ {
                         t if t == DaeEventType::Redirected as u32 => {
+                            let dir = if ev.outbound == 1 {
+                                "WAN-Egress(Local)"
+                            } else {
+                                "LAN-Ingress(Forward)"
+                            };
                             info!(
                                 target: "clash-ebpf",
+                                dir = dir,
                                 pid = ev.pid,
                                 pname = %pname,
                                 proto = ev.l4proto,
@@ -1028,16 +1134,12 @@ pub mod non_linux {
             _param: &DaeParam,
             _lan_interfaces: &[String],
             _wan_interface: Option<&str>,
-            _bypass_ports: &[u16],
             _bypass_src_ports: &[u16],
             _bypass_dst_ports: &[u16],
-            _bypass_ips: &[String],
             _bypass_src_ips: &[String],
             _bypass_dst_ips: &[String],
-            _proxy_ports: &[u16],
             _proxy_src_ports: &[u16],
             _proxy_dst_ports: &[u16],
-            _proxy_ips: &[String],
             _proxy_src_ips: &[String],
             _proxy_dst_ips: &[String],
             _proxy_processes: &[String],

@@ -61,13 +61,11 @@ impl EbpfInbound {
         self.offloader
             .get_or_init(|| async {
                 let rule_providers = self.dispatcher.router().get_rule_providers();
-                let bypass_ips =
-                    resolve_and_aggregate_ip_cidrs(&self.config.bypass_ips, rule_providers);
                 let bypass_dst_ips =
-                    resolve_and_aggregate_ip_cidrs(&self.config.bypass_dst_ips, rule_providers);
+                    resolve_and_aggregate_ip_cidrs(&self.config.target.bypass_dst_ips, rule_providers);
 
                 let mut trie = CidrTrie::new();
-                for ip in bypass_ips.iter().chain(bypass_dst_ips.iter()) {
+                for ip in bypass_dst_ips.iter() {
                     trie.insert(ip);
                 }
 
@@ -85,29 +83,27 @@ impl EbpfInbound {
     async fn get_or_init_listener(&self) -> std::io::Result<Arc<clash_ebpf::EbpfListener>> {
         self.listener
             .get_or_try_init(|| async {
-                use clash_ebpf::{EbpfConfig as CoreEbpfConfig, EbpfManager};
+                use clash_ebpf::{
+                    EbpfConfig as CoreEbpfConfig, EbpfHostConfig as CoreEbpfHostConfig,
+                    EbpfLanConfig as CoreEbpfLanConfig, EbpfTargetConfig as CoreEbpfTargetConfig,
+                    EbpfManager,
+                };
 
                 let rule_providers = self.dispatcher.router().get_rule_providers();
 
-                let bypass_ips =
-                    resolve_and_aggregate_ip_cidrs(&self.config.bypass_ips, rule_providers);
                 let bypass_src_ips =
-                    resolve_and_aggregate_ip_cidrs(&self.config.bypass_src_ips, rule_providers);
+                    resolve_and_aggregate_ip_cidrs(&self.config.lan.bypass_src_ips, rule_providers);
                 let bypass_dst_ips =
-                    resolve_and_aggregate_ip_cidrs(&self.config.bypass_dst_ips, rule_providers);
-                let proxy_ips =
-                    resolve_and_aggregate_ip_cidrs(&self.config.proxy_ips, rule_providers);
+                    resolve_and_aggregate_ip_cidrs(&self.config.target.bypass_dst_ips, rule_providers);
                 let proxy_src_ips =
-                    resolve_and_aggregate_ip_cidrs(&self.config.proxy_src_ips, rule_providers);
+                    resolve_and_aggregate_ip_cidrs(&self.config.lan.proxy_src_ips, rule_providers);
                 let proxy_dst_ips =
-                    resolve_and_aggregate_ip_cidrs(&self.config.proxy_dst_ips, rule_providers);
+                    resolve_and_aggregate_ip_cidrs(&self.config.target.proxy_dst_ips, rule_providers);
 
                 info!(
-                    "eBPF IP configs resolved & aggregated -> bypass_ips: {}, bypass_src_ips: {}, bypass_dst_ips: {}, proxy_ips: {}, proxy_src_ips: {}, proxy_dst_ips: {}",
-                    bypass_ips.len(),
+                    "eBPF IP configs resolved & aggregated -> bypass_src_ips: {}, bypass_dst_ips: {}, proxy_src_ips: {}, proxy_dst_ips: {}",
                     bypass_src_ips.len(),
                     bypass_dst_ips.len(),
-                    proxy_ips.len(),
                     proxy_src_ips.len(),
                     proxy_dst_ips.len()
                 );
@@ -118,22 +114,25 @@ impl EbpfInbound {
                     wan_interface: self.config.wan_interface.clone(),
                     tproxy_port: self.config.tproxy_port,
                     tproxy_udp_port: self.config.tproxy_udp_port,
-                    bypass_ports: self.config.bypass_ports.clone(),
-                    bypass_src_ports: self.config.bypass_src_ports.clone(),
-                    bypass_dst_ports: self.config.bypass_dst_ports.clone(),
-                    bypass_ips,
-                    bypass_src_ips,
-                    bypass_dst_ips,
-                    proxy_ports: self.config.proxy_ports.clone(),
-                    proxy_src_ports: self.config.proxy_src_ports.clone(),
-                    proxy_dst_ports: self.config.proxy_dst_ports.clone(),
-                    proxy_ips,
-                    proxy_src_ips,
-                    proxy_dst_ips,
                     auto_direct_offload: self.config.auto_direct_offload,
-                    proxy_local: self.config.proxy_local,
-                    proxy_processes: self.config.proxy_processes.clone(),
-                    bypass_processes: self.config.bypass_processes.clone(),
+                    routing_mark: self.config.routing_mark,
+                    lan: CoreEbpfLanConfig {
+                        bypass_src_ports: self.config.lan.bypass_src_ports.clone(),
+                        proxy_src_ports: self.config.lan.proxy_src_ports.clone(),
+                        bypass_src_ips,
+                        proxy_src_ips,
+                    },
+                    target: CoreEbpfTargetConfig {
+                        bypass_dst_ports: self.config.target.bypass_dst_ports.clone(),
+                        proxy_dst_ports: self.config.target.proxy_dst_ports.clone(),
+                        bypass_dst_ips,
+                        proxy_dst_ips,
+                    },
+                    host: CoreEbpfHostConfig {
+                        proxy_local: self.config.host.proxy_local,
+                        proxy_processes: self.config.host.proxy_processes.clone(),
+                        bypass_processes: self.config.host.bypass_processes.clone(),
+                    },
                 };
 
                 let mut manager = EbpfManager::new(core_config);
@@ -235,6 +234,7 @@ impl InboundHandlerTrait for EbpfInbound {
                             typ: Type::Ebpf,
                             source: session_info.source,
                             destination: dst.into(),
+                            so_mark: Some(clash_ebpf::DAE_BYPASS_MARK),
                             ..Default::default()
                         };
 
@@ -277,6 +277,7 @@ impl InboundHandlerTrait for EbpfInbound {
                 network: Network::Udp,
                 typ: Type::Ebpf,
                 iface: default_outbound.clone(),
+                so_mark: Some(clash_ebpf::DAE_BYPASS_MARK),
                 ..Default::default()
             };
 
