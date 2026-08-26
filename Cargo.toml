@@ -18,11 +18,11 @@ exclude = ["clash-ebpf-bpf"]
 
 
 [workspace.package]
-version = "0.10.7"
-repository = "https://github.com/Watfaq/clash-rs.git"
+version = "0.20.0-alpha"
+repository = "https://github.com/CHKayanami/clash-rs"
 edition = "2024"
 authors = ["https://github.com/Watfaq/clash-rs/graphs/contributors"]
-homepage = "https://github.com/watfaq/clash-rs"
+homepage = "https://github.com/CHKayanami/clash-rs"
 
 [profile.release]
 opt-level = 3

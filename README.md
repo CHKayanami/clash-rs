@@ -21,6 +21,7 @@ A custom protocol, rule based network proxy software.
 > **About this Fork**:
 > - ⚡ **Performance & Stability**: Extensively refactored and performance-tuned with rewritten core protocol stacks.
 > - 🚀 **New Features**: Shadowsocks UOT (UDP-over-TCP), Domain Sniffing (TLS SNI / HTTP Host / QUIC SNI), H2MUX, TUN System Stack, etc.
+> - ⚡ **eBPF Kernel Transparent Proxy**: High-performance in-kernel transparent proxy inbound powered by eBPF with direct fast-path offload (Linux only).
 > - 🪶 **Minimal Build**: Lightweight by design; excludes optional protocols (`SSH`, `WireGuard`, `Tailscale`, `Shadowquic`, `Tor`).
 > - 📖 **Configuration Reference**: See [full.yaml](https://github.com/CHKayanami/clash-rs/blob/master/clash-bin/tests/data/config/full.yaml).
 
@@ -29,8 +30,9 @@ A custom protocol, rule based network proxy software.
 - 🌈 Flexible traffic routing rules based off source/destination IP/Domain/GeoIP etc.
 - 📦 Local anti spoofing DNS with support of UDP/TCP/DoH/DoT remote, and expose it as a local UDP/TCP/DoH/DoT server.
 - 🔍 Domain Sniffer for TLS SNI, HTTP Host, and QUIC Initial SNI decryption to enable accurate routing for transparent proxies.
+- ⚡ **eBPF In-Kernel Transparent Proxy**: Wire-rate packet interception via TC Ingress/Egress and Cgroup eBPF hooks with direct kernel fast-path offload to eliminate userspace overhead.
 - ⚙️ AnyTLS/Hysteria2/Shadowquic/Shadowsocks/Socks5(TCP/UDP)/SSH/Tailscale/tor(onion)/Trojan/Tuic/VLess/Vmess/Wireguard(userspace) outbound support with different underlying transports(gRPC/TLS/H2/WebSocket/etc.).
-- 🔀 Multiple inbound modes: HTTP, SOCKS5, Mixed, Shadowsocks, AnyTLS, Redir, TProxy, and TUN (utun) for transparent proxying.
+- 🔀 Multiple inbound modes: HTTP, SOCKS5, Mixed, Shadowsocks, AnyTLS, Redir, TProxy, eBPF, and TUN (utun) for transparent proxying.
 - 🌍 Dynamic remote rule/proxy loader.
 - 🎵 Tracing with Jaeger
 
@@ -45,6 +47,7 @@ A custom protocol, rule based network proxy software.
 | `mixed` | HTTP + SOCKS5 on a single port | |
 | `shadowsocks` | Shadowsocks inbound with multi-user support | `shadowsocks` feature |
 | `anytls` | AnyTLS inbound with multi-user support, GFW fallback camouflage | |
+| `ebpf` | eBPF in-kernel transparent proxy (zero-copy / line-rate) | Linux; `ebpf` feature |
 | `tun` | TUN device for transparent proxying | All platforms |
 | `tproxy` | Transparent proxy (TCP + UDP) | Linux; `tproxy` feature |
 | `redir` | TCP redirect | Linux; `redir` feature |

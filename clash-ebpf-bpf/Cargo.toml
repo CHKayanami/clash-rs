@@ -1,6 +1,6 @@
 [package]
 name = "clash-ebpf-bpf"
-version = "0.10.7"
+version = "0.20.0-alpha"
 edition = "2024"
 license = "MIT"
 

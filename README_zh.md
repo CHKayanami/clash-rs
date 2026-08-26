@@ -21,6 +21,7 @@
 > **本 Fork 分支特性与说明**：
 > - ⚡ **性能与稳定性优化**：针对核心路径进行了大量重构与性能调优，重写了部分协议栈实现。
 > - 🚀 **新功能特性**：新增 Shadowsocks UOT (UDP-over-TCP)、域名嗅探（TLS SNI / HTTP Host / QUIC SNI）、H2MUX 、TUN system stack。
+> - ⚡ **eBPF 内核透明代理**：新增基于 eBPF 的高性能透明代理入站，支持内核态直连快路径决策（Direct Fast-Path）（仅限 Linux）。
 > - 🪶 **Minimal 轻量版本**：默认精简，不包含以下协议：`SSH`、`WireGuard`、`Tailscale`、`Shadowquic`、`Tor`。
 > - 📖 **完整配置参考**：请参阅 [full.yaml](https://github.com/CHKayanami/clash-rs/blob/master/clash-bin/tests/data/config/full.yaml)。
 
@@ -29,8 +30,9 @@
 - 🌈 **灵活的路由分流**：基于源/目标 IP、域名、GeoIP、GeoSite、Rule-Set 等规则进行精确流量调度。
 - 📦 **本地防污染 DNS**：支持 UDP / TCP / DoH / DoT / DoH3 上游，并可作为本地 DNS 服务器对外暴露服务；支持 Fake-IP、策略分流（`nameserver-policy`）与纯 IP 反查。
 - 🔍 **域名嗅探（Domain Sniffer）**：从 TCP/UDP 首包中零拷贝解密提取 TLS SNI、HTTP Host、QUIC Initial SNI，无缝支持透明代理域名还原与分流规则匹配。
+- ⚡ **eBPF 内核线速透明代理**：利用 TC Ingress/Egress 与 Cgroup eBPF Hook 拦截转发流量，并在内核态完成直连 IP 规则快路径转发（Direct Offload），避免用户态开销与数据包拷贝。
 - ⚙️ **丰富的出站协议支持**：AnyTLS / Hysteria2 / Shadowquic / Shadowsocks / Socks5(TCP/UDP) / SSH / Tailscale / Tor(onion) / Trojan / Tuic / VLess / VMess / WireGuard(userspace)，支持各类底层传输（gRPC / TLS / HTTP/2 / WebSocket / REALITY 等）。
-- 🔀 **多样化入站模式**：HTTP、SOCKS5、Mixed、Shadowsocks、AnyTLS、Redir、TProxy 以及全平台 TUN (utun) 透明代理。
+- 🔀 **多样化入站模式**：HTTP、SOCKS5、Mixed、Shadowsocks、AnyTLS、Redir、TProxy、eBPF 以及全平台 TUN (utun) 透明代理。
 - 🌍 **动态远程规则/节点加载**：支持订阅与 Rule-Provider 动态更新。
 - 🎵 **分布式追踪**：集成 Jaeger Tracing。
 
@@ -45,6 +47,7 @@
 | `mixed` | 单端口混合 HTTP + SOCKS5 | |
 | `shadowsocks` | Shadowsocks 入站（支持多用户） | `shadowsocks` 特性 |
 | `anytls` | AnyTLS 入站（支持多用户与 GFW 回落伪装） | |
+| `ebpf` | eBPF 内核级透明代理（零拷贝线速转发） | Linux；`ebpf` 特性 |
 | `tun` | TUN 虚拟网卡设备（透明代理） | 全平台支持 |
 | `tproxy` | TProxy 透明代理（TCP + UDP） | Linux；`tproxy` 特性 |
 | `redir` | TCP 重定向 (Redirect) | Linux；`redir` 特性 |

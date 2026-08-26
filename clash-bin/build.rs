@@ -19,8 +19,9 @@ fn main() {
     let version = match (git_ref.as_deref(), git_sha.as_deref()) {
         (Some("refs/heads/master"), Some(sha)) => {
             let short_sha = &sha[..7.min(sha.len())];
+            let base_ver = env!("CARGO_PKG_VERSION").trim_end_matches("-alpha");
             // Nightly release below
-            format!("{}-alpha+sha.{short_sha}", env!("CARGO_PKG_VERSION"))
+            format!("{base_ver}-alpha+sha.{short_sha}")
         }
         _ => env!("CARGO_PKG_VERSION").into(),
     };

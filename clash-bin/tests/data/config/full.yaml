@@ -393,6 +393,24 @@ ebpf:
   # bypass user space completely and forward directly in kernel space at wire speed.
   auto-direct-offload: true
 
+  # ── Kernel Fast-Path Bypass Lists (DSCP & FWMark) ──────────────────────────
+  # DSCP values blacklist: Packets with matching DSCP (IPv4 TOS / IPv6 Traffic Class)
+  # are bypassed directly in kernel space without being redirected to proxy.
+  # Typical use case: BT/P2P download clients configured with DSCP marking (e.g. DSCP 4).
+  # Alias: bypass-dscp, bypass-dscps
+  # bypass-dscp:
+  #   - 4
+  #   - 46
+
+  # FWMark / skb->mark blacklist: Packets marked with matching fwmarks are bypassed
+  # directly in the kernel at the earliest hook entrypoint with zero packet-parsing overhead.
+  # Supports decimal and hexadecimal integers.
+  # Alias: bypass-fwmark, bypass-fwmarks, bypass-mark, bypass-marks
+  # bypass-fwmark:
+  #   - 0x200
+  #   - 0x1000
+  #   - 512
+
   # ── 1. LAN Ingress Policies (针对局域网客户端设备的控制) ─────────────────────
   lan:
     # Source ports to bypass (e.g. locally hosted service ports, local SSH/DHCP):
@@ -406,12 +424,15 @@ ebpf:
     # Source ports to proxy (if set, ONLY traffic from these source ports will be proxied):
     # proxy-src-ports: []
 
-    # Specific LAN client IPs/CIDRs to bypass (direct connection, no proxy):
+    # Specific LAN client IPs/CIDRs to bypass (direct connection, no proxy).
+    # Supports single IP, CIDR, and rule-set references (e.g. "rule-set:provider_name").
     # (Alias: bypass-clients)
     # bypass-src-ips:
     #   - "192.168.1.100"
+    #   - "rule-set:lan-bypass-clients"
 
-    # Specific LAN client IPs/CIDRs to proxy (if set, ONLY these clients are proxied):
+    # Specific LAN client IPs/CIDRs to proxy (if set, ONLY these clients are proxied).
+    # Supports single IP, CIDR, and rule-set references (e.g. "rule-set:provider_name").
     # (Alias: proxy-clients)
     # proxy-src-ips:
     #   - "192.168.1.0/24"
@@ -432,6 +453,8 @@ ebpf:
     #   - 8443
 
     # Specific destination IPs/CIDRs to bypass (direct connection).
+    # Supports single IP, CIDR, and rule-set references (e.g. "rule-set:direct-ips").
+    # All entries are automatically aggregated and merged into optimal subnets.
     # Default bypasses:
     #   - IPv4: 127.0.0.0/8 (loopback), 169.254.0.0/16 (link-local), 224.0.0.0/4 (multicast)
     #   - IPv6: ::1/128 (loopback), fe80::/10 (link-local), ff00::/8 (multicast)
@@ -446,8 +469,10 @@ ebpf:
     #   - "192.168.0.0/16"
     #   - "10.0.0.0/8"
     #   - "172.16.0.0/12"
+    #   - "rule-set:direct-ips"
 
-    # Destination IP whitelists (if set, ONLY traffic to matching IPs will be proxied):
+    # Destination IP whitelists (if set, ONLY traffic to matching IPs will be proxied).
+    # Supports single IP, CIDR, and rule-set references (e.g. "rule-set:proxy-ips").
     # proxy-dst-ips: []
 
   # ── 3. Host Local Machine Policies (网关宿主机本机流量与进程控制) ─────────────
