@@ -760,23 +760,22 @@ impl ClashResolver for EnhancedResolver {
                 CacheLookup::Stale(template) => {
                     debug!(domain = %host, ?qtype, "DNS exchange cache stale, initiating background refresh");
                     let raw_key = query.canonical_wire_arc();
-                    if let FlightRole::Leader(mut leader) = self.singleflight.acquire(FlightKey::Refresh(raw_key)) {
+                    if let FlightRole::Leader(mut leader) = self.singleflight.acquire(FlightKey::Refresh(Arc::clone(&raw_key))) {
                         let query_clone = query.clone();
-                        let raw_clone = raw_query.to_vec();
-                        let host_clone = host.to_string();
                         let this = self.clone();
 
                         tokio::spawn(async move {
-                            if let Ok(fresh_resp) = this.exchange_no_cache(&query_clone, &raw_clone).await {
+                            if let Ok(fresh_resp) = this.exchange_no_cache(&query_clone, &raw_key).await {
                                 let fresh_template = ResponseTemplate::validate(&query_clone, &fresh_resp)
                                     .ok()
                                     .map(Arc::new);
                                 if let Some(ref tmpl) = fresh_template {
                                     leader.publish(Arc::clone(tmpl));
                                 }
+                                let domain = query_clone.qdomain().unwrap_or_default();
                                 this.process_fresh_response(
                                     &query_clone,
-                                    &host_clone,
+                                    domain,
                                     &fresh_resp,
                                     fresh_template,
                                 )

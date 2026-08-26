@@ -1,3 +1,4 @@
+use futures::stream::{FuturesUnordered, StreamExt};
 use std::sync::Arc;
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -31,34 +32,61 @@ where
     if let Some(udp_addr) = listen.udp {
         let socket = Arc::new(UdpSocket::bind(udp_addr).await?);
         info!("DNS UDP server listening on {}", udp_addr);
-        let ex = exchanger.clone();
-        let semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_UDP_QUERIES));
+        let num_workers = std::thread::available_parallelism()
+            .map_or(32, |n| (n.get() * 4).clamp(16, 128));
+        let mut senders = Vec::with_capacity(num_workers);
+        let per_worker_capacity = (MAX_CONCURRENT_UDP_QUERIES / num_workers).max(32);
+
+        for _ in 0..num_workers {
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<(bytes::Bytes, std::net::SocketAddr)>(per_worker_capacity);
+            senders.push(tx);
+            let ex = exchanger.clone();
+            let socket = Arc::clone(&socket);
+            tasks.push(tokio::spawn(async move {
+                let mut inflight = FuturesUnordered::new();
+                loop {
+                    tokio::select! {
+                        biased;
+                        Some(()) = inflight.next(), if !inflight.is_empty() => {}
+                        msg = rx.recv() => {
+                            match msg {
+                                Some((req, src)) => {
+                                    let ex = ex.clone();
+                                    let socket = Arc::clone(&socket);
+                                    inflight.push(async move {
+                                        match ex.exchange(&req).await {
+                                            Ok(resp) => {
+                                                let _ = socket.send_to(&resp, src).await;
+                                            }
+                                            Err(e) => {
+                                                debug!("DNS UDP query from {} failed: {}", src, e);
+                                            }
+                                        }
+                                    });
+                                }
+                                None => {
+                                    while inflight.next().await.is_some() {}
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }));
+        }
+
+        let mut round_robin = 0usize;
         tasks.push(tokio::spawn(async move {
             let mut buf = [0u8; 4096];
             loop {
                 match socket.recv_from(&mut buf).await {
                     Ok((len, src)) => {
-                        let permit = match semaphore.clone().try_acquire_owned() {
-                            Ok(p) => p,
-                            Err(_) => {
-                                debug!("DNS UDP query dropped due to concurrency saturation");
-                                continue;
-                            }
-                        };
                         let req = bytes::Bytes::copy_from_slice(&buf[..len]);
-                        let ex = ex.clone();
-                        let socket = Arc::clone(&socket);
-                        tokio::spawn(async move {
-                            let _permit = permit;
-                            match ex.exchange(&req).await {
-                                Ok(resp) => {
-                                    let _ = socket.send_to(&resp, src).await;
-                                }
-                                Err(e) => {
-                                    debug!("DNS UDP query from {} failed: {}", src, e);
-                                }
-                            }
-                        });
+                        let idx = round_robin % num_workers;
+                        round_robin = round_robin.wrapping_add(1);
+                        if senders[idx].try_send((req, src)).is_err() {
+                            debug!("DNS UDP query dropped due to concurrency saturation");
+                        }
                     }
                     Err(e) => {
                         error!("DNS UDP socket recv error: {}", e);
