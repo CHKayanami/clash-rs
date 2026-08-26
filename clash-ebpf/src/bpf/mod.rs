@@ -1,7 +1,7 @@
 //! eBPF program management and TC/cgroup attachment using Aya.
 
 pub use clash_ebpf_common as common;
-pub use clash_ebpf_common::{DaeParam, DAE_BYPASS_MARK, DAE_TPROXY_MARK};
+pub use clash_ebpf_common::{DAE_BYPASS_MARK, DAE_TPROXY_MARK, DaeParam};
 
 pub const EMBEDDED_BPF_OBJECT: &[u8] = include_bytes!(env!("CLASH_EBPF_OBJECT"));
 
@@ -51,7 +51,11 @@ pub mod linux {
         flags: u64,
     }
 
-    fn bpf_update_elem_raw<K, V>(map_fd: RawFd, key: &K, value: &V) -> Result<(), i64> {
+    fn bpf_update_elem_raw<K, V>(
+        map_fd: RawFd,
+        key: &K,
+        value: &V,
+    ) -> Result<(), i64> {
         let mut attr: BpfElemAttr = unsafe { core::mem::zeroed() };
         attr.map_fd = map_fd as u32;
         attr.key = key as *const K as u64;
@@ -65,7 +69,9 @@ pub mod linux {
             )
         };
         if ret < 0 {
-            Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO) as i64)
+            Err(std::io::Error::last_os_error()
+                .raw_os_error()
+                .unwrap_or(libc::EIO) as i64)
         } else {
             Ok(())
         }
@@ -84,7 +90,9 @@ pub mod linux {
             )
         };
         if ret < 0 {
-            Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO) as i64)
+            Err(std::io::Error::last_os_error()
+                .raw_os_error()
+                .unwrap_or(libc::EIO) as i64)
         } else {
             Ok(())
         }
@@ -132,7 +140,10 @@ pub mod linux {
             || errno == libc::ENOSYS as i64
     }
 
-    unsafe fn bpf_batch_syscall(cmd: libc::c_long, attr: &mut BpfBatchAttr) -> Result<(), i64> {
+    unsafe fn bpf_batch_syscall(
+        cmd: libc::c_long,
+        attr: &mut BpfBatchAttr,
+    ) -> Result<(), i64> {
         let ret = unsafe {
             libc::syscall(
                 libc::SYS_bpf,
@@ -142,7 +153,9 @@ pub mod linux {
             )
         };
         if ret < 0 {
-            Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO) as i64)
+            Err(std::io::Error::last_os_error()
+                .raw_os_error()
+                .unwrap_or(libc::EIO) as i64)
         } else {
             Ok(())
         }
@@ -201,7 +214,9 @@ pub mod linux {
         attr.count = keys.len() as u32;
         let result = unsafe { bpf_batch_syscall(BPF_MAP_UPDATE_BATCH, &mut attr) };
         if !cap.observe(result) {
-            debug!("BPF_MAP_UPDATE_BATCH unsupported on this kernel, falling back to per-element insert");
+            debug!(
+                "BPF_MAP_UPDATE_BATCH unsupported on this kernel, falling back to per-element insert"
+            );
             return Ok(false);
         }
         result.map_err(|e| format!("BPF_MAP_UPDATE_BATCH failed with errno={e}"))?;
@@ -222,7 +237,9 @@ pub mod linux {
         attr.count = keys.len() as u32;
         let result = unsafe { bpf_batch_syscall(BPF_MAP_DELETE_BATCH, &mut attr) };
         if !cap.observe(result) {
-            debug!("BPF_MAP_DELETE_BATCH unsupported on this kernel, falling back to per-element remove");
+            debug!(
+                "BPF_MAP_DELETE_BATCH unsupported on this kernel, falling back to per-element remove"
+            );
             return Ok(false);
         }
         match result {
@@ -291,11 +308,16 @@ pub mod linux {
             netns: Option<&crate::netns::linux::DaeNs>,
         ) -> Result<(), String> {
             if obj_bytes.is_empty() {
-                warn!("eBPF ELF bytecode is empty; skipping eBPF kernel hooks attachment");
+                warn!(
+                    "eBPF ELF bytecode is empty; skipping eBPF kernel hooks attachment"
+                );
                 return Ok(());
             }
 
-            info!("Loading embedded eBPF programs ({} bytes)...", obj_bytes.len());
+            info!(
+                "Loading embedded eBPF programs ({} bytes)...",
+                obj_bytes.len()
+            );
             let mut loader = EbpfLoader::new();
             let mut bpf = loader
                 .load(obj_bytes)
@@ -305,7 +327,10 @@ pub mod linux {
             if let Some(map) = bpf.map_mut("DAE_PARAM") {
                 if let Ok(mut param_map) = Array::<_, DaeParam>::try_from(map) {
                     let _ = param_map.set(0, *param, 0);
-                    debug!("DAE_PARAM map initialized: tproxy_port={}, dae0_ifindex={}", param.tproxy_port, param.dae0_ifindex);
+                    debug!(
+                        "DAE_PARAM map initialized: tproxy_port={}, dae0_ifindex={}",
+                        param.tproxy_port, param.dae0_ifindex
+                    );
                 }
             }
 
@@ -316,7 +341,10 @@ pub mod linux {
                     for &port in bypass_src_ports {
                         let _ = port_map.insert(port, 1, 0);
                     }
-                    debug!("Configured {} source bypass ports in BPF map", bypass_src_ports.len() + 1);
+                    debug!(
+                        "Configured {} source bypass ports in BPF map",
+                        bypass_src_ports.len() + 1
+                    );
                 }
             }
 
@@ -327,7 +355,10 @@ pub mod linux {
                     for &port in bypass_dst_ports {
                         let _ = port_map.insert(port, 1, 0);
                     }
-                    debug!("Configured {} dest bypass ports in BPF map", bypass_dst_ports.len() + 1);
+                    debug!(
+                        "Configured {} dest bypass ports in BPF map",
+                        bypass_dst_ports.len() + 1
+                    );
                 }
             }
 
@@ -345,21 +376,30 @@ pub mod linux {
                             let _ = ip_trie.insert(&key, 1, 0);
                         }
                     }
-                    debug!("Configured {} source bypass IPv4 IP/CIDRs in BPF Trie map", bypass_src_ips.len());
+                    debug!(
+                        "Configured {} source bypass IPv4 IP/CIDRs in BPF Trie map",
+                        bypass_src_ips.len()
+                    );
                 }
             }
             if let Some(map) = bpf.map_mut("BYPASS_SRC_IP6S") {
                 if let Ok(mut ip_trie) = LpmTrie::<_, [u8; 16], u8>::try_from(map) {
                     for ip_str in bypass_src_ips {
                         if let Ok(net) = ipnet::Ipv6Net::from_str(ip_str) {
-                            let key = Key::new(net.prefix_len() as u32, net.network().octets());
+                            let key = Key::new(
+                                net.prefix_len() as u32,
+                                net.network().octets(),
+                            );
                             let _ = ip_trie.insert(&key, 1, 0);
                         } else if let Ok(ip) = Ipv6Addr::from_str(ip_str) {
                             let key = Key::new(128, ip.octets());
                             let _ = ip_trie.insert(&key, 1, 0);
                         }
                     }
-                    debug!("Configured {} source bypass IPv6 IP/CIDRs in BPF Trie map", bypass_src_ips.len());
+                    debug!(
+                        "Configured {} source bypass IPv6 IP/CIDRs in BPF Trie map",
+                        bypass_src_ips.len()
+                    );
                 }
             }
 
@@ -377,21 +417,30 @@ pub mod linux {
                             let _ = ip_trie.insert(&key, 1, 0);
                         }
                     }
-                    debug!("Configured {} dest bypass IPv4 IP/CIDRs in BPF Trie map", bypass_dst_ips.len());
+                    debug!(
+                        "Configured {} dest bypass IPv4 IP/CIDRs in BPF Trie map",
+                        bypass_dst_ips.len()
+                    );
                 }
             }
             if let Some(map) = bpf.map_mut("BYPASS_DST_IP6S") {
                 if let Ok(mut ip_trie) = LpmTrie::<_, [u8; 16], u8>::try_from(map) {
                     for ip_str in bypass_dst_ips {
                         if let Ok(net) = ipnet::Ipv6Net::from_str(ip_str) {
-                            let key = Key::new(net.prefix_len() as u32, net.network().octets());
+                            let key = Key::new(
+                                net.prefix_len() as u32,
+                                net.network().octets(),
+                            );
                             let _ = ip_trie.insert(&key, 1, 0);
                         } else if let Ok(ip) = Ipv6Addr::from_str(ip_str) {
                             let key = Key::new(128, ip.octets());
                             let _ = ip_trie.insert(&key, 1, 0);
                         }
                     }
-                    debug!("Configured {} dest bypass IPv6 IP/CIDRs in BPF Trie map", bypass_dst_ips.len());
+                    debug!(
+                        "Configured {} dest bypass IPv6 IP/CIDRs in BPF Trie map",
+                        bypass_dst_ips.len()
+                    );
                 }
             }
 
@@ -433,7 +482,10 @@ pub mod linux {
                 if let Ok(mut ip_trie) = LpmTrie::<_, [u8; 16], u8>::try_from(map) {
                     for ip_str in proxy_src_ips {
                         if let Ok(net) = ipnet::Ipv6Net::from_str(ip_str) {
-                            let key = Key::new(net.prefix_len() as u32, net.network().octets());
+                            let key = Key::new(
+                                net.prefix_len() as u32,
+                                net.network().octets(),
+                            );
                             let _ = ip_trie.insert(&key, 1, 0);
                         } else if let Ok(ip) = Ipv6Addr::from_str(ip_str) {
                             let key = Key::new(128, ip.octets());
@@ -463,7 +515,10 @@ pub mod linux {
                 if let Ok(mut ip_trie) = LpmTrie::<_, [u8; 16], u8>::try_from(map) {
                     for ip_str in proxy_dst_ips {
                         if let Ok(net) = ipnet::Ipv6Net::from_str(ip_str) {
-                            let key = Key::new(net.prefix_len() as u32, net.network().octets());
+                            let key = Key::new(
+                                net.prefix_len() as u32,
+                                net.network().octets(),
+                            );
                             let _ = ip_trie.insert(&key, 1, 0);
                         } else if let Ok(ip) = Ipv6Addr::from_str(ip_str) {
                             let key = Key::new(128, ip.octets());
@@ -483,7 +538,10 @@ pub mod linux {
                         key[..len].copy_from_slice(&bytes[..len]);
                         let _ = proc_map.insert(key, 1, 0);
                     }
-                    debug!("Configured {} proxy processes in BPF map", proxy_processes.len());
+                    debug!(
+                        "Configured {} proxy processes in BPF map",
+                        proxy_processes.len()
+                    );
                 }
             }
 
@@ -497,7 +555,10 @@ pub mod linux {
                         key[..len].copy_from_slice(&bytes[..len]);
                         let _ = proc_map.insert(key, 1, 0);
                     }
-                    debug!("Configured {} bypass processes in BPF map", bypass_processes.len());
+                    debug!(
+                        "Configured {} bypass processes in BPF map",
+                        bypass_processes.len()
+                    );
                 }
             }
 
@@ -507,7 +568,10 @@ pub mod linux {
                     for &dscp in bypass_dscps {
                         let _ = dscp_map.insert(dscp, 1, 0);
                     }
-                    debug!("Configured {} bypass DSCP values in BPF map", bypass_dscps.len());
+                    debug!(
+                        "Configured {} bypass DSCP values in BPF map",
+                        bypass_dscps.len()
+                    );
                 }
             }
 
@@ -517,7 +581,10 @@ pub mod linux {
                     for &fwmark in bypass_fwmarks {
                         let _ = fwmark_map.insert(fwmark, 1, 0);
                     }
-                    debug!("Configured {} bypass FWMark values in BPF map", bypass_fwmarks.len());
+                    debug!(
+                        "Configured {} bypass FWMark values in BPF map",
+                        bypass_fwmarks.len()
+                    );
                 }
             }
 
@@ -549,8 +616,13 @@ pub mod linux {
 
             // 14. Attach TC Ingress on configured/detected LAN interfaces (局域网入站拦截)
             let detected_lan_fallback;
-            let effective_lan = if lan_interfaces.is_empty() || lan_interfaces.iter().any(|s| s == "auto") {
-                detected_lan_fallback = crate::manager::detect_lan_interfaces(lan_interfaces, wan_interface);
+            let effective_lan = if lan_interfaces.is_empty()
+                || lan_interfaces.iter().any(|s| s == "auto")
+            {
+                detected_lan_fallback = crate::manager::detect_lan_interfaces(
+                    lan_interfaces,
+                    wan_interface,
+                );
                 &detected_lan_fallback[..]
             } else {
                 lan_interfaces
@@ -558,9 +630,16 @@ pub mod linux {
 
             for lan in effective_lan {
                 if !lan.is_empty() {
-                    let prog_name = if Self::iface_is_ethernet(lan) { "lan_ingress_l2" } else { "lan_ingress_l3" };
+                    let prog_name = if Self::iface_is_ethernet(lan) {
+                        "lan_ingress_l2"
+                    } else {
+                        "lan_ingress_l3"
+                    };
                     if let Err(e) = self.attach_tc_interface(lan, true, prog_name) {
-                        warn!("Failed to attach TC ingress ({}) on {}: {}", prog_name, lan, e);
+                        warn!(
+                            "Failed to attach TC ingress ({}) on {}: {}",
+                            prog_name, lan, e
+                        );
                     } else {
                         info!("Attached TC ingress ({}) on {}", prog_name, lan);
                     }
@@ -571,16 +650,26 @@ pub mod linux {
             let detected_wan_fallback;
             let effective_wan = match wan_interface {
                 Some("auto") | None | Some("") => {
-                    detected_wan_fallback = crate::manager::detect_default_wan_interface(lan_interfaces);
-                    detected_wan_fallback.as_deref().or_else(|| lan_interfaces.first().map(|s| s.as_str()))
+                    detected_wan_fallback =
+                        crate::manager::detect_default_wan_interface(lan_interfaces);
+                    detected_wan_fallback
+                        .as_deref()
+                        .or_else(|| lan_interfaces.first().map(|s| s.as_str()))
                 }
                 Some(wan) => Some(wan),
             };
             if let Some(wan) = effective_wan {
                 if !wan.is_empty() {
-                    let prog_name = if Self::iface_is_ethernet(wan) { "wan_egress_l2" } else { "wan_egress_l3" };
+                    let prog_name = if Self::iface_is_ethernet(wan) {
+                        "wan_egress_l2"
+                    } else {
+                        "wan_egress_l3"
+                    };
                     if let Err(e) = self.attach_tc_interface(wan, false, prog_name) {
-                        warn!("Failed to attach TC egress ({}) on {}: {}", prog_name, wan, e);
+                        warn!(
+                            "Failed to attach TC egress ({}) on {}: {}",
+                            prog_name, wan, e
+                        );
                     } else {
                         info!("Attached TC egress ({}) on {}", prog_name, wan);
                     }
@@ -624,9 +713,9 @@ pub mod linux {
 
             // 1. IPv4 Dynamic Bypass
             if !add_v4.is_empty() || !remove_v4.is_empty() {
-                let map = bpf
-                    .map("DYNAMIC_BYPASS_DST_IPS")
-                    .ok_or_else(|| "map 'DYNAMIC_BYPASS_DST_IPS' not found".to_string())?;
+                let map = bpf.map("DYNAMIC_BYPASS_DST_IPS").ok_or_else(|| {
+                    "map 'DYNAMIC_BYPASS_DST_IPS' not found".to_string()
+                })?;
                 let raw_fd = map_raw_fd(map);
 
                 if !add_v4.is_empty() {
@@ -641,16 +730,27 @@ pub mod linux {
                         } else {
                             &vec![1u8; keys.len()][..]
                         };
-                        handled = bpf_update_batch_raw(&self.cap_batch_update, raw_fd, &keys, values)?;
+                        handled = bpf_update_batch_raw(
+                            &self.cap_batch_update,
+                            raw_fd,
+                            &keys,
+                            values,
+                        )?;
                         if handled {
-                            debug!("Batch updated {} dynamic bypass IPv4s via BPF_MAP_UPDATE_BATCH", add_v4.len());
+                            debug!(
+                                "Batch updated {} dynamic bypass IPv4s via BPF_MAP_UPDATE_BATCH",
+                                add_v4.len()
+                            );
                         }
                     }
                     if !handled {
                         for ip in add_v4 {
                             let k = u32::from_ne_bytes(ip.octets());
                             if let Err(e) = bpf_update_elem_raw(raw_fd, &k, &1u8) {
-                                debug!("Failed to insert dynamic bypass IPv4 {}: errno={}", ip, e);
+                                debug!(
+                                    "Failed to insert dynamic bypass IPv4 {}: errno={}",
+                                    ip, e
+                                );
                             }
                         }
                     }
@@ -663,9 +763,16 @@ pub mod linux {
                         for ip in remove_v4 {
                             keys.push(u32::from_ne_bytes(ip.octets()));
                         }
-                        handled = bpf_delete_batch_raw(&self.cap_batch_delete, raw_fd, &keys)?;
+                        handled = bpf_delete_batch_raw(
+                            &self.cap_batch_delete,
+                            raw_fd,
+                            &keys,
+                        )?;
                         if handled {
-                            debug!("Batch removed {} dynamic bypass IPv4s via BPF_MAP_DELETE_BATCH", remove_v4.len());
+                            debug!(
+                                "Batch removed {} dynamic bypass IPv4s via BPF_MAP_DELETE_BATCH",
+                                remove_v4.len()
+                            );
                         }
                     }
                     if !handled {
@@ -679,32 +786,46 @@ pub mod linux {
 
             // 2. IPv6 Dynamic Bypass
             if !add_v6.is_empty() || !remove_v6.is_empty() {
-                let map = bpf
-                    .map("DYNAMIC_BYPASS_DST_IP6S")
-                    .ok_or_else(|| "map 'DYNAMIC_BYPASS_DST_IP6S' not found".to_string())?;
+                let map = bpf.map("DYNAMIC_BYPASS_DST_IP6S").ok_or_else(|| {
+                    "map 'DYNAMIC_BYPASS_DST_IP6S' not found".to_string()
+                })?;
                 let raw_fd = map_raw_fd(map);
 
                 if !add_v6.is_empty() {
                     let mut handled = false;
                     if !self.cap_batch_update.is_unsupported() {
                         let keys: &[[u8; 16]] = unsafe {
-                            std::slice::from_raw_parts(add_v6.as_ptr() as *const [u8; 16], add_v6.len())
+                            std::slice::from_raw_parts(
+                                add_v6.as_ptr() as *const [u8; 16],
+                                add_v6.len(),
+                            )
                         };
                         let values = if keys.len() <= ONES.len() {
                             &ONES[..keys.len()]
                         } else {
                             &vec![1u8; keys.len()][..]
                         };
-                        handled = bpf_update_batch_raw(&self.cap_batch_update, raw_fd, keys, values)?;
+                        handled = bpf_update_batch_raw(
+                            &self.cap_batch_update,
+                            raw_fd,
+                            keys,
+                            values,
+                        )?;
                         if handled {
-                            debug!("Batch updated {} dynamic bypass IPv6s via BPF_MAP_UPDATE_BATCH", add_v6.len());
+                            debug!(
+                                "Batch updated {} dynamic bypass IPv6s via BPF_MAP_UPDATE_BATCH",
+                                add_v6.len()
+                            );
                         }
                     }
                     if !handled {
                         for ip in add_v6 {
                             let k = ip.octets();
                             if let Err(e) = bpf_update_elem_raw(raw_fd, &k, &1u8) {
-                                debug!("Failed to insert dynamic bypass IPv6 {}: errno={}", ip, e);
+                                debug!(
+                                    "Failed to insert dynamic bypass IPv6 {}: errno={}",
+                                    ip, e
+                                );
                             }
                         }
                     }
@@ -714,11 +835,21 @@ pub mod linux {
                     let mut handled = false;
                     if !self.cap_batch_delete.is_unsupported() {
                         let keys: &[[u8; 16]] = unsafe {
-                            std::slice::from_raw_parts(remove_v6.as_ptr() as *const [u8; 16], remove_v6.len())
+                            std::slice::from_raw_parts(
+                                remove_v6.as_ptr() as *const [u8; 16],
+                                remove_v6.len(),
+                            )
                         };
-                        handled = bpf_delete_batch_raw(&self.cap_batch_delete, raw_fd, keys)?;
+                        handled = bpf_delete_batch_raw(
+                            &self.cap_batch_delete,
+                            raw_fd,
+                            keys,
+                        )?;
                         if handled {
-                            debug!("Batch removed {} dynamic bypass IPv6s via BPF_MAP_DELETE_BATCH", remove_v6.len());
+                            debug!(
+                                "Batch removed {} dynamic bypass IPv6s via BPF_MAP_DELETE_BATCH",
+                                remove_v6.len()
+                            );
                         }
                     }
                     if !handled {
@@ -748,42 +879,62 @@ pub mod linux {
                 return Err("eBPF not loaded".to_string());
             };
 
-            let map = bpf.map_mut("LISTEN_SOCKET_MAP")
+            let map = bpf
+                .map_mut("LISTEN_SOCKET_MAP")
                 .ok_or_else(|| "map 'LISTEN_SOCKET_MAP' not found".to_string())?;
             let mut sockets = SockMap::try_from(map)
                 .map_err(|e| format!("map 'LISTEN_SOCKET_MAP': {e}"))?;
 
             // TCP4 at key 0
             let tcp4_bfd = unsafe { BorrowedFd::borrow_raw(tcp4_fd) };
-            sockets.set(0, &tcp4_bfd, 0)
+            sockets
+                .set(0, &tcp4_bfd, 0)
                 .map_err(|e| format!("LISTEN_SOCKET_MAP set[0/TCP4]: {e}"))?;
-            info!(fd = tcp4_fd, key = 0, "Published TCP4 listener to LISTEN_SOCKET_MAP");
+            info!(
+                fd = tcp4_fd,
+                key = 0,
+                "Published TCP4 listener to LISTEN_SOCKET_MAP"
+            );
 
             // TCP6 at key 1
             if let Some(fd6) = tcp6_fd {
                 let tcp6_bfd = unsafe { BorrowedFd::borrow_raw(fd6) };
-                sockets.set(1, &tcp6_bfd, 0)
+                sockets
+                    .set(1, &tcp6_bfd, 0)
                     .map_err(|e| format!("LISTEN_SOCKET_MAP set[1/TCP6]: {e}"))?;
-                info!(fd = fd6, key = 1, "Published TCP6 listener to LISTEN_SOCKET_MAP");
+                info!(
+                    fd = fd6,
+                    key = 1,
+                    "Published TCP6 listener to LISTEN_SOCKET_MAP"
+                );
             }
 
             // UDP4 at key 2
             let udp4_bfd = unsafe { BorrowedFd::borrow_raw(udp4_fd) };
-            sockets.set(2, &udp4_bfd, 0)
+            sockets
+                .set(2, &udp4_bfd, 0)
                 .map_err(|e| format!("LISTEN_SOCKET_MAP set[2/UDP4]: {e}"))?;
-            info!(fd = udp4_fd, key = 2, "Published UDP4 listener to LISTEN_SOCKET_MAP");
+            info!(
+                fd = udp4_fd,
+                key = 2,
+                "Published UDP4 listener to LISTEN_SOCKET_MAP"
+            );
 
             // UDP6 at key 3
             if let Some(fd6) = udp6_fd {
                 let udp6_bfd = unsafe { BorrowedFd::borrow_raw(fd6) };
-                sockets.set(3, &udp6_bfd, 0)
+                sockets
+                    .set(3, &udp6_bfd, 0)
                     .map_err(|e| format!("LISTEN_SOCKET_MAP set[3/UDP6]: {e}"))?;
-                info!(fd = fd6, key = 3, "Published UDP6 listener to LISTEN_SOCKET_MAP");
+                info!(
+                    fd = fd6,
+                    key = 3,
+                    "Published UDP6 listener to LISTEN_SOCKET_MAP"
+                );
             }
 
             Ok(())
         }
-
 
         /// Attach cgroup socket programs to root cgroup2 for process bypass and tracking.
         fn attach_cgroup(&mut self) -> Result<(), String> {
@@ -792,16 +943,20 @@ pub mod linux {
             };
 
             let Some(cgroup_path) = Self::detect_cgroup_path() else {
-                warn!("cgroup2 not mounted; cgroup bypass & process tracking hooks skipped");
+                warn!(
+                    "cgroup2 not mounted; cgroup bypass & process tracking hooks skipped"
+                );
                 return Ok(());
             };
 
-            let cgroup_file = File::open(&cgroup_path)
-                .map_err(|e| format!("Failed to open cgroup {}: {e}", cgroup_path))?;
+            let cgroup_file = File::open(&cgroup_path).map_err(|e| {
+                format!("Failed to open cgroup {}: {e}", cgroup_path)
+            })?;
 
             let mut attached_count = 0;
 
-            for name in &["tproxy_wan_cg_sock_create", "tproxy_wan_cg_sock_release"] {
+            for name in &["tproxy_wan_cg_sock_create", "tproxy_wan_cg_sock_release"]
+            {
                 let Some(prog) = bpf.program_mut(name) else {
                     error!("Cgroup program '{}' not found in eBPF object", name);
                     continue;
@@ -809,7 +964,10 @@ pub mod linux {
                 let p: &mut CgroupSock = match prog.try_into() {
                     Ok(p) => p,
                     Err(e) => {
-                        error!("Failed to convert program '{}' to CgroupSock: {e}", name);
+                        error!(
+                            "Failed to convert program '{}' to CgroupSock: {e}",
+                            name
+                        );
                         continue;
                     }
                 };
@@ -817,18 +975,22 @@ pub mod linux {
                     error!("Failed to load cgroup program '{}': {e}", name);
                     continue;
                 }
-                let (link_id, mode_name) = match p.attach(&cgroup_file, CgroupAttachMode::AllowMultiple) {
+                let (link_id, mode_name) = match p
+                    .attach(&cgroup_file, CgroupAttachMode::AllowMultiple)
+                {
                     Ok(id) => (id, "AllowMultiple"),
-                    Err(e1) => match p.attach(&cgroup_file, CgroupAttachMode::Single) {
-                        Ok(id) => (id, "Single"),
-                        Err(e2) => {
-                            error!(
-                                "Failed to attach cgroup hook '{}' (AllowMultiple: {e1}, Single: {e2})",
-                                name
-                            );
-                            continue;
+                    Err(e1) => {
+                        match p.attach(&cgroup_file, CgroupAttachMode::Single) {
+                            Ok(id) => (id, "Single"),
+                            Err(e2) => {
+                                error!(
+                                    "Failed to attach cgroup hook '{}' (AllowMultiple: {e1}, Single: {e2})",
+                                    name
+                                );
+                                continue;
+                            }
                         }
-                    },
+                    }
                 };
                 match p.take_link(link_id) {
                     Ok(link) => {
@@ -836,10 +998,16 @@ pub mod linux {
                             guard.push(link);
                         }
                         attached_count += 1;
-                        info!("Attached cgroup hook '{}' (mode: {})", name, mode_name);
+                        info!(
+                            "Attached cgroup hook '{}' (mode: {})",
+                            name, mode_name
+                        );
                     }
                     Err(e) => {
-                        error!("Failed to take link for cgroup hook '{}': {e}", name);
+                        error!(
+                            "Failed to take link for cgroup hook '{}': {e}",
+                            name
+                        );
                     }
                 }
             }
@@ -857,7 +1025,10 @@ pub mod linux {
                 let p: &mut CgroupSockAddr = match prog.try_into() {
                     Ok(p) => p,
                     Err(e) => {
-                        error!("Failed to convert program '{}' to CgroupSockAddr: {e}", name);
+                        error!(
+                            "Failed to convert program '{}' to CgroupSockAddr: {e}",
+                            name
+                        );
                         continue;
                     }
                 };
@@ -865,18 +1036,22 @@ pub mod linux {
                     error!("Failed to load cgroup program '{}': {e}", name);
                     continue;
                 }
-                let (link_id, mode_name) = match p.attach(&cgroup_file, CgroupAttachMode::AllowMultiple) {
+                let (link_id, mode_name) = match p
+                    .attach(&cgroup_file, CgroupAttachMode::AllowMultiple)
+                {
                     Ok(id) => (id, "AllowMultiple"),
-                    Err(e1) => match p.attach(&cgroup_file, CgroupAttachMode::Single) {
-                        Ok(id) => (id, "Single"),
-                        Err(e2) => {
-                            error!(
-                                "Failed to attach cgroup hook '{}' (AllowMultiple: {e1}, Single: {e2})",
-                                name
-                            );
-                            continue;
+                    Err(e1) => {
+                        match p.attach(&cgroup_file, CgroupAttachMode::Single) {
+                            Ok(id) => (id, "Single"),
+                            Err(e2) => {
+                                error!(
+                                    "Failed to attach cgroup hook '{}' (AllowMultiple: {e1}, Single: {e2})",
+                                    name
+                                );
+                                continue;
+                            }
                         }
-                    },
+                    }
                 };
                 match p.take_link(link_id) {
                     Ok(link) => {
@@ -884,18 +1059,30 @@ pub mod linux {
                             guard.push(link);
                         }
                         attached_count += 1;
-                        info!("Attached cgroup hook '{}' (mode: {})", name, mode_name);
+                        info!(
+                            "Attached cgroup hook '{}' (mode: {})",
+                            name, mode_name
+                        );
                     }
                     Err(e) => {
-                        error!("Failed to take link for cgroup hook '{}': {e}", name);
+                        error!(
+                            "Failed to take link for cgroup hook '{}': {e}",
+                            name
+                        );
                     }
                 }
             }
 
             if attached_count > 0 {
-                info!("Successfully attached {attached_count} cgroup programs to {}", cgroup_path);
+                info!(
+                    "Successfully attached {attached_count} cgroup programs to {}",
+                    cgroup_path
+                );
             } else {
-                warn!("No cgroup programs were successfully attached to {}", cgroup_path);
+                warn!(
+                    "No cgroup programs were successfully attached to {}",
+                    cgroup_path
+                );
             }
 
             Ok(())
@@ -910,7 +1097,12 @@ pub mod linux {
         }
 
         /// Attach TC ingress/egress filter to a network interface.
-        fn attach_tc_interface(&mut self, iface: &str, is_ingress: bool, prog_name: &str) -> Result<(), String> {
+        fn attach_tc_interface(
+            &mut self,
+            iface: &str,
+            is_ingress: bool,
+            prog_name: &str,
+        ) -> Result<(), String> {
             let Some(bpf) = self.bpf.as_mut() else {
                 return Err("eBPF not loaded".to_string());
             };
@@ -924,19 +1116,22 @@ pub mod linux {
             };
 
             let Some(prog) = bpf.program_mut(prog_name) else {
-                return Err(format!("TC program '{prog_name}' not found in eBPF object"));
+                return Err(format!(
+                    "TC program '{prog_name}' not found in eBPF object"
+                ));
             };
 
-            let p: &mut SchedClassifier = prog
-                .try_into()
-                .map_err(|e| format!("Program '{prog_name}' is not a SchedClassifier: {e}"))?;
+            let p: &mut SchedClassifier = prog.try_into().map_err(|e| {
+                format!("Program '{prog_name}' is not a SchedClassifier: {e}")
+            })?;
 
-            p.load()
-                .map_err(|e| format!("Failed to load TC program '{prog_name}': {e}"))?;
+            p.load().map_err(|e| {
+                format!("Failed to load TC program '{prog_name}': {e}")
+            })?;
 
-            let link_id = p
-                .attach(iface, attach_type)
-                .map_err(|e| format!("Failed to attach TC program '{prog_name}' to {iface}: {e}"))?;
+            let link_id = p.attach(iface, attach_type).map_err(|e| {
+                format!("Failed to attach TC program '{prog_name}' to {iface}: {e}")
+            })?;
 
             let link = p
                 .take_link(link_id)
@@ -946,23 +1141,32 @@ pub mod linux {
                 guard.push(link);
             }
 
-            info!("Attached TC {} program '{}' on {}", if is_ingress { "ingress" } else { "egress" }, prog_name, iface);
+            info!(
+                "Attached TC {} program '{}' on {}",
+                if is_ingress { "ingress" } else { "egress" },
+                prog_name,
+                iface
+            );
             Ok(())
         }
 
         /// Attach sk_lookup program to daens namespace for transparent listener routing.
-        fn attach_sk_lookup(&mut self, netns: &crate::netns::DaeNs) -> Result<(), String> {
+        fn attach_sk_lookup(
+            &mut self,
+            netns: &crate::netns::DaeNs,
+        ) -> Result<(), String> {
             let Some(bpf) = self.bpf.as_mut() else {
                 return Err("eBPF not loaded".to_string());
             };
 
             let Some(prog) = bpf.program_mut("tproxy_sk_lookup") else {
-                return Err("Program 'tproxy_sk_lookup' not found in eBPF object".to_string());
+                return Err("Program 'tproxy_sk_lookup' not found in eBPF object"
+                    .to_string());
             };
 
-            let p: &mut SkLookup = prog
-                .try_into()
-                .map_err(|e| format!("Program 'tproxy_sk_lookup' is not a SkLookup: {e}"))?;
+            let p: &mut SkLookup = prog.try_into().map_err(|e| {
+                format!("Program 'tproxy_sk_lookup' is not a SkLookup: {e}")
+            })?;
 
             p.load()
                 .map_err(|e| format!("Failed to load 'tproxy_sk_lookup': {e}"))?;
@@ -982,7 +1186,9 @@ pub mod linux {
             if let Ok(mut guard) = self.sk_lookup_link.lock() {
                 *guard = Some(link);
             }
-            info!("Attached sk_lookup program 'tproxy_sk_lookup' to daens namespace");
+            info!(
+                "Attached sk_lookup program 'tproxy_sk_lookup' to daens namespace"
+            );
             Ok(())
         }
 
@@ -1040,7 +1246,9 @@ pub mod linux {
 
                     if window.elapsed() >= std::time::Duration::from_secs(1) {
                         if suppressed > 0 {
-                            warn!("eBPF datapath events suppressed: {suppressed} in the last second");
+                            warn!(
+                                "eBPF datapath events suppressed: {suppressed} in the last second"
+                            );
                         }
                         window = std::time::Instant::now();
                         emitted = 0;

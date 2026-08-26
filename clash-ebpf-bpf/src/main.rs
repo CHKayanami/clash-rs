@@ -19,8 +19,8 @@ use aya_ebpf_bindings::helpers::{
     bpf_skb_change_head, bpf_skb_store_bytes,
 };
 use clash_ebpf_common::{
-    DAE_BYPASS_MARK, DAE_TPROXY_MARK, DaeEvent, DaeEventType, DaeParam, PIDName,
-    RedirectEntry, RedirectTuple,
+    DIRECT_TRACK_STATE_ACTIVE, DAE_BYPASS_MARK, DAE_TPROXY_MARK, DaeEvent, DaeEventType, DaeParam,
+    DirectTrackEntry, PIDName, RedirectEntry, RedirectTuple,
 };
 use core::mem;
 use maps::*;
@@ -33,11 +33,16 @@ const AF_INET6: u8 = 10;
 const SK_DROP: u32 = 0;
 const SK_PASS: u32 = 1;
 
+// ── Conntrack timeout constants ──
+const UDP_CONN_TIMEOUT_NS: u64 = 120_000_000_000; // 120 seconds
+const CONN_TRACK_UPDATE_INTERVAL_NS: u64 = 1_000_000_000; // 1 second
+
 // ── SOCKMAP key constants ──
 const SK_TCP4: u32 = 0;
 const SK_TCP6: u32 = 1;
 const SK_UDP4: u32 = 2;
 const SK_UDP6: u32 = 3;
+
 
 // ── Helper functions ──
 
@@ -58,7 +63,11 @@ pub fn send_dae_event(
     sport: u16,
     dport: u16,
 ) {
-    let mut e: DaeEvent = unsafe { mem::zeroed() };
+    let Some(ptr) = EVENT_SCRATCH_MAP.get_ptr_mut(0) else {
+        return;
+    };
+    let e = unsafe { &mut *ptr };
+    *e = unsafe { mem::zeroed() };
     e.timestamp = unsafe { bpf_ktime_get_ns() };
     e.type_ = type_;
     e.pid = pid;
@@ -75,7 +84,7 @@ pub fn send_dae_event(
     if let Some(d) = dip {
         e.dip.copy_from_slice(d);
     }
-    let _ = EVENT_RINGBUF.output::<DaeEvent>(&e, 0);
+    let _ = EVENT_RINGBUF.output::<DaeEvent>(e, 0);
 }
 
 #[inline(always)]
@@ -101,8 +110,8 @@ fn update_map_elem_by_cookie(cookie: u64) -> i32 {
     if cookie == 0 {
         return 0;
     }
+    let now = unsafe { bpf_ktime_get_ns() };
     if let Some(ptr) = COOKIE_PID_MAP.get_ptr_mut(&cookie) {
-        let now = unsafe { bpf_ktime_get_ns() };
         let entry = unsafe { &mut *ptr };
         entry.last_seen_ns = now;
         return 0;
@@ -201,6 +210,65 @@ fn is_dst_ip6_proxied(ip: [u8; 16]) -> bool {
     PROXY_DST_IP6S.get(&key).is_some()
 }
 
+#[inline(always)]
+fn check_direct_track(
+    tuple: &RedirectTuple,
+    is_tcp: bool,
+    is_udp: bool,
+    is_fin_rst: bool,
+    is_pure_syn: bool,
+) -> bool {
+    if is_pure_syn {
+        return false;
+    }
+    if let Some(entry) = unsafe { DIRECT_TRACK.get(tuple) } {
+        let last_seen_ns = entry.last_seen_ns;
+        let now = unsafe { bpf_ktime_get_ns() };
+
+        if is_udp {
+            if now.wrapping_sub(last_seen_ns) > UDP_CONN_TIMEOUT_NS {
+                let _ = DIRECT_TRACK.remove(tuple);
+                return false;
+            }
+            if now.wrapping_sub(last_seen_ns) > CONN_TRACK_UPDATE_INTERVAL_NS {
+                let updated = DirectTrackEntry {
+                    last_seen_ns: now,
+                    state: DIRECT_TRACK_STATE_ACTIVE,
+                    _pad: [0; 7],
+                };
+                let _ = DIRECT_TRACK.insert(tuple, &updated, 0);
+            }
+            return true;
+        }
+
+        if is_tcp {
+            if is_fin_rst {
+                let _ = DIRECT_TRACK.remove(tuple);
+            } else if now.wrapping_sub(last_seen_ns) > CONN_TRACK_UPDATE_INTERVAL_NS {
+                let updated = DirectTrackEntry {
+                    last_seen_ns: now,
+                    state: DIRECT_TRACK_STATE_ACTIVE,
+                    _pad: [0; 7],
+                };
+                let _ = DIRECT_TRACK.insert(tuple, &updated, 0);
+            }
+            return true;
+        }
+    }
+    false
+}
+
+#[inline(always)]
+fn register_direct_track(tuple: &RedirectTuple) {
+    let now = unsafe { bpf_ktime_get_ns() };
+    let direct_entry = DirectTrackEntry {
+        last_seen_ns: now,
+        state: DIRECT_TRACK_STATE_ACTIVE,
+        _pad: [0; 7],
+    };
+    let _ = DIRECT_TRACK.insert(tuple, &direct_entry, 0);
+}
+
 // ── Redirect helper: sets cb[] and performs bpf_redirect ──
 
 /// Perform the redirect to dae0 with cb[0]=TPROXY_MARK, cb[1]=listener_l4proto.
@@ -267,9 +335,269 @@ unsafe fn do_redirect(
 // ─────────────────────────────────────────────────────────────
 // 1. LAN Ingress (局域网转发流量处理)
 // ─────────────────────────────────────────────────────────────
+
 #[inline(always)]
-fn handle_lan_ingress_impl(ctx: *mut __sk_buff, link_h_len: usize) -> i32 {
-    let tc_ctx = TcContext::new(ctx);
+fn handle_lan_ipv4(
+    ctx: *mut __sk_buff,
+    param: &DaeParam,
+    link_h_len: usize,
+    pkt: &ParsedPacket,
+) -> i32 {
+    let src_port = pkt.tuples.five.src_port;
+    let dst_port = pkt.tuples.five.dst_port;
+
+    let is_tcp = pkt.l4proto == IPPROTO_TCP;
+    let is_udp = pkt.l4proto == IPPROTO_UDP;
+    let is_pure_syn = is_tcp && (pkt.tcph.syn() != 0 && pkt.tcph.ack() == 0);
+    let is_fin_rst = is_tcp && (pkt.tcph.fin() != 0 || pkt.tcph.rst() != 0);
+
+    let ip_be: [u8; 4] = [
+        pkt.tuples.five.dst_ip[12],
+        pkt.tuples.five.dst_ip[13],
+        pkt.tuples.five.dst_ip[14],
+        pkt.tuples.five.dst_ip[15],
+    ];
+    let src_ip_be: [u8; 4] = [
+        pkt.tuples.five.src_ip[12],
+        pkt.tuples.five.src_ip[13],
+        pkt.tuples.five.src_ip[14],
+        pkt.tuples.five.src_ip[15],
+    ];
+
+    let tuple = RedirectTuple {
+        src_ip: *pkt.tuples.five.src_ip.as_bytes(),
+        dst_ip: *pkt.tuples.five.dst_ip.as_bytes(),
+        src_port,
+        dst_port,
+        proto: pkt.l4proto,
+        ip_version: 4,
+        _pad: [0; 2],
+    };
+
+    // 1. 源 IP / 源端口 静态 Bypass 与白名单判定
+    if is_src_ip4_bypassed(src_ip_be) {
+        return TC_ACT_OK;
+    }
+    if param.has_proxy_src_ips != 0 && !is_src_ip4_proxied(src_ip_be) {
+        return TC_ACT_OK;
+    }
+    if is_src_port_bypassed(src_port) {
+        return TC_ACT_OK;
+    }
+    if param.has_proxy_src_ports != 0
+        && unsafe { PROXY_SRC_PORTS.get(&src_port).is_none() }
+    {
+        return TC_ACT_OK;
+    }
+
+    // 2. 常规业务流量目标过滤 (DNS 53 强制劫持到代理)
+    if dst_port != 53 {
+        // 本机直连流量放行
+        if param.local_ip != 0 && ip_be == param.local_ip.to_ne_bytes() {
+            return TC_ACT_OK;
+        }
+
+        // 静态目标 IP / 目标端口 Bypass 判定 (无需入表)
+        if is_dst_ip4_bypassed(ip_be) || is_dst_port_bypassed(dst_port, param.tproxy_port as u16) {
+            return TC_ACT_OK;
+        }
+
+        // 动态直连流表 Fast-Path 查询 (针对非纯 SYN 报文)
+        if check_direct_track(&tuple, is_tcp, is_udp, is_fin_rst, is_pure_syn) {
+            return TC_ACT_OK;
+        }
+
+        // 动态下发直连判定 (受 DNS TTL 影响，命中则建立 DIRECT_TRACK 连接追踪)
+        if is_dynamic_dst_ip4_bypassed(ip_be) {
+            register_direct_track(&tuple);
+            return TC_ACT_OK;
+        }
+
+        // 目标白名单过滤
+        if param.has_proxy_dst_ips != 0 && !is_dst_ip4_proxied(ip_be) {
+            return TC_ACT_OK;
+        }
+        if param.has_proxy_dst_ports != 0
+            && unsafe { PROXY_DST_PORTS.get(&dst_port).is_none() }
+        {
+            return TC_ACT_OK;
+        }
+    }
+
+    let ifindex = unsafe { (*ctx).ifindex };
+    let (smac, dmac) = if link_h_len >= EthHdr::LEN {
+        (pkt.ethh.src_addr, pkt.ethh.dst_addr)
+    } else {
+        ([0u8; 6], [0u8; 6])
+    };
+    let entry = RedirectEntry {
+        ifindex,
+        from_wan: 0,
+        _pad0: [0; 3],
+        smac,
+        dmac,
+    };
+    unsafe {
+        let is_new_flow = REDIRECT_TRACK.get(&tuple).is_none();
+        let _ = REDIRECT_TRACK.insert(&tuple, &entry, 0);
+        let l4proto = if pkt.l4proto == IPPROTO_TCP {
+            pkt.listener_l4proto
+        } else {
+            IPPROTO_UDP
+        };
+
+        if is_new_flow {
+            let sip_u32 = [u32::from_be_bytes(src_ip_be), 0, 0, 0];
+            let dip_u32 = [u32::from_be_bytes(ip_be), 0, 0, 0];
+            send_dae_event(
+                DaeEventType::Redirected as u32,
+                0,
+                None,
+                0,
+                pkt.l4proto,
+                Some(&sip_u32),
+                Some(&dip_u32),
+                src_port,
+                dst_port,
+            );
+        }
+
+        do_redirect(ctx, param, link_h_len, l4proto, ETH_P_IP, false)
+    }
+}
+
+#[inline(always)]
+fn handle_lan_ipv6(
+    ctx: *mut __sk_buff,
+    param: &DaeParam,
+    link_h_len: usize,
+    pkt: &ParsedPacket,
+) -> i32 {
+    let src_port = pkt.tuples.five.src_port;
+    let dst_port = pkt.tuples.five.dst_port;
+
+    let is_tcp = pkt.l4proto == IPPROTO_TCP;
+    let is_udp = pkt.l4proto == IPPROTO_UDP;
+    let is_pure_syn = is_tcp && (pkt.tcph.syn() != 0 && pkt.tcph.ack() == 0);
+    let is_fin_rst = is_tcp && (pkt.tcph.fin() != 0 || pkt.tcph.rst() != 0);
+
+    let dst_ip = *pkt.tuples.five.dst_ip.as_bytes();
+    let src_ip = *pkt.tuples.five.src_ip.as_bytes();
+
+    let tuple = RedirectTuple {
+        src_ip,
+        dst_ip,
+        src_port,
+        dst_port,
+        proto: pkt.l4proto,
+        ip_version: 6,
+        _pad: [0; 2],
+    };
+
+    // 1. 源 IP / 源端口 静态 Bypass 与白名单判定
+    if is_src_ip6_bypassed(src_ip) {
+        return TC_ACT_OK;
+    }
+    if param.has_proxy_src_ips != 0 && !is_src_ip6_proxied(src_ip) {
+        return TC_ACT_OK;
+    }
+    if is_src_port_bypassed(src_port) {
+        return TC_ACT_OK;
+    }
+    if param.has_proxy_src_ports != 0
+        && unsafe { PROXY_SRC_PORTS.get(&src_port).is_none() }
+    {
+        return TC_ACT_OK;
+    }
+
+    // 2. 常规业务流量目标过滤 (DNS 53 强制劫持到代理)
+    if dst_port != 53 {
+        // 静态目标 IP / 目标端口 Bypass 判定 (无需入表)
+        if is_dst_ip6_bypassed(dst_ip) || is_dst_port_bypassed(dst_port, param.tproxy_port as u16) {
+            return TC_ACT_OK;
+        }
+
+        // 动态直连流表 Fast-Path 查询 (针对非纯 SYN 报文)
+        if check_direct_track(&tuple, is_tcp, is_udp, is_fin_rst, is_pure_syn) {
+            return TC_ACT_OK;
+        }
+
+        // 动态下发直连判定 (受 DNS TTL 影响，命中则建立 DIRECT_TRACK 连接追踪)
+        if is_dynamic_dst_ip6_bypassed(dst_ip) {
+            register_direct_track(&tuple);
+            return TC_ACT_OK;
+        }
+
+        // 目标白名单过滤
+        if param.has_proxy_dst_ips != 0 && !is_dst_ip6_proxied(dst_ip) {
+            return TC_ACT_OK;
+        }
+        if param.has_proxy_dst_ports != 0
+            && unsafe { PROXY_DST_PORTS.get(&dst_port).is_none() }
+        {
+            return TC_ACT_OK;
+        }
+    }
+
+    let ifindex = unsafe { (*ctx).ifindex };
+    let (smac, dmac) = if link_h_len >= EthHdr::LEN {
+        (pkt.ethh.src_addr, pkt.ethh.dst_addr)
+    } else {
+        ([0u8; 6], [0u8; 6])
+    };
+    let entry = RedirectEntry {
+        ifindex,
+        from_wan: 0,
+        _pad0: [0; 3],
+        smac,
+        dmac,
+    };
+    unsafe {
+        let is_new_flow = REDIRECT_TRACK.get(&tuple).is_none();
+        let _ = REDIRECT_TRACK.insert(&tuple, &entry, 0);
+        let l4proto = if pkt.l4proto == IPPROTO_TCP {
+            pkt.listener_l4proto
+        } else {
+            IPPROTO_UDP
+        };
+
+        if is_new_flow {
+            let mut sip_u32 = [0u32; 4];
+            let mut dip_u32 = [0u32; 4];
+            for i in 0..4 {
+                sip_u32[i] = u32::from_ne_bytes([
+                    src_ip[i * 4],
+                    src_ip[i * 4 + 1],
+                    src_ip[i * 4 + 2],
+                    src_ip[i * 4 + 3],
+                ]);
+                dip_u32[i] = u32::from_ne_bytes([
+                    dst_ip[i * 4],
+                    dst_ip[i * 4 + 1],
+                    dst_ip[i * 4 + 2],
+                    dst_ip[i * 4 + 3],
+                ]);
+            }
+            send_dae_event(
+                DaeEventType::Redirected as u32,
+                0,
+                None,
+                0,
+                pkt.l4proto,
+                Some(&sip_u32),
+                Some(&dip_u32),
+                src_port,
+                dst_port,
+            );
+        }
+
+        do_redirect(ctx, param, link_h_len, l4proto, ETH_P_IPV6, false)
+    }
+}
+
+#[inline(never)]
+fn handle_lan_ingress_impl(tc_ctx: &TcContext, link_h_len: usize) -> i32 {
+    let ctx = tc_ctx.skb.skb;
     let mark = unsafe { (*ctx).mark };
 
     let Some(param) = get_param() else {
@@ -286,234 +614,23 @@ fn handle_lan_ingress_impl(ctx: *mut __sk_buff, link_h_len: usize) -> i32 {
         return TC_ACT_OK;
     }
 
-    let mut pkt: ParsedPacket = unsafe { mem::zeroed() };
-    let ret = parse_packet(&tc_ctx, link_h_len as u32, &mut pkt);
-    if ret != 0 {
-        return TC_ACT_OK;
-    }
+    let pkt = match parse_packet(tc_ctx, link_h_len as u32) {
+        Ok(p) => p,
+        Err(_) => return TC_ACT_OK,
+    };
 
     if param.has_bypass_dscps != 0 && unsafe { BYPASS_DSCPS.get(&pkt.tuples.dscp).is_some() } {
         return TC_ACT_OK;
     }
 
-    if dst_is_special(&pkt, link_h_len as u32) {
+    if dst_is_special(pkt, link_h_len as u32) {
         return TC_ACT_OK;
     }
 
-    let is_ipv4 = pkt.ethh.ether_type == ETH_P_IP.to_be();
-    let is_ipv6 = pkt.ethh.ether_type == ETH_P_IPV6.to_be();
-    let src_port = pkt.tuples.five.src_port;
-    let dst_port = pkt.tuples.five.dst_port;
-
-    if is_ipv4 {
-        let ip_be: [u8; 4] = [
-            pkt.tuples.five.dst_ip[12],
-            pkt.tuples.five.dst_ip[13],
-            pkt.tuples.five.dst_ip[14],
-            pkt.tuples.five.dst_ip[15],
-        ];
-        let src_ip_be: [u8; 4] = [
-            pkt.tuples.five.src_ip[12],
-            pkt.tuples.five.src_ip[13],
-            pkt.tuples.five.src_ip[14],
-            pkt.tuples.five.src_ip[15],
-        ];
-
-        // 1. 源 IP / 源端口 Bypass 与白名单判定 (针对特定局域网客户端设备过滤，包括其发出的 DNS)
-        if is_src_ip4_bypassed(src_ip_be) {
-            return TC_ACT_OK;
-        }
-        if param.has_proxy_src_ips != 0 && !is_src_ip4_proxied(src_ip_be) {
-            return TC_ACT_OK;
-        }
-        if is_src_port_bypassed(src_port) {
-            return TC_ACT_OK;
-        }
-        if param.has_proxy_src_ports != 0
-            && unsafe { PROXY_SRC_PORTS.get(&src_port).is_none() }
-        {
-            return TC_ACT_OK;
-        }
-
-        // 2. 常规业务流量目标过滤 (DNS 53 跳过目标 IP/Port Bypass，确保发往网关及公网的 DNS 均被强制劫持)
-        if dst_port != 53 {
-            // 本机直连流量放行 (访问路由器管理页面等)
-            if param.local_ip != 0 && ip_be == param.local_ip.to_ne_bytes() {
-                return TC_ACT_OK;
-            }
-
-            // 目标 IP / 目标端口 Bypass 判定
-            if is_dst_ip4_bypassed(ip_be) || is_dynamic_dst_ip4_bypassed(ip_be) {
-                return TC_ACT_OK;
-            }
-            if is_dst_port_bypassed(dst_port, param.tproxy_port as u16) {
-                return TC_ACT_OK;
-            }
-
-            // 目标白名单过滤
-            if param.has_proxy_dst_ips != 0 && !is_dst_ip4_proxied(ip_be) {
-                return TC_ACT_OK;
-            }
-            if param.has_proxy_dst_ports != 0
-                && unsafe { PROXY_DST_PORTS.get(&dst_port).is_none() }
-            {
-                return TC_ACT_OK;
-            }
-        }
-
-        let tuple = RedirectTuple {
-            src_ip: *pkt.tuples.five.src_ip.as_bytes(),
-            dst_ip: *pkt.tuples.five.dst_ip.as_bytes(),
-            src_port,
-            dst_port,
-            proto: pkt.l4proto,
-            ip_version: 4,
-            _pad: [0; 2],
-        };
-        let ifindex = unsafe { (*ctx).ifindex };
-        let (smac, dmac) = if link_h_len >= EthHdr::LEN {
-            (pkt.ethh.src_addr, pkt.ethh.dst_addr)
-        } else {
-            ([0u8; 6], [0u8; 6])
-        };
-        let entry = RedirectEntry {
-            ifindex,
-            from_wan: 0,
-            _pad0: [0; 3],
-            smac,
-            dmac,
-        };
-        unsafe {
-            let is_new_flow = REDIRECT_TRACK.get(&tuple).is_none();
-            let _ = REDIRECT_TRACK.insert(&tuple, &entry, 0);
-            let l4proto = if pkt.l4proto == IPPROTO_TCP {
-                pkt.listener_l4proto
-            } else {
-                IPPROTO_UDP
-            };
-
-            if is_new_flow {
-                let sip_u32 = [u32::from_be_bytes(src_ip_be), 0, 0, 0];
-                let dip_u32 = [u32::from_be_bytes(ip_be), 0, 0, 0];
-                send_dae_event(
-                    DaeEventType::Redirected as u32,
-                    0,
-                    None,
-                    0,
-                    pkt.l4proto,
-                    Some(&sip_u32),
-                    Some(&dip_u32),
-                    src_port,
-                    dst_port,
-                );
-            }
-
-            do_redirect(ctx, param, link_h_len, l4proto, ETH_P_IP, false)
-        }
-    } else if is_ipv6 {
-        let dst_ip = *pkt.tuples.five.dst_ip.as_bytes();
-        let src_ip = *pkt.tuples.five.src_ip.as_bytes();
-
-        // 1. 源 IP / 源端口 Bypass 与白名单判定 (针对特定局域网客户端设备过滤，包括其发出的 DNS)
-        if is_src_ip6_bypassed(src_ip) {
-            return TC_ACT_OK;
-        }
-        if param.has_proxy_src_ips != 0 && !is_src_ip6_proxied(src_ip) {
-            return TC_ACT_OK;
-        }
-        if is_src_port_bypassed(src_port) {
-            return TC_ACT_OK;
-        }
-        if param.has_proxy_src_ports != 0
-            && unsafe { PROXY_SRC_PORTS.get(&src_port).is_none() }
-        {
-            return TC_ACT_OK;
-        }
-
-        // 2. 常规业务流量目标过滤 (DNS 53 跳过目标 IP/Port Bypass，确保发往网关及公网的 DNS 均被强制劫持)
-        if dst_port != 53 {
-            // 目标 IP / 目标端口 Bypass 判定
-            if is_dst_ip6_bypassed(dst_ip) || is_dynamic_dst_ip6_bypassed(dst_ip) {
-                return TC_ACT_OK;
-            }
-            if is_dst_port_bypassed(dst_port, param.tproxy_port as u16) {
-                return TC_ACT_OK;
-            }
-
-            // 目标白名单过滤
-            if param.has_proxy_dst_ips != 0 && !is_dst_ip6_proxied(dst_ip) {
-                return TC_ACT_OK;
-            }
-            if param.has_proxy_dst_ports != 0
-                && unsafe { PROXY_DST_PORTS.get(&dst_port).is_none() }
-            {
-                return TC_ACT_OK;
-            }
-        }
-
-        let tuple = RedirectTuple {
-            src_ip,
-            dst_ip,
-            src_port,
-            dst_port,
-            proto: pkt.l4proto,
-            ip_version: 6,
-            _pad: [0; 2],
-        };
-        let ifindex = unsafe { (*ctx).ifindex };
-        let (smac, dmac) = if link_h_len >= EthHdr::LEN {
-            (pkt.ethh.src_addr, pkt.ethh.dst_addr)
-        } else {
-            ([0u8; 6], [0u8; 6])
-        };
-        let entry = RedirectEntry {
-            ifindex,
-            from_wan: 0,
-            _pad0: [0; 3],
-            smac,
-            dmac,
-        };
-        unsafe {
-            let is_new_flow = REDIRECT_TRACK.get(&tuple).is_none();
-            let _ = REDIRECT_TRACK.insert(&tuple, &entry, 0);
-            let l4proto = if pkt.l4proto == IPPROTO_TCP {
-                pkt.listener_l4proto
-            } else {
-                IPPROTO_UDP
-            };
-
-            if is_new_flow {
-                let mut sip_u32 = [0u32; 4];
-                let mut dip_u32 = [0u32; 4];
-                for i in 0..4 {
-                    sip_u32[i] = u32::from_ne_bytes([
-                        src_ip[i * 4],
-                        src_ip[i * 4 + 1],
-                        src_ip[i * 4 + 2],
-                        src_ip[i * 4 + 3],
-                    ]);
-                    dip_u32[i] = u32::from_ne_bytes([
-                        dst_ip[i * 4],
-                        dst_ip[i * 4 + 1],
-                        dst_ip[i * 4 + 2],
-                        dst_ip[i * 4 + 3],
-                    ]);
-                }
-                send_dae_event(
-                    DaeEventType::Redirected as u32,
-                    0,
-                    None,
-                    0,
-                    pkt.l4proto,
-                    Some(&sip_u32),
-                    Some(&dip_u32),
-                    src_port,
-                    dst_port,
-                );
-            }
-
-            do_redirect(ctx, param, link_h_len, l4proto, ETH_P_IPV6, false)
-        }
+    if pkt.ethh.ether_type == ETH_P_IP.to_be() {
+        handle_lan_ipv4(ctx, param, link_h_len, pkt)
+    } else if pkt.ethh.ether_type == ETH_P_IPV6.to_be() {
+        handle_lan_ipv6(ctx, param, link_h_len, pkt)
     } else {
         TC_ACT_OK
     }
@@ -522,9 +639,243 @@ fn handle_lan_ingress_impl(ctx: *mut __sk_buff, link_h_len: usize) -> i32 {
 // ─────────────────────────────────────────────────────────────
 // 2. WAN Egress (本机出站流量处理)
 // ─────────────────────────────────────────────────────────────
+
 #[inline(always)]
-fn handle_wan_egress_impl(ctx: *mut __sk_buff, link_h_len: usize) -> i32 {
-    let tc_ctx = TcContext::new(ctx);
+fn handle_wan_ipv4(
+    ctx: *mut __sk_buff,
+    param: &DaeParam,
+    link_h_len: usize,
+    pkt: &ParsedPacket,
+    pid_pname: Option<&PIDName>,
+) -> i32 {
+    let src_port = pkt.tuples.five.src_port;
+    let dst_port = pkt.tuples.five.dst_port;
+
+    let is_tcp = pkt.l4proto == IPPROTO_TCP;
+    let is_udp = pkt.l4proto == IPPROTO_UDP;
+    let is_pure_syn = is_tcp && (pkt.tcph.syn() != 0 && pkt.tcph.ack() == 0);
+    let is_fin_rst = is_tcp && (pkt.tcph.fin() != 0 || pkt.tcph.rst() != 0);
+
+    let ip_be: [u8; 4] = [
+        pkt.tuples.five.dst_ip[12],
+        pkt.tuples.five.dst_ip[13],
+        pkt.tuples.five.dst_ip[14],
+        pkt.tuples.five.dst_ip[15],
+    ];
+    let src_ip_be: [u8; 4] = [
+        pkt.tuples.five.src_ip[12],
+        pkt.tuples.five.src_ip[13],
+        pkt.tuples.five.src_ip[14],
+        pkt.tuples.five.src_ip[15],
+    ];
+
+    let tuple = RedirectTuple {
+        src_ip: *pkt.tuples.five.src_ip.as_bytes(),
+        dst_ip: *pkt.tuples.five.dst_ip.as_bytes(),
+        src_port,
+        dst_port,
+        proto: pkt.l4proto,
+        ip_version: 4,
+        _pad: [0; 2],
+    };
+
+    // 1. 常规业务流量目标过滤 (DNS 53 强制劫持到代理)
+    if dst_port != 53 {
+        // 本机直连流量放行
+        if param.local_ip != 0 && ip_be == param.local_ip.to_ne_bytes() {
+            return TC_ACT_OK;
+        }
+
+        // 静态目标 IP / 目标端口 Bypass 判定 (无需入表)
+        if is_dst_ip4_bypassed(ip_be) || is_dst_port_bypassed(dst_port, param.tproxy_port as u16) {
+            return TC_ACT_OK;
+        }
+
+        // 动态直连流表 Fast-Path 查询 (针对非纯 SYN 报文)
+        if check_direct_track(&tuple, is_tcp, is_udp, is_fin_rst, is_pure_syn) {
+            return TC_ACT_OK;
+        }
+
+        // 动态下发直连判定 (受 DNS TTL 影响，命中则建立 DIRECT_TRACK 连接追踪)
+        if is_dynamic_dst_ip4_bypassed(ip_be) {
+            register_direct_track(&tuple);
+            return TC_ACT_OK;
+        }
+
+        // 目标白名单过滤
+        if param.has_proxy_dst_ips != 0 && !is_dst_ip4_proxied(ip_be) {
+            return TC_ACT_OK;
+        }
+        if param.has_proxy_dst_ports != 0
+            && unsafe { PROXY_DST_PORTS.get(&dst_port).is_none() }
+        {
+            return TC_ACT_OK;
+        }
+    }
+
+    let ifindex = unsafe { (*ctx).ifindex };
+    let (smac, dmac) = if link_h_len >= EthHdr::LEN {
+        (pkt.ethh.src_addr, pkt.ethh.dst_addr)
+    } else {
+        ([0u8; 6], [0u8; 6])
+    };
+    let entry = RedirectEntry {
+        ifindex,
+        from_wan: 1,
+        _pad0: [0; 3],
+        smac,
+        dmac,
+    };
+    unsafe {
+        let is_new_flow = REDIRECT_TRACK.get(&tuple).is_none();
+        let _ = REDIRECT_TRACK.insert(&tuple, &entry, 0);
+        let l4proto = if pkt.l4proto == IPPROTO_TCP {
+            pkt.listener_l4proto
+        } else {
+            IPPROTO_UDP
+        };
+
+        if is_new_flow {
+            let pid = pid_pname.map(|p| p.pid).unwrap_or(0);
+            let pname = pid_pname.map(|p| &p.pname);
+            let sip_u32 = [u32::from_be_bytes(src_ip_be), 0, 0, 0];
+            let dip_u32 = [u32::from_be_bytes(ip_be), 0, 0, 0];
+            send_dae_event(
+                DaeEventType::Redirected as u32,
+                pid,
+                pname,
+                1,
+                pkt.l4proto,
+                Some(&sip_u32),
+                Some(&dip_u32),
+                src_port,
+                dst_port,
+            );
+        }
+
+        do_redirect(ctx, param, link_h_len, l4proto, ETH_P_IP, true)
+    }
+}
+
+#[inline(always)]
+fn handle_wan_ipv6(
+    ctx: *mut __sk_buff,
+    param: &DaeParam,
+    link_h_len: usize,
+    pkt: &ParsedPacket,
+    pid_pname: Option<&PIDName>,
+) -> i32 {
+    let src_port = pkt.tuples.five.src_port;
+    let dst_port = pkt.tuples.five.dst_port;
+
+    let is_tcp = pkt.l4proto == IPPROTO_TCP;
+    let is_udp = pkt.l4proto == IPPROTO_UDP;
+    let is_pure_syn = is_tcp && (pkt.tcph.syn() != 0 && pkt.tcph.ack() == 0);
+    let is_fin_rst = is_tcp && (pkt.tcph.fin() != 0 || pkt.tcph.rst() != 0);
+
+    let dst_ip = *pkt.tuples.five.dst_ip.as_bytes();
+    let src_ip = *pkt.tuples.five.src_ip.as_bytes();
+
+    let tuple = RedirectTuple {
+        src_ip,
+        dst_ip,
+        src_port,
+        dst_port,
+        proto: pkt.l4proto,
+        ip_version: 6,
+        _pad: [0; 2],
+    };
+
+    // 1. 常规业务流量目标过滤 (DNS 53 强制劫持到代理)
+    if dst_port != 53 {
+        // 静态目标 IP / 目标端口 Bypass 判定 (无需入表)
+        if is_dst_ip6_bypassed(dst_ip) || is_dst_port_bypassed(dst_port, param.tproxy_port as u16) {
+            return TC_ACT_OK;
+        }
+
+        // 动态直连流表 Fast-Path 查询 (针对非纯 SYN 报文)
+        if check_direct_track(&tuple, is_tcp, is_udp, is_fin_rst, is_pure_syn) {
+            return TC_ACT_OK;
+        }
+
+        // 动态下发直连判定 (受 DNS TTL 影响，命中则建立 DIRECT_TRACK 连接追踪)
+        if is_dynamic_dst_ip6_bypassed(dst_ip) {
+            register_direct_track(&tuple);
+            return TC_ACT_OK;
+        }
+
+        // 目标白名单过滤
+        if param.has_proxy_dst_ips != 0 && !is_dst_ip6_proxied(dst_ip) {
+            return TC_ACT_OK;
+        }
+        if param.has_proxy_dst_ports != 0
+            && unsafe { PROXY_DST_PORTS.get(&dst_port).is_none() }
+        {
+            return TC_ACT_OK;
+        }
+    }
+
+    let ifindex = unsafe { (*ctx).ifindex };
+    let (smac, dmac) = if link_h_len >= EthHdr::LEN {
+        (pkt.ethh.src_addr, pkt.ethh.dst_addr)
+    } else {
+        ([0u8; 6], [0u8; 6])
+    };
+    let entry = RedirectEntry {
+        ifindex,
+        from_wan: 1,
+        _pad0: [0; 3],
+        smac,
+        dmac,
+    };
+    unsafe {
+        let is_new_flow = REDIRECT_TRACK.get(&tuple).is_none();
+        let _ = REDIRECT_TRACK.insert(&tuple, &entry, 0);
+        let l4proto = if pkt.l4proto == IPPROTO_TCP {
+            pkt.listener_l4proto
+        } else {
+            IPPROTO_UDP
+        };
+
+        if is_new_flow {
+            let pid = pid_pname.map(|p| p.pid).unwrap_or(0);
+            let pname = pid_pname.map(|p| &p.pname);
+            let mut sip_u32 = [0u32; 4];
+            let mut dip_u32 = [0u32; 4];
+            for i in 0..4 {
+                sip_u32[i] = u32::from_ne_bytes([
+                    src_ip[i * 4],
+                    src_ip[i * 4 + 1],
+                    src_ip[i * 4 + 2],
+                    src_ip[i * 4 + 3],
+                ]);
+                dip_u32[i] = u32::from_ne_bytes([
+                    dst_ip[i * 4],
+                    dst_ip[i * 4 + 1],
+                    dst_ip[i * 4 + 2],
+                    dst_ip[i * 4 + 3],
+                ]);
+            }
+            send_dae_event(
+                DaeEventType::Redirected as u32,
+                pid,
+                pname,
+                1,
+                pkt.l4proto,
+                Some(&sip_u32),
+                Some(&dip_u32),
+                src_port,
+                dst_port,
+            );
+        }
+
+        do_redirect(ctx, param, link_h_len, l4proto, ETH_P_IPV6, true)
+    }
+}
+
+#[inline(never)]
+fn handle_wan_egress_impl(tc_ctx: &TcContext, link_h_len: usize) -> i32 {
+    let ctx = tc_ctx.skb.skb;
     let mark = unsafe { (*ctx).mark };
 
     let Some(param) = get_param() else {
@@ -574,210 +925,28 @@ fn handle_wan_egress_impl(ctx: *mut __sk_buff, link_h_len: usize) -> i32 {
         }
     }
 
-    let mut pkt: ParsedPacket = unsafe { mem::zeroed() };
-    let ret = parse_packet(&tc_ctx, link_h_len as u32, &mut pkt);
-    if ret != 0 {
-        return TC_ACT_OK;
-    }
+    let pkt = match parse_packet(tc_ctx, link_h_len as u32) {
+        Ok(p) => p,
+        Err(_) => return TC_ACT_OK,
+    };
 
     if param.has_bypass_dscps != 0 && unsafe { BYPASS_DSCPS.get(&pkt.tuples.dscp).is_some() } {
         return TC_ACT_OK;
     }
 
-    if dst_is_special(&pkt, link_h_len as u32) {
+    if dst_is_special(pkt, link_h_len as u32) {
         return TC_ACT_OK;
     }
 
-    let is_ipv4 = pkt.ethh.ether_type == ETH_P_IP.to_be();
-    let is_ipv6 = pkt.ethh.ether_type == ETH_P_IPV6.to_be();
-    let src_port = pkt.tuples.five.src_port;
-    let dst_port = pkt.tuples.five.dst_port;
-
-    if is_ipv4 {
-        let ip_be: [u8; 4] = [
-            pkt.tuples.five.dst_ip[12],
-            pkt.tuples.five.dst_ip[13],
-            pkt.tuples.five.dst_ip[14],
-            pkt.tuples.five.dst_ip[15],
-        ];
-        let src_ip_be: [u8; 4] = [
-            pkt.tuples.five.src_ip[12],
-            pkt.tuples.five.src_ip[13],
-            pkt.tuples.five.src_ip[14],
-            pkt.tuples.five.src_ip[15],
-        ];
-
-        // 1. 常规业务流量目标过滤 (DNS 53 强制劫持到代理)
-        if dst_port != 53 {
-            // 本机直连流量放行 (访问本机物理 IP 上的服务)
-            if param.local_ip != 0 && ip_be == param.local_ip.to_ne_bytes() {
-                return TC_ACT_OK;
-            }
-
-            // 目标 IP / 目标端口 Bypass 判定
-            if is_dst_ip4_bypassed(ip_be) || is_dynamic_dst_ip4_bypassed(ip_be) {
-                return TC_ACT_OK;
-            }
-            if is_dst_port_bypassed(dst_port, param.tproxy_port as u16) {
-                return TC_ACT_OK;
-            }
-
-            // 目标白名单过滤
-            if param.has_proxy_dst_ips != 0 && !is_dst_ip4_proxied(ip_be) {
-                return TC_ACT_OK;
-            }
-            if param.has_proxy_dst_ports != 0
-                && unsafe { PROXY_DST_PORTS.get(&dst_port).is_none() }
-            {
-                return TC_ACT_OK;
-            }
-        }
-
-        let tuple = RedirectTuple {
-            src_ip: *pkt.tuples.five.src_ip.as_bytes(),
-            dst_ip: *pkt.tuples.five.dst_ip.as_bytes(),
-            src_port,
-            dst_port,
-            proto: pkt.l4proto,
-            ip_version: 4,
-            _pad: [0; 2],
-        };
-        let ifindex = unsafe { (*ctx).ifindex };
-        let (smac, dmac) = if link_h_len >= EthHdr::LEN {
-            (pkt.ethh.src_addr, pkt.ethh.dst_addr)
-        } else {
-            ([0u8; 6], [0u8; 6])
-        };
-        let entry = RedirectEntry {
-            ifindex,
-            from_wan: 1,
-            _pad0: [0; 3],
-            smac,
-            dmac,
-        };
-        unsafe {
-            let is_new_flow = REDIRECT_TRACK.get(&tuple).is_none();
-            let _ = REDIRECT_TRACK.insert(&tuple, &entry, 0);
-            let l4proto = if pkt.l4proto == IPPROTO_TCP {
-                pkt.listener_l4proto
-            } else {
-                IPPROTO_UDP
-            };
-
-            if is_new_flow {
-                let pid = pid_pname.map(|p| p.pid).unwrap_or(0);
-                let pname = pid_pname.map(|p| &p.pname);
-                let sip_u32 = [u32::from_be_bytes(src_ip_be), 0, 0, 0];
-                let dip_u32 = [u32::from_be_bytes(ip_be), 0, 0, 0];
-                send_dae_event(
-                    DaeEventType::Redirected as u32,
-                    pid,
-                    pname,
-                    1,
-                    pkt.l4proto,
-                    Some(&sip_u32),
-                    Some(&dip_u32),
-                    src_port,
-                    dst_port,
-                );
-            }
-
-            do_redirect(ctx, param, link_h_len, l4proto, ETH_P_IP, true)
-        }
-    } else if is_ipv6 {
-        let dst_ip = *pkt.tuples.five.dst_ip.as_bytes();
-        let src_ip = *pkt.tuples.five.src_ip.as_bytes();
-
-        // 1. 常规业务流量目标过滤 (DNS 53 强制劫持到代理)
-        if dst_port != 53 {
-            // 目标 IP / 目标端口 Bypass 判定
-            if is_dst_ip6_bypassed(dst_ip) || is_dynamic_dst_ip6_bypassed(dst_ip) {
-                return TC_ACT_OK;
-            }
-            if is_dst_port_bypassed(dst_port, param.tproxy_port as u16) {
-                return TC_ACT_OK;
-            }
-
-            // 目标白名单过滤
-            if param.has_proxy_dst_ips != 0 && !is_dst_ip6_proxied(dst_ip) {
-                return TC_ACT_OK;
-            }
-            if param.has_proxy_dst_ports != 0
-                && unsafe { PROXY_DST_PORTS.get(&dst_port).is_none() }
-            {
-                return TC_ACT_OK;
-            }
-        }
-
-        let tuple = RedirectTuple {
-            src_ip,
-            dst_ip,
-            src_port,
-            dst_port,
-            proto: pkt.l4proto,
-            ip_version: 6,
-            _pad: [0; 2],
-        };
-        let ifindex = unsafe { (*ctx).ifindex };
-        let (smac, dmac) = if link_h_len >= EthHdr::LEN {
-            (pkt.ethh.src_addr, pkt.ethh.dst_addr)
-        } else {
-            ([0u8; 6], [0u8; 6])
-        };
-        let entry = RedirectEntry {
-            ifindex,
-            from_wan: 1,
-            _pad0: [0; 3],
-            smac,
-            dmac,
-        };
-        unsafe {
-            let is_new_flow = REDIRECT_TRACK.get(&tuple).is_none();
-            let _ = REDIRECT_TRACK.insert(&tuple, &entry, 0);
-            let l4proto = if pkt.l4proto == IPPROTO_TCP {
-                pkt.listener_l4proto
-            } else {
-                IPPROTO_UDP
-            };
-
-            if is_new_flow {
-                let pid = pid_pname.map(|p| p.pid).unwrap_or(0);
-                let pname = pid_pname.map(|p| &p.pname);
-                let mut sip_u32 = [0u32; 4];
-                let mut dip_u32 = [0u32; 4];
-                for i in 0..4 {
-                    sip_u32[i] = u32::from_ne_bytes([
-                        src_ip[i * 4],
-                        src_ip[i * 4 + 1],
-                        src_ip[i * 4 + 2],
-                        src_ip[i * 4 + 3],
-                    ]);
-                    dip_u32[i] = u32::from_ne_bytes([
-                        dst_ip[i * 4],
-                        dst_ip[i * 4 + 1],
-                        dst_ip[i * 4 + 2],
-                        dst_ip[i * 4 + 3],
-                    ]);
-                }
-                send_dae_event(
-                    DaeEventType::Redirected as u32,
-                    pid,
-                    pname,
-                    1,
-                    pkt.l4proto,
-                    Some(&sip_u32),
-                    Some(&dip_u32),
-                    src_port,
-                    dst_port,
-                );
-            }
-
-            do_redirect(ctx, param, link_h_len, l4proto, ETH_P_IPV6, true)
-        }
+    if pkt.ethh.ether_type == ETH_P_IP.to_be() {
+        handle_wan_ipv4(ctx, param, link_h_len, pkt, pid_pname)
+    } else if pkt.ethh.ether_type == ETH_P_IPV6.to_be() {
+        handle_wan_ipv6(ctx, param, link_h_len, pkt, pid_pname)
     } else {
         TC_ACT_OK
     }
 }
+
 
 // ─────────────────────────────────────────────────────────────
 // 3. TC Entrypoints
@@ -786,37 +955,37 @@ fn handle_wan_egress_impl(ctx: *mut __sk_buff, link_h_len: usize) -> i32 {
 #[unsafe(no_mangle)]
 #[unsafe(link_section = "classifier")]
 pub fn lan_ingress(ctx: *mut __sk_buff) -> i32 {
-    handle_lan_ingress_impl(ctx, EthHdr::LEN)
+    handle_lan_ingress_impl(&TcContext::new(ctx), EthHdr::LEN)
 }
 
 #[unsafe(no_mangle)]
 #[unsafe(link_section = "classifier")]
 pub fn lan_ingress_l2(ctx: *mut __sk_buff) -> i32 {
-    handle_lan_ingress_impl(ctx, EthHdr::LEN)
+    handle_lan_ingress_impl(&TcContext::new(ctx), EthHdr::LEN)
 }
 
 #[unsafe(no_mangle)]
 #[unsafe(link_section = "classifier")]
 pub fn lan_ingress_l3(ctx: *mut __sk_buff) -> i32 {
-    handle_lan_ingress_impl(ctx, 0)
+    handle_lan_ingress_impl(&TcContext::new(ctx), 0)
 }
 
 #[unsafe(no_mangle)]
 #[unsafe(link_section = "classifier")]
 pub fn wan_egress(ctx: *mut __sk_buff) -> i32 {
-    handle_wan_egress_impl(ctx, EthHdr::LEN)
+    handle_wan_egress_impl(&TcContext::new(ctx), EthHdr::LEN)
 }
 
 #[unsafe(no_mangle)]
 #[unsafe(link_section = "classifier")]
 pub fn wan_egress_l2(ctx: *mut __sk_buff) -> i32 {
-    handle_wan_egress_impl(ctx, EthHdr::LEN)
+    handle_wan_egress_impl(&TcContext::new(ctx), EthHdr::LEN)
 }
 
 #[unsafe(no_mangle)]
 #[unsafe(link_section = "classifier")]
 pub fn wan_egress_l3(ctx: *mut __sk_buff) -> i32 {
-    handle_wan_egress_impl(ctx, 0)
+    handle_wan_egress_impl(&TcContext::new(ctx), 0)
 }
 
 /// dae0peer ingress: runs inside daens namespace.
@@ -884,22 +1053,22 @@ fn do_tproxy_sk_lookup(ctx: &SkLookupContext) -> u32 {
 #[unsafe(no_mangle)]
 #[unsafe(link_section = "classifier")]
 pub fn dae0_ingress(ctx: *mut __sk_buff) -> i32 {
-    handle_dae0_ingress_impl(ctx)
+    handle_dae0_ingress_impl(&TcContext::new(ctx))
 }
 
 #[unsafe(no_mangle)]
 #[unsafe(link_section = "classifier")]
 pub fn dae0_ingress_l2(ctx: *mut __sk_buff) -> i32 {
-    handle_dae0_ingress_impl(ctx)
+    handle_dae0_ingress_impl(&TcContext::new(ctx))
 }
 
-#[inline(always)]
-fn handle_dae0_ingress_impl(ctx: *mut __sk_buff) -> i32 {
-    let tc_ctx = TcContext::new(ctx);
-    let mut pkt: ParsedPacket = unsafe { mem::zeroed() };
-    if parse_packet(&tc_ctx, EthHdr::LEN as u32, &mut pkt) != 0 {
-        return TC_ACT_OK;
-    }
+#[inline(never)]
+fn handle_dae0_ingress_impl(tc_ctx: &TcContext) -> i32 {
+    let ctx = tc_ctx.skb.skb;
+    let pkt = match parse_packet(tc_ctx, EthHdr::LEN as u32) {
+        Ok(p) => p,
+        Err(_) => return TC_ACT_OK,
+    };
 
     let is_ipv4 = pkt.ethh.ether_type == ETH_P_IP.to_be();
     let is_ipv6 = pkt.ethh.ether_type == ETH_P_IPV6.to_be();

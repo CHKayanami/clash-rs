@@ -1,11 +1,13 @@
 use aya_ebpf::macros::map;
 use aya_ebpf::maps::{Array, HashMap, LpmTrie, LruHashMap, PerCpuArray, RingBuf, SockMap};
 use clash_ebpf_common::{
-    DaeParam, PIDName, ParseTransportCtx, RedirectEntry, RedirectTuple,
+    DaeEvent, DaeParam, DirectTrackEntry, PIDName, ParseTransportCtx, RedirectEntry, RedirectTuple,
 };
+use crate::transport::ParsedPacket;
 
 #[map]
 pub static DAE_PARAM: Array<DaeParam> = Array::with_max_entries(1, 0);
+
 
 #[map]
 pub static BYPASS_SRC_PORTS: HashMap<u16, u8> = HashMap::with_max_entries(256, 0);
@@ -52,6 +54,11 @@ pub static DYNAMIC_BYPASS_DST_IP6S: LruHashMap<[u8; 16], u8> = LruHashMap::with_
 #[map]
 pub static REDIRECT_TRACK: LruHashMap<RedirectTuple, RedirectEntry> = LruHashMap::with_max_entries(32768, 0);
 
+/// Connection tracking map for dynamic bypass flows (TCP/UDP sessions).
+#[map]
+pub static DIRECT_TRACK: LruHashMap<RedirectTuple, DirectTrackEntry> = LruHashMap::with_max_entries(65536, 0);
+
+
 /// SOCKMAP for transparent proxy listener sockets.
 /// Keys: 0=TCP4, 1=TCP6, 2=UDP4, 3=UDP6
 #[map]
@@ -84,5 +91,13 @@ pub static BYPASS_FWMARKS: HashMap<u32, u8> = HashMap::with_max_entries(256, 0);
 /// RingBuffer for sending events and alerts from eBPF to userspace.
 #[map]
 pub static EVENT_RINGBUF: RingBuf = RingBuf::with_byte_size(262144, 0);
+
+/// PerCpuArray for event scratch memory (zero stack allocation).
+#[map]
+pub static EVENT_SCRATCH_MAP: PerCpuArray<DaeEvent> = PerCpuArray::with_max_entries(1, 0);
+
+/// PerCpuArray for parsed packet scratch memory (zero stack allocation).
+#[map]
+pub static PARSED_PKT_MAP: PerCpuArray<ParsedPacket> = PerCpuArray::with_max_entries(1, 0);
 
 

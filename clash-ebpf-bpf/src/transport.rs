@@ -1,4 +1,4 @@
-use crate::maps::PARSE_CTX_MAP;
+use crate::maps::{PARSE_CTX_MAP, PARSED_PKT_MAP};
 use aya_ebpf::programs::TcContext;
 use aya_ebpf_bindings::helpers::bpf_skb_load_bytes;
 use clash_ebpf_common::{In6Addr, ParseTransportCtx, Tuples};
@@ -719,28 +719,32 @@ impl ParseTransportExt for ParseTransportCtx {
     }
 }
 
-/// Parse the packet into `out` via the scratch-map-based fast/slow path.
+/// Parse the packet into `PARSED_PKT_MAP` via the scratch-map-based fast/slow path.
 #[inline(always)]
-pub fn parse_packet(
+pub fn parse_packet<'a>(
     ctx: &TcContext,
     link_h_len: u32,
-    out: &mut ParsedPacket,
-) -> c_long {
+) -> Result<&'a ParsedPacket, c_long> {
     let scratch_key: u32 = 0;
     let tctx = match PARSE_CTX_MAP.get_ptr_mut(scratch_key) {
         Some(ptr) => unsafe { &mut *ptr },
-        None => return ERR_MALFORMED,
+        None => return Err(ERR_MALFORMED),
     };
 
-    match tctx.parse(ctx, link_h_len) {
-        Err(e) => return e,
-        Ok(()) => {}
+    if let Err(e) = tctx.parse(ctx, link_h_len) {
+        return Err(e);
     }
 
     if tctx.l4proto == IPPROTO_ICMPV6 {
-        return PASS_UNSUPPORTED;
+        return Err(PASS_UNSUPPORTED);
     }
 
+    let pkt_ptr = match PARSED_PKT_MAP.get_ptr_mut(0) {
+        Some(ptr) => ptr,
+        None => return Err(ERR_MALFORMED),
+    };
+
+    let out = unsafe { &mut *pkt_ptr };
     *out = unsafe { mem::zeroed() };
     out.ethh = tctx.ethh;
     out.tcph = tctx.tcph;
@@ -748,5 +752,5 @@ pub fn parse_packet(
     out.l4proto = tctx.l4proto;
     out.listener_l4proto = tctx.listener_l4proto;
     tctx.fill_tuples(&mut out.tuples);
-    0
+    Ok(out)
 }

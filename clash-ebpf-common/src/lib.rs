@@ -71,6 +71,17 @@ pub struct RedirectEntry {
     pub dmac: [u8; 6],
 }
 
+pub const DIRECT_TRACK_STATE_ACTIVE: u8 = 0;
+pub const DIRECT_TRACK_STATE_CLOSING: u8 = 1;
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DirectTrackEntry {
+    pub last_seen_ns: u64,
+    pub state: u8,
+    pub _pad: [u8; 7],
+}
+
 #[cfg(all(feature = "user", target_os = "linux"))]
 unsafe impl aya::Pod for DaeParam {}
 
@@ -79,3 +90,7 @@ unsafe impl aya::Pod for RedirectTuple {}
 
 #[cfg(all(feature = "user", target_os = "linux"))]
 unsafe impl aya::Pod for RedirectEntry {}
+
+#[cfg(all(feature = "user", target_os = "linux"))]
+unsafe impl aya::Pod for DirectTrackEntry {}
+
