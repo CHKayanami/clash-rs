@@ -163,7 +163,7 @@ jobs:
             archive-name: clash-rs-minimal-i686-unknown-linux-musl
             binary-name: clash-rs
             archive-ext: tar.gz
-            features: minimal,ebpf
+            features: minimal
             os: ubuntu-latest
             use-zigbuild: true
             opt-level: "s"
