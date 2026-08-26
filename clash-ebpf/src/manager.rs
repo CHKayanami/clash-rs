@@ -248,6 +248,8 @@ impl EbpfManager {
             let proxy_local = if self.config.host.proxy_local { 1 } else { 0 };
             let has_proxy_processes = if !self.config.host.proxy_processes.is_empty() { 1 } else { 0 };
             let has_bypass_processes = if !self.config.host.bypass_processes.is_empty() { 1 } else { 0 };
+            let has_bypass_dscps = if !self.config.bypass_dscps.is_empty() { 1 } else { 0 };
+            let has_bypass_fwmarks = if !self.config.bypass_fwmarks.is_empty() { 1 } else { 0 };
 
             // Initialize eBPF programs and attach TC/cgroup hooks via Aya
             let bpf_param = clash_ebpf_common::DaeParam {
@@ -267,7 +269,9 @@ impl EbpfManager {
                 direct_offload_enabled,
                 has_proxy_processes,
                 has_bypass_processes,
-                _pad1: 0,
+                has_bypass_dscps,
+                has_bypass_fwmarks,
+                _pad1: [0; 3],
             };
 
             if let Err(e) = self.bpf_manager.load_and_attach(
@@ -285,6 +289,8 @@ impl EbpfManager {
                 &self.config.target.proxy_dst_ips,
                 &self.config.host.proxy_processes,
                 &self.config.host.bypass_processes,
+                &self.config.bypass_dscps,
+                &self.config.bypass_fwmarks,
                 Some(&ns),
             ) {
                 tracing::warn!("eBPF hooks attachment: {e}");

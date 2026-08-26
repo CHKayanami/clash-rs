@@ -73,7 +73,16 @@ pub static PROXY_PROCESSES: HashMap<[u8; 16], u8> = HashMap::with_max_entries(25
 #[map]
 pub static BYPASS_PROCESSES: HashMap<[u8; 16], u8> = HashMap::with_max_entries(256, 0);
 
+/// DSCP values blacklist for direct bypassing.
+#[map]
+pub static BYPASS_DSCPS: HashMap<u8, u8> = HashMap::with_max_entries(64, 0);
+
+/// FWMark values blacklist for direct bypassing.
+#[map]
+pub static BYPASS_FWMARKS: HashMap<u32, u8> = HashMap::with_max_entries(256, 0);
+
 /// RingBuffer for sending events and alerts from eBPF to userspace.
 #[map]
 pub static EVENT_RINGBUF: RingBuf = RingBuf::with_byte_size(262144, 0);
+
 

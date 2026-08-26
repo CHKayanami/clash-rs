@@ -30,7 +30,9 @@ pub struct DaeParam {
     pub direct_offload_enabled: u8,
     pub has_proxy_processes: u8,
     pub has_bypass_processes: u8,
-    pub _pad1: u8,
+    pub has_bypass_dscps: u8,
+    pub has_bypass_fwmarks: u8,
+    pub _pad1: [u8; 3],
 }
 
 #[repr(C)]

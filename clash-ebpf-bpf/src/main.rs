@@ -281,6 +281,7 @@ fn handle_lan_ingress_impl(ctx: *mut __sk_buff, link_h_len: usize) -> i32 {
 
     if mark == DAE_BYPASS_MARK
         || (param.dae_socket_mark != 0 && mark == param.dae_socket_mark)
+        || (param.has_bypass_fwmarks != 0 && unsafe { BYPASS_FWMARKS.get(&mark).is_some() })
     {
         return TC_ACT_OK;
     }
@@ -288,6 +289,10 @@ fn handle_lan_ingress_impl(ctx: *mut __sk_buff, link_h_len: usize) -> i32 {
     let mut pkt: ParsedPacket = unsafe { mem::zeroed() };
     let ret = parse_packet(&tc_ctx, link_h_len as u32, &mut pkt);
     if ret != 0 {
+        return TC_ACT_OK;
+    }
+
+    if param.has_bypass_dscps != 0 && unsafe { BYPASS_DSCPS.get(&pkt.tuples.dscp).is_some() } {
         return TC_ACT_OK;
     }
 
@@ -529,9 +534,10 @@ fn handle_wan_egress_impl(ctx: *mut __sk_buff, link_h_len: usize) -> i32 {
         return TC_ACT_OK;
     }
 
-    // 1. Clash 自身发出的出站请求 (带 DAE_BYPASS_MARK 或配置的 dae_socket_mark): 100% 绝对放行防自环
+    // 1. Clash 自身发出的出站请求 (带 DAE_BYPASS_MARK 或配置的 dae_socket_mark 或配置的 bypass_fwmarks): 绝对放行防自环/绕过
     if mark == DAE_BYPASS_MARK
         || (param.dae_socket_mark != 0 && mark == param.dae_socket_mark)
+        || (param.has_bypass_fwmarks != 0 && unsafe { BYPASS_FWMARKS.get(&mark).is_some() })
     {
         return TC_ACT_OK;
     }
@@ -571,6 +577,10 @@ fn handle_wan_egress_impl(ctx: *mut __sk_buff, link_h_len: usize) -> i32 {
     let mut pkt: ParsedPacket = unsafe { mem::zeroed() };
     let ret = parse_packet(&tc_ctx, link_h_len as u32, &mut pkt);
     if ret != 0 {
+        return TC_ACT_OK;
+    }
+
+    if param.has_bypass_dscps != 0 && unsafe { BYPASS_DSCPS.get(&pkt.tuples.dscp).is_some() } {
         return TC_ACT_OK;
     }
 

@@ -93,6 +93,14 @@ pub struct EbpfConfig {
     /// Host-local traffic configuration policies (TC Egress on WAN interface & cgroups).
     #[serde(default)]
     pub host: EbpfHostConfig,
+
+    /// DSCP values to bypass directly in kernel.
+    #[serde(default, rename = "bypass-dscps", alias = "bypass-dscp")]
+    pub bypass_dscps: Vec<u8>,
+
+    /// FWMark / skb->mark values to bypass directly in kernel.
+    #[serde(default, rename = "bypass-fwmarks", alias = "bypass-fwmark", alias = "bypass-marks", alias = "bypass-mark")]
+    pub bypass_fwmarks: Vec<u32>,
 }
 
 fn default_tproxy_port() -> u16 {
@@ -141,6 +149,8 @@ impl Default for EbpfConfig {
                 proxy_dst_ips: Vec::new(),
             },
             host: EbpfHostConfig::default(),
+            bypass_dscps: Vec::new(),
+            bypass_fwmarks: Vec::new(),
         }
     }
 }
@@ -218,4 +228,33 @@ mod tests {
         assert!(agg.contains(&"fe80::/10".to_string()));
         assert!(!agg.contains(&"fe80::1/128".to_string())); // subsumed
     }
+
+    #[test]
+    fn test_ebpf_config_dscp_fwmark_parsing() {
+        let yaml = r#"
+enable: true
+bypass-dscp:
+  - 4
+  - 46
+bypass-fwmarks:
+  - 0x100
+  - 512
+"#;
+        let cfg: EbpfConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(cfg.enable);
+        assert_eq!(cfg.bypass_dscps, vec![4, 46]);
+        assert_eq!(cfg.bypass_fwmarks, vec![256, 512]);
+
+        let yaml_alias = r#"
+enable: true
+bypass-dscps:
+  - 8
+bypass-mark:
+  - 1000
+"#;
+        let cfg2: EbpfConfig = serde_yaml::from_str(yaml_alias).unwrap();
+        assert_eq!(cfg2.bypass_dscps, vec![8]);
+        assert_eq!(cfg2.bypass_fwmarks, vec![1000]);
+    }
 }
+

@@ -113,6 +113,10 @@ pub struct EbpfConfig {
     pub target: EbpfTargetConfig,
     #[serde(default)]
     pub host: EbpfHostConfig,
+    #[serde(default, alias = "bypass-dscp")]
+    pub bypass_dscps: Vec<u8>,
+    #[serde(default, alias = "bypass-fwmark", alias = "bypass-marks", alias = "bypass-mark")]
+    pub bypass_fwmarks: Vec<u32>,
 }
 
 fn default_bypass_src_ports() -> Vec<u16> {
@@ -1183,6 +1187,25 @@ ports: 8080
             .parse::<Config>()
             .expect("unknown top-level fields should be ignored");
         assert_eq!(parsed.port.expect("port should be set"), Port(9090));
+    }
+
+    #[test]
+    fn test_ebpf_config_bypass_dscp_and_fwmark() {
+        let yaml = r#"
+ebpf:
+  enable: true
+  bypass-dscp:
+    - 4
+    - 46
+  bypass-fwmark:
+    - 0x200
+    - 0x1000
+"#;
+        let c = yaml.parse::<Config>().expect("should parse");
+        let ebpf = c.ebpf.expect("ebpf should be present");
+        assert!(ebpf.enable);
+        assert_eq!(ebpf.bypass_dscps, vec![4, 46]);
+        assert_eq!(ebpf.bypass_fwmarks, vec![0x200, 0x1000]);
     }
 
     #[test]

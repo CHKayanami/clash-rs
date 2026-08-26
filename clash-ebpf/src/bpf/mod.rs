@@ -286,6 +286,8 @@ pub mod linux {
             proxy_dst_ips: &[String],
             proxy_processes: &[String],
             bypass_processes: &[String],
+            bypass_dscps: &[u8],
+            bypass_fwmarks: &[u32],
             netns: Option<&crate::netns::linux::DaeNs>,
         ) -> Result<(), String> {
             if obj_bytes.is_empty() {
@@ -499,7 +501,27 @@ pub mod linux {
                 }
             }
 
-            // 12. Spawn RingBuf consumer for kernel events
+            // 12. Populate BYPASS_DSCPS map
+            if let Some(map) = bpf.map_mut("BYPASS_DSCPS") {
+                if let Ok(mut dscp_map) = HashMap::<_, u8, u8>::try_from(map) {
+                    for &dscp in bypass_dscps {
+                        let _ = dscp_map.insert(dscp, 1, 0);
+                    }
+                    debug!("Configured {} bypass DSCP values in BPF map", bypass_dscps.len());
+                }
+            }
+
+            // 13. Populate BYPASS_FWMARKS map
+            if let Some(map) = bpf.map_mut("BYPASS_FWMARKS") {
+                if let Ok(mut fwmark_map) = HashMap::<_, u32, u8>::try_from(map) {
+                    for &fwmark in bypass_fwmarks {
+                        let _ = fwmark_map.insert(fwmark, 1, 0);
+                    }
+                    debug!("Configured {} bypass FWMark values in BPF map", bypass_fwmarks.len());
+                }
+            }
+
+            // 14. Spawn RingBuf consumer for kernel events
             if let Some(map) = bpf.take_map("EVENT_RINGBUF") {
                 if let Ok(ring_buf) = RingBuf::try_from(map) {
                     match tokio::io::unix::AsyncFd::with_interest(
@@ -1144,6 +1166,8 @@ pub mod non_linux {
             _proxy_dst_ips: &[String],
             _proxy_processes: &[String],
             _bypass_processes: &[String],
+            _bypass_dscps: &[u8],
+            _bypass_fwmarks: &[u32],
             _netns: Option<&crate::netns::non_linux::DaeNs>,
         ) -> Result<(), String> {
             Ok(())

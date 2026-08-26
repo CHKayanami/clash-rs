@@ -133,6 +133,8 @@ impl EbpfInbound {
                         proxy_processes: self.config.host.proxy_processes.clone(),
                         bypass_processes: self.config.host.bypass_processes.clone(),
                     },
+                    bypass_dscps: self.config.bypass_dscps.clone(),
+                    bypass_fwmarks: self.config.bypass_fwmarks.clone(),
                 };
 
                 let mut manager = EbpfManager::new(core_config);

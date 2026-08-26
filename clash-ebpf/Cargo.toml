@@ -37,6 +37,8 @@ aya = { version = "0.14", default-features = false }
 [dev-dependencies]
 tokio-test = "0.4.5"
 anyhow = "1"
+serde_yaml = "0.9"
 
 [lints]
 workspace = true
+

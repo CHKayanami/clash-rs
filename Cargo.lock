@@ -1483,6 +1483,7 @@ dependencies = [
  "nix 0.29.0",
  "rtnetlink 0.21.0",
  "serde",
+ "serde_yaml",
  "socket2 0.6.4",
  "thiserror 2.0.18",
  "tokio",
