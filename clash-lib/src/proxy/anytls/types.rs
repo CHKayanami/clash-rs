@@ -96,16 +96,22 @@ impl Frame {
         Self::with_data(Command::Psh, stream_id, data)
     }
 
+    /// Encode frame parts into an existing buffer (zero allocation)
+    #[inline]
+    pub fn encode_parts(cmd: Command, stream_id: u32, data: &[u8], buf: &mut BytesMut) {
+        buf.reserve(FRAME_HEADER_SIZE + data.len());
+        buf.put_u8(cmd as u8);
+        buf.put_u32(stream_id);
+        buf.put_u16(data.len() as u16);
+        if !data.is_empty() {
+            buf.extend_from_slice(data);
+        }
+    }
+
     /// Encode frame into an existing buffer (zero allocation)
     #[inline]
     pub fn encode_into(&self, buf: &mut BytesMut) {
-        buf.reserve(FRAME_HEADER_SIZE + self.data.len());
-        buf.put_u8(self.cmd as u8);
-        buf.put_u32(self.stream_id);
-        buf.put_u16(self.data.len() as u16);
-        if !self.data.is_empty() {
-            buf.extend_from_slice(&self.data);
-        }
+        Self::encode_parts(self.cmd, self.stream_id, &self.data, buf);
     }
 
     /// Decode frame header

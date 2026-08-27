@@ -184,11 +184,10 @@ impl AsyncWrite for AnyTlsStream {
                 let write_len = buf.len().min(MAX_FRAME_DATA_SIZE);
                 let mut pooled = clash_common::PooledBuffer::acquire(write_len);
                 pooled.extend_from_slice(&buf[..write_len]);
-                let data = pooled.into_bytes();
                 let id = self.id;
                 match self.outgoing_tx.send_item(OutgoingMessage::Data {
                     stream_id: id,
-                    data,
+                    data: pooled,
                 }) {
                     Ok(()) => Poll::Ready(Ok(write_len)),
                     Err(_) => Poll::Ready(Err(io::Error::new(

@@ -43,7 +43,10 @@ pub(super) enum OutgoingMessage {
         data: Bytes,
     },
     /// Data frame for a stream (PSH)
-    Data { stream_id: u32, data: Bytes },
+    Data {
+        stream_id: u32,
+        data: clash_common::PooledBuffer,
+    },
     /// FIN frame for a stream
     Fin { stream_id: u32 },
 }
@@ -368,8 +371,12 @@ impl AnyTlsClientSession {
                     writer.flush().await?;
                 }
                 OutgoingMessage::Data { stream_id, data } => {
-                    Frame::with_data(Command::Psh, stream_id, data)
-                        .encode_into(&mut write_buf);
+                    Frame::encode_parts(
+                        Command::Psh,
+                        stream_id,
+                        data.as_ref(),
+                        &mut write_buf,
+                    );
                     Self::write_with_padding(
                         &session,
                         &mut writer,

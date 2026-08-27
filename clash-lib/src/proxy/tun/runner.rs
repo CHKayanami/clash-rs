@@ -611,7 +611,7 @@ impl Runner for TunRunner {
                                         break;
                                     }
                                 } else if let Err(e) = stack_sink
-                                    .send(watfaq_netstack::Packet::new(pooled.into_bytes()))
+                                    .send(watfaq_netstack::Packet::from_pooled(pooled))
                                     .await
                                 {
                                     error!("failed to send pkt to stack: {}", e);
@@ -620,7 +620,7 @@ impl Runner for TunRunner {
                                     ));
                                 }
                             } else if let Err(e) = stack_sink
-                                .send(watfaq_netstack::Packet::new(pooled.into_bytes()))
+                                .send(watfaq_netstack::Packet::from_pooled(pooled))
                                 .await
                             {
                                 error!("failed to send pkt to stack: {}", e);
@@ -629,7 +629,7 @@ impl Runner for TunRunner {
                                 ));
                             }
                         } else if let Err(e) = stack_sink
-                            .send(watfaq_netstack::Packet::new(pooled.into_bytes()))
+                            .send(watfaq_netstack::Packet::from_pooled(pooled))
                             .await
                         {
                             error!("failed to send pkt to stack: {}", e);
