@@ -101,8 +101,6 @@ pub struct EbpfConfig {
     pub wan_interface: Option<String>,
     #[serde(default = "default_tproxy_port")]
     pub tproxy_port: u16,
-    #[serde(default = "default_tproxy_port")]
-    pub tproxy_udp_port: u16,
     #[serde(default = "default_true")]
     pub auto_direct_offload: bool,
     #[serde(default, rename = "routing-mark")]

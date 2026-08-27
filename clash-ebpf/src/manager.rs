@@ -311,8 +311,8 @@ impl EbpfManager {
             self.listener = Some(listener.clone());
 
             info!(
-                "clash-ebpf started: TCP port {}, UDP port {}, LAN interfaces: {:?}, WAN interface: {:?}",
-                self.config.tproxy_port, self.config.tproxy_udp_port, self.config.lan_interface, effective_wan
+                "clash-ebpf started: TProxy port {}, LAN interfaces: {:?}, WAN interface: {:?}",
+                self.config.tproxy_port, self.config.lan_interface, effective_wan
             );
 
             Ok(listener)

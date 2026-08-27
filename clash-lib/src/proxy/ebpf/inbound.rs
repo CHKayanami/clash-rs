@@ -113,7 +113,6 @@ impl EbpfInbound {
                     lan_interface: self.config.lan_interface.clone(),
                     wan_interface: self.config.wan_interface.clone(),
                     tproxy_port: self.config.tproxy_port,
-                    tproxy_udp_port: self.config.tproxy_udp_port,
                     auto_direct_offload: self.config.auto_direct_offload,
                     routing_mark: self.config.routing_mark,
                     lan: CoreEbpfLanConfig {

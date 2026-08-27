@@ -383,9 +383,8 @@ ebpf:
   # Or explicitly specify: "eth1"
   wan-interface: "auto"
 
-  # Transparent proxy listener ports (default: 12345):
-  tproxy-port: 12345                  # TCP TProxy local port inside daens
-  tproxy-udp-port: 12345              # UDP TProxy local port inside daens
+  # Transparent proxy listener port (default: 12345):
+  tproxy-port: 12345                  # TProxy local port inside daens
 
   # ── Automatic Fast Path Offload ───────────────────────────────────────────
   # Automatically offload DIRECT domain resolved IPs directly into eBPF LRU Map.

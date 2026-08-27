@@ -131,7 +131,7 @@ impl EbpfListener {
             }
             let udp_addr_v4 = SocketAddr::V4(SocketAddrV4::new(
                 Ipv4Addr::UNSPECIFIED,
-                config.tproxy_udp_port,
+                config.tproxy_port,
             ));
             udp_sock_v4.bind(&udp_addr_v4.into())?;
             let udp_socket_v4 = UdpSocket::from_std(udp_sock_v4.into())?;
@@ -167,7 +167,7 @@ impl EbpfListener {
                 }
                 let udp_addr_v6 = SocketAddr::V6(SocketAddrV6::new(
                     Ipv6Addr::UNSPECIFIED,
-                    config.tproxy_udp_port,
+                    config.tproxy_port,
                     0,
                     0,
                 ));
@@ -177,7 +177,7 @@ impl EbpfListener {
                 Ok(s) => {
                     tracing::info!(
                         "Bound UDP IPv6 transparent listener on port {}",
-                        config.tproxy_udp_port
+                        config.tproxy_port
                     );
                     Some(s)
                 }

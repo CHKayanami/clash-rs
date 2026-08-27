@@ -66,13 +66,9 @@ pub struct EbpfConfig {
     #[serde(default, rename = "wan-interface")]
     pub wan_interface: Option<String>,
 
-    /// TCP transparent proxy port inside daens.
+    /// Transparent proxy port inside daens for both TCP and UDP.
     #[serde(default = "default_tproxy_port", rename = "tproxy-port")]
     pub tproxy_port: u16,
-
-    /// UDP transparent proxy port inside daens.
-    #[serde(default = "default_tproxy_port", rename = "tproxy-udp-port")]
-    pub tproxy_udp_port: u16,
 
     /// Automatically offload DIRECT domains/IPs to eBPF map for fast path forwarding.
     #[serde(default = "default_true", rename = "auto-direct-offload")]
@@ -133,7 +129,6 @@ impl Default for EbpfConfig {
             lan_interface: Vec::new(),
             wan_interface: Some("auto".to_string()),
             tproxy_port: default_tproxy_port(),
-            tproxy_udp_port: default_tproxy_port(),
             auto_direct_offload: true,
             routing_mark: None,
             lan: EbpfLanConfig {
