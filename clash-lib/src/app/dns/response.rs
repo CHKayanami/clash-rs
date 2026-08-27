@@ -5,7 +5,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use thiserror::Error;
 
-use super::query::{IngressProfile, NameParseState, QueryContext, TxId, parse_name};
+use super::query::{IngressProfile, NameParseState, QueryContext, TxId, parse_name, skip_name};
 
 const HEADER_LEN: usize = 12;
 const QR: u16 = 0x8000;
@@ -203,8 +203,8 @@ fn record_end(
     start: usize,
     name_state: &mut NameParseState,
 ) -> Result<usize, ResponseError> {
-    let (_, name_end) =
-        parse_name(response, start, name_state).map_err(|_| ResponseError::MalformedRecord)?;
+    let name_end =
+        skip_name(response, start, name_state).map_err(|_| ResponseError::MalformedRecord)?;
     let rdlength = usize::from(read_u16(response, name_end + 8)?);
     (name_end + 10)
         .checked_add(rdlength)

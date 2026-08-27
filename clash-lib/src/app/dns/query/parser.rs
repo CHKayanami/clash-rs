@@ -147,10 +147,30 @@ pub(crate) fn parse_name(
     start: usize,
     state: &mut NameParseState,
 ) -> Result<(DnsName, usize), QueryError> {
+    let mut wire = Vec::with_capacity(64);
+    let name_end = walk_name(raw, start, state, Some(&mut wire))?;
+    Ok((DnsName(wire.into_boxed_slice()), name_end))
+}
+
+pub(crate) fn skip_name(
+    raw: &[u8],
+    start: usize,
+    state: &mut NameParseState,
+) -> Result<usize, QueryError> {
+    walk_name(raw, start, state, None)
+}
+
+#[inline(always)]
+fn walk_name(
+    raw: &[u8],
+    start: usize,
+    state: &mut NameParseState,
+    mut sink: Option<&mut Vec<u8>>,
+) -> Result<usize, QueryError> {
     state.begin_name();
     let mut cursor = start;
     let mut end = None;
-    let mut wire = Vec::new();
+    let mut total_len = 0;
     loop {
         let octet = *raw.get(cursor).ok_or(QueryError::MalformedName)?;
         if octet & 0xc0 == 0xc0 {
@@ -166,23 +186,29 @@ pub(crate) fn parse_name(
         if octet & 0xc0 != 0 || octet > 63 {
             return Err(QueryError::MalformedName);
         }
-        wire.push(octet);
-        if wire.len() > 255 {
+        if let Some(ref mut wire) = sink {
+            wire.push(octet);
+        }
+        total_len += 1;
+        if total_len > 255 {
             return Err(QueryError::MalformedName);
         }
         cursor += 1;
         if octet == 0 {
-            return Ok((DnsName(wire.into_boxed_slice()), end.unwrap_or(cursor)));
+            return Ok(end.unwrap_or(cursor));
         }
         let label_end = cursor
             .checked_add(usize::from(octet))
             .filter(|label_end| *label_end <= raw.len())
             .ok_or(QueryError::MalformedName)?;
-        wire.extend_from_slice(
-            raw.get(cursor..label_end)
-                .ok_or(QueryError::MalformedName)?,
-        );
-        if wire.len() > 255 {
+        if let Some(ref mut wire) = sink {
+            wire.extend_from_slice(
+                raw.get(cursor..label_end)
+                    .ok_or(QueryError::MalformedName)?,
+            );
+        }
+        total_len += usize::from(octet);
+        if total_len > 255 {
             return Err(QueryError::MalformedName);
         }
         cursor = label_end;

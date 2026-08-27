@@ -387,6 +387,7 @@ async fn test_optimistic_cache_ttl_and_never_cache() {
 
 #[tokio::test]
 async fn test_reverse_lookup_cache_integration_and_conflict() {
+    use crate::app::dns::ClashResolver;
     use crate::app::dns::config::Config;
     use crate::app::dns::query::{build_dns_query_wire_with_id, DnsName, QType, QueryContext};
     use crate::app::dns::response::build_dns_ip_response;
@@ -401,6 +402,8 @@ async fn test_reverse_lookup_cache_integration_and_conflict() {
     let cfg = Config {
         enable: true,
         enhance_mode: DNSMode::FakeIp,
+        fake_ip_range: "198.18.0.1/16".parse().unwrap(),
+        fake_ip_range6: "fc00::/18".parse().unwrap(),
         nameserver: Config::parse_nameserver(&["114.114.114.114".to_string()]).unwrap(),
         default_nameserver: Config::parse_nameserver(&["114.114.114.114".to_string()]).unwrap(),
         ..Default::default()
