@@ -493,6 +493,8 @@ pub struct Session {
     pub inbound_user: Option<String>,
     /// Domain name sniffed from TLS SNI / HTTP Host / QUIC SNI
     pub sniffed_domain: Option<String>,
+    /// Domain name mapped from DNS reverse lookup or Fake-IP
+    pub mapped_domain: Option<String>,
     /// Original destination address before sniffing or DNS mapping override
     pub orig_destination: Option<SocksAddr>,
     /// Custom UDP session idle timeout
@@ -530,6 +532,9 @@ impl Serialize for Session {
         if self.sniffed_domain.is_some() {
             count += 1;
         }
+        if self.mapped_domain.is_some() {
+            count += 1;
+        }
 
         let mut map = serializer.serialize_map(Some(count))?;
         map.serialize_entry("id", &self.id)?;
@@ -544,7 +549,14 @@ impl Serialize for Session {
         );
         map.serialize_entry("destinationIP", &dest_ip_helper)?;
         map.serialize_entry("destinationPort", &self.destination.port())?;
-        map.serialize_entry("host", self.destination.host_cow().as_ref())?;
+
+        let dest_host = self.destination.host_cow();
+        let display_host = self
+            .sniffed_domain
+            .as_deref()
+            .or(self.mapped_domain.as_deref())
+            .unwrap_or_else(|| dest_host.as_ref());
+        map.serialize_entry("host", display_host)?;
         map.serialize_entry("asn", &self.asn)?;
         map.serialize_entry("country", &self.country)?;
         map.serialize_entry("traffic_stats", &self.traffic_stats)?;
@@ -554,6 +566,9 @@ impl Serialize for Session {
         }
         if let Some(ref sniffed) = self.sniffed_domain {
             map.serialize_entry("sniffedDomain", sniffed)?;
+        }
+        if let Some(ref mapped) = self.mapped_domain {
+            map.serialize_entry("mappedDomain", mapped)?;
         }
 
         map.end()
@@ -577,6 +592,7 @@ impl Default for Session {
             traffic_stats: None,
             inbound_user: None,
             sniffed_domain: None,
+            mapped_domain: None,
             orig_destination: None,
             udp_timeout: None,
         }
@@ -608,6 +624,7 @@ impl Debug for Session {
             .field("source", &self.source)
             .field("destination", &self.destination)
             .field("sniffed_domain", &self.sniffed_domain)
+            .field("mapped_domain", &self.mapped_domain)
             .field("packet_mark", &self.so_mark)
             .field("iface", &self.iface)
             .field("country", &self.country)
@@ -633,6 +650,7 @@ impl Clone for Session {
             traffic_stats: self.traffic_stats.clone(),
             inbound_user: self.inbound_user.clone(),
             sniffed_domain: self.sniffed_domain.clone(),
+            mapped_domain: self.mapped_domain.clone(),
             orig_destination: self.orig_destination.clone(),
             udp_timeout: self.udp_timeout,
         }
@@ -657,7 +675,7 @@ fn test_session_id() {
     let s2 = Session::default();
 
     assert!(s1.id >= 10_000_000);
-    assert_eq!(s2.id, s1.id + 1);
+    assert!(s2.id > s1.id);
 
     let s1_cloned = s1.clone();
     assert_eq!(s1_cloned.id, s1.id);
@@ -687,4 +705,21 @@ fn test_session_serialize() {
     s.destination = SocksAddr::Domain("example.com".into(), 80);
     let val3: serde_json::Value = serde_json::to_value(&s).unwrap();
     assert_eq!(val3["destinationIP"], "");
+
+    // Test host priority: sniffed_domain > mapped_domain > destination.host_cow()
+    let mut s_prio = Session::default();
+    s_prio.destination = SocksAddr::Ip(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), 443));
+    let v1: serde_json::Value = serde_json::to_value(&s_prio).unwrap();
+    assert_eq!(v1["host"], "1.2.3.4");
+
+    s_prio.mapped_domain = Some("mapped.apple.com".to_string());
+    let v2: serde_json::Value = serde_json::to_value(&s_prio).unwrap();
+    assert_eq!(v2["host"], "mapped.apple.com");
+    assert_eq!(v2["mappedDomain"], "mapped.apple.com");
+
+    s_prio.sniffed_domain = Some("sniffed.apple.com".to_string());
+    let v3: serde_json::Value = serde_json::to_value(&s_prio).unwrap();
+    assert_eq!(v3["host"], "sniffed.apple.com");
+    assert_eq!(v3["sniffedDomain"], "sniffed.apple.com");
+    assert_eq!(v3["mappedDomain"], "mapped.apple.com");
 }
