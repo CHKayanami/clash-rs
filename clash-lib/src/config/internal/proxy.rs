@@ -343,6 +343,8 @@ pub struct OutboundTrojan {
     pub alpn: Option<Vec<String>>,
     pub sni: Option<String>,
     pub skip_cert_verify: Option<bool>,
+    pub fingerprint: Option<String>,
+    pub client_fingerprint: Option<String>,
     pub udp: Option<bool>,
     pub network: Option<String>,
     pub grpc_opts: Option<GrpcOpt>,
@@ -369,6 +371,8 @@ pub struct OutboundVmess {
     pub udp: Option<bool>,
     pub tls: Option<bool>,
     pub skip_cert_verify: Option<bool>,
+    pub fingerprint: Option<String>,
+    pub client_fingerprint: Option<String>,
     #[serde(alias = "servername")]
     pub server_name: Option<String>,
     pub network: Option<String>,

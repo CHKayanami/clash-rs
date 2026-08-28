@@ -110,7 +110,7 @@ pub fn build_handler(
                 .transpose()?
                 .flatten(),
             tls: if s.tls.unwrap_or_default() {
-                let client = TlsClient::new(
+                let client = TlsClient::new_advanced(
                     s.skip_cert_verify.unwrap_or_default(),
                     s.server_name.as_ref().map(|x| x.to_owned()).unwrap_or(
                         s.ws_opts
@@ -135,6 +135,8 @@ pub fn build_handler(
                         })
                         .transpose()?,
                     None,
+                    s.fingerprint.as_deref(),
+                    s.client_fingerprint.as_deref(),
                     s.tls_cert.as_deref(),
                     s.tls_key.as_deref(),
                 )?;

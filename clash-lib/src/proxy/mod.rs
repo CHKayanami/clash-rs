@@ -127,6 +127,10 @@ impl<S: AsyncRead + AsyncWrite + Send + Sync + Unpin> ProxyStream
     for tokio_rustls::server::TlsStream<S>
 {
 }
+impl<S: AsyncRead + AsyncWrite + Send + Sync + Unpin> ProxyStream
+    for tokio_boring::SslStream<S>
+{
+}
 
 pub trait ClientStream: ProxyStream {}
 impl<T: ProxyStream> ClientStream for T {}

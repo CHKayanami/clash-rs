@@ -29,12 +29,6 @@ pub fn build_handler(
     if skip_cert_verify {
         warn!("skip_cert_verify is set to true for {}", s.common_opts.name);
     }
-    if s.fingerprint.is_some() || s.client_fingerprint.is_some() {
-        warn!(
-            "anytls fingerprint fields are parsed but not applied yet for {}",
-            s.common_opts.name
-        );
-    }
     let default_pool = crate::proxy::anytls::pool::SessionPoolConfig::default();
 
     Ok(Handler::new(
@@ -65,7 +59,7 @@ pub fn build_handler(
                 ),
             },
             tls: {
-                let client = TlsClient::new(
+                let client = TlsClient::new_advanced(
                     skip_cert_verify,
                     s.sni
                         .clone()
@@ -74,6 +68,8 @@ pub fn build_handler(
                         .clone()
                         .or(Some(DEFAULT_ALPN.map(str::to_owned).to_vec())),
                     None,
+                    s.fingerprint.as_deref(),
+                    s.client_fingerprint.as_deref(),
                     s.tls_cert.as_deref(),
                     s.tls_key.as_deref(),
                 )?;

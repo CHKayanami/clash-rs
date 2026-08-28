@@ -76,6 +76,12 @@ rustls = { version = "0.23", default-features = false }
 rustls-pemfile = "2"
 rcgen = { version = "0.14", default-features = false, features = ["pem"] }
 webpki-roots = "1.0"
+webpki-root-certs = "1"
+boring = { version = "=5.1.0", features = ["mlkem"] }
+boring-sys = "=5.1.0"
+tokio-boring = "=5.1.0"
+brotli = "8"
+foreign-types = "0.5"
 
 # Error handing & logging
 thiserror = "2"
@@ -124,6 +130,7 @@ ip_network_table-deps-treebitmap = "0.5"
 # Algorithms
 crc32fast = "1"
 hmac = "0.13"
+hkdf = "0.13"
 sha1 = "0.11"
 sha2 = "0.11"
 md-5 = "0.11"

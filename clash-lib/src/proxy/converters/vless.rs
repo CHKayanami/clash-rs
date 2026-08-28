@@ -30,94 +30,97 @@ pub fn build_handler(
     s.smux.as_ref().map(|m| m.validate()).transpose()?;
 
     let skip_cert_verify = s.skip_cert_verify.unwrap_or_default();
-        if skip_cert_verify {
-            warn!(
-                "skipping TLS cert verification for {}",
-                s.common_opts.server
-            );
-        }
+    if skip_cert_verify {
+        warn!(
+            "skipping TLS cert verification for {}",
+            s.common_opts.server
+        );
+    }
 
-        if s.client_fingerprint.is_some() {
-            warn!(
-                "client-fingerprint (uTLS) is not yet implemented, ignored for {}",
-                s.common_opts.name
-            );
-        }
-
-        if let Some(flow) = s.flow.as_deref() {
-            if flow == "xtls-rprx-vision"
-                && !s.tls.unwrap_or_default()
-                && s.reality_opts.is_none()
-            {
-                return Err(Error::InvalidConfig(format!(
-                    "flow '{}' requires TLS or Reality to be enabled for {}",
-                    flow, s.common_opts.name
-                )));
-            }
-        }
-
-        let tls: Option<TransportLayer> = if let Some(ref reality_opts) =
-            s.reality_opts
+    if let Some(flow) = s.flow.as_deref() {
+        if flow == "xtls-rprx-vision"
+            && !s.tls.unwrap_or_default()
+            && s.reality_opts.is_none()
         {
-            // vless with reality
+            return Err(Error::InvalidConfig(format!(
+                "flow '{}' requires TLS or Reality to be enabled for {}",
+                flow, s.common_opts.name
+            )));
+        }
+    }
 
-            // reality public-key bytes
-            let pk_bytes =
-                super::utils::decode_base64_public_key(&reality_opts.public_key)?;
+    let tls: Option<TransportLayer> = if let Some(ref reality_opts) = s.reality_opts
+    {
+        // vless with reality
 
-            // reality short id bytes
-            let short_id = super::utils::decode_short_id(
-                reality_opts.short_id.as_deref().unwrap_or_default(),
-            )?;
+        // reality public-key bytes
+        let pk_bytes =
+            super::utils::decode_base64_public_key(&reality_opts.public_key)?;
 
-            // SNI
-            let sni = s
-                .server_name
-                .clone()
-                .unwrap_or_else(|| s.common_opts.server.clone());
+        // reality short id bytes
+        let short_id = super::utils::decode_short_id(
+            reality_opts.short_id.as_deref().unwrap_or_default(),
+        )?;
 
-            Some(TransportLayer::Reality(RealityClient::new(
-                sni, pk_bytes, short_id,
-            )))
-        } else {
-            // vless without reality
-            match s.tls.unwrap_or_default() {
-                true => {
-                    let client = TlsClient::new(
-                        s.skip_cert_verify.unwrap_or_default(),
-                        s.server_name.as_ref().map(|x| x.to_owned()).unwrap_or(
-                            s.ws_opts
-                                .as_ref()
-                                .and_then(|x| {
-                                    x.headers.clone().and_then(|x| {
-                                        let h = x.get("Host");
-                                        h.cloned()
-                                    })
-                                })
-                                .unwrap_or(s.common_opts.server.to_owned()),
-                        ),
-                        s.network
-                            .as_ref()
-                            .map(|x| match x.as_str() {
-                                "tcp" | "raw" => Ok(vec![]),
-                                "ws" | "http" => Ok(vec!["http/1.1".to_owned()]),
-                                "h2" | "grpc" => Ok(vec!["h2".to_owned()]),
-                                _ => Err(Error::InvalidConfig(format!(
-                                    "unsupported network: {x}"
-                                ))),
-                            })
-                            .transpose()?,
-                        None,
-                        s.tls_cert.as_deref(),
-                        s.tls_key.as_deref(),
-                    )?;
-                    Some(TransportLayer::Tls(client))
-                }
-                false => None,
+        // SNI
+        let sni = s
+            .server_name
+            .clone()
+            .unwrap_or_else(|| s.common_opts.server.clone());
+
+        let chrome = match s.client_fingerprint.as_deref() {
+            Some(fp) => {
+                let fp_lower = fp.trim().to_ascii_lowercase();
+                fp_lower != "none"
             }
+            None => true,
         };
 
-        Ok(Handler::new(HandlerOptions {
+        Some(TransportLayer::Reality(RealityClient::new_advanced(
+            sni, pk_bytes, short_id, chrome,
+        )))
+    } else {
+        // vless without reality
+        match s.tls.unwrap_or_default() {
+            true => {
+                let client = TlsClient::new_advanced(
+                    s.skip_cert_verify.unwrap_or_default(),
+                    s.server_name.as_ref().map(|x| x.to_owned()).unwrap_or(
+                        s.ws_opts
+                            .as_ref()
+                            .and_then(|x| {
+                                x.headers.clone().and_then(|x| {
+                                    let h = x.get("Host");
+                                    h.cloned()
+                                })
+                            })
+                            .unwrap_or(s.common_opts.server.to_owned()),
+                    ),
+                    s.network
+                        .as_ref()
+                        .map(|x| match x.as_str() {
+                            "tcp" | "raw" => Ok(vec![]),
+                            "ws" | "http" => Ok(vec!["http/1.1".to_owned()]),
+                            "h2" | "grpc" => Ok(vec!["h2".to_owned()]),
+                            _ => Err(Error::InvalidConfig(format!(
+                                "unsupported network: {x}"
+                            ))),
+                        })
+                        .transpose()?,
+                    None,
+                    None,
+                    s.client_fingerprint.as_deref(),
+                    s.tls_cert.as_deref(),
+                    s.tls_key.as_deref(),
+                )?;
+                Some(TransportLayer::Tls(client))
+            }
+            false => None,
+        }
+    };
+
+    Ok(Handler::new(
+        HandlerOptions {
             name: s.common_opts.name.to_owned(),
             common_opts: HandlerCommonOptions {
                 connector: s.common_opts.connect_via.clone(),
@@ -146,11 +149,16 @@ pub fn build_handler(
                             "ws_opts is required for ws".to_owned(),
                         )),
                     "http" => {
-                        let default_http_opts = crate::config::proxy::HttpOpt::default();
-                        let opts = s.http_opts.as_ref().unwrap_or(&default_http_opts);
-                        let client: HttpClient = (opts, &s.common_opts)
-                            .try_into()
-                            .map_err(|e| Error::InvalidConfig(format!("invalid http options: {e}")))?;
+                        let default_http_opts =
+                            crate::config::proxy::HttpOpt::default();
+                        let opts =
+                            s.http_opts.as_ref().unwrap_or(&default_http_opts);
+                        let client: HttpClient =
+                            (opts, &s.common_opts).try_into().map_err(|e| {
+                                Error::InvalidConfig(format!(
+                                    "invalid http options: {e}"
+                                ))
+                            })?;
                         Ok(Some(TransportLayer::Http(client)))
                     }
                     "h2" => s
@@ -470,10 +478,7 @@ mod tests {
         use std::collections::HashMap;
 
         let mut headers = HashMap::new();
-        headers.insert(
-            "Host".to_string(),
-            vec!["example.com".to_string()],
-        );
+        headers.insert("Host".to_string(), vec!["example.com".to_string()]);
 
         let config = OutboundVless {
             common_opts: CommonConfigOptions {
@@ -499,4 +504,3 @@ mod tests {
         );
     }
 }
-

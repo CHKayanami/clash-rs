@@ -1,12 +1,11 @@
 mod grpc;
 mod h2;
 mod http;
-mod reality;
+pub mod reality;
 #[cfg(feature = "shadowsocks")]
 mod shadow_tls;
 #[cfg(feature = "shadowsocks")]
 mod simple_obfs;
-pub mod splice_tls;
 mod tls;
 #[cfg(feature = "shadowsocks")]
 mod v2ray;
@@ -17,14 +16,13 @@ mod ws;
 pub use grpc::Client as GrpcClient;
 pub use h2::Client as H2Client;
 pub use http::Client as HttpClient;
-pub use reality::Client as RealityClient;
+pub use reality::{Client as RealityClient, VisionOptions};
 #[cfg(feature = "shadowsocks")]
 pub use shadow_tls::Client as Shadowtls;
 #[cfg(feature = "shadowsocks")]
 pub use simple_obfs::{
     SimpleOBFSMode, SimpleOBFSOption, SimpleObfsHttp, SimpleObfsTLS,
 };
-pub use splice_tls::VisionOptions;
 pub use tls::Client as TlsClient;
 #[cfg(feature = "shadowsocks")]
 pub use v2ray::{V2RayOBFSOption, V2rayWsClient};

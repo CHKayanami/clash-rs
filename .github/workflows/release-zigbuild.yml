@@ -255,12 +255,12 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake libclang-dev protobuf-compiler zip
+          sudo apt-get install -y cmake libclang-dev nasm ninja-build protobuf-compiler zip
 
       - name: Install System Dependencies (macOS)
         if: runner.os == 'macOS'
         run: |
-          brew install protobuf cmake
+          brew install protobuf cmake nasm ninja
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable

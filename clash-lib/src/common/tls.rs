@@ -1,3 +1,5 @@
+pub mod boring;
+
 use rustls::{
     RootCertStore,
     client::{WebPkiServerVerifier, danger::ServerCertVerifier},

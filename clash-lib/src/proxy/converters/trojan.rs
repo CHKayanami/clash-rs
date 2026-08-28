@@ -46,7 +46,7 @@ pub fn build_handler(
             password: s.password.to_owned(),
             udp: s.udp.unwrap_or_default(),
             tls: {
-                let client = TlsClient::new(
+                let client = TlsClient::new_advanced(
                     skip_cert_verify,
                     s.sni
                         .as_ref()
@@ -66,6 +66,8 @@ pub fn build_handler(
                             .collect::<Vec<String>>()
                     })),
                     None,
+                    s.fingerprint.as_deref(),
+                    s.client_fingerprint.as_deref(),
                     s.tls_cert.as_deref(),
                     s.tls_key.as_deref(),
                 )?;

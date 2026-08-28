@@ -63,3 +63,4 @@ needless_collect = "deny"
 [patch.crates-io]
 #rustls = { git = "https://github.com/Watfaq/rustls.git", branch = "watfaq/0.23.40" }
 #tokio-rustls = { git = "https://github.com/Watfaq/tokio-rustls.git", branch = "watfaq/0.26.4" }
+boring-sys = { git = "https://github.com/Glassyiris/boring-sys", rev = "630d5030ee281371231f2c8c0b7206178032f62e" }
