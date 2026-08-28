@@ -61,4 +61,4 @@ redundant_clone = "deny"
 needless_collect = "deny"
 
 [patch.crates-io]
-boring-sys = { git = "https://github.com/CHKayanami/boring-sys", rev = "04a1111ac32c694b97ed3cde70c56174bb90f028" }
+boring-sys = { git = "https://github.com/CHKayanami/boring-sys", branch = "master" }
