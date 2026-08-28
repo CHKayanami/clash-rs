@@ -10,7 +10,6 @@ pub(super) const SERVER_HELLO: u8 = 0x02;
 pub(super) const HANDSHAKE: u8 = 0x16;
 pub(super) const APPLICATION_DATA: u8 = 0x17;
 
-pub(super) const SERVER_RANDOM_OFFSET: usize = 1 + 3 + 2;
 pub(super) const SESSION_ID_LEN_IDX: usize =
     TLS_HEADER_SIZE + 1 + 3 + 2 + TLS_RANDOM_SIZE;
 pub(super) const TLS_HMAC_HEADER_SIZE: usize = TLS_HEADER_SIZE + HMAC_SIZE;
