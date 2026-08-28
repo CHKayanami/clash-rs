@@ -456,39 +456,42 @@ async fn handle_packet_from_dispatcher(
     fw_mark: Option<u32>,
 ) {
     let cache = new_transparent_socket_cache();
+    let mut reply_batch = Vec::with_capacity(32);
 
-    // `while let` on recv() exits cleanly once the dispatcher drops its sender,
+    // `while` on recv_many() exits cleanly once the dispatcher drops its sender,
     // with no busy-wait.
-    while let Some(pkt) = l_rx.recv().await {
-        trace!("tproxy <- dispatcher: {:?}", pkt);
+    while l_rx.recv_many(&mut reply_batch, 32).await > 0 {
+        for pkt in reply_batch.drain(..) {
+            trace!("tproxy <- dispatcher: {:?}", pkt);
 
-        // an inbound that hands us a domain would otherwise panic here
-        let Some(src_addr) = pkt.src_addr.try_into_socket_addr() else {
-            tracing::warn!(
-                "tproxy drop packet: src_addr is not a valid socket addr"
-            );
-            continue;
-        };
+            // an inbound that hands us a domain would otherwise panic here
+            let Some(src_addr) = pkt.src_addr.try_into_socket_addr() else {
+                tracing::warn!(
+                    "tproxy drop packet: src_addr is not a valid socket addr"
+                );
+                continue;
+            };
 
-        let Some(dst_addr) = pkt.dst_addr.try_into_socket_addr() else {
-            tracing::warn!(
-                "tproxy drop packet: dst_addr is not a valid socket addr"
-            );
-            continue;
-        };
+            let Some(dst_addr) = pkt.dst_addr.try_into_socket_addr() else {
+                tracing::warn!(
+                    "tproxy drop packet: dst_addr is not a valid socket addr"
+                );
+                continue;
+            };
 
-        // Send the reply with the original destination as its source address.
-        // The cached IP_TRANSPARENT DGRAM socket handles all header
-        // construction, checksum computation, and fragmentation.
-        if let Err(e) =
-            sendto_with_src(&cache, &pkt.data, dst_addr, src_addr, fw_mark).await
-        {
-            tracing::error!(
-                "failed to send packet to {} (src {}) through tproxy: {}",
-                dst_addr,
-                src_addr,
-                e
-            );
+            // Send the reply with the original destination as its source address.
+            // The cached IP_TRANSPARENT DGRAM socket handles all header
+            // construction, checksum computation, and fragmentation.
+            if let Err(e) =
+                sendto_with_src(&cache, &pkt.data, dst_addr, src_addr, fw_mark).await
+            {
+                tracing::error!(
+                    "failed to send packet to {} (src {}) through tproxy: {}",
+                    dst_addr,
+                    src_addr,
+                    e
+                );
+            }
         }
     }
 

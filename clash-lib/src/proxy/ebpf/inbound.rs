@@ -294,59 +294,62 @@ impl InboundHandlerTrait for EbpfInbound {
                     std::net::SocketAddr,
                     (std::sync::Arc<tokio::net::UdpSocket>, std::time::Instant),
                 > = std::collections::HashMap::with_capacity(128);
+                let mut reply_batch = Vec::with_capacity(32);
 
-                while let Some(packet) = l_rx.recv().await {
-                    if let Some(client_target) = packet.dst_addr.try_into_socket_addr() {
-                        if let Some(orig_dst) = packet.src_addr.try_into_socket_addr() {
-                            let now = std::time::Instant::now();
-                            let reply_sock = if let Some((sock, exp)) = reply_sockets.get_mut(&orig_dst) {
-                                if now < *exp {
-                                    *exp = now + std::time::Duration::from_secs(60);
-                                    Some(std::sync::Arc::clone(sock))
+                while l_rx.recv_many(&mut reply_batch, 32).await > 0 {
+                    for packet in reply_batch.drain(..) {
+                        if let Some(client_target) = packet.dst_addr.try_into_socket_addr() {
+                            if let Some(orig_dst) = packet.src_addr.try_into_socket_addr() {
+                                let now = std::time::Instant::now();
+                                let reply_sock = if let Some((sock, exp)) = reply_sockets.get_mut(&orig_dst) {
+                                    if now < *exp {
+                                        *exp = now + std::time::Duration::from_secs(60);
+                                        Some(std::sync::Arc::clone(sock))
+                                    } else {
+                                        None
+                                    }
                                 } else {
                                     None
-                                }
-                            } else {
-                                None
-                            };
+                                };
 
-                            let reply_sock = match reply_sock {
-                                Some(s) => Some(s),
-                                None => {
-                                    if reply_sockets.len() > 1024 {
-                                        reply_sockets.retain(|_, (_, exp)| now < *exp);
-                                    }
-                                    match listener_for_send.create_reply_socket(orig_dst) {
-                                        Ok(new_sock) => {
-                                            let sock_arc = std::sync::Arc::new(new_sock);
-                                            reply_sockets.insert(
-                                                orig_dst,
-                                                (
-                                                    std::sync::Arc::clone(&sock_arc),
-                                                    now + std::time::Duration::from_secs(60),
-                                                ),
-                                            );
-                                            Some(sock_arc)
+                                let reply_sock = match reply_sock {
+                                    Some(s) => Some(s),
+                                    None => {
+                                        if reply_sockets.len() > 1024 {
+                                            reply_sockets.retain(|_, (_, exp)| now < *exp);
                                         }
-                                        Err(e) => {
-                                            tracing::warn!("failed to create transparent reply socket for {orig_dst}: {e}");
-                                            None
+                                        match listener_for_send.create_reply_socket(orig_dst) {
+                                            Ok(new_sock) => {
+                                                let sock_arc = std::sync::Arc::new(new_sock);
+                                                reply_sockets.insert(
+                                                    orig_dst,
+                                                    (
+                                                        std::sync::Arc::clone(&sock_arc),
+                                                        now + std::time::Duration::from_secs(60),
+                                                    ),
+                                                );
+                                                Some(sock_arc)
+                                            }
+                                            Err(e) => {
+                                                tracing::warn!("failed to create transparent reply socket for {orig_dst}: {e}");
+                                                None
+                                            }
                                         }
                                     }
-                                }
-                            };
+                                };
 
-                            if let Some(sock) = reply_sock {
-                                let _ = sock.send_to(&packet.data, client_target).await;
-                                continue;
+                                if let Some(sock) = reply_sock {
+                                    let _ = sock.send_to(&packet.data, client_target).await;
+                                    continue;
+                                }
                             }
+                            let socket = if client_target.is_ipv6() {
+                                listener_for_send.udp_socket_v6().unwrap_or_else(|| listener_for_send.udp_socket())
+                            } else {
+                                listener_for_send.udp_socket()
+                            };
+                            let _ = socket.send_to(&packet.data, client_target).await;
                         }
-                        let socket = if client_target.is_ipv6() {
-                            listener_for_send.udp_socket_v6().unwrap_or_else(|| listener_for_send.udp_socket())
-                        } else {
-                            listener_for_send.udp_socket()
-                        };
-                        let _ = socket.send_to(&packet.data, client_target).await;
                     }
                 }
             });
@@ -398,61 +401,75 @@ async fn udp_listener_loop(
     resolver: ThreadSafeDNSResolver,
     listener_for_dns: Arc<clash_ebpf::EbpfListener>,
 ) {
-    let mut buf = vec![0u8; 65535];
+    let mut batch = Vec::with_capacity(32);
     loop {
-        match clash_ebpf::EbpfListener::recv_from_socket(&socket, &mut buf).await {
-            Ok((n, src, dst)) => {
-                let data = &buf[..n];
-                // 1. Intercept UDP port 53 (DNS)
-                if dst.port() == 53 {
-                    let req_bytes = data.to_vec();
-                    let resolver = resolver.clone();
-                    let listener_for_dns = listener_for_dns.clone();
-                    tokio::spawn(async move {
-                        match crate::app::dns::exchange_with_resolver(&resolver, &req_bytes, true)
-                            .await
-                        {
-                            Ok(resp_bytes) => {
-                                match listener_for_dns
-                                    .send_dns_reply(&resp_bytes, dst, src)
-                                    .await
-                                {
-                                    Ok(_) => {
-                                        tracing::info!(
-                                            "[eBPF DNS] Replied {} -> {}",
-                                            dst,
-                                            src
-                                        );
-                                    }
-                                    Err(e) => {
-                                        tracing::warn!(
-                                            "[eBPF DNS] Failed to send UDP DNS reply {} -> {}: {}",
-                                            dst,
-                                            src,
-                                            e
-                                        );
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    "[eBPF DNS] DNS resolution failed for query from {}: {}",
-                                    src,
-                                    e
-                                );
-                            }
-                        }
-                    });
+        batch.clear();
+        match clash_ebpf::EbpfListener::recv_many_from_socket(&socket, &mut batch, 32).await {
+            Ok(count) => {
+                if count == 0 {
                     continue;
                 }
+                for (payload, src, dst) in batch.drain(..) {
+                    // 1. Intercept UDP port 53 (DNS)
+                    if dst.port() == 53 {
+                        let req_bytes = payload.to_vec();
+                        let resolver = resolver.clone();
+                        let listener_for_dns = listener_for_dns.clone();
+                        tokio::spawn(async move {
+                            match crate::app::dns::exchange_with_resolver(&resolver, &req_bytes, true)
+                                .await
+                            {
+                                Ok(resp_bytes) => {
+                                    match listener_for_dns
+                                        .send_dns_reply(&resp_bytes, dst, src)
+                                        .await
+                                    {
+                                        Ok(_) => {
+                                            tracing::info!(
+                                                "[eBPF DNS] Replied {} -> {}",
+                                                dst,
+                                                src
+                                            );
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!(
+                                                "[eBPF DNS] Failed to send UDP DNS reply {} -> {}: {}",
+                                                dst,
+                                                src,
+                                                e
+                                            );
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "[eBPF DNS] DNS resolution failed for query from {}: {}",
+                                        src,
+                                        e
+                                    );
+                                }
+                            }
+                        });
+                        continue;
+                    }
 
-                // 2. Regular UDP packet -> Dispatcher
-                info!("[eBPF UDP] Intercepted: {} -> {}", src, dst);
-                let payload = bytes::Bytes::copy_from_slice(data);
-                let packet = UdpPacket::new(payload, src.into(), dst.into());
+                    // 2. Regular UDP packet -> Dispatcher
+                    info!("[eBPF UDP] Intercepted: {} -> {}", src, dst);
+                    let packet = UdpPacket::new(payload, src.into(), dst.into());
 
-                if d_tx.send(packet).await.is_err() {
-                    break;
+                    match d_tx.try_send(packet) {
+                        Ok(()) => {}
+                        Err(tokio::sync::mpsc::error::TrySendError::Full(packet)) => {
+                            if let Err(e) = d_tx.send(packet).await {
+                                warn!("failed to send udp packet to proxy: {}", e);
+                                return;
+                            }
+                        }
+                        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                            warn!("dispatcher channel closed, stopping ebpf -> dispatcher");
+                            return;
+                        }
+                    }
                 }
             }
             Err(err) => {

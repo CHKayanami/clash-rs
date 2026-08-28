@@ -528,6 +528,118 @@ impl EbpfListener {
         .await
     }
 
+    /// Receives multiple transparent UDP packets in a batch using Tokio `async_io`.
+    #[cfg(target_os = "linux")]
+    pub async fn recv_many_from_socket(
+        sock: &UdpSocket,
+        packets: &mut Vec<(bytes::Bytes, SocketAddr, SocketAddr)>,
+        max_count: usize,
+    ) -> std::io::Result<usize> {
+        use std::os::fd::AsRawFd;
+        let fd = sock.as_raw_fd();
+        let local_addr = sock.local_addr().ok();
+
+        sock.async_io(tokio::io::Interest::READABLE, || {
+            let mut read_count = 0;
+            let mut buf = [0u8; 65535];
+            while read_count < max_count {
+                let mut iov = libc::iovec {
+                    iov_base: buf.as_mut_ptr() as *mut libc::c_void,
+                    iov_len: buf.len(),
+                };
+                let mut src_storage: libc::sockaddr_storage =
+                    unsafe { std::mem::zeroed() };
+                let mut control_buf = [0u8; 512];
+                let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+                msg.msg_name = &mut src_storage as *mut _ as *mut libc::c_void;
+                msg.msg_namelen =
+                    std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+                msg.msg_iov = &mut iov;
+                msg.msg_iovlen = 1;
+                msg.msg_control = control_buf.as_mut_ptr() as *mut libc::c_void;
+                msg.msg_controllen = control_buf.len() as _;
+
+                let n = unsafe { libc::recvmsg(fd, &mut msg, libc::MSG_DONTWAIT) };
+                if n < 0 {
+                    let err = std::io::Error::last_os_error();
+                    if err.kind() == std::io::ErrorKind::WouldBlock {
+                        if read_count > 0 {
+                            break;
+                        }
+                    }
+                    return Err(err);
+                }
+
+                let src_addr = match src_storage.ss_family as libc::c_int {
+                    libc::AF_INET => {
+                        let sin = unsafe {
+                            &*(&src_storage as *const _ as *const libc::sockaddr_in)
+                        };
+                        let ip =
+                            std::net::Ipv4Addr::from(sin.sin_addr.s_addr.to_ne_bytes());
+                        let port = u16::from_be(sin.sin_port);
+                        SocketAddr::V4(SocketAddrV4::new(ip, port))
+                    }
+                    libc::AF_INET6 => {
+                        let sin6 = unsafe {
+                            &*(&src_storage as *const _ as *const libc::sockaddr_in6)
+                        };
+                        let ip = std::net::Ipv6Addr::from(sin6.sin6_addr.s6_addr);
+                        let port = u16::from_be(sin6.sin6_port);
+                        SocketAddr::V6(std::net::SocketAddrV6::new(ip, port, 0, 0))
+                    }
+                    _ => {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "unknown address family",
+                        ));
+                    }
+                };
+
+                let mut dst_addr = None;
+                let mut cmsg = unsafe { libc::CMSG_FIRSTHDR(&msg) };
+                while !cmsg.is_null() {
+                    let level = unsafe { (*cmsg).cmsg_level };
+                    let type_ = unsafe { (*cmsg).cmsg_type };
+                    if level == libc::SOL_IP
+                        && (type_ == libc::IP_ORIGDSTADDR
+                            || type_ == libc::IP_RECVORIGDSTADDR)
+                    {
+                        let sin = unsafe {
+                            &*(libc::CMSG_DATA(cmsg) as *const libc::sockaddr_in)
+                        };
+                        let ip =
+                            std::net::Ipv4Addr::from(sin.sin_addr.s_addr.to_ne_bytes());
+                        let port = u16::from_be(sin.sin_port);
+                        dst_addr = Some(SocketAddr::V4(SocketAddrV4::new(ip, port)));
+                        break;
+                    } else if level == libc::SOL_IPV6
+                        && (type_ == libc::IPV6_ORIGDSTADDR
+                            || type_ == libc::IPV6_RECVORIGDSTADDR)
+                    {
+                        let sin6 = unsafe {
+                            &*(libc::CMSG_DATA(cmsg) as *const libc::sockaddr_in6)
+                        };
+                        let ip = std::net::Ipv6Addr::from(sin6.sin6_addr.s6_addr);
+                        let port = u16::from_be(sin6.sin6_port);
+                        dst_addr = Some(SocketAddr::V6(std::net::SocketAddrV6::new(
+                            ip, port, 0, 0,
+                        )));
+                        break;
+                    }
+                    cmsg = unsafe { libc::CMSG_NXTHDR(&msg, cmsg) };
+                }
+
+                let dst_addr = dst_addr.or(local_addr).unwrap_or(src_addr);
+                packets.push((bytes::Bytes::copy_from_slice(&buf[..n as usize]), src_addr, dst_addr));
+                read_count += 1;
+            }
+
+            Ok(read_count)
+        })
+        .await
+    }
+
     #[cfg(not(target_os = "linux"))]
     pub async fn recv_from_socket(
         sock: &UdpSocket,
@@ -536,6 +648,19 @@ impl EbpfListener {
         let (len, src_addr) = sock.recv_from(buf).await?;
         let dst_addr = sock.local_addr().unwrap_or(src_addr);
         Ok((len, src_addr, dst_addr))
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub async fn recv_many_from_socket(
+        sock: &UdpSocket,
+        packets: &mut Vec<(bytes::Bytes, SocketAddr, SocketAddr)>,
+        _max_count: usize,
+    ) -> std::io::Result<usize> {
+        let mut buf = [0u8; 65535];
+        let (len, src_addr) = sock.recv_from(&mut buf).await?;
+        let dst_addr = sock.local_addr().unwrap_or(src_addr);
+        packets.push((bytes::Bytes::copy_from_slice(&buf[..len]), src_addr, dst_addr));
+        Ok(1)
     }
 
     /// Receives the next transparent UDP packet into `buf`, returning bytes read, source address and original destination.

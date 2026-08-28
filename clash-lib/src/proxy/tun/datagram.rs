@@ -59,27 +59,36 @@ pub(crate) async fn handle_inbound_datagram(
 
     // dispatcher -> tun
     let fut1 = tokio::spawn(async move {
-        while let Some(UdpPacket { data, src_addr, dst_addr, .. }) = l_rx.recv().await {
-            let Some(src_sock_addr) = src_addr.try_into_socket_addr() else {
-                warn!("tun drop packet: src_addr is not a valid socket addr");
-                continue;
-            };
-            let Some(dst_sock_addr) = dst_addr.try_into_socket_addr() else {
-                warn!("tun drop packet: dst_addr is not a valid socket addr");
-                continue;
-            };
-            if let Err(e) = ls
-                .send(
-                    (
-                        data,
-                        src_sock_addr,
-                        dst_sock_addr,
-                    )
-                        .into(),
-                )
-                .await
+        let mut reply_batch = Vec::with_capacity(32);
+        while l_rx.recv_many(&mut reply_batch, 32).await > 0 {
+            for UdpPacket {
+                data,
+                src_addr,
+                dst_addr,
+                ..
+            } in reply_batch.drain(..)
             {
-                warn!("failed to send udp packet to netstack: {}", e);
+                let Some(src_sock_addr) = src_addr.try_into_socket_addr() else {
+                    warn!("tun drop packet: src_addr is not a valid socket addr");
+                    continue;
+                };
+                let Some(dst_sock_addr) = dst_addr.try_into_socket_addr() else {
+                    warn!("tun drop packet: dst_addr is not a valid socket addr");
+                    continue;
+                };
+                if let Err(e) = ls
+                    .send(
+                        (
+                            data,
+                            src_sock_addr,
+                            dst_sock_addr,
+                        )
+                            .into(),
+                    )
+                    .await
+                {
+                    warn!("failed to send udp packet to netstack: {}", e);
+                }
             }
         }
     });
@@ -121,32 +130,39 @@ pub(crate) async fn handle_inbound_datagram(
                     inbound_user: None,
                 };
 
-            trace!("tun -> dispatcher: {:?}", pkt);
+                trace!("tun -> dispatcher: {:?}", pkt);
 
-            if dns_hijack.is_hijacked(Network::Udp, &remote_addr) {
-                trace!("got dns packet: {:?}, returning from Clash DNS server", pkt);
-                let mut ls_dns = ls_dns.clone();
-                let resolver = resolver_dns.clone();
-                tokio::spawn(async move {
-                    match exchange_with_resolver(&resolver, &pkt.data, true).await {
-                        Ok(resp) => {
-                            let _ = ls_dns
-                                .send((resp, remote_addr, local_addr).into())
-                                .await;
+                if dns_hijack.is_hijacked(Network::Udp, &remote_addr) {
+                    trace!("got dns packet: {:?}, returning from Clash DNS server", pkt);
+                    let mut ls_dns = ls_dns.clone();
+                    let resolver = resolver_dns.clone();
+                    tokio::spawn(async move {
+                        match exchange_with_resolver(&resolver, &pkt.data, true).await {
+                            Ok(resp) => {
+                                let _ = ls_dns
+                                    .send((resp, remote_addr, local_addr).into())
+                                    .await;
+                            }
+                            Err(e) => {
+                                warn!("failed to exchange dns packet: {}", e);
+                            }
                         }
-                        Err(e) => {
-                            warn!("failed to exchange dns packet: {}", e);
+                    });
+                    // don't forward dns packet to dispatcher
+                    continue 'read_packet;
+                }
+
+                match d_tx.try_send(pkt) {
+                    Ok(()) => {}
+                    Err(tokio::sync::mpsc::error::TrySendError::Full(pkt)) => {
+                        if let Err(e) = d_tx.send(pkt).await {
+                            warn!("failed to send udp packet to proxy: {}", e);
+                            break 'outer;
                         }
                     }
-                });
-                // don't forward dns packet to dispatcher
-                continue 'read_packet;
-            }
-
-                match d_tx.send(pkt).await {
-                    Ok(_) => {}
-                    Err(e) => {
-                        warn!("failed to send udp packet to proxy: {}", e);
+                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                        warn!("dispatcher channel closed, stopping tun -> dispatcher");
+                        break 'outer;
                     }
                 }
             }
