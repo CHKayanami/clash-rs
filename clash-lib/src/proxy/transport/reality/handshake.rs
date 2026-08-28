@@ -18,7 +18,7 @@ use hkdf::Hkdf;
 use hmac::{Hmac, KeyInit, Mac};
 use sha2::{Sha256, Sha512};
 
-use crate::common::tls::boring::{add_chrome_alps_public, build_reality_connector};
+use crate::common::tls::boring::{add_chrome_alps_public, get_reality_connector};
 use super::RealityConfig;
 
 const SSL_GROUP_X25519: u16 = 29;
@@ -35,7 +35,7 @@ pub async fn reality_connect<S>(
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    let connector = build_reality_connector(chrome)
+    let connector = get_reality_connector(chrome)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
     let mut cfg = connector
         .configure()

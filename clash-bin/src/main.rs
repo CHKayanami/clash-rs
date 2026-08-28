@@ -11,6 +11,19 @@ use tikv_jemallocator::Jemalloc;
 #[global_allocator]
 static GLOBAL: Jemalloc = Jemalloc;
 
+#[cfg(all(feature = "jemallocator", not(feature = "dhat-heap"), not(feature = "mimalloc")))]
+#[repr(transparent)]
+pub struct MallocConfPtr(pub *const std::ffi::c_char);
+
+#[cfg(all(feature = "jemallocator", not(feature = "dhat-heap"), not(feature = "mimalloc")))]
+unsafe impl Sync for MallocConfPtr {}
+
+#[cfg(all(feature = "jemallocator", not(feature = "dhat-heap"), not(feature = "mimalloc")))]
+#[allow(non_upper_case_globals)]
+#[unsafe(no_mangle)]
+pub static malloc_conf: MallocConfPtr =
+    MallocConfPtr(c"dirty_decay_ms:3000,muzzy_decay_ms:3000,background_thread:true,max_background_threads:1,narenas:4".as_ptr());
+
 #[cfg(all(feature = "mimalloc", not(feature = "dhat-heap")))]
 use mimalloc::MiMalloc;
 

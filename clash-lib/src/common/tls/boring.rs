@@ -176,6 +176,24 @@ pub fn build_reality_connector(chrome: bool) -> anyhow::Result<SslConnector> {
     Ok(builder.build())
 }
 
+static REALITY_CONNECTOR_CHROME: LazyLock<anyhow::Result<SslConnector>> =
+    LazyLock::new(|| build_reality_connector(true));
+
+static REALITY_CONNECTOR_PLAIN: LazyLock<anyhow::Result<SslConnector>> =
+    LazyLock::new(|| build_reality_connector(false));
+
+pub fn get_reality_connector(chrome: bool) -> anyhow::Result<&'static SslConnector> {
+    if chrome {
+        REALITY_CONNECTOR_CHROME
+            .as_ref()
+            .map_err(|e| anyhow::anyhow!("{e}"))
+    } else {
+        REALITY_CONNECTOR_PLAIN
+            .as_ref()
+            .map_err(|e| anyhow::anyhow!("{e}"))
+    }
+}
+
 /// BoringSSL connector carrying Chrome fingerprint settings and certificate options.
 #[derive(Clone)]
 pub struct BoringTlsConnector {
