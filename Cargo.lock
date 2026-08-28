@@ -1147,7 +1147,7 @@ dependencies = [
 [[package]]
 name = "boring-sys"
 version = "5.1.0"
-source = "git+https://github.com/CHKayanami/boring-sys?branch=master#c277547d4d9c87ba5fd017e787b28b4dc0b9526b"
+source = "git+https://github.com/CHKayanami/boring-sys?rev=6767047bef8d5666236f71fd1d75c50d0613b978#6767047bef8d5666236f71fd1d75c50d0613b978"
 dependencies = [
  "bindgen 0.72.1",
  "cmake",
