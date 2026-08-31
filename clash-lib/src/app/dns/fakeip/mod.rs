@@ -133,7 +133,6 @@ impl FakeDns {
         }
 
         let ip = self.get(host);
-        self.store.put_by_host(host, ip);
         ip
     }
 
@@ -143,7 +142,6 @@ impl FakeDns {
         }
 
         let ip = self.getv6(host);
-        self.store.put_by_host(host, ip);
         ip
     }
 
@@ -397,10 +395,7 @@ mod tests {
         let bar = pool.reverse_lookup(last);
 
         assert_eq!(first, net::IpAddr::from([192, 168, 0, 2]));
-        assert_eq!(
-            pool.lookup("foo.com"),
-            net::IpAddr::from([192, 168, 0, 2])
-        );
+        assert_eq!(pool.lookup("foo.com"), net::IpAddr::from([192, 168, 0, 2]));
         assert_eq!(last, net::IpAddr::from([192, 168, 0, 3]));
         assert!(bar.is_some());
         assert_eq!(bar, Some("bar.com".into()));
@@ -648,10 +643,7 @@ mod tests {
 
         // Allocate one real fake IP.
         let allocated = pool.lookup("foo.com");
-        assert!(
-            pool.is_fake_ip(allocated),
-            "allocated IP must be fake"
-        );
+        assert!(pool.is_fake_ip(allocated), "allocated IP must be fake");
 
         // Directed broadcast for the /24 TUN subnet (198.18.0.0/24) – never
         // allocated, yet it falls inside the /16 range.
@@ -722,14 +714,8 @@ mod tests {
         assert_eq!(ip_v6, Some(first_v6));
 
         // 4. Reverse lookups should return original host
-        assert_eq!(
-            pool.reverse_lookup(first),
-            Some("foo.com".to_string())
-        );
-        assert_eq!(
-            pool.reverse_lookup(first_v6),
-            Some("foo.com".to_string())
-        );
+        assert_eq!(pool.reverse_lookup(first), Some("foo.com".to_string()));
+        assert_eq!(pool.reverse_lookup(first_v6), Some("foo.com".to_string()));
 
         // 5. Test existence
         assert!(pool.exist(first));
@@ -747,23 +733,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_file_store_fallback() {
+    async fn test_file_store_legacy_format_load() {
         let temp_dir = tempdir().unwrap();
-        let cache_path = temp_dir.path().join("test_cache_fallback.db");
+        let cache_path = temp_dir.path().join("test_cache_legacy.db");
         let cache_store =
             ThreadSafeCacheFile::new(cache_path.to_str().unwrap(), true);
 
         // Manually write old format to the cache store (no suffix)
         let host = "old-style.com";
         let ip_v4_str = "192.168.0.2";
-        let ip_v6_str = "fdfe:5a70:6451:982b::2";
 
         // Insert directly using cache_store set_host_to_ip
         cache_store.set_host_to_ip(host, ip_v4_str);
 
         let store = FileStore::new(cache_store.clone());
 
-        // Test fallback lookup v4
+        // Test lookup v4 from loaded legacy entry
         let res_v4 = store.get_by_host(host);
         assert_eq!(res_v4, Some(ip_v4_str.parse().unwrap()));
 
@@ -771,15 +756,68 @@ mod tests {
         let res_v6 = store.get_v6_by_host(host);
         assert_eq!(res_v6, None);
 
-        // Now change it to store IPv6 in the old format
-        cache_store.set_host_to_ip(host, ip_v6_str);
+        // Test IPv6 legacy format load
+        let host_v6 = "old-style-v6.com";
+        let ip_v6_str = "fdfe:5a70:6451:982b::2";
+        cache_store.set_host_to_ip(host_v6, ip_v6_str);
 
-        // Test fallback lookup v6
-        let res_v6_new = store.get_v6_by_host(host);
+        let store_v6 = FileStore::new(cache_store.clone());
+        let res_v6_new = store_v6.get_v6_by_host(host_v6);
         assert_eq!(res_v6_new, Some(ip_v6_str.parse().unwrap()));
+        assert_eq!(store_v6.get_by_host(host_v6), None);
+    }
 
-        // Lookup v4 should now be None
-        let res_v4_new = store.get_by_host(host);
-        assert_eq!(res_v4_new, None);
+    #[tokio::test]
+    async fn test_file_store_persistence_restore() {
+        let temp_dir = tempdir().unwrap();
+        let cache_path = temp_dir.path().join("test_persist_restore.db");
+        let cache_path_str = cache_path.to_str().unwrap();
+
+        let v4_ip;
+        let v6_ip;
+
+        // 阶段 1：使用首个 FakeDns 实例分配 FakeIP 并持久化
+        {
+            let cache_store = ThreadSafeCacheFile::new(cache_path_str, true);
+            let store = Box::new(FileStore::new(cache_store));
+            let pool = FakeDns::new(Opts {
+                ipnet: "198.18.0.0/16".parse().unwrap(),
+                ipnet6: "fdfe:5a70:6451:982b::/64".parse().unwrap(),
+                domain_filter: None,
+                filter_mode: FakeIpFilterMode::Blacklist,
+                store,
+            })
+            .unwrap();
+
+            v4_ip = pool.lookup("google.com");
+            v6_ip = pool.lookupv6("google.com");
+            assert!(pool.exist(v4_ip));
+            assert!(pool.exist(v6_ip));
+        }
+
+        // 等待阶段 1 实例 drop 后的后台 worker 完成最后落盘
+        tokio::time::sleep(std::time::Duration::from_millis(2100)).await;
+
+        // 阶段 2：重启并创建全新实例，验证启动时预热加载至内存
+        {
+            let cache_store = ThreadSafeCacheFile::new(cache_path_str, true);
+            let store = Box::new(FileStore::new(cache_store));
+            let pool = FakeDns::new(Opts {
+                ipnet: "198.18.0.0/16".parse().unwrap(),
+                ipnet6: "fdfe:5a70:6451:982b::/64".parse().unwrap(),
+                domain_filter: None,
+                filter_mode: FakeIpFilterMode::Blacklist,
+                store,
+            })
+            .unwrap();
+
+            // 内存中立即可查，无需重新分配
+            assert_eq!(pool.lookup("google.com"), v4_ip);
+            assert_eq!(pool.lookupv6("google.com"), v6_ip);
+            assert_eq!(pool.reverse_lookup(v4_ip), Some("google.com".into()));
+            assert_eq!(pool.reverse_lookup(v6_ip), Some("google.com".into()));
+            assert!(pool.exist(v4_ip));
+            assert!(pool.exist(v6_ip));
+        }
     }
 }

@@ -119,6 +119,7 @@ dashmap = "6"
 parking_lot = "0.12"
 arc-swap = "1"
 itoa = "1"
+redb = "4"
 
 h2 = "0.4"
 prost = "0.14"

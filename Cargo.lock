@@ -1657,6 +1657,7 @@ dependencies = [
  "rand 0.10.1",
  "rand_chacha 0.10.0",
  "rcgen 0.14.8",
+ "redb",
  "regex",
  "register-count",
  "reqwest",
@@ -7183,6 +7184,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d92195228612ac8eed47adbc2ed0f04e513a4ccb98175b6f2bd04d963b533655"
 dependencies = [
  "rand_core 0.6.4",
+]
+
+[[package]]
+name = "redb"
+version = "4.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "de6c3b63e007e90ce536ec2ae4690826136a20ec8dbbbb400daef1bb999d2e36"
+dependencies = [
+ "libc",
 ]
 
 [[package]]
