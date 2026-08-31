@@ -85,7 +85,7 @@ impl HealthCheck {
         self.inner.write().task_handle = Some(task_handle);
     }
 
-    pub async fn touch(&self) {
+    pub fn touch(&self) {
         self.inner.write().last_check = tokio::time::Instant::now();
     }
 

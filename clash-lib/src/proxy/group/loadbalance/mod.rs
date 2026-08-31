@@ -20,7 +20,7 @@ use crate::{
         AnyOutboundHandler, ConnectorType, DialWithConnector, HandlerCommonOptions,
         OutboundHandler, OutboundType,
         group::GroupProxyAPIResponse,
-        utils::{RemoteConnector, provider_helper::get_proxies_from_providers},
+        utils::{RemoteConnector, provider_helper::Providers},
     },
     session::Session,
 };
@@ -40,7 +40,7 @@ struct HandlerInner {
 pub struct Handler {
     opts: HandlerOptions,
 
-    providers: Vec<ArcProxyProvider>,
+    providers: Providers,
 
     inner: Arc<Mutex<HandlerInner>>,
 }
@@ -69,13 +69,13 @@ impl Handler {
 
         Self {
             opts,
-            providers,
+            providers: Providers::new(providers),
             inner: Arc::new(Mutex::new(HandlerInner { strategy_fn })),
         }
     }
 
-    async fn get_proxies(&self, touch: bool) -> Vec<AnyOutboundHandler> {
-        get_proxies_from_providers(&self.providers, touch).await
+    fn get_proxies(&self, touch: bool) -> Arc<Vec<AnyOutboundHandler>> {
+        self.providers.get_proxies(touch)
     }
 
     /// Run the configured strategy over the group's current members.
@@ -85,7 +85,7 @@ impl Handler {
     /// through this group, and the sticky-session strategy awaits liveness
     /// checks and an LRU lock of its own.
     async fn pick(&self, sess: &Session) -> io::Result<AnyOutboundHandler> {
-        let proxies = self.get_proxies(false).await;
+        let proxies = self.get_proxies(false);
         if proxies.is_empty() {
             return Err(io::Error::other(format!(
                 "no proxy available for {}",
@@ -180,7 +180,7 @@ impl OutboundHandler for Handler {
 #[async_trait]
 impl GroupProxyAPIResponse for Handler {
     async fn get_proxies(&self) -> Vec<AnyOutboundHandler> {
-        Handler::get_proxies(self, false).await
+        Handler::get_proxies(self, false).to_vec()
     }
 
     /// A load balancer has no single active member — the strategy picks per

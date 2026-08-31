@@ -33,8 +33,8 @@ mock! {
 
     #[async_trait::async_trait]
     impl ProxyProvider for DummyProxyProvider {
-        async fn proxies(&self) -> Vec<AnyOutboundHandler>;
-        async fn touch(&self);
+        fn proxies(&self) -> std::sync::Arc<Vec<AnyOutboundHandler>>;
+        fn touch(&self);
         async fn healthcheck(&self);
     }
 }

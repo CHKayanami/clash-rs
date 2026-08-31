@@ -28,6 +28,7 @@ use crate::{
         hysteria2, reject, socks, trojan, vless, vmess,
     },
 };
+use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use erased_serde::Serialize as ESerialize;
 use futures::future::BoxFuture;
@@ -40,10 +41,6 @@ use tracing::{debug, warn};
 struct ProviderScheme {
     #[serde(rename = "proxies")]
     proxies: Option<Vec<HashMap<String, Value>>>,
-}
-
-struct Inner {
-    proxies: Vec<AnyOutboundHandler>,
 }
 
 type ProxyUpdater = Box<
@@ -59,7 +56,7 @@ type ProxyParser = Box<
 pub struct ProxySetProvider {
     fetcher: Fetcher<ProxyUpdater, ProxyParser>,
     hc: Arc<HealthCheck>,
-    inner: Arc<tokio::sync::RwLock<Inner>>,
+    proxies: Arc<ArcSwap<Vec<AnyOutboundHandler>>>,
 }
 
 impl ProxySetProvider {
@@ -79,9 +76,8 @@ impl ProxySetProvider {
             });
         }
 
-        let inner = Arc::new(tokio::sync::RwLock::new(Inner { proxies: vec![] }));
-
-        let inner_clone = inner.clone();
+        let proxies = Arc::new(ArcSwap::from_pointee(Vec::new()));
+        let proxies_clone = proxies.clone();
 
         let n = name.clone();
         let hc_updater = hc.clone();
@@ -89,13 +85,10 @@ impl ProxySetProvider {
             move |input: Vec<AnyOutboundHandler>| -> BoxFuture<'static, ()> {
                 let hc = hc_updater.clone();
                 let n = n.clone();
-                let inner: Arc<tokio::sync::RwLock<Inner>> = inner_clone.clone();
+                let proxies = proxies_clone.clone();
                 Box::pin(async move {
-                    {
-                        let mut inner = inner.write().await;
-                        debug!("updating {} proxies for: {}", n, input.len());
-                        inner.proxies.clone_from(&input);
-                    }
+                    debug!("updating {} proxies for: {}", n, input.len());
+                    proxies.store(Arc::new(input.clone()));
                     hc.update(input).await;
                     tokio::spawn(async move {
                         hc.check().await;
@@ -220,7 +213,11 @@ impl ProxySetProvider {
         );
 
         let fetcher = Fetcher::new(name, interval, vehicle, parser, Some(updater));
-        Ok(Self { fetcher, hc, inner })
+        Ok(Self {
+            fetcher,
+            hc,
+            proxies,
+        })
     }
 }
 
@@ -282,12 +279,12 @@ impl Provider for ProxySetProvider {
 
 #[async_trait]
 impl ProxyProvider for ProxySetProvider {
-    async fn proxies(&self) -> Vec<AnyOutboundHandler> {
-        self.inner.read().await.proxies.to_vec()
+    fn proxies(&self) -> Arc<Vec<AnyOutboundHandler>> {
+        self.proxies.load_full()
     }
 
-    async fn touch(&self) {
-        self.hc.touch().await;
+    fn touch(&self) {
+        self.hc.touch();
     }
 
     async fn healthcheck(&self) {
@@ -359,12 +356,12 @@ proxies:
         )
         .unwrap();
 
-        assert_eq!(provider.proxies().await.len(), 0);
+        assert_eq!(provider.proxies().len(), 0);
 
         provider.initialize().await.unwrap();
 
         sleep(Duration::from_secs_f64(1.5)).await;
 
-        assert_eq!(provider.proxies().await.len(), 1);
+        assert_eq!(provider.proxies().len(), 1);
     }
 }

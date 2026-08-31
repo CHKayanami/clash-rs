@@ -1,7 +1,7 @@
 use std::{io, sync::Arc};
 
+use arc_swap::ArcSwapOption;
 use async_trait::async_trait;
-use parking_lot::RwLock;
 use tracing::warn;
 
 use crate::{
@@ -15,7 +15,7 @@ use crate::{
         AnyOutboundHandler, ConnectorType, DialWithConnector, HandlerCommonOptions,
         OutboundHandler, OutboundType,
         group::GroupProxyAPIResponse,
-        utils::{RemoteConnector, provider_helper::get_proxies_from_providers},
+        utils::{RemoteConnector, provider_helper::Providers},
     },
     session::Session,
 };
@@ -36,14 +36,17 @@ pub struct HandlerOptions {
     pub udp: bool,
 }
 
+struct ActiveSelection {
+    name: String,
+    snapshot: Arc<Vec<AnyOutboundHandler>>,
+    handler: AnyOutboundHandler,
+}
+
 #[derive(Clone)]
 pub struct Handler {
     opts: HandlerOptions,
-    providers: Vec<ArcProxyProvider>,
-    /// The chosen proxy's *name*. Storing a position instead meant a provider
-    /// refresh that reordered or resized the member list silently moved the
-    /// user's selection to whatever proxy now sat at that index.
-    current_selected: Arc<RwLock<Option<String>>>,
+    providers: Providers,
+    cached_active: Arc<ArcSwapOption<ActiveSelection>>,
 }
 
 impl std::fmt::Debug for Handler {
@@ -63,46 +66,83 @@ impl Handler {
         // Resolve against every provider, the same set `selected_proxy` reads.
         // Consulting only `providers.first()` restored the wrong proxy for a
         // group backed by more than one provider.
-        let proxies = get_proxies_from_providers(&providers, false).await;
+        let providers = Providers::new(providers);
+        let proxies = providers.get_proxies(false);
         let current_selected = selected
             .filter(|s| proxies.iter().any(|p| p.name() == s))
             .or_else(|| proxies.first().map(|p| p.name().to_owned()));
 
+        let cached_active = current_selected.as_ref().and_then(|name| {
+            proxies
+                .iter()
+                .find(|p| p.name() == name)
+                .map(|p| Arc::new(ActiveSelection {
+                    name: name.clone(),
+                    snapshot: proxies.clone(),
+                    handler: p.clone(),
+                }))
+        });
+
         Self {
             opts,
             providers,
-            current_selected: Arc::new(RwLock::new(current_selected)),
+            cached_active: Arc::new(ArcSwapOption::new(cached_active)),
         }
     }
 
     async fn selected_proxy(&self, touch: bool) -> Option<AnyOutboundHandler> {
-        let proxies = get_proxies_from_providers(&self.providers, touch).await;
-        let selected = self.current_selected.read().clone();
+        let proxies = self.providers.get_proxies(touch);
+        let cached_guard = self.cached_active.load();
 
-        if let Some(name) = selected.as_deref() {
-            if let Some(proxy) = proxies.iter().find(|p| p.name() == name) {
-                return Some(proxy.clone());
+        // Fast path: if the cached selection is valid and the provider snapshot
+        // pointer has not changed, return the cached handler directly in O(1).
+        if let Some(active) = cached_guard.as_deref() {
+            if Arc::ptr_eq(&active.snapshot, &proxies) {
+                return Some(active.handler.clone());
             }
-            // The provider no longer offers it — say which one went missing
-            // rather than the `<unknown>` the old lookup could only ever print.
-            warn!(
-                "`{}` selected proxy `{}` not found, falling back to the first \
-                 member",
-                self.name(),
-                name
-            );
         }
 
-        proxies.first().cloned()
+        // Slow path: resolve selection from current proxies list (e.g. subscription refreshed)
+        let found_proxy = if let Some(active) = cached_guard.as_deref() {
+            if let Some(proxy) = proxies.iter().find(|p| p.name() == active.name) {
+                Some(proxy.clone())
+            } else {
+                // The provider no longer offers it — say which one went missing
+                // rather than the `<unknown>` the old lookup could only ever print.
+                warn!(
+                    "`{}` selected proxy `{}` not found, falling back to the first \
+                     member",
+                    self.name(),
+                    active.name
+                );
+                proxies.first().cloned()
+            }
+        } else {
+            proxies.first().cloned()
+        };
+
+        if let Some(ref proxy) = found_proxy {
+            self.cached_active.store(Some(Arc::new(ActiveSelection {
+                name: proxy.name().to_string(),
+                snapshot: proxies.clone(),
+                handler: proxy.clone(),
+            })));
+        }
+
+        found_proxy
     }
 }
 
 #[async_trait]
 impl SelectorControl for Handler {
     async fn select(&self, name: &str) -> Result<(), Error> {
-        let proxies = get_proxies_from_providers(&self.providers, false).await;
-        if proxies.iter().any(|x| x.name() == name) {
-            *self.current_selected.write() = Some(name.to_owned());
+        let proxies = self.providers.get_proxies(false);
+        if let Some(proxy) = proxies.iter().find(|x| x.name() == name) {
+            self.cached_active.store(Some(Arc::new(ActiveSelection {
+                name: name.to_owned(),
+                snapshot: proxies.clone(),
+                handler: proxy.clone(),
+            })));
             Ok(())
         } else {
             Err(Error::Operation(format!("proxy {name} not found")))
@@ -220,7 +260,7 @@ impl OutboundHandler for Handler {
 #[async_trait]
 impl GroupProxyAPIResponse for Handler {
     async fn get_proxies(&self) -> Vec<AnyOutboundHandler> {
-        get_proxies_from_providers(&self.providers, false).await
+        self.providers.get_proxies(false).to_vec()
     }
 
     async fn get_active_proxy(&self) -> Option<AnyOutboundHandler> {
@@ -257,7 +297,7 @@ mod tests {
             proxy1.expect_name().return_const("provider1".to_owned());
             let mut proxy2 = MockDummyOutboundHandler::new();
             proxy2.expect_name().return_const("provider2".to_owned());
-            vec![Arc::new(proxy1), Arc::new(proxy2)]
+            Arc::new(vec![Arc::new(proxy1), Arc::new(proxy2)])
         });
 
         let handler = super::Handler::new(
@@ -299,7 +339,7 @@ mod tests {
         mock_provider
             .expect_name()
             .return_const("provider1".to_owned());
-        mock_provider.expect_proxies().returning(Vec::new);
+        mock_provider.expect_proxies().returning(|| Arc::new(Vec::new()));
 
         let handler = super::Handler::new(
             super::HandlerOptions {

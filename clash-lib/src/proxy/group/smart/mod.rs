@@ -23,7 +23,7 @@ use crate::{
     proxy::{
         AnyOutboundHandler, ConnectorType, DialWithConnector, HandlerCommonOptions,
         OutboundHandler, OutboundType,
-        utils::{RemoteConnector, provider_helper::get_proxies_from_providers},
+        utils::{RemoteConnector, provider_helper::Providers},
     },
     session::Session,
 };
@@ -88,7 +88,7 @@ pub struct Handler {
     /// Configuration options
     opts: HandlerOptions,
     /// Proxy providers for obtaining available proxies
-    providers: Vec<ArcProxyProvider>,
+    providers: Providers,
     /// Proxy manager for health checks and metrics
     proxy_manager: ProxyManager,
     /// Centralized state management
@@ -113,7 +113,7 @@ impl Handler {
     /// Tokio runtime inside it just to `block_on` the cache read, and then
     /// blocked the calling thread on a rendezvous channel — all while running
     /// on a Tokio worker, with three `expect`s on the way. Every caller is
-    /// already async, so the read just happens here.
+    /// async, so load the cache with a normal `.await` instead.
     pub async fn new_with_cache(
         opts: HandlerOptions,
         providers: Vec<ArcProxyProvider>,
@@ -122,10 +122,8 @@ impl Handler {
     ) -> Self {
         let group_name = opts.name.clone();
 
-        info!("{} attempting to load smart stats from cache", group_name);
-        let stored_data: Option<state::SmartStateData> =
-            cache_store.get_smart_stats(&group_name);
-
+        // Load persisted smart stats from cache
+        let stored_data = cache_store.get_smart_stats(&group_name);
         if stored_data.is_some() {
             info!("{} successfully loaded smart stats from cache", group_name);
         } else {
@@ -138,7 +136,7 @@ impl Handler {
 
         let handler = Self {
             opts,
-            providers,
+            providers: Providers::new(providers),
             proxy_manager,
             smart_state: Arc::new(tokio::sync::Mutex::new(smart_state)),
         };
@@ -173,8 +171,8 @@ impl Handler {
     ///
     /// # Returns
     /// Vector of available proxy handlers
-    async fn get_proxies(&self, touch: bool) -> Vec<AnyOutboundHandler> {
-        get_proxies_from_providers(&self.providers, touch).await
+    fn get_proxies(&self, touch: bool) -> Arc<Vec<AnyOutboundHandler>> {
+        self.providers.get_proxies(touch)
     }
 
     /// Smart proxy selection considering all available metrics
@@ -193,7 +191,7 @@ impl Handler {
     /// # Returns
     /// Selected proxy handler, or None if no suitable proxy available
     async fn pick_smart(&self, sess: &Session) -> Option<AnyOutboundHandler> {
-        let proxies = self.get_proxies(false).await;
+        let proxies = self.get_proxies(false);
         if proxies.is_empty() {
             debug!("{} no proxies available", self.name());
             return None;
@@ -230,7 +228,7 @@ impl Handler {
 
         let mut candidates: Vec<(f64, AnyOutboundHandler, String)> = Vec::new();
 
-        for proxy in proxies {
+        for proxy in proxies.iter() {
             let name = proxy.name().to_string();
 
             // Get basic metrics from proxy manager
@@ -399,7 +397,7 @@ impl Handler {
                 final_score
             );
 
-            candidates.push((final_score, proxy, name));
+            candidates.push((final_score, proxy.clone(), name));
         }
 
         // Sort by score (lower is better)
@@ -714,7 +712,7 @@ impl OutboundHandler for Handler {
 #[async_trait]
 impl GroupProxyAPIResponse for Handler {
     async fn get_proxies(&self) -> Vec<AnyOutboundHandler> {
-        Handler::get_proxies(self, false).await
+        Handler::get_proxies(self, false).to_vec()
     }
 
     async fn get_active_proxy(&self) -> Option<AnyOutboundHandler> {
@@ -796,7 +794,7 @@ mod tests {
         provider.expect_healthcheck().returning(|| ());
         provider
             .expect_proxies()
-            .returning(move || vec![ss_handler.clone()]);
+            .returning(move || Arc::new(vec![ss_handler.clone()]));
         let thread_safe_provider: ArcProxyProvider = Arc::new(provider);
 
         // Setup HandlerOptions for Smart group

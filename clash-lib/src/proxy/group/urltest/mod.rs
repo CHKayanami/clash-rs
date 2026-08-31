@@ -1,4 +1,4 @@
-use std::{io, time::Duration};
+use std::{io, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use tracing::trace;
@@ -15,7 +15,7 @@ use crate::{
         AnyOutboundHandler, ConnectorType, DialWithConnector, HandlerCommonOptions,
         OutboundHandler, OutboundType,
         group::GroupProxyAPIResponse,
-        utils::{RemoteConnector, provider_helper::get_proxies_from_providers},
+        utils::{RemoteConnector, provider_helper::Providers},
     },
     session::Session,
 };
@@ -31,7 +31,7 @@ pub struct Handler {
     opts: HandlerOptions,
     tolerance: u16,
 
-    providers: Vec<ArcProxyProvider>,
+    providers: Providers,
     proxy_manager: ProxyManager,
     /// Name of the proxy the tolerance hysteresis is currently sticky to.
     /// Tracking a list position instead silently retargeted the selection
@@ -57,14 +57,14 @@ impl Handler {
         Self {
             opts,
             tolerance,
-            providers,
+            providers: Providers::new(providers),
             proxy_manager,
             current_fastest: parking_lot::RwLock::new(None),
         }
     }
 
-    async fn get_proxies(&self, touch: bool) -> Vec<AnyOutboundHandler> {
-        get_proxies_from_providers(&self.providers, touch).await
+    fn get_proxies(&self, touch: bool) -> Arc<Vec<AnyOutboundHandler>> {
+        self.providers.get_proxies(touch)
     }
 
     /// Pick the proxy to use.
@@ -80,7 +80,7 @@ impl Handler {
     ) -> Option<AnyOutboundHandler> {
         let proxy_manager = self.proxy_manager.clone();
 
-        let proxies = self.get_proxies(touch).await;
+        let proxies = self.get_proxies(touch);
         if proxies.is_empty() {
             return None;
         }
@@ -268,7 +268,7 @@ impl OutboundHandler for Handler {
 #[async_trait]
 impl GroupProxyAPIResponse for Handler {
     async fn get_proxies(&self) -> Vec<AnyOutboundHandler> {
-        Handler::get_proxies(self, false).await
+        Handler::get_proxies(self, false).to_vec()
     }
 
     async fn get_active_proxy(&self) -> Option<AnyOutboundHandler> {
@@ -302,7 +302,7 @@ mod tests {
     async fn test_empty_provider_returns_none_active_proxy() {
         let mut provider = MockDummyProxyProvider::new();
         provider.expect_name().return_const("provider1".to_owned());
-        provider.expect_proxies().returning(Vec::new);
+        provider.expect_proxies().returning(|| Arc::new(Vec::new()));
 
         let proxy_manager = ProxyManager::new(Arc::new(NoopResolver), None);
         let handler = super::Handler::new(
@@ -328,7 +328,7 @@ mod tests {
         let mut provider = MockDummyProxyProvider::new();
         provider.expect_proxies().returning({
             let proxies = proxies.clone();
-            move || proxies.clone()
+            move || Arc::new(proxies.clone())
         });
 
         let proxy_manager = ProxyManager::new(Arc::new(NoopResolver), None);
@@ -348,26 +348,26 @@ mod tests {
             proxy_manager.clone(),
         );
 
-        assert_eq!(handler.get_active_proxy().await.unwrap().name(), "b");
+        assert_eq!(handler.fastest(false, true).await.unwrap().name(), "b");
 
         proxy_manager
             .report_delay("a", true, Duration::from_millis(40))
             .await;
-        assert_eq!(handler.get_active_proxy().await.unwrap().name(), "b");
+        assert_eq!(handler.fastest(false, true).await.unwrap().name(), "b");
 
         proxy_manager
             .report_delay("a", true, Duration::from_millis(20))
             .await;
-        assert_eq!(handler.get_active_proxy().await.unwrap().name(), "a");
+        assert_eq!(handler.fastest(false, true).await.unwrap().name(), "a");
 
         proxy_manager
             .report_delay("a", false, Duration::from_millis(20))
             .await;
-        assert_eq!(handler.get_active_proxy().await.unwrap().name(), "b");
+        assert_eq!(handler.fastest(false, true).await.unwrap().name(), "b");
 
         proxy_manager
             .report_delay("b", false, Duration::from_millis(50))
             .await;
-        assert_eq!(handler.get_active_proxy().await.unwrap().name(), "a");
+        assert_eq!(handler.fastest(false, true).await.unwrap().name(), "a");
     }
 }

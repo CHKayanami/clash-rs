@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 
-use std::{fmt::Debug, io};
+use std::{fmt::Debug, io, sync::Arc};
 use tracing::debug;
 
 use crate::{
@@ -15,7 +15,7 @@ use crate::{
         AnyOutboundHandler, ConnectorType, DialWithConnector, HandlerCommonOptions,
         OutboundHandler, OutboundType,
         group::GroupProxyAPIResponse,
-        utils::{RemoteConnector, provider_helper::get_proxies_from_providers},
+        utils::{RemoteConnector, provider_helper::Providers},
     },
     session::Session,
 };
@@ -29,7 +29,7 @@ pub struct HandlerOptions {
 
 pub struct Handler {
     opts: HandlerOptions,
-    providers: Vec<ArcProxyProvider>,
+    providers: Providers,
     proxy_manager: ProxyManager,
 }
 
@@ -49,17 +49,17 @@ impl Handler {
     ) -> Self {
         Self {
             opts,
-            providers,
+            providers: Providers::new(providers),
             proxy_manager,
         }
     }
 
-    async fn get_proxies(&self, touch: bool) -> Vec<AnyOutboundHandler> {
-        get_proxies_from_providers(&self.providers, touch).await
+    fn get_proxies(&self, touch: bool) -> Arc<Vec<AnyOutboundHandler>> {
+        self.providers.get_proxies(touch)
     }
 
     async fn find_alive_proxy(&self, touch: bool) -> Option<AnyOutboundHandler> {
-        let proxies = self.get_proxies(touch).await;
+        let proxies = self.get_proxies(touch);
         for proxy in proxies.iter() {
             if self.proxy_manager.alive(proxy.name()).await {
                 debug!("`{}` fallback to `{}`", self.name(), proxy.name());
@@ -157,7 +157,7 @@ impl OutboundHandler for Handler {
 #[async_trait]
 impl GroupProxyAPIResponse for Handler {
     async fn get_proxies(&self) -> Vec<AnyOutboundHandler> {
-        Handler::get_proxies(self, false).await
+        Handler::get_proxies(self, false).to_vec()
     }
 
     async fn get_active_proxy(&self) -> Option<AnyOutboundHandler> {

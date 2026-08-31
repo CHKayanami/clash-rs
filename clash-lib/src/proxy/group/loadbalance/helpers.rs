@@ -1,5 +1,6 @@
 use std::{
     io::Cursor,
+    sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -14,7 +15,7 @@ use crate::{
 
 pub type StrategyFn = Box<
     dyn FnMut(
-            Vec<AnyOutboundHandler>,
+            Arc<Vec<AnyOutboundHandler>>,
             &Session,
         ) -> BoxFuture<'static, std::io::Result<AnyOutboundHandler>>
         + Send
@@ -54,7 +55,7 @@ fn jump_hash(key: u64, buckets: i32) -> i32 {
 
 pub fn strategy_rr() -> StrategyFn {
     let mut index = 0usize;
-    Box::new(move |proxies: Vec<AnyOutboundHandler>, _: &Session| {
+    Box::new(move |proxies: Arc<Vec<AnyOutboundHandler>>, _: &Session| {
         let len = proxies.len();
         // `% len` on an empty group panicked. A group whose provider fetched an
         // empty (or failed) subscription reaches here with nothing to pick.
@@ -196,7 +197,7 @@ mod tests {
     #[tokio::test]
     async fn test_sticky_session() {
         let resolver = Arc::new(NoopResolver);
-        let proxies = vec![
+        let proxies: Arc<Vec<AnyOutboundHandler>> = Arc::new(vec![
             Arc::new(NoopOutboundHandler {
                 name: "a".to_string(),
             }) as _,
@@ -206,7 +207,7 @@ mod tests {
             Arc::new(NoopOutboundHandler {
                 name: "c".to_string(),
             }) as _,
-        ];
+        ]);
         let manager = ProxyManager::new(resolver, None);
         // if the proxy alive state isn't set, will return true by default
         // so we need to clear the alive states first

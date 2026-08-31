@@ -19,13 +19,13 @@ use crate::{
         group::GroupProxyAPIResponse,
         utils::{
             DirectConnector, ProxyConnector, RemoteConnector,
-            provider_helper::get_proxies_from_providers,
+            provider_helper::Providers,
         },
     },
     session::Session,
 };
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct HandlerOptions {
     pub common_opts: HandlerCommonOptions,
     pub name: String,
@@ -33,7 +33,7 @@ pub struct HandlerOptions {
 
 pub struct Handler {
     opts: HandlerOptions,
-    providers: Vec<ArcProxyProvider>,
+    providers: Providers,
 }
 
 impl std::fmt::Debug for Handler {
@@ -50,11 +50,14 @@ impl Handler {
         opts: HandlerOptions,
         providers: Vec<ArcProxyProvider>,
     ) -> AnyOutboundHandler {
-        Arc::new(Self { opts, providers })
+        Arc::new(Self {
+            opts,
+            providers: Providers::new(providers),
+        })
     }
 
-    async fn get_proxies(&self, touch: bool) -> Vec<AnyOutboundHandler> {
-        get_proxies_from_providers(&self.providers, touch).await
+    fn get_proxies(&self, touch: bool) -> Arc<Vec<AnyOutboundHandler>> {
+        self.providers.get_proxies(touch)
     }
 }
 
@@ -75,7 +78,7 @@ impl OutboundHandler for Handler {
         // datagram as a connector, and the last one dials it. Returning true on
         // the *first* hop advertising `ConnectorType::All` skipped every hop
         // after it.
-        let proxies = self.get_proxies(false).await;
+        let proxies = self.get_proxies(false);
         let Some((last, rest)) = proxies.split_last() else {
             return false;
         };
@@ -92,7 +95,7 @@ impl OutboundHandler for Handler {
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
     ) -> io::Result<BoxedChainedStream> {
-        let proxies = self.get_proxies(true).await;
+        let proxies = self.get_proxies(true);
 
         match proxies.len() {
             0 => Err(new_io_error("no proxy available")),
@@ -138,7 +141,7 @@ impl OutboundHandler for Handler {
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
     ) -> io::Result<BoxedChainedDatagram> {
-        let proxies = self.get_proxies(true).await;
+        let proxies = self.get_proxies(true);
 
         match proxies.len() {
             0 => Err(new_io_error("no proxy available")),
@@ -191,7 +194,7 @@ impl OutboundHandler for Handler {
 #[async_trait]
 impl GroupProxyAPIResponse for Handler {
     async fn get_proxies(&self) -> Vec<AnyOutboundHandler> {
-        Handler::get_proxies(self, false).await
+        Handler::get_proxies(self, false).to_vec()
     }
 
     /// A relay is the whole chain; naming any one hop as "active" would
@@ -275,7 +278,7 @@ mod tests {
 
         provider
             .expect_proxies()
-            .returning(move || vec![ss_handler.clone()]);
+            .returning(move || Arc::new(vec![ss_handler.clone()]));
 
         let handler = Handler::new(Default::default(), vec![Arc::new(provider)]);
         run_test_suites_and_cleanup(handler, container, Suite::all()).await
@@ -311,7 +314,7 @@ mod tests {
 
         provider
             .expect_proxies()
-            .returning(move || vec![ss_handler.clone(), ss_handler.clone()]);
+            .returning(move || Arc::new(vec![ss_handler.clone(), ss_handler.clone()]));
 
         let handler = Handler::new(Default::default(), vec![Arc::new(provider)]);
         run_test_suites_and_cleanup(handler, container, Suite::all()).await

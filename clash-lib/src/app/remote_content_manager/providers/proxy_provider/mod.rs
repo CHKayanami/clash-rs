@@ -17,8 +17,8 @@ pub type ArcProxyProvider = Arc<dyn ProxyProvider + Send + Sync>;
 
 #[async_trait]
 pub trait ProxyProvider: Provider {
-    async fn proxies(&self) -> Vec<AnyOutboundHandler>;
-    async fn touch(&self);
+    fn proxies(&self) -> Arc<Vec<AnyOutboundHandler>>;
+    fn touch(&self);
     /// this is a blocking call, you may want to spawn a new task to run this
     async fn healthcheck(&self);
 }

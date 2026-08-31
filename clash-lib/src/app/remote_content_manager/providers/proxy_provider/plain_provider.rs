@@ -20,7 +20,7 @@ use super::ProxyProvider;
 /// Used in GroupOutbounds to manage proxy health checks.
 pub struct PlainProvider {
     name: String,
-    proxies: Vec<AnyOutboundHandler>,
+    proxies: Arc<Vec<AnyOutboundHandler>>,
     hc: Arc<HealthCheck>,
 }
 
@@ -46,7 +46,11 @@ impl PlainProvider {
             });
         }
 
-        Ok(Self { name, proxies, hc })
+        Ok(Self {
+            name,
+            proxies: Arc::new(proxies),
+            hc,
+        })
     }
 }
 
@@ -88,12 +92,12 @@ impl Provider for PlainProvider {
 
 #[async_trait]
 impl ProxyProvider for PlainProvider {
-    async fn proxies(&self) -> Vec<AnyOutboundHandler> {
+    fn proxies(&self) -> Arc<Vec<AnyOutboundHandler>> {
         self.proxies.clone()
     }
 
-    async fn touch(&self) {
-        self.hc.touch().await;
+    fn touch(&self) {
+        self.hc.touch();
     }
 
     async fn healthcheck(&self) {

@@ -67,7 +67,7 @@ async fn get_providers(State(state): State<ProviderState>) -> impl IntoResponse 
     let mut providers = HashMap::new();
 
     for (name, p) in outbound_manager.get_proxy_providers() {
-        let proxies = p.proxies().await;
+        let proxies = p.proxies();
         let proxies = futures::future::join_all(
             proxies.iter().map(|x| outbound_manager.get_proxy(x)),
         );
@@ -152,7 +152,7 @@ async fn find_proxy_provider_proxy_by_name(
     mut req: Request<axum::body::Body>,
     next: Next,
 ) -> Response {
-    let proxies = provider.proxies().await;
+    let proxies = provider.proxies();
     let proxy = proxies.iter().find(|x| x.name() == proxy_name);
 
     if let Some(proxy) = proxy {
