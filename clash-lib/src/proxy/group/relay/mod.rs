@@ -5,17 +5,13 @@ use tracing::debug;
 
 use crate::{
     app::{
-        dispatcher::{
-            BoxedChainedDatagram, BoxedChainedStream, ChainedDatagram,
-            ChainedDatagramWrapper, ChainedStream, ChainedStreamWrapper,
-        },
         dns::ThreadSafeDNSResolver,
         remote_content_manager::providers::proxy_provider::ArcProxyProvider,
     },
     common::errors::new_io_error,
     proxy::{
-        AnyOutboundHandler, ConnectorType, DialWithConnector, HandlerCommonOptions,
-        OutboundHandler, OutboundType,
+        AnyOutboundDatagram, AnyOutboundHandler, AnyStream, ConnectorType,
+        DialWithConnector, HandlerCommonOptions, OutboundHandler, OutboundType,
         group::GroupProxyAPIResponse,
         utils::{
             DirectConnector, ProxyConnector, RemoteConnector,
@@ -94,7 +90,7 @@ impl OutboundHandler for Handler {
         &self,
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
-    ) -> io::Result<BoxedChainedStream> {
+    ) -> io::Result<AnyStream> {
         let proxies = self.get_proxies(true);
 
         match proxies.len() {
@@ -103,7 +99,7 @@ impl OutboundHandler for Handler {
                 let proxy = proxies[0].clone();
                 debug!("tcp relay `{}` via proxy `{}`", self.name(), proxy.name());
                 let s = proxy.connect_stream(sess, resolver).await?;
-                s.append_to_chain(self.name()).await;
+                sess.push_chain(self.name());
                 Ok(s)
             }
             _ => {
@@ -129,9 +125,8 @@ impl OutboundHandler for Handler {
                     )
                     .await?;
 
-                let chained = ChainedStreamWrapper::new(s);
-                chained.append_to_chain(self.name()).await;
-                Ok(Box::new(chained))
+                sess.push_chain(self.name());
+                Ok(s)
             }
         }
     }
@@ -140,7 +135,7 @@ impl OutboundHandler for Handler {
         &self,
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
-    ) -> io::Result<BoxedChainedDatagram> {
+    ) -> io::Result<AnyOutboundDatagram> {
         let proxies = self.get_proxies(true);
 
         match proxies.len() {
@@ -149,7 +144,7 @@ impl OutboundHandler for Handler {
                 let proxy = proxies[0].clone();
                 debug!("udp relay `{}` via proxy `{}`", self.name(), proxy.name());
                 let d = proxy.connect_datagram(sess, resolver).await?;
-                d.append_to_chain(self.name()).await;
+                sess.push_chain(self.name());
                 Ok(d)
             }
             _ => {
@@ -175,9 +170,8 @@ impl OutboundHandler for Handler {
                     )
                     .await?;
 
-                let chained = ChainedDatagramWrapper::new(d);
-                chained.append_to_chain(self.name()).await;
-                Ok(Box::new(chained))
+                sess.push_chain(self.name());
+                Ok(d)
             }
         }
     }

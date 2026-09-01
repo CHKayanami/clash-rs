@@ -5,15 +5,14 @@ use tracing::trace;
 
 use crate::{
     app::{
-        dispatcher::{BoxedChainedDatagram, BoxedChainedStream},
         dns::ThreadSafeDNSResolver,
         remote_content_manager::{
             ProxyManager, providers::proxy_provider::ArcProxyProvider,
         },
     },
     proxy::{
-        AnyOutboundHandler, ConnectorType, DialWithConnector, HandlerCommonOptions,
-        OutboundHandler, OutboundType,
+        AnyOutboundDatagram, AnyOutboundHandler, AnyStream, ConnectorType,
+        DialWithConnector, HandlerCommonOptions, OutboundHandler, OutboundType,
         group::GroupProxyAPIResponse,
         utils::{RemoteConnector, provider_helper::Providers},
     },
@@ -188,13 +187,13 @@ impl OutboundHandler for Handler {
         &self,
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
-    ) -> io::Result<BoxedChainedStream> {
+    ) -> io::Result<AnyStream> {
         let fastest = self.fastest(true, true).await.ok_or_else(|| {
             io::Error::other(format!("no proxy found for {}", self.name()))
         })?;
         let s = fastest.connect_stream(sess, resolver).await?;
 
-        s.append_to_chain(self.name()).await;
+        sess.push_chain(self.name());
 
         Ok(s)
     }
@@ -204,13 +203,13 @@ impl OutboundHandler for Handler {
         &self,
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
-    ) -> io::Result<BoxedChainedDatagram> {
+    ) -> io::Result<AnyOutboundDatagram> {
         let fastest = self.fastest(true, true).await.ok_or_else(|| {
             io::Error::other(format!("no proxy found for {}", self.name()))
         })?;
         let d = fastest.connect_datagram(sess, resolver).await?;
 
-        d.append_to_chain(self.name()).await;
+        sess.push_chain(self.name());
 
         Ok(d)
     }
@@ -227,7 +226,7 @@ impl OutboundHandler for Handler {
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
         connector: &dyn RemoteConnector,
-    ) -> io::Result<BoxedChainedStream> {
+    ) -> io::Result<AnyStream> {
         let s = self
             .fastest(true, true)
             .await
@@ -237,7 +236,7 @@ impl OutboundHandler for Handler {
             .connect_stream_with_connector(sess, resolver, connector)
             .await?;
 
-        s.append_to_chain(self.name()).await;
+        sess.push_chain(self.name());
         Ok(s)
     }
 
@@ -246,7 +245,7 @@ impl OutboundHandler for Handler {
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
         connector: &dyn RemoteConnector,
-    ) -> io::Result<BoxedChainedDatagram> {
+    ) -> io::Result<AnyOutboundDatagram> {
         let d = self
             .fastest(true, true)
             .await
@@ -256,7 +255,7 @@ impl OutboundHandler for Handler {
             .connect_datagram_with_connector(sess, resolver, connector)
             .await?;
 
-        d.append_to_chain(self.name()).await;
+        sess.push_chain(self.name());
         Ok(d)
     }
 

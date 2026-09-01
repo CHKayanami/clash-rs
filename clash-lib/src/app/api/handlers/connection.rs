@@ -91,10 +91,12 @@ async fn get_connections(
 
 async fn close_connection(
     State(state): State<ConnectionState>,
-    Path(id): Path<uuid::Uuid>,
+    Path(id): Path<String>,
 ) -> impl IntoResponse {
     let mgr = state.statistics_manager;
-    mgr.close(id);
+    if let Ok(num_id) = id.parse::<u64>() {
+        mgr.close(num_id);
+    }
     format!("connection {id} closed").into_response()
 }
 

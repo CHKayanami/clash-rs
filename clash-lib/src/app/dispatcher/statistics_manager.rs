@@ -8,11 +8,9 @@ use dashmap::DashMap;
 use memory_stats::memory_stats;
 use portable_atomic::AtomicU64;
 use serde::Serialize;
-use tokio::sync::{RwLock, oneshot::Sender};
+use tokio::sync::oneshot::Sender;
 
 use crate::session::Session;
-
-use super::tracked::Tracked;
 
 /// Per-user traffic since the last drain.  Both upload and download are in
 /// bytes.
@@ -22,24 +20,19 @@ pub struct UserTraffic {
     pub download: u64,
 }
 
-#[derive(Default, Clone, Debug)]
-pub struct ProxyChain(Arc<RwLock<Vec<String>>>);
+pub use crate::session::ProxyChain;
 
-impl ProxyChain {
-    pub async fn push(&self, s: String) {
-        let mut chain = self.0.write().await;
-        chain.push(s);
-    }
-
-    pub async fn snapshot(&self) -> Vec<String> {
-        self.0.read().await.clone()
-    }
+fn serialize_id_as_string<S>(id: &u64, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    serializer.serialize_str(&id.to_string())
 }
 
 #[derive(Serialize, Default)]
 pub struct TrackerInfo {
-    #[serde(rename = "id")]
-    pub uuid: uuid::Uuid,
+    #[serde(rename = "id", serialize_with = "serialize_id_as_string")]
+    pub id: u64,
     #[serde(rename = "metadata")]
     pub session_holder: Session,
     #[serde(rename = "upload")]
@@ -67,10 +60,27 @@ pub struct TrackerInfo {
     pub user_download: AtomicU64,
 }
 
+impl TrackerInfo {
+    pub fn new(
+        sess: &Session,
+        rule: Option<&Box<dyn crate::app::router::RuleMatcher>>,
+    ) -> Self {
+        Self {
+            id: sess.id,
+            session_holder: sess.clone(),
+            start_time: chrono::Utc::now(),
+            rule: rule.map(|r| r.type_name().to_string()).unwrap_or_default(),
+            rule_payload: rule.map(|r| r.payload()).unwrap_or_default(),
+            proxy_chain_holder: sess.proxy_chain.clone(),
+            ..Default::default()
+        }
+    }
+}
+
 impl Clone for TrackerInfo {
     fn clone(&self) -> Self {
         Self {
-            uuid: self.uuid,
+            id: self.id,
             session_holder: self.session_holder.clone(),
             upload_total: AtomicU64::new(self.upload_total.load(Ordering::Relaxed)),
             download_total: AtomicU64::new(
@@ -89,6 +99,54 @@ impl Clone for TrackerInfo {
     }
 }
 
+#[derive(Clone, Default)]
+pub enum TrafficTracker {
+    #[default]
+    Noop,
+    Active {
+        tracker: Arc<TrackerInfo>,
+        manager: Arc<Manager>,
+        has_user: bool,
+    },
+}
+
+impl TrafficTracker {
+    pub fn new(tracker: Arc<TrackerInfo>, manager: Arc<Manager>) -> Self {
+        let has_user = tracker.session_holder.inbound_user.is_some();
+        Self::Active {
+            tracker,
+            manager,
+            has_user,
+        }
+    }
+
+    pub fn noop() -> Self {
+        Self::Noop
+    }
+
+    #[inline(always)]
+    pub fn push_upload(&self, n: usize) {
+        if let Self::Active { tracker, manager, has_user } = self {
+            tracker.upload_total.fetch_add(n as u64, Ordering::Relaxed);
+            if *has_user {
+                tracker.user_upload.fetch_add(n as u64, Ordering::Relaxed);
+            }
+            manager.push_uploaded(n);
+        }
+    }
+
+    #[inline(always)]
+    pub fn push_download(&self, n: usize) {
+        if let Self::Active { tracker, manager, has_user } = self {
+            tracker.download_total.fetch_add(n as u64, Ordering::Relaxed);
+            if *has_user {
+                tracker.user_download.fetch_add(n as u64, Ordering::Relaxed);
+            }
+            manager.push_downloaded(n);
+        }
+    }
+}
+
 pub struct ConnectionView {
     pub tracker: Arc<TrackerInfo>,
     pub chains: Vec<String>,
@@ -101,7 +159,7 @@ impl Serialize for ConnectionView {
     {
         use serde::ser::SerializeStruct;
         let mut s = serializer.serialize_struct("TrackerInfo", 8)?;
-        s.serialize_field("id", &self.tracker.uuid)?;
+        s.serialize_field("id", &self.tracker.id.to_string())?;
         s.serialize_field("metadata", &self.tracker.session_holder)?;
         s.serialize_field("upload", &self.tracker.upload_total.load(Ordering::Relaxed))?;
         s.serialize_field("download", &self.tracker.download_total.load(Ordering::Relaxed))?;
@@ -126,7 +184,7 @@ pub struct Snapshot {
 /// (a `oneshot::Sender` is consumed by `send`) without removing the map entry.
 /// Removal — and the byte accounting that goes with it — stays the exclusive
 /// job of [`Manager::untrack`], which runs from the tracker's `Drop`.
-type ConnectionMap = DashMap<uuid::Uuid, (Tracked, Option<Sender<()>>)>;
+type ConnectionMap = DashMap<u64, (Arc<TrackerInfo>, Option<Sender<()>>)>;
 
 pub struct Manager {
     connections: ConnectionMap,
@@ -166,20 +224,19 @@ impl Manager {
         v
     }
 
-    pub fn track(&self, item: Tracked, close_notify: Sender<()>) {
+    pub fn track(&self, id: u64, item: Arc<TrackerInfo>, close_notify: Sender<()>) {
         self.connections
-            .insert(item.id(), (item, Some(close_notify)));
+            .insert(id, (item, Some(close_notify)));
     }
 
     /// Untrack a connection.
     /// This method is not async because it is called in Drop.
     /// When the connection has an inbound_user, its final byte counts are
     /// accumulated into `user_period_stats` so they survive connection close.
-    pub fn untrack(&self, id: uuid::Uuid) {
+    pub fn untrack(&self, id: u64) {
         let removed = self.connections.remove(&id);
 
-        if let Some((_, (tracked, _))) = removed {
-            let info = tracked.tracker_info();
+        if let Some((_, (info, _))) = removed {
             // Atomically take the remaining user-accounting bytes.
             // upload_total/download_total are left intact for /connections.
             let upload = info.user_upload.swap(0, Ordering::Relaxed);
@@ -210,7 +267,7 @@ impl Manager {
     pub fn active_connections_snapshot(&self) -> Vec<Arc<TrackerInfo>> {
         self.connections
             .iter()
-            .map(|r| r.value().0.tracker_info())
+            .map(|r| r.value().0.clone())
             .collect()
     }
 
@@ -235,8 +292,7 @@ impl Manager {
         // their user counters to 0. upload_total/download_total are untouched
         // so /connections keeps seeing the correct cumulative values.
         for r in self.connections.iter() {
-            let (tracked, _) = r.value();
-            let info = tracked.tracker_info();
+            let (info, _) = r.value();
             if let Some(ref user) = info.session_holder.inbound_user {
                 let upload = info.user_upload.swap(0, Ordering::Relaxed);
                 let download = info.user_download.swap(0, Ordering::Relaxed);
@@ -259,7 +315,7 @@ impl Manager {
     /// per-user bytes into `user_period_stats` and pushes the flow into
     /// `closed_flows`. Removing the entry here would make that `untrack` a no-op
     /// and silently lose both.
-    pub fn close(&self, id: uuid::Uuid) {
+    pub fn close(&self, id: u64) {
         if let Some(mut entry) = self.connections.get_mut(&id)
             && let Some(close_notify) = entry.value_mut().1.take()
         {
@@ -268,7 +324,7 @@ impl Manager {
     }
 
     pub fn close_all(&self) {
-        let keys: Vec<uuid::Uuid> =
+        let keys: Vec<u64> =
             self.connections.iter().map(|r| *r.key()).collect();
         for key in keys {
             self.close(key);
@@ -315,15 +371,14 @@ impl Manager {
             .connections
             .iter()
             .map(|r| {
-                let (tracked, _) = r.value();
-                let t = tracked.tracker_info();
-                (t.clone(), t.proxy_chain_holder.clone())
+                let (info, _) = r.value();
+                (info.clone(), info.proxy_chain_holder.clone())
             })
             .collect();
 
         let mut connections = Vec::with_capacity(conns_data.len());
         for (t, chain_holder) in conns_data {
-            let chains = chain_holder.snapshot().await;
+            let chains = chain_holder.snapshot();
             connections.push(ConnectionView {
                 tracker: t,
                 chains,

@@ -15,14 +15,9 @@ use super::{
     datagram::UdpPacket, utils::new_udp_socket,
 };
 use crate::{
-    app::{
-        dispatcher::{
-            BoxedChainedDatagram, BoxedChainedStream, ChainedDatagram,
-            ChainedDatagramWrapper, ChainedStream, ChainedStreamWrapper,
-        },
-        dns::ThreadSafeDNSResolver,
-    },
+    app::dns::ThreadSafeDNSResolver,
     common::tls::{DefaultTlsVerifier, build_tls_client_config},
+    proxy::{AnyOutboundDatagram, AnyStream},
     session::{Session, SocksAddr},
 };
 use anyhow::anyhow;
@@ -452,12 +447,11 @@ impl OutboundHandler for Handler {
         &self,
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
-    ) -> std::io::Result<BoxedChainedStream> {
+    ) -> std::io::Result<AnyStream> {
         let authed_conn = self.new_authed_connection(sess, resolver.clone()).await?;
         let hy_stream = authed_conn.connect_tcp(sess).await?;
-        let s = ChainedStreamWrapper::new(Box::new(hy_stream));
-        s.append_to_chain(self.name()).await;
-        Ok(Box::new(s))
+        sess.push_chain(self.name());
+        Ok(Box::new(hy_stream))
     }
 
     /// connect to remote target via UDP
@@ -465,15 +459,14 @@ impl OutboundHandler for Handler {
         &self,
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
-    ) -> std::io::Result<BoxedChainedDatagram> {
+    ) -> std::io::Result<AnyOutboundDatagram> {
         let authed_conn = self.new_authed_connection(sess, resolver.clone()).await?;
         let next_session_id = self
             .next_session_id
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let hy_datagram = authed_conn.connect_udp(sess, next_session_id).await;
-        let s = ChainedDatagramWrapper::new(hy_datagram);
-        s.append_to_chain(self.name()).await;
-        Ok(Box::new(s))
+        sess.push_chain(self.name());
+        Ok(Box::new(hy_datagram))
     }
 
     fn try_as_plain_handler(&self) -> Option<&dyn PlainProxyAPIResponse> {

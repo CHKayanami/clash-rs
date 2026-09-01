@@ -7,18 +7,13 @@ use self::{
 };
 
 use crate::{
-    app::{
-        dispatcher::{
-            BoxedChainedDatagram, BoxedChainedStream, ChainedDatagram,
-            ChainedDatagramWrapper, ChainedStream, ChainedStreamWrapper,
-        },
-        dns::ThreadSafeDNSResolver,
-    },
+    app::dns::ThreadSafeDNSResolver,
     common::errors::new_io_error,
     proxy::{
-        AnyStream, ConnectorType, DialWithConnector, HandlerCommonOptions,
-        OutboundHandler, OutboundType, PlainProxyAPIResponse,
-        shadowsocks::map_cipher, transport::TransportLayer,
+        AnyOutboundDatagram, AnyStream, ConnectorType, DialWithConnector,
+        HandlerCommonOptions, OutboundHandler, OutboundType,
+        PlainProxyAPIResponse, shadowsocks::map_cipher,
+        transport::TransportLayer,
         utils::{GLOBAL_DIRECT_CONNECTOR, RemoteConnector, new_udp_socket},
     },
     session::{Session, SocksAddr},
@@ -130,7 +125,7 @@ impl Handler {
         &self,
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
-    ) -> io::Result<BoxedChainedDatagram> {
+    ) -> io::Result<AnyOutboundDatagram> {
         let cfg = self.server_config()?;
 
         let server_ip = resolver
@@ -165,8 +160,7 @@ impl Handler {
                 socket.into(),
             );
         let d = OutboundDatagramShadowsocks::new(socket, server_addr);
-        let d = ChainedDatagramWrapper::new(d);
-        d.append_to_chain(self.name()).await;
+        sess.push_chain(self.name());
         Ok(Box::new(d))
     }
 }
@@ -193,7 +187,7 @@ impl OutboundHandler for Handler {
         &self,
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
-    ) -> io::Result<BoxedChainedStream> {
+    ) -> io::Result<AnyStream> {
         if let Some(dialer) = self.connector.as_ref() {
             debug!("{:?} is connecting via {:?}", self, dialer);
             self.connect_stream_with_connector(sess, resolver, dialer.as_ref())
@@ -212,7 +206,7 @@ impl OutboundHandler for Handler {
         &self,
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
-    ) -> io::Result<BoxedChainedDatagram> {
+    ) -> io::Result<AnyOutboundDatagram> {
         if let Some(dialer) = self.connector.as_ref() {
             debug!("{:?} is connecting via {:?}", self, dialer);
             self.connect_datagram_with_connector(sess, resolver, dialer.as_ref())
@@ -238,7 +232,7 @@ impl OutboundHandler for Handler {
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
         connector: &dyn RemoteConnector,
-    ) -> io::Result<BoxedChainedStream> {
+    ) -> io::Result<AnyStream> {
         if let Some(mux) = &self.mux_pool {
             let dialer = || async {
                 let stream = connector
@@ -264,9 +258,8 @@ impl OutboundHandler for Handler {
                     .await
             };
             let s = mux.open_stream(&sess.destination, false, dialer).await?;
-            let chained = ChainedStreamWrapper::new(s);
-            chained.append_to_chain(self.name()).await;
-            return Ok(Box::new(chained));
+            sess.push_chain(self.name());
+            return Ok(s);
         }
 
         let stream = connector
@@ -282,9 +275,8 @@ impl OutboundHandler for Handler {
             .await?;
 
         let s = self.proxy_stream(stream, sess, resolver).await?;
-        let chained = ChainedStreamWrapper::new(s);
-        chained.append_to_chain(self.name()).await;
-        Ok(Box::new(chained))
+        sess.push_chain(self.name());
+        Ok(s)
     }
 
     async fn connect_datagram_with_connector(
@@ -292,7 +284,7 @@ impl OutboundHandler for Handler {
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
         connector: &dyn RemoteConnector,
-    ) -> io::Result<BoxedChainedDatagram> {
+    ) -> io::Result<AnyOutboundDatagram> {
         if self.opts.uot {
             let uot_dest = SocksAddr::try_from((
                 crate::proxy::transport::uot::UDP_OVER_TCP_V2_MAGIC_HOST.to_owned(),
@@ -326,9 +318,8 @@ impl OutboundHandler for Handler {
                 stream,
                 sess.destination.clone(),
             );
-            let chained = ChainedDatagramWrapper::new(datagram);
-            chained.append_to_chain(self.name()).await;
-            return Ok(Box::new(chained));
+            sess.push_chain(self.name());
+            return Ok(Box::new(datagram));
         }
 
         let cfg = self.server_config()?;
@@ -372,8 +363,7 @@ impl OutboundHandler for Handler {
             ShadowsocksUdpIo::new(socket),
         );
         let d = OutboundDatagramShadowsocks::new(socket, server_addr);
-        let d = ChainedDatagramWrapper::new(d);
-        d.append_to_chain(self.name()).await;
+        sess.push_chain(self.name());
         Ok(Box::new(d))
     }
 

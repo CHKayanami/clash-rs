@@ -3,15 +3,9 @@ use std::fmt::Debug;
 pub(crate) mod datagram;
 
 use crate::{
-    app::{
-        dispatcher::{
-            BoxedChainedDatagram, BoxedChainedStream, ChainedDatagram,
-            ChainedDatagramWrapper, ChainedStream, ChainedStreamWrapper,
-        },
-        dns::ThreadSafeDNSResolver,
-    },
+    app::dns::ThreadSafeDNSResolver,
     proxy::{
-        OutboundHandler,
+        AnyOutboundDatagram, AnyStream, OutboundHandler,
         direct::datagram::OutboundDatagramImpl,
         utils::{dial_tcp_with_happy_eyeballs, new_dual_stack_udp_socket},
     },
@@ -71,7 +65,7 @@ impl OutboundHandler for Handler {
         &self,
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
-    ) -> std::io::Result<BoxedChainedStream> {
+    ) -> std::io::Result<AnyStream> {
         let stream = dial_tcp_with_happy_eyeballs(
             sess.destination.host_cow().as_ref(),
             sess.destination.port(),
@@ -83,16 +77,15 @@ impl OutboundHandler for Handler {
         )
         .await?;
 
-        let s = ChainedStreamWrapper::new(stream);
-        s.append_to_chain(self.name()).await;
-        Ok(Box::new(s))
+        sess.push_chain(self.name());
+        Ok(Box::new(stream))
     }
 
     async fn connect_datagram(
         &self,
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
-    ) -> std::io::Result<BoxedChainedDatagram> {
+    ) -> std::io::Result<AnyOutboundDatagram> {
         // The outbound socket is shared across ALL destinations from the same
         // client (keyed by src_addr only in the dispatcher). Use a dual-stack
         // socket so one socket can send to both IPv4 and IPv6 destinations
@@ -107,10 +100,8 @@ impl OutboundHandler for Handler {
             #[cfg(target_os = "linux")]
             sess.so_mark,
         )?;
-        let d =
-            ChainedDatagramWrapper::new(OutboundDatagramImpl::new(udp, resolver));
-        d.append_to_chain(self.name()).await;
-        Ok(Box::new(d))
+        sess.push_chain(self.name());
+        Ok(Box::new(OutboundDatagramImpl::new(udp, resolver)))
     }
 
     async fn support_connector(&self) -> ConnectorType {
@@ -122,7 +113,7 @@ impl OutboundHandler for Handler {
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
         connector: &dyn RemoteConnector,
-    ) -> std::io::Result<BoxedChainedStream> {
+    ) -> std::io::Result<AnyStream> {
         let s = connector
             .connect_stream(
                 resolver,
@@ -134,9 +125,8 @@ impl OutboundHandler for Handler {
                 sess.so_mark,
             )
             .await?;
-        let s = ChainedStreamWrapper::new(s);
-        s.append_to_chain(self.name()).await;
-        Ok(Box::new(s))
+        sess.push_chain(self.name());
+        Ok(s)
     }
 
     async fn connect_datagram_with_connector(
@@ -144,7 +134,7 @@ impl OutboundHandler for Handler {
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
         connector: &dyn RemoteConnector,
-    ) -> std::io::Result<BoxedChainedDatagram> {
+    ) -> std::io::Result<AnyOutboundDatagram> {
         let d = connector
             .connect_datagram(
                 resolver,
@@ -155,9 +145,8 @@ impl OutboundHandler for Handler {
                 sess.so_mark,
             )
             .await?;
-        let d = ChainedDatagramWrapper::new(d);
-        d.append_to_chain(self.name()).await;
-        Ok(Box::new(d))
+        sess.push_chain(self.name());
+        Ok(d)
     }
 
     fn try_as_plain_handler(&self) -> Option<&dyn PlainProxyAPIResponse> {

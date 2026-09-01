@@ -499,6 +499,40 @@ pub struct Session {
     pub orig_destination: Option<SocksAddr>,
     /// Custom UDP session idle timeout
     pub udp_timeout: Option<std::time::Duration>,
+    /// Proxy chain traversed during dispatch
+    pub proxy_chain: ProxyChain,
+}
+
+#[derive(Default, Clone, Debug)]
+pub struct ProxyChain(Arc<parking_lot::RwLock<Vec<String>>>);
+
+impl Serialize for ProxyChain {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        self.snapshot().serialize(serializer)
+    }
+}
+
+impl ProxyChain {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn push(&self, s: String) {
+        self.0.write().push(s);
+    }
+
+    pub fn snapshot(&self) -> Vec<String> {
+        self.0.read().clone()
+    }
+}
+
+impl Session {
+    pub fn push_chain(&self, name: &str) {
+        self.proxy_chain.push(name.to_owned());
+    }
 }
 
 struct DestinationIpHelper<'a>(Option<IpAddr>, Option<&'a str>);
@@ -595,6 +629,7 @@ impl Default for Session {
             mapped_domain: None,
             orig_destination: None,
             udp_timeout: None,
+            proxy_chain: ProxyChain::default(),
         }
     }
 }
@@ -653,6 +688,7 @@ impl Clone for Session {
             mapped_domain: self.mapped_domain.clone(),
             orig_destination: self.orig_destination.clone(),
             udp_timeout: self.udp_timeout,
+            proxy_chain: self.proxy_chain.clone(),
         }
     }
 }

@@ -1,10 +1,7 @@
 use crate::{
-    app::{
-        dispatcher::{BoxedChainedDatagram, BoxedChainedStream},
-        dns::ThreadSafeDNSResolver,
-    },
+    app::dns::ThreadSafeDNSResolver,
     config::internal::proxy::PROXY_REJECT,
-    proxy::OutboundHandler,
+    proxy::{AnyOutboundDatagram, AnyStream, OutboundHandler},
     session::Session,
 };
 use async_trait::async_trait;
@@ -53,7 +50,7 @@ impl OutboundHandler for Handler {
         &self,
         #[allow(unused_variables)] sess: &Session,
         #[allow(unused_variables)] _resolver: ThreadSafeDNSResolver,
-    ) -> io::Result<BoxedChainedStream> {
+    ) -> io::Result<AnyStream> {
         Err(io::Error::other("REJECT"))
     }
 
@@ -61,7 +58,7 @@ impl OutboundHandler for Handler {
         &self,
         #[allow(unused_variables)] sess: &Session,
         #[allow(unused_variables)] _resolver: ThreadSafeDNSResolver,
-    ) -> io::Result<BoxedChainedDatagram> {
+    ) -> io::Result<AnyOutboundDatagram> {
         Err(io::Error::other("REJECT"))
     }
 

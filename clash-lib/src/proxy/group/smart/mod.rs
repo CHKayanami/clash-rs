@@ -14,15 +14,14 @@ use tracing::{debug, info};
 
 use crate::{
     app::{
-        dispatcher::{BoxedChainedDatagram, BoxedChainedStream},
         dns::ThreadSafeDNSResolver,
         remote_content_manager::{
             ProxyManager, providers::proxy_provider::ArcProxyProvider,
         },
     },
     proxy::{
-        AnyOutboundHandler, ConnectorType, DialWithConnector, HandlerCommonOptions,
-        OutboundHandler, OutboundType,
+        AnyOutboundDatagram, AnyOutboundHandler, AnyStream, ConnectorType,
+        DialWithConnector, HandlerCommonOptions, OutboundHandler, OutboundType,
         utils::{RemoteConnector, provider_helper::Providers},
     },
     session::Session,
@@ -436,7 +435,7 @@ impl Handler {
         &self,
         sess: &Session,
         resolver: &ThreadSafeDNSResolver,
-    ) -> io::Result<BoxedChainedStream> {
+    ) -> io::Result<AnyStream> {
         let site = sess.destination.host_cow();
         let dest_ip = sess.destination.ip().map(|ip| ip.to_string());
         let mut tried = HashSet::new();
@@ -495,7 +494,7 @@ impl Handler {
                                 retries + 1
                             );
 
-                            stream.append_to_chain(self.name()).await;
+                            sess.push_chain(self.name());
 
                             return Ok(stream);
                         }
@@ -645,7 +644,7 @@ impl OutboundHandler for Handler {
         &self,
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
-    ) -> io::Result<BoxedChainedStream> {
+    ) -> io::Result<AnyStream> {
         debug!("{} starting smart proxy selection", self.name());
         match self.adaptive_retry(sess, &resolver).await {
             Ok(stream) => {
@@ -670,13 +669,13 @@ impl OutboundHandler for Handler {
         &self,
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
-    ) -> io::Result<BoxedChainedDatagram> {
+    ) -> io::Result<AnyOutboundDatagram> {
         // For UDP we use the best proxy without retries for simplicity
         if let Some(proxy) = self.pick_smart(sess).await {
             debug!("{} use proxy {} (smart)", self.name(), proxy.name());
             let s = proxy.connect_datagram(sess, resolver).await?;
 
-            s.append_to_chain(self.name()).await;
+            sess.push_chain(self.name());
 
             Ok(s)
         } else {
@@ -693,7 +692,7 @@ impl OutboundHandler for Handler {
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
         connector: &dyn RemoteConnector,
-    ) -> io::Result<BoxedChainedStream> {
+    ) -> io::Result<AnyStream> {
         if let Some(proxy) = self.pick_smart(sess).await {
             debug!("{} use proxy {} (smart)", self.name(), proxy.name());
             proxy

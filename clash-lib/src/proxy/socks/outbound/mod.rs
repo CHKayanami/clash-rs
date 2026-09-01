@@ -2,19 +2,13 @@ mod datagram;
 
 use super::socks5::{client_handshake, socks_command};
 use crate::{
-    app::{
-        dispatcher::{
-            BoxedChainedDatagram, BoxedChainedStream, ChainedDatagram,
-            ChainedDatagramWrapper, ChainedStream, ChainedStreamWrapper,
-        },
-        dns::ThreadSafeDNSResolver,
-    },
+    app::dns::ThreadSafeDNSResolver,
     common::errors::new_io_error,
     impl_default_connector,
     proxy::{
-        AnyStream, ConnectorType, DialWithConnector, HandlerCommonOptions,
-        OutboundHandler, OutboundType, PlainProxyAPIResponse,
-        transport::TransportLayer,
+        AnyOutboundDatagram, AnyStream, ConnectorType, DialWithConnector,
+        HandlerCommonOptions, OutboundHandler, OutboundType,
+        PlainProxyAPIResponse, transport::TransportLayer,
         utils::{GLOBAL_DIRECT_CONNECTOR, RemoteConnector, new_udp_socket},
     },
     session::Session,
@@ -161,7 +155,7 @@ impl OutboundHandler for Handler {
         &self,
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
-    ) -> std::io::Result<BoxedChainedStream> {
+    ) -> std::io::Result<AnyStream> {
         if let Some(dialer) = self.connector.as_ref() {
             debug!("{:?} is connecting via {:?}", self, dialer);
             self.connect_stream_with_connector(sess, resolver, dialer.as_ref())
@@ -182,7 +176,7 @@ impl OutboundHandler for Handler {
         &self,
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
-    ) -> std::io::Result<BoxedChainedDatagram> {
+    ) -> std::io::Result<AnyOutboundDatagram> {
         if let Some(dialer) = self.connector.as_ref() {
             debug!("{:?} is connecting via {:?}", self, dialer);
             self.connect_datagram_with_connector(sess, resolver, dialer.as_ref())
@@ -206,7 +200,7 @@ impl OutboundHandler for Handler {
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
         connector: &dyn RemoteConnector,
-    ) -> std::io::Result<BoxedChainedStream> {
+    ) -> std::io::Result<AnyStream> {
         let s = connector
             .connect_stream(
                 resolver,
@@ -221,9 +215,8 @@ impl OutboundHandler for Handler {
 
         let s = self.inner_connect_stream(s, sess).await?;
 
-        let s = ChainedStreamWrapper::new(s);
-        s.append_to_chain(self.name()).await;
-        Ok(Box::new(s))
+        sess.push_chain(self.name());
+        Ok(s)
     }
 
     async fn connect_datagram_with_connector(
@@ -231,7 +224,7 @@ impl OutboundHandler for Handler {
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
         connector: &dyn RemoteConnector,
-    ) -> std::io::Result<BoxedChainedDatagram> {
+    ) -> std::io::Result<AnyOutboundDatagram> {
         let s = connector
             .connect_stream(
                 resolver.clone(),
@@ -246,8 +239,7 @@ impl OutboundHandler for Handler {
 
         let d = self.inner_connect_datagram(s, sess, resolver).await?;
 
-        let d = ChainedDatagramWrapper::new(d);
-        d.append_to_chain(self.name()).await;
+        sess.push_chain(self.name());
         Ok(Box::new(d))
     }
 

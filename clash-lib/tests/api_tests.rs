@@ -1165,9 +1165,9 @@ async fn test_get_connections_rest() {
 async fn test_delete_connection_by_id() {
     let (_clash, api_port) = start_client_clash();
 
-    // Use a random UUID that doesn't correspond to any real connection.
+    // Use a non-existent connection ID.
     let url = format!(
-        "http://127.0.0.1:{}/connections/00000000-0000-0000-0000-000000000000",
+        "http://127.0.0.1:{}/connections/10000001",
         api_port
     );
     let req = hyper::Request::builder()

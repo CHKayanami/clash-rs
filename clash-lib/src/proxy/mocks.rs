@@ -3,10 +3,12 @@ use std::{collections::HashMap, io};
 use erased_serde::Serialize;
 use mockall::mock;
 
-use super::{AnyOutboundHandler, DialWithConnector, OutboundHandler, OutboundType};
+use super::{
+    AnyOutboundDatagram, AnyOutboundHandler, AnyStream, DialWithConnector,
+    OutboundHandler, OutboundType,
+};
 use crate::{
     app::{
-        dispatcher::{BoxedChainedDatagram, BoxedChainedStream},
         dns::ThreadSafeDNSResolver,
         remote_content_manager::providers::{
             Provider, ProviderType, ProviderVehicleType,
@@ -60,7 +62,7 @@ mock! {
             &self,
             sess: &Session,
             resolver: ThreadSafeDNSResolver,
-        ) -> io::Result<BoxedChainedStream>;
+        ) -> io::Result<AnyStream>;
 
 
         /// connect to remote target via UDP
@@ -68,7 +70,7 @@ mock! {
             &self,
             sess: &Session,
             resolver: ThreadSafeDNSResolver,
-        ) -> io::Result<BoxedChainedDatagram>;
+        ) -> io::Result<AnyOutboundDatagram>;
 
         /// relay related
         async fn support_connector(&self) -> crate::proxy::ConnectorType;

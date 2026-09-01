@@ -33,15 +33,9 @@ use std::{
 use uuid::Uuid;
 
 use crate::{
-    app::{
-        dispatcher::{
-            BoxedChainedDatagram, BoxedChainedStream, ChainedDatagram,
-            ChainedDatagramWrapper, ChainedStream, ChainedStreamWrapper,
-        },
-        dns::ThreadSafeDNSResolver,
-    },
+    app::dns::ThreadSafeDNSResolver,
     proxy::{
-        DialWithConnector,
+        AnyOutboundDatagram, AnyStream, DialWithConnector,
         tuic::types::{ServerAddr, TuicEndpoint},
     },
     session::Session,
@@ -132,7 +126,7 @@ impl OutboundHandler for Handler {
         &self,
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
-    ) -> std::io::Result<BoxedChainedStream> {
+    ) -> std::io::Result<AnyStream> {
         self.do_connect_stream(sess, resolver).await.map_err(|e| {
             tracing::error!("{:?}", e);
             std::io::Error::other(e.to_string())
@@ -143,7 +137,7 @@ impl OutboundHandler for Handler {
         &self,
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
-    ) -> std::io::Result<BoxedChainedDatagram> {
+    ) -> std::io::Result<AnyOutboundDatagram> {
         self.do_connect_datagram(sess, resolver).await.map_err(|e| {
             tracing::error!("{:?}", e);
             std::io::Error::other(e.to_string())
@@ -336,26 +330,24 @@ impl Handler {
         &self,
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
-    ) -> Result<BoxedChainedStream> {
+    ) -> Result<AnyStream> {
         let conn = self.get_conn(&resolver, sess).await?;
         let dest = sess.destination.clone().into_tuic();
         let tuic_tcp = conn.connect_tcp(dest).await?;
-        let s = ChainedStreamWrapper::new(tuic_tcp);
-        s.append_to_chain(self.name()).await;
-        Ok(Box::new(s))
+        sess.push_chain(self.name());
+        Ok(Box::new(tuic_tcp))
     }
 
     async fn do_connect_datagram(
         &self,
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
-    ) -> Result<BoxedChainedDatagram> {
+    ) -> Result<AnyOutboundDatagram> {
         let conn = self.get_conn(&resolver, sess).await?;
         let assos_id = self.next_assoc_id.fetch_add(1, Ordering::SeqCst);
         let quic_udp = TuicDatagramOutbound::new(assos_id, conn, sess.source.into());
-        let s = ChainedDatagramWrapper::new(quic_udp);
-        s.append_to_chain(self.name()).await;
-        Ok(Box::new(s))
+        sess.push_chain(self.name());
+        Ok(Box::new(quic_udp))
     }
 }
 

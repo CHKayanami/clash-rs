@@ -9,10 +9,6 @@ use tracing::trace;
 use super::{dial_tcp_with_happy_eyeballs, new_udp_socket};
 use crate::{
     app::{
-        dispatcher::{
-            ChainedDatagram, ChainedDatagramWrapper, ChainedStream,
-            ChainedStreamWrapper,
-        },
         dns::ThreadSafeDNSResolver,
         net::OutboundInterface,
     },
@@ -105,7 +101,6 @@ impl RemoteConnector for DirectConnector {
         .await
         .map(|x| OutboundDatagramImpl::new(x, resolver))?;
 
-        let dgram = ChainedDatagramWrapper::new(dgram);
         Ok(Box::new(dgram))
     }
 }
@@ -166,9 +161,8 @@ impl RemoteConnector for ProxyConnector {
             .connect_stream_with_connector(&sess, resolver, self.connector.as_ref())
             .await?;
 
-        let stream = ChainedStreamWrapper::new(s);
-        stream.append_to_chain(self.proxy.name()).await;
-        Ok(Box::new(stream))
+        sess.push_chain(self.proxy.name());
+        Ok(s)
     }
 
     async fn connect_datagram(
@@ -197,8 +191,7 @@ impl RemoteConnector for ProxyConnector {
             )
             .await?;
 
-        let stream = ChainedDatagramWrapper::new(s);
-        stream.append_to_chain(self.proxy.name()).await;
-        Ok(Box::new(stream))
+        sess.push_chain(self.proxy.name());
+        Ok(s)
     }
 }

@@ -6,21 +6,15 @@ use tokio::io::AsyncWriteExt;
 use tracing::debug;
 
 use crate::{
-    app::{
-        dispatcher::{
-            BoxedChainedDatagram, BoxedChainedStream, ChainedDatagram, ChainedStream,
-        },
-        dns::ThreadSafeDNSResolver,
-    },
+    app::dns::ThreadSafeDNSResolver,
     impl_default_connector,
-    proxy::transport::TransportLayer,
+    proxy::{
+        AnyOutboundDatagram, AnyStream, ConnectorType, DialWithConnector,
+        HandlerCommonOptions, OutboundHandler, OutboundType,
+        PlainProxyAPIResponse, transport::TransportLayer,
+        utils::{GLOBAL_DIRECT_CONNECTOR, RemoteConnector},
+    },
     session::{Session, SocksAddr},
-};
-
-use super::{
-    AnyStream, ConnectorType, DialWithConnector, HandlerCommonOptions,
-    OutboundHandler, OutboundType, PlainProxyAPIResponse,
-    utils::{GLOBAL_DIRECT_CONNECTOR, RemoteConnector},
 };
 
 pub mod inbound;
@@ -225,7 +219,7 @@ impl OutboundHandler for Handler {
         &self,
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
-    ) -> io::Result<BoxedChainedStream> {
+    ) -> io::Result<AnyStream> {
         if let Some(dialer) = self.connector.as_ref() {
             debug!("{:?} is connecting via {:?}", self, dialer);
             self.connect_stream_with_connector(sess, resolver, dialer.as_ref())
@@ -244,7 +238,7 @@ impl OutboundHandler for Handler {
         &self,
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
-    ) -> io::Result<BoxedChainedDatagram> {
+    ) -> io::Result<AnyOutboundDatagram> {
         if let Some(dialer) = self.connector.as_ref() {
             debug!("{:?} is connecting via {:?}", self, dialer);
             self.connect_datagram_with_connector(sess, resolver, dialer.as_ref())
@@ -268,15 +262,13 @@ impl OutboundHandler for Handler {
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
         connector: &dyn RemoteConnector,
-    ) -> io::Result<BoxedChainedStream> {
+    ) -> io::Result<AnyStream> {
         let stream = self
             .open_stream_with_retry(resolver, connector, sess, &sess.destination)
             .await?;
 
-        let chained =
-            crate::app::dispatcher::ChainedStreamWrapper::new(Box::new(stream));
-        chained.append_to_chain(self.name()).await;
-        Ok(Box::new(chained))
+        sess.push_chain(self.name());
+        Ok(Box::new(stream))
     }
 
     async fn connect_datagram_with_connector(
@@ -284,7 +276,7 @@ impl OutboundHandler for Handler {
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
         connector: &dyn RemoteConnector,
-    ) -> io::Result<BoxedChainedDatagram> {
+    ) -> io::Result<AnyOutboundDatagram> {
         let uot_dest =
             SocksAddr::try_from((crate::proxy::transport::uot::UDP_OVER_TCP_V2_MAGIC_HOST.to_owned(), 0))?;
 
@@ -298,9 +290,8 @@ impl OutboundHandler for Handler {
 
         let datagram =
             OutboundDatagramUotV2::new(Box::new(stream), sess.destination.clone());
-        let chained = crate::app::dispatcher::ChainedDatagramWrapper::new(datagram);
-        chained.append_to_chain(self.name()).await;
-        Ok(Box::new(chained))
+        sess.push_chain(self.name());
+        Ok(Box::new(datagram))
     }
 
     fn try_as_plain_handler(&self) -> Option<&dyn PlainProxyAPIResponse> {

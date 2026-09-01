@@ -10,9 +10,9 @@ use super::dial::DialContext;
 use super::lifecycle::LifecycleSlot;
 use super::pipelined::PipelinedSession;
 use super::retry::exchange_with_retry;
-use crate::app::dispatcher::BoxedChainedStream;
+use crate::proxy::AnyStream;
 
-type TcpSession = PipelinedSession<WriteHalf<BoxedChainedStream>>;
+type TcpSession = PipelinedSession<WriteHalf<AnyStream>>;
 
 /// Pipelined plain-TCP DNS client for one upstream multiplexing concurrent queries over a single TCP connection.
 pub struct TcpPool {

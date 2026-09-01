@@ -9,7 +9,6 @@ use tracing::debug;
 use self::helpers::{StrategyFn, strategy_consistent_hashring, strategy_rr};
 use crate::{
     app::{
-        dispatcher::{BoxedChainedDatagram, BoxedChainedStream},
         dns::ThreadSafeDNSResolver,
         remote_content_manager::{
             ProxyManager, providers::proxy_provider::ArcProxyProvider,
@@ -17,8 +16,8 @@ use crate::{
     },
     config::internal::proxy::LoadBalanceStrategy,
     proxy::{
-        AnyOutboundHandler, ConnectorType, DialWithConnector, HandlerCommonOptions,
-        OutboundHandler, OutboundType,
+        AnyOutboundDatagram, AnyOutboundHandler, AnyStream, ConnectorType,
+        DialWithConnector, HandlerCommonOptions, OutboundHandler, OutboundType,
         group::GroupProxyAPIResponse,
         utils::{RemoteConnector, provider_helper::Providers},
     },
@@ -125,13 +124,13 @@ impl OutboundHandler for Handler {
         &self,
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
-    ) -> io::Result<BoxedChainedStream> {
+    ) -> io::Result<AnyStream> {
         let proxy = self.pick(sess).await?;
         debug!("{} use proxy {}", self.name(), proxy.name());
 
         let s = proxy.connect_stream(sess, resolver).await?;
 
-        s.append_to_chain(self.name()).await;
+        sess.push_chain(self.name());
 
         Ok(s)
     }
@@ -141,13 +140,13 @@ impl OutboundHandler for Handler {
         &self,
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
-    ) -> io::Result<BoxedChainedDatagram> {
+    ) -> io::Result<AnyOutboundDatagram> {
         let proxy = self.pick(sess).await?;
         debug!("{} use proxy {}", self.name(), proxy.name());
 
         let s = proxy.connect_datagram(sess, resolver).await?;
 
-        s.append_to_chain(self.name()).await;
+        sess.push_chain(self.name());
 
         Ok(s)
     }
@@ -161,14 +160,14 @@ impl OutboundHandler for Handler {
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
         connector: &dyn RemoteConnector,
-    ) -> io::Result<BoxedChainedStream> {
+    ) -> io::Result<AnyStream> {
         let proxy = self.pick(sess).await?;
         debug!("{} use proxy {}", self.name(), proxy.name());
         let s = proxy
             .connect_stream_with_connector(sess, resolver, connector)
             .await?;
 
-        s.append_to_chain(self.name()).await;
+        sess.push_chain(self.name());
         Ok(s)
     }
 

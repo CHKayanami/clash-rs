@@ -7,13 +7,12 @@ use tracing::warn;
 use crate::{
     Error,
     app::{
-        dispatcher::{BoxedChainedDatagram, BoxedChainedStream},
         dns::ThreadSafeDNSResolver,
         remote_content_manager::providers::proxy_provider::ArcProxyProvider,
     },
     proxy::{
-        AnyOutboundHandler, ConnectorType, DialWithConnector, HandlerCommonOptions,
-        OutboundHandler, OutboundType,
+        AnyOutboundDatagram, AnyOutboundHandler, AnyStream, ConnectorType,
+        DialWithConnector, HandlerCommonOptions, OutboundHandler, OutboundType,
         group::GroupProxyAPIResponse,
         utils::{RemoteConnector, provider_helper::Providers},
     },
@@ -181,13 +180,13 @@ impl OutboundHandler for Handler {
         &self,
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
-    ) -> io::Result<BoxedChainedStream> {
+    ) -> io::Result<AnyStream> {
         let selected = self.selected_proxy(true).ok_or_else(|| {
             io::Error::other(format!("no proxy found for {}", self.name()))
         })?;
         let s = selected.connect_stream(sess, resolver).await?;
 
-        s.append_to_chain(self.name()).await;
+        sess.push_chain(self.name());
 
         Ok(s)
     }
@@ -196,13 +195,13 @@ impl OutboundHandler for Handler {
         &self,
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
-    ) -> io::Result<BoxedChainedDatagram> {
+    ) -> io::Result<AnyOutboundDatagram> {
         let selected = self.selected_proxy(true).ok_or_else(|| {
             io::Error::other(format!("no proxy found for {}", self.name()))
         })?;
         let s = selected.connect_datagram(sess, resolver).await?;
 
-        s.append_to_chain(self.name()).await;
+        sess.push_chain(self.name());
 
         Ok(s)
     }
@@ -216,7 +215,7 @@ impl OutboundHandler for Handler {
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
         connector: &dyn RemoteConnector,
-    ) -> io::Result<BoxedChainedStream> {
+    ) -> io::Result<AnyStream> {
         let s = self
             .selected_proxy(true)
             .ok_or_else(|| {
@@ -225,7 +224,7 @@ impl OutboundHandler for Handler {
             .connect_stream_with_connector(sess, resolver, connector)
             .await?;
 
-        s.append_to_chain(self.name()).await;
+        sess.push_chain(self.name());
         Ok(s)
     }
 
@@ -234,7 +233,7 @@ impl OutboundHandler for Handler {
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
         connector: &dyn RemoteConnector,
-    ) -> io::Result<BoxedChainedDatagram> {
+    ) -> io::Result<AnyOutboundDatagram> {
         let d = self
             .selected_proxy(true)
             .ok_or_else(|| {
@@ -243,7 +242,7 @@ impl OutboundHandler for Handler {
             .connect_datagram_with_connector(sess, resolver, connector)
             .await?;
 
-        d.append_to_chain(self.name()).await;
+        sess.push_chain(self.name());
         Ok(d)
     }
 

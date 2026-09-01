@@ -4,11 +4,13 @@ use std::sync::Arc;
 
 use crate::{
     app::{
-        dispatcher::{BoxedChainedDatagram, BoxedChainedStream},
         dns::{ClashResolver, ResolverKind, ThreadSafeDNSResolver},
         router::Router,
     },
-    proxy::{ConnectorType, DialWithConnector, OutboundHandler, OutboundType},
+    proxy::{
+        AnyOutboundDatagram, AnyStream, ConnectorType, DialWithConnector,
+        OutboundHandler, OutboundType,
+    },
     session::Session,
 };
 
@@ -104,7 +106,7 @@ impl OutboundHandler for NoopOutboundHandler {
         &self,
         _sess: &Session,
         _resolver: ThreadSafeDNSResolver,
-    ) -> io::Result<BoxedChainedStream> {
+    ) -> io::Result<AnyStream> {
         Err(io::Error::other("noop"))
     }
 
@@ -112,7 +114,7 @@ impl OutboundHandler for NoopOutboundHandler {
         &self,
         _sess: &Session,
         _resolver: ThreadSafeDNSResolver,
-    ) -> io::Result<BoxedChainedDatagram> {
+    ) -> io::Result<AnyOutboundDatagram> {
         Err(io::Error::other("noop"))
     }
 

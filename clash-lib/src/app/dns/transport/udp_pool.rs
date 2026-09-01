@@ -13,7 +13,7 @@ use tokio::sync::oneshot;
 
 use super::dial::DialContext;
 use super::owned_task::OwnedTask;
-use crate::app::dispatcher::BoxedChainedDatagram;
+use crate::proxy::AnyOutboundDatagram;
 use crate::proxy::datagram::UdpPacket;
 use crate::session::{Network, Session, Type};
 
@@ -321,7 +321,7 @@ impl UdpPool {
 
     async fn proxied_receive_loop(
         pool: Weak<Self>,
-        mut stream: SplitStream<BoxedChainedDatagram>,
+        mut stream: SplitStream<AnyOutboundDatagram>,
     ) {
         while let Some(packet) = stream.next().await {
             let buffer = packet.data;

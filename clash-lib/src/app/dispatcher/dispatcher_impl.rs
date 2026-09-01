@@ -1,6 +1,5 @@
 use crate::{
     app::{
-        dispatcher::tracked::{TrackedDatagram, TrackedStream},
         dns::ClashResolver,
         outbound::manager::ThreadSafeOutboundManager,
         router::ArcRouter,
@@ -31,7 +30,7 @@ use tracing::{Instrument, debug, error, info, info_span, instrument, trace, warn
 
 use crate::app::dns::ThreadSafeDNSResolver;
 
-use super::statistics_manager::Manager;
+use super::statistics_manager::{Manager, TrackerInfo, TrafficTracker};
 
 use crate::app::sniffer::ArcSniffer;
 
@@ -254,95 +253,109 @@ impl Dispatcher {
         {
             Ok(rhs) => {
                 debug!("remote connection established {}", sess);
-                let rhs = TrackedStream::new(
-                    rhs,
+                let tracker_info = Arc::new(TrackerInfo::new(&sess, rule));
+                let (close_tx, close_rx) = tokio::sync::oneshot::channel();
+                self.manager.track(sess.id, tracker_info.clone(), close_tx);
+
+                let manager = self.manager.clone();
+                let sess_id = sess.id;
+                let tracker = TrafficTracker::new(
+                    tracker_info,
                     self.manager.clone(),
-                    sess.clone(),
-                    rule,
-                )
-                .await;
-                match copy_bidirectional(
+                );
+
+                let copy_fut = copy_bidirectional(
                     lhs,
                     rhs,
                     self.tcp_buffer_size,
                     Duration::from_secs(10),
                     Duration::from_secs(10),
+                    tracker,
                 )
                 .instrument(info_span!(
                     "copy_bidirectional",
                     outbound_name = outbound_name,
-                ))
-                .await
-                {
-                    Ok((up, down)) => {
-                        debug!(
-                            "connection {} closed with {} bytes up, {} bytes down",
-                            sess, up, down
-                        );
-                    }
-                    Err(err) => match err {
-                        crate::common::io::CopyBidirectionalError::LeftClosed(
-                            err,
-                        ) => match err.kind() {
-                            std::io::ErrorKind::UnexpectedEof
-                            | std::io::ErrorKind::ConnectionReset
-                            | std::io::ErrorKind::BrokenPipe
-                            | std::io::ErrorKind::TimedOut
-                            | std::io::ErrorKind::NotConnected => {
+                ));
+
+                tokio::select! {
+                    res = copy_fut => {
+                        match res {
+                            Ok((up, down)) => {
                                 debug!(
-                                    "connection {} closed with error {} by local",
-                                    sess, err
+                                    "connection {} closed with {} bytes up, {} bytes down",
+                                    sess, up, down
                                 );
                             }
-                            _ => {
-                                warn!(
-                                    "connection {} closed with error {} by local",
-                                    sess, err
-                                );
-                            }
-                        },
-                        crate::common::io::CopyBidirectionalError::RightClosed(
-                            err,
-                        ) => match err.kind() {
-                            std::io::ErrorKind::UnexpectedEof
-                            | std::io::ErrorKind::ConnectionReset
-                            | std::io::ErrorKind::BrokenPipe
-                            | std::io::ErrorKind::TimedOut
-                            | std::io::ErrorKind::NotConnected => {
-                                debug!(
-                                    "connection {} closed with error {} by remote",
-                                    sess, err
-                                );
-                            }
-                            _ => {
-                                warn!(
-                                    "connection {} closed with error {} by remote",
-                                    sess, err
-                                );
-                            }
-                        },
-                        crate::common::io::CopyBidirectionalError::Other(err) => {
-                            match err.kind() {
-                                std::io::ErrorKind::UnexpectedEof
-                                | std::io::ErrorKind::ConnectionReset
-                                | std::io::ErrorKind::BrokenPipe
-                                | std::io::ErrorKind::TimedOut
-                                | std::io::ErrorKind::NotConnected => {
-                                    debug!(
-                                        "connection {} closed with error {} by unknown",
-                                        sess, err
-                                    );
+                            Err(err) => match err {
+                                crate::common::io::CopyBidirectionalError::LeftClosed(
+                                    err,
+                                ) => match err.kind() {
+                                    std::io::ErrorKind::UnexpectedEof
+                                    | std::io::ErrorKind::ConnectionReset
+                                    | std::io::ErrorKind::BrokenPipe
+                                    | std::io::ErrorKind::TimedOut
+                                    | std::io::ErrorKind::NotConnected => {
+                                        debug!(
+                                            "connection {} closed with error {} by local",
+                                            sess, err
+                                        );
+                                    }
+                                    _ => {
+                                        warn!(
+                                            "connection {} closed with error {} by local",
+                                            sess, err
+                                        );
+                                    }
+                                },
+                                crate::common::io::CopyBidirectionalError::RightClosed(
+                                    err,
+                                ) => match err.kind() {
+                                    std::io::ErrorKind::UnexpectedEof
+                                    | std::io::ErrorKind::ConnectionReset
+                                    | std::io::ErrorKind::BrokenPipe
+                                    | std::io::ErrorKind::TimedOut
+                                    | std::io::ErrorKind::NotConnected => {
+                                        debug!(
+                                            "connection {} closed with error {} by remote",
+                                            sess, err
+                                        );
+                                    }
+                                    _ => {
+                                        warn!(
+                                            "connection {} closed with error {} by remote",
+                                            sess, err
+                                        );
+                                    }
+                                },
+                                crate::common::io::CopyBidirectionalError::Other(err) => {
+                                    match err.kind() {
+                                        std::io::ErrorKind::UnexpectedEof
+                                        | std::io::ErrorKind::ConnectionReset
+                                        | std::io::ErrorKind::BrokenPipe
+                                        | std::io::ErrorKind::TimedOut
+                                        | std::io::ErrorKind::NotConnected => {
+                                            debug!(
+                                                "connection {} closed with error {} by unknown",
+                                                sess, err
+                                            );
+                                        }
+                                        _ => {
+                                            warn!(
+                                                "connection {} closed with error {} by unknown",
+                                                sess, err
+                                            );
+                                        }
+                                    }
                                 }
-                                _ => {
-                                    warn!(
-                                        "connection {} closed with error {} by unknown",
-                                        sess, err
-                                    );
-                                }
-                            }
+                            },
                         }
-                    },
+                    }
+                    _ = close_rx => {
+                        debug!("connection {} closed by manager signal", sess);
+                    }
                 }
+
+                manager.untrack(sess_id);
             }
             Err(err) => {
                 warn!(
@@ -795,13 +808,9 @@ async fn establish_outbound_session(
 
     debug!("{} outbound datagram connected", sess);
 
-    let outbound_datagram = TrackedDatagram::new(
-        outbound_datagram,
-        ctx.manager.clone(),
-        sess.clone(),
-        rule,
-    )
-    .await;
+    let tracker_info = Arc::new(TrackerInfo::new(&sess, rule));
+    let (close_tx, close_rx) = tokio::sync::oneshot::channel();
+    ctx.manager.track(sess.id, tracker_info.clone(), close_tx);
 
     let (mut remote_w, mut remote_r) = outbound_datagram.split();
     let (remote_sender, mut remote_forwarder) =
@@ -812,23 +821,36 @@ async fn establish_outbound_session(
     let orig_inbound_dst_for_relay = orig_inbound_dst.clone();
     let relay_sess = sess.clone();
     let remote_receiver_w_clone = ctx.remote_receiver_w.clone();
+    let manager = ctx.manager.clone();
+    let sess_id = sess.id;
+    let tracker = TrafficTracker::new(
+        tracker_info,
+        ctx.manager.clone(),
+    );
 
     let relay_handle = tokio::spawn(async move {
         // local -> remote
+        let tracker_out = tracker.clone();
         let outgoing = async move {
             while let Some((mut packet, dest_addr)) =
                 remote_forwarder.recv().await
             {
+                let len = packet.data.len();
                 packet.dst_addr = dest_addr;
                 if let Err(err) = remote_w.send(packet).await {
                     warn!("failed to send packet to remote: {err:?}");
+                } else {
+                    tracker_out.push_upload(len);
                 }
             }
         };
 
         // remote -> local
+        let tracker_in = tracker;
         let incoming = async move {
             while let Some(mut packet) = remote_r.next().await {
+                tracker_in.push_download(packet.data.len());
+
                 packet.src_addr = orig_inbound_dst_for_relay.clone();
                 packet.dst_addr = relay_sess.source.into();
                 debug!(
@@ -857,7 +879,10 @@ async fn establish_outbound_session(
         tokio::select! {
             _ = outgoing => {}
             _ = incoming => {}
+            _ = close_rx => {}
         }
+
+        manager.untrack(sess_id);
     });
 
     Some(EstablishedSession {

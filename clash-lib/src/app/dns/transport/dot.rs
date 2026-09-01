@@ -11,9 +11,9 @@ use super::dial::DialContext;
 use super::lifecycle::LifecycleSlot;
 use super::pipelined::PipelinedSession;
 use super::retry::exchange_with_retry;
-use crate::app::dispatcher::BoxedChainedStream;
+use crate::proxy::AnyStream;
 
-type DotStream = TlsStream<BoxedChainedStream>;
+type DotStream = TlsStream<AnyStream>;
 type DotSession = PipelinedSession<WriteHalf<DotStream>>;
 
 /// Pipelined DoT client for one upstream multiplexing concurrent queries over a single TLS session.

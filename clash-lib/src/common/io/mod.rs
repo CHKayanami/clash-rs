@@ -1,4 +1,3 @@
-/// copy of https://github.com/eycorsican/leaf/blob/a77a1e497ae034f3a2a89c8628d5e7ebb2af47f0/leaf/src/common/io.rs
 use std::future::Future;
 use std::{
     io,
@@ -14,11 +13,14 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 #[cfg(all(target_os = "linux", feature = "zero_copy"))]
 mod splice;
 #[cfg(all(target_os = "linux", feature = "zero_copy"))]
-pub use splice::zero_copy_bidirectional;
+pub use splice::{TrackCopy, zero_copy_bidirectional};
 
 pub use clash_common::{PooledBuffer, SlideBuffer};
 
-use crate::{app::dispatcher::TrackedStream, proxy::ClientStream};
+use crate::{
+    app::dispatcher::TrafficTracker,
+    proxy::{AnyStream, ClientStream},
+};
 
 #[derive(Debug)]
 pub enum CopyBidirectionalError {
@@ -113,6 +115,7 @@ impl CopyBuffer {
         mut reader: Pin<&mut R>,
         mut writer: Pin<&mut W>,
         mut last_active: Option<&mut tokio::time::Instant>,
+        mut on_progress: Option<&mut dyn FnMut(usize)>,
     ) -> Poll<io::Result<u64>>
     where
         R: AsyncRead + ?Sized,
@@ -183,6 +186,9 @@ impl CopyBuffer {
                             if let Some(last_active) = last_active.as_mut() {
                                 **last_active = tokio::time::Instant::now();
                             }
+                            if let Some(ref mut on_progress) = on_progress {
+                                on_progress(written);
+                            }
                         }
                     }
                     Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
@@ -232,6 +238,7 @@ struct CopyBidirectional<'a, A: ?Sized, B: ?Sized> {
     idle_timeout: Pin<Box<tokio::time::Sleep>>,
     idle_timeout_duration: Duration,
     last_active: tokio::time::Instant,
+    tracker: TrafficTracker,
 }
 
 impl<A, B> Future for CopyBidirectional<'_, A, B>
@@ -242,7 +249,6 @@ where
     type Output = Result<(u64, u64), CopyBidirectionalError>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        // Unpack self into mut refs to each field to avoid borrow check issues.
         let CopyBidirectional {
             a,
             b,
@@ -257,6 +263,7 @@ where
             idle_timeout,
             idle_timeout_duration,
             last_active,
+            tracker,
         } = &mut *self;
 
         let mut a = Pin::new(a);
@@ -282,8 +289,11 @@ where
         loop {
             match a_to_b {
                 TransferState::Running(buf) => {
+                    let mut on_upload = |written: usize| {
+                        tracker.push_upload(written);
+                    };
                     let res =
-                        buf.poll_copy(cx, a.as_mut(), b.as_mut(), Some(last_active));
+                        buf.poll_copy(cx, a.as_mut(), b.as_mut(), Some(last_active), Some(&mut on_upload));
                     match res {
                         Poll::Ready(Ok(count)) => {
                             *a_to_b = TransferState::ShuttingDown(count);
@@ -333,8 +343,11 @@ where
 
             match b_to_a {
                 TransferState::Running(buf) => {
+                    let mut on_download = |written: usize| {
+                        tracker.push_download(written);
+                    };
                     let res =
-                        buf.poll_copy(cx, b.as_mut(), a.as_mut(), Some(last_active));
+                        buf.poll_copy(cx, b.as_mut(), a.as_mut(), Some(last_active), Some(&mut on_download));
                     match res {
                         Poll::Ready(Ok(count)) => {
                             *b_to_a = TransferState::ShuttingDown(count);
@@ -392,30 +405,47 @@ where
     }
 }
 
+#[cfg(all(target_os = "linux", feature = "zero_copy"))]
+struct UploadTracker(TrafficTracker);
+#[cfg(all(target_os = "linux", feature = "zero_copy"))]
+impl TrackCopy for UploadTracker {
+    fn track(&self, total: usize) {
+        self.0.push_upload(total);
+    }
+}
+
+#[cfg(all(target_os = "linux", feature = "zero_copy"))]
+struct DownloadTracker(TrafficTracker);
+#[cfg(all(target_os = "linux", feature = "zero_copy"))]
+impl TrackCopy for DownloadTracker {
+    fn track(&self, total: usize) {
+        self.0.push_download(total);
+    }
+}
+
 pub async fn copy_bidirectional(
     mut a: Box<dyn ClientStream>,
-    mut b: TrackedStream,
+    mut b: AnyStream,
     size: usize,
     a_to_b_timeout_duration: Duration,
     b_to_a_timeout_duration: Duration,
+    tracker: TrafficTracker,
 ) -> Result<(u64, u64), CopyBidirectionalError> {
     use tokio::io::AsyncWriteExt;
 
     // zero copy is only available on linux
     #[cfg(all(target_os = "linux", feature = "zero_copy"))]
     let res = {
-        // for zero copy, we need to track the download and upload amount with the
-        // assistance of the tracker it's somehow ugly, but i could not
-        // figure out a better way
-        let (r_tracker, w_tracker) = b.trackers();
         let a_raw = a.underlying_socket();
         let b_raw = b.underlying_socket();
         match (a_raw, b_raw) {
             // zero copy is only available when both streams are raw TcpStream
-            (Some(a), Some(b_stream)) => {
+            (Some(a_stream), Some(b_stream)) => {
                 tracing::trace!("using zero copy for bidirectional copy");
+                let w_tracker = std::sync::Arc::new(UploadTracker(tracker.clone()));
+                let r_tracker = std::sync::Arc::new(DownloadTracker(tracker));
                 zero_copy_bidirectional(
-                    a,
+                    a_stream,
                     b_stream,
                     r_tracker,
                     w_tracker,
@@ -431,6 +461,7 @@ pub async fn copy_bidirectional(
                     size,
                     a_to_b_timeout_duration,
                     b_to_a_timeout_duration,
+                    tracker,
                 )
                 .await
             }
@@ -444,6 +475,7 @@ pub async fn copy_bidirectional(
             size,
             a_to_b_timeout_duration,
             b_to_a_timeout_duration,
+            tracker,
         )
         .await
     };
@@ -460,6 +492,7 @@ pub async fn copy_buf_bidirectional_with_timeout<A, B>(
     size: usize,
     a_to_b_timeout_duration: Duration,
     b_to_a_timeout_duration: Duration,
+    tracker: TrafficTracker,
 ) -> Result<(u64, u64), CopyBidirectionalError>
 where
     A: AsyncRead + AsyncWrite + Unpin + ?Sized,
@@ -480,6 +513,7 @@ where
         idle_timeout: Box::pin(tokio::time::sleep(idle_timeout_duration)),
         idle_timeout_duration,
         last_active: tokio::time::Instant::now(),
+        tracker,
     }
     .await
 }
@@ -611,6 +645,7 @@ mod tests {
                 Pin::new(&mut reader),
                 Pin::new(&mut writer),
                 None,
+                None,
             )
         })
         .await;
@@ -635,6 +670,7 @@ mod tests {
                 cx,
                 Pin::new(&mut reader),
                 Pin::new(&mut writer),
+                None,
                 None,
             )
         })

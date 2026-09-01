@@ -17,21 +17,15 @@ use russh::{
 use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::{
-    app::{
-        dispatcher::{
-            BoxedChainedDatagram, BoxedChainedStream, ChainedStream,
-            ChainedStreamWrapper,
-        },
-        dns::ThreadSafeDNSResolver,
-    },
+    app::dns::ThreadSafeDNSResolver,
     common::errors::new_io_error,
     impl_default_connector,
+    proxy::{
+        AnyOutboundDatagram, AnyStream, ConnectorType, DialWithConnector,
+        HandlerCommonOptions, OutboundHandler, OutboundType,
+        PlainProxyAPIResponse, ProxyStream, utils::RemoteConnector,
+    },
     session::Session,
-};
-
-use super::{
-    ConnectorType, DialWithConnector, HandlerCommonOptions, OutboundHandler,
-    OutboundType, PlainProxyAPIResponse, ProxyStream, utils::RemoteConnector,
 };
 
 /// Wrapper for `ChannelStream` for `Debug` trait
@@ -168,7 +162,7 @@ impl OutboundHandler for Handler {
         &self,
         sess: &Session,
         _resolver: ThreadSafeDNSResolver,
-    ) -> io::Result<BoxedChainedStream> {
+    ) -> io::Result<AnyStream> {
         // key exchange algorithms
         let kex = Cow::Borrowed(KEX_ALGORITHMS);
         // host key algorithms
@@ -219,10 +213,8 @@ impl OutboundHandler for Handler {
         let s = Box::new(ChannelStreamWrapper {
             inner: channel.into_stream(),
         });
-        let chained: ChainedStreamWrapper<Box<dyn ProxyStream + Sync>> =
-            ChainedStreamWrapper::new(s);
-        chained.append_to_chain(self.name()).await;
-        Ok(Box::new(chained))
+        sess.push_chain(self.name());
+        Ok(s)
     }
 
     /// connect to remote target via UDP
@@ -230,7 +222,7 @@ impl OutboundHandler for Handler {
         &self,
         _sess: &Session,
         _resolver: ThreadSafeDNSResolver,
-    ) -> std::io::Result<BoxedChainedDatagram> {
+    ) -> std::io::Result<AnyOutboundDatagram> {
         Err(new_io_error("ssh udp is not implemented yet"))
     }
 

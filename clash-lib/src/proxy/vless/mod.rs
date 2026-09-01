@@ -3,19 +3,13 @@ use self::{
     vision::VisionStream,
 };
 use super::{
-    AnyStream, ConnectorType, DialWithConnector, HandlerCommonOptions,
-    OutboundHandler, OutboundType, PlainProxyAPIResponse,
+    AnyOutboundDatagram, AnyStream, ConnectorType, DialWithConnector,
+    HandlerCommonOptions, OutboundHandler, OutboundType, PlainProxyAPIResponse,
     transport::TransportLayer,
     utils::{GLOBAL_DIRECT_CONNECTOR, RemoteConnector},
 };
 use crate::{
-    app::{
-        dispatcher::{
-            BoxedChainedDatagram, BoxedChainedStream, ChainedDatagram,
-            ChainedDatagramWrapper, ChainedStream, ChainedStreamWrapper,
-        },
-        dns::ThreadSafeDNSResolver,
-    },
+    app::dns::ThreadSafeDNSResolver,
     impl_default_connector,
     session::Session,
 };
@@ -150,7 +144,7 @@ impl OutboundHandler for Handler {
         &self,
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
-    ) -> io::Result<BoxedChainedStream> {
+    ) -> io::Result<AnyStream> {
         if let Some(dialer) = self.connector.as_ref() {
             debug!("{:?} is connecting via {:?}", self, dialer);
             self.connect_stream_with_connector(sess, resolver, dialer.as_ref())
@@ -169,7 +163,7 @@ impl OutboundHandler for Handler {
         &self,
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
-    ) -> io::Result<BoxedChainedDatagram> {
+    ) -> io::Result<AnyOutboundDatagram> {
         if let Some(dialer) = self.connector.as_ref() {
             debug!("{:?} is connecting via {:?}", self, dialer);
             self.connect_datagram_with_connector(sess, resolver, dialer.as_ref())
@@ -193,7 +187,7 @@ impl OutboundHandler for Handler {
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
         connector: &dyn RemoteConnector,
-    ) -> io::Result<BoxedChainedStream> {
+    ) -> io::Result<AnyStream> {
         if let Some(mux) = &self.mux_pool {
             let dialer = || async {
                 let stream = connector
@@ -219,9 +213,8 @@ impl OutboundHandler for Handler {
                     .await
             };
             let s = mux.open_stream(&sess.destination, false, dialer).await?;
-            let chained = ChainedStreamWrapper::new(s);
-            chained.append_to_chain(self.name()).await;
-            return Ok(Box::new(chained));
+            sess.push_chain(self.name());
+            return Ok(s);
         }
 
         let stream = connector
@@ -239,9 +232,8 @@ impl OutboundHandler for Handler {
         let s = self
             .inner_proxy_stream(stream, sess, VLESS_COMMAND_TCP)
             .await?;
-        let chained = ChainedStreamWrapper::new(s);
-        chained.append_to_chain(self.name()).await;
-        Ok(Box::new(chained))
+        sess.push_chain(self.name());
+        Ok(s)
     }
 
     async fn connect_datagram_with_connector(
@@ -249,7 +241,7 @@ impl OutboundHandler for Handler {
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
         connector: &dyn RemoteConnector,
-    ) -> io::Result<BoxedChainedDatagram> {
+    ) -> io::Result<AnyOutboundDatagram> {
         let dial_carrier = || async {
             let stream = connector
                 .connect_stream(
@@ -271,9 +263,8 @@ impl OutboundHandler for Handler {
             .open_stream(&sess.destination, dial_carrier)
             .await?;
 
-        let chained = ChainedDatagramWrapper::new(child_dgram);
-        chained.append_to_chain(self.name()).await;
-        Ok(Box::new(chained))
+        sess.push_chain(self.name());
+        Ok(Box::new(child_dgram))
     }
 
     fn try_as_plain_handler(&self) -> Option<&dyn PlainProxyAPIResponse> {

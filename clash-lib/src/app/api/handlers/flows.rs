@@ -215,7 +215,7 @@ async fn build_flow_records(
     // is preserved (snapshot() materialises a reduced view that drops it).
     let active = mgr.active_connections_snapshot();
     for info in &active {
-        let chains = info.proxy_chain_holder.snapshot().await;
+        let chains = info.proxy_chain_holder.snapshot();
         merge_info!(info, chains, true);
     }
 
@@ -223,7 +223,7 @@ async fn build_flow_records(
     if include_closed {
         let closed = mgr.closed_flows_snapshot();
         for info in &closed {
-            let chains = info.proxy_chain_holder.snapshot().await;
+            let chains = info.proxy_chain_holder.snapshot();
             merge_info!(info, chains, false);
         }
     }

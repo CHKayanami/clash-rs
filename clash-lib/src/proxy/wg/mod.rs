@@ -1,17 +1,12 @@
 use self::{keys::KeyBytes, wireguard::Config};
 use super::{
-    ConnectorType, DialWithConnector, HandlerCommonOptions, OutboundHandler,
-    OutboundType, PlainProxyAPIResponse, utils::RemoteConnector,
+    AnyOutboundDatagram, AnyStream, ConnectorType, DialWithConnector,
+    HandlerCommonOptions, OutboundHandler, OutboundType, PlainProxyAPIResponse,
+    utils::RemoteConnector,
 };
 use crate::{
     Error,
-    app::{
-        dispatcher::{
-            BoxedChainedDatagram, BoxedChainedStream, ChainedDatagram,
-            ChainedDatagramWrapper, ChainedStream, ChainedStreamWrapper,
-        },
-        dns::ThreadSafeDNSResolver,
-    },
+    app::dns::ThreadSafeDNSResolver,
     common::errors::{map_io_error, new_io_error},
     impl_default_connector,
     session::Session,
@@ -243,7 +238,7 @@ impl OutboundHandler for Handler {
         &self,
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
-    ) -> io::Result<BoxedChainedStream> {
+    ) -> io::Result<AnyStream> {
         let inner = self
             .initialize_inner(resolver.clone(), sess)
             .await
@@ -280,9 +275,8 @@ impl OutboundHandler for Handler {
         let remote = (ip, sess.destination.port()).into();
 
         let socket = inner.device_manager.new_tcp_socket(remote).await;
-        let chained = ChainedStreamWrapper::new(socket);
-        chained.append_to_chain(self.name()).await;
-        Ok(Box::new(chained))
+        sess.push_chain(self.name());
+        Ok(Box::new(socket))
     }
 
     /// connect to remote target via UDP
@@ -290,16 +284,15 @@ impl OutboundHandler for Handler {
         &self,
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
-    ) -> io::Result<BoxedChainedDatagram> {
+    ) -> io::Result<AnyOutboundDatagram> {
         let inner = self
             .initialize_inner(resolver, sess)
             .await
             .map_err(map_io_error)?;
 
         let socket = inner.device_manager.new_udp_socket().await;
-        let chained = ChainedDatagramWrapper::new(socket);
-        chained.append_to_chain(self.name()).await;
-        Ok(Box::new(chained))
+        sess.push_chain(self.name());
+        Ok(Box::new(socket))
     }
 
     async fn support_connector(&self) -> ConnectorType {

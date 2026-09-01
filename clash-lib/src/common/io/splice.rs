@@ -14,7 +14,9 @@ use tokio::io::{AsyncRead, AsyncWrite, Interest};
 
 use tokio::net::{TcpStream, UnixStream};
 
-use crate::app::dispatcher::TrackCopy;
+pub trait TrackCopy: Send + Sync {
+    fn track(&self, total: usize);
+}
 
 use super::CopyBidirectionalError;
 

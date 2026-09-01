@@ -1,8 +1,5 @@
 use crate::{
-    app::{
-        dispatcher::{BoxedChainedDatagram, BoxedChainedStream},
-        dns::ThreadSafeDNSResolver,
-    },
+    app::dns::ThreadSafeDNSResolver,
     proxy::datagram::UdpPacket,
     session::Session,
 };
@@ -246,14 +243,14 @@ pub trait OutboundHandler: Sync + Send + Unpin + DialWithConnector + Debug {
         &self,
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
-    ) -> io::Result<BoxedChainedStream>;
+    ) -> io::Result<AnyStream>;
 
     /// connect to remote target via UDP
     async fn connect_datagram(
         &self,
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
-    ) -> io::Result<BoxedChainedDatagram>;
+    ) -> io::Result<AnyOutboundDatagram>;
 
     /// relay related
     async fn support_connector(&self) -> ConnectorType;
@@ -263,7 +260,7 @@ pub trait OutboundHandler: Sync + Send + Unpin + DialWithConnector + Debug {
         _sess: &Session,
         _resolver: ThreadSafeDNSResolver,
         _connector: &dyn RemoteConnector,
-    ) -> io::Result<BoxedChainedStream> {
+    ) -> io::Result<AnyStream> {
         error!("tcp relay not supported for {}", self.proto());
         Err(io::Error::other(format!(
             "tcp relay not supported for {}",
@@ -276,7 +273,7 @@ pub trait OutboundHandler: Sync + Send + Unpin + DialWithConnector + Debug {
         _sess: &Session,
         _resolver: ThreadSafeDNSResolver,
         _connector: &dyn RemoteConnector,
-    ) -> io::Result<BoxedChainedDatagram> {
+    ) -> io::Result<AnyOutboundDatagram> {
         Err(io::Error::other(format!(
             "udp relay not supported for {}",
             self.proto()
