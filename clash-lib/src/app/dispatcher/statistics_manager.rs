@@ -26,7 +26,7 @@ fn serialize_id_as_string<S>(id: &u64, serializer: S) -> Result<S::Ok, S::Error>
 where
     S: serde::Serializer,
 {
-    serializer.serialize_str(&id.to_string())
+    serializer.collect_str(id)
 }
 
 #[derive(Serialize, Default)]
@@ -42,14 +42,11 @@ pub struct TrackerInfo {
     #[serde(rename = "start")]
     pub start_time: chrono::DateTime<Utc>,
     #[serde(rename = "chains")]
-    pub proxy_chain: Vec<String>,
+    pub proxy_chain_holder: ProxyChain,
     #[serde(rename = "rule")]
     pub rule: String,
     #[serde(rename = "rulePayload")]
     pub rule_payload: String,
-
-    #[serde(skip)]
-    pub proxy_chain_holder: ProxyChain,
 
     /// Per-user byte counters, separate from `upload_total`/`download_total`.
     /// Only incremented when `session_holder.inbound_user` is set.
@@ -87,7 +84,6 @@ impl Clone for TrackerInfo {
                 self.download_total.load(Ordering::Relaxed),
             ),
             start_time: self.start_time,
-            proxy_chain: self.proxy_chain.clone(),
             rule: self.rule.clone(),
             rule_payload: self.rule_payload.clone(),
             proxy_chain_holder: self.proxy_chain_holder.clone(),
@@ -166,36 +162,12 @@ impl Drop for TrackGuard {
     }
 }
 
-pub struct ConnectionView {
-    pub tracker: Arc<TrackerInfo>,
-    pub chains: Vec<String>,
-}
-
-impl Serialize for ConnectionView {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        use serde::ser::SerializeStruct;
-        let mut s = serializer.serialize_struct("TrackerInfo", 8)?;
-        s.serialize_field("id", &self.tracker.id.to_string())?;
-        s.serialize_field("metadata", &self.tracker.session_holder)?;
-        s.serialize_field("upload", &self.tracker.upload_total.load(Ordering::Relaxed))?;
-        s.serialize_field("download", &self.tracker.download_total.load(Ordering::Relaxed))?;
-        s.serialize_field("start", &self.tracker.start_time)?;
-        s.serialize_field("chains", &self.chains)?;
-        s.serialize_field("rule", &self.tracker.rule)?;
-        s.serialize_field("rulePayload", &self.tracker.rule_payload)?;
-        s.end()
-    }
-}
-
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Snapshot {
     download_total: u64,
     upload_total: u64,
-    connections: Vec<ConnectionView>,
+    connections: Vec<Arc<TrackerInfo>>,
     memory: usize,
 }
 
@@ -373,36 +345,11 @@ impl Manager {
     }
 
     pub async fn snapshot(&self) -> Snapshot {
-        if self.connections.is_empty() {
-            return Snapshot {
-                download_total: self
-                    .download_total
-                    .load(std::sync::atomic::Ordering::Relaxed),
-                upload_total: self
-                    .upload_total
-                    .load(std::sync::atomic::Ordering::Relaxed),
-                connections: Vec::new(),
-                memory: self.memory_usage(),
-            };
-        }
-
-        let conns_data: Vec<(Arc<TrackerInfo>, ProxyChain)> = self
+        let connections: Vec<Arc<TrackerInfo>> = self
             .connections
             .iter()
-            .map(|r| {
-                let (info, _) = r.value();
-                (info.clone(), info.proxy_chain_holder.clone())
-            })
+            .map(|r| r.value().0.clone())
             .collect();
-
-        let mut connections = Vec::with_capacity(conns_data.len());
-        for (t, chain_holder) in conns_data {
-            let chains = chain_holder.snapshot();
-            connections.push(ConnectionView {
-                tracker: t,
-                chains,
-            });
-        }
 
         Snapshot {
             download_total: self

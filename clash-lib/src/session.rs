@@ -511,7 +511,7 @@ impl Serialize for ProxyChain {
     where
         S: Serializer,
     {
-        self.snapshot().serialize(serializer)
+        self.0.read().serialize(serializer)
     }
 }
 
