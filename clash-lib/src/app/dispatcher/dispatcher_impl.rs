@@ -30,7 +30,7 @@ use tracing::{Instrument, debug, error, info, info_span, instrument, trace, warn
 
 use crate::app::dns::ThreadSafeDNSResolver;
 
-use super::statistics_manager::{Manager, TrackerInfo, TrafficTracker};
+use super::statistics_manager::{Manager, TrackGuard, TrackerInfo, TrafficTracker};
 
 use crate::app::sniffer::ArcSniffer;
 
@@ -256,9 +256,8 @@ impl Dispatcher {
                 let tracker_info = Arc::new(TrackerInfo::new(&sess, rule));
                 let (close_tx, close_rx) = tokio::sync::oneshot::channel();
                 self.manager.track(sess.id, tracker_info.clone(), close_tx);
+                let _track_guard = TrackGuard::new(sess.id, self.manager.clone());
 
-                let manager = self.manager.clone();
-                let sess_id = sess.id;
                 let tracker = TrafficTracker::new(
                     tracker_info,
                     self.manager.clone(),
@@ -354,8 +353,6 @@ impl Dispatcher {
                         debug!("connection {} closed by manager signal", sess);
                     }
                 }
-
-                manager.untrack(sess_id);
             }
             Err(err) => {
                 warn!(
@@ -811,6 +808,7 @@ async fn establish_outbound_session(
     let tracker_info = Arc::new(TrackerInfo::new(&sess, rule));
     let (close_tx, close_rx) = tokio::sync::oneshot::channel();
     ctx.manager.track(sess.id, tracker_info.clone(), close_tx);
+    let track_guard = TrackGuard::new(sess.id, ctx.manager.clone());
 
     let (mut remote_w, mut remote_r) = outbound_datagram.split();
     let (remote_sender, mut remote_forwarder) =
@@ -821,14 +819,13 @@ async fn establish_outbound_session(
     let orig_inbound_dst_for_relay = orig_inbound_dst.clone();
     let relay_sess = sess.clone();
     let remote_receiver_w_clone = ctx.remote_receiver_w.clone();
-    let manager = ctx.manager.clone();
-    let sess_id = sess.id;
     let tracker = TrafficTracker::new(
         tracker_info,
         ctx.manager.clone(),
     );
 
     let relay_handle = tokio::spawn(async move {
+        let _guard = track_guard;
         // local -> remote
         let tracker_out = tracker.clone();
         let outgoing = async move {
@@ -881,8 +878,6 @@ async fn establish_outbound_session(
             _ = incoming => {}
             _ = close_rx => {}
         }
-
-        manager.untrack(sess_id);
     });
 
     Some(EstablishedSession {

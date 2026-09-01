@@ -147,6 +147,25 @@ impl TrafficTracker {
     }
 }
 
+/// RAII Drop Guard that ensures a connection is untracked from `Manager`
+/// even if the holding future / task is cancelled or aborted.
+pub struct TrackGuard {
+    id: u64,
+    manager: Arc<Manager>,
+}
+
+impl TrackGuard {
+    pub fn new(id: u64, manager: Arc<Manager>) -> Self {
+        Self { id, manager }
+    }
+}
+
+impl Drop for TrackGuard {
+    fn drop(&mut self) {
+        self.manager.untrack(self.id);
+    }
+}
+
 pub struct ConnectionView {
     pub tracker: Arc<TrackerInfo>,
     pub chains: Vec<String>,
