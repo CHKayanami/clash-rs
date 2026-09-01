@@ -252,6 +252,19 @@ impl Manager {
         }
     }
 
+    pub fn for_each_active_connection(&self, mut f: impl FnMut(&TrackerInfo)) {
+        for r in self.connections.iter() {
+            f(&r.value().0);
+        }
+    }
+
+    pub fn for_each_closed_flow(&self, mut f: impl FnMut(&TrackerInfo)) {
+        let ring = self.closed_flows.lock().unwrap();
+        for info in ring.iter() {
+            f(info);
+        }
+    }
+
     /// Return `Arc<TrackerInfo>` for every currently-active connection.
     /// Unlike `snapshot()`, this preserves the full `session_holder` so
     /// callers can access destination, source, and network fields directly.
@@ -345,11 +358,10 @@ impl Manager {
     }
 
     pub async fn snapshot(&self) -> Snapshot {
-        let connections: Vec<Arc<TrackerInfo>> = self
-            .connections
-            .iter()
-            .map(|r| r.value().0.clone())
-            .collect();
+        let mut connections = Vec::with_capacity(self.connections.len());
+        for r in self.connections.iter() {
+            connections.push(r.value().0.clone());
+        }
 
         Snapshot {
             download_total: self

@@ -211,15 +211,14 @@ async fn build_flow_records(
         }};
     }
 
-    // Active connections — use active_connections_snapshot so session_holder
-    // is preserved (snapshot() materialises a reduced view that drops it).
+    // Active connections — fast pointer clone outside lock
     let active = mgr.active_connections_snapshot();
     for info in &active {
         let chains = info.proxy_chain_holder.snapshot();
         merge_info!(info, chains, true);
     }
 
-    // Closed connections (ring buffer).
+    // Closed connections (ring buffer) — fast pointer clone outside lock
     if include_closed {
         let closed = mgr.closed_flows_snapshot();
         for info in &closed {
@@ -297,23 +296,40 @@ pub async fn ws_handle(
 
     let callback = async move |mut socket: axum::extract::ws::WebSocket| {
         let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut buf = Vec::with_capacity(4096);
         loop {
-            ticker.tick().await;
-            let records =
-                build_flow_records(&state.statistics_manager, top, include_closed)
-                    .await;
-            buf.clear();
-            if let Err(e) = serde_json::to_writer(&mut buf, &records) {
-                warn!("failed to serialize flow records: {}", e);
-                break;
-            }
-            let Ok(body) = std::str::from_utf8(&buf) else {
-                break;
-            };
-            if let Err(e) = socket.send(Message::Text(body.into())).await {
-                debug!("ws/flows send error: {}", e);
-                break;
+            tokio::select! {
+                _ = ticker.tick() => {
+                    let records =
+                        build_flow_records(&state.statistics_manager, top, include_closed)
+                            .await;
+                    buf.clear();
+                    if let Err(e) = serde_json::to_writer(&mut buf, &records) {
+                        warn!("failed to serialize flow records: {}", e);
+                        break;
+                    }
+                    let Ok(body) = std::str::from_utf8(&buf) else {
+                        break;
+                    };
+                    if let Err(e) = socket.send(Message::Text(body.into())).await {
+                        debug!("ws/flows send error: {}", e);
+                        break;
+                    }
+                }
+                msg = socket.recv() => {
+                    match msg {
+                        Some(Ok(Message::Close(_))) | None => {
+                            debug!("ws/flows client disconnected");
+                            break;
+                        }
+                        Some(Err(e)) => {
+                            debug!("ws/flows receive error: {}", e);
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
             }
         }
     };

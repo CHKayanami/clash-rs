@@ -59,32 +59,46 @@ async fn get_connections(
         warn!("ws upgrade error: {}", e);
     })
     .on_upgrade(move |mut socket| async move {
-        let interval = q.interval;
+        let interval = q.interval.unwrap_or(1).max(1);
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(interval));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mgr = state.statistics_manager.clone();
         let mut buf = Vec::with_capacity(8192);
 
         loop {
-            let snapshot = mgr.snapshot().await;
-            buf.clear();
-            if let Err(e) = serde_json::to_writer(&mut buf, &snapshot) {
-                warn!("Failed to serialize connection snapshot: {}", e);
-                continue;
+            tokio::select! {
+                _ = interval.tick() => {
+                    let snapshot = mgr.snapshot().await;
+                    buf.clear();
+                    if let Err(e) = serde_json::to_writer(&mut buf, &snapshot) {
+                        warn!("Failed to serialize connection snapshot: {}", e);
+                        continue;
+                    }
+
+                    let Ok(body) = std::str::from_utf8(&buf) else {
+                        continue;
+                    };
+
+                    if let Err(e) = socket.send(Message::Text(body.into())).await {
+                        // likely client gone
+                        debug!("ws send error: {}", e);
+                        break;
+                    }
+                }
+                msg = socket.recv() => {
+                    match msg {
+                        Some(Ok(Message::Close(_))) | None => {
+                            debug!("ws connection client disconnected");
+                            break;
+                        }
+                        Some(Err(e)) => {
+                            debug!("ws connection receive error: {}", e);
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
             }
-
-            let Ok(body) = std::str::from_utf8(&buf) else {
-                continue;
-            };
-
-            if let Err(e) = socket.send(Message::Text(body.into())).await {
-                // likely client gone
-                debug!("ws send error: {}", e);
-                break;
-            }
-
-            tokio::time::sleep(tokio::time::Duration::from_secs(
-                interval.unwrap_or(1).max(1),
-            ))
-            .await;
         }
     })
 }

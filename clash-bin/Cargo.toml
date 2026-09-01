@@ -35,6 +35,8 @@ dashboard = ["clash-lib/dashboard"]
 dhat-heap = ["dep:dhat"]
 telemetry = ["clash-lib/telemetry"]
 jemallocator = ["dep:tikv-jemallocator"]
+jemalloc-prof = ["jemallocator", "tikv-jemallocator/profiling"]
+jemallocator-prof = ["jemalloc-prof"]
 mimalloc = ["dep:mimalloc"]
 
 aws-lc-rs = ["dep:aws-lc-rs", "clash-lib/aws-lc-rs"]

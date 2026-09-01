@@ -36,28 +36,45 @@ pub async fn connections(
     query: Query<GetConnectionsQuery>,
 ) -> impl IntoResponse {
     let callback = async move |mut socket: WebSocket| {
-        let interval = query.interval.unwrap_or(1);
+        let interval = query.interval.unwrap_or(1).max(1);
         let mut interval = tokio::time::interval(Duration::from_secs(interval));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut buf = Vec::with_capacity(8192);
 
         loop {
-            interval.tick().await;
-            let snapshot = state.statistics_manager.snapshot().await;
+            tokio::select! {
+                _ = interval.tick() => {
+                    let snapshot = state.statistics_manager.snapshot().await;
 
-            buf.clear();
-            if let Err(e) = serde_json::to_writer(&mut buf, &snapshot) {
-                debug!("failed to serialize snapshot for ws connection: {}", e);
-                break;
-            }
+                    buf.clear();
+                    if let Err(e) = serde_json::to_writer(&mut buf, &snapshot) {
+                        debug!("failed to serialize snapshot for ws connection: {}", e);
+                        break;
+                    }
 
-            let Ok(body) = std::str::from_utf8(&buf) else {
-                debug!("failed to parse utf-8 for ws connection");
-                break;
-            };
+                    let Ok(body) = std::str::from_utf8(&buf) else {
+                        debug!("failed to parse utf-8 for ws connection");
+                        break;
+                    };
 
-            if let Err(e) = socket.send(Message::Text(body.into())).await {
-                debug!("ws connection closed with error: {}", e);
-                break;
+                    if let Err(e) = socket.send(Message::Text(body.into())).await {
+                        debug!("ws connection closed with error: {}", e);
+                        break;
+                    }
+                }
+                msg = socket.recv() => {
+                    match msg {
+                        Some(Ok(Message::Close(_))) | None => {
+                            debug!("ws client disconnected");
+                            break;
+                        }
+                        Some(Err(e)) => {
+                            debug!("ws receive error: {}", e);
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
             }
         }
     };
@@ -75,20 +92,13 @@ pub async fn traffic(
 ) -> impl IntoResponse {
     let callback = async move |mut socket: WebSocket| {
         let mut interval = tokio::time::interval(Duration::from_secs(1));
-        let mut buf = Vec::with_capacity(64);
 
         loop {
             interval.tick().await;
             let (up, down) = state.statistics_manager.now();
-            buf.clear();
-            use std::io::Write;
-            let _ = write!(&mut buf, r#"{{"up":{up},"down":{down}}}"#);
+            let body = format!(r#"{{"up":{up},"down":{down}}}"#);
 
-            let Ok(response) = std::str::from_utf8(&buf) else {
-                break;
-            };
-
-            if let Err(e) = socket.send(Message::Text(response.into())).await {
+            if let Err(e) = socket.send(Message::Text(body.into())).await {
                 debug!("ws connection closed with error: {}", e);
                 break;
             }
@@ -110,18 +120,11 @@ pub async fn memory(
     let callback = async move |mut socket: WebSocket| {
         let interval = query.interval.unwrap_or(1).max(1);
         let mut interval = tokio::time::interval(Duration::from_secs(interval));
-        let mut buf = Vec::with_capacity(64);
 
         loop {
             interval.tick().await;
             let inuse = state.statistics_manager.memory_usage();
-            buf.clear();
-            use std::io::Write;
-            let _ = write!(&mut buf, r#"{{"inuse":{inuse},"oslimit":0}}"#);
-
-            let Ok(body) = std::str::from_utf8(&buf) else {
-                break;
-            };
+            let body = format!(r#"{{"inuse":{inuse},"oslimit":0}}"#);
 
             if let Err(e) = socket.send(Message::Text(body.into())).await {
                 debug!("ws connection closed with error: {}", e);
@@ -146,19 +149,16 @@ pub async fn log(
     })
     .on_upgrade(move |mut socket| async move {
         let mut rx = state.log_source_tx.subscribe();
-        let mut buf = Vec::with_capacity(512);
         while let Ok(evt) = rx.recv().await {
-            buf.clear();
-            if let Err(e) = serde_json::to_writer(&mut buf, &evt) {
-                warn!("Failed to serialize log event: {}", e);
-                continue;
-            }
-
-            let Ok(res) = std::str::from_utf8(&buf) else {
-                continue;
+            let body = match serde_json::to_string(&evt) {
+                Ok(b) => b,
+                Err(e) => {
+                    warn!("Failed to serialize log event: {}", e);
+                    continue;
+                }
             };
 
-            if let Err(e) = socket.send(Message::Text(res.into())).await {
+            if let Err(e) = socket.send(Message::Text(body.into())).await {
                 debug!("ws send error: {}", e);
                 break;
             }
