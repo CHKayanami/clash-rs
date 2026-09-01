@@ -20,11 +20,10 @@ use crate::{
     session::Session,
 };
 
-#[async_trait]
 pub trait SelectorControl {
-    async fn select(&self, name: &str) -> Result<(), Error>;
+    fn select(&self, name: &str) -> Result<(), Error>;
     #[cfg(test)]
-    async fn current(&self) -> String;
+    fn current(&self) -> String;
 }
 
 pub type ThreadSafeSelectorControl = Arc<dyn SelectorControl + Send + Sync>;
@@ -90,7 +89,7 @@ impl Handler {
         }
     }
 
-    async fn selected_proxy(&self, touch: bool) -> Option<AnyOutboundHandler> {
+    fn selected_proxy(&self, touch: bool) -> Option<AnyOutboundHandler> {
         let proxies = self.providers.get_proxies(touch);
         let cached_guard = self.cached_active.load();
 
@@ -133,9 +132,8 @@ impl Handler {
     }
 }
 
-#[async_trait]
 impl SelectorControl for Handler {
-    async fn select(&self, name: &str) -> Result<(), Error> {
+    fn select(&self, name: &str) -> Result<(), Error> {
         let proxies = self.providers.get_proxies(false);
         if let Some(proxy) = proxies.iter().find(|x| x.name() == name) {
             self.cached_active.store(Some(Arc::new(ActiveSelection {
@@ -150,9 +148,8 @@ impl SelectorControl for Handler {
     }
 
     #[cfg(test)]
-    async fn current(&self) -> String {
+    fn current(&self) -> String {
         self.selected_proxy(false)
-            .await
             .map(|p| p.name().to_owned())
             .unwrap_or_else(|| "<none>".to_owned())
     }
@@ -174,7 +171,7 @@ impl OutboundHandler for Handler {
         if !self.opts.udp {
             return false;
         }
-        match self.selected_proxy(false).await {
+        match self.selected_proxy(false) {
             Some(selected) => selected.support_udp().await,
             None => false,
         }
@@ -185,7 +182,7 @@ impl OutboundHandler for Handler {
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
     ) -> io::Result<BoxedChainedStream> {
-        let selected = self.selected_proxy(true).await.ok_or_else(|| {
+        let selected = self.selected_proxy(true).ok_or_else(|| {
             io::Error::other(format!("no proxy found for {}", self.name()))
         })?;
         let s = selected.connect_stream(sess, resolver).await?;
@@ -200,7 +197,7 @@ impl OutboundHandler for Handler {
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
     ) -> io::Result<BoxedChainedDatagram> {
-        let selected = self.selected_proxy(true).await.ok_or_else(|| {
+        let selected = self.selected_proxy(true).ok_or_else(|| {
             io::Error::other(format!("no proxy found for {}", self.name()))
         })?;
         let s = selected.connect_datagram(sess, resolver).await?;
@@ -222,7 +219,6 @@ impl OutboundHandler for Handler {
     ) -> io::Result<BoxedChainedStream> {
         let s = self
             .selected_proxy(true)
-            .await
             .ok_or_else(|| {
                 io::Error::other(format!("no proxy found for {}", self.name()))
             })?
@@ -241,7 +237,6 @@ impl OutboundHandler for Handler {
     ) -> io::Result<BoxedChainedDatagram> {
         let d = self
             .selected_proxy(true)
-            .await
             .ok_or_else(|| {
                 io::Error::other(format!("no proxy found for {}", self.name()))
             })?
@@ -264,7 +259,7 @@ impl GroupProxyAPIResponse for Handler {
     }
 
     async fn get_active_proxy(&self) -> Option<AnyOutboundHandler> {
-        Handler::selected_proxy(self, false).await
+        Handler::selected_proxy(self, false)
     }
 
     fn get_latency_test_url(&self) -> Option<String> {
@@ -315,21 +310,21 @@ mod tests {
             Arc::new(handler.clone()) as ThreadSafeSelectorControl;
         let outbound_handler = Arc::new(handler);
 
-        assert_eq!(selector_control.current().await, "provider1".to_owned());
+        assert_eq!(selector_control.current(), "provider1".to_owned());
         assert_eq!(
-            outbound_handler.selected_proxy(false).await.unwrap().name(),
+            outbound_handler.selected_proxy(false).unwrap().name(),
             "provider1".to_owned()
         );
 
-        selector_control.select("provider2").await.unwrap();
+        selector_control.select("provider2").unwrap();
 
-        assert_eq!(selector_control.current().await, "provider2".to_owned());
+        assert_eq!(selector_control.current(), "provider2".to_owned());
         assert_eq!(
-            outbound_handler.selected_proxy(false).await.unwrap().name(),
+            outbound_handler.selected_proxy(false).unwrap().name(),
             "provider2".to_owned()
         );
 
-        let fail = selector_control.select("provider3").await;
+        let fail = selector_control.select("provider3");
         assert!(fail.is_err());
     }
 
@@ -355,8 +350,8 @@ mod tests {
         let selector_control =
             Arc::new(handler.clone()) as ThreadSafeSelectorControl;
 
-        assert_eq!(selector_control.current().await, "<none>".to_owned());
-        assert!(handler.selected_proxy(false).await.is_none());
-        assert!(selector_control.select("provider1").await.is_err());
+        assert_eq!(selector_control.current(), "<none>".to_owned());
+        assert!(handler.selected_proxy(false).is_none());
+        assert!(selector_control.select("provider1").is_err());
     }
 }
