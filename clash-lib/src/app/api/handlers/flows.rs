@@ -13,7 +13,7 @@ use tracing::{debug, warn};
 use crate::{
     app::{
         api::AppState,
-        dispatcher::StatisticsManager,
+        dispatcher::{FlowKey, StatisticsManager},
     },
     session::Network,
 };
@@ -79,37 +79,24 @@ pub struct FlowRecord {
     pub last_seen: DateTime<Utc>,
 }
 
-// ---------------------------------------------------------------------------
-// Aggregation key (owned — necessary because SocksAddr::Ip produces Cow::Owned)
-// ---------------------------------------------------------------------------
-
 use std::net::IpAddr;
 
-#[derive(Hash, PartialEq, Eq)]
-struct FlowKey {
-    dst_host: String,
-    dst_port: u16,
-    is_tcp: bool,
-}
-
 // ---------------------------------------------------------------------------
-// Per-key accumulator — borrows strings from Arc<TrackerInfo> which outlive
-// the map, but owns only what it must (src_ips as stack-cheap IpAddr, chains
-// cloned lazily at most once per unique flow key).
+// Per-key accumulator
 // ---------------------------------------------------------------------------
 
-struct Acc<'a> {
+struct Acc {
     src_ips: Vec<IpAddr>,
     conn_count: usize,
     active_count: usize,
     closed_count: usize,
     upload_total: u64,
     download_total: u64,
-    rule: Option<&'a str>,
-    rule_payload: Option<&'a str>,
-    chains: Option<Vec<String>>,
-    country: Option<&'a str>,
-    asn: Option<&'a str>,
+    rule: String,
+    rule_payload: String,
+    chains: Vec<String>,
+    country: Option<String>,
+    asn: Option<String>,
     last_seen: DateTime<Utc>,
 }
 
@@ -128,19 +115,37 @@ async fn build_flow_records(
     let closed = if include_closed {
         mgr.closed_flows_snapshot().await
     } else {
-        Vec::new()
+        Arc::new(HashMap::new())
     };
 
-    let total_hint = active.len() + closed.len();
-    let mut map: HashMap<FlowKey, Acc<'_>> =
-        HashMap::with_capacity(total_hint.min(64));
+    let mut map: HashMap<FlowKey, Acc> =
+        HashMap::with_capacity(active.len() + closed.len());
 
-    // Process TrackerInfo into the aggregation map.
-    for (info, is_active) in active
-        .iter()
-        .map(|i| (i, true))
-        .chain(closed.iter().map(|i| (i, false)))
-    {
+    // 1. Initialize map from pre-aggregated closed flows
+    for (key, closed_entry) in closed.iter() {
+        map.insert(
+            key.clone(),
+            Acc {
+                src_ips: closed_entry.src_ips.clone(),
+                conn_count: closed_entry.conn_count,
+                active_count: 0,
+                closed_count: closed_entry.conn_count,
+                upload_total: closed_entry.upload_total,
+                download_total: closed_entry.download_total,
+                rule: closed_entry.rule.clone(),
+                rule_payload: closed_entry.rule_payload.clone(),
+                chains: closed_entry.chains.clone(),
+                country: closed_entry.country.clone(),
+                asn: closed_entry.asn.clone(),
+                last_seen: closed_entry.last_seen,
+            },
+        );
+    }
+
+    const MAX_SRC_IPS: usize = 32;
+
+    // 2. Aggregate active connections
+    for info in active.iter() {
         let dst_host = info.session_holder.destination.host();
         let dst_port = info.session_holder.destination.port();
         let is_tcp = matches!(info.session_holder.network, Network::Tcp);
@@ -157,36 +162,32 @@ async fn build_flow_records(
 
         if let Some(acc) = map.get_mut(&key) {
             acc.conn_count += 1;
-            if is_active {
-                acc.active_count += 1;
-            } else {
-                acc.closed_count += 1;
-            }
+            acc.active_count += 1;
             acc.upload_total += upload;
             acc.download_total += download;
-            if !acc.src_ips.contains(&src_ip) {
+            if acc.src_ips.len() < MAX_SRC_IPS && !acc.src_ips.contains(&src_ip) {
                 acc.src_ips.push(src_ip);
             }
             if info.start_time > acc.last_seen {
                 acc.last_seen = info.start_time;
             }
-            if acc.rule.is_none() && !info.rule.is_empty() {
-                acc.rule = Some(&info.rule);
+            if acc.rule.is_empty() && !info.rule.is_empty() {
+                acc.rule = info.rule.clone();
             }
-            if acc.rule_payload.is_none() && !info.rule_payload.is_empty() {
-                acc.rule_payload = Some(&info.rule_payload);
+            if acc.rule_payload.is_empty() && !info.rule_payload.is_empty() {
+                acc.rule_payload = info.rule_payload.clone();
             }
-            if acc.chains.is_none() {
+            if acc.chains.is_empty() {
                 let c = info.proxy_chain_holder.snapshot();
                 if !c.is_empty() {
-                    acc.chains = Some(c);
+                    acc.chains = c;
                 }
             }
             if acc.country.is_none() {
-                acc.country = info.session_holder.country.as_deref();
+                acc.country = info.session_holder.country.clone();
             }
             if acc.asn.is_none() {
-                acc.asn = info.session_holder.asn.as_deref();
+                acc.asn = info.session_holder.asn.clone();
             }
         } else {
             let chains = info.proxy_chain_holder.snapshot();
@@ -195,27 +196,15 @@ async fn build_flow_records(
                 Acc {
                     src_ips: vec![src_ip],
                     conn_count: 1,
-                    active_count: if is_active { 1 } else { 0 },
-                    closed_count: if is_active { 0 } else { 1 },
+                    active_count: 1,
+                    closed_count: 0,
                     upload_total: upload,
                     download_total: download,
-                    rule: if info.rule.is_empty() {
-                        None
-                    } else {
-                        Some(&info.rule)
-                    },
-                    rule_payload: if info.rule_payload.is_empty() {
-                        None
-                    } else {
-                        Some(&info.rule_payload)
-                    },
-                    chains: if chains.is_empty() {
-                        None
-                    } else {
-                        Some(chains)
-                    },
-                    country: info.session_holder.country.as_deref(),
-                    asn: info.session_holder.asn.as_deref(),
+                    rule: info.rule.clone(),
+                    rule_payload: info.rule_payload.clone(),
+                    chains,
+                    country: info.session_holder.country.clone(),
+                    asn: info.session_holder.asn.clone(),
                     last_seen: info.start_time,
                 },
             );
@@ -242,11 +231,11 @@ async fn build_flow_records(
                 upload_total: acc.upload_total,
                 download_total: acc.download_total,
                 bytes_total,
-                rule: acc.rule.unwrap_or_default().to_string(),
-                rule_payload: acc.rule_payload.unwrap_or_default().to_string(),
-                chains: acc.chains.unwrap_or_default(),
-                country: acc.country.map(|s| s.to_string()),
-                asn: acc.asn.map(|s| s.to_string()),
+                rule: acc.rule,
+                rule_payload: acc.rule_payload,
+                chains: acc.chains,
+                country: acc.country,
+                asn: acc.asn,
                 last_seen: acc.last_seen,
             }
         })

@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{BTreeSet, HashMap},
     sync::{Arc, atomic::Ordering},
 };
 
@@ -183,6 +183,28 @@ pub struct Snapshot {
     memory: usize,
 }
 
+#[derive(Clone, Debug, Hash, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FlowKey {
+    pub dst_host: String,
+    pub dst_port: u16,
+    pub is_tcp: bool,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ClosedFlowEntry {
+    pub conn_count: usize,
+    pub upload_total: u64,
+    pub download_total: u64,
+    pub src_ips: Vec<std::net::IpAddr>,
+    pub rule: String,
+    pub rule_payload: String,
+    pub chains: Vec<String>,
+    pub country: Option<String>,
+    pub asn: Option<String>,
+    pub last_seen: chrono::DateTime<Utc>,
+}
+
 /// The close notifier is an `Option` so that [`Manager::close`] can *take* it
 /// (a `oneshot::Sender` is consumed by `send`) without removing the map entry.
 /// Removal — and the byte accounting that goes with it — stays the exclusive
@@ -195,7 +217,7 @@ enum StatsCommand {
         upload: u64,
         download: u64,
     },
-    GetClosedFlows(tokio::sync::oneshot::Sender<Vec<Arc<TrackerInfo>>>),
+    GetClosedFlows(tokio::sync::oneshot::Sender<Arc<HashMap<FlowKey, ClosedFlowEntry>>>),
     DrainUserStats(tokio::sync::oneshot::Sender<HashMap<String, UserTraffic>>),
     #[cfg(test)]
     InjectClosedUserBytes {
@@ -243,8 +265,9 @@ impl Manager {
     }
 
     async fn run_actor(mut rx: tokio::sync::mpsc::UnboundedReceiver<StatsCommand>) {
-        let mut closed_flows: VecDeque<Arc<TrackerInfo>> =
-            VecDeque::with_capacity(1000);
+        let mut closed_flows: Arc<HashMap<FlowKey, ClosedFlowEntry>> =
+            Arc::new(HashMap::new());
+        let mut time_index: BTreeSet<(chrono::DateTime<Utc>, FlowKey)> = BTreeSet::new();
         let mut user_period_stats: HashMap<String, UserTraffic> = HashMap::new();
 
         while let Some(cmd) = rx.recv().await {
@@ -264,14 +287,14 @@ impl Manager {
                         entry.download += download;
                     }
 
-                    closed_flows.push_back(info);
-                    if closed_flows.len() > 1000 {
-                        closed_flows.pop_front();
-                    }
+                    Self::record_closed_flow(
+                        &mut closed_flows,
+                        &mut time_index,
+                        &info,
+                    );
                 }
                 StatsCommand::GetClosedFlows(reply) => {
-                    let snapshot = closed_flows.iter().cloned().collect();
-                    let _ = reply.send(snapshot);
+                    let _ = reply.send(closed_flows.clone());
                 }
                 StatsCommand::DrainUserStats(reply) => {
                     let drained = std::mem::take(&mut user_period_stats);
@@ -288,6 +311,85 @@ impl Manager {
                     entry.download += download;
                 }
             }
+        }
+    }
+
+    fn record_closed_flow(
+        closed_flows: &mut Arc<HashMap<FlowKey, ClosedFlowEntry>>,
+        time_index: &mut BTreeSet<(chrono::DateTime<Utc>, FlowKey)>,
+        info: &TrackerInfo,
+    ) {
+        let dst_host = info.session_holder.destination.host();
+        let dst_port = info.session_holder.destination.port();
+        let is_tcp = matches!(info.session_holder.network, crate::session::Network::Tcp);
+        let conn_upload = info.upload_total.load(Ordering::Relaxed);
+        let conn_download = info.download_total.load(Ordering::Relaxed);
+        let src_ip = info.session_holder.source.ip();
+
+        let key = FlowKey {
+            dst_host,
+            dst_port,
+            is_tcp,
+        };
+
+        const MAX_SRC_IPS: usize = 32;
+        let map = Arc::make_mut(closed_flows);
+
+        if let Some(entry) = map.get_mut(&key) {
+            entry.conn_count += 1;
+            entry.upload_total += conn_upload;
+            entry.download_total += conn_download;
+            if entry.src_ips.len() < MAX_SRC_IPS && !entry.src_ips.contains(&src_ip) {
+                entry.src_ips.push(src_ip);
+            }
+            if info.start_time > entry.last_seen {
+                time_index.remove(&(entry.last_seen, key.clone()));
+                entry.last_seen = info.start_time;
+                time_index.insert((entry.last_seen, key));
+            }
+            if entry.rule.is_empty() && !info.rule.is_empty() {
+                entry.rule = info.rule.clone();
+            }
+            if entry.rule_payload.is_empty() && !info.rule_payload.is_empty() {
+                entry.rule_payload = info.rule_payload.clone();
+            }
+            if entry.chains.is_empty() {
+                let c = info.proxy_chain_holder.snapshot();
+                if !c.is_empty() {
+                    entry.chains = c;
+                }
+            }
+            if entry.country.is_none() {
+                entry.country = info.session_holder.country.clone();
+            }
+            if entry.asn.is_none() {
+                entry.asn = info.session_holder.asn.clone();
+            }
+        } else {
+            const MAX_CLOSED_FLOWS: usize = 500;
+            if map.len() >= MAX_CLOSED_FLOWS {
+                if let Some((_, oldest_key)) = time_index.pop_first() {
+                    map.remove(&oldest_key);
+                }
+            }
+
+            let chains = info.proxy_chain_holder.snapshot();
+            time_index.insert((info.start_time, key.clone()));
+            map.insert(
+                key,
+                ClosedFlowEntry {
+                    conn_count: 1,
+                    upload_total: conn_upload,
+                    download_total: conn_download,
+                    src_ips: vec![src_ip],
+                    rule: info.rule.clone(),
+                    rule_payload: info.rule_payload.clone(),
+                    chains,
+                    country: info.session_holder.country.clone(),
+                    asn: info.session_holder.asn.clone(),
+                    last_seen: info.start_time,
+                },
+            );
         }
     }
 
@@ -322,13 +424,13 @@ impl Manager {
             .collect()
     }
 
-    /// Return a snapshot of recently closed connections (up to 1000 entries).
-    pub async fn closed_flows_snapshot(&self) -> Vec<Arc<TrackerInfo>> {
+    /// Return a snapshot of pre-aggregated recently closed flows.
+    pub async fn closed_flows_snapshot(&self) -> Arc<HashMap<FlowKey, ClosedFlowEntry>> {
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         if self.tx.send(StatsCommand::GetClosedFlows(reply_tx)).is_ok() {
             reply_rx.await.unwrap_or_default()
         } else {
-            Vec::new()
+            Arc::new(HashMap::new())
         }
     }
 
@@ -540,5 +642,58 @@ mod tests {
             u.download, 280,
             "download should be sum of both connections"
         );
+    }
+
+    #[tokio::test]
+    async fn test_closed_flows_pre_aggregation() {
+        use std::net::SocketAddr;
+        use crate::session::SocksAddr;
+
+        let mgr = Manager::new();
+
+        let mut sess1 = Session::default();
+        sess1.destination = SocksAddr::Domain("example.com".into(), 443);
+        sess1.source = "192.168.1.10:12345".parse::<SocketAddr>().unwrap();
+        sess1.country = Some("US".into());
+        sess1.asn = Some("Cloudflare".into());
+
+        let tracker1 = Arc::new(TrackerInfo::new(&sess1, None));
+        tracker1.upload_total.store(100, Ordering::Relaxed);
+        tracker1.download_total.store(200, Ordering::Relaxed);
+
+        let (close_tx1, _) = tokio::sync::oneshot::channel();
+        mgr.track(sess1.id, tracker1, close_tx1);
+
+        let mut sess2 = Session::default();
+        sess2.destination = SocksAddr::Domain("example.com".into(), 443);
+        sess2.source = "192.168.1.20:12346".parse::<SocketAddr>().unwrap();
+
+        let tracker2 = Arc::new(TrackerInfo::new(&sess2, None));
+        tracker2.upload_total.store(300, Ordering::Relaxed);
+        tracker2.download_total.store(400, Ordering::Relaxed);
+
+        let (close_tx2, _) = tokio::sync::oneshot::channel();
+        mgr.track(sess2.id, tracker2, close_tx2);
+
+        // Untrack both (they close)
+        mgr.untrack(sess1.id);
+        mgr.untrack(sess2.id);
+
+        tokio::task::yield_now().await;
+
+        let closed = mgr.closed_flows_snapshot().await;
+        let key = FlowKey {
+            dst_host: "example.com".into(),
+            dst_port: 443,
+            is_tcp: true,
+        };
+
+        let entry = closed.get(&key).expect("flow key should exist");
+        assert_eq!(entry.conn_count, 2);
+        assert_eq!(entry.upload_total, 400);
+        assert_eq!(entry.download_total, 600);
+        assert_eq!(entry.src_ips.len(), 2);
+        assert_eq!(entry.country.as_deref(), Some("US"));
+        assert_eq!(entry.asn.as_deref(), Some("Cloudflare"));
     }
 }
