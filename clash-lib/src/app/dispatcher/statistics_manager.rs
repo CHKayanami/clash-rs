@@ -39,8 +39,10 @@ pub struct TrackerInfo {
     pub upload_total: AtomicU64,
     #[serde(rename = "download")]
     pub download_total: AtomicU64,
-    #[serde(rename = "start")]
+    #[serde(skip)]
     pub start_time: chrono::DateTime<Utc>,
+    #[serde(rename = "start")]
+    pub start_time_str: String,
     #[serde(rename = "chains")]
     pub proxy_chain_holder: ProxyChain,
     #[serde(rename = "rule")]
@@ -62,10 +64,12 @@ impl TrackerInfo {
         sess: &Session,
         rule: Option<&Box<dyn crate::app::router::RuleMatcher>>,
     ) -> Self {
+        let now = chrono::Utc::now();
         Self {
             id: sess.id,
             session_holder: sess.clone(),
-            start_time: chrono::Utc::now(),
+            start_time: now,
+            start_time_str: now.to_rfc3339(),
             rule: rule.map(|r| r.type_name().to_string()).unwrap_or_default(),
             rule_payload: rule.map(|r| r.payload()).unwrap_or_default(),
             proxy_chain_holder: sess.proxy_chain.clone(),
@@ -84,6 +88,7 @@ impl Clone for TrackerInfo {
                 self.download_total.load(Ordering::Relaxed),
             ),
             start_time: self.start_time,
+            start_time_str: self.start_time_str.clone(),
             rule: self.rule.clone(),
             rule_payload: self.rule_payload.clone(),
             proxy_chain_holder: self.proxy_chain_holder.clone(),
@@ -183,6 +188,52 @@ pub struct Snapshot {
     memory: usize,
 }
 
+pub struct SnapshotView<'a> {
+    manager: &'a Manager,
+}
+
+impl Serialize for SnapshotView<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+        let mut state = serializer.serialize_struct("Snapshot", 4)?;
+        state.serialize_field(
+            "downloadTotal",
+            &self.manager.download_total.load(Ordering::Relaxed),
+        )?;
+        state.serialize_field(
+            "uploadTotal",
+            &self.manager.upload_total.load(Ordering::Relaxed),
+        )?;
+
+        struct ConnectionsSerializer<'b>(
+            &'b DashMap<u64, (Arc<TrackerInfo>, Option<Sender<()>>)>,
+        );
+        impl Serialize for ConnectionsSerializer<'_> {
+            fn serialize<S2>(&self, s2: S2) -> Result<S2::Ok, S2::Error>
+            where
+                S2: serde::Serializer,
+            {
+                use serde::ser::SerializeSeq;
+                let mut seq = s2.serialize_seq(Some(self.0.len()))?;
+                for entry in self.0.iter() {
+                    seq.serialize_element(&*entry.value().0)?;
+                }
+                seq.end()
+            }
+        }
+
+        state.serialize_field(
+            "connections",
+            &ConnectionsSerializer(&self.manager.connections),
+        )?;
+        state.serialize_field("memory", &self.manager.memory_usage())?;
+        state.end()
+    }
+}
+
 #[derive(Clone, Debug, Hash, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FlowKey {
@@ -217,7 +268,9 @@ enum StatsCommand {
         upload: u64,
         download: u64,
     },
-    GetClosedFlows(tokio::sync::oneshot::Sender<Arc<HashMap<FlowKey, ClosedFlowEntry>>>),
+    GetClosedFlows(
+        tokio::sync::oneshot::Sender<Arc<HashMap<FlowKey, ClosedFlowEntry>>>,
+    ),
     DrainUserStats(tokio::sync::oneshot::Sender<HashMap<String, UserTraffic>>),
     #[cfg(test)]
     InjectClosedUserBytes {
@@ -267,7 +320,8 @@ impl Manager {
     async fn run_actor(mut rx: tokio::sync::mpsc::UnboundedReceiver<StatsCommand>) {
         let mut closed_flows: Arc<HashMap<FlowKey, ClosedFlowEntry>> =
             Arc::new(HashMap::new());
-        let mut time_index: BTreeSet<(chrono::DateTime<Utc>, FlowKey)> = BTreeSet::new();
+        let mut time_index: BTreeSet<(chrono::DateTime<Utc>, FlowKey)> =
+            BTreeSet::new();
         let mut user_period_stats: HashMap<String, UserTraffic> = HashMap::new();
 
         while let Some(cmd) = rx.recv().await {
@@ -321,7 +375,8 @@ impl Manager {
     ) {
         let dst_host = info.session_holder.destination.host();
         let dst_port = info.session_holder.destination.port();
-        let is_tcp = matches!(info.session_holder.network, crate::session::Network::Tcp);
+        let is_tcp =
+            matches!(info.session_holder.network, crate::session::Network::Tcp);
         let conn_upload = info.upload_total.load(Ordering::Relaxed);
         let conn_download = info.download_total.load(Ordering::Relaxed);
         let src_ip = info.session_holder.source.ip();
@@ -339,7 +394,8 @@ impl Manager {
             entry.conn_count += 1;
             entry.upload_total += conn_upload;
             entry.download_total += conn_download;
-            if entry.src_ips.len() < MAX_SRC_IPS && !entry.src_ips.contains(&src_ip) {
+            if entry.src_ips.len() < MAX_SRC_IPS && !entry.src_ips.contains(&src_ip)
+            {
                 entry.src_ips.push(src_ip);
             }
             if info.start_time > entry.last_seen {
@@ -425,7 +481,9 @@ impl Manager {
     }
 
     /// Return a snapshot of pre-aggregated recently closed flows.
-    pub async fn closed_flows_snapshot(&self) -> Arc<HashMap<FlowKey, ClosedFlowEntry>> {
+    pub async fn closed_flows_snapshot(
+        &self,
+    ) -> Arc<HashMap<FlowKey, ClosedFlowEntry>> {
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         if self.tx.send(StatsCommand::GetClosedFlows(reply_tx)).is_ok() {
             reply_rx.await.unwrap_or_default()
@@ -509,6 +567,22 @@ impl Manager {
             self.download_blip
                 .load(std::sync::atomic::Ordering::Relaxed),
         )
+    }
+
+    pub fn traffic_summary(&self) -> (u64, u64, u64, u64, usize) {
+        (
+            self.upload_blip.load(std::sync::atomic::Ordering::Relaxed),
+            self.download_blip
+                .load(std::sync::atomic::Ordering::Relaxed),
+            self.upload_total.load(std::sync::atomic::Ordering::Relaxed),
+            self.download_total
+                .load(std::sync::atomic::Ordering::Relaxed),
+            self.connections.len(),
+        )
+    }
+
+    pub fn snapshot_view(&self) -> SnapshotView<'_> {
+        SnapshotView { manager: self }
     }
 
     pub async fn snapshot(&self) -> Snapshot {
@@ -646,8 +720,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_closed_flows_pre_aggregation() {
-        use std::net::SocketAddr;
         use crate::session::SocksAddr;
+        use std::net::SocketAddr;
 
         let mgr = Manager::new();
 

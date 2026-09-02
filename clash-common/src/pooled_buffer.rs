@@ -8,7 +8,7 @@ use std::{
     },
 };
 
-static MAX_POOLED_BUFFERS: AtomicUsize = AtomicUsize::new(128);
+static MAX_POOLED_BUFFERS: AtomicUsize = AtomicUsize::new(64);
 
 #[allow(dead_code)]
 pub fn set_max_pooled_buffers(limit: usize) {
@@ -19,7 +19,8 @@ pub fn max_pooled_buffers() -> usize {
     MAX_POOLED_BUFFERS.load(Ordering::Relaxed)
 }
 
-const LOCAL_POOL_CAPACITY: usize = 16;
+const LOCAL_POOL_CAPACITY: usize = 8;
+const MAX_REUSABLE_CAPACITY: usize = 64 * 1024;
 
 thread_local! {
     static LOCAL_POOL: RefCell<Vec<BytesMut>> = const { RefCell::new(Vec::new()) };
@@ -172,7 +173,7 @@ impl DerefMut for PooledBuffer {
 impl Drop for PooledBuffer {
     fn drop(&mut self) {
         let mut buffer = std::mem::replace(&mut self.buffer, BytesMut::new());
-        if buffer.capacity() == 0 || buffer.capacity() > 65536 * 4 {
+        if buffer.capacity() == 0 || buffer.capacity() > MAX_REUSABLE_CAPACITY {
             return;
         }
         buffer.clear();
@@ -242,5 +243,22 @@ mod tests {
         assert_eq!(buf.len(), 5);
         let bytes = buf.into_bytes();
         assert_eq!(&bytes[..], b"hello");
+    }
+
+    #[test]
+    fn test_pooled_buffer_oversized_discarded() {
+        // Clear out local pool first
+        while LOCAL_POOL.with_borrow_mut(|p| p.pop()).is_some() {}
+
+        // Acquire an oversized buffer (>64KB) and drop it
+        {
+            let buf = PooledBuffer::acquire(128 * 1024);
+            assert!(buf.buffer.capacity() >= 128 * 1024);
+            drop(buf);
+        }
+
+        // Local pool should be empty because oversized buffer was discarded
+        let count = LOCAL_POOL.with_borrow(|p| p.len());
+        assert_eq!(count, 0);
     }
 }

@@ -11,9 +11,13 @@ use tracing::{debug, warn};
 use crate::app::api::AppState;
 
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct TrafficResponse {
     up: u64,
     down: u64,
+    upload_total: u64,
+    download_total: u64,
+    conn_count: usize,
 }
 pub async fn handle(
     ws: WebSocketUpgrade,
@@ -25,10 +29,17 @@ pub async fn handle(
     })
     .on_upgrade(move |mut socket| async move {
         let mgr = state.statistics_manager.clone();
-        let mut buf = Vec::with_capacity(64);
+        let mut buf = Vec::with_capacity(128);
         loop {
-            let (up, down) = mgr.now();
-            let res = TrafficResponse { up, down };
+            let (up, down, upload_total, download_total, conn_count) =
+                mgr.traffic_summary();
+            let res = TrafficResponse {
+                up,
+                down,
+                upload_total,
+                download_total,
+                conn_count,
+            };
             buf.clear();
             if let Err(e) = serde_json::to_writer(&mut buf, &res) {
                 warn!("Failed to serialize traffic stats: {}", e);

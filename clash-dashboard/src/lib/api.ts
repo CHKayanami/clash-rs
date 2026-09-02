@@ -90,6 +90,9 @@ export interface Connection {
 export interface TrafficData {
   up: number;
   down: number;
+  uploadTotal?: number;
+  downloadTotal?: number;
+  connCount?: number;
 }
 
 export interface LogEntry {

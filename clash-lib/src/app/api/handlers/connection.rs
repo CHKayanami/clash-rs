@@ -43,8 +43,8 @@ async fn get_connections(
 ) -> impl IntoResponse {
     if !is_request_websocket(&headers) {
         let mgr = state.statistics_manager.clone();
-        let snapshot = mgr.snapshot().await;
-        return Json(snapshot).into_response();
+        let view = mgr.snapshot_view();
+        return Json(view).into_response();
     }
 
     let ws = match WebSocketUpgrade::from_request(req, &state).await {
@@ -59,7 +59,7 @@ async fn get_connections(
         warn!("ws upgrade error: {}", e);
     })
     .on_upgrade(move |mut socket| async move {
-        let interval = q.interval.unwrap_or(1).max(1);
+        let interval = q.interval.unwrap_or(2).max(1);
         let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(interval));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mgr = state.statistics_manager.clone();
@@ -68,9 +68,9 @@ async fn get_connections(
         loop {
             tokio::select! {
                 _ = interval.tick() => {
-                    let snapshot = mgr.snapshot().await;
+                    let view = mgr.snapshot_view();
                     buf.clear();
-                    if let Err(e) = serde_json::to_writer(&mut buf, &snapshot) {
+                    if let Err(e) = serde_json::to_writer(&mut buf, &view) {
                         warn!("Failed to serialize connection snapshot: {}", e);
                         continue;
                     }

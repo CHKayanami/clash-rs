@@ -36,7 +36,7 @@ pub async fn connections(
     query: Query<GetConnectionsQuery>,
 ) -> impl IntoResponse {
     let callback = async move |mut socket: WebSocket| {
-        let interval = query.interval.unwrap_or(1).max(1);
+        let interval = query.interval.unwrap_or(2).max(1);
         let mut interval = tokio::time::interval(Duration::from_secs(interval));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut buf = Vec::with_capacity(8192);
@@ -44,10 +44,10 @@ pub async fn connections(
         loop {
             tokio::select! {
                 _ = interval.tick() => {
-                    let snapshot = state.statistics_manager.snapshot().await;
+                    let view = state.statistics_manager.snapshot_view();
 
                     buf.clear();
-                    if let Err(e) = serde_json::to_writer(&mut buf, &snapshot) {
+                    if let Err(e) = serde_json::to_writer(&mut buf, &view) {
                         debug!("failed to serialize snapshot for ws connection: {}", e);
                         break;
                     }
@@ -95,8 +95,11 @@ pub async fn traffic(
 
         loop {
             interval.tick().await;
-            let (up, down) = state.statistics_manager.now();
-            let body = format!(r#"{{"up":{up},"down":{down}}}"#);
+            let (up, down, u_total, d_total, conn_count) =
+                state.statistics_manager.traffic_summary();
+            let body = format!(
+                r#"{{"up":{up},"down":{down},"uploadTotal":{u_total},"downloadTotal":{d_total},"connCount":{conn_count}}}"#
+            );
 
             if let Err(e) = socket.send(Message::Text(body.into())).await {
                 debug!("ws connection closed with error: {}", e);

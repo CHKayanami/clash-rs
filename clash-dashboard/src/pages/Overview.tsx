@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
-import { getMemory, getConfigs, patchConfigs, reloadConfigs, getWsUrl } from '../lib/api';
+import { getMemory, getConfigs, patchConfigs, reloadConfigs } from '../lib/api';
 import { useTraffic } from '../hooks/useTraffic';
 import { TrafficChart } from '../components/TrafficChart';
 import { ProxyGroups } from '../components/ProxyGroups';
@@ -9,8 +9,7 @@ import {
   Globe, Router, Sliders, Server, Wifi, FileText, Shield,
   RefreshCw, ChevronDown, ChevronUp,
 } from 'lucide-react';
-import { useWebSocket } from '../hooks/useWebSocket';
-import type { ConnectionsData, PatchableConfig, ClashConfig } from '../lib/api';
+import type { PatchableConfig, ClashConfig } from '../lib/api';
 
 function formatSpeed(bytes: number): string {
   if (bytes < 1024) return `${bytes} B/s`;
@@ -184,11 +183,9 @@ export function Overview() {
 
   function patch(fields: PatchableConfig) { patchMutation.mutate(fields); }
 
-  const wsUrl = getWsUrl('/ws/connections');
-  const { lastMessage: connData } = useWebSocket<ConnectionsData>(wsUrl);
-  const connCount = connData?.connections?.length ?? 0;
-  const uploadTotal = connData?.uploadTotal ?? 0;
-  const downloadTotal = connData?.downloadTotal ?? 0;
+  const connCount = current.connCount ?? 0;
+  const uploadTotal = current.uploadTotal ?? 0;
+  const downloadTotal = current.downloadTotal ?? 0;
 
   const memValue = memory ? formatMB(memory.inuse) : '—';
   const memSubtext = memory

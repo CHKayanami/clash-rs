@@ -31,7 +31,7 @@ function IconBadge({ bg, children }: { bg: string; children: React.ReactNode }) 
 
 export function Connections() {
   const [search, setSearch] = useState('');
-  const wsUrl = getWsUrl('/ws/connections');
+  const wsUrl = getWsUrl('/ws/connections?interval=2');
   const { lastMessage } = useWebSocket<ConnectionsData>(wsUrl);
 
   const connections = lastMessage?.connections ?? [];
