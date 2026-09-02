@@ -1,6 +1,6 @@
 use std::{
     collections::{HashMap, VecDeque},
-    sync::{Arc, Mutex, atomic::Ordering},
+    sync::{Arc, atomic::Ordering},
 };
 
 use chrono::Utc;
@@ -122,7 +122,12 @@ impl TrafficTracker {
 
     #[inline(always)]
     pub fn push_upload(&self, n: usize) {
-        if let Self::Active { tracker, manager, has_user } = self {
+        if let Self::Active {
+            tracker,
+            manager,
+            has_user,
+        } = self
+        {
             tracker.upload_total.fetch_add(n as u64, Ordering::Relaxed);
             if *has_user {
                 tracker.user_upload.fetch_add(n as u64, Ordering::Relaxed);
@@ -133,8 +138,15 @@ impl TrafficTracker {
 
     #[inline(always)]
     pub fn push_download(&self, n: usize) {
-        if let Self::Active { tracker, manager, has_user } = self {
-            tracker.download_total.fetch_add(n as u64, Ordering::Relaxed);
+        if let Self::Active {
+            tracker,
+            manager,
+            has_user,
+        } = self
+        {
+            tracker
+                .download_total
+                .fetch_add(n as u64, Ordering::Relaxed);
             if *has_user {
                 tracker.user_download.fetch_add(n as u64, Ordering::Relaxed);
             }
@@ -177,32 +189,47 @@ pub struct Snapshot {
 /// job of [`Manager::untrack`], which runs from the tracker's `Drop`.
 type ConnectionMap = DashMap<u64, (Arc<TrackerInfo>, Option<Sender<()>>)>;
 
+enum StatsCommand {
+    ConnectionClosed {
+        info: Arc<TrackerInfo>,
+        upload: u64,
+        download: u64,
+    },
+    GetClosedFlows(tokio::sync::oneshot::Sender<Vec<Arc<TrackerInfo>>>),
+    DrainUserStats(tokio::sync::oneshot::Sender<HashMap<String, UserTraffic>>),
+    #[cfg(test)]
+    InjectClosedUserBytes {
+        user: String,
+        upload: u64,
+        download: u64,
+    },
+}
+
 pub struct Manager {
     connections: ConnectionMap,
-    closed_flows: Mutex<VecDeque<Arc<TrackerInfo>>>,
+    tx: tokio::sync::mpsc::UnboundedSender<StatsCommand>,
     upload_temp: AtomicU64,
     download_temp: AtomicU64,
     upload_blip: AtomicU64,
     download_blip: AtomicU64,
     upload_total: AtomicU64,
     download_total: AtomicU64,
-    /// Bytes accumulated from **closed** connections, keyed by inbound_user.
-    /// Drained (and reset) by [`Manager::drain_user_stats`].
-    user_period_stats: Mutex<HashMap<String, UserTraffic>>,
 }
 
 impl Manager {
     pub fn new() -> Arc<Self> {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(Self::run_actor(rx));
+
         let v = Arc::new(Self {
             connections: DashMap::new(),
-            closed_flows: Mutex::new(VecDeque::new()),
+            tx,
             upload_temp: AtomicU64::new(0),
             download_temp: AtomicU64::new(0),
             upload_blip: AtomicU64::new(0),
             download_blip: AtomicU64::new(0),
             upload_total: AtomicU64::new(0),
             download_total: AtomicU64::new(0),
-            user_period_stats: Mutex::new(HashMap::new()),
         });
         // Hold a *weak* reference: a strong one would make the ticker task own
         // the Manager it ticks, so the Arc count could never reach zero and the
@@ -215,53 +242,73 @@ impl Manager {
         v
     }
 
+    async fn run_actor(mut rx: tokio::sync::mpsc::UnboundedReceiver<StatsCommand>) {
+        let mut closed_flows: VecDeque<Arc<TrackerInfo>> =
+            VecDeque::with_capacity(1000);
+        let mut user_period_stats: HashMap<String, UserTraffic> = HashMap::new();
+
+        while let Some(cmd) = rx.recv().await {
+            match cmd {
+                StatsCommand::ConnectionClosed {
+                    info,
+                    upload,
+                    download,
+                } => {
+                    if let Some(ref user) = info.session_holder.inbound_user
+                        && (upload > 0 || download > 0)
+                    {
+                        let entry = user_period_stats
+                            .entry(user.clone())
+                            .or_insert_with(UserTraffic::default);
+                        entry.upload += upload;
+                        entry.download += download;
+                    }
+
+                    closed_flows.push_back(info);
+                    if closed_flows.len() > 1000 {
+                        closed_flows.pop_front();
+                    }
+                }
+                StatsCommand::GetClosedFlows(reply) => {
+                    let snapshot = closed_flows.iter().cloned().collect();
+                    let _ = reply.send(snapshot);
+                }
+                StatsCommand::DrainUserStats(reply) => {
+                    let drained = std::mem::take(&mut user_period_stats);
+                    let _ = reply.send(drained);
+                }
+                #[cfg(test)]
+                StatsCommand::InjectClosedUserBytes {
+                    user,
+                    upload,
+                    download,
+                } => {
+                    let entry = user_period_stats.entry(user).or_default();
+                    entry.upload += upload;
+                    entry.download += download;
+                }
+            }
+        }
+    }
+
     pub fn track(&self, id: u64, item: Arc<TrackerInfo>, close_notify: Sender<()>) {
-        self.connections
-            .insert(id, (item, Some(close_notify)));
+        self.connections.insert(id, (item, Some(close_notify)));
     }
 
     /// Untrack a connection.
     /// This method is not async because it is called in Drop.
-    /// When the connection has an inbound_user, its final byte counts are
-    /// accumulated into `user_period_stats` so they survive connection close.
+    /// Non-blocking: pushes an event to the Actor channel.
     pub fn untrack(&self, id: u64) {
         let removed = self.connections.remove(&id);
 
         if let Some((_, (info, _))) = removed {
-            // Atomically take the remaining user-accounting bytes.
-            // upload_total/download_total are left intact for /connections.
             let upload = info.user_upload.swap(0, Ordering::Relaxed);
             let download = info.user_download.swap(0, Ordering::Relaxed);
-            if let Some(ref user) = info.session_holder.inbound_user
-                && (upload > 0 || download > 0)
-            {
-                let mut stats = self.user_period_stats.lock().unwrap();
-                let entry = stats
-                    .entry(user.clone())
-                    .or_insert_with(UserTraffic::default);
-                entry.upload += upload;
-                entry.download += download;
-            }
-
-            // Push to the closed_flows ring buffer (cap 1000).
-            let mut ring = self.closed_flows.lock().unwrap();
-            ring.push_back(info);
-            if ring.len() > 1000 {
-                ring.pop_front();
-            }
-        }
-    }
-
-    pub fn for_each_active_connection(&self, mut f: impl FnMut(&TrackerInfo)) {
-        for r in self.connections.iter() {
-            f(&r.value().0);
-        }
-    }
-
-    pub fn for_each_closed_flow(&self, mut f: impl FnMut(&TrackerInfo)) {
-        let ring = self.closed_flows.lock().unwrap();
-        for info in ring.iter() {
-            f(info);
+            let _ = self.tx.send(StatsCommand::ConnectionClosed {
+                info,
+                upload,
+                download,
+            });
         }
     }
 
@@ -276,9 +323,13 @@ impl Manager {
     }
 
     /// Return a snapshot of recently closed connections (up to 1000 entries).
-    pub fn closed_flows_snapshot(&self) -> Vec<Arc<TrackerInfo>> {
-        let ring = self.closed_flows.lock().unwrap();
-        ring.iter().cloned().collect()
+    pub async fn closed_flows_snapshot(&self) -> Vec<Arc<TrackerInfo>> {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        if self.tx.send(StatsCommand::GetClosedFlows(reply_tx)).is_ok() {
+            reply_rx.await.unwrap_or_default()
+        } else {
+            Vec::new()
+        }
     }
 
     /// Return per-user traffic accumulated since the last call (for both closed
@@ -286,11 +337,13 @@ impl Manager {
     ///
     /// Called by the `/user-stats` REST endpoint so FAC can poll for deltas.
     pub async fn drain_user_stats(&self) -> HashMap<String, UserTraffic> {
-        // Drain the closed-connection accumulator.
-        let mut result: HashMap<String, UserTraffic> = {
-            let mut stats = self.user_period_stats.lock().unwrap();
-            std::mem::take(&mut *stats)
-        };
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        let mut result =
+            if self.tx.send(StatsCommand::DrainUserStats(reply_tx)).is_ok() {
+                reply_rx.await.unwrap_or_default()
+            } else {
+                HashMap::new()
+            };
 
         // Include bytes from still-active connections by atomically swapping
         // their user counters to 0. upload_total/download_total are untouched
@@ -328,8 +381,7 @@ impl Manager {
     }
 
     pub fn close_all(&self) {
-        let keys: Vec<u64> =
-            self.connections.iter().map(|r| *r.key()).collect();
+        let keys: Vec<u64> = self.connections.iter().map(|r| *r.key()).collect();
         for key in keys {
             self.close(key);
         }
@@ -398,10 +450,13 @@ impl Manager {
         upload: u64,
         download: u64,
     ) {
-        let mut stats = self.user_period_stats.lock().unwrap();
-        let entry = stats.entry(user.to_string()).or_default();
-        entry.upload += upload;
-        entry.download += download;
+        let _ = self.tx.send(StatsCommand::InjectClosedUserBytes {
+            user: user.to_string(),
+            upload,
+            download,
+        });
+        // Yield to allow the actor to process the message before test assertions.
+        tokio::task::yield_now().await;
     }
 
     async fn kick_off(this: std::sync::Weak<Self>) {

@@ -11,7 +11,10 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
 use crate::{
-    app::{api::AppState, dispatcher::StatisticsManager},
+    app::{
+        api::AppState,
+        dispatcher::StatisticsManager,
+    },
     session::Network,
 };
 
@@ -77,81 +80,37 @@ pub struct FlowRecord {
 }
 
 // ---------------------------------------------------------------------------
-// Aggregation key
+// Aggregation key (owned — necessary because SocksAddr::Ip produces Cow::Owned)
 // ---------------------------------------------------------------------------
+
+use std::net::IpAddr;
 
 #[derive(Hash, PartialEq, Eq)]
 struct FlowKey {
     dst_host: String,
     dst_port: u16,
-    protocol: String,
+    is_tcp: bool,
 }
 
 // ---------------------------------------------------------------------------
-// Per-key accumulator
+// Per-key accumulator — borrows strings from Arc<TrackerInfo> which outlive
+// the map, but owns only what it must (src_ips as stack-cheap IpAddr, chains
+// cloned lazily at most once per unique flow key).
 // ---------------------------------------------------------------------------
 
-/// Data extracted from one connection tracker, passed into `Acc::apply`.
-struct ConnEntry {
-    src_ip: String,
-    upload: u64,
-    download: u64,
-    rule: String,
-    rule_payload: String,
-    chains: Vec<String>,
-    country: Option<String>,
-    asn: Option<String>,
-    start_time: DateTime<Utc>,
-    is_active: bool,
-}
-
-struct Acc {
-    src_ips: Vec<String>,
+struct Acc<'a> {
+    src_ips: Vec<IpAddr>,
     conn_count: usize,
     active_count: usize,
     closed_count: usize,
     upload_total: u64,
     download_total: u64,
-    rule: String,
-    rule_payload: String,
-    chains: Vec<String>,
-    country: Option<String>,
-    asn: Option<String>,
+    rule: Option<&'a str>,
+    rule_payload: Option<&'a str>,
+    chains: Option<Vec<String>>,
+    country: Option<&'a str>,
+    asn: Option<&'a str>,
     last_seen: DateTime<Utc>,
-}
-
-impl Acc {
-    fn apply(&mut self, entry: ConnEntry) {
-        if !entry.src_ip.is_empty() && !self.src_ips.contains(&entry.src_ip) {
-            self.src_ips.push(entry.src_ip);
-        }
-        self.conn_count += 1;
-        if entry.is_active {
-            self.active_count += 1;
-        } else {
-            self.closed_count += 1;
-        }
-        self.upload_total += entry.upload;
-        self.download_total += entry.download;
-        if self.rule.is_empty() && !entry.rule.is_empty() {
-            self.rule = entry.rule;
-        }
-        if self.rule_payload.is_empty() && !entry.rule_payload.is_empty() {
-            self.rule_payload = entry.rule_payload;
-        }
-        if self.chains.is_empty() && !entry.chains.is_empty() {
-            self.chains = entry.chains;
-        }
-        if self.country.is_none() && entry.country.is_some() {
-            self.country = entry.country;
-        }
-        if self.asn.is_none() && entry.asn.is_some() {
-            self.asn = entry.asn;
-        }
-        if entry.start_time > self.last_seen {
-            self.last_seen = entry.start_time;
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -165,65 +124,101 @@ async fn build_flow_records(
 ) -> Vec<FlowRecord> {
     use std::sync::atomic::Ordering;
 
-    let mut map: HashMap<FlowKey, Acc> = HashMap::new();
-
-    // Helper to insert/merge one TrackerInfo into the map.
-    macro_rules! merge_info {
-        ($info:expr, $chains:expr, $is_active:expr) => {{
-            let info = $info;
-            let dst_host = info.session_holder.destination.host();
-            let dst_port = info.session_holder.destination.port();
-            let protocol = match info.session_holder.network {
-                Network::Tcp => "tcp".to_string(),
-                Network::Udp => "udp".to_string(),
-            };
-            let key = FlowKey {
-                dst_host,
-                dst_port,
-                protocol,
-            };
-            let acc = map.entry(key).or_insert_with(|| Acc {
-                src_ips: Vec::new(),
-                conn_count: 0,
-                active_count: 0,
-                closed_count: 0,
-                upload_total: 0,
-                download_total: 0,
-                rule: String::new(),
-                rule_payload: String::new(),
-                chains: Vec::new(),
-                country: None,
-                asn: None,
-                last_seen: DateTime::<Utc>::MIN_UTC,
-            });
-            acc.apply(ConnEntry {
-                src_ip: info.session_holder.source.ip().to_string(),
-                upload: info.upload_total.load(Ordering::Relaxed),
-                download: info.download_total.load(Ordering::Relaxed),
-                rule: info.rule.clone(),
-                rule_payload: info.rule_payload.clone(),
-                chains: $chains,
-                country: info.session_holder.country.clone(),
-                asn: info.session_holder.asn.clone(),
-                start_time: info.start_time,
-                is_active: $is_active,
-            });
-        }};
-    }
-
-    // Active connections — fast pointer clone outside lock
     let active = mgr.active_connections_snapshot();
-    for info in &active {
-        let chains = info.proxy_chain_holder.snapshot();
-        merge_info!(info, chains, true);
-    }
+    let closed = if include_closed {
+        mgr.closed_flows_snapshot().await
+    } else {
+        Vec::new()
+    };
 
-    // Closed connections (ring buffer) — fast pointer clone outside lock
-    if include_closed {
-        let closed = mgr.closed_flows_snapshot();
-        for info in &closed {
+    let total_hint = active.len() + closed.len();
+    let mut map: HashMap<FlowKey, Acc<'_>> =
+        HashMap::with_capacity(total_hint.min(64));
+
+    // Process TrackerInfo into the aggregation map.
+    for (info, is_active) in active
+        .iter()
+        .map(|i| (i, true))
+        .chain(closed.iter().map(|i| (i, false)))
+    {
+        let dst_host = info.session_holder.destination.host();
+        let dst_port = info.session_holder.destination.port();
+        let is_tcp = matches!(info.session_holder.network, Network::Tcp);
+
+        let upload = info.upload_total.load(Ordering::Relaxed);
+        let download = info.download_total.load(Ordering::Relaxed);
+        let src_ip = info.session_holder.source.ip();
+
+        let key = FlowKey {
+            dst_host,
+            dst_port,
+            is_tcp,
+        };
+
+        if let Some(acc) = map.get_mut(&key) {
+            acc.conn_count += 1;
+            if is_active {
+                acc.active_count += 1;
+            } else {
+                acc.closed_count += 1;
+            }
+            acc.upload_total += upload;
+            acc.download_total += download;
+            if !acc.src_ips.contains(&src_ip) {
+                acc.src_ips.push(src_ip);
+            }
+            if info.start_time > acc.last_seen {
+                acc.last_seen = info.start_time;
+            }
+            if acc.rule.is_none() && !info.rule.is_empty() {
+                acc.rule = Some(&info.rule);
+            }
+            if acc.rule_payload.is_none() && !info.rule_payload.is_empty() {
+                acc.rule_payload = Some(&info.rule_payload);
+            }
+            if acc.chains.is_none() {
+                let c = info.proxy_chain_holder.snapshot();
+                if !c.is_empty() {
+                    acc.chains = Some(c);
+                }
+            }
+            if acc.country.is_none() {
+                acc.country = info.session_holder.country.as_deref();
+            }
+            if acc.asn.is_none() {
+                acc.asn = info.session_holder.asn.as_deref();
+            }
+        } else {
             let chains = info.proxy_chain_holder.snapshot();
-            merge_info!(info, chains, false);
+            map.insert(
+                key,
+                Acc {
+                    src_ips: vec![src_ip],
+                    conn_count: 1,
+                    active_count: if is_active { 1 } else { 0 },
+                    closed_count: if is_active { 0 } else { 1 },
+                    upload_total: upload,
+                    download_total: download,
+                    rule: if info.rule.is_empty() {
+                        None
+                    } else {
+                        Some(&info.rule)
+                    },
+                    rule_payload: if info.rule_payload.is_empty() {
+                        None
+                    } else {
+                        Some(&info.rule_payload)
+                    },
+                    chains: if chains.is_empty() {
+                        None
+                    } else {
+                        Some(chains)
+                    },
+                    country: info.session_holder.country.as_deref(),
+                    asn: info.session_holder.asn.as_deref(),
+                    last_seen: info.start_time,
+                },
+            );
         }
     }
 
@@ -235,19 +230,23 @@ async fn build_flow_records(
             FlowRecord {
                 dst_host: key.dst_host,
                 dst_port: key.dst_port,
-                protocol: key.protocol,
-                src_ips: acc.src_ips,
+                protocol: if key.is_tcp {
+                    "tcp".to_string()
+                } else {
+                    "udp".to_string()
+                },
+                src_ips: acc.src_ips.into_iter().map(|ip| ip.to_string()).collect(),
                 conn_count: acc.conn_count,
                 active_count: acc.active_count,
                 closed_count: acc.closed_count,
                 upload_total: acc.upload_total,
                 download_total: acc.download_total,
                 bytes_total,
-                rule: acc.rule,
-                rule_payload: acc.rule_payload,
-                chains: acc.chains,
-                country: acc.country,
-                asn: acc.asn,
+                rule: acc.rule.unwrap_or_default().to_string(),
+                rule_payload: acc.rule_payload.unwrap_or_default().to_string(),
+                chains: acc.chains.unwrap_or_default(),
+                country: acc.country.map(|s| s.to_string()),
+                asn: acc.asn.map(|s| s.to_string()),
                 last_seen: acc.last_seen,
             }
         })
