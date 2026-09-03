@@ -143,9 +143,11 @@ impl Runner for ApiRunner {
             .allow_private_network(true)
             .allow_origin(origins);
 
+        let samplers = Arc::new(crate::app::api::StreamSamplers::new());
         let app_state = Arc::new(AppState {
             log_source_tx: self.log_source.clone(),
             statistics_manager: statistics_manager.clone(),
+            samplers: samplers.clone(),
         });
         let cancellation_token = self.cancellation_token.clone();
         let handle = tokio::spawn(async move {
@@ -182,7 +184,7 @@ impl Runner for ApiRunner {
                 .nest("/providers/rules", handlers::provider::rule_routes(router))
                 .nest(
                     "/connections",
-                    handlers::connection::routes(statistics_manager.clone()),
+                    handlers::connection::routes(statistics_manager.clone(), samplers),
                 )
                 .nest("/flows", handlers::flows::routes(statistics_manager))
                 .nest("/dns", handlers::dns::routes(dns_resolver))

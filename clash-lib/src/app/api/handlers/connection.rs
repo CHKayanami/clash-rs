@@ -14,20 +14,27 @@ use serde::Deserialize;
 use tracing::{debug, warn};
 
 use crate::app::{
-    api::{AppState, handlers::utils::is_request_websocket},
+    api::{AppState, StreamSamplers, handlers::utils::is_request_websocket},
     dispatcher::StatisticsManager,
 };
 
 #[derive(Clone)]
 struct ConnectionState {
     statistics_manager: Arc<StatisticsManager>,
+    samplers: Arc<StreamSamplers>,
 }
 
-pub fn routes(statistics_manager: Arc<StatisticsManager>) -> Router<Arc<AppState>> {
+pub fn routes(
+    statistics_manager: Arc<StatisticsManager>,
+    samplers: Arc<StreamSamplers>,
+) -> Router<Arc<AppState>> {
     Router::new()
         .route("/", get(get_connections).delete(close_all_connection))
         .route("/{id}", delete(close_connection))
-        .with_state(ConnectionState { statistics_manager })
+        .with_state(ConnectionState {
+            statistics_manager,
+            samplers,
+        })
 }
 
 #[derive(Deserialize)]
@@ -43,8 +50,8 @@ async fn get_connections(
 ) -> impl IntoResponse {
     if !is_request_websocket(&headers) {
         let mgr = state.statistics_manager.clone();
-        let view = mgr.snapshot_view();
-        return Json(view).into_response();
+        let snapshot = mgr.snapshot();
+        return Json(snapshot).into_response();
     }
 
     let ws = match WebSocketUpgrade::from_request(req, &state).await {
@@ -55,34 +62,27 @@ async fn get_connections(
         }
     };
 
+    let interval = std::time::Duration::from_secs(q.interval.unwrap_or(2).max(1));
+    let mut frames = state
+        .samplers
+        .subscribe_connections(state.statistics_manager.clone(), interval);
+
     ws.on_failed_upgrade(|e| {
         warn!("ws upgrade error: {}", e);
     })
     .on_upgrade(move |mut socket| async move {
-        let interval = q.interval.unwrap_or(2).max(1);
-        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(interval));
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let mgr = state.statistics_manager.clone();
-        let mut buf = Vec::with_capacity(8192);
-
         loop {
             tokio::select! {
-                _ = interval.tick() => {
-                    let view = mgr.snapshot_view();
-                    buf.clear();
-                    if let Err(e) = serde_json::to_writer(&mut buf, &view) {
-                        warn!("Failed to serialize connection snapshot: {}", e);
-                        continue;
-                    }
-
-                    let Ok(body) = std::str::from_utf8(&buf) else {
-                        continue;
-                    };
-
-                    if let Err(e) = socket.send(Message::Text(body.into())).await {
-                        // likely client gone
-                        debug!("ws send error: {}", e);
-                        break;
+                res = frames.recv() => {
+                    match res {
+                        Ok(frame) => {
+                            if let Err(e) = socket.send(Message::Text(frame.as_ref().into())).await {
+                                debug!("ws connection closed with error: {}", e);
+                                break;
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     }
                 }
                 msg = socket.recv() => {

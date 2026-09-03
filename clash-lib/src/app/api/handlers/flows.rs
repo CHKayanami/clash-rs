@@ -1,4 +1,4 @@
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{collections::HashMap, sync::Arc};
 
 use axum::{
     Json, Router,
@@ -105,7 +105,7 @@ struct Acc {
 // Core aggregation logic
 // ---------------------------------------------------------------------------
 
-async fn build_flow_records(
+pub(crate) async fn build_flow_records(
     mgr: &StatisticsManager,
     top: usize,
     include_closed: bool,
@@ -287,6 +287,10 @@ pub async fn handle(
 
 #[derive(Deserialize)]
 pub struct WsFlowQuery {
+    /// Legacy parameter: The flow streaming interval is now fixed globally to 5s
+    /// (see `FLOW_SAMPLER_INTERVAL`) for efficient broadcast deduplication.
+    /// This field is kept for API backwards-compatibility with existing dashboard clients.
+    #[allow(dead_code)]
     pub interval: Option<u64>,
     pub top: Option<usize>,
     pub include_closed: Option<bool>,
@@ -299,50 +303,89 @@ pub async fn ws_handle(
 ) -> impl IntoResponse {
     let top = q.top.unwrap_or(20).clamp(1, 500);
     let include_closed = q.include_closed.unwrap_or(true);
-    let interval_secs = q.interval.unwrap_or(5).max(1);
+    let mut frames = state.samplers.subscribe_flows(
+        state.statistics_manager.clone(),
+        top,
+        include_closed,
+    );
 
-    let callback = async move |mut socket: axum::extract::ws::WebSocket| {
-        let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs));
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let mut buf = Vec::with_capacity(4096);
-        loop {
-            tokio::select! {
-                _ = ticker.tick() => {
-                    let records =
-                        build_flow_records(&state.statistics_manager, top, include_closed)
-                            .await;
-                    buf.clear();
-                    if let Err(e) = serde_json::to_writer(&mut buf, &records) {
-                        warn!("failed to serialize flow records: {}", e);
-                        break;
-                    }
-                    let Ok(body) = std::str::from_utf8(&buf) else {
-                        break;
-                    };
-                    if let Err(e) = socket.send(Message::Text(body.into())).await {
-                        debug!("ws/flows send error: {}", e);
-                        break;
-                    }
-                }
-                msg = socket.recv() => {
-                    match msg {
-                        Some(Ok(Message::Close(_))) | None => {
-                            debug!("ws/flows client disconnected");
-                            break;
+    ws.on_failed_upgrade(|e| warn!("ws/flows upgrade error: {}", e))
+        .on_upgrade(move |mut socket: axum::extract::ws::WebSocket| async move {
+            loop {
+                tokio::select! {
+                    res = frames.recv() => {
+                        match res {
+                            Ok(frame) => {
+                                if let Err(e) = socket.send(Message::Text(frame.as_ref().into())).await {
+                                    debug!("ws/flows send error: {}", e);
+                                    break;
+                                }
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                         }
-                        Some(Err(e)) => {
-                            debug!("ws/flows receive error: {}", e);
-                            break;
+                    }
+                    msg = socket.recv() => {
+                        match msg {
+                            Some(Ok(Message::Close(_))) | None => {
+                                debug!("ws/flows client disconnected");
+                                break;
+                            }
+                            Some(Err(e)) => {
+                                debug!("ws/flows receive error: {}", e);
+                                break;
+                            }
+                            _ => {}
                         }
-                        _ => {}
                     }
                 }
             }
-        }
-    };
-
-    ws.on_failed_upgrade(|e| warn!("ws/flows upgrade error: {}", e))
-        .on_upgrade(async move |socket| {
-            callback(socket).await;
         })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::api::StreamSamplers;
+    use crate::app::dispatcher::Manager;
+
+    #[tokio::test]
+    async fn test_subscribe_flows_broadcast() {
+        let mgr = Manager::new();
+        let samplers = Arc::new(StreamSamplers::new());
+        let mut sub1 = samplers.subscribe_flows(mgr.clone(), 20, true);
+        let mut sub2 = samplers.subscribe_flows(mgr.clone(), 20, true);
+
+        // Same top and include_closed should share 1 sampler
+        assert_eq!(samplers.active_flow_samplers_count(), 1);
+
+        // First tick happens immediately in tokio interval
+        let frame1 = tokio::time::timeout(std::time::Duration::from_millis(300), sub1.recv())
+            .await
+            .expect("sub1 timed out")
+            .expect("sub1 recv error");
+
+        let frame2 = tokio::time::timeout(std::time::Duration::from_millis(300), sub2.recv())
+            .await
+            .expect("sub2 timed out")
+            .expect("sub2 recv error");
+
+        assert_eq!(frame1, frame2);
+        assert!(frame1.starts_with('[') && frame1.ends_with(']'));
+
+        // Different params should create another sampler
+        let mut sub3 = samplers.subscribe_flows(mgr.clone(), 50, false);
+        assert_eq!(samplers.active_flow_samplers_count(), 2);
+        let frame3 = tokio::time::timeout(std::time::Duration::from_millis(300), sub3.recv())
+            .await
+            .expect("sub3 timed out")
+            .expect("sub3 recv error");
+        assert!(frame3.starts_with('[') && frame3.ends_with(']'));
+
+        drop(sub1);
+        drop(sub2);
+        drop(sub3);
+    }
+}
+
+

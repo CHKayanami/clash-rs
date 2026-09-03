@@ -35,31 +35,27 @@ pub async fn connections(
     State(state): State<Arc<AppState>>,
     query: Query<GetConnectionsQuery>,
 ) -> impl IntoResponse {
-    let callback = async move |mut socket: WebSocket| {
-        let interval = query.interval.unwrap_or(2).max(1);
-        let mut interval = tokio::time::interval(Duration::from_secs(interval));
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let mut buf = Vec::with_capacity(8192);
+    let interval = Duration::from_secs(query.interval.unwrap_or(2).max(1));
+    let mut frames = state
+        .samplers
+        .subscribe_connections(state.statistics_manager.clone(), interval);
 
+    ws.on_failed_upgrade(|e| {
+        warn!("ws upgrade error: {}", e);
+    })
+    .on_upgrade(move |mut socket: WebSocket| async move {
         loop {
             tokio::select! {
-                _ = interval.tick() => {
-                    let view = state.statistics_manager.snapshot_view();
-
-                    buf.clear();
-                    if let Err(e) = serde_json::to_writer(&mut buf, &view) {
-                        debug!("failed to serialize snapshot for ws connection: {}", e);
-                        break;
-                    }
-
-                    let Ok(body) = std::str::from_utf8(&buf) else {
-                        debug!("failed to parse utf-8 for ws connection");
-                        break;
-                    };
-
-                    if let Err(e) = socket.send(Message::Text(body.into())).await {
-                        debug!("ws connection closed with error: {}", e);
-                        break;
+                res = frames.recv() => {
+                    match res {
+                        Ok(frame) => {
+                            if let Err(e) = socket.send(Message::Text(frame.as_ref().into())).await {
+                                debug!("ws connection closed with error: {}", e);
+                                break;
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     }
                 }
                 msg = socket.recv() => {
@@ -77,12 +73,6 @@ pub async fn connections(
                 }
             }
         }
-    };
-    ws.on_failed_upgrade(|e| {
-        warn!("ws upgrade error: {}", e);
-    })
-    .on_upgrade(async move |socket| {
-        callback(socket).await;
     })
 }
 

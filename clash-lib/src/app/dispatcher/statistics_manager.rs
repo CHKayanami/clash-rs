@@ -190,51 +190,7 @@ pub struct Snapshot {
     memory: usize,
 }
 
-pub struct SnapshotView<'a> {
-    manager: &'a Manager,
-}
 
-impl Serialize for SnapshotView<'_> {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        use serde::ser::SerializeStruct;
-        let mut state = serializer.serialize_struct("Snapshot", 4)?;
-        state.serialize_field(
-            "downloadTotal",
-            &self.manager.download_total.load(Ordering::Relaxed),
-        )?;
-        state.serialize_field(
-            "uploadTotal",
-            &self.manager.upload_total.load(Ordering::Relaxed),
-        )?;
-
-        struct ConnectionsSerializer<'b>(
-            &'b DashMap<u64, (Arc<TrackerInfo>, Option<Sender<()>>)>,
-        );
-        impl Serialize for ConnectionsSerializer<'_> {
-            fn serialize<S2>(&self, s2: S2) -> Result<S2::Ok, S2::Error>
-            where
-                S2: serde::Serializer,
-            {
-                use serde::ser::SerializeSeq;
-                let mut seq = s2.serialize_seq(Some(self.0.len()))?;
-                for entry in self.0.iter() {
-                    seq.serialize_element(&*entry.value().0)?;
-                }
-                seq.end()
-            }
-        }
-
-        state.serialize_field(
-            "connections",
-            &ConnectionsSerializer(&self.manager.connections),
-        )?;
-        state.serialize_field("memory", &self.manager.memory_usage())?;
-        state.end()
-    }
-}
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -570,11 +526,7 @@ impl Manager {
         )
     }
 
-    pub fn snapshot_view(&self) -> SnapshotView<'_> {
-        SnapshotView { manager: self }
-    }
-
-    pub async fn snapshot(&self) -> Snapshot {
+    pub fn snapshot(&self) -> Snapshot {
         let mut connections = Vec::with_capacity(self.connections.len());
         for r in self.connections.iter() {
             connections.push(r.value().0.clone());
@@ -590,6 +542,24 @@ impl Manager {
             connections,
             memory: self.memory_usage(),
         }
+    }
+
+    /// Shrink connection map capacity immediately if capacity is bloated.
+    pub fn maybe_shrink(&self) {
+        let len = self.connections.len();
+        let capacity = self.connections.capacity();
+        if capacity > 512 && capacity > len.saturating_mul(4) {
+            self.shrink_connections(capacity, len);
+        }
+    }
+
+    fn shrink_connections(&self, capacity: usize, len: usize) {
+        tracing::debug!(
+            "shrinking connections DashMap from capacity {} (active len: {})",
+            capacity,
+            len
+        );
+        self.connections.shrink_to_fit();
     }
 
     #[allow(dead_code)]
@@ -626,16 +596,81 @@ impl Manager {
 
     async fn kick_off(this: std::sync::Weak<Self>) {
         let mut ticker = tokio::time::interval(std::time::Duration::from_secs(1));
+        let mut shrink_controller = ShrinkController::new();
+
         loop {
             ticker.tick().await;
             // Last owner gone — nothing left to tick for.
             let Some(me) = this.upgrade() else { break };
-            me.upload_blip
-                .store(me.upload_temp.swap(0, Ordering::Relaxed), Ordering::Relaxed);
-            me.download_blip.store(
-                me.download_temp.swap(0, Ordering::Relaxed),
-                Ordering::Relaxed,
-            );
+            let up_blip = me.upload_temp.swap(0, Ordering::Relaxed);
+            let down_blip = me.download_temp.swap(0, Ordering::Relaxed);
+
+            me.upload_blip.store(up_blip, Ordering::Relaxed);
+            me.download_blip.store(down_blip, Ordering::Relaxed);
+
+            let len = me.connections.len();
+            let capacity = me.connections.capacity();
+            let total_traffic_rate = up_blip.saturating_add(down_blip);
+
+            if shrink_controller.should_shrink(len, capacity, total_traffic_rate) {
+                me.shrink_connections(capacity, len);
+            }
+        }
+    }
+}
+
+/// Controller to safely trigger DashMap shrinkage only during genuine, sustained idle periods,
+/// preventing thrashing and lock contention during traffic bursts.
+#[derive(Debug)]
+struct ShrinkController {
+    /// Consecutive seconds during which connection count and capacity met the shrink criteria.
+    low_watermark_seconds: u32,
+    /// Seconds elapsed since the last shrink operation (cooldown tracking).
+    cooldown_seconds: u32,
+}
+
+impl ShrinkController {
+    /// Minimum consecutive seconds of low connection count and low traffic required before shrinking.
+    const REQUIRED_IDLE_SECONDS: u32 = 60;
+    /// Minimum seconds between consecutive shrink operations to prevent thrashing.
+    const COOLDOWN_SECONDS: u32 = 300;
+    /// Maximum traffic rate (upload + download) in bytes/sec to still be considered an idle period (512 KB/s).
+    const MAX_IDLE_TRAFFIC_BYTES_PER_SEC: u64 = 512 * 1024;
+
+    fn new() -> Self {
+        Self {
+            low_watermark_seconds: 0,
+            // Initialize with cooldown satisfied so first shrink after a peak isn't unnecessarily delayed.
+            cooldown_seconds: Self::COOLDOWN_SECONDS,
+        }
+    }
+
+    /// Evaluates conditions on each 1-second tick and returns true if shrinking should be performed.
+    fn should_shrink(&mut self, len: usize, capacity: usize, current_traffic_rate: u64) -> bool {
+        self.cooldown_seconds = self.cooldown_seconds.saturating_add(1);
+
+        // If capacity is not bloated, reset idle period counter.
+        if capacity <= 512 || capacity <= len.saturating_mul(4) {
+            self.low_watermark_seconds = 0;
+            return false;
+        }
+
+        // If there is significant active network throughput, we are not in an idle window.
+        if current_traffic_rate > Self::MAX_IDLE_TRAFFIC_BYTES_PER_SEC {
+            self.low_watermark_seconds = 0;
+            return false;
+        }
+
+        self.low_watermark_seconds = self.low_watermark_seconds.saturating_add(1);
+
+        if self.cooldown_seconds >= Self::COOLDOWN_SECONDS
+            && self.low_watermark_seconds >= Self::REQUIRED_IDLE_SECONDS
+        {
+            self.cooldown_seconds = 0;
+            self.low_watermark_seconds = 0;
+            true
+        } else {
+            false
         }
     }
 }
@@ -759,4 +794,78 @@ mod tests {
         assert_eq!(entry.country.as_deref(), Some("US"));
         assert_eq!(entry.asn.as_deref(), Some("Cloudflare"));
     }
+
+    #[tokio::test]
+    async fn test_connections_maybe_shrink() {
+        let mgr = Manager::new();
+        // Insert 2000 connections to force DashMap growth
+        for i in 0..2000u64 {
+            let mut sess = Session::default();
+            sess.id = i;
+            let tracker = Arc::new(TrackerInfo::new(&sess, None));
+            let (tx, _) = tokio::sync::oneshot::channel();
+            mgr.track(i, tracker, tx);
+        }
+
+        let cap_before = mgr.connections.capacity();
+        assert!(cap_before >= 2000, "capacity should expand to accommodate 2000 items");
+
+        // Remove 1990 connections, keeping only 10 live
+        for i in 0..1990u64 {
+            mgr.untrack(i);
+        }
+        assert_eq!(mgr.connections.len(), 10);
+
+        // Before shrink, capacity remains high due to tombstone retention
+        assert!(mgr.connections.capacity() > 512);
+
+        // Trigger adaptive shrink
+        mgr.maybe_shrink();
+
+        let cap_after = mgr.connections.capacity();
+        assert!(
+            cap_after < cap_before,
+            "capacity should shrink significantly (before: {}, after: {})",
+            cap_before,
+            cap_after
+        );
+        assert!(
+            cap_after <= 512,
+            "capacity should be shrunk near active count, got {}",
+            cap_after
+        );
+    }
+
+    #[test]
+    fn test_shrink_controller_logic() {
+        let mut controller = ShrinkController::new();
+
+        // 1. Not bloated: capacity <= 512 or <= len * 4 -> should NOT shrink
+        for _ in 0..100 {
+            assert!(!controller.should_shrink(200, 500, 0));
+        }
+
+        // 2. Bloated, but high traffic -> should NOT shrink
+        for _ in 0..100 {
+            assert!(!controller.should_shrink(10, 2048, 1024 * 1024));
+        }
+
+        // 3. Bloated and low traffic, but before 60s threshold -> should NOT shrink
+        for _ in 0..59 {
+            assert!(!controller.should_shrink(10, 2048, 100));
+        }
+
+        // 4. Exactly at 60s of sustained low traffic & bloated capacity -> TRIGGER shrink!
+        assert!(controller.should_shrink(10, 2048, 100));
+
+        // 5. Immediately after shrinking, cooldown is active (300s) -> should NOT shrink
+        for _ in 0..299 {
+            assert!(!controller.should_shrink(10, 2048, 100));
+        }
+
+        // 6. After cooldown finishes and 60s sustained idle -> can trigger again
+        assert!(controller.should_shrink(10, 2048, 100));
+    }
 }
+
+
