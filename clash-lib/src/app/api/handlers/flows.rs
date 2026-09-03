@@ -92,6 +92,7 @@ struct Acc {
     closed_count: usize,
     upload_total: u64,
     download_total: u64,
+    bytes_total: u64,
     rule: String,
     rule_payload: String,
     chains: Vec<String>,
@@ -115,28 +116,30 @@ async fn build_flow_records(
     let closed = if include_closed {
         mgr.closed_flows_snapshot().await
     } else {
-        Arc::new(HashMap::new())
+        HashMap::new()
     };
 
     let mut map: HashMap<FlowKey, Acc> =
         HashMap::with_capacity(active.len() + closed.len());
 
     // 1. Initialize map from pre-aggregated closed flows
-    for (key, closed_entry) in closed.iter() {
+    for (key, closed_entry) in closed.into_iter() {
+        let bytes_total = closed_entry.upload_total + closed_entry.download_total;
         map.insert(
-            key.clone(),
+            key,
             Acc {
-                src_ips: closed_entry.src_ips.clone(),
+                src_ips: closed_entry.src_ips,
                 conn_count: closed_entry.conn_count,
                 active_count: 0,
                 closed_count: closed_entry.conn_count,
                 upload_total: closed_entry.upload_total,
                 download_total: closed_entry.download_total,
-                rule: closed_entry.rule.clone(),
-                rule_payload: closed_entry.rule_payload.clone(),
-                chains: closed_entry.chains.clone(),
-                country: closed_entry.country.clone(),
-                asn: closed_entry.asn.clone(),
+                bytes_total,
+                rule: closed_entry.rule,
+                rule_payload: closed_entry.rule_payload,
+                chains: closed_entry.chains,
+                country: closed_entry.country,
+                asn: closed_entry.asn,
                 last_seen: closed_entry.last_seen,
             },
         );
@@ -165,6 +168,7 @@ async fn build_flow_records(
             acc.active_count += 1;
             acc.upload_total += upload;
             acc.download_total += download;
+            acc.bytes_total += upload + download;
             if acc.src_ips.len() < MAX_SRC_IPS && !acc.src_ips.contains(&src_ip) {
                 acc.src_ips.push(src_ip);
             }
@@ -191,6 +195,7 @@ async fn build_flow_records(
             }
         } else {
             let chains = info.proxy_chain_holder.snapshot();
+            let bytes_total = upload + download;
             map.insert(
                 key,
                 Acc {
@@ -200,6 +205,7 @@ async fn build_flow_records(
                     closed_count: 0,
                     upload_total: upload,
                     download_total: download,
+                    bytes_total,
                     rule: info.rule.clone(),
                     rule_payload: info.rule_payload.clone(),
                     chains,
@@ -211,11 +217,28 @@ async fn build_flow_records(
         }
     }
 
-    // Convert accumulator map → sorted FlowRecord list.
-    let mut records: Vec<FlowRecord> = map
+    if top == 0 {
+        return Vec::new();
+    }
+
+    // Convert accumulator map → sorted (FlowKey, Acc) list.
+    let mut entries: Vec<(FlowKey, Acc)> = map.into_iter().collect();
+
+    // Sort and truncate at (FlowKey, Acc) level to avoid formatting records that will be discarded.
+    if entries.len() > top {
+        entries.select_nth_unstable_by_key(top, |(_, acc)| {
+            std::cmp::Reverse(acc.bytes_total)
+        });
+        entries.truncate(top);
+    }
+    entries.sort_by_key(|(_, acc)| {
+        std::cmp::Reverse(acc.bytes_total)
+    });
+
+    // Only format and allocate Strings for the final top records.
+    entries
         .into_iter()
         .map(|(key, acc)| {
-            let bytes_total = acc.upload_total + acc.download_total;
             FlowRecord {
                 dst_host: key.dst_host,
                 dst_port: key.dst_port,
@@ -230,7 +253,7 @@ async fn build_flow_records(
                 closed_count: acc.closed_count,
                 upload_total: acc.upload_total,
                 download_total: acc.download_total,
-                bytes_total,
+                bytes_total: acc.bytes_total,
                 rule: acc.rule,
                 rule_payload: acc.rule_payload,
                 chains: acc.chains,
@@ -239,11 +262,7 @@ async fn build_flow_records(
                 last_seen: acc.last_seen,
             }
         })
-        .collect();
-
-    records.sort_by_key(|r| std::cmp::Reverse(r.bytes_total));
-    records.truncate(top);
-    records
+        .collect()
 }
 
 // ---------------------------------------------------------------------------

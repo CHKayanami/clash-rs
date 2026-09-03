@@ -120,6 +120,7 @@ parking_lot = "0.12"
 arc-swap = "1"
 itoa = "1"
 redb = "4"
+lru = "0.18"
 
 h2 = "0.4"
 prost = "0.14"

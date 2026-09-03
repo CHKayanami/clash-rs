@@ -1,10 +1,12 @@
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::HashMap,
+    num::NonZeroUsize,
     sync::{Arc, atomic::Ordering},
 };
 
 use chrono::Utc;
 use dashmap::DashMap;
+use lru::LruCache;
 use memory_stats::memory_stats;
 use portable_atomic::AtomicU64;
 use serde::Serialize;
@@ -269,7 +271,7 @@ enum StatsCommand {
         download: u64,
     },
     GetClosedFlows(
-        tokio::sync::oneshot::Sender<Arc<HashMap<FlowKey, ClosedFlowEntry>>>,
+        tokio::sync::oneshot::Sender<HashMap<FlowKey, ClosedFlowEntry>>,
     ),
     DrainUserStats(tokio::sync::oneshot::Sender<HashMap<String, UserTraffic>>),
     #[cfg(test)]
@@ -318,10 +320,9 @@ impl Manager {
     }
 
     async fn run_actor(mut rx: tokio::sync::mpsc::UnboundedReceiver<StatsCommand>) {
-        let mut closed_flows: Arc<HashMap<FlowKey, ClosedFlowEntry>> =
-            Arc::new(HashMap::new());
-        let mut time_index: BTreeSet<(chrono::DateTime<Utc>, FlowKey)> =
-            BTreeSet::new();
+        const MAX_CLOSED_FLOWS: usize = 500;
+        let mut closed_flows: LruCache<FlowKey, ClosedFlowEntry> =
+            LruCache::new(NonZeroUsize::new(MAX_CLOSED_FLOWS).unwrap());
         let mut user_period_stats: HashMap<String, UserTraffic> = HashMap::new();
 
         while let Some(cmd) = rx.recv().await {
@@ -341,14 +342,14 @@ impl Manager {
                         entry.download += download;
                     }
 
-                    Self::record_closed_flow(
-                        &mut closed_flows,
-                        &mut time_index,
-                        &info,
-                    );
+                    Self::record_closed_flow(&mut closed_flows, &info);
                 }
                 StatsCommand::GetClosedFlows(reply) => {
-                    let _ = reply.send(closed_flows.clone());
+                    let mut snapshot = HashMap::with_capacity(closed_flows.len());
+                    for (k, v) in closed_flows.iter() {
+                        snapshot.insert(k.clone(), v.clone());
+                    }
+                    let _ = reply.send(snapshot);
                 }
                 StatsCommand::DrainUserStats(reply) => {
                     let drained = std::mem::take(&mut user_period_stats);
@@ -369,8 +370,7 @@ impl Manager {
     }
 
     fn record_closed_flow(
-        closed_flows: &mut Arc<HashMap<FlowKey, ClosedFlowEntry>>,
-        time_index: &mut BTreeSet<(chrono::DateTime<Utc>, FlowKey)>,
+        closed_flows: &mut LruCache<FlowKey, ClosedFlowEntry>,
         info: &TrackerInfo,
     ) {
         let dst_host = info.session_holder.destination.host();
@@ -388,9 +388,8 @@ impl Manager {
         };
 
         const MAX_SRC_IPS: usize = 32;
-        let map = Arc::make_mut(closed_flows);
 
-        if let Some(entry) = map.get_mut(&key) {
+        if let Some(entry) = closed_flows.get_mut(&key) {
             entry.conn_count += 1;
             entry.upload_total += conn_upload;
             entry.download_total += conn_download;
@@ -399,9 +398,7 @@ impl Manager {
                 entry.src_ips.push(src_ip);
             }
             if info.start_time > entry.last_seen {
-                time_index.remove(&(entry.last_seen, key.clone()));
                 entry.last_seen = info.start_time;
-                time_index.insert((entry.last_seen, key));
             }
             if entry.rule.is_empty() && !info.rule.is_empty() {
                 entry.rule = info.rule.clone();
@@ -422,16 +419,8 @@ impl Manager {
                 entry.asn = info.session_holder.asn.clone();
             }
         } else {
-            const MAX_CLOSED_FLOWS: usize = 500;
-            if map.len() >= MAX_CLOSED_FLOWS {
-                if let Some((_, oldest_key)) = time_index.pop_first() {
-                    map.remove(&oldest_key);
-                }
-            }
-
             let chains = info.proxy_chain_holder.snapshot();
-            time_index.insert((info.start_time, key.clone()));
-            map.insert(
+            closed_flows.push(
                 key,
                 ClosedFlowEntry {
                     conn_count: 1,
@@ -483,12 +472,12 @@ impl Manager {
     /// Return a snapshot of pre-aggregated recently closed flows.
     pub async fn closed_flows_snapshot(
         &self,
-    ) -> Arc<HashMap<FlowKey, ClosedFlowEntry>> {
+    ) -> HashMap<FlowKey, ClosedFlowEntry> {
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         if self.tx.send(StatsCommand::GetClosedFlows(reply_tx)).is_ok() {
             reply_rx.await.unwrap_or_default()
         } else {
-            Arc::new(HashMap::new())
+            HashMap::new()
         }
     }
 
