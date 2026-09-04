@@ -285,7 +285,9 @@ jobs:
 
       - name: Install cargo-zigbuild
         if: matrix.use-zigbuild
-        uses: taiki-e/install-action@cargo-zigbuild
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild@0.23.2
 
       - name: Build eBPF Bytecode
         if: runner.os == 'Linux'
@@ -297,6 +299,7 @@ jobs:
         if: matrix.use-zigbuild
         env:
           CARGO_PROFILE_RELEASE_OPT_LEVEL: ${{ matrix.opt-level }}
+          MAKEFLAGS: "CC_MM="
         run: |
           cargo zigbuild --release --target ${{ matrix.target }} -F ${{ matrix.features }} -p clash-rs
 
