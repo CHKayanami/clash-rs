@@ -76,7 +76,7 @@ async fn get_connections(
                 res = frames.recv() => {
                     match res {
                         Ok(frame) => {
-                            if let Err(e) = socket.send(Message::Text(frame.as_ref().into())).await {
+                            if let Err(e) = socket.send(Message::Text(frame)).await {
                                 debug!("ws connection closed with error: {}", e);
                                 break;
                             }

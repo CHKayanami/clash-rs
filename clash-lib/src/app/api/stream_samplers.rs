@@ -4,6 +4,7 @@ use std::{
     time::Duration,
 };
 
+use axum::extract::ws::Utf8Bytes;
 use parking_lot::Mutex;
 use tokio::sync::broadcast;
 use tracing::{debug, warn};
@@ -11,13 +12,13 @@ use tracing::{debug, warn};
 use super::handlers::flows::build_flow_records;
 use crate::app::dispatcher::StatisticsManager;
 
-const CHANNEL_CAPACITY: usize = 16;
+const CHANNEL_CAPACITY: usize = 2;
 pub const FLOW_SAMPLER_INTERVAL: Duration = Duration::from_secs(5);
 
 struct ConnectionSamplerGuard {
     samplers: Weak<StreamSamplers>,
     interval: Duration,
-    tx: broadcast::Sender<Arc<str>>,
+    tx: broadcast::Sender<Utf8Bytes>,
     active: bool,
 }
 
@@ -40,7 +41,7 @@ impl Drop for ConnectionSamplerGuard {
 struct FlowSamplerGuard {
     samplers: Weak<StreamSamplers>,
     key: (usize, bool),
-    tx: broadcast::Sender<Arc<str>>,
+    tx: broadcast::Sender<Utf8Bytes>,
     active: bool,
 }
 
@@ -66,8 +67,8 @@ impl Drop for FlowSamplerGuard {
 /// query parameters) subscribe to a single shared background polling/aggregation
 /// task, avoiding redundant DashMap scans, sorting, and JSON serializations.
 pub struct StreamSamplers {
-    connections: Mutex<HashMap<Duration, broadcast::Sender<Arc<str>>>>,
-    flows: Mutex<HashMap<(usize, bool), broadcast::Sender<Arc<str>>>>,
+    connections: Mutex<HashMap<Duration, broadcast::Sender<Utf8Bytes>>>,
+    flows: Mutex<HashMap<(usize, bool), broadcast::Sender<Utf8Bytes>>>,
 }
 
 impl StreamSamplers {
@@ -87,7 +88,7 @@ impl StreamSamplers {
         self: &Arc<Self>,
         mgr: Arc<StatisticsManager>,
         interval: Duration,
-    ) -> broadcast::Receiver<Arc<str>> {
+    ) -> broadcast::Receiver<Utf8Bytes> {
         let mut conns = self.connections.lock();
         if let Some(sender) = conns.get(&interval) {
             sender.subscribe()
@@ -104,7 +105,7 @@ impl StreamSamplers {
         self: &Arc<Self>,
         mgr: Arc<StatisticsManager>,
         interval: Duration,
-        tx: broadcast::Sender<Arc<str>>,
+        tx: broadcast::Sender<Utf8Bytes>,
     ) {
         let samplers = Arc::downgrade(self);
         tokio::spawn(async move {
@@ -117,7 +118,6 @@ impl StreamSamplers {
 
             let mut ticker = tokio::time::interval(interval);
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            let mut buf = Vec::with_capacity(8192);
 
             loop {
                 ticker.tick().await;
@@ -138,13 +138,14 @@ impl StreamSamplers {
                 }
 
                 let snapshot = mgr.snapshot();
-                buf.clear();
-                if let Err(e) = serde_json::to_writer(&mut buf, &snapshot) {
-                    warn!("failed to serialize connection snapshot: {}", e);
-                    continue;
-                }
-                let Ok(body) = std::str::from_utf8(&buf) else { continue };
-                let frame: Arc<str> = Arc::from(body);
+                let json_str = match serde_json::to_string(&snapshot) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        warn!("failed to serialize connection snapshot: {}", e);
+                        continue;
+                    }
+                };
+                let frame = Utf8Bytes::from(json_str);
                 let _ = tx.send(frame);
             }
             debug!("connection sampler task for {:?} stopped", interval);
@@ -161,7 +162,7 @@ impl StreamSamplers {
         mgr: Arc<StatisticsManager>,
         top: usize,
         include_closed: bool,
-    ) -> broadcast::Receiver<Arc<str>> {
+    ) -> broadcast::Receiver<Utf8Bytes> {
         let key = (top, include_closed);
         let mut flows = self.flows.lock();
         if let Some(sender) = flows.get(&key) {
@@ -179,7 +180,7 @@ impl StreamSamplers {
         self: &Arc<Self>,
         mgr: Arc<StatisticsManager>,
         key: (usize, bool),
-        tx: broadcast::Sender<Arc<str>>,
+        tx: broadcast::Sender<Utf8Bytes>,
     ) {
         let (top, include_closed) = key;
         let samplers = Arc::downgrade(self);
@@ -193,7 +194,6 @@ impl StreamSamplers {
 
             let mut ticker = tokio::time::interval(FLOW_SAMPLER_INTERVAL);
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            let mut buf = Vec::with_capacity(4096);
 
             loop {
                 ticker.tick().await;
@@ -214,13 +214,14 @@ impl StreamSamplers {
                 }
 
                 let records = build_flow_records(&mgr, top, include_closed).await;
-                buf.clear();
-                if let Err(e) = serde_json::to_writer(&mut buf, &records) {
-                    warn!("failed to serialize flow records: {}", e);
-                    continue;
-                }
-                let Ok(body) = std::str::from_utf8(&buf) else { continue };
-                let frame: Arc<str> = Arc::from(body);
+                let json_str = match serde_json::to_string(&records) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        warn!("failed to serialize flow records: {}", e);
+                        continue;
+                    }
+                };
+                let frame = Utf8Bytes::from(json_str);
                 let _ = tx.send(frame);
             }
             debug!("flow sampler task for {:?} stopped", key);
@@ -271,7 +272,7 @@ mod tests {
             .expect("sub2 recv error");
 
         assert_eq!(frame1, frame2);
-        assert!(frame1.contains("\"connections\":[]"));
+        assert!(frame1.as_str().contains("\"connections\":[]"));
 
         drop(sub1);
         drop(sub2);

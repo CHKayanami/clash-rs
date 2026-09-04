@@ -122,6 +122,7 @@ fn make_udp_flow_session(
     sess.orig_destination = Some(orig_inbound_dst);
     sess.inbound_user = inbound_user;
     sess.mapped_domain = mapped_domain;
+    sess.proxy_chain = crate::session::ProxyChain::new();
     sess
 }
 

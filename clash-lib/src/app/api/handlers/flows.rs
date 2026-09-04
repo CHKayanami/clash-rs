@@ -316,7 +316,7 @@ pub async fn ws_handle(
                     res = frames.recv() => {
                         match res {
                             Ok(frame) => {
-                                if let Err(e) = socket.send(Message::Text(frame.as_ref().into())).await {
+                                if let Err(e) = socket.send(Message::Text(frame)).await {
                                     debug!("ws/flows send error: {}", e);
                                     break;
                                 }
@@ -371,7 +371,7 @@ mod tests {
             .expect("sub2 recv error");
 
         assert_eq!(frame1, frame2);
-        assert!(frame1.starts_with('[') && frame1.ends_with(']'));
+        assert!(frame1.as_str().starts_with('[') && frame1.as_str().ends_with(']'));
 
         // Different params should create another sampler
         let mut sub3 = samplers.subscribe_flows(mgr.clone(), 50, false);
@@ -380,7 +380,7 @@ mod tests {
             .await
             .expect("sub3 timed out")
             .expect("sub3 recv error");
-        assert!(frame3.starts_with('[') && frame3.ends_with(']'));
+        assert!(frame3.as_str().starts_with('[') && frame3.as_str().ends_with(']'));
 
         drop(sub1);
         drop(sub2);
