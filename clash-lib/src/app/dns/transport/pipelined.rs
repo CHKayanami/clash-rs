@@ -34,6 +34,34 @@ pub struct PipelinedSession<W> {
     driver: Mutex<Option<OwnedTask>>,
 }
 
+struct PendingGuard<'a, W: AsyncWrite + Send + Unpin + 'static> {
+    session: &'a PipelinedSession<W>,
+    id: u16,
+    disarmed: bool,
+}
+
+impl<'a, W: AsyncWrite + Send + Unpin + 'static> PendingGuard<'a, W> {
+    fn new(session: &'a PipelinedSession<W>, id: u16) -> Self {
+        Self {
+            session,
+            id,
+            disarmed: false,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.disarmed = true;
+    }
+}
+
+impl<W: AsyncWrite + Send + Unpin + 'static> Drop for PendingGuard<'_, W> {
+    fn drop(&mut self) {
+        if !self.disarmed {
+            self.session.unregister(self.id);
+        }
+    }
+}
+
 impl<W: AsyncWrite + Send + Unpin + 'static> PipelinedSession<W> {
     pub fn new<R>(
         mut reader: R,
@@ -98,6 +126,7 @@ impl<W: AsyncWrite + Send + Unpin + 'static> PipelinedSession<W> {
             );
             (receiver, id)
         };
+        let mut guard = PendingGuard::new(self, id);
 
         let mut wire = Vec::with_capacity(query.len() + 2);
         wire.extend_from_slice(&(query.len() as u16).to_be_bytes());
@@ -110,19 +139,19 @@ impl<W: AsyncWrite + Send + Unpin + 'static> PipelinedSession<W> {
         };
 
         if let Err(e) = write_res {
-            self.unregister(id);
             self.mark_closed();
             return Err(anyhow::anyhow!("DNS pipe write error: {e}"));
         }
 
         match tokio::time::timeout(timeout, receiver).await {
-            Ok(Ok(response)) => Ok(response),
+            Ok(Ok(response)) => {
+                guard.disarm();
+                Ok(response)
+            }
             Ok(Err(_)) => {
-                self.unregister(id);
                 anyhow::bail!("Pipelined DNS session closed while waiting for response")
             }
             Err(_) => {
-                self.unregister(id);
                 anyhow::bail!("Pipelined DNS query timed out after {timeout:?}")
             }
         }
@@ -334,5 +363,29 @@ mod tests {
         let q = build_test_query(0x1234, "example.com");
         let res = session.exchange(&q, Duration::from_millis(100)).await;
         assert!(res.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_pipelined_cancellation_safety() {
+        let (client_stream, _server_stream) = tokio::io::duplex(1024);
+        let (reader, writer) = tokio::io::split(client_stream);
+        let active_tasks = Arc::new(AtomicUsize::new(0));
+        let session = Arc::new(PipelinedSession::new(reader, writer, active_tasks));
+
+        let q = build_test_query(0x1234, "example.com");
+
+        // Start exchange and cancel it after short duration (simulating outer select!/timeout drop)
+        {
+            let fut = session.exchange(&q, Duration::from_secs(5));
+            tokio::pin!(fut);
+            tokio::select! {
+                _ = &mut fut => {}
+                _ = tokio::time::sleep(Duration::from_millis(20)) => {}
+            }
+        }
+
+        // Pending map should be cleaned up by PendingGuard
+        assert_eq!(session.state.lock().pending.len(), 0);
+        session.shutdown(Duration::from_millis(50)).await;
     }
 }

@@ -180,6 +180,8 @@ impl<T> LifecycleSlot<T> {
         let mut waited_generation = None;
         loop {
             let notified = self.changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
             let action = {
                 let mut inner = self.inner.lock();
                 if let Some(generation) = waited_generation
@@ -238,6 +240,8 @@ impl<T> LifecycleSlot<T> {
         let mut close = Some(close);
         loop {
             let notified = self.changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
             let resource = {
                 let mut inner = self.inner.lock();
                 match &mut inner.state {
@@ -253,8 +257,8 @@ impl<T> LifecycleSlot<T> {
                         *owner = true;
                         Some(Arc::clone(value))
                     }
-                    SlotState::Building { .. } | SlotState::Closing { .. } => None,
-                    SlotState::Closed => return,
+                    SlotState::Building { .. } | SlotState::Closed => return,
+                    SlotState::Closing { .. } => None,
                 }
             };
             let Some(resource) = resource else {
@@ -339,5 +343,53 @@ mod tests {
             .unwrap();
         assert_eq!(*res, "reconnected");
         assert_eq!(build_count.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn test_lifecycle_close_during_building_does_not_abort_new_session() {
+        let slot = Arc::new(LifecycleSlot::<String>::new());
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (finish_tx, finish_rx) = tokio::sync::oneshot::channel();
+
+        // Task 1: Starts building
+        let slot_clone = Arc::clone(&slot);
+        let builder = tokio::spawn(async move {
+            slot_clone
+                .acquire(|| async move {
+                    let _ = started_tx.send(());
+                    finish_rx.await.unwrap();
+                    Ok("brand_new_session".to_string())
+                })
+                .await
+        });
+
+        // Wait until Task 1 has entered building state
+        started_rx.await.unwrap();
+
+        // Task 2: Calls close while slot is currently in Building state
+        let slot_clone2 = Arc::clone(&slot);
+        let closer = tokio::spawn(async move {
+            slot_clone2
+                .close(|_| async { panic!("Should not close building session!") })
+                .await;
+        });
+
+        // Close should return immediately without blocking or waiting for building session
+        tokio::time::timeout(Duration::from_millis(100), closer)
+            .await
+            .expect("close during Building state must return immediately")
+            .unwrap();
+
+        // Now let builder finish
+        let _ = finish_tx.send(());
+        let val = builder.await.unwrap().unwrap();
+        assert_eq!(*val, "brand_new_session");
+
+        // The session should still be active and usable, not killed by closer
+        let current = slot
+            .acquire(|| async { panic!("Should be Ready") })
+            .await
+            .unwrap();
+        assert_eq!(*current, "brand_new_session");
     }
 }

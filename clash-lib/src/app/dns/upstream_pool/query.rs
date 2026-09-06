@@ -93,10 +93,10 @@ impl UpstreamPool {
                 {
                     state.current = None;
                 }
-                state
+                let old = state
                     .pools
                     .insert(cache_key, (address, Arc::clone(&candidate)));
-                (candidate, None)
+                (candidate, old.map(|(_, old_pool)| old_pool))
             }
         };
         if let Some(unused) = unused {
