@@ -60,6 +60,34 @@ pub struct UdpPool {
     timeout: Duration,
 }
 
+struct SlotGuard<'a> {
+    pool: &'a UdpPool,
+    wire_id: u16,
+    disarmed: bool,
+}
+
+impl<'a> SlotGuard<'a> {
+    fn new(pool: &'a UdpPool, wire_id: u16) -> Self {
+        Self {
+            pool,
+            wire_id,
+            disarmed: false,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.disarmed = true;
+    }
+}
+
+impl Drop for SlotGuard<'_> {
+    fn drop(&mut self) {
+        if !self.disarmed {
+            self.pool.unregister(self.wire_id);
+        }
+    }
+}
+
 impl UdpPool {
     pub async fn new_direct(
         address: SocketAddr,
@@ -221,6 +249,7 @@ impl UdpPool {
         let (reply, receiver) = oneshot::channel();
 
         let id = self.allocate_slot(question, original_id, reply)?;
+        let mut guard = SlotGuard::new(self, id);
 
         let mut wire = query.to_vec();
         wire[..2].copy_from_slice(&id.to_be_bytes());
@@ -244,15 +273,16 @@ impl UdpPool {
         };
 
         if let Err(error) = send_res {
-            self.unregister(id);
             return Err(error);
         }
 
         match tokio::time::timeout(self.timeout, receiver).await {
-            Ok(Ok(response)) => Ok(response),
+            Ok(Ok(response)) => {
+                guard.disarm();
+                Ok(response)
+            }
             Ok(Err(_)) => anyhow::bail!("UDP DNS receive loop stopped"),
             Err(_) => {
-                self.unregister(id);
                 anyhow::bail!("UDP DNS query timed out after {:?}", self.timeout)
             }
         }
@@ -284,7 +314,8 @@ impl UdpPool {
                     }
                 }
 
-                let salt = slot.salt.fetch_add(1, Ordering::Relaxed).wrapping_add(1) & 0x3F;
+                let salt = (slot.salt.load(Ordering::Relaxed) + 1) & 0x3F;
+                slot.salt.store(salt, Ordering::Relaxed);
                 data.question = question;
                 data.original_id = original_id;
                 data.reply = Some(reply);
@@ -344,7 +375,7 @@ impl UdpPool {
         let expected_salt = ((wire_id >> 10) & 0x3F) as u8;
 
         let slot = &self.slots[slot_idx];
-        if slot.salt.load(Ordering::Relaxed) != expected_salt
+        if (slot.salt.load(Ordering::Relaxed) & 0x3F) != expected_salt
             || !slot.in_use.load(Ordering::Acquire)
         {
             return;
@@ -352,7 +383,7 @@ impl UdpPool {
 
         let pending_reply = {
             let mut data = slot.data.lock();
-            if slot.salt.load(Ordering::Relaxed) != expected_salt {
+            if (slot.salt.load(Ordering::Relaxed) & 0x3F) != expected_salt {
                 return;
             }
             let matches = Self::question_end(buffer).is_ok_and(|end| {
@@ -382,7 +413,7 @@ impl UdpPool {
         let slot = &self.slots[slot_idx];
 
         let mut data = slot.data.lock();
-        if slot.salt.load(Ordering::Relaxed) == expected_salt {
+        if (slot.salt.load(Ordering::Relaxed) & 0x3F) == expected_salt {
             data.reply = None;
             data.retired_until = Some(Instant::now() + ID_QUARANTINE);
             slot.in_use.store(false, Ordering::Release);
@@ -479,6 +510,109 @@ mod tests {
             h.await.unwrap();
         }
         server_task.await.unwrap();
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn test_udp_pool_slot_salt_wrap_around() {
+        let active_tasks = Arc::new(AtomicUsize::new(0));
+        let server_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server_addr: SocketAddr = server_socket.local_addr().unwrap();
+        let pool = UdpPool::new_direct(
+            server_addr,
+            None,
+            None,
+            Duration::from_secs(2),
+            active_tasks,
+        )
+        .await
+        .unwrap();
+
+        let query = build_test_query(1, "example.com");
+        let question = query[12..UdpPool::question_end(&query).unwrap()].to_vec();
+
+        // Repeatedly allocate the SAME slot (slot 0) over 130 times (more than 64 salt cycles)
+        // by locking the slot data and clearing retired_until.
+        for i in 0..130 {
+            // Force cursor to 0 so we always allocate slot 0
+            pool.cursor.store(0, std::sync::atomic::Ordering::Relaxed);
+            {
+                let slot = &pool.slots[0];
+                let mut data = slot.data.lock();
+                data.retired_until = None;
+            }
+
+            let (reply, rx) = tokio::sync::oneshot::channel();
+            let wire_id = pool
+                .allocate_slot(question.clone(), [0x12, 0x34], reply)
+                .expect("slot allocation should succeed even after 64+ reuses");
+
+            let slot_idx = (wire_id & (super::SLOT_MASK as u16)) as usize;
+            assert_eq!(slot_idx, 0);
+
+            let expected_salt = ((wire_id >> 10) & 0x3F) as u8;
+            assert_eq!(expected_salt, (i + 1) as u8 & 0x3F);
+
+            // Construct a valid DNS response packet with wire_id
+            let mut resp = query.clone();
+            resp[..2].copy_from_slice(&wire_id.to_be_bytes());
+            resp[2] |= 0x80; // QR = 1
+
+            // Handle response should successfully match salt and deliver reply
+            pool.handle_response(&resp);
+
+            let received = rx
+                .await
+                .expect("reply must be delivered even after 64+ reuses of the same slot");
+            assert_eq!(received[..2], [0x12, 0x34]);
+        }
+
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn test_udp_pool_cancellation_safety() {
+        let active_tasks = Arc::new(AtomicUsize::new(0));
+        let server_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server_addr: SocketAddr = server_socket.local_addr().unwrap();
+        let pool = UdpPool::new_direct(
+            server_addr,
+            None,
+            None,
+            Duration::from_millis(50),
+            active_tasks,
+        )
+        .await
+        .unwrap();
+
+        let query = build_test_query(1, "timeout.com");
+
+        // Timeout should unregister slot cleanly
+        let res = pool.exchange(&query).await;
+        assert!(res.is_err());
+
+        // Cancellation by dropping future before completion
+        let query2 = build_test_query(2, "cancelled.com");
+        {
+            let exchange_fut = pool.exchange(&query2);
+            tokio::pin!(exchange_fut);
+            tokio::select! {
+                _ = &mut exchange_fut => {}
+                _ = tokio::time::sleep(Duration::from_millis(10)) => {}
+            }
+        }
+
+        // The slot used should have been unregistered and in_use reset to false
+        let used_slots = pool
+            .slots
+            .iter()
+            .filter(|s| s.in_use.load(std::sync::atomic::Ordering::Relaxed))
+            .count();
+        assert_eq!(
+            used_slots, 0,
+            "All slots should be freed after timeout or cancellation"
+        );
+
         pool.close().await;
     }
 }
