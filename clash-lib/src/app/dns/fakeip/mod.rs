@@ -12,9 +12,14 @@ use tracing::debug;
 
 use crate::{
     Error,
-    app::{dns::filters::DomainFilter, router::ThreadSafeRuleProvider},
+    app::{
+        dns::filters::DomainFilter, profile::ThreadSafeCacheFile,
+        router::ThreadSafeRuleProvider,
+    },
     config::def::FakeIpFilterMode,
 };
+
+use enum_dispatch::enum_dispatch;
 
 mod file_store;
 mod mem_store;
@@ -22,14 +27,7 @@ mod mem_store;
 pub use file_store::FileStore;
 pub use mem_store::InMemStore;
 
-pub struct Opts {
-    pub ipnet: ipnet::Ipv4Net,
-    pub ipnet6: ipnet::Ipv6Net,
-    pub domain_filter: Option<DomainFilter>,
-    pub filter_mode: FakeIpFilterMode,
-    pub store: Box<dyn Store>,
-}
-
+#[enum_dispatch]
 pub trait Store: Sync + Send {
     fn get_by_host(&self, host: &str) -> Option<net::IpAddr>;
     fn get_v6_by_host(&self, host: &str) -> Option<net::IpAddr>;
@@ -40,6 +38,82 @@ pub trait Store: Sync + Send {
     fn del_by_ip(&self, ip: net::IpAddr);
     fn exist(&self, ip: net::IpAddr) -> bool;
     fn copy_to(&self, store: &dyn Store);
+
+    fn initial_offset_v4(&self, _min: u32, _max: u32) -> u32 {
+        0
+    }
+    fn initial_offset_v6(
+        &self,
+        _prefix: &[u8; 16],
+        _prefix_len: u8,
+        _min_host: u128,
+        _max_host: u128,
+    ) -> u128 {
+        0
+    }
+}
+
+#[enum_dispatch(Store)]
+pub enum FakeStore {
+    Memory(InMemStore),
+    File(FileStore),
+}
+
+pub struct Opts {
+    pub ipnet: ipnet::Ipv4Net,
+    pub ipnet6: ipnet::Ipv6Net,
+    pub domain_filter: Option<DomainFilter>,
+    pub filter_mode: FakeIpFilterMode,
+    pub cache_file: Option<ThreadSafeCacheFile>,
+    pub store: Option<FakeStore>,
+}
+
+pub(crate) fn compute_v4_range(ipnet: &ipnet::Ipv4Net) -> Result<(u32, u32), Error> {
+    let prefix_len = ipnet.prefix_len();
+    if prefix_len > 30 {
+        return Err(Error::InvalidConfig(format!(
+            "fake ip range {} is too small, need /30 or wider",
+            ipnet
+        )));
+    }
+    let host_bits = 32 - prefix_len;
+    let total: u32 = if host_bits >= 32 {
+        u32::MAX - 2
+    } else {
+        (1u32 << host_bits) - 2
+    };
+    let min = u32::from(ipnet.network()).saturating_add(2);
+    let max = min.saturating_add(total - 1);
+    Ok((min, max))
+}
+
+pub(crate) fn compute_v6_range(
+    ipnet6: &ipnet::Ipv6Net,
+) -> Result<([u8; 16], u8, u128, u128), Error> {
+    let prefix_len6 = ipnet6.prefix_len();
+    if prefix_len6 > 126 {
+        return Err(Error::InvalidConfig(format!(
+            "fake ipv6 range {} is too small, need /126 or wider",
+            ipnet6
+        )));
+    }
+    let host_bits = 128 - prefix_len6;
+    let max_host = if host_bits >= 128 {
+        u128::MAX - 2
+    } else {
+        (1u128 << host_bits) - 2
+    };
+    let prefix = ipnet6.network().octets();
+    let min_host = 1;
+    Ok((prefix, prefix_len6, min_host, max_host))
+}
+
+pub(crate) fn v6_prefix_mask(prefix_len: u8) -> u128 {
+    if prefix_len == 0 {
+        0
+    } else {
+        u128::MAX << (128 - prefix_len)
+    }
 }
 
 pub type ThreadSafeFakeDns = Arc<FakeDns>;
@@ -63,58 +137,57 @@ pub struct FakeDns {
     v6_pool: Option<FakePoolV6>,
     domain_filter: Option<DomainFilter>,
     filter_mode: FakeIpFilterMode,
-    store: Box<dyn Store>,
+    store: FakeStore,
     /// Memoized `should_skip` verdicts. Covers both static `fake-ip-filter`
     /// entries and `rule-set:` matches; cleared wholesale whenever one of the
     /// bound rule-sets reloads (see [`FakeDns::add_rule_set`]).
     skip_cache: Arc<quick_cache::sync::Cache<String, bool>>,
 }
 
+impl Opts {
+    #[allow(dead_code)]
+    pub fn new(ipnet: ipnet::Ipv4Net, ipnet6: ipnet::Ipv6Net) -> Self {
+        Self {
+            ipnet,
+            ipnet6,
+            domain_filter: None,
+            filter_mode: FakeIpFilterMode::Blacklist,
+            cache_file: None,
+            store: None,
+        }
+    }
+}
+
 impl FakeDns {
     pub fn new(opt: Opts) -> Result<Self, Error> {
-        // /31 and /32 leave no usable host addresses: `total` would underflow
-        // and `pool_size` in `get()` would end up zero, panicking on `% 0`.
-        // /0 would overflow the shift. Reject both up front.
-        let prefix_len = opt.ipnet.prefix_len();
-        if prefix_len > 30 {
-            return Err(Error::InvalidConfig(format!(
-                "fake ip range {} is too small, need /30 or wider",
-                opt.ipnet
-            )));
-        }
-        let host_bits = 32 - prefix_len;
-        let total: u32 = if host_bits >= 32 {
-            u32::MAX - 2
-        } else {
-            (1u32 << host_bits) - 2
+        let store = match opt.store {
+            Some(s) => s,
+            None => match opt.cache_file {
+                Some(cache_file) => FakeStore::File(FileStore::new(
+                    cache_file, opt.ipnet, opt.ipnet6,
+                )),
+                None => FakeStore::Memory(InMemStore::new(10000)),
+            },
         };
-        let min = u32::from(opt.ipnet.network()).saturating_add(2);
+
+        let (min, max) = compute_v4_range(&opt.ipnet)?;
+        let initial_offset_v4 = store.initial_offset_v4(min, max);
         let v4_pool = Some(FakePoolV4 {
             min,
-            max: min.saturating_add(total - 1),
-            offset: AtomicU32::new(0),
+            max,
+            offset: AtomicU32::new(initial_offset_v4),
         });
 
-        // Same reasoning as above: /127 and /128 make `max_host` underflow.
-        let prefix_len6 = opt.ipnet6.prefix_len();
-        if prefix_len6 > 126 {
-            return Err(Error::InvalidConfig(format!(
-                "fake ipv6 range {} is too small, need /126 or wider",
-                opt.ipnet6
-            )));
-        }
-        let host_bits = 128 - prefix_len6;
-        let max_host = if host_bits >= 128 {
-            u128::MAX - 2
-        } else {
-            (1u128 << host_bits) - 2
-        };
+        let (prefix, prefix_len6, min_host, max_host) =
+            compute_v6_range(&opt.ipnet6)?;
+        let initial_offset_v6 =
+            store.initial_offset_v6(&prefix, prefix_len6, min_host, max_host);
         let v6_pool = Some(FakePoolV6 {
-            prefix: opt.ipnet6.network().octets(),
+            prefix,
             prefix_len: prefix_len6,
-            min_host: 1,
+            min_host,
             max_host,
-            offset: AtomicU128::new(0),
+            offset: AtomicU128::new(initial_offset_v6),
         });
 
         Ok(Self {
@@ -122,7 +195,7 @@ impl FakeDns {
             v6_pool,
             domain_filter: opt.domain_filter,
             filter_mode: opt.filter_mode,
-            store: opt.store,
+            store,
             skip_cache: Arc::new(quick_cache::sync::Cache::new(1000)),
         })
     }
@@ -254,7 +327,7 @@ impl FakeDns {
 
     #[allow(dead_code)]
     pub fn copy_from(&self, src: &Self) {
-        src.store.copy_to(&*self.store);
+        src.store.copy_to(&self.store);
     }
 
     fn get(&self, host: &str) -> net::IpAddr {
@@ -374,7 +447,7 @@ mod tests {
     #[tokio::test]
     async fn test_inmem_basic() {
         let ipnet = "192.168.0.0/29".parse::<ipnet::IpNet>().unwrap();
-        let store = Box::new(InMemStore::new(10));
+        let store = InMemStore::new(10);
         let pool = FakeDns::new(Opts {
             ipnet: match ipnet {
                 ipnet::IpNet::V4(v4) => v4,
@@ -385,7 +458,8 @@ mod tests {
                 .unwrap(),
             domain_filter: None,
             filter_mode: FakeIpFilterMode::Blacklist,
-            store,
+            cache_file: None,
+            store: Some(store.into()),
         })
         .unwrap();
 
@@ -406,7 +480,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_inmem_cycle_used() {
-        let store = Box::new(InMemStore::new(10));
+        let store = InMemStore::new(10);
 
         let ipnet = "192.168.0.0/29".parse::<ipnet::IpNet>().unwrap();
         let pool = FakeDns::new(Opts {
@@ -419,7 +493,8 @@ mod tests {
                 .unwrap(),
             domain_filter: None,
             filter_mode: FakeIpFilterMode::Blacklist,
-            store,
+            cache_file: None,
+            store: Some(store.into()),
         })
         .unwrap();
 
@@ -438,7 +513,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_pool_skip() {
-        let store = Box::new(InMemStore::new(10));
+        let store = InMemStore::new(10);
 
         let ipnet = "192.168.0.0/30".parse::<ipnet::IpNet>().unwrap();
         let mut tree = trie::StringTrie::new();
@@ -454,7 +529,8 @@ mod tests {
                 .unwrap(),
             domain_filter: Some(DomainFilter::new(vec!["example.com"])),
             filter_mode: FakeIpFilterMode::Blacklist,
-            store,
+            cache_file: None,
+            store: Some(store.into()),
         })
         .unwrap();
 
@@ -473,7 +549,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_pool_skip_whitelist() {
-        let store = Box::new(InMemStore::new(10));
+        let store = InMemStore::new(10);
 
         let ipnet = "192.168.0.0/30".parse::<ipnet::IpNet>().unwrap();
         let pool = FakeDns::new(Opts {
@@ -486,7 +562,8 @@ mod tests {
                 .unwrap(),
             domain_filter: Some(DomainFilter::new(vec!["example.com"])),
             filter_mode: FakeIpFilterMode::Whitelist,
-            store,
+            cache_file: None,
+            store: Some(store.into()),
         })
         .unwrap();
 
@@ -505,7 +582,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_pool_skip_empty_filters() {
-        let store = Box::new(InMemStore::new(10));
+        let store = InMemStore::new(10);
         let ipnet = "192.168.0.0/30".parse::<ipnet::IpNet>().unwrap();
 
         // Blacklist with no filter -> nothing is skipped (all fake IP)
@@ -519,7 +596,8 @@ mod tests {
                 .unwrap(),
             domain_filter: None,
             filter_mode: FakeIpFilterMode::Blacklist,
-            store,
+            cache_file: None,
+            store: Some(store.into()),
         })
         .unwrap();
 
@@ -527,7 +605,7 @@ mod tests {
         assert!(!blacklist_pool.should_skip("foo.com"));
 
         // Whitelist with no filter -> everything is skipped (all real IP)
-        let store_wl = Box::new(InMemStore::new(10));
+        let store_wl = InMemStore::new(10);
         let whitelist_pool = FakeDns::new(Opts {
             ipnet: match ipnet {
                 ipnet::IpNet::V4(v4) => v4,
@@ -538,7 +616,8 @@ mod tests {
                 .unwrap(),
             domain_filter: None,
             filter_mode: FakeIpFilterMode::Whitelist,
-            store: store_wl,
+            cache_file: None,
+            store: Some(store_wl.into()),
         })
         .unwrap();
 
@@ -548,7 +627,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_pool_max_cache_size() {
-        let store = Box::new(InMemStore::new(2));
+        let store = InMemStore::new(2);
 
         let ipnet = "192.168.0.0/24".parse::<ipnet::IpNet>().unwrap();
         let pool = FakeDns::new(Opts {
@@ -561,7 +640,8 @@ mod tests {
                 .unwrap(),
             domain_filter: None,
             filter_mode: FakeIpFilterMode::Blacklist,
-            store,
+            cache_file: None,
+            store: Some(store.into()),
         })
         .unwrap();
 
@@ -578,7 +658,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "copy not implemented"]
     async fn test_pool_clone() {
-        let store = Box::new(InMemStore::new(2));
+        let store = InMemStore::new(2);
 
         let ipnet = "192.168.0.0/24".parse::<ipnet::IpNet>().unwrap();
         let pool = FakeDns::new(Opts {
@@ -591,7 +671,8 @@ mod tests {
                 .unwrap(),
             domain_filter: None,
             filter_mode: FakeIpFilterMode::Blacklist,
-            store,
+            cache_file: None,
+            store: Some(store.into()),
         })
         .unwrap();
 
@@ -600,7 +681,7 @@ mod tests {
         assert_eq!(first, net::IpAddr::from([192, 168, 0, 2]));
         assert_eq!(last, net::IpAddr::from([192, 168, 0, 3]));
 
-        let store = Box::new(InMemStore::new(2));
+        let store = InMemStore::new(2);
 
         let new_pool = FakeDns::new(Opts {
             ipnet: match ipnet {
@@ -612,7 +693,8 @@ mod tests {
                 .unwrap(),
             domain_filter: None,
             filter_mode: FakeIpFilterMode::Blacklist,
-            store,
+            cache_file: None,
+            store: Some(store.into()),
         })
         .unwrap();
 
@@ -624,7 +706,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_is_fake_ip_excludes_broadcast_and_unallocated() {
-        let store = Box::new(InMemStore::new(10));
+        let store = InMemStore::new(10);
 
         let ipnet = "198.18.0.0/16".parse::<ipnet::IpNet>().unwrap();
         let pool = FakeDns::new(Opts {
@@ -637,7 +719,8 @@ mod tests {
                 .unwrap(),
             domain_filter: None,
             filter_mode: FakeIpFilterMode::Blacklist,
-            store,
+            cache_file: None,
+            store: Some(store.into()),
         })
         .unwrap();
 
@@ -683,18 +766,20 @@ mod tests {
             ThreadSafeCacheFile::new(cache_path.to_str().unwrap(), true);
 
         let ipnet = "192.168.0.0/29".parse::<ipnet::IpNet>().unwrap();
-        let store = Box::new(FileStore::new(cache_store.clone()));
+        let v4 = match ipnet {
+            ipnet::IpNet::V4(v4) => v4,
+            _ => panic!(),
+        };
+        let v6 = "fdfe:5a70:6451:982b::/64"
+            .parse::<ipnet::Ipv6Net>()
+            .unwrap();
         let pool = FakeDns::new(Opts {
-            ipnet: match ipnet {
-                ipnet::IpNet::V4(v4) => v4,
-                _ => panic!(),
-            },
-            ipnet6: "fdfe:5a70:6451:982b::/64"
-                .parse::<ipnet::Ipv6Net>()
-                .unwrap(),
+            ipnet: v4,
+            ipnet6: v6,
             domain_filter: None,
             filter_mode: FakeIpFilterMode::Blacklist,
-            store,
+            cache_file: Some(cache_store.clone()),
+            store: None,
         })
         .unwrap();
 
@@ -746,7 +831,10 @@ mod tests {
         // Insert directly using cache_store set_host_to_ip
         cache_store.set_host_to_ip(host, ip_v4_str);
 
-        let store = FileStore::new(cache_store.clone());
+        let v4_net = "192.168.0.0/24".parse().unwrap();
+        let v6_net = "fdfe:5a70:6451:982b::/64".parse().unwrap();
+
+        let store = FileStore::new(cache_store.clone(), v4_net, v6_net);
 
         // Test lookup v4 from loaded legacy entry
         let res_v4 = store.get_by_host(host);
@@ -761,7 +849,7 @@ mod tests {
         let ip_v6_str = "fdfe:5a70:6451:982b::2";
         cache_store.set_host_to_ip(host_v6, ip_v6_str);
 
-        let store_v6 = FileStore::new(cache_store.clone());
+        let store_v6 = FileStore::new(cache_store.clone(), v4_net, v6_net);
         let res_v6_new = store_v6.get_v6_by_host(host_v6);
         assert_eq!(res_v6_new, Some(ip_v6_str.parse().unwrap()));
         assert_eq!(store_v6.get_by_host(host_v6), None);
@@ -776,16 +864,19 @@ mod tests {
         let v4_ip;
         let v6_ip;
 
+        let v4_net: ipnet::Ipv4Net = "198.18.0.0/16".parse().unwrap();
+        let v6_net: ipnet::Ipv6Net = "fdfe:5a70:6451:982b::/64".parse().unwrap();
+
         // 阶段 1：使用首个 FakeDns 实例分配 FakeIP 并持久化
         {
             let cache_store = ThreadSafeCacheFile::new(cache_path_str, true);
-            let store = Box::new(FileStore::new(cache_store));
             let pool = FakeDns::new(Opts {
-                ipnet: "198.18.0.0/16".parse().unwrap(),
-                ipnet6: "fdfe:5a70:6451:982b::/64".parse().unwrap(),
+                ipnet: v4_net,
+                ipnet6: v6_net,
                 domain_filter: None,
                 filter_mode: FakeIpFilterMode::Blacklist,
-                store,
+                cache_file: Some(cache_store),
+                store: None,
             })
             .unwrap();
 
@@ -801,13 +892,13 @@ mod tests {
         // 阶段 2：重启并创建全新实例，验证启动时预热加载至内存
         {
             let cache_store = ThreadSafeCacheFile::new(cache_path_str, true);
-            let store = Box::new(FileStore::new(cache_store));
             let pool = FakeDns::new(Opts {
-                ipnet: "198.18.0.0/16".parse().unwrap(),
-                ipnet6: "fdfe:5a70:6451:982b::/64".parse().unwrap(),
+                ipnet: v4_net,
+                ipnet6: v6_net,
                 domain_filter: None,
                 filter_mode: FakeIpFilterMode::Blacklist,
-                store,
+                cache_file: Some(cache_store),
+                store: None,
             })
             .unwrap();
 
@@ -818,6 +909,106 @@ mod tests {
             assert_eq!(pool.reverse_lookup(v6_ip), Some("google.com".into()));
             assert!(pool.exist(v4_ip));
             assert!(pool.exist(v6_ip));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_file_store_prune_on_subnet_change() {
+        let temp_dir = tempdir().unwrap();
+        let cache_path = temp_dir.path().join("test_prune.db");
+        let cache_path_str = cache_path.to_str().unwrap();
+
+        let old_v4: ipnet::Ipv4Net = "198.18.0.0/16".parse().unwrap();
+        let old_v6: ipnet::Ipv6Net = "fdfe:5a70:6451:982b::/64".parse().unwrap();
+
+        // 写入旧网段数据
+        {
+            let cache_store = ThreadSafeCacheFile::new(cache_path_str, true);
+            let pool = FakeDns::new(Opts {
+                ipnet: old_v4,
+                ipnet6: old_v6,
+                domain_filter: None,
+                filter_mode: FakeIpFilterMode::Blacklist,
+                cache_file: Some(cache_store.clone()),
+                store: None,
+            })
+            .unwrap();
+
+            let old_ip = pool.lookup("stale.com");
+            assert_eq!(old_ip, net::IpAddr::from([198, 18, 0, 2]));
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(2100)).await;
+
+        // 使用新网段启动
+        let new_v4: ipnet::Ipv4Net = "198.19.0.0/16".parse().unwrap();
+        let new_v6: ipnet::Ipv6Net = "fdfe:9999:6451:982b::/64".parse().unwrap();
+        {
+            let cache_store = ThreadSafeCacheFile::new(cache_path_str, true);
+            let pool = FakeDns::new(Opts {
+                ipnet: new_v4,
+                ipnet6: new_v6,
+                domain_filter: None,
+                filter_mode: FakeIpFilterMode::Blacklist,
+                cache_file: Some(cache_store.clone()),
+                store: None,
+            })
+            .unwrap();
+
+            // 旧条目不应命中，应当在新网段分配新 IP
+            let new_ip = pool.lookup("stale.com");
+            assert_eq!(new_ip, net::IpAddr::from([198, 19, 0, 2]));
+            assert_ne!(new_ip, net::IpAddr::from([198, 18, 0, 2]));
+
+            // 旧 IP 在 redb 中应已被修剪删除
+            assert_eq!(cache_store.get_fake_ip("198.18.0.2"), None);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_file_store_offset_recovery() {
+        let temp_dir = tempdir().unwrap();
+        let cache_path = temp_dir.path().join("test_offset.db");
+        let cache_path_str = cache_path.to_str().unwrap();
+
+        let v4_net: ipnet::Ipv4Net = "198.18.0.0/16".parse().unwrap();
+        let v6_net: ipnet::Ipv6Net = "fdfe:5a70:6451:982b::/64".parse().unwrap();
+
+        // 阶段 1：分配 3 个 IP
+        {
+            let cache_store = ThreadSafeCacheFile::new(cache_path_str, true);
+            let pool = FakeDns::new(Opts {
+                ipnet: v4_net,
+                ipnet6: v6_net,
+                domain_filter: None,
+                filter_mode: FakeIpFilterMode::Blacklist,
+                cache_file: Some(cache_store.clone()),
+                store: None,
+            })
+            .unwrap();
+
+            assert_eq!(pool.lookup("a.com"), net::IpAddr::from([198, 18, 0, 2]));
+            assert_eq!(pool.lookup("b.com"), net::IpAddr::from([198, 18, 0, 3]));
+            assert_eq!(pool.lookup("c.com"), net::IpAddr::from([198, 18, 0, 4]));
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(2100)).await;
+
+        // 阶段 2：重启后，offset 应恢复至 3（紧随 198.18.0.4 之后），分配新域名时直接得到 198.18.0.5
+        {
+            let cache_store = ThreadSafeCacheFile::new(cache_path_str, true);
+            let pool = FakeDns::new(Opts {
+                ipnet: v4_net,
+                ipnet6: v6_net,
+                domain_filter: None,
+                filter_mode: FakeIpFilterMode::Blacklist,
+                cache_file: Some(cache_store.clone()),
+                store: None,
+            })
+            .unwrap();
+
+            let next_ip = pool.lookup("d.com");
+            assert_eq!(next_ip, net::IpAddr::from([198, 18, 0, 5]));
         }
     }
 }

@@ -206,18 +206,14 @@ async fn test_dns_resolution_hook_end_to_end_on_exchange() {
 
 #[tokio::test]
 async fn test_fake_ip_exchange() {
-    use crate::app::dns::fakeip::{FakeDns, InMemStore, Opts};
+    use crate::app::dns::fakeip::{FakeDns, Opts};
     use crate::app::dns::query::{DnsName, QType, build_dns_query_wire_with_id};
-    use crate::config::def::FakeIpFilterMode;
 
     let fake_dns = Arc::new(
-        FakeDns::new(Opts {
-            ipnet: "198.18.0.1/16".parse().unwrap(),
-            ipnet6: "fc00::/18".parse().unwrap(),
-            domain_filter: None,
-            filter_mode: FakeIpFilterMode::Blacklist,
-            store: Box::new(InMemStore::new(1000)),
-        })
+        FakeDns::new(Opts::new(
+            "198.18.0.1/16".parse().unwrap(),
+            "fc00::/18".parse().unwrap(),
+        ))
         .unwrap(),
     );
 

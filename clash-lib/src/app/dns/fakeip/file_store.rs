@@ -1,4 +1,4 @@
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
@@ -21,44 +21,151 @@ pub struct FileStore {
     cache: InMemStore,
     file: ThreadSafeCacheFile,
     tx: Option<mpsc::UnboundedSender<FakeIpCommand>>,
+    initial_v4_offset: u32,
+    initial_v6_offset: u128,
 }
 
 impl FileStore {
-    pub fn new(store: ThreadSafeCacheFile) -> Self {
-        Self::with_capacity(store, 10_000)
+    pub fn new(
+        store: ThreadSafeCacheFile,
+        ipnet: ipnet::Ipv4Net,
+        ipnet6: ipnet::Ipv6Net,
+    ) -> Self {
+        Self::with_capacity(store, 10_000, ipnet, ipnet6)
     }
 
-    pub fn with_capacity(store: ThreadSafeCacheFile, capacity: usize) -> Self {
+    pub fn with_capacity(
+        store: ThreadSafeCacheFile,
+        capacity: usize,
+        ipnet: ipnet::Ipv4Net,
+        ipnet6: ipnet::Ipv6Net,
+    ) -> Self {
+        let (min_v4, max_v4) = super::compute_v4_range(&ipnet).unwrap_or((u32::MAX, 0));
+        let (prefix_v6, prefix_len_v6, min_host_v6, max_host_v6) =
+            super::compute_v6_range(&ipnet6).unwrap_or(([0; 16], 128, 1, 0));
+        let mask_v6 = super::v6_prefix_mask(prefix_len_v6);
+        let prefix_u128_v6 = u128::from_be_bytes(prefix_v6) & mask_v6;
+
+        let is_valid_v4 = |v4: Ipv4Addr| -> bool {
+            if v4.is_broadcast() || v4.is_multicast() {
+                return false;
+            }
+            let u = u32::from(v4);
+            u >= min_v4 && u <= max_v4
+        };
+
+        let is_valid_v6 = |v6: Ipv6Addr| -> bool {
+            if v6.is_multicast() {
+                return false;
+            }
+            let u = u128::from(v6);
+            if u & mask_v6 != prefix_u128_v6 {
+                return false;
+            }
+            let host_id = u & !mask_v6;
+            host_id >= min_host_v6 && host_id <= max_host_v6
+        };
+
         let (host_to_ip, ip_to_host) = store.get_fake_ip_tables();
         let total_entries = ip_to_host.len();
         let cache = InMemStore::new(capacity.max(total_entries.max(host_to_ip.len())));
 
-        // 预热 host_to_ip 表
+        let mut max_v4_offset: Option<u32> = None;
+        let mut max_v6_offset: Option<u128> = None;
+        let mut stale_deletes = Vec::new();
+        let mut valid_count = 0;
+
+        // 预热 host_to_ip 表并过滤旧网段
         for (host_key, ip_str) in host_to_ip {
             if let Ok(ip) = ip_str.parse::<IpAddr>() {
-                if let Some(host) = host_key.strip_suffix("#v4") {
-                    if ip.is_ipv4() {
-                        cache.put_by_host(host, ip);
-                    }
-                } else if let Some(host) = host_key.strip_suffix("#v6") {
-                    if ip.is_ipv6() {
-                        cache.put_by_host(host, ip);
+                let is_valid = match ip {
+                    IpAddr::V4(v4) => is_valid_v4(v4),
+                    IpAddr::V6(v6) => is_valid_v6(v6),
+                };
+
+                if is_valid {
+                    if let Some(host) = host_key.strip_suffix("#v4") {
+                        if ip.is_ipv4() {
+                            cache.put_by_host(host, ip);
+                        }
+                    } else if let Some(host) = host_key.strip_suffix("#v6") {
+                        if ip.is_ipv6() {
+                            cache.put_by_host(host, ip);
+                        }
+                    } else {
+                        // 兼容旧格式无后缀 key
+                        cache.put_by_host(&host_key, ip);
                     }
                 } else {
-                    // 兼容旧格式无后缀 key
-                    cache.put_by_host(&host_key, ip);
+                    stale_deletes.push((ip_str, Some(host_key)));
                 }
+            } else {
+                stale_deletes.push((ip_str, Some(host_key)));
             }
         }
 
-        // 预热 ip_to_host 表
+        // 预热 ip_to_host 表并计算最大 offset
         for (ip_str, host) in ip_to_host {
             if let Ok(ip) = ip_str.parse::<IpAddr>() {
-                cache.put_by_ip(ip, &host);
+                let is_valid = match ip {
+                    IpAddr::V4(v4) => {
+                        if is_valid_v4(v4) {
+                            let offset = u32::from(v4) - min_v4;
+                            max_v4_offset = Some(max_v4_offset.map_or(offset, |m| m.max(offset)));
+                            true
+                        } else {
+                            false
+                        }
+                    }
+                    IpAddr::V6(v6) => {
+                        if is_valid_v6(v6) {
+                            let host_id = (u128::from(v6)) & !mask_v6;
+                            let offset = host_id - min_host_v6;
+                            max_v6_offset = Some(max_v6_offset.map_or(offset, |m| m.max(offset)));
+                            true
+                        } else {
+                            false
+                        }
+                    }
+                };
+
+                if is_valid {
+                    cache.put_by_ip(ip, &host);
+                    valid_count += 1;
+                } else {
+                    let host_key = Self::make_host_key(&host, ip.is_ipv6());
+                    stale_deletes.push((ip_str, Some(host_key)));
+                }
+            } else {
+                stale_deletes.push((ip_str, None));
             }
         }
 
-        info!("loaded {} fake-ip entries from cache file", total_entries);
+        // 若存在不属于当前网段的历史条目，批量物理修剪清除
+        if !stale_deletes.is_empty() {
+            let stale_count = stale_deletes.len();
+            store.apply_fake_ip_batch(&[], &stale_deletes);
+            info!(
+                "loaded {} valid fake-ip entries, pruned {} stale entries from cache file",
+                valid_count, stale_count
+            );
+        } else {
+            info!("loaded {} fake-ip entries from cache file", total_entries);
+        }
+
+        let pool_size_v4 = (max_v4 - min_v4).saturating_add(1);
+        let initial_v4_offset = if pool_size_v4 > 0 {
+            max_v4_offset.map(|o| (o + 1) % pool_size_v4).unwrap_or(0)
+        } else {
+            0
+        };
+
+        let pool_size_v6 = (max_host_v6 - min_host_v6).saturating_add(1);
+        let initial_v6_offset = if pool_size_v6 > 0 {
+            max_v6_offset.map(|o| (o + 1) % pool_size_v6).unwrap_or(0)
+        } else {
+            0
+        };
 
         // 启动后台异步定时批量持久化 Worker
         let tx = if tokio::runtime::Handle::try_current().is_ok() {
@@ -121,6 +228,8 @@ impl FileStore {
             cache,
             file: store,
             tx,
+            initial_v4_offset,
+            initial_v6_offset,
         }
     }
 
@@ -207,5 +316,19 @@ impl Store for FileStore {
 
     fn copy_to(&self, #[allow(unused)] store: &dyn Store) {
         // NO-OP
+    }
+
+    fn initial_offset_v4(&self, _min: u32, _max: u32) -> u32 {
+        self.initial_v4_offset
+    }
+
+    fn initial_offset_v6(
+        &self,
+        _prefix: &[u8; 16],
+        _prefix_len: u8,
+        _min_host: u128,
+        _max_host: u128,
+    ) -> u128 {
+        self.initial_v6_offset
     }
 }

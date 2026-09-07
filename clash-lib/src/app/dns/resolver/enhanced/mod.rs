@@ -20,7 +20,7 @@ use rand::seq::IteratorRandom;
 use tracing::{debug, instrument, trace};
 
 use crate::app::dns::config::{Config, NameServer};
-use crate::app::dns::fakeip::{self, FileStore, InMemStore, ThreadSafeFakeDns};
+use crate::app::dns::fakeip::{self, ThreadSafeFakeDns};
 use crate::app::dns::filters::{BlackDomainFilter, DomainFilter, FallbackFilter, PendingMmdb};
 use crate::app::dns::query::{DnsName, QType, QueryContext, build_dns_query_wire};
 use crate::app::dns::response::{
@@ -222,11 +222,8 @@ impl EnhancedResolver {
                         Some(DomainFilter::new(cfg.fake_ip_filter))
                     },
                     filter_mode: cfg.fake_ip_filter_mode,
-                    store: if cfg.store_fake_ip {
-                        Box::new(FileStore::new(store))
-                    } else {
-                        Box::new(InMemStore::new(1000))
-                    },
+                    cache_file: if cfg.store_fake_ip { Some(store) } else { None },
+                    store: None,
                 })
                 .expect("failed to create fake ip"),
             )),
