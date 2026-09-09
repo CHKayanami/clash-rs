@@ -588,6 +588,9 @@ pub struct Config {
     pub log_level: LogLevel,
     /// DNS client/server settings
     pub dns: DNS,
+    /// Next-generation router DNS client/server settings
+    #[serde(default)]
+    pub dns2: Option<Dns2Config>,
     /// Profile settings
     pub profile: Profile,
     /// Domain Sniffer settings
@@ -925,6 +928,112 @@ pub struct DNS {
 fn default_stale_cache_retention() -> u32 {
     3600
 }
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(untagged)]
+pub enum Dns2StringOrList {
+    Single(String),
+    List(Vec<String>),
+}
+
+impl Dns2StringOrList {
+    pub fn into_vec(self) -> Vec<String> {
+        match self {
+            Self::Single(s) => vec![s],
+            Self::List(l) => l,
+        }
+    }
+
+    pub fn as_slice(&self) -> &[String] {
+        match self {
+            Self::Single(s) => std::slice::from_ref(s),
+            Self::List(l) => l.as_slice(),
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Educe)]
+#[serde(rename_all = "kebab-case", default)]
+#[educe(Default)]
+pub struct Dns2Config {
+    pub enable: bool,
+    pub listen: Option<DNSListen>,
+    pub ipv6: bool,
+    #[educe(Default = true)]
+    pub use_hosts: bool,
+    #[serde(alias = "hosts-file", alias = "hosts_files", alias = "hosts_file")]
+    pub hosts_files: Vec<String>,
+    pub hosts: HashMap<String, Dns2StringOrList>,
+    #[serde(alias = "bootstrap")]
+    pub default_nameserver: Vec<String>,
+    pub proxy_server_nameserver: Vec<String>,
+    pub upstreams: Vec<Dns2UpstreamDef>,
+    pub routing: Dns2RoutingDef,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Educe)]
+#[serde(rename_all = "kebab-case", default)]
+#[educe(Default)]
+pub struct Dns2UpstreamDef {
+    pub tag: String,
+    #[serde(rename = "type")]
+    pub r#type: String,
+    #[serde(alias = "server", alias = "address")]
+    pub servers: Option<Dns2StringOrList>,
+    #[serde(alias = "detour")]
+    pub proxy: Option<String>,
+    pub client_subnet: Option<String>,
+    #[educe(Default = "198.18.0.1/16".to_string())]
+    pub inet4_range: String,
+    #[educe(Default = "fc00::/18".to_string())]
+    pub inet6_range: String,
+    pub ttl: Option<u32>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[serde(rename_all = "kebab-case", default)]
+pub struct Dns2RoutingDef {
+    pub request: Vec<Dns2RequestRuleDef>,
+    pub response: Vec<Dns2ResponseRuleDef>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[serde(rename_all = "kebab-case", default)]
+pub struct Dns2RequestRuleDef {
+    pub domain: Vec<String>,
+    #[serde(alias = "rule-set")]
+    pub rule_set: Vec<String>,
+    #[serde(alias = "query-type")]
+    pub query_type: Vec<String>,
+    #[serde(alias = "source-ip-cidr", alias = "source_ip", alias = "sip")]
+    pub source_ip_cidr: Vec<String>,
+    #[serde(alias = "server")]
+    pub upstream: Option<String>,
+    pub action: Option<String>,
+    pub reject_code: Option<String>,
+    pub fallback: Option<String>,
+    pub invert: bool,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[serde(rename_all = "kebab-case", default)]
+pub struct Dns2ResponseRuleDef {
+    #[serde(alias = "from-upstream", alias = "from_upstream")]
+    pub from_upstream: Option<String>,
+    pub domain: Vec<String>,
+    #[serde(alias = "rule-set")]
+    pub rule_set: Vec<String>,
+    #[serde(alias = "query-type")]
+    pub query_type: Vec<String>,
+    #[serde(alias = "ip-cidr", alias = "ip")]
+    pub ip_cidr: Vec<String>,
+    #[serde(alias = "to-upstream", alias = "server", alias = "requery")]
+    pub upstream: Option<String>,
+    pub action: Option<String>,
+    pub fallback: Option<String>,
+    pub invert: bool,
+}
+
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(untagged)]

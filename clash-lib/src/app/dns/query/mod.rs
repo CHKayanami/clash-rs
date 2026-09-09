@@ -64,7 +64,8 @@ pub fn validate_exact_dns_query(data: &[u8]) -> Option<ValidatedDnsQuery> {
             {
                 return None;
             }
-            let rdlength = usize::from(u16::from_be_bytes([data[pos + 8], data[pos + 9]]));
+            let rdlength =
+                usize::from(u16::from_be_bytes([data[pos + 8], data[pos + 9]]));
             pos += 10; // TYPE + CLASS + TTL + RDLENGTH
             let rdata_end = pos.checked_add(rdlength)?;
             if rdata_end > data.len() {
@@ -93,7 +94,11 @@ pub fn is_exact_dns_query(data: &[u8]) -> bool {
 
 /// Bounds-safe name walk that enforces the RFC expanded-name limit and
 /// restricts compression pointers to previously observed label boundaries.
-fn skip_strict_dns_name(data: &[u8], pos: &mut usize, label_boundaries: &mut [bool]) -> bool {
+fn skip_strict_dns_name(
+    data: &[u8],
+    pos: &mut usize,
+    label_boundaries: &mut [bool],
+) -> bool {
     let mut cursor = *pos;
     let mut expanded = 0usize;
     let mut jumped = false;
@@ -128,7 +133,10 @@ fn skip_strict_dns_name(data: &[u8], pos: &mut usize, label_boundaries: &mut [bo
                 return false;
             };
             let target = (usize::from(label_len & 0x3f) << 8) | usize::from(next);
-            if target >= cursor || target >= label_boundaries.len() || !label_boundaries[target] {
+            if target >= cursor
+                || target >= label_boundaries.len()
+                || !label_boundaries[target]
+            {
                 return false;
             }
             if !jumped {
@@ -226,7 +234,10 @@ impl std::str::FromStr for QType {
         if let Ok(num) = trimmed.parse::<u16>() {
             return Ok(Self(num));
         }
-        if let Some(rest) = trimmed.strip_prefix("TYPE").or_else(|| trimmed.strip_prefix("type")) {
+        if let Some(rest) = trimmed
+            .strip_prefix("TYPE")
+            .or_else(|| trimmed.strip_prefix("type"))
+        {
             if let Ok(num) = rest.parse::<u16>() {
                 return Ok(Self(num));
             }
@@ -325,7 +336,11 @@ pub fn build_dns_query_wire(name: &DnsName, qtype: QType) -> Vec<u8> {
 }
 
 /// Builds a standard DNS query wire packet with a specific TxID.
-pub fn build_dns_query_wire_with_id(tx_id: u16, name: &DnsName, qtype: QType) -> Vec<u8> {
+pub fn build_dns_query_wire_with_id(
+    tx_id: u16,
+    name: &DnsName,
+    qtype: QType,
+) -> Vec<u8> {
     let wire_name = name.as_wire();
     let mut buf = Vec::with_capacity(12 + wire_name.len() + 4);
     buf.extend_from_slice(&tx_id.to_be_bytes());
@@ -448,7 +463,7 @@ pub struct QueryContext {
     txid: TxId,
     flags: u16,
     questions: Vec<Question>,
-    cached_domain: Option<String>,
+    cached_domain: Option<Arc<str>>,
     edns: Option<EdnsMetadata>,
     ingress: IngressProfile,
     canonical_wire: Arc<[u8]>,
@@ -474,7 +489,10 @@ impl QueryContext {
         Self::parse_with_profile(raw, IngressProfile::default())
     }
 
-    pub fn parse_with_profile(raw: &[u8], ingress: IngressProfile) -> Result<Self, QueryError> {
+    pub fn parse_with_profile(
+        raw: &[u8],
+        ingress: IngressProfile,
+    ) -> Result<Self, QueryError> {
         if raw.len() < HEADER_LEN {
             return Err(QueryError::HeaderTruncated);
         }
@@ -502,8 +520,10 @@ impl QueryContext {
                 qtype,
                 qclass,
                 offsets: QuestionOffsets {
-                    start: u32::try_from(start).map_err(|_| QueryError::TruncatedField)?,
-                    end: u32::try_from(cursor).map_err(|_| QueryError::TruncatedField)?,
+                    start: u32::try_from(start)
+                        .map_err(|_| QueryError::TruncatedField)?,
+                    end: u32::try_from(cursor)
+                        .map_err(|_| QueryError::TruncatedField)?,
                 },
             });
         }
@@ -545,7 +565,9 @@ impl QueryContext {
                     && value.extended_rcode == 0
                     && value.flags & !0x8000 == 0
             });
-        let cached_domain = questions.first().and_then(|q| q.name.to_domain_name());
+        let cached_domain = questions
+            .first()
+            .and_then(|q| q.name.to_domain_name().map(Arc::from));
         Ok(Self {
             txid,
             flags,
@@ -570,6 +592,10 @@ impl QueryContext {
         self.cached_domain.as_deref()
     }
 
+    pub fn qdomain_arc(&self) -> Option<Arc<str>> {
+        self.cached_domain.clone()
+    }
+
     pub fn qtype(&self) -> Option<QType> {
         self.questions.first().map(|question| question.qtype)
     }
@@ -582,7 +608,9 @@ impl QueryContext {
         self.questions.first().map(|question| question.offsets)
     }
 
-    pub fn all_question_offsets(&self) -> impl ExactSizeIterator<Item = QuestionOffsets> + '_ {
+    pub fn all_question_offsets(
+        &self,
+    ) -> impl ExactSizeIterator<Item = QuestionOffsets> + '_ {
         self.questions.iter().map(|question| question.offsets)
     }
 
@@ -618,7 +646,9 @@ impl QueryContext {
         self.flags
     }
 
-    pub fn questions(&self) -> impl ExactSizeIterator<Item = (&DnsName, QType, QClass)> {
+    pub fn questions(
+        &self,
+    ) -> impl ExactSizeIterator<Item = (&DnsName, QType, QClass)> {
         self.questions
             .iter()
             .map(|question| (&question.name, question.qtype, question.qclass))

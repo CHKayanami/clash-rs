@@ -885,8 +885,8 @@ impl ClashResolver for EnhancedResolver {
 }
 
 pub struct BootstrapResolver {
-    pool: Arc<UpstreamPool>,
-    upstreams: Vec<String>,
+    pub pool: Arc<UpstreamPool>,
+    pub upstreams: Vec<String>,
 }
 
 #[async_trait]

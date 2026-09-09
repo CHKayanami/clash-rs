@@ -1,4 +1,5 @@
 mod enhanced;
+pub mod router;
 
 #[cfg(all(target_feature = "crt-static", target_env = "gnu"))]
 #[path = "system_static_crt.rs"]
@@ -11,6 +12,7 @@ mod system;
 use std::sync::Arc;
 
 pub use enhanced::EnhancedResolver;
+pub use router::RouterResolver;
 pub use system::SystemResolver;
 
 use super::{Config, ThreadSafeDNSResolver};
@@ -22,13 +24,29 @@ use crate::{
 };
 
 pub async fn new(
-    cfg: Config,
+    mut cfg: Config,
     store: Option<ThreadSafeCacheFile>,
     mmdb: Option<PendingMmdb>,
     outbounds: OutboundHandlerRegistry,
     rule_dispatch: Option<Arc<RuleDispatch>>,
     collector: Option<super::ThreadSafeDnsCollector>,
 ) -> ThreadSafeDNSResolver {
+    if let Some(ref d2) = cfg.dns2 {
+        if d2.enable {
+            let dns2_cfg = cfg.dns2.take().unwrap();
+            return Arc::new(
+                RouterResolver::new(
+                    dns2_cfg,
+                    cfg.fw_mark,
+                    store,
+                    outbounds,
+                    collector,
+                )
+                .await,
+            );
+        }
+    }
+
     if cfg.enable {
         match store {
             Some(store) => Arc::new(

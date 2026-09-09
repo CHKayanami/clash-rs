@@ -1,9 +1,13 @@
 use crate::{
     Error,
-    app::net::{OutboundInterface, get_interface_by_name, get_outbound_interface},
+    app::{
+        dns::resolver::router::config::RouterConfig,
+        net::{OutboundInterface, get_interface_by_name, get_outbound_interface},
+    },
     common::trie,
     config::def::{
-        DNSListen, DNSMode, EdnsClientSubnet as DefEdnsClientSubnet, FakeIpFilterMode,
+        DNSListen, DNSMode, EdnsClientSubnet as DefEdnsClientSubnet,
+        FakeIpFilterMode,
     },
 };
 
@@ -46,10 +50,13 @@ impl std::str::FromStr for DNSNetMode {
             )),
             "quic" | "doq" => Ok(Self::Quic),
             "h3" | "doh3" => Ok(Self::H3),
-            _ => Err(crate::Error::InvalidConfig(format!("unsupported DNS protocol: {s}"))),
+            _ => Err(crate::Error::InvalidConfig(format!(
+                "unsupported DNS protocol: {s}"
+            ))),
         }
     }
 }
+use super::query::QType;
 use ipnet::{AddrParseError, Ipv4Net, Ipv6Net};
 use std::{
     collections::{HashMap, HashSet},
@@ -57,7 +64,6 @@ use std::{
     net::{IpAddr, SocketAddr},
     sync::Arc,
 };
-use super::query::QType;
 use tracing::warn;
 use url::Url;
 pub use watfaq_dns::{DNSListenAddr, DoH3Config, DoHConfig, DoTConfig};
@@ -128,6 +134,7 @@ pub struct Config {
     pub fixed_domain_ttl: HashMap<String, u32>,
     pub stale_cache_retention: u32,
     pub qtype_filter: HashSet<QType>,
+    pub dns2: Option<crate::app::dns::resolver::router::config::RouterConfig>,
 }
 
 impl Config {
@@ -399,13 +406,20 @@ impl TryFrom<&crate::config::def::Config> for Config {
         let nameserver_policy =
             Config::parse_nameserver_policy(&dc.nameserver_policy)?;
 
-        if dc.default_nameserver.is_empty() {
-            return Err(Error::InvalidConfig(String::from(
-                "default nameserver empty",
-            )));
-        }
+        let dns2_enabled = c.dns2.as_ref().map(|d| d.enable).unwrap_or(false);
+        let default_nameserver_raw = if dc.default_nameserver.is_empty() {
+            if dns2_enabled {
+                vec!["223.5.5.5".to_string()]
+            } else {
+                return Err(Error::InvalidConfig(String::from(
+                    "default nameserver empty",
+                )));
+            }
+        } else {
+            dc.default_nameserver.clone()
+        };
 
-        let default_nameserver = Config::parse_nameserver(&dc.default_nameserver)?;
+        let default_nameserver = Config::parse_nameserver(&default_nameserver_raw)?;
 
         for ns in &default_nameserver {
             if let url::Host::Domain(_) = ns.host {
@@ -565,11 +579,22 @@ impl TryFrom<&crate::config::def::Config> for Config {
                 let mut set = HashSet::new();
                 for entry in &dc.qtype_filter {
                     let qtype = entry.parse::<QType>().map_err(|e| {
-                        Error::InvalidConfig(format!("invalid `qtype-filter` entry: {e}"))
+                        Error::InvalidConfig(format!(
+                            "invalid `qtype-filter` entry: {e}"
+                        ))
                     })?;
                     set.insert(qtype);
                 }
                 set
+            },
+            dns2: if let Some(d2) = &c.dns2 {
+                if d2.enable {
+                    Some(RouterConfig::from_def(d2, c.ipv6)?)
+                } else {
+                    None
+                }
+            } else {
+                None
             },
         })
     }
@@ -659,7 +684,10 @@ mod tests {
         let mut policy_map = std::collections::HashMap::new();
         policy_map.insert(
             "geosite:cn,private".to_string(),
-            NameServerPolicyValue::List(vec!["114.114.114.114".to_string(), "223.5.5.5".to_string()]),
+            NameServerPolicyValue::List(vec![
+                "114.114.114.114".to_string(),
+                "223.5.5.5".to_string(),
+            ]),
         );
         policy_map.insert(
             "rule-set:adblock".to_string(),

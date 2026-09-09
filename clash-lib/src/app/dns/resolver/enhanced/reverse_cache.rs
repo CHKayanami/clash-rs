@@ -73,6 +73,7 @@ impl Expiry<IpAddr, ReverseEntry> for ReverseExpiry {
 }
 
 /// Thread-safe reverse DNS lookup cache with per-entry TTL and conflict resolution.
+#[derive(Clone)]
 pub struct ReverseLookupCache {
     inner: Cache<IpAddr, ReverseEntry>,
 }

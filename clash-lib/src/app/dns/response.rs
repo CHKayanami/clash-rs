@@ -5,7 +5,9 @@ use std::sync::Arc;
 use bytes::Bytes;
 use thiserror::Error;
 
-use super::query::{IngressProfile, NameParseState, QueryContext, TxId, parse_name, skip_name};
+use super::query::{
+    IngressProfile, NameParseState, QType, QueryContext, TxId, parse_name, skip_name,
+};
 
 const HEADER_LEN: usize = 12;
 const QR: u16 = 0x8000;
@@ -49,7 +51,8 @@ struct RecordBoundary {
 
 #[derive(Debug, Clone)]
 pub struct ResponseTemplate {
-    request_identity: Arc<[u8]>,
+    domain: Arc<str>,
+    qtype: QType,
     wire: Bytes,
     question_end: usize,
     records: Vec<RecordBoundary>,
@@ -62,8 +65,13 @@ impl ResponseTemplate {
 
     pub fn validate(request: &QueryContext, response: &[u8]) -> Result<Self, ResponseError> {
         let (question_end, records) = validate_layout(request, response)?;
+        let domain = request
+            .qdomain_arc()
+            .unwrap_or_else(|| Arc::from(""));
+        let qtype = request.qtype().unwrap_or(QType::A);
         Ok(Self {
-            request_identity: request.canonical_wire_arc(),
+            domain,
+            qtype,
             wire: Bytes::copy_from_slice(response),
             question_end,
             records,
@@ -75,35 +83,55 @@ impl ResponseTemplate {
         response: Bytes,
     ) -> Result<Self, ResponseError> {
         let (question_end, records) = validate_layout(request, &response)?;
+        let domain = request
+            .qdomain_arc()
+            .unwrap_or_else(|| Arc::from(""));
+        let qtype = request.qtype().unwrap_or(QType::A);
         Ok(Self {
-            request_identity: request.canonical_wire_arc(),
+            domain,
+            qtype,
             wire: response,
             question_end,
             records,
         })
     }
 
+    pub fn domain(&self) -> &str {
+        &self.domain
+    }
+
+    pub fn qtype(&self) -> QType {
+        self.qtype
+    }
+
     pub fn render(&self, caller: &QueryContext) -> Result<Vec<u8>, ResponseError> {
-        if caller.canonical_wire() != self.request_identity.as_ref() {
-            return Err(ResponseError::RequestIdentityMismatch);
+        if caller.qdomain() != Some(&self.domain) || caller.qtype() != Some(self.qtype) {
+            return Err(ResponseError::QuestionMismatch);
         }
         match caller.ingress() {
             IngressProfile::Udp { advertised_size } => {
-                self.render_udp(caller.txid(), usize::from(advertised_size))
+                self.render_udp(caller, usize::from(advertised_size))
             }
             IngressProfile::Tcp | IngressProfile::Api | IngressProfile::Internal => {
-                let mut response = self.wire.to_vec();
-                set_txid(&mut response, caller.txid())?;
-                Ok(response)
+                self.render_full(caller)
             }
         }
     }
 
-    fn render_udp(&self, txid: TxId, limit: usize) -> Result<Vec<u8>, ResponseError> {
+    fn render_full(&self, caller: &QueryContext) -> Result<Vec<u8>, ResponseError> {
+        let mut response = self.wire.to_vec();
+        set_txid(&mut response, caller.txid())?;
+        if let Some(qw) = caller.question_wire() {
+            if 12 + qw.len() == self.question_end && response.len() >= self.question_end {
+                response[12..self.question_end].copy_from_slice(qw);
+            }
+        }
+        Ok(response)
+    }
+
+    fn render_udp(&self, caller: &QueryContext, limit: usize) -> Result<Vec<u8>, ResponseError> {
         if self.wire.len() <= limit {
-            let mut response = self.wire.to_vec();
-            set_txid(&mut response, txid)?;
-            return Ok(response);
+            return self.render_full(caller);
         }
         let prefix = self
             .wire
@@ -111,6 +139,11 @@ impl ResponseTemplate {
             .ok_or(ResponseError::MalformedRecord)?;
         let mut response = Vec::with_capacity(limit.max(prefix.len()));
         response.extend_from_slice(prefix);
+        if let Some(qw) = caller.question_wire() {
+            if 12 + qw.len() == self.question_end && response.len() >= self.question_end {
+                response[12..self.question_end].copy_from_slice(qw);
+            }
+        }
         let mut counts = [0u16; 3];
         for record in &self.records {
             let record_wire = self
@@ -128,7 +161,7 @@ impl ResponseTemplate {
             };
             counts[index] = counts[index].saturating_add(1);
         }
-        set_txid(&mut response, txid)?;
+        set_txid(&mut response, caller.txid())?;
         let flags = read_u16(&response, 2)? | TC;
         write_u16(&mut response, 2, flags)?;
         write_u16(&mut response, 6, counts[0])?;

@@ -19,6 +19,128 @@ dns:
     "+.google.com":"1.1.1.1#myproxy"
     "+.cloudflare-quic.com":"1.1.1.1#myproxy"
 
+dns2:
+  enable: true           # 是否启用 dns2 子系统
+
+  ipv6: true             # 是否解析并返回 IPv6 (AAAA) 记录
+
+  # DNS 监听地址（支持与 dns: 相同的监听格式，可同时启用 UDP/TCP/DoT/DoH/DoH3）
+  listen:
+    udp: 0.0.0.0:1053
+
+  # 是否优先查询静态 hosts 映射表（内存零网络开销快速直出）
+  use-hosts: true
+
+  # 静态自定义 hosts 映射表（支持单个 IP 或 IP 列表）
+  hosts:
+    "green.nas": "192.168.10.111"
+
+  # 外部 hosts 文件路径列表（支持多文件，按行解析）
+  hosts-files:
+    # - /etc/hosts
+    # - ./custom-hosts.txt
+
+  # 引导 DNS (Bootstrap) — 仅用于解析上游服务器列表中的 DoH/DoT 域名（必须填纯 IP）
+  default-nameserver:
+    - 223.5.5.5
+
+
+  # 专用于解析代理节点出站服务器域名（proxy server domain）的直连 DNS 列表
+  # proxy-server-nameserver:
+  #   - 119.29.29.29
+  #   - 223.5.5.5
+
+  # ── 上游端点配置 (Upstreams) ────────────────────────────────────────────────
+  # 支持定义多种类型的上游：
+  #   - remote: 远程 DNS 服务器池（支持普通 UDP、DoT、DoH、指定出站代理 detour 等）
+  #   - local:  本机直连系统 libc 解析器（lookup_host）
+  #   - fakeip: Fake-IP 虚拟 IP 分配池
+  #   - reject: 阻断/拦截解析器（返回 nodata、nxdomain 或 refused）
+  upstreams:
+    # 1. 默认直连国内 DNS (Remote)
+    - tag: direct-dns
+      type: remote
+      server:
+        - 223.5.5.5
+        - 119.29.29.29
+
+    # 2. 经由代理节点解析的海外清洁 DNS (Remote via Proxy Detour)
+    - tag: proxy-dns
+      type: remote
+      server:
+        - https://1.1.1.1/dns-query
+        - tls://8.8.8.8:853
+      proxy: myProxy          # 绑定的出站代理组或节点名称 (detour)
+
+    # 3. 本机系统默认 DNS (Local libc)
+    - tag: local-dns
+      type: local
+
+    # 4. Fake-IP 分配池 (Fake-IP)
+    - tag: fakeip-dns
+      type: fakeip
+      inet4-range: 198.18.0.1/16
+      inet6-range: fc00::/18
+      ttl: 1
+
+  # ── DNS 路由规则引擎 (Routing) ──────────────────────────────────────────────
+  # 分为 Request 阶段分发与 Response 阶段防污染校验两大引擎
+  routing:
+    # ── 阶段一：Request 路由规则 ──────────────────────────────────────────────
+    # 客户端发起查询时，自上而下匹配规则，将请求分发至指定 upstream tag 或直接拦截
+    request:
+      # 拦截广告域名
+      - domain:
+          - "+.qq.com"
+        action: reject
+        reject-code: nodata
+
+      # 指定特定查询类型拦截（例如丢弃 IPv6 AAAA 查询）
+      - query-type:
+          - HTTPS
+        action: reject
+        reject-code: nodata
+
+      # 国内域名走直连 DNS 解析真实 IP
+      - domain:
+          - "+.baidu.com"
+        upstream: direct-dns
+
+      # 走代理的境外域名分发至 Fake-IP 池（实现极速响应并在连接建立时由代理节点远端解析）
+      - domain:
+          - "+.google.com"
+        upstream: fakeip-dns
+
+      - domain:
+          - "+.youtube.com"
+        upstream: proxy-dns
+
+      # 兜底规则 (Fallback) — 未匹配任何规则时的默认分发 upstream
+      - fallback: local-dns
+
+    # ── 阶段二：Response 路由规则 ─────────────────────────────────────────────
+    # 上游解析完成返回 IP 后的防污染校验引擎。
+    # 针对直连上游返回的结果，若发现污染 IP 或异常归属地，可精准触发重查 (Requery)
+    response:
+      # 防 DNS 投毒重查：若 direct-dns 返回的 IP 命中了常见投毒保留网段，将该域名重新发往海外清洁 DNS
+      # - from-upstream: direct-dns
+      #   ip-cidr:
+      #     - 240.0.0.0/4     # 常见 ISP/GFW 伪造保留网段
+      #     - 127.0.0.0/8     # 环回回环异常污染
+      #     - 0.0.0.0/8
+      #   action: requery
+      #   upstream: proxy-dns # 指定重查的目标清洁上游（限制重查 1 次，杜绝死循环）
+
+      # 防污染校验：若 direct-dns 解析出的 IP 命中了非国内 IP 规则集（如 geoip-cn 的反向集合），触发重查
+      # - from-upstream: direct-dns
+      #   rule-set:
+      #     - geoip-non-cn
+      #   upstream: proxy-dns
+
+      # 兜底规则 (Fallback) — 可选，未匹配任何规则时的默认响应动作，省略时默认为 accept
+      # - fallback: accept
+
+
 # 2. eBPF 内核透明代理引擎 (极简配置，开箱即用)
 ebpf:
   enable: true
