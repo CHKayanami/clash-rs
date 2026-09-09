@@ -8,7 +8,7 @@ pub use cache::{CacheLookup, DnsCache, SERVE_STALE_WIRE_TTL};
 pub use policy::NameServerPolicyContainer;
 pub use reverse_cache::ReverseLookupCache;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{self, IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::sync::{Arc, OnceLock};
@@ -24,7 +24,7 @@ use crate::app::dns::fakeip::{self, ThreadSafeFakeDns};
 use crate::app::dns::filters::{BlackDomainFilter, DomainFilter, FallbackFilter, PendingMmdb};
 use crate::app::dns::query::{DnsName, QType, QueryContext, build_dns_query_wire};
 use crate::app::dns::response::{
-    ResponseTemplate, build_dns_ip_response, build_dns_nxdomain,
+    ResponseTemplate, build_dns_ip_response, build_dns_nodata, build_dns_nxdomain,
 };
 use crate::app::dns::singleflight::{FlightKey, FlightRole, Singleflight};
 use crate::app::dns::upstream_pool::{UpstreamEntry, UpstreamPool};
@@ -81,6 +81,7 @@ pub struct EnhancedResolverInner {
     stale_cache_retention: Duration,
     fixed_domain_ttl: Option<trie::StringTrie<u32>>,
     resolution_hook: OnceLock<DnsResolutionHook>,
+    qtype_filter: HashSet<QType>,
 }
 
 impl EnhancedResolver {
@@ -296,6 +297,7 @@ impl EnhancedResolver {
             stale_cache_retention: Duration::from_secs(cfg.stale_cache_retention as u64),
             fixed_domain_ttl,
             resolution_hook: OnceLock::new(),
+            qtype_filter: cfg.qtype_filter,
         });
 
         Self { inner }
@@ -701,10 +703,15 @@ impl ClashResolver for EnhancedResolver {
             return Ok(build_dns_nxdomain(raw_query));
         }
 
+        if self.qtype_filter.contains(&qtype) {
+            debug!(domain = %host, ?qtype, "DNS query matched qtype filter, returning NODATA");
+            return Ok(build_dns_nodata(raw_query));
+        }
+
         // AAAA asked for while IPv6 is globally disabled: answer NODATA (NoError + zero answers)
         if qtype == QType::AAAA && !self.ipv6() {
             debug!(domain = %host, "AAAA query while IPv6 disabled, returning NODATA");
-            return Ok(crate::app::dns::response::build_dns_nodata(raw_query));
+            return Ok(build_dns_nodata(raw_query));
         }
 
         // 1. Hosts match (takes precedence over Fake-IP when record type matches)

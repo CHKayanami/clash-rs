@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -38,6 +39,7 @@ impl EnhancedResolver {
                 stale_cache_retention: Duration::from_secs(3600),
                 fixed_domain_ttl: None,
                 resolution_hook: OnceLock::new(),
+                qtype_filter: HashSet::new(),
             }),
         }
     }
@@ -179,6 +181,7 @@ async fn test_dns_resolution_hook_end_to_end_on_exchange() {
             stale_cache_retention: Duration::from_secs(3600),
             fixed_domain_ttl: None,
             resolution_hook: OnceLock::new(),
+            qtype_filter: HashSet::new(),
         }),
     };
 
@@ -246,6 +249,7 @@ async fn test_fake_ip_exchange() {
             stale_cache_retention: Duration::from_secs(3600),
             fixed_domain_ttl: None,
             resolution_hook: OnceLock::new(),
+            qtype_filter: HashSet::new(),
         }),
     };
 
@@ -437,6 +441,70 @@ async fn test_reverse_lookup_cache_integration_and_conflict() {
 
     // Since domain-b.com and domain-a.com share 1.2.3.4, it should be marked as ambiguous -> None
     assert_eq!(resolver.reverse_lookup(ip), None);
+}
+
+#[tokio::test]
+async fn test_qtype_filter_exchange() {
+    use crate::app::dns::query::{build_dns_query_wire_with_id, DnsName, QType};
+
+    let mut filter_set = HashSet::new();
+    filter_set.insert(QType::HTTPS);
+    filter_set.insert(QType::TXT);
+
+    let resolver = EnhancedResolver {
+        inner: Arc::new(EnhancedResolverInner {
+            ipv6: AtomicBool::new(false),
+            hosts: None,
+            pool: UpstreamPool::new(
+                std::collections::HashMap::new(),
+                Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
+                None,
+                None,
+                None,
+                None,
+            ),
+            main_upstreams: vec![],
+            fallback_upstreams: None,
+            fallback_filter: None,
+            lru_cache: None,
+            policy: None,
+            proxy_upstreams: None,
+            proxy_server_domains: None,
+            fake_dns: None,
+            fake_ip_ttl: 1,
+            reverse_lookup_cache: None,
+            black_domain_filter: None,
+            collector: None,
+            singleflight: Singleflight::new(),
+            optimistic_cache_ttl: 0,
+            stale_cache_retention: Duration::from_secs(3600),
+            fixed_domain_ttl: None,
+            resolution_hook: OnceLock::new(),
+            qtype_filter: filter_set,
+        }),
+    };
+
+    let name = DnsName::from_domain("example.com").unwrap();
+
+    // 1. Query HTTPS (Type 65) -> filtered -> returns NODATA
+    let https_query = build_dns_query_wire_with_id(0x1001, &name, QType::HTTPS);
+    let resp = resolver.exchange(&https_query).await.expect("exchange should succeed");
+    // Verify response header: QR=1, RCODE=0 (NoError), ANCOUNT=0
+    assert!(resp.len() >= 12);
+    let flags = u16::from_be_bytes([resp[2], resp[3]]);
+    let rcode = flags & 0x000F;
+    let ancount = u16::from_be_bytes([resp[6], resp[7]]);
+    assert_eq!(rcode, 0, "filtered qtype should return RCODE NoError (NODATA)");
+    assert_eq!(ancount, 0, "filtered qtype should have 0 answers");
+
+    // 2. Query TXT (Type 16) -> filtered -> returns NODATA
+    let txt_query = build_dns_query_wire_with_id(0x1002, &name, QType::TXT);
+    let resp = resolver.exchange(&txt_query).await.expect("exchange should succeed");
+    let flags = u16::from_be_bytes([resp[2], resp[3]]);
+    let rcode = flags & 0x000F;
+    let ancount = u16::from_be_bytes([resp[6], resp[7]]);
+    assert_eq!(rcode, 0);
+    assert_eq!(ancount, 0);
 }
 
 

@@ -52,11 +52,12 @@ impl std::str::FromStr for DNSNetMode {
 }
 use ipnet::{AddrParseError, Ipv4Net, Ipv6Net};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fmt::Display,
     net::{IpAddr, SocketAddr},
     sync::Arc,
 };
+use super::query::QType;
 use tracing::warn;
 use url::Url;
 pub use watfaq_dns::{DNSListenAddr, DoH3Config, DoHConfig, DoTConfig};
@@ -126,6 +127,7 @@ pub struct Config {
     pub optimistic_cache_ttl: u32,
     pub fixed_domain_ttl: HashMap<String, u32>,
     pub stale_cache_retention: u32,
+    pub qtype_filter: HashSet<QType>,
 }
 
 impl Config {
@@ -559,6 +561,16 @@ impl TryFrom<&crate::config::def::Config> for Config {
             optimistic_cache_ttl: dc.optimistic_cache_ttl,
             fixed_domain_ttl: dc.fixed_domain_ttl.clone(),
             stale_cache_retention: dc.stale_cache_retention,
+            qtype_filter: {
+                let mut set = HashSet::new();
+                for entry in &dc.qtype_filter {
+                    let qtype = entry.parse::<QType>().map_err(|e| {
+                        Error::InvalidConfig(format!("invalid `qtype-filter` entry: {e}"))
+                    })?;
+                    set.insert(qtype);
+                }
+                set
+            },
         })
     }
 }
@@ -678,5 +690,30 @@ mod tests {
         assert_eq!(ns[0].proxy.as_deref(), Some("🚀 节点选择"));
         assert_eq!(ns[1].proxy.as_deref(), Some("🚀 节点选择"));
         assert_eq!(ns[2].proxy.as_deref(), Some("🚀 节点选择"));
+    }
+
+    #[test]
+    fn test_dns_config_qtype_filter() {
+        use crate::app::dns::query::QType;
+        use crate::config::def::Config as DefConfig;
+
+        let yaml = r#"
+dns:
+  enable: true
+  nameserver:
+    - 114.114.114.114
+  qtype-filter:
+    - 65
+    - HTTPS
+    - txt
+    - SVCB
+"#;
+        let def_cfg: DefConfig = serde_yaml::from_str(yaml).unwrap();
+        let cfg: Config = def_cfg.try_into().unwrap();
+
+        assert!(cfg.qtype_filter.contains(&QType::HTTPS));
+        assert!(cfg.qtype_filter.contains(&QType::TXT));
+        assert!(cfg.qtype_filter.contains(&QType::SVCB));
+        assert_eq!(cfg.qtype_filter.len(), 3);
     }
 }

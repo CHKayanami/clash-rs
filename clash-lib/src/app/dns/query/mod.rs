@@ -185,7 +185,9 @@ impl QType {
     pub const TXT: Self = Self(16);
     pub const AAAA: Self = Self(28);
     pub const SRV: Self = Self(33);
+    pub const SVCB: Self = Self(64);
     pub const HTTPS: Self = Self(65);
+    pub const ANY: Self = Self(255);
 
     pub const fn new(qtype: u16) -> Self {
         Self(qtype)
@@ -193,6 +195,57 @@ impl QType {
 
     pub const fn get(self) -> u16 {
         self.0
+    }
+}
+
+impl std::fmt::Display for QType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match *self {
+            Self::A => write!(f, "A"),
+            Self::NS => write!(f, "NS"),
+            Self::CNAME => write!(f, "CNAME"),
+            Self::SOA => write!(f, "SOA"),
+            Self::PTR => write!(f, "PTR"),
+            Self::MX => write!(f, "MX"),
+            Self::TXT => write!(f, "TXT"),
+            Self::AAAA => write!(f, "AAAA"),
+            Self::SRV => write!(f, "SRV"),
+            Self::SVCB => write!(f, "SVCB"),
+            Self::HTTPS => write!(f, "HTTPS"),
+            Self::ANY => write!(f, "ANY"),
+            other => write!(f, "TYPE{}", other.0),
+        }
+    }
+}
+
+impl std::str::FromStr for QType {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let trimmed = s.trim();
+        if let Ok(num) = trimmed.parse::<u16>() {
+            return Ok(Self(num));
+        }
+        if let Some(rest) = trimmed.strip_prefix("TYPE").or_else(|| trimmed.strip_prefix("type")) {
+            if let Ok(num) = rest.parse::<u16>() {
+                return Ok(Self(num));
+            }
+        }
+        match trimmed.to_ascii_uppercase().as_str() {
+            "A" => Ok(Self::A),
+            "NS" => Ok(Self::NS),
+            "CNAME" => Ok(Self::CNAME),
+            "SOA" => Ok(Self::SOA),
+            "PTR" => Ok(Self::PTR),
+            "MX" => Ok(Self::MX),
+            "TXT" => Ok(Self::TXT),
+            "AAAA" => Ok(Self::AAAA),
+            "SRV" => Ok(Self::SRV),
+            "SVCB" => Ok(Self::SVCB),
+            "HTTPS" => Ok(Self::HTTPS),
+            "ANY" => Ok(Self::ANY),
+            _ => Err(format!("unknown DNS QType: '{s}'")),
+        }
     }
 }
 
@@ -569,5 +622,39 @@ impl QueryContext {
         self.questions
             .iter()
             .map(|question| (&question.name, question.qtype, question.qclass))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_qtype_from_str_and_display() {
+        assert_eq!("A".parse::<QType>().unwrap(), QType::A);
+        assert_eq!("a".parse::<QType>().unwrap(), QType::A);
+        assert_eq!("AAAA".parse::<QType>().unwrap(), QType::AAAA);
+        assert_eq!("aaaa".parse::<QType>().unwrap(), QType::AAAA);
+        assert_eq!("HTTPS".parse::<QType>().unwrap(), QType::HTTPS);
+        assert_eq!("https".parse::<QType>().unwrap(), QType::HTTPS);
+        assert_eq!("svcb".parse::<QType>().unwrap(), QType::SVCB);
+        assert_eq!("txt".parse::<QType>().unwrap(), QType::TXT);
+        assert_eq!("TXT".parse::<QType>().unwrap(), QType::TXT);
+        assert_eq!("any".parse::<QType>().unwrap(), QType::ANY);
+
+        // Numeric string
+        assert_eq!("65".parse::<QType>().unwrap(), QType::HTTPS);
+        assert_eq!("64".parse::<QType>().unwrap(), QType::SVCB);
+        assert_eq!("16".parse::<QType>().unwrap(), QType::TXT);
+        assert_eq!("TYPE65".parse::<QType>().unwrap(), QType::HTTPS);
+        assert_eq!("type28".parse::<QType>().unwrap(), QType::AAAA);
+
+        // Display
+        assert_eq!(QType::A.to_string(), "A");
+        assert_eq!(QType::HTTPS.to_string(), "HTTPS");
+        assert_eq!(QType::new(999).to_string(), "TYPE999");
+
+        // Invalid
+        assert!("invalid_qtype".parse::<QType>().is_err());
     }
 }

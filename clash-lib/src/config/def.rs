@@ -917,6 +917,9 @@ pub struct DNS {
     #[educe(Default = 3600)]
     #[serde(default = "default_stale_cache_retention")]
     pub stale_cache_retention: u32,
+    /// DNS query types to filter (return NODATA immediately without forwarding upstream)
+    #[serde(default)]
+    pub qtype_filter: Vec<String>,
 }
 
 fn default_stale_cache_retention() -> u32 {
