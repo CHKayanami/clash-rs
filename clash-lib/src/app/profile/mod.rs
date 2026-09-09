@@ -1,4 +1,10 @@
-use std::{collections::HashMap, path::Path, sync::Arc};
+use std::{
+    collections::HashMap,
+    fs,
+    path::Path,
+    sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use tracing::{debug, error, info, warn};
@@ -22,22 +28,20 @@ impl ThreadSafeCacheFile {
         let db_path = Path::new(path);
         if let Some(parent) = db_path.parent() {
             if !parent.as_os_str().is_empty() {
-                let _ = std::fs::create_dir_all(parent);
+                let _ = fs::create_dir_all(parent);
             }
         }
 
-        let db = match open_or_init_db(path) {
-            Ok(db) => Arc::new(db),
+        let mut db = match open_or_init_db(path) {
+            Ok(db) => db,
             Err(e) => {
                 error!(
                     "failed to open cache database at {}: {}, resetting",
                     path, e
                 );
                 reset_corrupt_db(path);
-                Arc::new(
-                    Database::create(path)
-                        .expect("failed to create fresh cache database"),
-                )
+                Database::create(path)
+                    .expect("failed to create fresh cache database")
             }
         };
 
@@ -50,7 +54,28 @@ impl ThreadSafeCacheFile {
             let _ = write_txn.commit();
         }
 
-        Self { db, store_selected }
+        // 启动时整理压缩数据库以回收碎片和空闲空间
+        let size_before = fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        match db.compact() {
+            Ok(true) => {
+                let size_after = fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+                info!(
+                    "compacted cache database at {}: {} -> {} bytes",
+                    path, size_before, size_after
+                );
+            }
+            Ok(false) => {
+                debug!("cache database at {} does not require compaction", path);
+            }
+            Err(e) => {
+                warn!("failed to compact cache database at {}: {}", path, e);
+            }
+        }
+
+        Self {
+            db: Arc::new(db),
+            store_selected,
+        }
     }
 
     pub fn store_selected(&self) -> bool {
@@ -241,7 +266,7 @@ fn open_or_init_db(path: &str) -> Result<Database, redb::DatabaseError> {
             }
             Err(e) => {
                 // Check if it's a legacy YAML cache file
-                if let Ok(content) = std::fs::read_to_string(path) {
+                if let Ok(content) = fs::read_to_string(path) {
                     if let Ok(legacy_map) =
                         serde_yaml::from_str::<serde_json::Value>(&content)
                     {
@@ -250,7 +275,7 @@ fn open_or_init_db(path: &str) -> Result<Database, redb::DatabaseError> {
                             path
                         );
                         let backup_path = format!("{}.legacy-yaml", path);
-                        let _ = std::fs::rename(path, &backup_path);
+                        let _ = fs::rename(path, &backup_path);
                         let db = Database::create(path)?;
                         migrate_legacy_json(&db, &legacy_map);
                         return Ok(db);
@@ -303,13 +328,13 @@ fn migrate_legacy_json(db: &Database, legacy: &serde_json::Value) {
 }
 
 fn reset_corrupt_db(path: &str) {
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
     let corrupt_path = format!("{}.corrupt-{}", path, ts);
     warn!("moving corrupt database {} to {}", path, corrupt_path);
-    let _ = std::fs::rename(path, corrupt_path);
+    let _ = fs::rename(path, corrupt_path);
 }
 
 #[cfg(test)]
@@ -409,7 +434,7 @@ ip_to_host:
 host_to_ip:
   "legacy.com#v4": "198.18.0.99"
 "#;
-        std::fs::write(&db_path, yaml_content).unwrap();
+        fs::write(&db_path, yaml_content).unwrap();
 
         let cache = ThreadSafeCacheFile::new(path_str, true);
         assert_eq!(cache.get_selected("PROXY"), Some("Legacy-Node".to_string()));
@@ -421,5 +446,46 @@ host_to_ip:
             cache.get_fake_ip("legacy.com#v4"),
             Some("198.18.0.99".to_string())
         );
+    }
+
+    #[test]
+    fn test_startup_compaction() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("compaction.db");
+        let path_str = db_path.to_str().unwrap();
+
+        {
+            let cache = ThreadSafeCacheFile::new(path_str, true);
+            // 写入较多数据制造页面占用
+            for i in 0..1000 {
+                cache.set_ip_to_host(&format!("198.18.0.{}", i), &format!("host-{}.com", i));
+                cache.set_host_to_ip(&format!("host-{}.com#v4", i), &format!("198.18.0.{}", i));
+            }
+            // 删除大部分数据制造空闲死页（碎片）
+            for i in 100..1000 {
+                cache.delete_fake_ip_pair(
+                    &format!("198.18.0.{}", i),
+                    &format!("host-{}.com#v4", i),
+                );
+            }
+            cache.set_selected("PROXY", "Node-Main");
+        }
+
+        let size_before = fs::metadata(&db_path).unwrap().len();
+
+        // 重新启动打开数据库，触发 startup compaction
+        let cache = ThreadSafeCacheFile::new(path_str, true);
+        let size_after = fs::metadata(&db_path).unwrap().len();
+
+        // 验证碎片被成功压缩，文件尺寸减小或维持紧凑
+        assert!(size_after <= size_before);
+
+        // 验证未删除的数据完好保留
+        assert_eq!(cache.get_selected("PROXY"), Some("Node-Main".to_string()));
+        assert_eq!(
+            cache.get_fake_ip("198.18.0.0"),
+            Some("host-0.com".to_string())
+        );
+        assert_eq!(cache.get_fake_ip("198.18.0.500"), None);
     }
 }
