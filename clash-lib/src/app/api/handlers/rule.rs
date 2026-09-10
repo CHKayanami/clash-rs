@@ -2,7 +2,10 @@ use std::{collections::HashMap, sync::Arc};
 
 use axum::{Router, extract::State, response::IntoResponse, routing::get};
 
-use crate::app::{api::AppState, router::ArcRouter};
+use crate::app::{
+    api::AppState,
+    router::{ArcRouter, RuleMatcher},
+};
 
 #[derive(Clone)]
 struct RuleState {

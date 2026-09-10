@@ -12,13 +12,52 @@ use std::{
 use libc;
 use tokio::io::{AsyncRead, AsyncWrite, Interest};
 
+use enum_dispatch::enum_dispatch;
 use tokio::net::{TcpStream, UnixStream};
 
+use super::{CopyBidirectionalError, TrafficTracker};
+
+#[enum_dispatch]
 pub trait TrackCopy: Send + Sync {
     fn track(&self, total: usize);
 }
 
-use super::CopyBidirectionalError;
+#[derive(Clone)]
+pub struct UploadTracker(TrafficTracker);
+
+impl UploadTracker {
+    pub fn new(tracker: TrafficTracker) -> Self {
+        Self(tracker)
+    }
+}
+
+impl TrackCopy for UploadTracker {
+    fn track(&self, total: usize) {
+        self.0.push_upload(total);
+    }
+}
+
+#[derive(Clone)]
+pub struct DownloadTracker(TrafficTracker);
+
+impl DownloadTracker {
+    pub fn new(tracker: TrafficTracker) -> Self {
+        Self(tracker)
+    }
+}
+
+impl TrackCopy for DownloadTracker {
+    fn track(&self, total: usize) {
+        self.0.push_download(total);
+    }
+}
+
+#[derive(Clone)]
+#[enum_dispatch(TrackCopy)]
+pub enum CopyTracker {
+    Upload(UploadTracker),
+    Download(DownloadTracker),
+}
 
 /// the size of PIPE_BUF
 const PIPE_SIZE: usize = 65536;
@@ -379,8 +418,8 @@ pub trait Stream: AsyncRead + AsyncWrite + AsRawFd {
 pub async fn zero_copy_bidirectional<A, B>(
     a: &mut A,
     b: &mut B,
-    read_tracker: std::sync::Arc<dyn TrackCopy + Send + Sync>,
-    write_tracker: std::sync::Arc<dyn TrackCopy + Send + Sync>,
+    read_tracker: CopyTracker,
+    write_tracker: CopyTracker,
     a_to_b_timeout_duration: Duration,
     b_to_a_timeout_duration: Duration,
 ) -> Result<(u64, u64)>
@@ -445,8 +484,8 @@ struct CopyBidirectional<'a, A, B> {
     idle_timeout: Pin<Box<tokio::time::Sleep>>,
     idle_timeout_duration: Duration,
     last_active: tokio::time::Instant,
-    write_tracker: std::sync::Arc<dyn TrackCopy + Send + Sync>,
-    read_tracker: std::sync::Arc<dyn TrackCopy + Send + Sync>,
+    write_tracker: CopyTracker,
+    read_tracker: CopyTracker,
 }
 
 impl<'a, A, B> CopyBidirectional<'a, A, B> {
@@ -459,8 +498,8 @@ impl<'a, A, B> CopyBidirectional<'a, A, B> {
         a_to_b_timeout_duration: Duration,
         b_to_a_timeout_duration: Duration,
         idle_timeout_duration: Duration,
-        write_tracker: std::sync::Arc<dyn TrackCopy + Send + Sync>,
-        read_tracker: std::sync::Arc<dyn TrackCopy + Send + Sync>,
+        write_tracker: CopyTracker,
+        read_tracker: CopyTracker,
     ) -> Self
     where
         A: Stream + Unpin,

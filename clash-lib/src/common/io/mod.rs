@@ -13,7 +13,9 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 #[cfg(all(target_os = "linux", feature = "zero_copy"))]
 mod splice;
 #[cfg(all(target_os = "linux", feature = "zero_copy"))]
-pub use splice::{TrackCopy, zero_copy_bidirectional};
+pub use splice::{
+    CopyTracker, DownloadTracker, UploadTracker, zero_copy_bidirectional,
+};
 
 pub use clash_common::{PooledBuffer, SlideBuffer};
 
@@ -127,16 +129,19 @@ impl CopyBuffer {
 
             // 1. Read as much as possible into the circular buffer.
             while !self.read_done && self.cache_length < self.size {
-                let unused_start_index = (self.start_index + self.cache_length) % self.size;
-                let unused_end_index_exclusive = if unused_start_index < self.start_index {
-                    self.start_index
-                } else {
-                    self.size
-                };
+                let unused_start_index =
+                    (self.start_index + self.cache_length) % self.size;
+                let unused_end_index_exclusive =
+                    if unused_start_index < self.start_index {
+                        self.start_index
+                    } else {
+                        self.size
+                    };
 
                 let me = &mut *self;
-                let mut buf =
-                    ReadBuf::new(&mut me.buf[unused_start_index..unused_end_index_exclusive]);
+                let mut buf = ReadBuf::new(
+                    &mut me.buf[unused_start_index..unused_end_index_exclusive],
+                );
                 match reader.as_mut().poll_read(cx, &mut buf) {
                     Poll::Ready(Ok(())) => {
                         let n = buf.filled().len();
@@ -164,10 +169,10 @@ impl CopyBuffer {
                     std::cmp::min(self.start_index + self.cache_length, self.size);
 
                 let me = &mut *self;
-                match writer
-                    .as_mut()
-                    .poll_write(cx, &me.buf[used_start_index..used_end_index_exclusive])
-                {
+                match writer.as_mut().poll_write(
+                    cx,
+                    &me.buf[used_start_index..used_end_index_exclusive],
+                ) {
                     Poll::Ready(Ok(written)) => {
                         if written == 0 {
                             return Poll::Ready(Err(io::Error::new(
@@ -179,7 +184,8 @@ impl CopyBuffer {
                             if self.cache_length == 0 {
                                 self.start_index = 0;
                             } else {
-                                self.start_index = (self.start_index + written) % self.size;
+                                self.start_index =
+                                    (self.start_index + written) % self.size;
                             }
                             self.amt += written as u64;
                             self.need_flush = true;
@@ -292,8 +298,13 @@ where
                     let mut on_upload = |written: usize| {
                         tracker.push_upload(written);
                     };
-                    let res =
-                        buf.poll_copy(cx, a.as_mut(), b.as_mut(), Some(last_active), Some(&mut on_upload));
+                    let res = buf.poll_copy(
+                        cx,
+                        a.as_mut(),
+                        b.as_mut(),
+                        Some(last_active),
+                        Some(&mut on_upload),
+                    );
                     match res {
                         Poll::Ready(Ok(count)) => {
                             *a_to_b = TransferState::ShuttingDown(count);
@@ -346,8 +357,13 @@ where
                     let mut on_download = |written: usize| {
                         tracker.push_download(written);
                     };
-                    let res =
-                        buf.poll_copy(cx, b.as_mut(), a.as_mut(), Some(last_active), Some(&mut on_download));
+                    let res = buf.poll_copy(
+                        cx,
+                        b.as_mut(),
+                        a.as_mut(),
+                        Some(last_active),
+                        Some(&mut on_download),
+                    );
                     match res {
                         Poll::Ready(Ok(count)) => {
                             *b_to_a = TransferState::ShuttingDown(count);
@@ -405,24 +421,6 @@ where
     }
 }
 
-#[cfg(all(target_os = "linux", feature = "zero_copy"))]
-struct UploadTracker(TrafficTracker);
-#[cfg(all(target_os = "linux", feature = "zero_copy"))]
-impl TrackCopy for UploadTracker {
-    fn track(&self, total: usize) {
-        self.0.push_upload(total);
-    }
-}
-
-#[cfg(all(target_os = "linux", feature = "zero_copy"))]
-struct DownloadTracker(TrafficTracker);
-#[cfg(all(target_os = "linux", feature = "zero_copy"))]
-impl TrackCopy for DownloadTracker {
-    fn track(&self, total: usize) {
-        self.0.push_download(total);
-    }
-}
-
 pub async fn copy_bidirectional(
     mut a: Box<dyn ClientStream>,
     mut b: AnyStream,
@@ -442,8 +440,9 @@ pub async fn copy_bidirectional(
             // zero copy is only available when both streams are raw TcpStream
             (Some(a_stream), Some(b_stream)) => {
                 tracing::trace!("using zero copy for bidirectional copy");
-                let w_tracker = std::sync::Arc::new(UploadTracker(tracker.clone()));
-                let r_tracker = std::sync::Arc::new(DownloadTracker(tracker));
+                let w_tracker =
+                    CopyTracker::from(UploadTracker::new(tracker.clone()));
+                let r_tracker = CopyTracker::from(DownloadTracker::new(tracker));
                 zero_copy_bidirectional(
                     a_stream,
                     b_stream,
@@ -659,7 +658,8 @@ mod tests {
     #[tokio::test]
     async fn test_copy_buffer_wrap_around_multi_mb() {
         // Transfer 1MB of pseudo-random data through a small 8KB circular buffer
-        let test_data: Vec<u8> = (0..(1024 * 1024)).map(|i| (i % 251) as u8).collect();
+        let test_data: Vec<u8> =
+            (0..(1024 * 1024)).map(|i| (i % 251) as u8).collect();
         let mut reader = Cursor::new(test_data.clone());
         let mut writer = Vec::new();
 

@@ -1,5 +1,7 @@
 use crate::{
-    app::router::rules::geodata::str_matcher::{Matcher, try_new_matcher},
+    app::router::rules::geodata::str_matcher::{
+        Matcher, StringMatcher, try_new_matcher,
+    },
     common::{
         geodata::geodata_proto::{Domain, domain::Type},
         trie,
@@ -13,7 +15,7 @@ pub trait DomainGroupMatcher: Send + Sync {
 
 pub struct SuccinctMatcherGroup {
     set: trie::StringTrie<()>,
-    other_matchers: Vec<Box<dyn Matcher>>,
+    other_matchers: Vec<StringMatcher>,
     not: bool,
 }
 

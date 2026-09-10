@@ -1,9 +1,13 @@
+use enum_dispatch::enum_dispatch;
+
 use crate::common::geodata::geodata_proto::domain::Type;
 
+#[enum_dispatch]
 pub trait Matcher: Send + Sync {
     fn matches(&self, url: &str) -> bool;
 }
 
+#[derive(Clone)]
 pub struct FullMatcher(pub String);
 
 impl Matcher for FullMatcher {
@@ -12,6 +16,7 @@ impl Matcher for FullMatcher {
     }
 }
 
+#[derive(Clone)]
 pub struct SubStrMatcher(pub String);
 
 impl Matcher for SubStrMatcher {
@@ -20,6 +25,7 @@ impl Matcher for SubStrMatcher {
     }
 }
 
+#[derive(Clone)]
 pub struct DomainMatcher(pub String);
 
 impl Matcher for DomainMatcher {
@@ -39,6 +45,7 @@ impl Matcher for DomainMatcher {
     }
 }
 
+#[derive(Clone)]
 pub struct RegexMatcher(regex::Regex);
 
 impl Matcher for RegexMatcher {
@@ -47,19 +54,28 @@ impl Matcher for RegexMatcher {
     }
 }
 
+#[derive(Clone)]
+#[enum_dispatch(Matcher)]
+pub enum StringMatcher {
+    Full(FullMatcher),
+    SubStr(SubStrMatcher),
+    Domain(DomainMatcher),
+    Regex(RegexMatcher),
+}
+
 pub fn try_new_matcher(
     domain: String,
     t: Type,
-) -> Result<Box<dyn Matcher>, crate::Error> {
+) -> Result<StringMatcher, crate::Error> {
     Ok(match t {
-        Type::Plain => Box::new(SubStrMatcher(domain)),
+        Type::Plain => StringMatcher::SubStr(SubStrMatcher(domain)),
         Type::Regex => {
-            Box::new(RegexMatcher(regex::Regex::new(&domain).map_err(|x| {
+            StringMatcher::Regex(RegexMatcher(regex::Regex::new(&domain).map_err(|x| {
                 crate::Error::InvalidConfig(format!("invalid regex: {x}"))
             })?))
         }
-        Type::Domain => Box::new(DomainMatcher(domain)),
-        Type::Full => Box::new(FullMatcher(domain)),
+        Type::Domain => StringMatcher::Domain(DomainMatcher(domain)),
+        Type::Full => StringMatcher::Full(FullMatcher(domain)),
     })
 }
 

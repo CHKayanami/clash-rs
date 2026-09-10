@@ -26,12 +26,12 @@ use tracing::{error, info, trace};
 mod rules;
 
 use crate::common::{geodata::GeoDataLookup, mmdb::MmdbLookup};
-pub use rules::RuleMatcher;
+pub use rules::{Rule, RuleMatcher};
 pub use rules::geodata::GeoSiteMatcher;
 pub use super::remote_content_manager::providers::rule_provider::ThreadSafeRuleProvider;
 
 pub struct Router {
-    rules: Vec<Box<dyn RuleMatcher>>,
+    rules: Vec<Rule>,
     dns_resolver: ThreadSafeDNSResolver,
 
     country_mmdb: Option<MmdbLookup>,
@@ -133,7 +133,7 @@ impl Router {
     pub async fn match_route(
         &self,
         sess: &mut Session,
-    ) -> (&str, Option<&Box<dyn RuleMatcher>>) {
+    ) -> (&str, Option<&Rule>) {
         // whether a DNS lookup has been *attempted* for this session — not
         // whether it succeeded. A domain that fails to resolve must not be
         // retried once per remaining IP rule.
@@ -364,7 +364,7 @@ impl Router {
     }
 
     /// API handlers
-    pub fn get_all_rules(&self) -> &Vec<Box<dyn RuleMatcher>> {
+    pub fn get_all_rules(&self) -> &Vec<Rule> {
         &self.rules
     }
 }
@@ -374,25 +374,25 @@ pub fn map_rule_type(
     mmdb: Option<MmdbLookup>,
     geodata: Option<GeoDataLookup>,
     rule_provider_registry: Option<&HashMap<String, ThreadSafeRuleProvider>>,
-) -> Box<dyn RuleMatcher> {
+) -> Rule {
     match rule_type {
         RuleType::Domain { domain, target } => {
-            Box::new(Domain { domain, target }) as Box<dyn RuleMatcher>
+            Rule::Domain(Domain { domain, target })
         }
         RuleType::DomainRegex { regex, target } => {
-            Box::new(DomainRegex { regex, target })
+            Rule::DomainRegex(DomainRegex { regex, target })
         }
         RuleType::DomainSuffix {
             domain_suffix,
             target,
-        } => Box::new(DomainSuffix {
+        } => Rule::DomainSuffix(DomainSuffix {
             suffix: domain_suffix,
             target,
         }),
         RuleType::DomainKeyword {
             domain_keyword,
             target,
-        } => Box::new(DomainKeyword {
+        } => Rule::DomainKeyword(DomainKeyword {
             keyword: domain_keyword,
             target,
         }),
@@ -400,7 +400,7 @@ pub fn map_rule_type(
             ipnet,
             target,
             no_resolve,
-        } => Box::new(IpCidr {
+        } => Rule::IpCidr(IpCidr {
             ipnet,
             target,
             no_resolve,
@@ -410,7 +410,7 @@ pub fn map_rule_type(
             ipnet,
             target,
             no_resolve,
-        } => Box::new(IpCidr {
+        } => Rule::IpCidr(IpCidr {
             ipnet,
             target,
             no_resolve,
@@ -421,7 +421,7 @@ pub fn map_rule_type(
             target,
             country_code,
             no_resolve,
-        } => Box::new(rules::geoip::GeoIP {
+        } => Rule::GeoIP(rules::geoip::GeoIP {
             target,
             country_code,
             no_resolve,
@@ -435,7 +435,7 @@ pub fn map_rule_type(
             target,
             geodata.as_ref(),
         ) {
-            Ok(res) => Box::new(res) as _,
+            Ok(res) => Rule::GeoSite(res),
             // a missing geosite.dat or a typo'd code used to abort the whole
             // process here; degrade the way a broken composite rule does
             Err(e) => {
@@ -444,17 +444,17 @@ pub fn map_rule_type(
                      fallback.",
                     country_code, e
                 );
-                Box::new(Final {
+                Rule::Final(Final {
                     target: "REJECT".to_string(),
                 })
             }
         },
-        RuleType::SRCPort { target, port } => Box::new(rules::port::Port {
+        RuleType::SRCPort { target, port } => Rule::Port(rules::port::Port {
             port,
             target,
             is_src: true,
         }),
-        RuleType::DSTPort { target, port } => Box::new(rules::port::Port {
+        RuleType::DSTPort { target, port } => Rule::Port(rules::port::Port {
             port,
             target,
             is_src: false,
@@ -462,7 +462,7 @@ pub fn map_rule_type(
         RuleType::ProcessName {
             process_name,
             target,
-        } => Box::new(rules::process::Process {
+        } => Rule::Process(rules::process::Process {
             name: process_name,
             target,
             name_only: true,
@@ -470,7 +470,7 @@ pub fn map_rule_type(
         RuleType::ProcessPath {
             process_path,
             target,
-        } => Box::new(rules::process::Process {
+        } => Rule::Process(rules::process::Process {
             name: process_path,
             target,
             name_only: false,
@@ -480,7 +480,7 @@ pub fn map_rule_type(
             target,
             no_resolve,
         } => match rule_provider_registry {
-            Some(rule_provider_registry) => Box::new(RuleSet::new(
+            Some(rule_provider_registry) => Rule::RuleSet(RuleSet::new(
                 rule_set.clone(),
                 target,
                 rule_provider_registry
@@ -498,7 +498,7 @@ pub fn map_rule_type(
             }
         },
         RuleType::Network { network, target } => {
-            Box::new(rules::network::NetworkRule { network, target })
+            Rule::Network(rules::network::NetworkRule { network, target })
         }
         RuleType::Composite {
             operator,
@@ -513,20 +513,20 @@ pub fn map_rule_type(
                 geodata,
                 rule_provider_registry,
             ) {
-                Ok(rule) => Box::new(rule),
+                Ok(rule) => Rule::Composite(rule),
                 Err(e) => {
                     error!(
                         "failed to create composite rule: {}, expression: {}. \
                          Using REJECT as fallback.",
                         e, expression
                     );
-                    Box::new(Final {
+                    Rule::Final(Final {
                         target: "REJECT".to_string(),
                     })
                 }
             }
         }
-        RuleType::Match { target } => Box::new(Final { target }),
+        RuleType::Match { target } => Rule::Final(Final { target }),
     }
 }
 

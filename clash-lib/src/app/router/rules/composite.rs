@@ -6,7 +6,7 @@ use std::{
 use crate::{
     app::{
         remote_content_manager::providers::rule_provider::ThreadSafeRuleProvider,
-        router::{RuleMatcher, map_rule_type},
+        router::{Rule, RuleMatcher, map_rule_type},
     },
     common::{geodata::GeoDataLookup, mmdb::MmdbLookup},
     config::internal::rule::RuleType,
@@ -16,7 +16,7 @@ use crate::{
 /// Represents a node in the composite rule expression tree
 enum RuleExpression {
     /// A leaf node containing an actual rule matcher
-    Rule(Box<dyn RuleMatcher>),
+    Rule(Box<Rule>),
 
     /// AND operator - all sub-expressions must match
     And(Vec<RuleExpression>),
@@ -293,7 +293,7 @@ impl CompositeRule {
         let (payload, params) = split_trailing_params(rest);
         let rule = RuleType::new(rule_type, payload, "", params)?;
         let matcher = map_rule_type(rule, mmdb, geodata, rule_provider_registry);
-        Ok(RuleExpression::Rule(matcher))
+        Ok(RuleExpression::Rule(Box::new(matcher)))
     }
 }
 

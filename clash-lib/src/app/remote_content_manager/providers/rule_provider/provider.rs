@@ -14,7 +14,7 @@ use crate::{
             Provider, ProviderType, ProviderVehicleType, ThreadSafeProviderVehicle,
             fetcher::Fetcher,
         },
-        router::{RuleMatcher, map_rule_type},
+        router::{Rule, RuleMatcher, map_rule_type},
     },
     common::{
         errors::map_io_error, geodata::GeoDataLookup, mmdb::MmdbLookup,
@@ -73,7 +73,7 @@ pub enum RuleContent {
     // the left will converted into a right
     Domain(succinct_set::DomainSet),
     Ipcidr(Box<CidrTrie>),
-    Classical(Vec<Box<dyn RuleMatcher>>),
+    Classical(Vec<Rule>),
 }
 
 struct Inner {
@@ -548,7 +548,7 @@ fn make_classical_rules(
     rules: Vec<String>,
     mmdb: Option<MmdbLookup>,
     geodata: Option<GeoDataLookup>,
-) -> Result<Vec<Box<dyn RuleMatcher>>, Error> {
+) -> Result<Vec<Rule>, Error> {
     let mut rv = vec![];
     for rule in rules {
         let parts = rule.split(',').map(str::trim).collect::<Vec<&str>>();

@@ -12,7 +12,10 @@ use portable_atomic::AtomicU64;
 use serde::Serialize;
 use tokio::sync::oneshot::Sender;
 
-use crate::session::Session;
+use crate::{
+    app::router::{Rule, RuleMatcher},
+    session::Session,
+};
 
 /// Per-user traffic since the last drain.  Both upload and download are in
 /// bytes.
@@ -64,7 +67,7 @@ pub struct TrackerInfo {
 impl TrackerInfo {
     pub fn new(
         sess: &Session,
-        rule: Option<&Box<dyn crate::app::router::RuleMatcher>>,
+        rule: Option<&Rule>,
     ) -> Self {
         let now = chrono::Utc::now();
         Self {
