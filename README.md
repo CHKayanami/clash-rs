@@ -23,7 +23,7 @@ A custom protocol, rule based network proxy software.
 > - 🚀 **New Features**: Shadowsocks UOT (UDP-over-TCP), Domain Sniffing (TLS SNI / HTTP Host / QUIC SNI), H2MUX, TUN System Stack, etc.
 > - ⚡ **eBPF Kernel Transparent Proxy**: High-performance in-kernel transparent proxy inbound powered by eBPF with direct fast-path offload (Linux only).
 > - 🪶 **Minimal Build**: Lightweight by design; excludes optional protocols (`SSH`, `WireGuard`, `Tailscale`, `Shadowquic`, `Tor`).
-> - 📖 **Configuration Reference**: See [full.yaml](https://github.com/CHKayanami/clash-rs/blob/master/clash-bin/tests/data/config/full.yaml).
+> - 📖 **Configuration Documentation**: See [clash-rs-alpha-docs](https://chkayanami.github.io/clash-rs-alpha-docs).
 
 ## ✨ Features
 

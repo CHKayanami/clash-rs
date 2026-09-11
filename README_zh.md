@@ -23,7 +23,7 @@
 > - 🚀 **新功能特性**：新增 Shadowsocks UOT (UDP-over-TCP)、域名嗅探（TLS SNI / HTTP Host / QUIC SNI）、H2MUX 、TUN system stack。
 > - ⚡ **eBPF 内核透明代理**：新增基于 eBPF 的高性能透明代理入站，支持内核态直连快路径决策（Direct Fast-Path）（仅限 Linux）。
 > - 🪶 **Minimal 轻量版本**：默认精简，不包含以下协议：`SSH`、`WireGuard`、`Tailscale`、`Shadowquic`、`Tor`。
-> - 📖 **完整配置参考**：请参阅 [full.yaml](https://github.com/CHKayanami/clash-rs/blob/master/clash-bin/tests/data/config/full.yaml)。
+> - 📖 **配置说明文档**：请参阅 [clash-rs-alpha-docs](https://chkayanami.github.io/clash-rs-alpha-docs)。
 
 ## ✨ 特性
 
