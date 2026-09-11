@@ -23,6 +23,43 @@ use crate::app::dns::{DnsResolutionHook, ThreadSafeDnsCollector};
 
 use super::config::UpstreamType;
 
+#[derive(Clone, Copy, Debug)]
+pub struct DnsCachePolicy {
+    pub optimistic_cache_ttl: u32,
+    pub stale_cache_retention: Duration,
+}
+
+impl Default for DnsCachePolicy {
+    fn default() -> Self {
+        Self {
+            optimistic_cache_ttl: 0,
+            stale_cache_retention: Duration::from_secs(3600),
+        }
+    }
+}
+
+impl DnsCachePolicy {
+    pub fn new(optimistic_cache_ttl: u32, stale_cache_retention_secs: u32) -> Self {
+        Self {
+            optimistic_cache_ttl,
+            stale_cache_retention: Duration::from_secs(stale_cache_retention_secs as u64),
+        }
+    }
+
+    pub fn calculate_effective_ttl(&self, override_ttl: Option<u32>, raw_resp: &[u8]) -> u32 {
+        if let Some(ttl) = override_ttl {
+            ttl
+        } else {
+            let min_ttl = extract_min_ttl_from_dns_response(raw_resp).unwrap_or(60);
+            if self.optimistic_cache_ttl > 0 {
+                min_ttl.max(self.optimistic_cache_ttl)
+            } else {
+                min_ttl
+            }
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct DnsResolvedNotifier {
     reverse_lookup_cache: ReverseLookupCache,
@@ -43,15 +80,14 @@ impl DnsResolvedNotifier {
         }
     }
 
-    pub fn on_fresh_response(&self, qname: &str, resp: &[u8]) {
+    pub fn on_fresh_response(&self, qname: &str, resp: &[u8], effective_ttl: u32) {
         let ips = extract_ips_from_dns_response(resp);
-        let min_ttl = extract_min_ttl_from_dns_response(resp).unwrap_or(60);
 
         // 1. 保存反向 IP 缓存（供后续连接管理反查域名）
-        if min_ttl > 0 {
+        if effective_ttl > 0 {
             for ip in &ips {
                 if !ip.is_unspecified() {
-                    self.reverse_lookup_cache.insert(*ip, qname, min_ttl);
+                    self.reverse_lookup_cache.insert(*ip, qname, effective_ttl);
                 }
             }
         }
@@ -59,7 +95,7 @@ impl DnsResolvedNotifier {
         // 2. 触发 Resolution Hook (例如 eBPF offload)
         if let Some(hook) = self.resolution_hook.get() {
             if !ips.is_empty() {
-                hook(qname, &ips, Duration::from_secs(min_ttl as u64));
+                hook(qname, &ips, Duration::from_secs(effective_ttl as u64));
             }
         }
 
@@ -222,6 +258,7 @@ pub struct CachedTransport {
     cache: DnsCache,
     singleflight: Singleflight,
     notifier: Option<DnsResolvedNotifier>,
+    policy: DnsCachePolicy,
 }
 
 impl CachedTransport {
@@ -232,6 +269,7 @@ impl CachedTransport {
         endpoint: Endpoint,
         cache: DnsCache,
         notifier: Option<DnsResolvedNotifier>,
+        policy: DnsCachePolicy,
     ) -> Self {
         Self {
             tag: Arc::from(tag),
@@ -241,6 +279,7 @@ impl CachedTransport {
             cache,
             singleflight: Singleflight::new(),
             notifier,
+            policy,
         }
     }
 
@@ -251,10 +290,11 @@ impl CachedTransport {
         pool: Arc<UpstreamPool>,
         cache: DnsCache,
         notifier: Option<DnsResolvedNotifier>,
+        policy: DnsCachePolicy,
     ) -> Self {
         let endpoint =
             Endpoint::Remote(RemoteEndpoint::new(tag.clone(), upstream_keys, pool));
-        Self::new(tag, UpstreamType::Remote, override_ttl, endpoint, cache, notifier)
+        Self::new(tag, UpstreamType::Remote, override_ttl, endpoint, cache, notifier, policy)
     }
 
     pub fn new_local(
@@ -262,9 +302,10 @@ impl CachedTransport {
         override_ttl: Option<u32>,
         cache: DnsCache,
         notifier: Option<DnsResolvedNotifier>,
+        policy: DnsCachePolicy,
     ) -> Self {
         let endpoint = Endpoint::Local(LocalEndpoint::new(tag.clone()));
-        Self::new(tag, UpstreamType::Local, override_ttl, endpoint, cache, notifier)
+        Self::new(tag, UpstreamType::Local, override_ttl, endpoint, cache, notifier, policy)
     }
 }
 
@@ -324,26 +365,30 @@ impl DnsTransport for CachedTransport {
                             .fetch(&raw_query_vec, &domain_string, qtype)
                             .await
                         {
+                            let effective_ttl = this.policy.calculate_effective_ttl(this.override_ttl, &fresh_resp);
+                            let ips = extract_ips_from_dns_response(&fresh_resp);
+                            let is_acme = query_clone.qtype() == Some(QType::TXT)
+                                && domain_string.starts_with("_acme-challenge.");
+                            let is_unspecified = !ips.is_empty() && ips.iter().all(|ip| ip.is_unspecified());
+
                             if let Ok(fresh_tmpl) =
                                 ResponseTemplate::validate(&query_clone, &fresh_resp)
                             {
                                 let arc_template = Arc::new(fresh_tmpl);
                                 leader.publish(Arc::clone(&arc_template));
-                                let min_ttl = this.override_ttl.unwrap_or_else(|| {
-                                    extract_min_ttl_from_dns_response(&fresh_resp)
-                                        .unwrap_or(60)
-                                });
-                                this.cache.insert_scoped(
-                                    &this.tag,
-                                    &query_clone,
-                                    arc_template,
-                                    min_ttl,
-                                    Duration::from_secs(3600),
-                                );
+                                if !is_acme && !is_unspecified && effective_ttl > 0 {
+                                    this.cache.insert_scoped(
+                                        &this.tag,
+                                        &query_clone,
+                                        arc_template,
+                                        effective_ttl,
+                                        this.policy.stale_cache_retention,
+                                    );
+                                }
                             }
                             if let Some(notifier) = &this.notifier {
                                 notifier
-                                    .on_fresh_response(&domain_string, &fresh_resp);
+                                    .on_fresh_response(&domain_string, &fresh_resp, effective_ttl);
                             }
                         }
                     });
@@ -380,46 +425,53 @@ impl DnsTransport for CachedTransport {
                     Ok(rendered)
                 } else {
                     let mut resp = self.endpoint.fetch(raw_query, domain, qtype).await?;
-                    if let Some(ttl) = self.override_ttl {
-                        rewrite_dns_response_ttl(resp.as_mut_slice(), ttl);
+                    let effective_ttl = self.policy.calculate_effective_ttl(self.override_ttl, &resp);
+                    if self.override_ttl.is_some() || self.policy.optimistic_cache_ttl > 0 {
+                        rewrite_dns_response_ttl(resp.as_mut_slice(), effective_ttl);
                     }
                     if let Some(notifier) = &self.notifier {
-                        notifier.on_fresh_response(domain, &resp);
+                        notifier.on_fresh_response(domain, &resp, effective_ttl);
                     }
                     Ok(resp)
                 }
             }
             FlightRole::Leader(mut leader) => {
                 let mut resp = self.endpoint.fetch(raw_query, domain, qtype).await?;
+                let effective_ttl = self.policy.calculate_effective_ttl(self.override_ttl, &resp);
+                let ips = extract_ips_from_dns_response(&resp);
+                let is_acme = query.qtype() == Some(QType::TXT)
+                    && domain.starts_with("_acme-challenge.");
+                let is_unspecified = !ips.is_empty() && ips.iter().all(|ip| ip.is_unspecified());
+
                 if let Ok(template) = ResponseTemplate::validate(query, &resp) {
                     let arc_template = Arc::new(template);
                     leader.publish(Arc::clone(&arc_template));
-                    let min_ttl = self.override_ttl.unwrap_or_else(|| {
-                        extract_min_ttl_from_dns_response(&resp).unwrap_or(60)
-                    });
-                    self.cache.insert_scoped(
-                        &self.tag,
-                        query,
-                        arc_template,
-                        min_ttl,
-                        Duration::from_secs(3600),
-                    );
+                    if !is_acme && !is_unspecified && effective_ttl > 0 {
+                        self.cache.insert_scoped(
+                            &self.tag,
+                            query,
+                            arc_template,
+                            effective_ttl,
+                            self.policy.stale_cache_retention,
+                        );
+                    }
                 }
-                if let Some(ttl) = self.override_ttl {
-                    rewrite_dns_response_ttl(resp.as_mut_slice(), ttl);
+                if self.override_ttl.is_some() || self.policy.optimistic_cache_ttl > 0 {
+                    rewrite_dns_response_ttl(resp.as_mut_slice(), effective_ttl);
                 }
                 if let Some(notifier) = &self.notifier {
-                    notifier.on_fresh_response(domain, &resp);
+                    notifier.on_fresh_response(domain, &resp, effective_ttl);
                 }
                 Ok(resp)
             }
             FlightRole::Rejected => {
                 let mut resp = self.endpoint.fetch(raw_query, domain, qtype).await?;
-                if let Some(ttl) = self.override_ttl {
-                    rewrite_dns_response_ttl(resp.as_mut_slice(), ttl);
+                let effective_ttl = self.policy.calculate_effective_ttl(self.override_ttl, &resp);
+                if self.override_ttl.is_some() || self.policy.optimistic_cache_ttl > 0 {
+                    rewrite_dns_response_ttl(resp.as_mut_slice(), effective_ttl);
                 }
                 if let Some(notifier) = &self.notifier {
-                    notifier.on_fresh_response(domain, &resp);
+                    notifier.on_fresh_response(domain, &resp, effective_ttl);
                 }
                 Ok(resp)
             }

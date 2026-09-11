@@ -334,3 +334,54 @@ fn test_request_routing_or_and_empty_conditions() {
     let act_other = router.route_request("google.com", QType::A, None);
     assert_eq!(*act_other, RequestAction::Route("fallback-dns".to_string()));
 }
+
+#[test]
+fn test_dns2_cache_policy_effective_ttl() {
+    use crate::app::dns::resolver::router::transport::DnsCachePolicy;
+    use crate::app::dns::response::build_dns_ip_response;
+
+    let policy_default = DnsCachePolicy::default();
+    assert_eq!(policy_default.optimistic_cache_ttl, 0);
+    assert_eq!(policy_default.stale_cache_retention, std::time::Duration::from_secs(3600));
+
+    let qname = DnsName::from_domain("example.com").unwrap();
+    let query_wire = build_dns_query_wire(&qname, QType::A);
+
+    // 构造一个原始 TTL 为 60 的响应
+    let resp = build_dns_ip_response(&query_wire, &[IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))], 60).unwrap();
+
+    // 1. 无 optimistic TTL 时保持原上游 TTL
+    assert_eq!(policy_default.calculate_effective_ttl(None, &resp), 60);
+
+    // 2. 有 override_ttl 时优先使用 override_ttl
+    assert_eq!(policy_default.calculate_effective_ttl(Some(120), &resp), 120);
+
+    // 3. 配置 optimistic_cache_ttl = 300 时提升保底
+    let policy_optimistic = DnsCachePolicy::new(300, 7200);
+    assert_eq!(policy_optimistic.calculate_effective_ttl(None, &resp), 300);
+
+    // 4. override_ttl 优先于 optimistic_cache_ttl
+    assert_eq!(policy_optimistic.calculate_effective_ttl(Some(10), &resp), 10);
+}
+
+#[test]
+fn test_dns2_config_cache_fields_from_def() {
+    use crate::config::def::Dns2Config as DefDns2Config;
+
+    let yaml_str = r#"
+enable: true
+optimistic-cache-ttl: 300
+stale-cache-retention: 7200
+cache-capacity: 8192
+"#;
+    let def: DefDns2Config = serde_yaml::from_str(yaml_str).expect("deserialize Dns2Config");
+    assert_eq!(def.optimistic_cache_ttl, 300);
+    assert_eq!(def.stale_cache_retention, 7200);
+    assert_eq!(def.cache_capacity, Some(8192));
+
+    let cfg = RouterConfig::from_def(&def, true).expect("RouterConfig::from_def");
+    assert_eq!(cfg.optimistic_cache_ttl, 300);
+    assert_eq!(cfg.stale_cache_retention, 7200);
+    assert_eq!(cfg.cache_capacity, 8192);
+}
+

@@ -969,6 +969,16 @@ pub struct Dns2Config {
     pub proxy_server_nameserver: Vec<String>,
     pub upstreams: Vec<Dns2UpstreamDef>,
     pub routing: Dns2RoutingDef,
+    /// Minimum TTL for optimistic DNS cache in seconds (0 = follow upstream TTL)
+    #[serde(default)]
+    pub optimistic_cache_ttl: u32,
+    /// Retention duration in seconds for expired cache entries used for serve-stale fallback
+    #[educe(Default = 3600)]
+    #[serde(default = "default_stale_cache_retention")]
+    pub stale_cache_retention: u32,
+    /// Maximum capacity for DNS LRU cache and reverse lookup cache
+    #[serde(alias = "cache-size", alias = "cache_size")]
+    pub cache_capacity: Option<usize>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Educe)]

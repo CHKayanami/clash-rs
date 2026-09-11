@@ -95,6 +95,9 @@ pub struct RouterConfig {
     pub request_fallback: RequestAction,
     pub response_rules: Vec<ResponseRule>,
     pub response_fallback: ResponseAction,
+    pub optimistic_cache_ttl: u32,
+    pub stale_cache_retention: u32,
+    pub cache_capacity: usize,
 }
 
 impl Default for RouterConfig {
@@ -113,6 +116,9 @@ impl Default for RouterConfig {
             request_fallback: RequestAction::Reject(RejectCode::Nodata),
             response_rules: Vec::new(),
             response_fallback: ResponseAction::Accept,
+            optimistic_cache_ttl: 0,
+            stale_cache_retention: 3600,
+            cache_capacity: 4096,
         }
     }
 }
@@ -323,6 +329,13 @@ impl RouterConfig {
             request_fallback,
             response_rules,
             response_fallback,
+            optimistic_cache_ttl: def.optimistic_cache_ttl,
+            stale_cache_retention: if def.stale_cache_retention == 0 {
+                3600
+            } else {
+                def.stale_cache_retention
+            },
+            cache_capacity: def.cache_capacity.unwrap_or(4096).max(1),
         })
     }
 }

@@ -43,7 +43,7 @@ use self::config::{
 use self::hosts::HostsSnapshot;
 use self::routing::DnsRouter;
 use self::transport::{
-    CachedTransport, DnsResolvedNotifier, DnsTransport, FakeIpTransport, Transport,
+    CachedTransport, DnsCachePolicy, DnsResolvedNotifier, DnsTransport, FakeIpTransport, Transport,
 };
 
 pub struct RouterResolver {
@@ -126,14 +126,16 @@ impl RouterResolver {
                 None
             };
 
-        let reverse_lookup_cache = ReverseLookupCache::new(4096);
+        let capacity = cfg.cache_capacity.max(1);
+        let reverse_lookup_cache = ReverseLookupCache::new(capacity);
         let resolution_hook = Arc::new(OnceLock::new());
         let notifier = DnsResolvedNotifier::new(
             reverse_lookup_cache.clone(),
             Arc::clone(&resolution_hook),
             collector.clone(),
         );
-        let cache = DnsCache::new(4096);
+        let cache = DnsCache::new(capacity);
+        let cache_policy = DnsCachePolicy::new(cfg.optimistic_cache_ttl, cfg.stale_cache_retention);
 
         let mut transports: HashMap<String, Transport> = HashMap::new();
         let mut fake_dns: Option<Arc<FakeDns>> = None;
@@ -161,6 +163,7 @@ impl RouterResolver {
                             u.ttl,
                             cache.clone(),
                             Some(notifier.clone()),
+                            cache_policy,
                         )),
                     );
                 }
@@ -217,6 +220,7 @@ impl RouterResolver {
                         pool.clone(),
                         cache.clone(),
                         Some(notifier.clone()),
+                        cache_policy,
                     )),
                 );
             }
@@ -241,6 +245,7 @@ impl RouterResolver {
                         pool.clone(),
                         cache.clone(),
                         Some(notifier.clone()),
+                        cache_policy,
                     ),
                 ));
             }
