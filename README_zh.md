@@ -22,6 +22,7 @@
 > - ⚡ **性能与稳定性优化**：针对核心路径进行了大量重构与性能调优，重写了部分协议栈实现。
 > - 🚀 **新功能特性**：新增 Shadowsocks UOT (UDP-over-TCP)、域名嗅探（TLS SNI / HTTP Host / QUIC SNI）、H2MUX 、TUN system stack。
 > - ⚡ **eBPF 内核透明代理**：新增基于 eBPF 的高性能透明代理入站，支持内核态直连快路径决策（Direct Fast-Path）（仅限 Linux）。
+> - 🌐 **灵活的 DNS2 路由引擎**：新增两阶段 DNS 路由子系统，支持对上游 DNS 服务器池（直连 / 代理 Detour / Fake-IP）与分流规则进行更灵活精细的配置。
 > - 🪶 **Minimal 轻量版本**：默认精简，不包含以下协议：`SSH`、`WireGuard`、`Tailscale`、`Shadowquic`、`Tor`。
 > - 📖 **配置说明文档**：请参阅 [clash-rs-alpha-docs](https://chkayanami.github.io/clash-rs-alpha-docs)。
 
