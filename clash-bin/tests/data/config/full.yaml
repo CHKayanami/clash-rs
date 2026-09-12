@@ -1054,7 +1054,6 @@ proxies:
     # up: 50
     # down: 100
     # QUIC tuning:
-    # cwnd: 4                        # congestion window
     # udp-mtu: 1400
     # disable-mtu-discovery: false
     # Custom CA for self-signed certs:

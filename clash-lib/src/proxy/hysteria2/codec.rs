@@ -3,7 +3,12 @@ use anyhow::anyhow;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use quinn_proto::{VarInt, coding::Codec};
 use rand::distr::Distribution;
-use std::{io::ErrorKind, str::FromStr};
+use std::{
+    collections::HashMap,
+    io::ErrorKind,
+    str::FromStr,
+    time::{Duration, Instant},
+};
 use tokio_util::codec::{Decoder, Encoder};
 
 pub struct Hy2TcpCodec;
@@ -244,10 +249,13 @@ impl EncodedAddr {
 #[inline]
 pub fn padding(range: std::ops::RangeInclusive<u32>) -> Vec<u8> {
     let len = rand::random_range(range) as usize;
-    rand::distr::Alphanumeric
-        .sample_iter(rand::rng())
-        .take(len)
-        .collect()
+    let mut vec = Vec::with_capacity(len);
+    vec.extend(
+        rand::distr::Alphanumeric
+            .sample_iter(rand::rng())
+            .take(len),
+    );
+    vec
 }
 
 impl Encoder<&'_ SocksAddr> for Hy2TcpCodec {
@@ -497,8 +505,8 @@ where
             let payload =
                 &self.payload.as_ref()[self.next_frag_start..next_frag_end];
 
-            let mut buf = BytesMut::new();
-            buf.reserve(self.fixed_size + payload.len());
+            let mut buf =
+                BytesMut::with_capacity(self.fixed_size + payload.len());
 
             buf.put_u32(self.session_id);
             buf.put_u16(self.pkt_id);
@@ -528,60 +536,102 @@ where
     }
 }
 
-#[derive(Default)]
+const DEFRAG_MAX_PENDING: usize = 64;
+const DEFRAG_MAX_FRAGMENTS: usize = 64;
+const DEFRAG_MAX_AGE: Duration = Duration::from_secs(5);
+
+struct DefragEntry {
+    frags: Vec<Option<HysUdpPacket>>,
+    count: usize,
+    updated: Instant,
+}
+
 pub struct Defragger {
-    pub pkt_id: u16,
-    pub frags: Vec<Option<HysUdpPacket>>,
-    pub cnt: u16,
+    pending: HashMap<u16, DefragEntry>,
+}
+
+impl Default for Defragger {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Defragger {
+    pub fn new() -> Self {
+        Self {
+            pending: HashMap::new(),
+        }
+    }
+
     pub fn feed(&mut self, pkt: HysUdpPacket) -> Option<HysUdpPacket> {
         if pkt.frag_count == 1 {
             return Some(pkt);
         }
-        if pkt.frag_count <= pkt.frag_id {
+        if pkt.frag_count == 0
+            || pkt.frag_count <= pkt.frag_id
+            || pkt.frag_count as usize > DEFRAG_MAX_FRAGMENTS
+        {
             tracing::warn!(
-                "invalid frag, id, count: {}, {}",
+                "invalid frag, id: {}, count: {}",
                 pkt.frag_id,
                 pkt.frag_count
             );
             return None;
         }
-        let frag_id = pkt.frag_id as usize;
 
-        if pkt.pkt_id != self.pkt_id || pkt.frag_count as usize != self.frags.len() {
-            // new packet, overwrite the old one
-            // if the new packet frags is 1, should already return
-            self.pkt_id = pkt.pkt_id;
-            self.frags.clear();
-            self.frags.resize(pkt.frag_count as usize, None);
-            self.cnt = 0;
-            self.frags[frag_id] = Some(pkt);
-            self.cnt += 1;
-        } else if frag_id < self.frags.len() && self.frags[frag_id].is_none() {
-            self.frags[frag_id] = Some(pkt);
-            self.cnt += 1;
-            if self.cnt as usize == self.frags.len() {
-                // now we have all fragments
-                let total_len: usize = self
-                    .frags
-                    .iter()
-                    .filter_map(|p| p.as_ref().map(|x| x.data.len()))
-                    .sum();
-                let frags = std::mem::take(&mut self.frags);
-                let mut iters = frags.into_iter().map(|x| x.unwrap());
-                let mut pkt0 = iters.next().unwrap();
-                let mut data_buf = BytesMut::with_capacity(total_len);
-                data_buf.extend_from_slice(&pkt0.data);
-                for pkt in iters {
-                    data_buf.extend_from_slice(&pkt.data);
-                }
-                pkt0.data = data_buf.freeze();
-                return Some(pkt0);
+        let pkt_id = pkt.pkt_id;
+        let frag_id = pkt.frag_id as usize;
+        let frag_count = pkt.frag_count as usize;
+
+        // 容量超出时淘汰过期条目
+        if self.pending.len() >= DEFRAG_MAX_PENDING && !self.pending.contains_key(&pkt_id) {
+            self.pending
+                .retain(|_, entry| entry.updated.elapsed() < DEFRAG_MAX_AGE);
+            if self.pending.len() >= DEFRAG_MAX_PENDING {
+                return None;
             }
         }
-        None
+
+        let entry = self.pending.entry(pkt_id).or_insert_with(|| DefragEntry {
+            frags: vec![None; frag_count],
+            count: 0,
+            updated: Instant::now(),
+        });
+
+        // 若旧分片已超时或分片总数不匹配，重置 entry
+        if entry.updated.elapsed() >= DEFRAG_MAX_AGE || entry.frags.len() != frag_count {
+            entry.frags = vec![None; frag_count];
+            entry.count = 0;
+        }
+
+        if frag_id >= entry.frags.len() || entry.frags[frag_id].is_some() {
+            // 重复分片或非法索引
+            return None;
+        }
+
+        entry.frags[frag_id] = Some(pkt);
+        entry.count += 1;
+        entry.updated = Instant::now();
+
+        if entry.count == entry.frags.len() {
+            let entry = self.pending.remove(&pkt_id).expect("entry exists");
+            let total_len: usize = entry
+                .frags
+                .iter()
+                .filter_map(|p| p.as_ref().map(|x| x.data.len()))
+                .sum();
+            let mut iters = entry.frags.into_iter().map(|x| x.unwrap());
+            let mut pkt0 = iters.next().unwrap();
+            let mut data_buf = BytesMut::with_capacity(total_len);
+            data_buf.extend_from_slice(&pkt0.data);
+            for p in iters {
+                data_buf.extend_from_slice(&p.data);
+            }
+            pkt0.data = data_buf.freeze();
+            Some(pkt0)
+        } else {
+            None
+        }
     }
 }
 
@@ -632,11 +682,9 @@ fn test_udp_roundtrip() {
     let addr = SocksAddr::Domain("example.com".into(), 1234);
     let payload = Bytes::from_static(b"hello world hysteria2");
     let mut frags = Fragments::new(0x12345678, 42, addr.clone(), 1500, payload.clone()).unwrap();
-    let frag_bytes = frags.next().unwrap();
-
-    let mut buf = BytesMut::from(frag_bytes.as_ref());
+    let encoded = frags.next().unwrap();
+    let mut buf = BytesMut::from(encoded.as_ref());
     let decoded = HysUdpPacket::decode(&mut buf).unwrap();
-
     assert_eq!(decoded.session_id, 0x12345678);
     assert_eq!(decoded.pkt_id, 42);
     assert_eq!(decoded.frag_id, 0);
@@ -645,3 +693,56 @@ fn test_udp_roundtrip() {
     assert_eq!(decoded.data, payload);
 }
 
+#[test]
+fn test_defragger_interleaved_packets() {
+    let mut defrag = Defragger::new();
+    let addr = SocksAddr::Ip("127.0.0.1:8080".parse().unwrap());
+
+    // Packet 100 分 2 片：P100-F0, P100-F1
+    let p100_0 = HysUdpPacket {
+        session_id: 1,
+        pkt_id: 100,
+        frag_id: 0,
+        frag_count: 2,
+        addr: addr.clone(),
+        data: Bytes::from_static(b"hello "),
+    };
+    let p100_1 = HysUdpPacket {
+        session_id: 1,
+        pkt_id: 100,
+        frag_id: 1,
+        frag_count: 2,
+        addr: addr.clone(),
+        data: Bytes::from_static(b"world"),
+    };
+
+    // Packet 200 分 2 片：P200-F0, P200-F1
+    let p200_0 = HysUdpPacket {
+        session_id: 2,
+        pkt_id: 200,
+        frag_id: 0,
+        frag_count: 2,
+        addr: addr.clone(),
+        data: Bytes::from_static(b"foo "),
+    };
+    let p200_1 = HysUdpPacket {
+        session_id: 2,
+        pkt_id: 200,
+        frag_id: 1,
+        frag_count: 2,
+        addr: addr.clone(),
+        data: Bytes::from_static(b"bar"),
+    };
+
+    // 交错到达：P100-0 -> P200-0 -> P100-1 -> P200-1
+    assert!(defrag.feed(p100_0).is_none());
+    assert!(defrag.feed(p200_0).is_none());
+
+    let res100 = defrag.feed(p100_1).expect("p100 should reassemble");
+    assert_eq!(res100.pkt_id, 100);
+    assert_eq!(res100.data.as_ref(), b"hello world");
+
+    let res200 = defrag.feed(p200_1).expect("p200 should reassemble");
+    assert_eq!(res200.pkt_id, 200);
+    assert_eq!(res200.data.as_ref(), b"foo bar");
+}

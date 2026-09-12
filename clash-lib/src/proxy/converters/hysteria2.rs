@@ -120,12 +120,14 @@ impl TryFrom<OutboundHysteria2> for Handler {
             passwd: value.password,
             ports: ports_gen,
             obfs,
-            up_down: value
-                .up
-                .zip(value.down)
-                .map(|(u, d)| (u * 1_000_000, d * 1_000_000)),
+            up_down: match (value.up, value.down) {
+                (None, None) => None,
+                (up, down) => Some((
+                    up.unwrap_or(0).saturating_mul(125_000),
+                    down.unwrap_or(0).saturating_mul(125_000),
+                )),
+            },
             ca_str: value.ca_str,
-            cwnd: value.cwnd,
             udp_mtu: value.udp_mtu,
             disable_mtu_discovery: value.disable_mtu_discovery.unwrap_or(false),
             tls_cert: value.tls_cert,
@@ -274,5 +276,59 @@ mod tests {
         let handler = Handler::try_from(outbound)
             .expect("failed to build handler from outbound");
         assert_eq!(handler.name(), "hysteria2");
+    }
+
+    #[test]
+    fn test_hysteria2_bandwidth_parsing() {
+        // 双向配置：up 100 Mbps, down 200 Mbps -> 12_500_000, 25_000_000 Bytes/s
+        let ob = OutboundHysteria2 {
+            name: "test".into(),
+            server: "1.1.1.1".into(),
+            port: 443,
+            password: "pw".into(),
+            up: Some(100),
+            down: Some(200),
+            ..Default::default()
+        };
+        let h = Handler::try_from(ob).unwrap();
+        // 验证 handler 的 up_down
+        assert_eq!(h.opts().up_down, Some((12_500_000, 25_000_000)));
+
+        // 单向配置：仅配置 up
+        let ob_up_only = OutboundHysteria2 {
+            name: "test".into(),
+            server: "1.1.1.1".into(),
+            port: 443,
+            password: "pw".into(),
+            up: Some(50),
+            down: None,
+            ..Default::default()
+        };
+        let h_up = Handler::try_from(ob_up_only).unwrap();
+        assert_eq!(h_up.opts().up_down, Some((6_250_000, 0)));
+
+        // 单向配置：仅配置 down
+        let ob_down_only = OutboundHysteria2 {
+            name: "test".into(),
+            server: "1.1.1.1".into(),
+            port: 443,
+            password: "pw".into(),
+            up: None,
+            down: Some(80),
+            ..Default::default()
+        };
+        let h_down = Handler::try_from(ob_down_only).unwrap();
+        assert_eq!(h_down.opts().up_down, Some((0, 10_000_000)));
+
+        // 未配置
+        let ob_none = OutboundHysteria2 {
+            name: "test".into(),
+            server: "1.1.1.1".into(),
+            port: 443,
+            password: "pw".into(),
+            ..Default::default()
+        };
+        let h_none = Handler::try_from(ob_none).unwrap();
+        assert_eq!(h_none.opts().up_down, None);
     }
 }

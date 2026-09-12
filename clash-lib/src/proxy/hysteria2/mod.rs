@@ -4,9 +4,11 @@ mod datagram;
 mod salamander;
 mod udp_hop;
 
+use quinn_proto::congestion::{BbrConfig, ControllerFactory};
+
 use self::{
     codec::Hy2TcpCodec,
-    congestion::{DynCongestion, try_set_brutal_controller},
+    congestion::BrutalConfig,
     datagram::{HysteriaDatagramOutbound, UdpSession},
 };
 use super::{
@@ -69,6 +71,7 @@ pub struct HystOption {
     pub skip_cert_verify: bool,
     pub alpn: Vec<String>,
     #[allow(dead_code)]
+    /// Bandwidth hints: (up_bytes_per_sec, down_bytes_per_sec)
     pub up_down: Option<(u64, u64)>,
     pub fingerprint: Option<String>,
     pub ca: Option<PathBuf>,
@@ -76,8 +79,6 @@ pub struct HystOption {
     pub disable_mtu_discovery: bool,
     #[allow(dead_code)]
     pub ca_str: Option<String>,
-    #[allow(dead_code)]
-    pub cwnd: Option<u64>,
     /// File path or inline PEM client certificate for mTLS.
     pub tls_cert: Option<String>,
     /// File path or inline PEM client private key for mTLS.
@@ -129,7 +130,28 @@ impl Debug for Handler {
 
 impl Handler {
     const DEFAULT_MAX_IDLE_TIMEOUT: std::time::Duration =
-        std::time::Duration::from_secs(300);
+        std::time::Duration::from_secs(30);
+
+    #[cfg(test)]
+    pub fn opts(&self) -> &HystOption {
+        &self.opts
+    }
+
+    pub fn evict_connection(&self, failed: &Arc<HysteriaConnection>) {
+        let mut conn_lock = self.conn.write();
+        if let Some(cached) = conn_lock.as_ref() {
+            if Arc::ptr_eq(&cached.conn, failed) {
+                tracing::warn!(
+                    "hysteria2 connection to {} failed, actively evicting from cache",
+                    self.opts.addr
+                );
+                failed
+                    .conn
+                    .close(quinn::VarInt::from_u32(0), b"connection evicted");
+                *conn_lock = None;
+            }
+        }
+    }
 
     pub fn new(opts: HystOption) -> std::io::Result<Self> {
         // Fail closed. Warning and carrying on validated the server against the
@@ -166,12 +188,20 @@ impl Handler {
             transport.mtu_discovery_config(None);
         }
         transport.stream_receive_window(quinn::VarInt::from_u32(8 * 1024 * 1024));
-        transport.receive_window(quinn::VarInt::from_u32(16 * 1024 * 1024));
-        transport.congestion_controller_factory(Arc::new(DynCongestion));
+        transport.receive_window(quinn::VarInt::from_u32(8 * 1024 * 1024));
+
+        let up_bytes = opts.up_down.map(|(up, _)| up).unwrap_or(0);
+        let factory: Arc<dyn ControllerFactory + Send + Sync> = if up_bytes > 0 {
+            Arc::new(BrutalConfig::new(up_bytes))
+        } else {
+            Arc::new(BbrConfig::default())
+        };
+        transport.congestion_controller_factory(factory);
+
         transport.max_idle_timeout(Some(
             Self::DEFAULT_MAX_IDLE_TIMEOUT.try_into().unwrap(),
         ));
-        transport.keep_alive_interval(Some(std::time::Duration::from_secs(10)));
+        transport.keep_alive_interval(Some(std::time::Duration::from_secs(5)));
 
         let quic_config: QuicClientConfig = tls_config.try_into().map_err(|e| {
             std::io::Error::new(
@@ -282,9 +312,9 @@ impl Handler {
             .unwrap_or(&default_sni);
         let session = ep.connect(server_socket_addr, sni)?.await?;
         tracing::trace!("hysteria2 QUIC connection established");
-        let down_bps = self.opts.up_down.map(|(_, down)| down).unwrap_or(0);
+        let down_bytes = self.opts.up_down.map(|(_, down)| down).unwrap_or(0);
         let (guard, cc_rx, udp) =
-            Self::auth(&session, &self.opts.passwd, down_bps).await?;
+            Self::auth(&session, &self.opts.passwd, down_bytes).await?;
         tracing::trace!(
             "hysteria2 authentication successful, cc_rx={:?}, udp={}",
             cc_rx,
@@ -292,8 +322,9 @@ impl Handler {
         );
         *self.support_udp.write() = udp;
 
-        let up_bps = self.opts.up_down.map(|(up, _)| up).unwrap_or(0);
-        let effective_up_bps = match (up_bps, cc_rx) {
+        let up_bytes = self.opts.up_down.map(|(up, _)| up).unwrap_or(0);
+        let effective_up_bytes = match (up_bytes, cc_rx) {
+            (0, CcRx::Fixed(rx)) if rx > 0 => rx,
             (0, _) => 0,
             (up, CcRx::Auto) => up,
             (up, CcRx::Fixed(rx)) if rx > 0 => up.min(rx),
@@ -301,13 +332,11 @@ impl Handler {
         };
 
         tracing::info!(
-            "hysteria2 cc_rx negotiation: server cc_rx={:?}, local up_bps={}, negotiated effective_up_bps={}",
+            "hysteria2 cc_rx negotiation: server cc_rx={:?}, local up_bytes={}, negotiated effective_up_bytes={}",
             cc_rx,
-            up_bps,
-            effective_up_bps
+            up_bytes,
+            effective_up_bytes
         );
-
-        try_set_brutal_controller(&session, effective_up_bps);
 
         Ok((session, guard))
     }
@@ -315,7 +344,7 @@ impl Handler {
     async fn auth(
         conn: &quinn::Connection,
         passwd: &str,
-        down_bps: u64,
+        down_bytes: u64,
     ) -> anyhow::Result<(SendRequest<OpenStreams, Bytes>, CcRx, bool)> {
         let h3_conn = h3_quinn::Connection::new(conn.clone());
 
@@ -324,7 +353,7 @@ impl Handler {
 
         let req = http::Request::post("https://hysteria/auth")
             .header("Hysteria-Auth", passwd)
-            .header("Hysteria-CC-RX", down_bps.to_string())
+            .header("Hysteria-CC-RX", down_bytes.to_string())
             .header("Hysteria-Padding", codec::padding(64..=512))
             .body(())
             .unwrap();
@@ -448,10 +477,29 @@ impl OutboundHandler for Handler {
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
     ) -> std::io::Result<AnyStream> {
-        let authed_conn = self.new_authed_connection(sess, resolver.clone()).await?;
-        let hy_stream = authed_conn.connect_tcp(sess).await?;
-        sess.push_chain(self.name());
-        Ok(Box::new(hy_stream))
+        let mut retry = true;
+        loop {
+            let authed_conn = self.new_authed_connection(sess, resolver.clone()).await?;
+            match authed_conn.connect_tcp(sess).await {
+                Ok(hy_stream) => {
+                    sess.push_chain(self.name());
+                    return Ok(Box::new(hy_stream));
+                }
+                Err(e) => {
+                    self.evict_connection(&authed_conn);
+                    if retry {
+                        tracing::warn!(
+                            "hysteria2 connect_tcp to {} on cached connection failed ({}), retrying with fresh connection...",
+                            self.opts.addr,
+                            e
+                        );
+                        retry = false;
+                        continue;
+                    }
+                    return Err(e);
+                }
+            }
+        }
     }
 
     /// connect to remote target via UDP
@@ -936,7 +984,6 @@ mod tests {
             obfs,
             up_down: Some((100, 100)),
             ca_str: None,
-            cwnd: None,
             udp_mtu: None,
             disable_mtu_discovery: false,
             tls_cert: None,

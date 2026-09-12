@@ -596,8 +596,6 @@ pub struct OutboundHysteria2 {
     pub fingerprint: Option<String>,
     pub udp_mtu: Option<u32>,
     pub disable_mtu_discovery: Option<bool>,
-    /// bbr congestion control window
-    pub cwnd: Option<u64>,
     /// File path or inline PEM client certificate for mTLS.
     /// Must be set together with `tls-key`.
     pub tls_cert: Option<String>,
