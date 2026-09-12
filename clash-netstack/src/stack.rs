@@ -67,43 +67,27 @@ pub struct NetStack {
     udp_outbound: mpsc::Receiver<Packet>,
 }
 
-use crate::ring_buffer::PooledBuffer;
-
-#[derive(Debug)]
-pub enum PacketData {
-    Bytes(Bytes),
-    Pooled(PooledBuffer),
-}
-
+#[derive(Debug, Clone)]
 pub struct Packet {
-    data: PacketData,
+    data: Bytes,
 }
 
 impl Packet {
+    #[inline]
     pub fn new(data: impl Into<Bytes>) -> Self {
         Packet {
-            data: PacketData::Bytes(data.into()),
+            data: data.into(),
         }
     }
 
-    pub fn from_pooled(pooled: PooledBuffer) -> Self {
-        Packet {
-            data: PacketData::Pooled(pooled),
-        }
-    }
-
+    #[inline]
     pub fn data(&self) -> &[u8] {
-        match &self.data {
-            PacketData::Bytes(b) => b.as_ref(),
-            PacketData::Pooled(p) => p.as_ref(),
-        }
+        self.data.as_ref()
     }
 
+    #[inline]
     pub fn into_bytes(self) -> Bytes {
-        match self.data {
-            PacketData::Bytes(b) => b,
-            PacketData::Pooled(p) => p.into_bytes(),
-        }
+        self.data
     }
 }
 
@@ -128,12 +112,6 @@ impl From<&'static [u8]> for Packet {
 impl From<bytes::BytesMut> for Packet {
     fn from(data: bytes::BytesMut) -> Self {
         Packet::new(data.freeze())
-    }
-}
-
-impl From<PooledBuffer> for Packet {
-    fn from(pooled: PooledBuffer) -> Self {
-        Packet::from_pooled(pooled)
     }
 }
 

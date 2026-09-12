@@ -1,4 +1,5 @@
 use crate::Packet;
+use bytes::BytesMut;
 use log::trace;
 use std::net::SocketAddr;
 use tokio::sync::mpsc;
@@ -214,7 +215,7 @@ impl SplitWrite {
             ));
         }
 
-        let mut buf = crate::ring_buffer::PooledBuffer::acquire(total_len);
+        let mut buf = BytesMut::with_capacity(total_len);
 
         if is_v4 {
             let SocketAddr::V4(src) = packet.local_addr else {
@@ -298,7 +299,7 @@ impl SplitWrite {
 
         // UDP is inherently unreliable — drop the packet if the outbound
         // channel is full rather than blocking the UDP handler task.
-        match self.send.try_send(Packet::from_pooled(buf)) {
+        match self.send.try_send(Packet::new(buf.freeze())) {
             Ok(()) => Ok(()),
             Err(mpsc::error::TrySendError::Full(_)) => Ok(()),
             Err(mpsc::error::TrySendError::Closed(_)) => {

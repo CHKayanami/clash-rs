@@ -1,5 +1,6 @@
 use std::{sync::Arc, time::Duration};
 
+use bytes::BytesMut;
 use futures::{FutureExt, SinkExt, StreamExt, future::BoxFuture};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
@@ -276,16 +277,6 @@ impl TunRunner {
                     ));
                 }
             };
-
-        let pool_limit = cfg.max_pooled_buffers.or_else(|| {
-            std::env::var("CLASH_NETSTACK_MAX_POOLED_BUFFERS")
-                .or_else(|_| std::env::var("TUN_MAX_POOLED_BUFFERS"))
-                .ok()
-                .and_then(|v| v.parse::<usize>().ok())
-        });
-        if let Some(limit) = pool_limit {
-            watfaq_netstack::set_max_pooled_buffers(limit);
-        }
 
         let (stack, tcp_listener, udp_socket) = watfaq_netstack::NetStack::new();
         Ok((tun, stack, tcp_listener, udp_socket))
@@ -572,94 +563,25 @@ impl Runner for TunRunner {
                     }};
                 }
 
-                macro_rules! dispatch_pooled {
-                    ($pooled:expr) => {{
-                        let mut pooled = $pooled;
-                        if let Ok(version) = smoltcp::wire::IpVersion::of_packet(pooled.as_ref()) {
-                            let is_tcp = match version {
-                                smoltcp::wire::IpVersion::Ipv4 => {
-                                    smoltcp::wire::Ipv4Packet::new_checked(pooled.as_ref())
-                                        .map(|p| p.next_header() == smoltcp::wire::IpProtocol::Tcp)
-                                        .unwrap_or(false)
-                                }
-                                smoltcp::wire::IpVersion::Ipv6 => {
-                                    smoltcp::wire::Ipv6Packet::new_checked(pooled.as_ref())
-                                        .map(|p| p.next_header() == smoltcp::wire::IpProtocol::Tcp)
-                                        .unwrap_or(false)
-                                }
-                            };
-
-                            if is_tcp {
-                                if !enable_tcp {
-                                    // TCP disabled on TUN, drop incoming TCP packet
-                                } else if use_system_stack
-                                    && super::system_stack::process_system_tcp_packet(
-                                        pooled.as_mut_slice(),
-                                        v4_nat_info,
-                                        v6_nat_info,
-                                        &nat,
-                                    ) == Some(true)
-                                {
-                                    if let Err(e) = tun_tx_for_system_tcp
-                                        .send(pooled.into_bytes())
-                                        .await
-                                    {
-                                        error!(
-                                            "failed to write system TCP packet to tun channel: {}",
-                                            e
-                                        );
-                                        break;
-                                    }
-                                } else if let Err(e) = stack_sink
-                                    .send(watfaq_netstack::Packet::from_pooled(pooled))
-                                    .await
-                                {
-                                    error!("failed to send pkt to stack: {}", e);
-                                    return Err(Error::Operation(
-                                        "tun stopped unexpectedly 1".to_string(),
-                                    ));
-                                }
-                            } else if let Err(e) = stack_sink
-                                .send(watfaq_netstack::Packet::from_pooled(pooled))
-                                .await
-                            {
-                                error!("failed to send pkt to stack: {}", e);
-                                return Err(Error::Operation(
-                                    "tun stopped unexpectedly 1".to_string(),
-                                ));
-                            }
-                        } else if let Err(e) = stack_sink
-                            .send(watfaq_netstack::Packet::from_pooled(pooled))
-                            .await
-                        {
-                            error!("failed to send pkt to stack: {}", e);
-                            return Err(Error::Operation(
-                                "tun stopped unexpectedly 1".to_string(),
-                            ));
-                        }
-                    }};
-                }
-
                 let read_cap = if gso_enabled { 65535 } else { stack_mtu.max(2048) };
                 loop {
-                    let mut pooled = crate::common::io::PooledBuffer::acquire(read_cap);
-                    pooled.resize(read_cap, 0);
-                    match tun.recv(pooled.as_mut_slice()).await {
+                    let mut buf = BytesMut::zeroed(read_cap);
+                    match tun.recv(&mut buf[..]).await {
                         Ok(0) => {
                             info!("tun reader reached EOF");
                             break;
                         }
                         Ok(n) => {
-                            pooled.truncate(n);
-                            if gso_enabled && pooled.len() > stack_mtu {
-                                let pkt = pooled.into_bytes();
+                            buf.truncate(n);
+                            if gso_enabled && buf.len() > stack_mtu {
+                                let pkt = buf.freeze();
                                 for single_pkt in
                                     super::gso::split_gso_packet(pkt, stack_mtu)
                                 {
                                     dispatch_bytes_mut!(single_pkt);
                                 }
                             } else {
-                                dispatch_pooled!(pooled);
+                                dispatch_bytes_mut!(buf);
                             }
                         }
                         Err(e) => {

@@ -1,10 +1,6 @@
-pub mod pooled_buffer;
 pub mod ring_buffer;
 pub mod slide_buffer;
 
-pub use pooled_buffer::{
-    PooledBuffer, max_pooled_buffers, set_max_pooled_buffers,
-};
 pub use ring_buffer::{LockFreeRingBuffer, acquire_vec};
 pub use slide_buffer::SlideBuffer;
 

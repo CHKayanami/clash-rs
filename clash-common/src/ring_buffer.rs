@@ -1,15 +1,11 @@
-use crate::pooled_buffer::PooledBuffer;
-use std::{
-    cell::UnsafeCell,
-    sync::atomic::{AtomicUsize, Ordering},
-};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 pub fn acquire_vec(capacity: usize) -> Vec<u8> {
     vec![0u8; capacity]
 }
 
 pub struct LockFreeRingBuffer {
-    buffer: UnsafeCell<Option<PooledBuffer>>,
+    _buffer: Box<[u8]>,
     raw_ptr: *mut u8,
     capacity: usize,
     write_pos: AtomicUsize, // Only TCP thread writes
@@ -21,10 +17,10 @@ unsafe impl Sync for LockFreeRingBuffer {}
 
 impl LockFreeRingBuffer {
     pub fn new(capacity: usize) -> Self {
-        let mut buffer = PooledBuffer::with_capacity(capacity);
+        let mut buffer = vec![0u8; capacity].into_boxed_slice();
         let raw_ptr = buffer.as_mut_ptr();
         Self {
-            buffer: UnsafeCell::new(Some(buffer)),
+            _buffer: buffer,
             raw_ptr,
             capacity,
             write_pos: AtomicUsize::new(0),
@@ -126,20 +122,12 @@ impl LockFreeRingBuffer {
     }
 }
 
-impl Drop for LockFreeRingBuffer {
-    fn drop(&mut self) {
-        unsafe {
-            let _ = (*self.buffer.get()).take();
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn test_ring_buffer_pooling() {
+    fn test_ring_buffer() {
         let rb = LockFreeRingBuffer::new(64 * 1024);
         assert_eq!(rb.enqueue_slice(b"hello world"), 11);
         let mut out = [0u8; 11];
@@ -147,7 +135,6 @@ mod tests {
         assert_eq!(&out, b"hello world");
         drop(rb);
 
-        // Next allocation should reuse pooled buffer
         let rb2 = LockFreeRingBuffer::new(64 * 1024);
         assert_eq!(rb2.enqueue_slice(b"reused"), 6);
         let mut out2 = [0u8; 6];

@@ -17,7 +17,7 @@ pub use splice::{
     CopyTracker, DownloadTracker, UploadTracker, zero_copy_bidirectional,
 };
 
-pub use clash_common::{PooledBuffer, SlideBuffer};
+pub use clash_common::SlideBuffer;
 
 use crate::{
     app::dispatcher::TrafficTracker,

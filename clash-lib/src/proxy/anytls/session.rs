@@ -45,7 +45,7 @@ pub(super) enum OutgoingMessage {
     /// Data frame for a stream (PSH)
     Data {
         stream_id: u32,
-        data: clash_common::PooledBuffer,
+        data: Bytes,
     },
     /// FIN frame for a stream
     Fin { stream_id: u32 },

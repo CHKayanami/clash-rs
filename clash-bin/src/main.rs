@@ -22,7 +22,7 @@ unsafe impl Sync for MallocConfPtr {}
 #[allow(non_upper_case_globals)]
 #[unsafe(no_mangle)]
 pub static malloc_conf: MallocConfPtr =
-    MallocConfPtr(c"dirty_decay_ms:3000,muzzy_decay_ms:3000,background_thread:true,max_background_threads:1,narenas:4".as_ptr());
+    MallocConfPtr(c"background_thread:true,max_background_threads:1,dirty_decay_ms:2000,muzzy_decay_ms:0,narenas:4,lg_tcache_max:16,thp:never,metadata_thp:disabled".as_ptr());
 
 #[cfg(all(feature = "mimalloc", not(feature = "dhat-heap")))]
 use mimalloc::MiMalloc;
