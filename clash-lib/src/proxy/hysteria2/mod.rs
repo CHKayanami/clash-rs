@@ -145,9 +145,6 @@ impl Handler {
                     "hysteria2 connection to {} failed, actively evicting from cache",
                     self.opts.addr
                 );
-                failed
-                    .conn
-                    .close(quinn::VarInt::from_u32(0), b"connection evicted");
                 *conn_lock = None;
             }
         }
@@ -486,6 +483,11 @@ impl OutboundHandler for Handler {
                     return Ok(Box::new(hy_stream));
                 }
                 Err(e) => {
+                    // 如果错误是业务层的 ConnectionRefused（即服务端正常回应拒绝，如目标域名不存在、端口拒绝），
+                    // 证明底层 QUIC 连接完全健康，绝不能驱逐连接，更不能盲目重试！
+                    if e.kind() == std::io::ErrorKind::ConnectionRefused {
+                        return Err(e);
+                    }
                     self.evict_connection(&authed_conn);
                     if retry {
                         tracing::warn!(
@@ -643,10 +645,10 @@ impl HysteriaConnection {
                 resp.status,
                 resp.msg
             );
-            return Err(std::io::Error::other(format!(
-                "server response error, msg: {:?}",
-                resp.msg
-            )));
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionRefused,
+                format!("server response error, msg: {:?}", resp.msg),
+            ));
         } else {
             tracing::debug!(
                 "hysteria2 tcp connection established to {}: status={:#x}, msg={:?}",
