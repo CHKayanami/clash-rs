@@ -1,6 +1,7 @@
 mod codec;
 mod congestion;
 mod datagram;
+mod h3;
 mod salamander;
 mod udp_hop;
 
@@ -10,6 +11,10 @@ use self::{
     codec::Hy2TcpCodec,
     congestion::BrutalConfig,
     datagram::{HysteriaDatagramOutbound, UdpSession},
+    h3::{
+        H3_STREAM_QPACK_DECODER, H3_STREAM_QPACK_ENCODER, auth_request_frame, client_preface,
+        read_h3_response_headers,
+    },
 };
 use super::{
     ConnectorType, DialWithConnector, OutboundHandler, OutboundType,
@@ -22,13 +27,11 @@ use crate::{
     proxy::{AnyOutboundDatagram, AnyStream},
     session::{Session, SocksAddr},
 };
-use anyhow::anyhow;
+use anyhow::{Context as _, anyhow};
 use bytes::{Bytes, BytesMut};
 use codec::Fragments;
 use erased_serde::Serialize as ErasedSerialize;
 use futures::SinkExt;
-use h3::client::SendRequest;
-use h3_quinn::OpenStreams;
 use parking_lot::RwLock;
 use quinn::{
     ClientConfig, Connection, TokioRuntime, crypto::rustls::QuicClientConfig,
@@ -104,11 +107,16 @@ impl FromStr for CcRx {
     }
 }
 
+type H3Preface = (quinn::SendStream, quinn::SendStream, quinn::SendStream);
+
 #[derive(Clone)]
 struct CachedConn {
     conn: Arc<HysteriaConnection>,
+    /// H3 client preface streams (control + QPACK encoder/decoder). Held
+    /// open for the life of the connection: dropping the send half finishes
+    /// the stream, and closing a critical H3 stream is a connection error.
     #[allow(dead_code)]
-    guard: Arc<SendRequest<OpenStreams, Bytes>>,
+    _preface: Arc<H3Preface>,
 }
 
 pub struct Handler {
@@ -130,7 +138,9 @@ impl Debug for Handler {
 
 impl Handler {
     const DEFAULT_MAX_IDLE_TIMEOUT: std::time::Duration =
-        std::time::Duration::from_secs(30);
+        std::time::Duration::from_secs(120);
+    const DEFAULT_KEEP_ALIVE_INTERVAL: std::time::Duration =
+        std::time::Duration::from_secs(10);
 
     #[cfg(test)]
     pub fn opts(&self) -> &HystOption {
@@ -198,7 +208,7 @@ impl Handler {
         transport.max_idle_timeout(Some(
             Self::DEFAULT_MAX_IDLE_TIMEOUT.try_into().unwrap(),
         ));
-        transport.keep_alive_interval(Some(std::time::Duration::from_secs(5)));
+        transport.keep_alive_interval(Some(Self::DEFAULT_KEEP_ALIVE_INTERVAL));
 
         let quic_config: QuicClientConfig = tls_config.try_into().map_err(|e| {
             std::io::Error::new(
@@ -226,7 +236,7 @@ impl Handler {
         &self,
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
-    ) -> anyhow::Result<(Connection, SendRequest<OpenStreams, Bytes>)> {
+    ) -> anyhow::Result<(Connection, H3Preface)> {
         tracing::trace!(
             "hysteria2 new_authed_connection_inner: starting connection to {:?}",
             self.opts.addr
@@ -310,7 +320,7 @@ impl Handler {
         let session = ep.connect(server_socket_addr, sni)?.await?;
         tracing::trace!("hysteria2 QUIC connection established");
         let down_bytes = self.opts.up_down.map(|(_, down)| down).unwrap_or(0);
-        let (guard, cc_rx, udp) =
+        let (preface, cc_rx, udp) =
             Self::auth(&session, &self.opts.passwd, down_bytes).await?;
         tracing::trace!(
             "hysteria2 authentication successful, cc_rx={:?}, udp={}",
@@ -335,52 +345,80 @@ impl Handler {
             effective_up_bytes
         );
 
-        Ok((session, guard))
+        Ok((session, preface))
     }
 
     async fn auth(
         conn: &quinn::Connection,
         passwd: &str,
         down_bytes: u64,
-    ) -> anyhow::Result<(SendRequest<OpenStreams, Bytes>, CcRx, bool)> {
-        let h3_conn = h3_quinn::Connection::new(conn.clone());
+    ) -> anyhow::Result<(H3Preface, CcRx, bool)> {
+        // 1. 打开 3 个 H3 关键单向流：Control, QPACK Encoder, QPACK Decoder
+        let mut control = conn
+            .open_uni()
+            .await
+            .context("hysteria2: open control stream failed")?;
+        control
+            .write_all(&client_preface())
+            .await
+            .context("hysteria2: send SETTINGS failed")?;
 
-        let (_, mut sender) =
-            h3::client::builder().build::<_, _, Bytes>(h3_conn).await?;
+        let mut qpack_enc = conn
+            .open_uni()
+            .await
+            .context("hysteria2: open QPACK encoder stream failed")?;
+        qpack_enc
+            .write_all(&[H3_STREAM_QPACK_ENCODER as u8])
+            .await
+            .context("hysteria2: send QPACK encoder stream preface failed")?;
 
-        let req = http::Request::post("https://hysteria/auth")
-            .header("Hysteria-Auth", passwd)
-            .header("Hysteria-CC-RX", down_bytes.to_string())
-            .header("Hysteria-Padding", codec::padding(64..=512))
-            .body(())
-            .unwrap();
-        let mut r = sender.send_request(req).await?;
-        r.finish().await?;
+        let mut qpack_dec = conn
+            .open_uni()
+            .await
+            .context("hysteria2: open QPACK decoder stream failed")?;
+        qpack_dec
+            .write_all(&[H3_STREAM_QPACK_DECODER as u8])
+            .await
+            .context("hysteria2: send QPACK decoder stream preface failed")?;
 
-        let r = r.recv_response().await?;
+        // 2. 打开双向流发送 POST https://hysteria/auth 请求
+        let (mut send, mut recv) = conn
+            .open_bi()
+            .await
+            .context("hysteria2: open auth stream failed")?;
+        send.write_all(&auth_request_frame(passwd, down_bytes))
+            .await
+            .context("hysteria2: send auth request failed")?;
+        send.finish().context("hysteria2: finish auth request failed")?;
 
+        let headers = read_h3_response_headers(&mut recv)
+            .await
+            .context("hysteria2: read auth response headers failed")?;
+
+        let get_header = |name: &str| {
+            headers
+                .iter()
+                .find(|(n, _)| n.eq_ignore_ascii_case(name))
+                .map(|(_, v)| v.as_str())
+        };
+
+        let status: u16 = get_header(":status")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
         const HYSTERIA_STATUS_OK: u16 = 233;
-        if r.status() != HYSTERIA_STATUS_OK {
-            return Err(anyhow!("auth failed: response status code {}", r.status()));
+        if status != HYSTERIA_STATUS_OK {
+            return Err(anyhow!("auth failed: response status code {status}"));
         }
 
-        // MUST have Hysteria-CC-RX and Hysteria-UDP headers according to hysteria2
-        // document
-        let cc_rx = r
-            .headers()
-            .get("Hysteria-CC-RX")
+        let cc_rx = get_header("hysteria-cc-rx")
             .ok_or_else(|| anyhow!("auth failed: missing Hysteria-CC-RX header"))?
-            .to_str()?
             .parse()?;
 
-        let support_udp = r
-            .headers()
-            .get("Hysteria-UDP")
+        let support_udp = get_header("hysteria-udp")
             .ok_or_else(|| anyhow!("auth failed: missing Hysteria-UDP header"))?
-            .to_str()?
             .parse()?;
 
-        Ok((sender, cc_rx, support_udp))
+        Ok(((control, qpack_enc, qpack_dec), cc_rx, support_udp))
     }
 
     pub async fn new_authed_connection(
@@ -423,7 +461,7 @@ impl Handler {
             return Ok(conn);
         }
 
-        let (session, guard) = self
+        let (session, preface) = self
             .new_authed_connection_inner(sess, resolver)
             .await
             .map_err(|e| {
@@ -438,7 +476,7 @@ impl Handler {
 
         *self.conn.write() = Some(CachedConn {
             conn: hyst_conn.clone(),
-            guard: Arc::new(guard),
+            _preface: Arc::new(preface),
         });
 
         Ok(hyst_conn)
