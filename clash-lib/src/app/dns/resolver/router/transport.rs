@@ -13,7 +13,9 @@ use crate::app::dns::resolver::enhanced::{
 use crate::app::dns::response::{
     ResponseTemplate, build_dns_ip_response, build_dns_nodata, build_dns_nxdomain,
 };
-use crate::app::dns::singleflight::{FlightKey, FlightRole, Singleflight};
+use crate::app::dns::singleflight::{
+    FlightKey, FlightLeader, FlightRole, Singleflight,
+};
 use crate::app::dns::upstream_pool::UpstreamPool;
 use crate::app::dns::wire::{
     extract_ips_from_dns_response, extract_min_ttl_from_dns_response,
@@ -42,11 +44,17 @@ impl DnsCachePolicy {
     pub fn new(optimistic_cache_ttl: u32, stale_cache_retention_secs: u32) -> Self {
         Self {
             optimistic_cache_ttl,
-            stale_cache_retention: Duration::from_secs(stale_cache_retention_secs as u64),
+            stale_cache_retention: Duration::from_secs(
+                stale_cache_retention_secs as u64,
+            ),
         }
     }
 
-    pub fn calculate_effective_ttl(&self, override_ttl: Option<u32>, raw_resp: &[u8]) -> u32 {
+    pub fn calculate_effective_ttl(
+        &self,
+        override_ttl: Option<u32>,
+        raw_resp: &[u8],
+    ) -> u32 {
         if let Some(ttl) = override_ttl {
             ttl
         } else {
@@ -106,6 +114,61 @@ impl DnsResolvedNotifier {
     }
 }
 
+pub struct RefreshTicket {
+    transport: CachedTransport,
+    leader: FlightLeader,
+    raw_query: Vec<u8>,
+    query: QueryContext,
+}
+
+impl RefreshTicket {
+    pub fn tag(&self) -> &str {
+        self.transport.tag()
+    }
+
+    pub fn query(&self) -> &QueryContext {
+        &self.query
+    }
+
+    pub async fn run(self) -> anyhow::Result<Vec<u8>> {
+        self.transport
+            .fetch_and_cache(&self.raw_query, &self.query, Some(self.leader))
+            .await
+    }
+}
+
+pub struct ExchangeResult {
+    pub wire: Vec<u8>,
+    pub is_fresh: bool,
+    pub refresh_ticket: Option<RefreshTicket>,
+}
+
+impl ExchangeResult {
+    pub fn fresh(wire: Vec<u8>) -> Self {
+        Self {
+            wire,
+            is_fresh: true,
+            refresh_ticket: None,
+        }
+    }
+
+    pub fn cached(wire: Vec<u8>) -> Self {
+        Self {
+            wire,
+            is_fresh: false,
+            refresh_ticket: None,
+        }
+    }
+
+    pub fn stale(wire: Vec<u8>, refresh_ticket: Option<RefreshTicket>) -> Self {
+        Self {
+            wire,
+            is_fresh: false,
+            refresh_ticket,
+        }
+    }
+}
+
 #[allow(async_fn_in_trait)]
 #[enum_dispatch]
 pub trait DnsTransport: Send + Sync {
@@ -120,7 +183,7 @@ pub trait DnsTransport: Send + Sync {
         &self,
         raw_query: &[u8],
         query: &QueryContext,
-    ) -> anyhow::Result<Vec<u8>>;
+    ) -> anyhow::Result<ExchangeResult>;
     async fn resolve_ip(
         &self,
         host: &str,
@@ -257,7 +320,6 @@ pub struct CachedTransport {
     endpoint: Endpoint,
     cache: DnsCache,
     singleflight: Singleflight,
-    notifier: Option<DnsResolvedNotifier>,
     policy: DnsCachePolicy,
 }
 
@@ -268,7 +330,6 @@ impl CachedTransport {
         override_ttl: Option<u32>,
         endpoint: Endpoint,
         cache: DnsCache,
-        notifier: Option<DnsResolvedNotifier>,
         policy: DnsCachePolicy,
     ) -> Self {
         Self {
@@ -278,9 +339,47 @@ impl CachedTransport {
             endpoint,
             cache,
             singleflight: Singleflight::new(),
-            notifier,
             policy,
         }
+    }
+
+    pub async fn fetch_and_cache(
+        &self,
+        raw_query: &[u8],
+        query: &QueryContext,
+        mut leader: Option<FlightLeader>,
+    ) -> anyhow::Result<Vec<u8>> {
+        let domain = query.qdomain().unwrap_or_default();
+        let qtype = query.qtype().unwrap_or(QType::A);
+        let mut resp = self.endpoint.fetch(raw_query, domain, qtype).await?;
+        let effective_ttl = self
+            .policy
+            .calculate_effective_ttl(self.override_ttl, &resp);
+        let ips = extract_ips_from_dns_response(&resp);
+        let is_acme = query.qtype() == Some(QType::TXT)
+            && domain.starts_with("_acme-challenge.");
+        let is_unspecified =
+            !ips.is_empty() && ips.iter().all(|ip| ip.is_unspecified());
+
+        if let Ok(template) = ResponseTemplate::validate(query, &resp) {
+            let arc_template = Arc::new(template);
+            if let Some(leader) = leader.as_mut() {
+                leader.publish(Arc::clone(&arc_template));
+            }
+            if !is_acme && !is_unspecified && effective_ttl > 0 {
+                self.cache.insert_scoped(
+                    &self.tag,
+                    query,
+                    arc_template,
+                    effective_ttl,
+                    self.policy.stale_cache_retention,
+                );
+            }
+        }
+        if self.override_ttl.is_some() || self.policy.optimistic_cache_ttl > 0 {
+            rewrite_dns_response_ttl(resp.as_mut_slice(), effective_ttl);
+        }
+        Ok(resp)
     }
 
     pub fn new_remote(
@@ -289,23 +388,35 @@ impl CachedTransport {
         upstream_keys: Vec<String>,
         pool: Arc<UpstreamPool>,
         cache: DnsCache,
-        notifier: Option<DnsResolvedNotifier>,
         policy: DnsCachePolicy,
     ) -> Self {
         let endpoint =
             Endpoint::Remote(RemoteEndpoint::new(tag.clone(), upstream_keys, pool));
-        Self::new(tag, UpstreamType::Remote, override_ttl, endpoint, cache, notifier, policy)
+        Self::new(
+            tag,
+            UpstreamType::Remote,
+            override_ttl,
+            endpoint,
+            cache,
+            policy,
+        )
     }
 
     pub fn new_local(
         tag: String,
         override_ttl: Option<u32>,
         cache: DnsCache,
-        notifier: Option<DnsResolvedNotifier>,
         policy: DnsCachePolicy,
     ) -> Self {
         let endpoint = Endpoint::Local(LocalEndpoint::new(tag.clone()));
-        Self::new(tag, UpstreamType::Local, override_ttl, endpoint, cache, notifier, policy)
+        Self::new(
+            tag,
+            UpstreamType::Local,
+            override_ttl,
+            endpoint,
+            cache,
+            policy,
+        )
     }
 }
 
@@ -322,7 +433,7 @@ impl DnsTransport for CachedTransport {
         &self,
         raw_query: &[u8],
         query: &QueryContext,
-    ) -> anyhow::Result<Vec<u8>> {
+    ) -> anyhow::Result<ExchangeResult> {
         let domain = query.qdomain().unwrap_or_default();
         let qtype = query.qtype().unwrap_or(QType::A);
 
@@ -340,7 +451,7 @@ impl DnsTransport for CachedTransport {
                 if let Ok(mut rendered) = template.render(query) {
                     let effective_ttl = self.override_ttl.unwrap_or(remaining_ttl);
                     rewrite_dns_response_ttl(rendered.as_mut_slice(), effective_ttl);
-                    return Ok(rendered);
+                    return Ok(ExchangeResult::cached(rendered));
                 }
             }
             CacheLookup::Stale(template) => {
@@ -348,59 +459,26 @@ impl DnsTransport for CachedTransport {
                     upstream = %self.tag,
                     domain,
                     ?qtype,
-                    "stale cache hit, serving stale and refreshing asynchronously"
+                    "stale cache hit, serving stale"
                 );
+                let mut refresh_ticket = None;
                 let flight_key = FlightKey::Refresh(query.canonical_wire_arc());
-                if let FlightRole::Leader(mut leader) =
+                if let FlightRole::Leader(leader) =
                     self.singleflight.acquire(flight_key)
                 {
-                    let this = self.clone();
-                    let raw_query_vec = raw_query.to_vec();
-                    let domain_string = domain.to_string();
-                    let query_clone = query.clone();
-
-                    tokio::spawn(async move {
-                        if let Ok(fresh_resp) = this
-                            .endpoint
-                            .fetch(&raw_query_vec, &domain_string, qtype)
-                            .await
-                        {
-                            let effective_ttl = this.policy.calculate_effective_ttl(this.override_ttl, &fresh_resp);
-                            let ips = extract_ips_from_dns_response(&fresh_resp);
-                            let is_acme = query_clone.qtype() == Some(QType::TXT)
-                                && domain_string.starts_with("_acme-challenge.");
-                            let is_unspecified = !ips.is_empty() && ips.iter().all(|ip| ip.is_unspecified());
-
-                            if let Ok(fresh_tmpl) =
-                                ResponseTemplate::validate(&query_clone, &fresh_resp)
-                            {
-                                let arc_template = Arc::new(fresh_tmpl);
-                                leader.publish(Arc::clone(&arc_template));
-                                if !is_acme && !is_unspecified && effective_ttl > 0 {
-                                    this.cache.insert_scoped(
-                                        &this.tag,
-                                        &query_clone,
-                                        arc_template,
-                                        effective_ttl,
-                                        this.policy.stale_cache_retention,
-                                    );
-                                }
-                            }
-                            if let Some(notifier) = &this.notifier {
-                                notifier
-                                    .on_fresh_response(&domain_string, &fresh_resp, effective_ttl);
-                            }
-                        }
+                    refresh_ticket = Some(RefreshTicket {
+                        transport: self.clone(),
+                        leader,
+                        raw_query: raw_query.to_vec(),
+                        query: query.clone(),
                     });
                 }
 
                 if let Ok(mut rendered) = template.render(query) {
-                    let effective_ttl = self.override_ttl.unwrap_or(SERVE_STALE_WIRE_TTL);
-                    rewrite_dns_response_ttl(
-                        rendered.as_mut_slice(),
-                        effective_ttl,
-                    );
-                    return Ok(rendered);
+                    let effective_ttl =
+                        self.override_ttl.unwrap_or(SERVE_STALE_WIRE_TTL);
+                    rewrite_dns_response_ttl(rendered.as_mut_slice(), effective_ttl);
+                    return Ok(ExchangeResult::stale(rendered, refresh_ticket));
                 }
             }
             CacheLookup::Miss => {}
@@ -414,7 +492,7 @@ impl DnsTransport for CachedTransport {
                 if let Some(ttl) = self.override_ttl {
                     rewrite_dns_response_ttl(rendered.as_mut_slice(), ttl);
                 }
-                Ok(rendered)
+                Ok(ExchangeResult::cached(rendered))
             }
             FlightRole::Waiter(waiter) => {
                 if let Some(template) = waiter.receive().await {
@@ -422,58 +500,20 @@ impl DnsTransport for CachedTransport {
                     if let Some(ttl) = self.override_ttl {
                         rewrite_dns_response_ttl(rendered.as_mut_slice(), ttl);
                     }
-                    Ok(rendered)
+                    Ok(ExchangeResult::cached(rendered))
                 } else {
-                    let mut resp = self.endpoint.fetch(raw_query, domain, qtype).await?;
-                    let effective_ttl = self.policy.calculate_effective_ttl(self.override_ttl, &resp);
-                    if self.override_ttl.is_some() || self.policy.optimistic_cache_ttl > 0 {
-                        rewrite_dns_response_ttl(resp.as_mut_slice(), effective_ttl);
-                    }
-                    if let Some(notifier) = &self.notifier {
-                        notifier.on_fresh_response(domain, &resp, effective_ttl);
-                    }
-                    Ok(resp)
+                    let resp = self.fetch_and_cache(raw_query, query, None).await?;
+                    Ok(ExchangeResult::fresh(resp))
                 }
             }
-            FlightRole::Leader(mut leader) => {
-                let mut resp = self.endpoint.fetch(raw_query, domain, qtype).await?;
-                let effective_ttl = self.policy.calculate_effective_ttl(self.override_ttl, &resp);
-                let ips = extract_ips_from_dns_response(&resp);
-                let is_acme = query.qtype() == Some(QType::TXT)
-                    && domain.starts_with("_acme-challenge.");
-                let is_unspecified = !ips.is_empty() && ips.iter().all(|ip| ip.is_unspecified());
-
-                if let Ok(template) = ResponseTemplate::validate(query, &resp) {
-                    let arc_template = Arc::new(template);
-                    leader.publish(Arc::clone(&arc_template));
-                    if !is_acme && !is_unspecified && effective_ttl > 0 {
-                        self.cache.insert_scoped(
-                            &self.tag,
-                            query,
-                            arc_template,
-                            effective_ttl,
-                            self.policy.stale_cache_retention,
-                        );
-                    }
-                }
-                if self.override_ttl.is_some() || self.policy.optimistic_cache_ttl > 0 {
-                    rewrite_dns_response_ttl(resp.as_mut_slice(), effective_ttl);
-                }
-                if let Some(notifier) = &self.notifier {
-                    notifier.on_fresh_response(domain, &resp, effective_ttl);
-                }
-                Ok(resp)
+            FlightRole::Leader(leader) => {
+                let resp =
+                    self.fetch_and_cache(raw_query, query, Some(leader)).await?;
+                Ok(ExchangeResult::fresh(resp))
             }
             FlightRole::Rejected => {
-                let mut resp = self.endpoint.fetch(raw_query, domain, qtype).await?;
-                let effective_ttl = self.policy.calculate_effective_ttl(self.override_ttl, &resp);
-                if self.override_ttl.is_some() || self.policy.optimistic_cache_ttl > 0 {
-                    rewrite_dns_response_ttl(resp.as_mut_slice(), effective_ttl);
-                }
-                if let Some(notifier) = &self.notifier {
-                    notifier.on_fresh_response(domain, &resp, effective_ttl);
-                }
-                Ok(resp)
+                let resp = self.fetch_and_cache(raw_query, query, None).await?;
+                Ok(ExchangeResult::fresh(resp))
             }
         }
     }
@@ -490,7 +530,7 @@ impl DnsTransport for CachedTransport {
         let query = QueryContext::parse(&query_wire)
             .map_err(|e| anyhow::anyhow!("failed to parse built query: {e}"))?;
         let resp = self.exchange(&query_wire, &query).await?;
-        let ips = extract_ips_from_dns_response(&resp);
+        let ips = extract_ips_from_dns_response(&resp.wire);
         Ok(ips)
     }
 }
@@ -528,26 +568,27 @@ impl DnsTransport for FakeIpTransport {
         &self,
         raw_query: &[u8],
         query: &QueryContext,
-    ) -> anyhow::Result<Vec<u8>> {
+    ) -> anyhow::Result<ExchangeResult> {
         let domain = query.qdomain().unwrap_or_default();
         let qtype = query.qtype().unwrap_or(QType::A);
-        match qtype {
+        let wire = match qtype {
             QType::A => {
                 let ip = self.fake_dns.lookup(domain);
                 debug!(upstream = %self.tag, domain, ?qtype, fake_ip = %ip, "assigned fake-ip");
-                build_dns_ip_response(raw_query, &[ip], self.ttl).ok_or_else(|| {
-                    anyhow::anyhow!("failed to construct fakeip A response")
-                })
+                build_dns_ip_response(raw_query, &[ip], self.ttl).ok_or_else(
+                    || anyhow::anyhow!("failed to construct fakeip A response"),
+                )?
             }
             QType::AAAA => {
                 let ip = self.fake_dns.lookupv6(domain);
                 debug!(upstream = %self.tag, domain, ?qtype, fake_ip = %ip, "assigned fake-ip");
-                build_dns_ip_response(raw_query, &[ip], self.ttl).ok_or_else(|| {
-                    anyhow::anyhow!("failed to construct fakeip AAAA response")
-                })
+                build_dns_ip_response(raw_query, &[ip], self.ttl).ok_or_else(
+                    || anyhow::anyhow!("failed to construct fakeip AAAA response"),
+                )?
             }
-            _ => Ok(build_dns_nodata(raw_query)),
-        }
+            _ => build_dns_nodata(raw_query),
+        };
+        Ok(ExchangeResult::cached(wire))
     }
 
     async fn resolve_ip(

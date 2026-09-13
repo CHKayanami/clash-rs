@@ -26,7 +26,9 @@ use crate::app::dns::response::{
     build_dns_nodata, build_dns_nxdomain, build_dns_refused,
 };
 use crate::app::dns::upstream_pool::{UpstreamEntry, UpstreamPool};
-use crate::app::dns::wire::extract_ips_from_dns_response;
+use crate::app::dns::wire::{
+    extract_ips_from_dns_response, extract_min_ttl_from_dns_response,
+};
 use crate::app::dns::{
     ClashResolver, DnsResolutionHook, ResolverKind, ThreadSafeDnsCollector,
     parse_ip_literal,
@@ -51,7 +53,7 @@ pub struct RouterResolver {
     transports: HashMap<String, Transport>,
     fake_dns: Option<Arc<FakeDns>>,
     hosts: HostsSnapshot,
-    router: DnsRouter,
+    router: Arc<DnsRouter>,
     reverse_lookup_cache: ReverseLookupCache,
     #[allow(dead_code)]
     cache: DnsCache,
@@ -59,6 +61,7 @@ pub struct RouterResolver {
     resolution_hook: Arc<OnceLock<DnsResolutionHook>>,
     proxy_server_domains: Option<StringTrie<bool>>,
     proxy_server_transports: Vec<Transport>,
+    notifier: DnsResolvedNotifier,
 }
 
 impl RouterResolver {
@@ -136,6 +139,7 @@ impl RouterResolver {
         );
         let cache = DnsCache::new(capacity);
         let cache_policy = DnsCachePolicy::new(cfg.optimistic_cache_ttl, cfg.stale_cache_retention);
+        let router = Arc::new(DnsRouter::new(&cfg));
 
         let mut transports: HashMap<String, Transport> = HashMap::new();
         let mut fake_dns: Option<Arc<FakeDns>> = None;
@@ -162,7 +166,6 @@ impl RouterResolver {
                             u.tag.clone(),
                             u.ttl,
                             cache.clone(),
-                            Some(notifier.clone()),
                             cache_policy,
                         )),
                     );
@@ -219,7 +222,6 @@ impl RouterResolver {
                         keys,
                         pool.clone(),
                         cache.clone(),
-                        Some(notifier.clone()),
                         cache_policy,
                     )),
                 );
@@ -244,7 +246,6 @@ impl RouterResolver {
                         keys,
                         pool.clone(),
                         cache.clone(),
-                        Some(notifier.clone()),
                         cache_policy,
                     ),
                 ));
@@ -270,7 +271,6 @@ impl RouterResolver {
 
         // 4. 初始化 Hosts 快照与路由引擎
         let hosts = HostsSnapshot::new(&cfg.hosts, &cfg.hosts_files);
-        let router = DnsRouter::new(&cfg);
 
         info!(
             "RouterResolver initialized with {} upstreams",
@@ -289,6 +289,7 @@ impl RouterResolver {
             resolution_hook,
             proxy_server_domains,
             proxy_server_transports,
+            notifier,
         }
     }
 }
@@ -406,8 +407,25 @@ impl ClashResolver for RouterResolver {
                     "using proxy-server-nameserver for proxy node domain"
                 );
                 for transport in &self.proxy_server_transports {
-                    if let Ok(resp) = transport.exchange(message, &query).await {
-                        return Ok(resp);
+                    if let Ok(mut res) = transport.exchange(message, &query).await {
+                        if let Some(ticket) = res.refresh_ticket.take() {
+                            let notifier = self.notifier.clone();
+                            tokio::spawn(async move {
+                                let qname = ticket.query().qdomain().unwrap_or_default().to_string();
+                                if let Ok(fresh_wire) = ticket.run().await {
+                                    let effective_ttl =
+                                        extract_min_ttl_from_dns_response(&fresh_wire).unwrap_or(60);
+                                    notifier.on_fresh_response(&qname, &fresh_wire, effective_ttl);
+                                }
+                            });
+                        }
+                        if res.is_fresh {
+                            let effective_ttl =
+                                extract_min_ttl_from_dns_response(&res.wire).unwrap_or(60);
+                            self.notifier
+                                .on_fresh_response(qname, &res.wire, effective_ttl);
+                        }
+                        return Ok(res.wire);
                     }
                 }
             }
@@ -443,18 +461,50 @@ impl ClashResolver for RouterResolver {
         );
 
         // 4. 执行初次上游查询（若为 RemoteTransport，其内部自治命中 Cache / Singleflight 并发收敛）
-        let mut current_resp = transport.exchange(message, &query).await?;
+        let mut exchange_res = transport.exchange(message, &query).await?;
         let current_tag = initial_tag;
 
-        // Fake-IP 上游自动跳过 Response 阶段的防污染与规则检查
+        // Fake-IP 上游自动跳过后续缓存刷新与 Response 防污染检查，直接返回
         if transport.is_fake_ip() {
-            return Ok(current_resp);
+            return Ok(exchange_res.wire);
+        }
+
+        // 如果底层命中了 Stale 缓存且作为 Leader 获得了刷新凭证，由顶层调度异步刷新！
+        if let Some(ticket) = exchange_res.refresh_ticket.take() {
+            let router = Arc::clone(&self.router);
+            let notifier = self.notifier.clone();
+            tokio::spawn(async move {
+                let tag = ticket.tag().to_string();
+                let qname = ticket.query().qdomain().unwrap_or_default().to_string();
+                let qtype = ticket.query().qtype().unwrap_or(QType::A);
+                if let Ok(fresh_wire) = ticket.run().await {
+                    let ips = extract_ips_from_dns_response(&fresh_wire);
+                    if !ips.is_empty() {
+                        let resp_decision = router.route_response(&tag, &qname, qtype, &ips);
+                        match resp_decision {
+                            ResponseAction::Accept => {
+                                let effective_ttl =
+                                    extract_min_ttl_from_dns_response(&fresh_wire).unwrap_or(60);
+                                notifier.on_fresh_response(&qname, &fresh_wire, effective_ttl);
+                            }
+                            ResponseAction::Reject | ResponseAction::Requery(_) => {
+                                debug!(
+                                    domain = %qname,
+                                    from = %tag,
+                                    ?ips,
+                                    "background stale refresh detected polluted/rejected IPs, skipped offload"
+                                );
+                            }
+                        }
+                    }
+                }
+            });
         }
 
         // 若为非 IP 类请求（TXT/MX/HTTPS 等）或上游返回 NODATA/NXDOMAIN，无 IP 供防污染校验，直接放行
-        let answer_ips = extract_ips_from_dns_response(&current_resp);
+        let answer_ips = extract_ips_from_dns_response(&exchange_res.wire);
         if answer_ips.is_empty() {
-            return Ok(current_resp);
+            return Ok(exchange_res.wire);
         }
 
         // 5. 执行 Response 路由检查 (精准 match-response，防污染重查，限制最多重查 1 次)
@@ -479,13 +529,13 @@ impl ClashResolver for RouterResolver {
                             "re-querying DNS upstream due to response rule"
                         );
                         match next_transport.exchange(message, &query).await {
-                            Ok(new_resp) => {
+                            Ok(new_res) => {
                                 debug!(
                                     domain = qname,
                                     target = %next_tag,
                                     "DNS requery succeeded"
                                 );
-                                current_resp = new_resp;
+                                exchange_res = new_res;
                             }
                             Err(err) => {
                                 warn!(
@@ -493,16 +543,29 @@ impl ClashResolver for RouterResolver {
                                     target = %next_tag,
                                     "DNS requery failed: {err}"
                                 );
+                                return Ok(build_dns_nodata(message));
                             }
                         }
                     } else {
                         warn!(target = %next_tag, "target upstream for requery not found");
+                        return Ok(build_dns_nodata(message));
                     }
                 }
             }
         }
 
-        Ok(current_resp)
+        // 6. 确认为刷新缓存的结果时才下发反向缓存与直连 (Fresh Result)
+        if exchange_res.is_fresh {
+            let final_ips = extract_ips_from_dns_response(&exchange_res.wire);
+            if !final_ips.is_empty() {
+                let effective_ttl =
+                    extract_min_ttl_from_dns_response(&exchange_res.wire).unwrap_or(60);
+                self.notifier
+                    .on_fresh_response(qname, &exchange_res.wire, effective_ttl);
+            }
+        }
+
+        Ok(exchange_res.wire)
     }
 
     fn reverse_lookup(&self, ip: net::IpAddr) -> Option<String> {
