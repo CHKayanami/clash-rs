@@ -267,42 +267,54 @@ impl Handler {
             .await
         };
 
-        let mut ep = if let Some(obfs) = self.opts.obfs.as_ref() {
-            match obfs {
-                Obfs::Salamander(salamander_obfs) => {
-                    let socket = create_socket().await?;
-                    let obfs = salamander::Salamander::new(
-                        socket.into_std()?,
-                        salamander_obfs.key.to_vec(),
-                    )?;
+        let socket = create_socket().await?.into_std()?;
 
-                    quinn::Endpoint::new_with_abstract_socket(
-                        self.ep_config.clone(),
+        let has_hop = self
+            .opts
+            .ports
+            .as_ref()
+            .map(|p| p.has_hopping())
+            .unwrap_or(false);
+        let has_obfs = self.opts.obfs.is_some();
+
+        let mut ep = if has_hop || has_obfs {
+            use quinn::Runtime;
+            let mut current: Arc<dyn quinn::AsyncUdpSocket> =
+                TokioRuntime.wrap_udp_socket(socket)?;
+
+            if let Some(port_gen) = self.opts.ports.as_ref() {
+                if port_gen.has_hopping() {
+                    current = Arc::new(udp_hop::UdpHop::new_with_inner(
+                        current,
+                        server_socket_addr.port(),
+                        port_gen.clone(),
                         None,
-                        Arc::new(obfs),
-                        Arc::new(TokioRuntime),
-                    )?
+                    ));
                 }
             }
-        } else if let Some(port_gen) = self.opts.ports.as_ref() {
-            let udp_hop = udp_hop::UdpHop::new(
-                server_socket_addr.port(),
-                port_gen.clone(),
-                None,
-            )?;
+
+            if let Some(obfs) = self.opts.obfs.as_ref() {
+                match obfs {
+                    Obfs::Salamander(salamander_obfs) => {
+                        current = Arc::new(salamander::Salamander::new_with_inner(
+                            current,
+                            salamander_obfs.key.to_vec(),
+                        ));
+                    }
+                }
+            }
+
             quinn::Endpoint::new_with_abstract_socket(
                 self.ep_config.clone(),
                 None,
-                Arc::new(udp_hop),
+                current,
                 Arc::new(TokioRuntime),
             )?
         } else {
-            let socket = create_socket().await?;
-
             quinn::Endpoint::new(
                 self.ep_config.clone(),
                 None,
-                socket.into_std()?,
+                socket,
                 Arc::new(TokioRuntime),
             )?
         };

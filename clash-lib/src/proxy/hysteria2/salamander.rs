@@ -64,14 +64,18 @@ pub struct Salamander {
 }
 
 impl Salamander {
+    pub fn new_with_inner(inner: Arc<dyn AsyncUdpSocket>, key: Vec<u8>) -> Self {
+        Self {
+            inner,
+            obfs: SalamanderObfs::new(key),
+        }
+    }
+
+    #[allow(dead_code)]
     pub fn new(socket: std::net::UdpSocket, key: Vec<u8>) -> std::io::Result<Self> {
         use quinn::Runtime;
         let inner = TokioRuntime.wrap_udp_socket(socket)?;
-
-        std::io::Result::Ok(Self {
-            inner,
-            obfs: SalamanderObfs::new(key),
-        })
+        Ok(Self::new_with_inner(inner, key))
     }
 }
 
@@ -245,6 +249,14 @@ impl AsyncUdpSocket for Salamander {
 
     fn may_fragment(&self) -> bool {
         self.inner.may_fragment()
+    }
+
+    fn max_transmit_segments(&self) -> usize {
+        self.inner.max_transmit_segments()
+    }
+
+    fn max_receive_segments(&self) -> usize {
+        self.inner.max_receive_segments()
     }
 }
 

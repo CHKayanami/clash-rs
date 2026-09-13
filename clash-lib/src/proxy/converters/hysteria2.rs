@@ -30,19 +30,60 @@ impl PortGenerator {
     }
 
     fn add_range(&mut self, start: u16, end: u16) {
-        self.range.push(start..=end);
+        if start <= end {
+            self.range.push(start..=end);
+        }
+    }
+
+    pub fn has_hopping(&self) -> bool {
+        !self.ports.is_empty() || !self.range.is_empty()
+    }
+
+    pub fn total_candidates(&self) -> usize {
+        if !self.has_hopping() {
+            1
+        } else {
+            self.ports.len()
+                + self
+                    .range
+                    .iter()
+                    .map(|r| (r.end() - r.start() + 1) as usize)
+                    .sum::<usize>()
+        }
     }
 
     pub fn get(&self) -> u16 {
-        let len =
-            1 + self.ports.len() + self.range.iter().map(|r| r.len()).sum::<usize>();
-        let idx = rand::random_range(0..len);
-        match idx {
-            0 => self.default,
-            idx if idx <= self.ports.len() => self.ports[idx - 1],
-            idx => {
-                let mut x = self.range.iter().cloned().flatten();
-                x.nth(idx - 1 - self.ports.len()).unwrap()
+        if !self.has_hopping() {
+            return self.default;
+        }
+
+        let total = self.total_candidates();
+        let idx = rand::random_range(0..total);
+        if idx < self.ports.len() {
+            return self.ports[idx];
+        }
+
+        let mut offset = idx - self.ports.len();
+        for r in &self.range {
+            let len = (r.end() - r.start() + 1) as usize;
+            if offset < len {
+                return r.start() + (offset as u16);
+            }
+            offset -= len;
+        }
+
+        self.default
+    }
+
+    pub fn get_next_avoiding(&self, current: Option<u16>) -> u16 {
+        if self.total_candidates() <= 1 {
+            return self.get();
+        }
+
+        loop {
+            let port = self.get();
+            if Some(port) != current {
+                return port;
             }
         }
     }
@@ -250,10 +291,22 @@ mod tests {
     #[test]
     fn test_port_gen() {
         let p = PortGenerator::new(1000).parse_ports_str("").unwrap();
-        let p = p.parse_ports_str("1001,1002,1003, 5000-5001").unwrap();
+        assert!(!p.has_hopping());
+        assert_eq!(p.get(), 1000);
+        assert_eq!(p.get_next_avoiding(Some(1000)), 1000);
 
+        let p = p.parse_ports_str("1001,1002,1003, 5000-5001").unwrap();
+        assert!(p.has_hopping());
+        assert_eq!(p.total_candidates(), 5);
+
+        let mut prev = p.get();
         for _ in 0..100 {
-            println!("{}", p.get());
+            let next = p.get_next_avoiding(Some(prev));
+            assert_ne!(next, prev);
+            assert!(
+                next == 1001 || next == 1002 || next == 1003 || next == 5000 || next == 5001
+            );
+            prev = next;
         }
     }
 
