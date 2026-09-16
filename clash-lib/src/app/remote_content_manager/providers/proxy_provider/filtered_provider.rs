@@ -3,7 +3,7 @@ use std::{collections::HashMap, io, sync::Arc};
 use arc_swap::ArcSwapOption;
 use async_trait::async_trait;
 use erased_serde::Serialize;
-use regex::Regex;
+use fancy_regex::Regex;
 
 use crate::{
     app::remote_content_manager::providers::{
@@ -84,7 +84,7 @@ impl ProxyProvider for FilteredProxyProvider {
 
         let mut filtered: Vec<AnyOutboundHandler> = current
             .iter()
-            .filter(|p| self.filter.is_match(p.name()))
+            .filter(|p| self.filter.is_match(p.name()).unwrap_or(false))
             .cloned()
             .collect();
 
@@ -168,7 +168,8 @@ mod tests {
         let p1: AnyOutboundHandler = Arc::new(direct::Handler::new("HK 01"));
         let p2: AnyOutboundHandler = Arc::new(direct::Handler::new("US 01"));
         let p3: AnyOutboundHandler = Arc::new(direct::Handler::new("TW 01"));
-        let reject_handler: AnyOutboundHandler = Arc::new(reject::Handler::new("REJECT"));
+        let reject_handler: AnyOutboundHandler =
+            Arc::new(reject::Handler::new("REJECT"));
 
         let dummy = Arc::new(DummyProvider {
             name: "test_provider".to_string(),
@@ -177,7 +178,8 @@ mod tests {
 
         // Test 1: Match HK
         let filter_hk = Arc::new(Regex::new(r"HK.*").unwrap());
-        let filtered_provider = FilteredProxyProvider::new(dummy.clone(), filter_hk, None);
+        let filtered_provider =
+            FilteredProxyProvider::new(dummy.clone(), filter_hk, None);
         let res = filtered_provider.proxies();
         assert_eq!(res.len(), 1);
         assert_eq!(res[0].name(), "HK 01");
@@ -188,16 +190,36 @@ mod tests {
 
         // Test 3: No match without fallback
         let filter_sg = Arc::new(Regex::new(r"SG.*").unwrap());
-        let filtered_provider_empty = FilteredProxyProvider::new(dummy.clone(), filter_sg, None);
+        let filtered_provider_empty =
+            FilteredProxyProvider::new(dummy.clone(), filter_sg, None);
         let res_empty = filtered_provider_empty.proxies();
         assert_eq!(res_empty.len(), 0);
 
         // Test 4: No match with fallback
         let filter_sg2 = Arc::new(Regex::new(r"SG.*").unwrap());
-        let filtered_provider_fallback =
-            FilteredProxyProvider::new(dummy, filter_sg2, Some(reject_handler));
+        let filtered_provider_fallback = FilteredProxyProvider::new(
+            dummy.clone(),
+            filter_sg2,
+            Some(reject_handler),
+        );
         let res_fb = filtered_provider_fallback.proxies();
         assert_eq!(res_fb.len(), 1);
         assert_eq!(res_fb[0].name(), "REJECT");
+
+        // Test 5: Negative lookahead (filter out TW and US)
+        let filter_lookahead = Arc::new(Regex::new(r"^(?!.*(?:TW|US)).*$").unwrap());
+        let filtered_provider_la =
+            FilteredProxyProvider::new(dummy.clone(), filter_lookahead, None);
+        let res_la = filtered_provider_la.proxies();
+        assert_eq!(res_la.len(), 1);
+        assert_eq!(res_la[0].name(), "HK 01");
+
+        // Test 6: Positive lookbehind
+        let filter_lookbehind = Arc::new(Regex::new(r"(?<=HK\s)01").unwrap());
+        let filtered_provider_lb =
+            FilteredProxyProvider::new(dummy, filter_lookbehind, None);
+        let res_lb = filtered_provider_lb.proxies();
+        assert_eq!(res_lb.len(), 1);
+        assert_eq!(res_lb[0].name(), "HK 01");
     }
 }

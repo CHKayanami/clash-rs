@@ -54,7 +54,7 @@ use crate::{
 use anyhow::Result;
 use erased_serde::Serialize;
 use hyper::Uri;
-use regex::Regex;
+use fancy_regex::Regex;
 use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Duration};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
@@ -619,7 +619,7 @@ impl OutboundManager {
                     && !matches!(h.proto(), OutboundType::Reject)
                 {
                     if let Some(re) = &filter_re {
-                        if !re.is_match(p_name) {
+                        if !re.is_match(p_name).unwrap_or(false) {
                             continue;
                         }
                     }
@@ -1197,6 +1197,52 @@ include-all: true
         let proxies = providers[0].proxies();
         assert_eq!(proxies.len(), 1);
         assert_eq!(proxies[0].name(), "HK 01");
+    }
+
+    #[test]
+    fn test_group_filter_lookaround() {
+        // User's exact pattern: Positive lookahead for HK + Negative lookahead for excluded patterns
+        let yaml = r#"
+name: "香港"
+type: select
+filter: "^(?=.*(?i)(港|hk|HK|Hong|HKG))(?!.*(排除1|排除2|5x)).*$"
+empty-fallback: "REJECT"
+include-all: true
+"#;
+        let group: OutboundGroupProtocol = serde_yaml::from_str(yaml).unwrap();
+
+        let hk_node: AnyOutboundHandler = Arc::new(direct::Handler::new("香港 01 节点"));
+        let hk_excluded: AnyOutboundHandler = Arc::new(direct::Handler::new("香港 02 排除1"));
+        let us_node: AnyOutboundHandler = Arc::new(direct::Handler::new("US 01"));
+
+        let mut handlers = HashMap::new();
+        handlers.insert("香港 01 节点".to_string(), hk_node);
+        handlers.insert("香港 02 排除1".to_string(), hk_excluded);
+        handlers.insert("US 01".to_string(), us_node);
+
+        let proxy_names = vec![
+            "香港 01 节点".to_string(),
+            "香港 02 排除1".to_string(),
+            "US 01".to_string(),
+        ];
+        let proxy_manager = ProxyManager::new(Arc::new(NoopResolver), None);
+        let mut provider_registry = HashMap::new();
+
+        let providers = OutboundManager::build_group_providers(
+            &group,
+            0,
+            false,
+            &handlers,
+            &proxy_names,
+            &proxy_manager,
+            &mut provider_registry,
+        )
+        .unwrap();
+
+        assert_eq!(providers.len(), 1);
+        let proxies = providers[0].proxies();
+        assert_eq!(proxies.len(), 1);
+        assert_eq!(proxies[0].name(), "香港 01 节点");
     }
 
     #[test]
