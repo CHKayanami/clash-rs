@@ -3,27 +3,31 @@ use crate::{
     app::dns::ThreadSafeDNSResolver,
     common::{
         errors::map_io_error,
-        http::{ClashHTTPClientExt, HttpClient, new_http_client},
+        http::{ClashHTTPClientExt, HttpClient, DEFAULT_USER_AGENT, new_http_client},
     },
     proxy::utils::OutboundHandlerRegistry,
 };
 
 use async_trait::async_trait;
 
+use http::{
+    Request,
+    header::{HeaderName, HeaderValue, LOCATION, USER_AGENT},
+};
 use http_body_util::BodyExt;
 use hyper::Uri;
-use tracing::debug;
-
-use std::io;
-
-use crate::common::http::DEFAULT_USER_AGENT;
-use http::Request;
-use std::path::{Path, PathBuf};
+use std::{
+    collections::HashMap,
+    io,
+    path::{Path, PathBuf},
+};
+use tracing::{debug, warn};
 
 pub struct Vehicle {
     pub url: Uri,
     pub path: PathBuf,
     pub outbound: Option<String>,
+    pub headers: Option<HashMap<String, Vec<String>>>,
     http_client: HttpClient,
 }
 
@@ -35,6 +39,7 @@ impl Vehicle {
         dns_resolver: ThreadSafeDNSResolver,
         outbound: Option<String>,
         outbounds: Option<OutboundHandlerRegistry>,
+        headers: Option<HashMap<String, Vec<String>>>,
     ) -> Self {
         let client = new_http_client(dns_resolver, outbounds)
             .expect("failed to create http client");
@@ -53,6 +58,7 @@ impl Vehicle {
                 None => path_buf,
             },
             outbound,
+            headers,
             http_client: client,
         }
     }
@@ -66,10 +72,39 @@ impl ProviderVehicle for Vehicle {
 
         loop {
             let mut req = Request::default();
-            req.headers_mut().insert(
-                http::header::USER_AGENT,
-                DEFAULT_USER_AGENT.parse().expect("must parse user agent"),
-            );
+            let mut has_user_agent = false;
+            if let Some(headers) = &self.headers {
+                for (key, values) in headers {
+                    match HeaderName::from_bytes(key.as_bytes()) {
+                        Ok(header_name) => {
+                            if header_name == USER_AGENT {
+                                has_user_agent = true;
+                            }
+                            for val in values {
+                                match HeaderValue::from_str(val) {
+                                    Ok(header_val) => {
+                                        req.headers_mut().append(header_name.clone(), header_val);
+                                    }
+                                    Err(e) => {
+                                        warn!(
+                                            "invalid header value for {key}: {val}, error: {e}"
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            warn!("invalid header name: {key}, error: {e}");
+                        }
+                    }
+                }
+            }
+            if !has_user_agent {
+                req.headers_mut().insert(
+                    USER_AGENT,
+                    DEFAULT_USER_AGENT.parse().expect("must parse user agent"),
+                );
+            }
             if let Some(outbound) = &self.outbound {
                 req.extensions_mut().insert(ClashHTTPClientExt {
                     outbound: Some(outbound.clone()),
@@ -93,7 +128,7 @@ impl ProviderVehicle for Vehicle {
 
                 let location = res
                     .headers()
-                    .get(http::header::LOCATION)
+                    .get(LOCATION)
                     .ok_or_else(|| {
                         io::Error::other(format!(
                             "redirect response ({status}) missing Location header"
@@ -166,7 +201,15 @@ mod tests {
         let u = server.url("/test_http_vehicle").parse::<Uri>().unwrap();
         let p = std::env::temp_dir().join("test_http_vehicle");
         let r = Arc::new(EnhancedResolver::new_default().await);
-        let v = super::Vehicle::new(u, p, None, r.clone() as ThreadSafeDNSResolver, None, None);
+        let v = super::Vehicle::new(
+            u,
+            p,
+            None,
+            r.clone() as ThreadSafeDNSResolver,
+            None,
+            None,
+            None,
+        );
 
         let data = v.read().await.unwrap();
         mock.assert();
@@ -189,7 +232,15 @@ mod tests {
         let u = server.url("/redirect").parse::<Uri>().unwrap();
         let p = std::env::temp_dir().join("test_http_vehicle_redirect");
         let r = Arc::new(EnhancedResolver::new_default().await);
-        let v = super::Vehicle::new(u, p, None, r.clone() as ThreadSafeDNSResolver, None, None);
+        let v = super::Vehicle::new(
+            u,
+            p,
+            None,
+            r.clone() as ThreadSafeDNSResolver,
+            None,
+            None,
+            None,
+        );
 
         let data = v.read().await.unwrap();
         mock_redirect.assert();
@@ -202,7 +253,15 @@ mod tests {
         initialize();
         let u = "http://example.com/test".parse::<Uri>().unwrap();
         let r = Arc::new(EnhancedResolver::new_default().await);
-        let v = super::Vehicle::new(u.clone(), "", None, r.clone() as ThreadSafeDNSResolver, None, None);
+        let v = super::Vehicle::new(
+            u.clone(),
+            "",
+            None,
+            r.clone() as ThreadSafeDNSResolver,
+            None,
+            None,
+            None,
+        );
         let expected_md5 = crate::common::utils::md5_str(u.to_string().as_bytes());
         assert_eq!(v.path(), format!("cache/{expected_md5}"));
     }
@@ -233,11 +292,90 @@ mod tests {
             r.clone() as ThreadSafeDNSResolver,
             Some("my-proxy".to_string()),
             Some(registry),
+            None,
         );
 
         let data = v.read().await.unwrap();
         mock.assert();
         assert_eq!(str::from_utf8(&data).unwrap(), "proxied success");
+    }
+
+    #[tokio::test]
+    async fn test_http_vehicle_custom_headers() {
+        initialize();
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(GET)
+                .path("/test_headers")
+                .header("authorization", "Bearer token123")
+                .header("x-custom-key", "custom-val")
+                .header("user-agent", crate::common::http::DEFAULT_USER_AGENT);
+            then.status(200).body("headers ok");
+        });
+
+        let u = server.url("/test_headers").parse::<Uri>().unwrap();
+        let p = std::env::temp_dir().join("test_headers");
+        let r = Arc::new(EnhancedResolver::new_default().await);
+
+        let mut headers = std::collections::HashMap::new();
+        headers.insert(
+            "Authorization".to_string(),
+            vec!["Bearer token123".to_string()],
+        );
+        headers.insert(
+            "X-Custom-Key".to_string(),
+            vec!["custom-val".to_string()],
+        );
+
+        let v = super::Vehicle::new(
+            u,
+            p,
+            None,
+            r.clone() as ThreadSafeDNSResolver,
+            None,
+            None,
+            Some(headers),
+        );
+
+        let data = v.read().await.unwrap();
+        mock.assert();
+        assert_eq!(str::from_utf8(&data).unwrap(), "headers ok");
+    }
+
+    #[tokio::test]
+    async fn test_http_vehicle_custom_user_agent() {
+        initialize();
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(GET)
+                .path("/test_custom_ua")
+                .header("user-agent", "MyCustomAgent/1.0");
+            then.status(200).body("ua ok");
+        });
+
+        let u = server.url("/test_custom_ua").parse::<Uri>().unwrap();
+        let p = std::env::temp_dir().join("test_custom_ua");
+        let r = Arc::new(EnhancedResolver::new_default().await);
+
+        let mut headers = std::collections::HashMap::new();
+        headers.insert(
+            "User-Agent".to_string(),
+            vec!["MyCustomAgent/1.0".to_string()],
+        );
+
+        let v = super::Vehicle::new(
+            u,
+            p,
+            None,
+            r.clone() as ThreadSafeDNSResolver,
+            None,
+            None,
+            Some(headers),
+        );
+
+        let data = v.read().await.unwrap();
+        mock.assert();
+        assert_eq!(str::from_utf8(&data).unwrap(), "ua ok");
     }
 }
 

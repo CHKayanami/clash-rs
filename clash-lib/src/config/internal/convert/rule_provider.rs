@@ -35,6 +35,7 @@ pub(super) fn convert(
                         format: h.format,
                         inline_rules: h.inline_rules,
                         proxy: h.proxy,
+                        header: h.header,
                     })
                 }
                 def::RuleProviderDef::File(f) => {

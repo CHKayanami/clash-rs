@@ -1,4 +1,7 @@
-use crate::common::utils::default_bool_true;
+use crate::{
+    common::utils::default_bool_true,
+    config::utils::deserialize_map_string_or_seq,
+};
 use serde::{Deserialize, Serialize};
 use serde_yaml::Value;
 use std::collections::HashMap;
@@ -343,6 +346,12 @@ pub struct InboundHttpProvider {
     pub interval: u64,
     #[serde(default)]
     pub path: Option<String>,
+    #[serde(
+        default,
+        alias = "headers",
+        deserialize_with = "deserialize_map_string_or_seq"
+    )]
+    pub header: Option<HashMap<String, Vec<String>>>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]

@@ -1,4 +1,8 @@
-use crate::{Error, common::utils::default_bool_true, config::utils};
+use crate::{
+    Error,
+    common::utils::default_bool_true,
+    config::utils::{self, deserialize_opt_bandwidth_mbps},
+};
 use serde::{Deserialize, de::value::MapDeserializer};
 use serde_yaml::Value;
 #[cfg(feature = "shadowquic")]
@@ -54,7 +58,7 @@ pub enum OutboundProxyProtocol {
     #[serde(rename = "reject")]
     Reject(OutboundReject),
     #[cfg(feature = "shadowsocks")]
-    #[serde(rename = "ss")]
+    #[serde(rename = "ss", alias = "shadowsocks")]
     Ss(OutboundShadowsocks),
     #[serde(rename = "socks5")]
     Socks5(OutboundSocks5),
@@ -586,10 +590,13 @@ pub struct OutboundHysteria2 {
     pub alpn: Option<Vec<String>>,
     /// set brutal congestion control, need compare with tx which is received by
     /// auth request
+    #[serde(default, deserialize_with = "deserialize_opt_bandwidth_mbps")]
     pub up: Option<u64>,
     /// receive_bps: send by auth request
+    #[serde(default, deserialize_with = "deserialize_opt_bandwidth_mbps")]
     pub down: Option<u64>,
     pub sni: Option<String>,
+    #[serde(default)]
     pub skip_cert_verify: bool,
     pub ca: Option<String>,
     pub ca_str: Option<String>,
@@ -884,6 +891,12 @@ pub struct OutboundHttpProvider {
     pub health_check: HealthCheck,
     #[serde(default)]
     pub proxy: Option<String>,
+    #[serde(
+        default,
+        alias = "headers",
+        deserialize_with = "utils::deserialize_map_string_or_seq"
+    )]
+    pub header: Option<HashMap<String, Vec<String>>>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug)]
@@ -1101,6 +1114,81 @@ mod proxy_group_tests {
 
         assert_eq!(group.name(), "Auto Group");
         assert_eq!(group.include_all(), Some(true));
+    }
+
+    #[test]
+    fn test_hysteria2_bandwidth_deserialize() {
+        use crate::config::internal::proxy::OutboundProxyProtocol;
+
+        let yaml = r#"
+            name: hy2-test
+            type: hysteria2
+            server: 1.2.3.4
+            port: 443
+            password: test-pass
+            up: "1000 Mbps"
+            down: "50 MB/s"
+        "#;
+
+        let proto: OutboundProxyProtocol = serde_yaml::from_str(yaml).unwrap();
+        if let OutboundProxyProtocol::Hysteria2(h2) = proto {
+            assert_eq!(h2.up, Some(1000));
+            assert_eq!(h2.down, Some(400));
+        } else {
+            panic!("expected Hysteria2 variant");
+        }
+    }
+
+    #[test]
+    fn test_trojan_smux_string_deserialize() {
+        use crate::config::internal::proxy::OutboundProxyProtocol;
+
+        let yaml = r#"
+            name: trojan-test
+            type: trojan
+            server: 1.2.3.4
+            port: 443
+            password: test-pass
+            smux:
+              enabled: true
+              max-streams: "8"
+              min-streams: "2"
+              max-connections: "4"
+        "#;
+
+        let proto: OutboundProxyProtocol = serde_yaml::from_str(yaml).unwrap();
+        if let OutboundProxyProtocol::Trojan(trojan) = proto {
+            let smux = trojan.smux.unwrap();
+            assert!(smux.enable);
+            assert_eq!(smux.max_streams, 8);
+            assert_eq!(smux.min_streams, 2);
+            assert_eq!(smux.max_connections, 4);
+        } else {
+            panic!("expected Trojan variant");
+        }
+
+        let yaml_null = r#"
+            name: trojan-test
+            type: trojan
+            server: 1.2.3.4
+            port: 443
+            password: test-pass
+            smux:
+              enabled: true
+              max-streams: ~
+              min-streams: null
+        "#;
+
+        let proto_null: OutboundProxyProtocol = serde_yaml::from_str(yaml_null).unwrap();
+        if let OutboundProxyProtocol::Trojan(trojan) = proto_null {
+            let smux = trojan.smux.unwrap();
+            assert!(smux.enable);
+            assert_eq!(smux.max_streams, 0);
+            assert_eq!(smux.min_streams, 0);
+            assert_eq!(smux.max_connections, 0);
+        } else {
+            panic!("expected Trojan variant");
+        }
     }
 }
 

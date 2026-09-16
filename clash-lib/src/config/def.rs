@@ -3,6 +3,7 @@ use crate::{
     app::remote_content_manager::providers::rule_provider::{
         RuleSetBehavior, RuleSetFormat,
     },
+    config::utils::deserialize_map_string_or_seq,
 };
 use educe::Educe;
 use serde::{Deserialize, Deserializer, Serialize};
@@ -1219,6 +1220,13 @@ pub struct HttpRuleProviderDef {
     /// Outbound proxy node to use when downloading the rule set.
     #[serde(default)]
     pub proxy: Option<String>,
+    /// Custom HTTP headers to send when downloading the rule set.
+    #[serde(
+        default,
+        alias = "headers",
+        deserialize_with = "deserialize_map_string_or_seq"
+    )]
+    pub header: Option<HashMap<String, Vec<String>>>,
 }
 
 /// File-based rule provider loaded from a local path.
@@ -1259,8 +1267,10 @@ pub struct InlineRuleProviderDef {
 #[cfg(test)]
 mod tests {
     use crate::config::{
-        def::Port,
-        internal::proxy::{OutboundGroupProtocol, OutboundProxyProtocol},
+        def::{Port, RuleProviderDef},
+        internal::proxy::{
+            OutboundGroupProtocol, OutboundProxyProtocol, OutboundProxyProviderDef,
+        },
     };
 
     use super::Config;
@@ -1510,6 +1520,96 @@ inbound-providers:
         assert_eq!(internal.proxy_providers.len(), 2);
         assert_eq!(internal.rule_providers.len(), 1);
         assert_eq!(internal.inbound_providers.len(), 1);
+    }
+
+    #[test]
+    fn parse_providers_headers() {
+        let cfg = r#"
+proxy-providers:
+  http-provider-header:
+    type: http
+    url: "https://example.com/proxies.yaml"
+    interval: 3600
+    health-check:
+      enable: true
+      interval: 600
+      url: http://www.gstatic.com/generate_204
+    header:
+      User-Agent:
+        - "custom-agent/1.0"
+      Authorization: "Bearer token123"
+  http-provider-headers-alias:
+    type: http
+    url: "https://example.com/proxies2.yaml"
+    interval: 3600
+    health-check:
+      enable: true
+      interval: 600
+      url: http://www.gstatic.com/generate_204
+    headers:
+      X-Custom: "test"
+
+rule-providers:
+  http-rule-header:
+    type: http
+    url: "https://example.com/rules.yaml"
+    behavior: domain
+    header:
+      User-Agent:
+        - "rule-agent/1.0"
+      X-Rule-Key: "key456"
+  http-rule-headers-alias:
+    type: http
+    url: "https://example.com/rules2.yaml"
+    behavior: classical
+    headers:
+      Authorization:
+        - "token789"
+"#;
+        let c = cfg.parse::<Config>().expect("should parse config with provider headers");
+        let proxy_providers = c.proxy_provider.as_ref().expect("proxy_providers should be set");
+        let rule_providers = c.rule_provider.as_ref().expect("rule_providers should be set");
+
+        if let OutboundProxyProviderDef::Http(p) = &proxy_providers["http-provider-header"] {
+            let h = p.header.as_ref().expect("header should be present");
+            assert_eq!(h.get("User-Agent").unwrap(), &vec!["custom-agent/1.0".to_string()]);
+            assert_eq!(h.get("Authorization").unwrap(), &vec!["Bearer token123".to_string()]);
+        } else {
+            panic!("expected OutboundProxyProviderDef::Http");
+        }
+
+        if let OutboundProxyProviderDef::Http(p) = &proxy_providers["http-provider-headers-alias"] {
+            let h = p.header.as_ref().expect("header should be present");
+            assert_eq!(h.get("X-Custom").unwrap(), &vec!["test".to_string()]);
+        } else {
+            panic!("expected OutboundProxyProviderDef::Http");
+        }
+
+        if let RuleProviderDef::Http(r) = &rule_providers["http-rule-header"] {
+            let h = r.header.as_ref().expect("header should be present");
+            assert_eq!(h.get("User-Agent").unwrap(), &vec!["rule-agent/1.0".to_string()]);
+            assert_eq!(h.get("X-Rule-Key").unwrap(), &vec!["key456".to_string()]);
+        } else {
+            panic!("expected RuleProviderDef::Http");
+        }
+
+        if let RuleProviderDef::Http(r) = &rule_providers["http-rule-headers-alias"] {
+            let h = r.header.as_ref().expect("header should be present");
+            assert_eq!(h.get("Authorization").unwrap(), &vec!["token789".to_string()]);
+        } else {
+            panic!("expected RuleProviderDef::Http");
+        }
+
+        let internal: crate::config::internal::config::Config =
+            c.try_into().expect("convert to internal config should succeed");
+        if let crate::config::internal::config::RuleProviderDef::Http(r) =
+            &internal.rule_providers["http-rule-header"]
+        {
+            let h = r.header.as_ref().expect("converted rule header should be present");
+            assert_eq!(h.get("User-Agent").unwrap(), &vec!["rule-agent/1.0".to_string()]);
+        } else {
+            panic!("expected internal RuleProviderDef::Http");
+        }
     }
 
     #[test]

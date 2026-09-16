@@ -11,6 +11,7 @@ use crate::{
     config::{
         def::{self, LogLevel, RunMode},
         internal::{proxy::OutboundProxy, rule::RuleType},
+        utils::deserialize_map_string_or_seq,
     },
 };
 use anyhow::anyhow;
@@ -394,6 +395,12 @@ pub struct HttpRuleProvider {
     #[serde(alias = "payload")]
     pub inline_rules: Option<Vec<String>>,
     pub proxy: Option<String>,
+    #[serde(
+        default,
+        alias = "headers",
+        deserialize_with = "deserialize_map_string_or_seq"
+    )]
+    pub header: Option<HashMap<String, Vec<String>>>,
 }
 
 #[derive(Serialize, Deserialize)]

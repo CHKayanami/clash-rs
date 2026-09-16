@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use crate::config::utils::deserialize_usize;
+
 pub mod h2mux;
 pub use h2mux::H2MuxPool;
 
@@ -22,11 +24,11 @@ pub struct MuxOption {
     pub enable: bool,
     #[serde(default)]
     pub protocol: MuxProtocol,
-    #[serde(default, alias = "max_connections")]
+    #[serde(default, alias = "max_connections", deserialize_with = "deserialize_usize")]
     pub max_connections: usize,
-    #[serde(default, alias = "min_streams")]
+    #[serde(default, alias = "min_streams", deserialize_with = "deserialize_usize")]
     pub min_streams: usize,
-    #[serde(default, alias = "max_streams")]
+    #[serde(default, alias = "max_streams", deserialize_with = "deserialize_usize")]
     pub max_streams: usize,
     #[serde(default)]
     pub padding: bool,

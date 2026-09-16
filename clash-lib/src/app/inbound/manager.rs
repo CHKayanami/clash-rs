@@ -167,6 +167,7 @@ impl InboundManager {
                     url,
                     path,
                     interval,
+                    header,
                     ..
                 }) => {
                     let uri = match url.parse::<hyper::Uri>() {
@@ -189,6 +190,7 @@ impl InboundManager {
                         dns_resolver.clone(),
                         None,
                         None,
+                        header,
                     );
                     (Arc::new(v), Duration::from_secs(interval))
                 }

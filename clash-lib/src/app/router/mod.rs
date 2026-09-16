@@ -283,6 +283,7 @@ impl Router {
                         resolver_to_use,
                         http.proxy,
                         outbound_registry.clone(),
+                        http.header,
                     );
 
                     // Default to yaml if not specified

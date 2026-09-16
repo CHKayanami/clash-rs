@@ -1040,6 +1040,7 @@ impl OutboundManager {
                         resolver_to_use,
                         http.proxy,
                         Some(self.registry.clone()),
+                        http.header,
                     );
                     (
                         Arc::new(vehicle) as ThreadSafeProviderVehicle,
