@@ -6,6 +6,7 @@ use crate::{
 };
 use futures::future::BoxFuture;
 use serde::{Deserialize, Serialize};
+use serde_yaml::Value;
 use std::{sync::Arc, time::Duration};
 
 /// The YAML structure expected at the provider URL / file.
@@ -46,8 +47,17 @@ impl InboundSetProvider {
     ) -> anyhow::Result<Self> {
         let n = name.clone();
         let parser: InboundParser = Box::new(move |input: &[u8]| {
-            let scheme: ProviderScheme =
+            let mut val: Value =
                 serde_yaml::from_slice(input).map_err(|e| {
+                    anyhow::anyhow!("inbound provider {n} parse error: {e}")
+                })?;
+            val.apply_merge().map_err(|e| {
+                anyhow::anyhow!(
+                    "inbound provider {n} anchor merge error: {e}"
+                )
+            })?;
+            let scheme: ProviderScheme =
+                serde_yaml::from_value(val).map_err(|e| {
                     anyhow::anyhow!("inbound provider {n} parse error: {e}")
                 })?;
             let opts = scheme.listeners.unwrap_or_default();
@@ -189,5 +199,40 @@ listeners:
         let initial = provider.initialize().await.unwrap();
         assert!(initial.is_empty());
         assert!(*called.lock().await);
+    }
+
+    #[tokio::test]
+    async fn test_inbound_provider_with_anchor() {
+        let yaml = br#"
+common: &common
+  type: socks
+  listen: 0.0.0.0
+  port: 1080
+  udp: true
+
+listeners:
+  - name: test-socks
+    <<: *common
+"#;
+        let vehicle = make_vehicle(yaml);
+        let received: Arc<Mutex<Vec<InboundOpts>>> = Arc::new(Mutex::new(vec![]));
+        let received_clone = received.clone();
+
+        let provider = InboundSetProvider::new(
+            "test_anchor".to_owned(),
+            Duration::ZERO,
+            vehicle,
+            move |opts| {
+                let received = received_clone.clone();
+                Box::pin(async move {
+                    received.lock().await.extend(opts);
+                })
+            },
+        )
+        .unwrap();
+
+        let initial = provider.initialize().await.unwrap();
+        assert_eq!(initial.len(), 1);
+        assert_eq!(initial[0].common_opts().name, "test-socks");
     }
 }

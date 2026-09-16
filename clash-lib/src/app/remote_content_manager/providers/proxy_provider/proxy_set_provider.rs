@@ -100,8 +100,19 @@ impl ProxySetProvider {
         let n = name.clone();
         let parser: ProxyParser = Box::new(
             move |input: &[u8]| -> anyhow::Result<Vec<AnyOutboundHandler>> {
-                let scheme: ProviderScheme =
+                let mut val: Value =
                     serde_yaml::from_slice(input).map_err(|x| {
+                        Error::InvalidConfig(format!(
+                            "proxy provider parse error {n}: {x}"
+                        ))
+                    })?;
+                val.apply_merge().map_err(|x| {
+                    Error::InvalidConfig(format!(
+                        "proxy provider anchor merge error {n}: {x}"
+                    ))
+                })?;
+                let scheme: ProviderScheme =
+                    serde_yaml::from_value(val).map_err(|x| {
                         Error::InvalidConfig(format!(
                             "proxy provider parse error {n}: {x}"
                         ))
@@ -350,6 +361,62 @@ proxies:
 
         let provider = ProxySetProvider::new(
             "test".to_owned(),
+            Duration::from_secs(1),
+            vehicle,
+            hc,
+        )
+        .unwrap();
+
+        assert_eq!(provider.proxies().len(), 0);
+
+        provider.initialize().await.unwrap();
+
+        sleep(Duration::from_secs_f64(1.5)).await;
+
+        assert_eq!(provider.proxies().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_proxy_set_provider_with_anchor() {
+        let mut mock_vehicle = MockProviderVehicle::new();
+
+        mock_vehicle.expect_read().returning(|| {
+            Ok(r#"
+node_base: &node_base
+  type: socks5
+  server: localhost
+  port: 1080
+  udp: true
+
+proxies:
+  - name: "socks5"
+    <<: *node_base
+"#
+            .as_bytes()
+            .to_vec())
+        });
+        mock_vehicle
+            .expect_path()
+            .return_const("/tmp/test_proxy_set_provider_anchor".to_owned());
+        mock_vehicle
+            .expect_typ()
+            .return_const(ProviderVehicleType::File);
+
+        let vehicle = Arc::new(mock_vehicle);
+
+        let mock_resolver = MockClashResolver::new();
+
+        let latency_manager = ProxyManager::new(Arc::new(mock_resolver), None);
+        let hc = HealthCheck::new(
+            vec![],
+            "http://www.google.com".to_owned(),
+            0,
+            true,
+            latency_manager.clone(),
+        );
+
+        let provider = ProxySetProvider::new(
+            "test_anchor".to_owned(),
             Duration::from_secs(1),
             vehicle,
             hc,

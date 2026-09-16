@@ -677,6 +677,30 @@ impl OutboundGroupProtocol {
             OutboundGroupProtocol::Select(g) => g.include_all,
         }
     }
+
+    /// Returns the filter regex string for the group, if any.
+    pub fn filter(&self) -> Option<&str> {
+        match &self {
+            OutboundGroupProtocol::Relay(g) => g.filter.as_deref(),
+            OutboundGroupProtocol::UrlTest(g) => g.filter.as_deref(),
+            OutboundGroupProtocol::Fallback(g) => g.filter.as_deref(),
+            OutboundGroupProtocol::LoadBalance(g) => g.filter.as_deref(),
+            OutboundGroupProtocol::Smart(g) => g.filter.as_deref(),
+            OutboundGroupProtocol::Select(g) => g.filter.as_deref(),
+        }
+    }
+
+    /// Returns the empty-fallback proxy name for the group, if any.
+    pub fn empty_fallback(&self) -> Option<&str> {
+        match &self {
+            OutboundGroupProtocol::Relay(g) => g.empty_fallback.as_deref(),
+            OutboundGroupProtocol::UrlTest(g) => g.empty_fallback.as_deref(),
+            OutboundGroupProtocol::Fallback(g) => g.empty_fallback.as_deref(),
+            OutboundGroupProtocol::LoadBalance(g) => g.empty_fallback.as_deref(),
+            OutboundGroupProtocol::Smart(g) => g.empty_fallback.as_deref(),
+            OutboundGroupProtocol::Select(g) => g.empty_fallback.as_deref(),
+        }
+    }
 }
 
 impl Display for OutboundGroupProtocol {
@@ -702,6 +726,9 @@ pub struct OutboundGroupRelay {
     pub include_all: Option<bool>,
     pub icon: Option<String>,
     pub url: Option<String>,
+    pub filter: Option<String>,
+    #[serde(rename = "empty-fallback")]
+    pub empty_fallback: Option<String>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Default, Clone)]
@@ -720,6 +747,9 @@ pub struct OutboundGroupUrlTest {
     pub lazy: Option<bool>,
     pub tolerance: Option<u16>,
     pub icon: Option<String>,
+    pub filter: Option<String>,
+    #[serde(rename = "empty-fallback")]
+    pub empty_fallback: Option<String>,
 }
 #[derive(serde::Serialize, serde::Deserialize, Debug, Default, Clone)]
 pub struct OutboundGroupFallback {
@@ -736,6 +766,9 @@ pub struct OutboundGroupFallback {
     pub interval: u64,
     pub lazy: Option<bool>,
     pub icon: Option<String>,
+    pub filter: Option<String>,
+    #[serde(rename = "empty-fallback")]
+    pub empty_fallback: Option<String>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Default, Clone)]
@@ -754,6 +787,9 @@ pub struct OutboundGroupLoadBalance {
     pub lazy: Option<bool>,
     pub strategy: Option<LoadBalanceStrategy>,
     pub icon: Option<String>,
+    pub filter: Option<String>,
+    #[serde(rename = "empty-fallback")]
+    pub empty_fallback: Option<String>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy, Default)]
@@ -781,6 +817,9 @@ pub struct OutboundGroupSmart {
     pub lazy: Option<bool>,
     pub icon: Option<String>,
     pub url: Option<String>,
+    pub filter: Option<String>,
+    #[serde(rename = "empty-fallback")]
+    pub empty_fallback: Option<String>,
 
     /// Maximum retries for failed connections (default: 3)
     #[serde(rename = "max-retries")]
@@ -810,6 +849,9 @@ pub struct OutboundGroupSelect {
 
     pub url: Option<String>,
     pub icon: Option<String>,
+    pub filter: Option<String>,
+    #[serde(rename = "empty-fallback")]
+    pub empty_fallback: Option<String>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug)]

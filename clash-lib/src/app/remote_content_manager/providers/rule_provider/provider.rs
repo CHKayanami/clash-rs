@@ -4,6 +4,7 @@ use async_trait::async_trait;
 use erased_serde::Serialize as ESerialize;
 use futures::future::BoxFuture;
 use serde::{Deserialize, Serialize};
+use serde_yaml::Value;
 use tracing::{debug, trace};
 
 use super::cidr_trie::CidrTrie;
@@ -216,12 +217,23 @@ impl RuleProviderImpl {
             Box::new(move |input: &[u8]| -> anyhow::Result<RuleContent> {
                 match current_format {
                     RuleSetFormat::Yaml => {
-                        let scheme: ProviderScheme = serde_yaml::from_slice(input)
+                        let mut val: Value = serde_yaml::from_slice(input)
                             .map_err(|x| {
+                                Error::InvalidConfig(format!(
+                                    "rule provider parse error (yaml) {n_parser}: {x}"
+                                ))
+                            })?;
+                        val.apply_merge().map_err(|x| {
                             Error::InvalidConfig(format!(
-                                "rule provider parse error (yaml) {n_parser}: {x}"
+                                "rule provider anchor merge error (yaml) {n_parser}: {x}"
                             ))
                         })?;
+                        let scheme: ProviderScheme = serde_yaml::from_value(val)
+                            .map_err(|x| {
+                                Error::InvalidConfig(format!(
+                                    "rule provider parse error (yaml) {n_parser}: {x}"
+                                ))
+                            })?;
 
                         // Fn: we need to clone the values anyway to avoid moving
                         // `inline_rules` from the "Environment"
@@ -653,6 +665,46 @@ mod tests {
 
         assert!(provider.search(&Session {
             destination: SocksAddr::Domain("test.google.com".into(), 443),
+            ..Default::default()
+        }));
+    }
+
+    #[tokio::test]
+    async fn test_rule_provider_yaml_with_anchor() {
+        let mock_mmdb = MockMmdbLookupTrait::new();
+        let mock_geodata = MockGeoDataLookupTrait::new();
+        let mut mock_vehicle = MockProviderVehicle::new();
+
+        let yaml = r#"
+anchors:
+  - &item "DOMAIN,example.com"
+payload:
+  - *item
+"#;
+        mock_vehicle
+            .expect_path()
+            .return_const("/tmp/mock_rule_provider_anchor".to_owned());
+        mock_vehicle
+            .expect_read()
+            .returning(move || Ok(yaml.as_bytes().to_vec()));
+        mock_vehicle
+            .expect_typ()
+            .return_const(ProviderVehicleType::File);
+
+        let provider = RuleProviderImpl::new(
+            "test_anchor".to_string(),
+            RuleSetBehavior::Classical,
+            RuleSetFormat::Yaml,
+            Some(Duration::from_secs(5)),
+            Some(Arc::new(mock_vehicle)),
+            Some(Arc::new(mock_mmdb)),
+            Some(Arc::new(mock_geodata)),
+            None,
+        );
+
+        assert_ok!(provider.initialize().await);
+        assert!(provider.search(&Session {
+            destination: SocksAddr::Domain("example.com".into(), 80),
             ..Default::default()
         }));
     }

@@ -1,7 +1,8 @@
+pub mod filtered_provider;
 pub mod plain_provider;
-
 pub mod proxy_set_provider;
 
+pub use filtered_provider::FilteredProxyProvider;
 pub use plain_provider::PlainProvider;
 pub use proxy_set_provider::ProxySetProvider;
 

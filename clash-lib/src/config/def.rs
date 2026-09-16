@@ -706,7 +706,7 @@ impl FromStr for Config {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let mut val: Value = serde_yaml::from_str(s).map_err(|e| {
             Error::InvalidConfig(format!(
-                "couldn't not parse config content {s}: {e}"
+                "could not parse config content {s}: {e}"
             ))
         })?;
 
@@ -764,7 +764,7 @@ pub(crate) fn check_unknown_fields(s: &str) -> crate::Result<Config> {
 /// Both protocols share the same wire format. For DoH3, `hostname` acts as the
 /// QUIC SNI value presented to clients.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
-#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+#[serde(rename_all = "kebab-case")]
 pub struct DohListenDef {
     /// Address to listen on, e.g. `127.0.0.1:53555`.
     pub addr: String,
@@ -779,7 +779,7 @@ pub struct DohListenDef {
 /// Listen configuration for DoT (DNS over TLS).
 /// Unlike [`DohListenDef`], DoT does not expose a hostname/SNI override field.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
-#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+#[serde(rename_all = "kebab-case")]
 pub struct DotListenDef {
     /// Address to listen on, e.g. `127.0.0.1:53554`.
     pub addr: String,
@@ -810,7 +810,7 @@ pub struct DotListenDef {
 ///       ca-key: /path/to/key.pem
 /// ```
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
-#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+#[serde(rename_all = "kebab-case")]
 pub struct DnsMultipleListenDef {
     /// Plain UDP listener address, e.g. `127.0.0.1:53`.
     pub udp: Option<String>,
@@ -1079,7 +1079,7 @@ pub enum DNSMode {
 }
 
 #[derive(Serialize, Deserialize, Clone, Educe)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 #[educe(Default)]
 pub struct FallbackFilter {
     #[serde(rename = "geoip")]
@@ -1096,7 +1096,7 @@ pub struct FallbackFilter {
 }
 
 #[derive(Serialize, Deserialize, Default, Clone, Debug, PartialEq, Eq)]
-#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+#[serde(rename_all = "kebab-case")]
 pub struct EdnsClientSubnet {
     /// IPv4 subnet expressed in CIDR notation, e.g. `1.2.3.0/24`
     pub ipv4: Option<String>,
@@ -1105,7 +1105,7 @@ pub struct EdnsClientSubnet {
 }
 
 #[derive(Serialize, Deserialize, Default)]
-#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+#[serde(rename_all = "kebab-case")]
 pub struct Experimental {
     /// buffer size for tcp stream bidirectional copy
     pub tcp_buffer_size: Option<usize>,
@@ -1114,7 +1114,7 @@ pub struct Experimental {
 }
 
 #[derive(Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 #[serde(rename_all = "kebab-case")]
 pub struct Profile {
     /// Store the `select` results in $CWD/cache.db
@@ -1199,7 +1199,7 @@ pub enum RuleProviderDef {
 /// When `path` is absent, a local cache path is automatically derived from
 /// the MD5 hash of `url` during config conversion.
 #[derive(Serialize, Deserialize, Clone, Debug)]
-#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+#[serde(rename_all = "kebab-case")]
 pub struct HttpRuleProviderDef {
     /// Remote URL to fetch the rule set from.
     pub url: String,
@@ -1223,7 +1223,7 @@ pub struct HttpRuleProviderDef {
 
 /// File-based rule provider loaded from a local path.
 #[derive(Serialize, Deserialize, Clone, Debug)]
-#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+#[serde(rename_all = "kebab-case")]
 pub struct FileRuleProviderDef {
     /// Path to the rule set file, relative to the working directory.
     pub path: String,
@@ -1244,7 +1244,7 @@ pub struct FileRuleProviderDef {
 /// When `path` is absent, a cache path is derived from the MD5 hash of the
 /// provider name during config conversion.
 #[derive(Serialize, Deserialize, Clone, Debug)]
-#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+#[serde(rename_all = "kebab-case")]
 pub struct InlineRuleProviderDef {
     /// Optional local cache path. Derived from the provider name's MD5 hash
     /// when absent.
@@ -2190,6 +2190,26 @@ dns:
         let c = cfg_custom.parse::<Config>().unwrap();
         assert_eq!(c.dns.fake_ip_ttl, 60);
         assert!(super::check_unknown_fields(cfg_custom).is_ok());
+    }
+
+    #[test]
+    fn parse_config_with_anchors() {
+        let cfg = r#"
+pr: &pr
+  type: socks5
+  server: 127.0.0.1
+  port: 1080
+
+port: 7890
+proxies:
+  - name: "socks-node"
+    <<: *pr
+"#;
+        let c = cfg.parse::<Config>().expect("should parse config with anchors");
+        assert_eq!(c.port.unwrap(), Port(7890));
+        let proxies = c.proxy.expect("proxies should be present");
+        assert_eq!(proxies.len(), 1);
+        assert_eq!(proxies[0].name(), "socks-node");
     }
 }
 

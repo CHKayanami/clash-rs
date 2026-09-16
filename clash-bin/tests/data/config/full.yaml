@@ -1119,9 +1119,34 @@ proxies:
     type: tor
 
 # ── Proxy Groups ──────────────────────────────────────────────────────────────
+# Proxy groups combine multiple proxies or proxy-providers into a single routing target.
+#
+# Supported group types:
+#   select       — Manual proxy selection via Dashboard or REST API.
+#   url-test     — Periodically tests latency and automatically routes to the fastest proxy.
+#   fallback     — Uses the first reachable proxy in order; falls back to the next upon failure.
+#   load-balance — Distributes traffic across multiple proxies using load-balancing strategies.
+#   relay        — Chains multiple proxies sequentially (Traffic -> Proxy1 -> Proxy2 -> Target).
+#   smart        — Adaptive selection based on latency, historical success rates, and site affinity.
+#
+# Common attributes (supported across proxy groups):
+#   name:            Name of the group (used as rule target or inside other groups).
+#   type:            select | url-test | fallback | load-balance | relay | smart
+#   proxies:         List of fixed proxy names (includes built-in DIRECT and REJECT).
+#   use:             List of proxy-provider names to import nodes from.
+#   include-all:     Automatically include all defined proxy nodes (excluding DIRECT/REJECT/self).
+#   filter:          Regex pattern to filter nodes imported via `use` or `include-all` by name.
+#                    Supports regex flags (e.g. `(?i)`) and anchors (e.g. `^HK.*$`).
+#   empty-fallback:  Fallback proxy name (e.g. "DIRECT" or "REJECT") used when the group has no
+#                    available nodes (e.g., all filtered out or provider empty).
+#   icon:            URL for an icon displayed in dashboards.
+#   url:             Health-check / latency test URL (defaults to http://www.gstatic.com/generate_204).
+#   interval:        Health check interval in seconds (url-test, fallback, load-balance).
+#   lazy:            When true, health checks run only when traffic arrives (default: false/true depending on type).
+#
 proxy-groups:
 
-  # select — manual selection via API or dashboard
+  # 1. select — manual selection via API or dashboard
   - name: "Manual"
     type: select
     proxies:
@@ -1130,64 +1155,116 @@ proxy-groups:
       - trojan-tcp
       - DIRECT
       - REJECT
-    # use: [provider-name]          # include proxies from a proxy-provider
-    udp: true
+    # use:
+    #   - local-proxies
+    #   - remote-proxies
+    udp: true                       # Enable/disable UDP forwarding (default: true)
     icon: "https://example.com/icon.png"
 
-  # url-test — automatically pick the lowest-latency proxy
+  # 2. url-test — automatically pick the lowest-latency proxy
   - name: "Auto"
     type: url-test
     proxies:
       - ss-legacy
       - vmess-tcp
-    # use: [provider-name]
+    # use:
+    #   - remote-proxies
     url: "http://www.gstatic.com/generate_204"
     interval: 300                   # seconds between health checks
     lazy: true                      # skip checks until traffic arrives
     tolerance: 50                   # switch only if new best beats current by >50ms
     icon: "https://example.com/icon.png"
 
-  # fallback — use first available proxy in priority order
+  # 3. Filtered Group with include-all and empty-fallback
+  # Automatically collects all defined proxies matching the regex, falling back to REJECT if none match
+  - name: "HK-Auto"
+    type: url-test
+    include-all: true               # Import all defined proxies
+    filter: "(?i)香港|HK|HongKong"   # Case-insensitive regex matching
+    empty-fallback: "REJECT"        # Fallback to REJECT if no nodes match the filter
+    url: "http://www.gstatic.com/generate_204"
+    interval: 300
+    lazy: true
+    tolerance: 50
+    icon: "https://example.com/hk.png"
+
+  # 4. Filtered Group using Proxy-Provider with empty-fallback
+  - name: "US-Nodes"
+    type: select
+    use:
+      - remote-proxies              # Import nodes from `proxy-providers` defined below
+    filter: "(?i)美国|US|United States"
+    empty-fallback: "DIRECT"        # Fallback to DIRECT if provider is empty or no match
+    proxies:
+      - DIRECT                      # Static nodes can still be included alongside `use`
+    icon: "https://example.com/us.png"
+
+  # 5. fallback — use first available proxy in priority order
   - name: "Fallback"
     type: fallback
     proxies:
       - ss-legacy
       - vmess-tcp
       - DIRECT
+    # use:
+    #   - remote-proxies
+    # filter: ".*"
+    # empty-fallback: "DIRECT"
     url: "http://www.gstatic.com/generate_204"
     interval: 300
     lazy: false
+    icon: "https://example.com/icon.png"
 
-  # load-balance — distribute connections across proxies
+  # 6. load-balance — distribute connections across proxies
   - name: "LoadBalance"
     type: load-balance
     proxies:
       - ss-legacy
       - vmess-tcp
+    # use:
+    #   - remote-proxies
+    # filter: ".*"
+    # empty-fallback: "DIRECT"
     url: "http://www.gstatic.com/generate_204"
     interval: 300
-    # strategy: consistent-hashing | round-robin | sticky-session
+    lazy: true
+    # strategy:
+    #   consistent-hashing — Hash based on source IP + destination (default)
+    #   round-robin        — Sequential round-robin distribution
+    #   sticky-session     — Hash strictly based on source IP for session persistence
     strategy: round-robin
+    icon: "https://example.com/icon.png"
 
-  # relay — chain proxies sequentially: traffic flows A -> B -> C -> destination
+  # 7. relay — chain proxies sequentially: traffic flows A -> B -> C -> destination
   - name: "Relay"
     type: relay
     proxies:
       - ss-legacy
       - trojan-tcp
+    # use:
+    #   - local-proxies
+    # filter: ".*"
+    # empty-fallback: "DIRECT"
+    icon: "https://example.com/icon.png"
 
-  # smart — adaptive selection using latency, success rate, and optional bandwidth
+  # 8. smart — adaptive selection using latency, success rate, and optional bandwidth
   - name: "Smart"
     type: smart
     proxies:
       - ss-legacy
       - vmess-tcp
       - DIRECT
+    # use:
+    #   - remote-proxies
+    # filter: ".*"
+    # empty-fallback: "DIRECT"
     url: "http://www.gstatic.com/generate_204"
     lazy: true
-    max-retries: 3                  # max connection retries before marking failed
-    site-stickiness: 0.8            # 0.0-1.0; higher = same proxy per site more often
-    bandwidth-weight: 0.0           # >0 to factor in bandwidth in proxy selection
+    udp: true
+    max-retries: 3                  # max connection retries before marking failed (default: 3)
+    site-stickiness: 0.8            # 0.0-1.0; higher = same proxy per site more often (default: 0.8)
+    bandwidth-weight: 0.0           # >0 to factor in bandwidth in proxy selection (default: 0.0)
+    icon: "https://example.com/icon.png"
 
 # ── Proxy Providers ───────────────────────────────────────────────────────────
 # Load proxy lists from files or remote URLs.

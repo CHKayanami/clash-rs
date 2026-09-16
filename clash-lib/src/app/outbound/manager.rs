@@ -25,7 +25,8 @@ use crate::{
                 ProviderVehicleType, ThreadSafeProviderVehicle, file_vehicle,
                 http_vehicle,
                 proxy_provider::{
-                    ArcProxyProvider, PlainProvider, ProxySetProvider,
+                    ArcProxyProvider, FilteredProxyProvider, PlainProvider,
+                    ProxySetProvider,
                 },
             },
         },
@@ -53,8 +54,9 @@ use crate::{
 use anyhow::Result;
 use erased_serde::Serialize;
 use hyper::Uri;
+use regex::Regex;
 use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Duration};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 static RESERVED_PROVIDER_NAME: &str = "default";
@@ -556,6 +558,193 @@ impl OutboundManager {
         Ok(())
     }
 
+    /// Common boilerplate: build providers list from proxies and
+    /// use_provider. Returns `Vec<ArcProxyProvider>`
+    /// directly — the caller checks for emptiness.
+    #[allow(clippy::too_many_arguments)]
+    fn build_group_providers(
+        group: &OutboundGroupProtocol,
+        interval: u64,
+        lazy: bool,
+        handlers: &HashMap<String, AnyOutboundHandler>,
+        proxy_names: &[String],
+        proxy_manager: &ProxyManager,
+        provider_registry: &mut HashMap<String, ArcProxyProvider>,
+    ) -> Result<Vec<ArcProxyProvider>, Error> {
+        let name = group.name();
+        let mut providers: Vec<ArcProxyProvider> = vec![];
+        let include_all = group.include_all().unwrap_or(false);
+
+        let filter_re = if let Some(pattern) = group.filter() {
+            Some(Arc::new(Regex::new(pattern).map_err(|e| {
+                Error::InvalidConfig(format!(
+                    "invalid filter regex `{pattern}` in proxy group `{name}`: {e}"
+                ))
+            })?))
+        } else {
+            None
+        };
+
+        let fallback_handler = if let Some(fb) = group.empty_fallback() {
+            handlers
+                .get(fb)
+                .cloned()
+                .or_else(|| {
+                    if fb == PROXY_DIRECT || fb.eq_ignore_ascii_case("direct") {
+                        Some(Arc::new(direct::Handler::new(fb)) as _)
+                    } else if fb == PROXY_REJECT || fb.eq_ignore_ascii_case("reject") {
+                        Some(Arc::new(reject::Handler::new(fb)) as _)
+                    } else {
+                        warn!(
+                            "empty-fallback proxy `{}` not found for group `{}`, ignoring",
+                            fb, name
+                        );
+                        None
+                    }
+                })
+        } else {
+            None
+        };
+
+        let mut group_proxies = group.proxies().cloned().unwrap_or_default();
+        if include_all {
+            for p_name in proxy_names {
+                if p_name != name
+                    && p_name != PROXY_DIRECT
+                    && p_name != PROXY_REJECT
+                    && !p_name.eq_ignore_ascii_case("reject")
+                    && !group_proxies.contains(p_name)
+                    && let Some(h) = handlers.get(p_name)
+                    && h.try_as_group_handler().is_none()
+                    && !matches!(h.proto(), OutboundType::Reject)
+                {
+                    if let Some(re) = &filter_re {
+                        if !re.is_match(p_name) {
+                            continue;
+                        }
+                    }
+                    group_proxies.push(p_name.clone());
+                }
+            }
+        }
+
+        if !group_proxies.is_empty() {
+            let pd = Self::make_provider_from_proxies(
+                name,
+                &group_proxies,
+                interval,
+                lazy,
+                handlers,
+                proxy_manager.clone(),
+                provider_registry,
+            )?;
+            providers.push(pd);
+        }
+
+        let mut group_providers =
+            group.use_provider().cloned().unwrap_or_default();
+        if include_all {
+            for (provider_name, provider) in provider_registry.iter() {
+                if provider_name != RESERVED_PROVIDER_NAME
+                    && provider_name != name
+                    && !group_providers.contains(provider_name)
+                    && matches!(
+                        provider.vehicle_type(),
+                        ProviderVehicleType::Http | ProviderVehicleType::File
+                    )
+                {
+                    group_providers.push(provider_name.clone());
+                }
+            }
+        }
+
+        for provider_name in &group_providers {
+            let provider = provider_registry
+                .get(provider_name)
+                .unwrap_or_else(|| {
+                    print_and_exit!("provider {} not found", provider_name);
+                })
+                .clone();
+            if let Some(re) = &filter_re {
+                providers.push(Arc::new(FilteredProxyProvider::new(
+                    provider,
+                    re.clone(),
+                    fallback_handler.clone(),
+                )));
+            } else {
+                providers.push(provider);
+            }
+        }
+
+        if providers.is_empty() {
+            if let Some(fb_handler) = fallback_handler {
+                let fallback_proxies = vec![fb_handler];
+                let hc = HealthCheck::new(
+                    fallback_proxies.clone(),
+                    DEFAULT_LATENCY_TEST_URL.to_owned(),
+                    interval,
+                    lazy,
+                    proxy_manager.clone(),
+                );
+                let pd: ArcProxyProvider = Arc::new(
+                    PlainProvider::new(name.to_owned(), fallback_proxies, hc).map_err(|x| {
+                        Error::InvalidConfig(format!("invalid provider config: {x}"))
+                    })?,
+                );
+                provider_registry.insert(name.to_owned(), pd.clone());
+                providers.push(pd);
+            }
+        }
+
+        Ok(providers)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn make_provider_from_proxies(
+        name: &str,
+        proxies: &[String],
+        interval: u64,
+        lazy: bool,
+        handlers: &HashMap<String, AnyOutboundHandler>,
+        proxy_manager: ProxyManager,
+        provider_registry: &mut HashMap<String, ArcProxyProvider>,
+    ) -> Result<ArcProxyProvider, Error> {
+        if name == PROXY_DIRECT || name == PROXY_REJECT {
+            return Err(Error::InvalidConfig(format!(
+                "proxy group name `{name}` is reserved"
+            )));
+        }
+        let proxies = proxies
+            .iter()
+            .map(|x| {
+                handlers
+                    .get(x)
+                    .ok_or_else(|| {
+                        Error::InvalidConfig(format!("proxy {x} not found"))
+                    })
+                    .cloned()
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let hc = HealthCheck::new(
+            proxies.clone(),
+            DEFAULT_LATENCY_TEST_URL.to_owned(),
+            interval,
+            lazy,
+            proxy_manager,
+        );
+
+        let pd: ArcProxyProvider = Arc::new(
+            PlainProvider::new(name.to_owned(), proxies, hc).map_err(|x| {
+                Error::InvalidConfig(format!("invalid provider config: {x}"))
+            })?,
+        );
+
+        provider_registry.insert(name.to_owned(), pd.clone());
+
+        Ok(pd)
+    }
+
     async fn load_group_outbounds(
         &mut self,
         handlers: &mut HashMap<String, AnyOutboundHandler>,
@@ -571,134 +760,11 @@ impl OutboundManager {
         let provider_registry = &mut self.proxy_providers;
         let selector_control = &mut self.selector_control;
 
-        /// Common boilerplate: build providers list from proxies and
-        /// use_provider. Returns `Vec<ArcProxyProvider>`
-        /// directly — the caller checks for emptiness.
-        #[allow(clippy::too_many_arguments)]
-        fn build_group_providers(
-            group: &OutboundGroupProtocol,
-            interval: u64,
-            lazy: bool,
-            handlers: &HashMap<String, AnyOutboundHandler>,
-            proxy_names: &[String],
-            proxy_manager: &ProxyManager,
-            provider_registry: &mut HashMap<String, ArcProxyProvider>,
-        ) -> Result<Vec<ArcProxyProvider>, Error> {
-            let name = group.name();
-            let mut providers: Vec<ArcProxyProvider> = vec![];
-            let include_all = group.include_all().unwrap_or(false);
-
-            let mut group_proxies = group.proxies().cloned().unwrap_or_default();
-            if include_all {
-                for p_name in proxy_names {
-                    if p_name != name
-                        && p_name != PROXY_DIRECT
-                        && p_name != PROXY_REJECT
-                        && !p_name.eq_ignore_ascii_case("reject")
-                        && !group_proxies.contains(p_name)
-                        && let Some(h) = handlers.get(p_name)
-                        && h.try_as_group_handler().is_none()
-                        && !matches!(h.proto(), OutboundType::Reject)
-                    {
-                        group_proxies.push(p_name.clone());
-                    }
-                }
-            }
-
-            if !group_proxies.is_empty() {
-                let pd = make_provider_from_proxies(
-                    name,
-                    &group_proxies,
-                    interval,
-                    lazy,
-                    handlers,
-                    proxy_manager.clone(),
-                    provider_registry,
-                )?;
-                providers.push(pd);
-            }
-
-            let mut group_providers =
-                group.use_provider().cloned().unwrap_or_default();
-            if include_all {
-                for (provider_name, provider) in provider_registry.iter() {
-                    if provider_name != RESERVED_PROVIDER_NAME
-                        && provider_name != name
-                        && !group_providers.contains(provider_name)
-                        && matches!(
-                            provider.vehicle_type(),
-                            ProviderVehicleType::Http | ProviderVehicleType::File
-                        )
-                    {
-                        group_providers.push(provider_name.clone());
-                    }
-                }
-            }
-
-            for provider_name in &group_providers {
-                let provider = provider_registry
-                    .get(provider_name)
-                    .unwrap_or_else(|| {
-                        print_and_exit!("provider {} not found", provider_name);
-                    })
-                    .clone();
-                providers.push(provider);
-            }
-
-            Ok(providers)
-        }
-
-        #[allow(clippy::too_many_arguments)]
-        fn make_provider_from_proxies(
-            name: &str,
-            proxies: &[String],
-            interval: u64,
-            lazy: bool,
-            handlers: &HashMap<String, AnyOutboundHandler>,
-            proxy_manager: ProxyManager,
-            provider_registry: &mut HashMap<String, ArcProxyProvider>,
-        ) -> Result<ArcProxyProvider, Error> {
-            if name == PROXY_DIRECT || name == PROXY_REJECT {
-                return Err(Error::InvalidConfig(format!(
-                    "proxy group name `{name}` is reserved"
-                )));
-            }
-            let proxies = proxies
-                .iter()
-                .map(|x| {
-                    handlers
-                        .get(x)
-                        .ok_or_else(|| {
-                            Error::InvalidConfig(format!("proxy {x} not found"))
-                        })
-                        .cloned()
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-
-            let hc = HealthCheck::new(
-                proxies.clone(),
-                DEFAULT_LATENCY_TEST_URL.to_owned(),
-                interval,
-                lazy,
-                proxy_manager,
-            );
-
-            let pd: ArcProxyProvider = Arc::new(
-                PlainProvider::new(name.to_owned(), proxies, hc).map_err(|x| {
-                    Error::InvalidConfig(format!("invalid provider config: {x}"))
-                })?,
-            );
-
-            provider_registry.insert(name.to_owned(), pd.clone());
-
-            Ok(pd)
-        }
-
         // Initialize handlers for each outbound group protocol
         for outbound_group in outbound_groups.iter() {
             match outbound_group {
                 OutboundGroupProtocol::Relay(proto) => {
-                    let providers = build_group_providers(
+                    let providers = Self::build_group_providers(
                         outbound_group,
                         0,
                         true,
@@ -731,7 +797,7 @@ impl OutboundManager {
                     );
                 }
                 OutboundGroupProtocol::UrlTest(proto) => {
-                    let providers = build_group_providers(
+                    let providers = Self::build_group_providers(
                         outbound_group,
                         proto.interval,
                         proto.lazy.unwrap_or_default(),
@@ -766,7 +832,7 @@ impl OutboundManager {
                     handlers.insert(proto.name.clone(), Arc::new(url_test));
                 }
                 OutboundGroupProtocol::Fallback(proto) => {
-                    let providers = build_group_providers(
+                    let providers = Self::build_group_providers(
                         outbound_group,
                         proto.interval,
                         proto.lazy.unwrap_or_default(),
@@ -801,7 +867,7 @@ impl OutboundManager {
                     );
                 }
                 OutboundGroupProtocol::LoadBalance(proto) => {
-                    let providers = build_group_providers(
+                    let providers = Self::build_group_providers(
                         outbound_group,
                         proto.interval,
                         proto.lazy.unwrap_or_default(),
@@ -836,7 +902,7 @@ impl OutboundManager {
                     );
                 }
                 OutboundGroupProtocol::Select(proto) => {
-                    let providers = build_group_providers(
+                    let providers = Self::build_group_providers(
                         outbound_group,
                         0,
                         true,
@@ -875,7 +941,7 @@ impl OutboundManager {
                     selector_control.insert(proto.name.clone(), Arc::new(selector));
                 }
                 OutboundGroupProtocol::Smart(proto) => {
-                    let providers = build_group_providers(
+                    let providers = Self::build_group_providers(
                         outbound_group,
                         0,
                         proto.lazy.unwrap_or_default(),
@@ -1032,9 +1098,12 @@ impl OutboundManager {
 #[allow(unused_imports)]
 mod tests {
     use super::*;
+    use crate::app::remote_content_manager::ProxyManager;
     use crate::config::internal::proxy::{
-        CommonConfigOptions, OutboundProxyProtocol, OutboundShadowsocks,
+        CommonConfigOptions, OutboundGroupProtocol, OutboundProxyProtocol,
+        OutboundShadowsocks,
     };
+    use crate::proxy::utils::test_utils::noop::NoopResolver;
 
     #[test]
     #[cfg(feature = "shadowsocks")]
@@ -1085,5 +1154,121 @@ mod tests {
 
         assert!(handler_map.contains_key("ss1"));
         assert!(handler_map.contains_key("ss2"));
+    }
+
+    #[test]
+    fn test_group_filter_and_empty_fallback() {
+        let yaml = r#"
+name: "HK-Group"
+type: select
+filter: "HK.*"
+empty-fallback: "REJECT"
+include-all: true
+"#;
+        let group: OutboundGroupProtocol = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(group.filter(), Some("HK.*"));
+        assert_eq!(group.empty_fallback(), Some("REJECT"));
+
+        let hk_node: AnyOutboundHandler = Arc::new(direct::Handler::new("HK 01"));
+        let us_node: AnyOutboundHandler = Arc::new(direct::Handler::new("US 01"));
+        let reject_node: AnyOutboundHandler = Arc::new(reject::Handler::new(PROXY_REJECT));
+
+        let mut handlers = HashMap::new();
+        handlers.insert("HK 01".to_string(), hk_node);
+        handlers.insert("US 01".to_string(), us_node);
+        handlers.insert(PROXY_REJECT.to_string(), reject_node);
+
+        let proxy_names = vec!["HK 01".to_string(), "US 01".to_string()];
+        let proxy_manager = ProxyManager::new(Arc::new(NoopResolver), None);
+        let mut provider_registry = HashMap::new();
+
+        let providers = OutboundManager::build_group_providers(
+            &group,
+            0,
+            false,
+            &handlers,
+            &proxy_names,
+            &proxy_manager,
+            &mut provider_registry,
+        )
+        .unwrap();
+
+        assert_eq!(providers.len(), 1);
+        let proxies = providers[0].proxies();
+        assert_eq!(proxies.len(), 1);
+        assert_eq!(proxies[0].name(), "HK 01");
+    }
+
+    #[test]
+    fn test_group_empty_fallback_when_no_match() {
+        let yaml = r#"
+name: "SG-Group"
+type: select
+filter: "SG.*"
+empty-fallback: "REJECT"
+include-all: true
+"#;
+        let group: OutboundGroupProtocol = serde_yaml::from_str(yaml).unwrap();
+
+        let us_node: AnyOutboundHandler = Arc::new(direct::Handler::new("US 01"));
+        let reject_node: AnyOutboundHandler = Arc::new(reject::Handler::new(PROXY_REJECT));
+
+        let mut handlers = HashMap::new();
+        handlers.insert("US 01".to_string(), us_node);
+        handlers.insert(PROXY_REJECT.to_string(), reject_node);
+
+        let proxy_names = vec!["US 01".to_string()];
+        let proxy_manager = ProxyManager::new(Arc::new(NoopResolver), None);
+        let mut provider_registry = HashMap::new();
+
+        let providers = OutboundManager::build_group_providers(
+            &group,
+            0,
+            false,
+            &handlers,
+            &proxy_names,
+            &proxy_manager,
+            &mut provider_registry,
+        )
+        .unwrap();
+
+        assert_eq!(providers.len(), 1);
+        let proxies = providers[0].proxies();
+        assert_eq!(proxies.len(), 1);
+        assert_eq!(proxies[0].name(), PROXY_REJECT);
+    }
+
+    #[test]
+    fn test_group_empty_fallback_not_found_ignored() {
+        let yaml = r#"
+name: "SG-Group"
+type: select
+filter: "SG.*"
+empty-fallback: "NOT_FOUND_NODE"
+include-all: true
+"#;
+        let group: OutboundGroupProtocol = serde_yaml::from_str(yaml).unwrap();
+
+        let us_node: AnyOutboundHandler = Arc::new(direct::Handler::new("US 01"));
+        let mut handlers = HashMap::new();
+        handlers.insert("US 01".to_string(), us_node);
+
+        let proxy_names = vec!["US 01".to_string()];
+        let proxy_manager = ProxyManager::new(Arc::new(NoopResolver), None);
+        let mut provider_registry = HashMap::new();
+
+        let providers = OutboundManager::build_group_providers(
+            &group,
+            0,
+            false,
+            &handlers,
+            &proxy_names,
+            &proxy_manager,
+            &mut provider_registry,
+        )
+        .unwrap();
+
+        // Since fallback node does not exist, providers remains empty (warn log is issued)
+        assert!(providers.is_empty());
     }
 }
