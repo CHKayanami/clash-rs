@@ -429,7 +429,7 @@ pub enum Type {
     Socks5,
     #[cfg(feature = "tun")]
     Tun,
-    #[cfg(feature = "ebpf")]
+    #[cfg(all(target_os = "linux", feature = "ebpf"))]
     Ebpf,
     #[cfg(all(target_os = "linux", feature = "tproxy"))]
     Tproxy,

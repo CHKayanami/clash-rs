@@ -60,11 +60,11 @@ pub(crate) fn resolve_so_mark(so_mark: Option<u32>) -> Option<u32> {
     {
         return Some(mark);
     }
-    #[cfg(feature = "ebpf")]
+    #[cfg(all(target_os = "linux", feature = "ebpf"))]
     {
         return Some(clash_ebpf::DAE_BYPASS_MARK);
     }
-    #[cfg(not(feature = "ebpf"))]
+    #[cfg(not(all(target_os = "linux", feature = "ebpf")))]
     {
         None
     }

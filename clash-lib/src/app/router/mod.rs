@@ -107,10 +107,16 @@ impl Router {
 
     /// Quick check if a domain routes to DIRECT.
     pub async fn is_domain_direct(&self, domain: &str) -> bool {
+        self.is_domain_direct_with_ips(domain, &[]).await
+    }
+
+    /// Quick check if a domain routes to DIRECT, utilizing pre-resolved IPs to avoid redundant DNS lookups.
+    pub async fn is_domain_direct_with_ips(&self, domain: &str, ips: &[std::net::IpAddr]) -> bool {
         let mut sess = Session {
             id: 0,
             typ: crate::session::Type::RouteProbe,
             destination: crate::session::SocksAddr::Domain(domain.into(), 80),
+            resolved_ip: ips.first().copied(),
             ..Default::default()
         };
         let (outbound, _) = self.match_route(&mut sess).await;

@@ -1,11 +1,8 @@
-#[allow(unused_imports)]
 use tracing::{debug, warn};
 
-#[allow(unused_imports)]
 use crate::app::dns::ThreadSafeDNSResolver;
 
 /// Handle intercepted TCP DNS stream in eBPF transparent proxy.
-#[cfg(target_os = "linux")]
 pub async fn handle_tcp_dns(
     mut stream: tokio::net::TcpStream,
     resolver: ThreadSafeDNSResolver,

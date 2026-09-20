@@ -1,39 +1,25 @@
 use async_trait::async_trait;
-#[allow(unused_imports)]
 use std::net::IpAddr;
 use std::sync::Arc;
-#[allow(unused_imports)]
 use std::time::Duration;
-
-#[allow(unused_imports)]
+use tokio::sync::OnceCell;
 use tracing::{error, info, warn};
 
-#[allow(unused_imports)]
 use super::offloader::{DirectOffloader, RoutingAction};
-#[allow(unused_imports)]
 use super::utils::resolve_and_aggregate_ip_cidrs;
 use crate::app::dispatcher::Dispatcher;
 use crate::app::dns::ThreadSafeDNSResolver;
+use crate::app::remote_content_manager::providers::rule_provider::CidrTrie;
 use crate::config::def::EbpfConfig;
+use crate::proxy::datagram::{ChannelDatagram, UdpPacket};
 use crate::proxy::inbound::InboundHandlerTrait;
 
-#[cfg(target_os = "linux")]
-use crate::app::remote_content_manager::providers::rule_provider::CidrTrie;
-#[cfg(target_os = "linux")]
-use crate::proxy::datagram::{ChannelDatagram, UdpPacket};
-#[cfg(target_os = "linux")]
-use tokio::sync::OnceCell;
-
-#[allow(dead_code)]
 pub struct EbpfInbound {
     config: EbpfConfig,
     dispatcher: Arc<Dispatcher>,
     dns_resolver: ThreadSafeDNSResolver,
-    #[cfg(target_os = "linux")]
     manager: Arc<OnceCell<Arc<clash_ebpf::EbpfManager>>>,
-    #[cfg(target_os = "linux")]
     listener: Arc<OnceCell<Arc<clash_ebpf::EbpfListener>>>,
-    #[cfg(target_os = "linux")]
     offloader: Arc<OnceCell<DirectOffloader>>,
 }
 
@@ -47,39 +33,42 @@ impl EbpfInbound {
             config,
             dispatcher,
             dns_resolver,
-            #[cfg(target_os = "linux")]
             manager: Arc::new(OnceCell::new()),
-            #[cfg(target_os = "linux")]
             listener: Arc::new(OnceCell::new()),
-            #[cfg(target_os = "linux")]
             offloader: Arc::new(OnceCell::new()),
         }
     }
 
-    #[cfg(target_os = "linux")]
     async fn get_or_init_offloader(&self) -> DirectOffloader {
         self.offloader
             .get_or_init(|| async {
                 let rule_providers = self.dispatcher.router().get_rule_providers();
                 let bypass_dst_ips =
                     resolve_and_aggregate_ip_cidrs(&self.config.target.bypass_dst_ips, rule_providers);
+                let proxy_dst_ips =
+                    resolve_and_aggregate_ip_cidrs(&self.config.target.proxy_dst_ips, rule_providers);
 
-                let mut trie = CidrTrie::new();
+                let mut bypass_trie = CidrTrie::new();
                 for ip in bypass_dst_ips.iter() {
-                    trie.insert(ip);
+                    bypass_trie.insert(ip);
+                }
+
+                let mut proxy_trie = CidrTrie::new();
+                for ip in proxy_dst_ips.iter() {
+                    proxy_trie.insert(ip);
                 }
 
                 DirectOffloader::new(
                     self.manager.clone(),
                     self.dns_resolver.clone(),
-                    Arc::new(trie),
+                    Arc::new(bypass_trie),
+                    Arc::new(proxy_trie),
                 )
             })
             .await
             .clone()
     }
 
-    #[cfg(target_os = "linux")]
     async fn get_or_init_listener(&self) -> std::io::Result<Arc<clash_ebpf::EbpfListener>> {
         self.listener
             .get_or_try_init(|| async {
@@ -151,39 +140,33 @@ impl EbpfInbound {
     }
 
     pub async fn init(&self) -> std::io::Result<()> {
-        #[cfg(target_os = "linux")]
-        {
-            let _ = self.get_or_init_listener().await?;
-            if self.config.auto_direct_offload {
-                let offloader = self.get_or_init_offloader().await;
-                let router = self.dispatcher.router().clone();
-                let hook = Arc::new(move |domain: &str, ips: &[IpAddr], ttl: Duration| {
-                    let offloader = offloader.clone();
-                    let router = router.clone();
-                    let domain: Arc<str> = Arc::from(domain);
-                    let ips = ips.to_vec();
-                    tokio::spawn(async move {
-                        let is_direct = router.is_domain_direct(&domain).await;
-                        let action = if is_direct {
-                            RoutingAction::Direct
-                        } else {
-                            RoutingAction::Proxy
-                        };
-                        offloader.observe(domain, ips, action, ttl).await;
-                    });
+        let _ = self.get_or_init_listener().await?;
+        if self.config.auto_direct_offload {
+            let offloader = self.get_or_init_offloader().await;
+            let router = self.dispatcher.router().clone();
+            let hook = Arc::new(move |domain: &str, ips: &[IpAddr], ttl: Duration| {
+                let offloader = offloader.clone();
+                let router = router.clone();
+                let domain: Arc<str> = Arc::from(domain);
+                let ips = ips.to_vec();
+                tokio::spawn(async move {
+                    let is_direct = router.is_domain_direct_with_ips(&domain, &ips).await;
+                    let action = if is_direct {
+                        RoutingAction::Direct
+                    } else {
+                        RoutingAction::Proxy
+                    };
+                    offloader.observe(domain, ips, action, ttl).await;
                 });
-                self.dns_resolver.register_resolution_hook(hook);
-            }
+            });
+            self.dns_resolver.register_resolution_hook(hook);
         }
         Ok(())
     }
 
     pub async fn stop(&self) {
-        #[cfg(target_os = "linux")]
-        {
-            if let Some(mgr) = self.manager.get() {
-                mgr.stop().await;
-            }
+        if let Some(mgr) = self.manager.get() {
+            mgr.stop().await;
         }
     }
 }
@@ -199,88 +182,70 @@ impl InboundHandlerTrait for EbpfInbound {
     }
 
     async fn listen_tcp(&self) -> std::io::Result<()> {
-        #[cfg(not(target_os = "linux"))]
-        {
-            warn!("eBPF inbound is only supported on Linux");
-            futures::future::pending::<()>().await;
-            Ok(())
-        }
+        use super::dns::handle_tcp_dns;
+        use crate::session::{Network, Session, Type};
 
-        #[cfg(target_os = "linux")]
-        {
-            use super::dns::handle_tcp_dns;
-            use crate::session::{Network, Session, Type};
+        let listener = self.get_or_init_listener().await?;
+        info!("clash-ebpf TCP inbound worker running");
 
-            let listener = self.get_or_init_listener().await?;
-            info!("clash-ebpf TCP inbound worker running");
+        loop {
+            match listener.accept_tcp().await {
+                Ok((stream, session_info)) => {
+                    let dst = session_info.destination;
 
-            loop {
-                match listener.accept_tcp().await {
-                    Ok((stream, session_info)) => {
-                        let dst = session_info.destination;
-
-                        // 1. Intercept TCP port 53 (DNS-over-TCP)
-                        if dst.port() == 53 {
-                            let resolver = self.dns_resolver.clone();
-                            tokio::spawn(async move {
-                                handle_tcp_dns(stream, resolver).await;
-                            });
-                            continue;
-                        }
-
-                        // 2. Regular TCP proxy stream
-                        info!("[eBPF TCP] Intercepted: {} -> {}", session_info.source, dst);
-                        let session = Session {
-                            network: Network::Tcp,
-                            typ: Type::Ebpf,
-                            source: session_info.source,
-                            destination: dst.into(),
-                            so_mark: Some(clash_ebpf::DAE_BYPASS_MARK),
-                            ..Default::default()
-                        };
-
-                        let dispatcher = self.dispatcher.clone();
+                    // 1. Intercept TCP port 53 (DNS-over-TCP)
+                    if dst.port() == 53 {
+                        let resolver = self.dns_resolver.clone();
                         tokio::spawn(async move {
-                            dispatcher.dispatch_stream(session, Box::new(stream)).await;
+                            handle_tcp_dns(stream, resolver).await;
                         });
+                        continue;
                     }
-                    Err(err) => {
-                        error!("eBPF TCP accept error: {err}");
-                        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-                    }
+
+                    // 2. Regular TCP proxy stream
+                    info!("[eBPF TCP] Intercepted: {} -> {}", session_info.source, dst);
+                    let session = Session {
+                        network: Network::Tcp,
+                        typ: Type::Ebpf,
+                        source: session_info.source,
+                        destination: dst.into(),
+                        so_mark: Some(clash_ebpf::DAE_BYPASS_MARK),
+                        ..Default::default()
+                    };
+
+                    let dispatcher = self.dispatcher.clone();
+                    tokio::spawn(async move {
+                        dispatcher.dispatch_stream(session, Box::new(stream)).await;
+                    });
+                }
+                Err(err) => {
+                    error!("eBPF TCP accept error: {err}");
+                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
                 }
             }
         }
     }
 
     async fn listen_udp(&self) -> std::io::Result<()> {
-        #[cfg(not(target_os = "linux"))]
-        {
-            futures::future::pending::<()>().await;
-            Ok(())
-        }
+        use crate::session::{Network, Session, Type};
 
-        #[cfg(target_os = "linux")]
-        {
-            use crate::session::{Network, Session, Type};
+        let listener = self.get_or_init_listener().await?;
+        info!("clash-ebpf UDP inbound worker running");
 
-            let listener = self.get_or_init_listener().await?;
-            info!("clash-ebpf UDP inbound worker running");
+        const UDP_CHANNEL_CAPACITY: usize = 1024;
+        let (l_tx, mut l_rx) = tokio::sync::mpsc::channel::<UdpPacket>(UDP_CHANNEL_CAPACITY);
+        let (d_tx, d_rx) = tokio::sync::mpsc::channel::<UdpPacket>(UDP_CHANNEL_CAPACITY);
 
-            const UDP_CHANNEL_CAPACITY: usize = 1024;
-            let (l_tx, mut l_rx) = tokio::sync::mpsc::channel::<UdpPacket>(UDP_CHANNEL_CAPACITY);
-            let (d_tx, d_rx) = tokio::sync::mpsc::channel::<UdpPacket>(UDP_CHANNEL_CAPACITY);
+        let udp_stream = ChannelDatagram::new(l_tx, d_rx);
 
-            let udp_stream = ChannelDatagram::new(l_tx, d_rx);
-
-            let default_outbound = crate::app::net::DEFAULT_OUTBOUND_INTERFACE.read().await;
-            let sess = Session {
-                network: Network::Udp,
-                typ: Type::Ebpf,
-                iface: default_outbound.clone(),
-                so_mark: Some(clash_ebpf::DAE_BYPASS_MARK),
-                ..Default::default()
-            };
+        let default_outbound = crate::app::net::DEFAULT_OUTBOUND_INTERFACE.read().await;
+        let sess = Session {
+            network: Network::Udp,
+            typ: Type::Ebpf,
+            iface: default_outbound.clone(),
+            so_mark: Some(clash_ebpf::DAE_BYPASS_MARK),
+            ..Default::default()
+        };
 
             let _closer = self
                 .dispatcher
@@ -391,9 +356,7 @@ impl InboundHandlerTrait for EbpfInbound {
             Ok(())
         }
     }
-}
 
-#[cfg(target_os = "linux")]
 async fn udp_listener_loop(
     socket: Arc<tokio::net::UdpSocket>,
     family: &'static str,

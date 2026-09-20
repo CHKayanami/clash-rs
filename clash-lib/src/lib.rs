@@ -532,7 +532,7 @@ struct RuntimeComponents {
 
     #[cfg(feature = "tun")]
     tun_runner: ArcRunner,
-    #[cfg(feature = "ebpf")]
+    #[cfg(all(target_os = "linux", feature = "ebpf"))]
     ebpf_runner: ArcRunner,
     dns_listener: ArcRunner,
     inbound_manager: Arc<InboundManager>,
@@ -551,7 +551,7 @@ impl RuntimeComponents {
     fn start_all(&self) {
         #[cfg(feature = "tun")]
         self.tun_runner.run_async();
-        #[cfg(feature = "ebpf")]
+        #[cfg(all(target_os = "linux", feature = "ebpf"))]
         self.ebpf_runner.run_async();
         self.dns_listener.run_async();
         self.inbound_manager.run_async();
@@ -560,7 +560,7 @@ impl RuntimeComponents {
     fn stop_all(&self) {
         #[cfg(feature = "tun")]
         self.tun_runner.shutdown();
-        #[cfg(feature = "ebpf")]
+        #[cfg(all(target_os = "linux", feature = "ebpf"))]
         self.ebpf_runner.shutdown();
         self.dns_listener.shutdown();
         self.inbound_manager.shutdown();
@@ -595,7 +595,7 @@ async fn create_components(
         }
     }
 
-    #[cfg(feature = "ebpf")]
+    #[cfg(all(target_os = "linux", feature = "ebpf"))]
     if let Some(ebpf_cfg) = &config.ebpf
         && ebpf_cfg.enable
     {
@@ -906,9 +906,9 @@ async fn create_components(
         Some(cancellation_token.child_token()),
     )?);
 
-    #[cfg(feature = "ebpf")]
+    #[cfg(all(target_os = "linux", feature = "ebpf"))]
     debug!("initializing ebpf runner");
-    #[cfg(feature = "ebpf")]
+    #[cfg(all(target_os = "linux", feature = "ebpf"))]
     let ebpf_runner: ArcRunner = Arc::new(proxy::ebpf::EbpfRunner::new(
         config.ebpf.unwrap_or_default(),
         dispatcher.clone(),
@@ -936,7 +936,7 @@ async fn create_components(
         inbound_manager,
         #[cfg(feature = "tun")]
         tun_runner,
-        #[cfg(feature = "ebpf")]
+        #[cfg(all(target_os = "linux", feature = "ebpf"))]
         ebpf_runner,
         dns_listener,
         dns_listen,

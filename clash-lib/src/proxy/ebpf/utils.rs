@@ -1,102 +1,9 @@
-#[allow(unused_imports)]
-use std::sync::Arc;
+use std::collections::HashMap;
 use tracing::warn;
 
-#[allow(unused_imports)]
-use crate::app::remote_content_manager::providers::rule_provider::CidrTrie;
-
-/// A lightweight, memory-efficient two-generation rotating Bloom filter for IP deduplication.
-/// Total memory is fixed at ~4KB (2 generations of 2048 bytes / 16384 bits each), with zero GC/heap churn.
-#[allow(dead_code)]
-#[derive(Clone)]
-pub struct RotatingBloomFilter {
-    curr: [u64; 256],
-    prev: [u64; 256],
-    last_rotation: std::time::Instant,
-    interval: std::time::Duration,
-}
-
-#[allow(dead_code)]
-impl RotatingBloomFilter {
-    pub fn new(interval: std::time::Duration) -> Self {
-        Self {
-            curr: [0; 256],
-            prev: [0; 256],
-            last_rotation: std::time::Instant::now(),
-            interval,
-        }
-    }
-
-    fn maybe_rotate(&mut self) {
-        if self.last_rotation.elapsed() >= self.interval {
-            self.prev = self.curr;
-            self.curr = [0; 256];
-            self.last_rotation = std::time::Instant::now();
-        }
-    }
-
-    /// Computes 4 bit positions using Kirsch-Mitzenmacher dual hashing.
-    fn hash_indexes(ip: &std::net::IpAddr) -> [usize; 4] {
-        let (h1, h2) = match ip {
-            std::net::IpAddr::V4(v4) => {
-                let u = u32::from_ne_bytes(v4.octets()) as u64;
-                let h1 = u.wrapping_mul(0x9E3779B97F4A7C15);
-                let h2 = (u ^ 0x85EBCA6B).wrapping_mul(0xC2B2AE35);
-                (h1, h2)
-            }
-            std::net::IpAddr::V6(v6) => {
-                let bytes = v6.octets();
-                let lo = u64::from_ne_bytes(bytes[0..8].try_into().unwrap());
-                let hi = u64::from_ne_bytes(bytes[8..16].try_into().unwrap());
-                let h1 = lo.wrapping_mul(0x9E3779B97F4A7C15) ^ hi;
-                let h2 = hi.wrapping_mul(0xC2B2AE35) ^ lo;
-                (h1, h2)
-            }
-        };
-
-        const NUM_BITS: u64 = 256 * 64; // 16384 bits
-        [
-            (h1 % NUM_BITS) as usize,
-            (h1.wrapping_add(h2) % NUM_BITS) as usize,
-            (h1.wrapping_add(h2.wrapping_mul(2)) % NUM_BITS) as usize,
-            (h1.wrapping_add(h2.wrapping_mul(3)) % NUM_BITS) as usize,
-        ]
-    }
-
-    /// Checks if `ip` was recently recorded. If not, records it in the current generation.
-    /// Returns `true` if `ip` was already present (or likely present), `false` if it was newly inserted.
-    pub fn check_and_insert(&mut self, ip: std::net::IpAddr) -> bool {
-        self.maybe_rotate();
-        let idxs = Self::hash_indexes(&ip);
-
-        let in_curr = idxs.iter().all(|&idx| {
-            let word = idx / 64;
-            let bit = idx % 64;
-            (self.curr[word] & (1 << bit)) != 0
-        });
-
-        let in_prev = idxs.iter().all(|&idx| {
-            let word = idx / 64;
-            let bit = idx % 64;
-            (self.prev[word] & (1 << bit)) != 0
-        });
-
-        if in_curr || in_prev {
-            return true;
-        }
-
-        for &idx in &idxs {
-            let word = idx / 64;
-            let bit = idx % 64;
-            self.curr[word] |= 1 << bit;
-        }
-
-        false
-    }
-}
+use crate::app::router::ThreadSafeRuleProvider;
 
 /// Check if an IP is in the standard reserved/loopback/broadcast range.
-#[allow(dead_code)]
 pub fn is_reserved_ip(ip: std::net::IpAddr) -> bool {
     match ip {
         std::net::IpAddr::V4(v4) => {
@@ -114,10 +21,9 @@ pub fn is_reserved_ip(ip: std::net::IpAddr) -> bool {
 
 /// Resolves raw IP/CIDR strings and `rule-set:` / `ruleset:` references against rule providers,
 /// then performs deduplication and aggregation (merging subnets) using ipnet.
-#[allow(dead_code)]
 pub fn resolve_and_aggregate_ip_cidrs(
     entries: &[String],
-    rule_providers: &std::collections::HashMap<String, crate::app::router::ThreadSafeRuleProvider>,
+    rule_providers: &HashMap<String, ThreadSafeRuleProvider>,
 ) -> Vec<String> {
     use std::str::FromStr;
 
@@ -205,8 +111,9 @@ pub fn resolve_and_aggregate_ip_cidrs(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
     use crate::app::remote_content_manager::providers::{
-        rule_provider::{RuleProviderImpl, RuleSetBehavior, RuleSetFormat},
+        rule_provider::{CidrTrie, RuleProviderImpl, RuleSetBehavior, RuleSetFormat},
         Provider,
     };
     use std::collections::HashMap;
@@ -285,39 +192,5 @@ mod tests {
         assert!(trie.contains(ip_in_3));
         assert!(!trie.contains(ip_out_1));
         assert!(!trie.contains(ip_out_2));
-    }
-
-    #[test]
-    fn test_rotating_bloom_filter() {
-        let mut bf = RotatingBloomFilter::new(std::time::Duration::from_millis(50));
-        let ip1: std::net::IpAddr = "1.2.3.4".parse().unwrap();
-        let ip2: std::net::IpAddr = "5.6.7.8".parse().unwrap();
-        let ip3: std::net::IpAddr = "2001:db8::1".parse().unwrap();
-
-        assert!(!bf.check_and_insert(ip1));
-        assert!(bf.check_and_insert(ip1));
-        assert!(!bf.check_and_insert(ip2));
-        assert!(bf.check_and_insert(ip2));
-        assert!(!bf.check_and_insert(ip3));
-
-        std::thread::sleep(std::time::Duration::from_millis(60));
-
-        assert!(bf.check_and_insert(ip1));
-        assert!(bf.check_and_insert(ip2));
-        assert!(bf.check_and_insert(ip3));
-
-        let ip4: std::net::IpAddr = "9.10.11.12".parse().unwrap();
-        assert!(!bf.check_and_insert(ip4));
-
-        std::thread::sleep(std::time::Duration::from_millis(60));
-
-        assert!(bf.check_and_insert(ip4));
-
-        std::thread::sleep(std::time::Duration::from_millis(60));
-        bf.maybe_rotate();
-        std::thread::sleep(std::time::Duration::from_millis(60));
-        bf.maybe_rotate();
-
-        assert!(!bf.check_and_insert(ip1));
     }
 }
