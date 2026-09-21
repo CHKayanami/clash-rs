@@ -1,13 +1,14 @@
-use crate::app::dispatcher::Dispatcher;
-use crate::app::dns::ThreadSafeDNSResolver;
-use crate::config::def::EbpfConfig;
-use crate::proxy::ebpf::EbpfInbound;
-use crate::proxy::inbound::InboundHandlerTrait;
-use crate::runner::Runner;
-use futures::future::BoxFuture;
+use async_trait::async_trait;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
+
+use crate::{
+    app::{dispatcher::Dispatcher, dns::ThreadSafeDNSResolver},
+    config::def::EbpfConfig,
+    proxy::{ebpf::EbpfInbound, inbound::InboundHandlerTrait},
+    runner::{AsyncService, ServiceContext},
+};
 
 pub struct EbpfRunner {
     cfg: EbpfConfig,
@@ -30,13 +31,18 @@ impl EbpfRunner {
             cancellation_token: cancellation_token.unwrap_or_default(),
         }
     }
+
+    pub fn shutdown(&self) {
+        self.cancellation_token.cancel();
+    }
 }
 
-impl Runner for EbpfRunner {
-    fn run_async(&self) {
+#[async_trait]
+impl AsyncService for EbpfRunner {
+    async fn start(&self, ctx: &ServiceContext) -> Result<(), crate::Error> {
         if !self.cfg.enable {
             info!("ebpf is disabled, skipping");
-            return;
+            return Ok(());
         }
 
         let inbound = Arc::new(EbpfInbound::new(
@@ -45,14 +51,14 @@ impl Runner for EbpfRunner {
             self.dns_resolver.clone(),
         ));
         let cancel = self.cancellation_token.clone();
+        let lifecycle_token = cancel.clone();
 
-        tokio::spawn(async move {
-            info!("starting eBPF inbound runner");
-            if let Err(err) = inbound.init().await {
-                error!("failed to initialize eBPF inbound: {err}");
-                return;
-            }
+        info!("starting eBPF inbound runner");
+        inbound.init().await.map_err(|e| {
+            crate::Error::Operation(format!("failed to init ebpf inbound: {e}"))
+        })?;
 
+        ctx.spawn_critical_with_token("ebpf_inbound", lifecycle_token, async move {
             let inbound_tcp = inbound.clone();
             let mut tcp_task = tokio::spawn(async move {
                 if let Err(err) = inbound_tcp.listen_tcp().await {
@@ -77,16 +83,13 @@ impl Runner for EbpfRunner {
                 _ = &mut tcp_task => {}
                 _ = &mut udp_task => {}
             }
-
         });
 
+        Ok(())
     }
 
-    fn shutdown(&self) {
-        self.cancellation_token.cancel();
-    }
-
-    fn join(&self) -> BoxFuture<'_, Result<(), crate::Error>> {
-        Box::pin(async move { Ok(()) })
+    async fn stop(&self) -> Result<(), crate::Error> {
+        self.shutdown();
+        Ok(())
     }
 }

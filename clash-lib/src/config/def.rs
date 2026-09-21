@@ -1105,7 +1105,7 @@ pub struct EdnsClientSubnet {
     pub ipv6: Option<String>,
 }
 
-#[derive(Serialize, Deserialize, Default)]
+#[derive(Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
 pub struct Experimental {
     /// buffer size for tcp stream bidirectional copy
@@ -2312,4 +2312,3 @@ proxies:
         assert_eq!(proxies[0].name(), "socks-node");
     }
 }
-

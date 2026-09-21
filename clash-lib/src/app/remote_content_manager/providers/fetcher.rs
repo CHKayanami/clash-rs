@@ -37,6 +37,7 @@ pub struct Fetcher<U, P> {
     inner: Arc<RwLock<Inner>>,
     parser: Arc<P>,
     pub on_update: Option<Arc<U>>,
+    cancellation_token: tokio_util::sync::CancellationToken,
 }
 
 impl<T, U, P> Fetcher<U, P>
@@ -63,7 +64,8 @@ where
                 thread_handle: None,
             })),
             parser: Arc::new(parser),
-            on_update: on_update.map(|f| Arc::new(f)),
+            on_update: on_update.map(Arc::new),
+            cancellation_token: tokio_util::sync::CancellationToken::new(),
         }
     }
 
@@ -196,6 +198,13 @@ where
         }
     }
 
+    pub async fn stop(&self) {
+        self.cancellation_token.cancel();
+        if let Some(handle) = self.inner.write().await.thread_handle.take() {
+            handle.abort();
+        }
+    }
+
     async fn pull_loop(
         &self,
         immediately_update: bool,
@@ -207,9 +216,14 @@ where
         let on_update = self.on_update.clone();
         let name = self.name.clone();
         let fire_immediately = immediately_update;
+        let cancel = self.cancellation_token.clone();
 
         let thread_handle = Some(tokio::spawn(async move {
             loop {
+                if cancel.is_cancelled() {
+                    break;
+                }
+
                 let Some(inner) = weak_inner.upgrade() else {
                     break;
                 };
@@ -244,15 +258,25 @@ where
 
                 if fire_immediately {
                     update().await;
-                    ticker.tick().await;
+                    tokio::select! {
+                        _ = cancel.cancelled() => break,
+                        _ = ticker.tick() => {}
+                    }
                 } else {
-                    ticker.tick().await;
+                    tokio::select! {
+                        _ = cancel.cancelled() => break,
+                        _ = ticker.tick() => {}
+                    }
                     update().await;
                 }
             }
         }));
 
-        self.inner.write().await.thread_handle = thread_handle;
+        let mut inner_guard = self.inner.write().await;
+        if let Some(old_handle) = inner_guard.thread_handle.take() {
+            old_handle.abort();
+        }
+        inner_guard.thread_handle = thread_handle;
     }
 }
 

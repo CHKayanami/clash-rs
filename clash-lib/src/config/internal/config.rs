@@ -28,6 +28,7 @@ use super::{
     proxy::OutboundProxyProviderDef,
 };
 
+#[derive(Clone)]
 pub struct Config {
     pub general: General,
     pub dns: dns::Config,
@@ -89,6 +90,7 @@ impl Config {
     }
 }
 
+#[derive(Clone)]
 pub struct General {
     pub authentication: Vec<String>,
     pub bind_address: BindAddress,
@@ -107,6 +109,7 @@ pub struct General {
     pub geosite_download_url: Option<String>,
 }
 
+#[derive(Clone)]
 pub struct Profile {
     pub store_selected: bool,
     pub store_smart_stats: bool,
@@ -376,7 +379,7 @@ pub struct Controller {
     pub cors_allow_origins: Option<Vec<String>>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 #[serde(rename_all = "kebab-case")]
 pub enum RuleProviderDef {
@@ -385,7 +388,7 @@ pub enum RuleProviderDef {
     Inline(InlineRuleProvider),
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct HttpRuleProvider {
     pub url: String,
     pub interval: u64,
@@ -403,7 +406,7 @@ pub struct HttpRuleProvider {
     pub header: Option<HashMap<String, Vec<String>>>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct FileRuleProvider {
     pub path: String,
     pub interval: Option<u64>,
@@ -413,7 +416,7 @@ pub struct FileRuleProvider {
     pub inline_rules: Option<Vec<String>>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct InlineRuleProvider {
     pub path: String,
     pub behavior: RuleSetBehavior,

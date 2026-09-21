@@ -4,6 +4,7 @@ use tokio::sync::broadcast::Sender;
 
 use super::{dispatcher::StatisticsManager, logging::LogEvent};
 
+pub mod context;
 #[cfg(feature = "dashboard")]
 mod embedded_dashboard;
 mod handlers;
@@ -14,6 +15,7 @@ pub mod stream_samplers;
 mod tcp;
 mod websocket;
 
+pub use context::RuntimeContext;
 pub use runner::ApiRunner;
 pub use stream_samplers::StreamSamplers;
 
@@ -22,4 +24,3 @@ pub struct AppState {
     pub statistics_manager: Arc<StatisticsManager>,
     pub samplers: Arc<StreamSamplers>,
 }
-

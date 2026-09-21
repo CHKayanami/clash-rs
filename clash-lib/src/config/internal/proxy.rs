@@ -18,6 +18,7 @@ pub const PROXY_REJECT: &str = "REJECT";
 pub const PROXY_GLOBAL: &str = "GLOBAL";
 
 #[allow(clippy::large_enum_variant)]
+#[derive(Clone)]
 pub enum OutboundProxy {
     ProxyServer(OutboundProxyProtocol),
     ProxyGroup(OutboundGroupProtocol),
@@ -50,7 +51,7 @@ pub fn map_serde_error(
     }
 }
 
-#[derive(serde::Serialize, serde::Deserialize, Debug)]
+#[derive(Clone, serde::Serialize, serde::Deserialize, Debug)]
 #[serde(tag = "type")]
 pub enum OutboundProxyProtocol {
     #[serde(rename = "direct")]
@@ -226,19 +227,19 @@ pub struct CommonConfigOptions {
     pub connect_via: Option<String>,
 }
 
-#[derive(serde::Serialize, serde::Deserialize, Debug, Default)]
+#[derive(Clone, serde::Serialize, serde::Deserialize, Debug, Default)]
 #[serde(rename_all = "kebab-case")]
 pub struct OutboundDirect {
     pub name: String,
 }
 
-#[derive(serde::Serialize, serde::Deserialize, Debug, Default)]
+#[derive(Clone, serde::Serialize, serde::Deserialize, Debug, Default)]
 #[serde(rename_all = "kebab-case")]
 pub struct OutboundReject {
     pub name: String,
 }
 
-#[derive(serde::Serialize, serde::Deserialize, Debug, Default)]
+#[derive(Clone, serde::Serialize, serde::Deserialize, Debug, Default)]
 #[serde(rename_all = "kebab-case")]
 pub struct OutboundShadowsocks {
     #[serde(flatten)]
@@ -255,7 +256,7 @@ pub struct OutboundShadowsocks {
     pub smux: Option<crate::proxy::transport::mux::MuxOption>,
 }
 
-#[derive(serde::Serialize, serde::Deserialize, Debug, Default)]
+#[derive(Clone, serde::Serialize, serde::Deserialize, Debug, Default)]
 #[serde(rename_all = "kebab-case")]
 pub struct OutboundSocks5 {
     #[serde(flatten)]
@@ -273,7 +274,7 @@ pub struct OutboundSocks5 {
     pub smux: Option<crate::proxy::transport::mux::MuxOption>,
 }
 
-#[derive(serde::Serialize, serde::Deserialize, Debug, Default)]
+#[derive(Clone, serde::Serialize, serde::Deserialize, Debug, Default)]
 #[serde(rename_all = "kebab-case")]
 pub struct WsOpt {
     pub path: Option<String>,
@@ -291,13 +292,13 @@ pub struct HttpOpt {
     pub headers: Option<HashMap<String, Vec<String>>>,
 }
 
-#[derive(serde::Serialize, serde::Deserialize, Debug, Default)]
+#[derive(Clone, serde::Serialize, serde::Deserialize, Debug, Default)]
 pub struct H2Opt {
     pub host: Option<Vec<String>>,
     pub path: Option<String>,
 }
 
-#[derive(serde::Serialize, serde::Deserialize, Debug, Default)]
+#[derive(Clone, serde::Serialize, serde::Deserialize, Debug, Default)]
 #[serde(rename_all = "kebab-case")]
 pub struct GrpcOpt {
     pub grpc_service_name: Option<String>,
@@ -311,7 +312,7 @@ pub struct RealityOpt {
     pub short_id: Option<String>,
 }
 
-#[derive(serde::Serialize, serde::Deserialize, Debug, Default)]
+#[derive(Clone, serde::Serialize, serde::Deserialize, Debug, Default)]
 #[serde(rename_all = "kebab-case")]
 pub struct OutboundAnytls {
     #[serde(flatten)]
@@ -338,7 +339,7 @@ pub struct OutboundAnytls {
     pub tls_key: Option<String>,
 }
 
-#[derive(serde::Serialize, serde::Deserialize, Debug, Default)]
+#[derive(Clone, serde::Serialize, serde::Deserialize, Debug, Default)]
 #[serde(rename_all = "kebab-case")]
 pub struct OutboundTrojan {
     #[serde(flatten)]
@@ -363,7 +364,7 @@ pub struct OutboundTrojan {
     pub smux: Option<crate::proxy::transport::mux::MuxOption>,
 }
 
-#[derive(serde::Serialize, serde::Deserialize, Debug, Default)]
+#[derive(Clone, serde::Serialize, serde::Deserialize, Debug, Default)]
 #[serde(rename_all = "kebab-case")]
 pub struct OutboundVmess {
     #[serde(flatten)]
@@ -394,7 +395,7 @@ pub struct OutboundVmess {
     pub smux: Option<crate::proxy::transport::mux::MuxOption>,
 }
 
-#[derive(serde::Serialize, serde::Deserialize, Debug, Default)]
+#[derive(Clone, serde::Serialize, serde::Deserialize, Debug, Default)]
 #[serde(rename_all = "kebab-case")]
 pub struct OutboundVless {
     #[serde(flatten)]
@@ -444,13 +445,13 @@ pub struct OutboundWireguard {
 }
 
 #[cfg(feature = "onion")]
-#[derive(serde::Serialize, serde::Deserialize, Debug, Default)]
+#[derive(Clone, serde::Serialize, serde::Deserialize, Debug, Default)]
 #[serde(rename_all = "kebab-case")]
 pub struct OutboundTor {
     pub name: String,
 }
 
-#[derive(serde::Serialize, serde::Deserialize, Debug, Default)]
+#[derive(Clone, serde::Serialize, serde::Deserialize, Debug, Default)]
 #[serde(rename_all = "kebab-case")]
 pub struct OutboundTuic {
     #[serde(flatten)]
@@ -489,7 +490,7 @@ pub struct OutboundTuic {
 }
 
 #[cfg(feature = "shadowquic")]
-#[derive(serde::Serialize, serde::Deserialize, Debug, Default)]
+#[derive(Clone, serde::Serialize, serde::Deserialize, Debug, Default)]
 #[serde(rename_all = "kebab-case")]
 pub struct OutboundShadowQuic {
     #[serde(flatten)]
@@ -529,7 +530,7 @@ pub struct OutboundShadowQuic {
 }
 
 #[cfg(feature = "ssh")]
-#[derive(serde::Serialize, serde::Deserialize, Debug, Default)]
+#[derive(Clone, serde::Serialize, serde::Deserialize, Debug, Default)]
 #[serde(rename_all = "kebab-case")]
 pub struct OutboundSsh {
     #[serde(flatten)]
@@ -861,7 +862,7 @@ pub struct OutboundGroupSelect {
     pub empty_fallback: Option<String>,
 }
 
-#[derive(serde::Serialize, serde::Deserialize, Debug)]
+#[derive(Clone, serde::Serialize, serde::Deserialize, Debug)]
 #[serde(tag = "type")]
 #[serde(rename_all = "kebab-case")]
 pub enum OutboundProxyProviderDef {
@@ -899,7 +900,7 @@ pub struct OutboundHttpProvider {
     pub header: Option<HashMap<String, Vec<String>>>,
 }
 
-#[derive(serde::Serialize, serde::Deserialize, Debug)]
+#[derive(Clone, serde::Serialize, serde::Deserialize, Debug)]
 #[serde(rename_all = "kebab-case")]
 pub struct OutboundFileProvider {
     #[serde(skip)]
@@ -1191,4 +1192,3 @@ mod proxy_group_tests {
         }
     }
 }
-

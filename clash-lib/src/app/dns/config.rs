@@ -106,7 +106,7 @@ pub struct EdnsClientSubnet {
     pub ipv6: Option<Ipv6Net>,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct Config {
     pub enable: bool,
     pub ipv6: bool,

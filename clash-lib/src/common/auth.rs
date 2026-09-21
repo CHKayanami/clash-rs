@@ -8,6 +8,7 @@ pub trait Authenticator {
 
 pub type ThreadSafeAuthenticator = Arc<dyn Authenticator + Send + Sync>;
 
+#[derive(Clone)]
 pub struct User(String, String);
 
 impl User {

@@ -5,6 +5,7 @@ static COMPLEX_WILDCARD: &str = "+";
 static DOT_WILDCARD: &str = "";
 static WILDCARD: &str = "*";
 
+#[derive(Clone)]
 pub struct Node<T> {
     children: HashMap<String, Node<T>>,
     data: Option<Arc<T>>,
@@ -48,6 +49,7 @@ impl<T> Node<T> {
         &self.children
     }
 }
+#[derive(Clone)]
 pub struct StringTrie<T> {
     root: Node<T>,
 }

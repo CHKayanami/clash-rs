@@ -57,6 +57,13 @@ struct Inner {
     device_manager_handle: tokio::task::JoinHandle<()>,
 }
 
+impl Drop for Inner {
+    fn drop(&mut self) {
+        self.wg_handle.abort();
+        self.device_manager_handle.abort();
+    }
+}
+
 pub struct Handler {
     opts: HandlerOptions,
     inner: OnceCell<Inner>,
@@ -75,7 +82,10 @@ impl std::fmt::Debug for Handler {
 impl_default_connector!(Handler);
 
 impl Handler {
-    pub fn new(opts: HandlerOptions, connector: Option<Arc<dyn RemoteConnector>>) -> Self {
+    pub fn new(
+        opts: HandlerOptions,
+        connector: Option<Arc<dyn RemoteConnector>>,
+    ) -> Self {
         Self {
             opts,
             inner: OnceCell::new(),
@@ -394,10 +404,8 @@ mod tests {
             allowed_ips: Some(vec!["0.0.0.0/0".to_owned()]),
             reserved_bits: None,
         };
-        let handler = Arc::new(Handler::new(
-            opts,
-            Some(GLOBAL_DIRECT_CONNECTOR.clone()),
-        ));
+        let handler =
+            Arc::new(Handler::new(opts, Some(GLOBAL_DIRECT_CONNECTOR.clone())));
 
         // cannot run the ping pong test, since the wireguard server is running
         // on bridge network mode and the `net.ipv4.conf.all.

@@ -27,6 +27,7 @@ pub struct HealthCheck {
     lazy: bool,
     proxy_manager: ProxyManager,
     inner: Arc<parking_lot::RwLock<HealthCheckInner>>,
+    cancellation_token: tokio_util::sync::CancellationToken,
 }
 
 impl HealthCheck {
@@ -47,6 +48,14 @@ impl HealthCheck {
                 proxies,
                 task_handle: None,
             })),
+            cancellation_token: tokio_util::sync::CancellationToken::new(),
+        }
+    }
+
+    pub fn stop(&self) {
+        self.cancellation_token.cancel();
+        if let Some(handle) = self.inner.write().task_handle.take() {
+            handle.abort();
         }
     }
 
@@ -62,11 +71,13 @@ impl HealthCheck {
         let weak_inner = Arc::downgrade(&self.inner);
         let proxy_manager = self.proxy_manager.clone();
         let url = self.url.clone();
+        let cancel = self.cancellation_token.clone();
         let task_handle = tokio::spawn(async move {
             let mut ticker =
                 tokio::time::interval(tokio::time::Duration::from_secs(interval));
             loop {
                 tokio::select! {
+                    _ = cancel.cancelled() => break,
                     _ = ticker.tick() => {
                         let Some(inner) = weak_inner.upgrade() else { break; };
                         debug!("healthcheck ticking: {}, lazy: {}", url, lazy);
@@ -82,7 +93,11 @@ impl HealthCheck {
             }
         });
 
-        self.inner.write().task_handle = Some(task_handle);
+        let mut inner_guard = self.inner.write();
+        if let Some(old_handle) = inner_guard.task_handle.take() {
+            old_handle.abort();
+        }
+        inner_guard.task_handle = Some(task_handle);
     }
 
     pub fn touch(&self) {

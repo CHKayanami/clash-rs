@@ -1,15 +1,13 @@
-use std::{
-    path::PathBuf,
-    sync::{Arc, Mutex as StdMutex},
-};
+use std::{path::PathBuf, sync::Arc};
 
+use async_trait::async_trait;
 use axum::{
     Router, middleware,
     response::Redirect,
     routing::{get, post},
 };
 use http::{Method, header};
-use tokio::sync::{Mutex, broadcast::Sender};
+use tokio::sync::broadcast::Sender;
 use tower::ServiceBuilder;
 use tower_http::{
     cors::{AllowOrigin, Any, CorsLayer},
@@ -18,12 +16,12 @@ use tower_http::{
 };
 use tracing::{debug, error, info, warn};
 
+use super::context::RuntimeContext;
 use crate::{
     GlobalState,
     app::{
         api::{AppState, handlers, ipc, middlewares, websocket},
-        dispatcher::{self, StatisticsManager},
-        dns::{ThreadSafeDNSResolver, config::DNSListenAddr},
+        dns::config::DNSListenAddr,
         inbound::manager::InboundManager,
         logging::LogEvent,
         outbound::manager::ThreadSafeOutboundManager,
@@ -31,39 +29,43 @@ use crate::{
         router::ArcRouter,
     },
     config::config::Controller,
-    runner::Runner,
+    runner::{AsyncService, ServiceContext},
 };
 
 pub struct ApiRunner {
     controller_cfg: Controller,
     log_source: Sender<LogEvent>,
-    inbound_manager: Arc<InboundManager>,
-    dispatcher: Arc<dispatcher::Dispatcher>,
-    global_state: Arc<Mutex<GlobalState>>,
-    dns_resolver: ThreadSafeDNSResolver,
-    outbound_manager: ThreadSafeOutboundManager,
-    statistics_manager: Arc<StatisticsManager>,
-    cache_store: ThreadSafeCacheFile,
-    router: ArcRouter,
-    cwd: String,
-
+    ctx: RuntimeContext,
     cancellation_token: tokio_util::sync::CancellationToken,
-    dns_listen_addr: DNSListenAddr,
-    dns_enabled: bool,
-    task_handle: StdMutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl ApiRunner {
+    /// Modern constructor accepting an aggregated [`RuntimeContext`].
+    pub fn from_context(
+        controller_cfg: Controller,
+        log_source: Sender<LogEvent>,
+        ctx: RuntimeContext,
+        cancellation_token: Option<tokio_util::sync::CancellationToken>,
+    ) -> Self {
+        Self {
+            controller_cfg,
+            log_source,
+            ctx,
+            cancellation_token: cancellation_token.unwrap_or_default(),
+        }
+    }
+
+    /// Backwards-compatible constructor mapping legacy parameter lists into [`RuntimeContext`].
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         controller_cfg: Controller,
         log_source: Sender<LogEvent>,
         inbound_manager: Arc<InboundManager>,
-        dispatcher: Arc<dispatcher::Dispatcher>,
-        global_state: Arc<Mutex<GlobalState>>,
-        dns_resolver: ThreadSafeDNSResolver,
+        dispatcher: Arc<crate::app::dispatcher::Dispatcher>,
+        global_state: Arc<tokio::sync::Mutex<GlobalState>>,
+        dns_resolver: crate::app::dns::ThreadSafeDNSResolver,
         outbound_manager: ThreadSafeOutboundManager,
-        statistics_manager: Arc<StatisticsManager>,
+        statistics_manager: Arc<crate::app::dispatcher::StatisticsManager>,
         cache_store: ThreadSafeCacheFile,
         router: ArcRouter,
         cwd: String,
@@ -71,9 +73,7 @@ impl ApiRunner {
         dns_listen_addr: DNSListenAddr,
         dns_enabled: bool,
     ) -> Self {
-        Self {
-            controller_cfg,
-            log_source,
+        let ctx = RuntimeContext::new(
             inbound_manager,
             dispatcher,
             global_state,
@@ -83,149 +83,192 @@ impl ApiRunner {
             cache_store,
             router,
             cwd,
-            cancellation_token: cancellation_token.unwrap_or_default(),
             dns_listen_addr,
             dns_enabled,
-            task_handle: StdMutex::new(None),
-        }
+        );
+        Self::from_context(controller_cfg, log_source, ctx, cancellation_token)
     }
-}
 
-impl Runner for ApiRunner {
-    fn run_async(&self) {
-        let inbound_manager = self.inbound_manager.clone();
-        let dispatcher = self.dispatcher.clone();
-        let global_state = self.global_state.clone();
-        let dns_resolver = self.dns_resolver.clone();
-        let outbound_manager = self.outbound_manager.clone();
-        let statistics_manager = self.statistics_manager.clone();
-        let cache_store = self.cache_store.clone();
-        let controller_cfg = self.controller_cfg.clone();
-        let router = self.router.clone();
-        let cwd = self.cwd.clone();
-        let dns_listen_addr = self.dns_listen_addr.clone();
-        let dns_enabled = self.dns_enabled;
+    pub fn shutdown(&self) {
+        info!("Shutting down API server");
+        self.cancellation_token.cancel();
+    }
 
-        let ipc_addr = controller_cfg.external_controller_ipc;
-        let tcp_addr = controller_cfg.external_controller;
+    pub fn cancellation_token(&self) -> &tokio_util::sync::CancellationToken {
+        &self.cancellation_token
+    }
 
-        let origins: AllowOrigin =
-            if let Some(origins) = &controller_cfg.cors_allow_origins {
-                let has_wildcard = origins.iter().any(|origin| origin.trim() == "*");
-                if has_wildcard {
-                    if origins.iter().any(|origin| origin.trim() != "*") {
-                        warn!(
-                            "CORS origin '*' enables all origins; ignoring \
-                             additional configured origins"
-                        );
-                    }
-                    Any.into()
-                } else {
-                    origins
-                        .iter()
-                        .filter_map(|v| match v.parse() {
-                            Ok(origin) => Some(origin),
-                            Err(e) => {
-                                warn!("ignored invalid CORS origin '{}': {}", v, e);
-                                None
-                            }
-                        })
-                        .collect::<Vec<_>>()
-                        .into()
+    pub fn controller_config(&self) -> &Controller {
+        &self.controller_cfg
+    }
+
+    fn build_cors_layer(&self) -> CorsLayer {
+        let origins: AllowOrigin = if let Some(origins) =
+            &self.controller_cfg.cors_allow_origins
+        {
+            let has_wildcard = origins.iter().any(|origin| origin.trim() == "*");
+            if has_wildcard {
+                if origins.iter().any(|origin| origin.trim() != "*") {
+                    warn!(
+                        "CORS origin '*' enables all origins; ignoring additional configured origins"
+                    );
                 }
-            } else {
                 Any.into()
-            };
+            } else {
+                origins
+                    .iter()
+                    .filter_map(|v| match v.parse() {
+                        Ok(origin) => Some(origin),
+                        Err(e) => {
+                            warn!("ignored invalid CORS origin '{}': {}", v, e);
+                            None
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .into()
+            }
+        } else {
+            Any.into()
+        };
 
-        let cors = CorsLayer::new()
+        CorsLayer::new()
             .allow_methods([Method::GET, Method::POST, Method::PUT, Method::PATCH])
             .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE])
             .allow_private_network(true)
-            .allow_origin(origins);
+            .allow_origin(origins)
+    }
+}
 
+#[async_trait]
+impl AsyncService for ApiRunner {
+    async fn start(&self, ctx: &ServiceContext) -> Result<(), crate::Error> {
+        let controller_cfg = self.controller_cfg.clone();
+        let current_ctx = &self.ctx;
+
+        let ipc_addr = controller_cfg.external_controller_ipc.clone();
+        let tcp_addr = controller_cfg.external_controller.clone();
+
+        if tcp_addr.is_none() && ipc_addr.is_none() {
+            info!("API server: no listener configured, skipping");
+            return Ok(());
+        }
+
+        let cors = self.build_cors_layer();
         let samplers = Arc::new(crate::app::api::StreamSamplers::new());
         let app_state = Arc::new(AppState {
             log_source_tx: self.log_source.clone(),
-            statistics_manager: statistics_manager.clone(),
+            statistics_manager: current_ctx.statistics_manager.clone(),
             samplers: samplers.clone(),
         });
-        let cancellation_token = self.cancellation_token.clone();
-        let handle = tokio::spawn(async move {
-            let mut router = Router::new()
-                .route("/", get(handlers::hello::handle))
-                .route("/logs", get(handlers::log::handle))
-                .route("/traffic", get(handlers::traffic::handle))
-                .route("/user-stats", get(handlers::user_stats::handle))
-                .route("/version", get(handlers::version::handle))
-                .route("/memory", get(handlers::memory::handle))
-                .route("/restart", post(handlers::restart::handle))
-                .nest("/ws", websocket::routes(app_state.clone()))
-                .nest(
-                    "/configs",
-                    handlers::config::routes(
-                        inbound_manager,
-                        dispatcher,
-                        global_state,
-                        dns_resolver.clone(),
-                        dns_listen_addr,
-                        dns_enabled,
-                    ),
-                )
-                .nest("/rules", handlers::rule::routes(router.clone()))
-                .nest("/group", handlers::group::routes(outbound_manager.clone()))
-                .nest(
-                    "/proxies",
-                    handlers::proxy::routes(outbound_manager.clone(), cache_store),
-                )
-                .nest(
-                    "/providers/proxies",
-                    handlers::provider::routes(outbound_manager),
-                )
-                .nest("/providers/rules", handlers::provider::rule_routes(router))
-                .nest(
-                    "/connections",
-                    handlers::connection::routes(statistics_manager.clone(), samplers),
-                )
-                .nest("/flows", handlers::flows::routes(statistics_manager))
-                .nest("/dns", handlers::dns::routes(dns_resolver))
-                .layer(middleware::from_fn(
-                    middlewares::fix_json_content_type::fix_content_type,
-                ))
-                .route_layer(cors)
-                .with_state(app_state)
-                .layer(ServiceBuilder::new().layer(TraceLayer::new_for_http()));
 
-            async fn ui_redirect(uri: http::Uri) -> Redirect {
-                if let Some(query) = uri.query() {
-                    Redirect::to(&format!("/ui/?{}", query))
-                } else {
-                    Redirect::to("/ui/")
-                }
-            }
+        let mut router = Router::new()
+            .route("/", get(handlers::hello::handle))
+            .route("/logs", get(handlers::log::handle))
+            .route("/traffic", get(handlers::traffic::handle))
+            .route("/user-stats", get(handlers::user_stats::handle))
+            .route("/version", get(handlers::version::handle))
+            .route("/memory", get(handlers::memory::handle))
+            .route("/restart", post(handlers::restart::handle))
+            .nest("/ws", websocket::routes(app_state.clone()))
+            .nest(
+                "/configs",
+                handlers::config::routes(
+                    current_ctx.inbound_manager.clone(),
+                    current_ctx.dispatcher.clone(),
+                    current_ctx.global_state.clone(),
+                    current_ctx.dns_resolver.clone(),
+                    current_ctx.dns_listen_addr.clone(),
+                    current_ctx.dns_enabled,
+                ),
+            )
+            .nest("/rules", handlers::rule::routes(current_ctx.router.clone()))
+            .nest(
+                "/group",
+                handlers::group::routes(current_ctx.outbound_manager.clone()),
+            )
+            .nest(
+                "/proxies",
+                handlers::proxy::routes(
+                    current_ctx.outbound_manager.clone(),
+                    current_ctx.cache_store.clone(),
+                ),
+            )
+            .nest(
+                "/providers/proxies",
+                handlers::provider::routes(current_ctx.outbound_manager.clone()),
+            )
+            .nest(
+                "/providers/rules",
+                handlers::provider::rule_routes(current_ctx.router.clone()),
+            )
+            .nest(
+                "/connections",
+                handlers::connection::routes(
+                    current_ctx.statistics_manager.clone(),
+                    samplers.clone(),
+                ),
+            )
+            .nest(
+                "/flows",
+                handlers::flows::routes(current_ctx.statistics_manager.clone()),
+            )
+            .nest(
+                "/dns",
+                handlers::dns::routes(current_ctx.dns_resolver.clone()),
+            )
+            .layer(middleware::from_fn(
+                middlewares::fix_json_content_type::fix_content_type,
+            ))
+            .route_layer(cors)
+            .with_state(app_state)
+            .layer(ServiceBuilder::new().layer(TraceLayer::new_for_http()));
 
-            if let Some(external_ui) = controller_cfg.external_ui {
-                router = router
-                    .route("/ui", get(ui_redirect))
-                    .nest_service(
-                        "/ui/",
-                        ServeDir::new(PathBuf::from(cwd).join(external_ui)),
-                    );
+        async fn ui_redirect(uri: http::Uri) -> Redirect {
+            if let Some(query) = uri.query() {
+                Redirect::to(&format!("/ui/?{}", query))
             } else {
-                #[cfg(feature = "dashboard")]
-                {
-                    use super::embedded_dashboard;
-                    router = router
-                        .route("/ui", get(ui_redirect))
-                        .route("/ui/", get(embedded_dashboard::serve_index))
-                        .route("/ui/{*path}", get(embedded_dashboard::serve_asset));
-                }
+                Redirect::to("/ui/")
             }
+        }
 
-            // Create display strings before moving values
-            let tcp_addr_display = tcp_addr.as_ref().map(|addr| addr.to_string());
-            let ipc_addr_display = ipc_addr.clone();
+        router = router
+            .route("/ui", get(ui_redirect))
+            .route("/dashboard", get(ui_redirect));
 
-            // Handle TCP listening
+        if let Some(dashboard_dir) = &controller_cfg.external_ui {
+            let p = PathBuf::from(dashboard_dir);
+            let dir = if p.is_relative() {
+                PathBuf::from(&current_ctx.cwd).join(p)
+            } else {
+                p
+            };
+            if dir.exists() {
+                info!("Serving dashboard from: {:?}", dir);
+                router = router.nest_service("/ui", ServeDir::new(dir));
+            } else {
+                warn!("Dashboard dir {:?} does not exist, skipping", dir);
+            }
+        } else {
+            #[cfg(feature = "dashboard")]
+            {
+                router = router
+                    .route("/ui/", get(super::embedded_dashboard::serve_index))
+                    .route(
+                        "/ui/{*path}",
+                        get(super::embedded_dashboard::serve_asset),
+                    );
+            }
+        }
+
+        let tcp_addr_display = tcp_addr.clone();
+        let ipc_addr_display = ipc_addr.clone();
+
+        let cancellation_token = self.cancellation_token.clone();
+        let cancel_child = cancellation_token.child_token();
+        let ctx_cancel = ctx.cancellation_token().clone();
+        let lifecycle_tokens = vec![cancellation_token.clone(), ctx_cancel.clone()];
+
+        ctx.spawn_critical_with_tokens("api_server", lifecycle_tokens, async move {
             let tcp_fut = tcp_addr.map(|bind_addr| {
                 let bind_addr = if bind_addr.starts_with(':') {
                     info!(
@@ -238,16 +281,21 @@ impl Runner for ApiRunner {
                 };
                 let auth_secret = controller_cfg.secret.clone().unwrap_or_default();
                 let cors_allow_origins = controller_cfg.cors_allow_origins.clone();
-                super::tcp::serve_tcp(
-                    bind_addr,
-                    router.clone(),
-                    auth_secret,
-                    cors_allow_origins,
-                )
+                let router = router.clone();
+                async move {
+                    super::tcp::serve_tcp(
+                        bind_addr,
+                        router,
+                        auth_secret,
+                        cors_allow_origins,
+                    )
+                    .await
+                }
             });
-            // Handle IPC listening
+
             let ipc_fut = ipc_addr.as_ref().map(|ipc_path| {
                 let ipc_path = ipc_path.clone();
+                let router = router.clone();
                 async move { ipc::serve_ipc(router, &ipc_path).await }
             });
 
@@ -258,39 +306,31 @@ impl Runner for ApiRunner {
                 ),
                 (Some(tcp), None) => debug!("API server is running on TCP {}", tcp),
                 (None, Some(ipc)) => debug!("API server is running on IPC {}", ipc),
-                (None, None) => {
-                    info!("API server: no listener configured, skipping");
-                    return;
-                }
+                (None, None) => unreachable!(),
             }
 
             let result = tokio::select! {
                 Some(result) = futures::future::OptionFuture::from(tcp_fut) => result,
                 Some(result) = futures::future::OptionFuture::from(ipc_fut) => result,
-                _ = cancellation_token.cancelled() => {
-                    info!("API server closed");
+                _ = cancel_child.cancelled() => {
+                    info!("API server closed gracefully");
+                    Ok(())
+                }
+                _ = ctx_cancel.cancelled() => {
+                    info!("API server closed gracefully via context");
                     Ok(())
                 }
             };
             if let Err(e) = result {
-                error!("API server failed to start, error: {}", e);
+                error!("API server error: {}", e);
             }
         });
-        *self.task_handle.lock().unwrap() = Some(handle);
+
+        Ok(())
     }
 
-    fn shutdown(&self) {
-        info!("Shutting down API server");
-        self.cancellation_token.cancel();
-    }
-
-    fn join(&self) -> futures::future::BoxFuture<'_, Result<(), crate::Error>> {
-        Box::pin(async move {
-            let handle = self.task_handle.lock().unwrap().take();
-            if let Some(h) = handle {
-                let _ = h.await;
-            }
-            Ok(())
-        })
+    async fn stop(&self) -> Result<(), crate::Error> {
+        self.shutdown();
+        Ok(())
     }
 }

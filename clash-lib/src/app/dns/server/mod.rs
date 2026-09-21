@@ -1,11 +1,9 @@
-use futures::future::BoxFuture;
-use parking_lot::Mutex;
-use tokio::task::JoinHandle;
+use async_trait::async_trait;
 use tracing::{error, info, instrument};
 use watfaq_dns::DNSListenAddr;
 
-use crate::runner::Runner;
 use super::ThreadSafeDNSResolver;
+use crate::runner::{AsyncService, ServiceContext};
 
 mod handler;
 pub use handler::exchange_with_resolver;
@@ -36,7 +34,6 @@ pub struct DnsRunner {
     #[allow(dead_code)]
     cwd: std::path::PathBuf,
     cancellation_token: tokio_util::sync::CancellationToken,
-    task_handle: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl DnsRunner {
@@ -53,15 +50,19 @@ impl DnsRunner {
             resolver,
             cwd: cwd.to_path_buf(),
             cancellation_token: cancellation_token.unwrap_or_default(),
-            task_handle: Mutex::new(None),
         }
+    }
+
+    pub fn shutdown(&self) {
+        self.cancellation_token.cancel();
     }
 }
 
-impl Runner for DnsRunner {
-    fn run_async(&self) {
+#[async_trait]
+impl AsyncService for DnsRunner {
+    async fn start(&self, ctx: &ServiceContext) -> Result<(), crate::Error> {
         if !self.enable {
-            return;
+            return Ok(());
         }
 
         let exchanger = DnsMessageExchanger {
@@ -69,37 +70,36 @@ impl Runner for DnsRunner {
         };
         let listener = self.listener.clone();
         let cancellation_token = self.cancellation_token.clone();
+        let child_cancel = cancellation_token.child_token();
 
-        let handle = tokio::spawn(async move {
+        let listener_fut =
             match watfaq_dns::get_dns_listener(listener, exchanger).await {
-                Ok(listener_fut) => {
-                    info!("DNS server started");
-                    tokio::select! {
-                        _ = listener_fut => {},
-                        _ = cancellation_token.cancelled() => {
-                            info!("DNS server is cancelled");
-                        }
-                    }
-                }
+                Ok(fut) => fut,
                 Err(e) => {
                     error!("failed to start DNS server: {}", e);
+                    return Err(crate::Error::DNSServerError(e));
                 }
-            }
-        });
-        *self.task_handle.lock() = Some(handle);
+            };
+
+        info!("DNS server started");
+        ctx.spawn_critical_with_token(
+            "dns_server",
+            cancellation_token,
+            async move {
+                tokio::select! {
+                    _ = listener_fut => {},
+                    _ = child_cancel.cancelled() => {
+                        info!("DNS server is cancelled");
+                    }
+                }
+            },
+        );
+
+        Ok(())
     }
 
-    fn shutdown(&self) {
-        self.cancellation_token.cancel();
-    }
-
-    fn join(&self) -> BoxFuture<'_, Result<(), crate::Error>> {
-        Box::pin(async move {
-            let handle = self.task_handle.lock().take();
-            if let Some(h) = handle {
-                let _ = h.await;
-            }
-            Ok(())
-        })
+    async fn stop(&self) -> Result<(), crate::Error> {
+        self.shutdown();
+        Ok(())
     }
 }

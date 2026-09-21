@@ -1,7 +1,7 @@
 use std::{sync::Arc, time::Duration};
 
 use bytes::BytesMut;
-use futures::{FutureExt, SinkExt, StreamExt, future::BoxFuture};
+use futures::{SinkExt, StreamExt};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 use url::Url;
@@ -11,8 +11,9 @@ use crate::{
     app::{dispatcher::Dispatcher, dns::ThreadSafeDNSResolver},
     config::config::TunConfig,
     proxy::tun::{datagram::handle_inbound_datagram, routes},
-    runner::Runner,
+    runner::{AsyncService, ServiceContext},
 };
+use async_trait::async_trait;
 
 /// Maximum number of attempts to wait for a newly created TUN interface to
 /// become visible via NetworkInterface::show().
@@ -117,177 +118,191 @@ impl TunRunner {
             }
         };
 
-        let tun =
-            if let Some(fd) = tun_init_config.fd {
-                #[cfg(target_family = "unix")]
-                {
-                    info!("tun started with fd {}", fd);
-                    unsafe { tun_rs::AsyncDevice::from_fd(fd as _)? }
+        let tun = if let Some(fd) = tun_init_config.fd {
+            #[cfg(target_family = "unix")]
+            {
+                info!("tun started with fd {}", fd);
+                unsafe { tun_rs::AsyncDevice::from_fd(fd as _)? }
+            }
+
+            #[cfg(not(target_family = "unix"))]
+            {
+                return Err(Error::InvalidConfig(format!(
+                    "tun fd({fd}) is only supported on Unix-like systems"
+                )));
+            }
+        } else {
+            #[cfg(not(any(target_os = "ios", target_os = "android")))]
+            {
+                use crate::proxy::tun::routes::maybe_add_routes;
+                use network_interface::NetworkInterfaceConfig;
+                use tun_rs::DeviceBuilder;
+
+                let tun_name =
+                    tun_init_config.tun_name.expect("tun name must be provided");
+                let tun_exist = network_interface::NetworkInterface::show()
+                    .map(|ifs| ifs.into_iter().any(|x| x.name == tun_name))
+                    .unwrap_or_default();
+
+                if tun_exist {
+                    info!("tun device {} already exists, using it.", &tun_name);
+                } else {
+                    info!("tun device {} does not exist, creating.", &tun_name);
                 }
 
-                #[cfg(not(target_family = "unix"))]
-                {
-                    return Err(Error::InvalidConfig(format!(
-                        "tun fd({fd}) is only supported on Unix-like systems"
-                    )));
+                let mut tun_builder = DeviceBuilder::new();
+                #[cfg(not(target_os = "linux"))]
+                let gso_enabled = {
+                    if cfg.gso.unwrap_or(false) {
+                        warn!(
+                            "GSO is only supported on Linux, ignoring on this platform"
+                        );
+                    }
+                    false
+                };
+                #[cfg(target_os = "linux")]
+                let gso_enabled = cfg.gso.unwrap_or(false);
+
+                let gso_max_size = cfg.gso_max_size.unwrap_or(65536) as usize;
+                let stack_mtu = cfg.mtu.unwrap_or(1500) as usize;
+                let effective_mtu = if gso_enabled {
+                    (gso_max_size.min(65535)) as u16
+                } else {
+                    cfg.mtu
+                        .unwrap_or(if cfg!(windows) { 65535u16 } else { 1500u16 })
+                };
+
+                if gso_enabled {
+                    info!(
+                        "TUN GSO enabled (gso_max_size: {}, standard MTU: {})",
+                        gso_max_size, stack_mtu
+                    );
                 }
-            } else {
-                #[cfg(not(any(target_os = "ios", target_os = "android")))]
+
+                tun_builder = tun_builder.name(&tun_name).mtu(effective_mtu);
+
+                #[cfg(target_os = "linux")]
+                if gso_enabled {
+                    tun_builder = tun_builder.offload(true);
+                }
+
+                if !tun_exist {
+                    debug!("setting tun ipv4 addr: {:?}", cfg.gateway);
+                    tun_builder = tun_builder.ipv4(
+                        cfg.gateway.addr(),
+                        cfg.gateway.netmask(),
+                        None,
+                    );
+
+                    if let Some(gateway_v6) = cfg.gateway_v6 {
+                        debug!("setting tun ipv6 addr: {:?}", cfg.gateway_v6);
+                        tun_builder = tun_builder
+                            .ipv6(gateway_v6.addr(), gateway_v6.netmask());
+                    }
+                }
+                #[cfg(target_os = "windows")]
                 {
-                    use crate::proxy::tun::routes::maybe_add_routes;
-                    use network_interface::NetworkInterfaceConfig;
-                    use tun_rs::DeviceBuilder;
+                    // Use the explicitly configured GUID, or derive a
+                    // deterministic one from the device name so that the
+                    // same adapter is reused across restarts instead of
+                    // creating a new one every time.
+                    let guid = tun_init_config.guid.unwrap_or_else(|| {
+                        uuid::Uuid::new_v5(
+                            &uuid::Uuid::NAMESPACE_DNS,
+                            tun_name.as_bytes(),
+                        )
+                        .as_u128()
+                    });
+                    tun_builder = tun_builder.device_guid(guid);
+                }
 
-                    let tun_name =
-                        tun_init_config.tun_name.expect("tun name must be provided");
-                    let tun_exist = network_interface::NetworkInterface::show()
-                        .map(|ifs| ifs.into_iter().any(|x| x.name == tun_name))
-                        .unwrap_or_default();
+                let dev = tun_builder.build_async()?;
 
-                    if tun_exist {
-                        info!("tun device {} already exists, using it.", &tun_name);
-                    } else {
-                        info!("tun device {} does not exist, creating.", &tun_name);
-                    }
-
-                    let mut tun_builder = DeviceBuilder::new();
-                    #[cfg(not(target_os = "linux"))]
-                    let gso_enabled = {
-                        if cfg.gso.unwrap_or(false) {
-                            warn!("GSO is only supported on Linux, ignoring on this platform");
-                        }
-                        false
-                    };
-                    #[cfg(target_os = "linux")]
-                    let gso_enabled = cfg.gso.unwrap_or(false);
-
-                    let gso_max_size = cfg.gso_max_size.unwrap_or(65536) as usize;
-                    let stack_mtu = cfg.mtu.unwrap_or(1500) as usize;
-                    let effective_mtu = if gso_enabled {
-                        (gso_max_size.min(65535)) as u16
-                    } else {
-                        cfg.mtu.unwrap_or(if cfg!(windows) { 65535u16 } else { 1500u16 })
-                    };
-
-                    if gso_enabled {
-                        info!(
-                            "TUN GSO enabled (gso_max_size: {}, standard MTU: {})",
-                            gso_max_size, stack_mtu
-                        );
-                    }
-
-                    tun_builder = tun_builder.name(&tun_name).mtu(effective_mtu);
-
-                    #[cfg(target_os = "linux")]
-                    if gso_enabled {
-                        tun_builder = tun_builder.offload(true);
-                    }
-
-                    if !tun_exist {
-                        debug!("setting tun ipv4 addr: {:?}", cfg.gateway);
-                        tun_builder = tun_builder.ipv4(
-                            cfg.gateway.addr(),
-                            cfg.gateway.netmask(),
-                            None,
-                        );
-
-                        if let Some(gateway_v6) = cfg.gateway_v6 {
-                            debug!("setting tun ipv6 addr: {:?}", cfg.gateway_v6);
-                            tun_builder = tun_builder
-                                .ipv6(gateway_v6.addr(), gateway_v6.netmask());
-                        }
-                    }
-                    #[cfg(target_os = "windows")]
-                    {
-                        // Use the explicitly configured GUID, or derive a
-                        // deterministic one from the device name so that the
-                        // same adapter is reused across restarts instead of
-                        // creating a new one every time.
-                        let guid = tun_init_config.guid.unwrap_or_else(|| {
-                            uuid::Uuid::new_v5(
-                                &uuid::Uuid::NAMESPACE_DNS,
-                                tun_name.as_bytes(),
-                            )
-                            .as_u128()
-                        });
-                        tun_builder = tun_builder.device_guid(guid);
-                    }
-
-                    let dev = tun_builder.build_async()?;
-
-                    if !tun_exist {
-                        // After build_async(), the new TUN interface may not be
-                        // immediately visible via NetworkInterface::show(). Poll up
-                        // to TUN_VISIBILITY_MAX_ATTEMPTS times (≈2 s) before
-                        // setting up routes, but never sleep after the final check.
-                        let mut tun_visible = false;
-                        let mut last_show_err: Option<String> = None;
-                        let mut attempt = 0u32;
-                        loop {
-                            match network_interface::NetworkInterface::show() {
-                                Ok(ifs) => {
-                                    if ifs.into_iter().any(|x| x.name == tun_name) {
-                                        tun_visible = true;
-                                        break;
-                                    }
-                                }
-                                Err(e) => {
-                                    last_show_err = Some(e.to_string());
+                if !tun_exist {
+                    // After build_async(), the new TUN interface may not be
+                    // immediately visible via NetworkInterface::show(). Poll up
+                    // to TUN_VISIBILITY_MAX_ATTEMPTS times (≈2 s) before
+                    // setting up routes, but never sleep after the final check.
+                    let mut tun_visible = false;
+                    let mut last_show_err: Option<String> = None;
+                    let mut attempt = 0u32;
+                    loop {
+                        match network_interface::NetworkInterface::show() {
+                            Ok(ifs) => {
+                                if ifs.into_iter().any(|x| x.name == tun_name) {
+                                    tun_visible = true;
+                                    break;
                                 }
                             }
-                            attempt += 1;
-                            if attempt >= TUN_VISIBILITY_MAX_ATTEMPTS {
-                                break;
+                            Err(e) => {
+                                last_show_err = Some(e.to_string());
                             }
-                            tokio::time::sleep(std::time::Duration::from_millis(
-                                TUN_VISIBILITY_POLL_INTERVAL_MS,
-                            ))
-                            .await;
                         }
+                        attempt += 1;
+                        if attempt >= TUN_VISIBILITY_MAX_ATTEMPTS {
+                            break;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(
+                            TUN_VISIBILITY_POLL_INTERVAL_MS,
+                        ))
+                        .await;
+                    }
 
-                        if !tun_visible {
-                            let total_ms = TUN_VISIBILITY_MAX_ATTEMPTS as u64
-                                * TUN_VISIBILITY_POLL_INTERVAL_MS;
-                            let err_msg = match last_show_err {
-                                Some(e) => format!(
-                                    "tun device {} not visible after waiting {}ms \
+                    if !tun_visible {
+                        let total_ms = TUN_VISIBILITY_MAX_ATTEMPTS as u64
+                            * TUN_VISIBILITY_POLL_INTERVAL_MS;
+                        let err_msg = match last_show_err {
+                            Some(e) => format!(
+                                "tun device {} not visible after waiting {}ms \
                                      (last error: {})",
-                                    tun_name, total_ms, e
-                                ),
-                                None => format!(
-                                    "tun device {} not visible after waiting {}ms",
-                                    tun_name, total_ms
-                                ),
-                            };
-                            return Err(Error::Operation(err_msg));
-                        }
-
-                        info!("setting up routes for tun {}", &tun_name);
-                        maybe_add_routes(cfg, &tun_name)?;
-                    } else {
-                        info!("skipping route setup for existing tun {}", &tun_name);
+                                tun_name, total_ms, e
+                            ),
+                            None => format!(
+                                "tun device {} not visible after waiting {}ms",
+                                tun_name, total_ms
+                            ),
+                        };
+                        return Err(Error::Operation(err_msg));
                     }
 
-                    dev
+                    info!("setting up routes for tun {}", &tun_name);
+                    maybe_add_routes(cfg, &tun_name)?;
+                } else {
+                    info!("skipping route setup for existing tun {}", &tun_name);
                 }
-                #[cfg(any(target_os = "ios", target_os = "android"))]
-                {
-                    return Err(Error::InvalidConfig(
-                        "only fd is supported on mobile platforms".to_string(),
-                    ));
-                }
-            };
+
+                dev
+            }
+            #[cfg(any(target_os = "ios", target_os = "android"))]
+            {
+                return Err(Error::InvalidConfig(
+                    "only fd is supported on mobile platforms".to_string(),
+                ));
+            }
+        };
 
         let (stack, tcp_listener, udp_socket) = watfaq_netstack::NetStack::new();
         Ok((tun, stack, tcp_listener, udp_socket))
     }
+
+    pub fn shutdown(&self) {
+        info!("shutting down tun runner");
+        match routes::maybe_routes_clean_up(&self.cfg) {
+            Ok(_) => {}
+            Err(e) => {
+                error!("failed to clean up routes: {}", e);
+            }
+        }
+        self.cancellation_token.cancel();
+    }
 }
 
-impl Runner for TunRunner {
-    fn run_async(&self) {
+#[async_trait]
+impl AsyncService for TunRunner {
+    async fn start(&self, ctx: &ServiceContext) -> Result<(), Error> {
         if !self.cfg.enable {
             info!("tun is disabled, skipping");
-            return;
+            return Ok(());
         }
 
         let cfg = self.cfg.clone();
@@ -297,70 +312,71 @@ impl Runner for TunRunner {
         let dns_hijack = self.cfg.dns_hijack.clone();
         let cancellation_token = self.cancellation_token.clone();
 
-        tokio::spawn(async move {
-            let (tun, stack, mut tcp_listener, udp_socket) =
-                TunRunner::new_internal(&cfg)
-                    .await
-                    .inspect_err(|e| match e {
-                        Error::Io(e) => {
-                            if e.kind() == std::io::ErrorKind::PermissionDenied {
-                                error!(
-                                    "tun initialization failed: permission denied. \
-                                     Please make sure the program has the \
-                                     necessary permissions to create and manage \
-                                     TUN interfaces."
-                                );
-                            } else {
-                                error!("tun initialization I/O error: {}", e);
-                            }
+        let (tun, stack, mut tcp_listener, udp_socket) =
+            TunRunner::new_internal(&cfg)
+                .await
+                .inspect_err(|e| match e {
+                    Error::Io(e) => {
+                        if e.kind() == std::io::ErrorKind::PermissionDenied {
+                            error!(
+                                "tun initialization failed: permission denied. \
+                                 Please make sure the program has the \
+                                 necessary permissions to create and manage \
+                                 TUN interfaces."
+                            );
+                        } else {
+                            error!("tun initialization I/O error: {}", e);
                         }
-                        _ => {
-                            error!("tun initialization error: {}", e);
-                        }
-                    })?;
+                    }
+                    _ => {
+                        error!("tun initialization error: {}", e);
+                    }
+                })?;
 
-            let tun = Arc::new(tun);
-            let tun_for_writer = tun.clone();
-            let (mut stack_sink, mut stack_stream) = stack.split();
+        let tun = Arc::new(tun);
+        let tun_for_writer = tun.clone();
+        let (mut stack_sink, mut stack_stream) = stack.split();
 
-            let auto_detect_cancel = cancellation_token.clone();
-            if cfg.auto_detect_interface {
-                tokio::spawn(async move {
-                    let mut interval =
-                        tokio::time::interval(std::time::Duration::from_secs(3));
-                    while !auto_detect_cancel.is_cancelled() {
-                        tokio::select! {
-                            _ = auto_detect_cancel.cancelled() => break,
-                            _ = interval.tick() => {
-                                if let Some(new_iface) =
-                                    crate::app::net::get_outbound_interface()
-                                {
-                                    let mut current =
-                                        crate::app::net::DEFAULT_OUTBOUND_INTERFACE
-                                            .write()
-                                            .await;
-                                    let changed = match &*current {
-                                        Some(old) => {
-                                            old.name != new_iface.name
-                                                || old.index != new_iface.index
-                                        }
-                                        None => true,
-                                    };
-                                    if changed {
-                                        info!(
-                                            "auto-detected default outbound interface \
-                                             changed to {} (index: {})",
-                                            new_iface.name, new_iface.index
-                                        );
-                                        *current = Some(new_iface);
+        let auto_detect_cancel = cancellation_token.clone();
+        if cfg.auto_detect_interface {
+            ctx.spawn(async move {
+                let mut interval =
+                    tokio::time::interval(std::time::Duration::from_secs(3));
+                while !auto_detect_cancel.is_cancelled() {
+                    tokio::select! {
+                        _ = auto_detect_cancel.cancelled() => break,
+                        _ = interval.tick() => {
+                            if let Some(new_iface) =
+                                crate::app::net::get_outbound_interface()
+                            {
+                                let mut current =
+                                    crate::app::net::DEFAULT_OUTBOUND_INTERFACE
+                                        .write()
+                                        .await;
+                                let changed = match &*current {
+                                    Some(old) => {
+                                        old.name != new_iface.name
+                                            || old.index != new_iface.index
                                     }
+                                    None => true,
+                                };
+                                if changed {
+                                    info!(
+                                        "auto-detected default outbound interface \
+                                         changed to {} (index: {})",
+                                        new_iface.name, new_iface.index
+                                    );
+                                    *current = Some(new_iface);
                                 }
                             }
                         }
                     }
-                });
-            }
+                }
+            });
+        }
 
+        let lifecycle_token = cancellation_token.clone();
+        ctx.spawn_critical_with_token("tun_packet_pipeline", lifecycle_token, async move {
             let (tun_tx, mut tun_rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(4096);
             let tun_tx_for_dispatcher = tun_tx.clone();
             let tun_tx_for_system_tcp = tun_tx.clone();
@@ -715,20 +731,12 @@ impl Runner for TunRunner {
             info!("tun runner exited");
             run_res
         });
+
+        Ok(())
     }
 
-    fn shutdown(&self) {
-        info!("shutting down tun runner");
-        match routes::maybe_routes_clean_up(&self.cfg) {
-            Ok(_) => {}
-            Err(e) => {
-                error!("failed to clean up routes: {}", e);
-            }
-        }
-        self.cancellation_token.cancel();
-    }
-
-    fn join(&self) -> BoxFuture<'_, Result<(), Error>> {
-        async move { Ok(()) }.boxed()
+    async fn stop(&self) -> Result<(), Error> {
+        self.shutdown();
+        Ok(())
     }
 }

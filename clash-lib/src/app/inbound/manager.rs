@@ -19,8 +19,9 @@ use crate::{
             InboundProviderDef, InboundUser,
         },
     },
-    runner::Runner,
+    runner::{AsyncService, ServiceContext},
 };
+use async_trait::async_trait;
 use parking_lot::RwLock;
 use std::{
     collections::{HashMap, HashSet},
@@ -32,6 +33,7 @@ use std::{
 /// push user-list updates without restarting the listener.
 struct ProviderHandleEntry {
     handle: Option<JoinHandle<()>>,
+    stop_token: tokio_util::sync::CancellationToken,
     /// Present only for Shadowsocks and AnyTLS listeners — used to push updated
     /// user lists without restarting the listener.
     /// lists into the running listener without a restart.
@@ -42,6 +44,7 @@ struct ProviderHandleEntry {
 /// Per-listener handle entry for static (non-provider) inbounds.
 struct StaticHandleEntry {
     handle: Option<JoinHandle<()>>,
+    stop_token: tokio_util::sync::CancellationToken,
     /// Present only for AnyTLS (and Shadowsocks) listeners — used to push
     /// updated user lists without restarting the listener.
     #[allow(dead_code)]
@@ -91,35 +94,43 @@ pub struct InboundManager {
     inbound_providers: Arc<RwLock<HashMap<String, Arc<InboundSetProvider>>>>,
 
     cancellation_token: tokio_util::sync::CancellationToken,
+    service_context: Arc<RwLock<Option<ServiceContext>>>,
 }
 
-impl Runner for InboundManager {
-    fn run_async(&self) {
+#[async_trait]
+impl AsyncService for InboundManager {
+    async fn start(&self, ctx: &ServiceContext) -> Result<(), crate::Error> {
         let inbound_handlers = self.inbound_handlers.clone();
         let dispatcher = self.dispatcher.clone();
         let authenticator = self.authenticator.clone();
         let cancellation_token = self.cancellation_token.clone();
+        let ctx_clone = ctx.clone();
+        *self.service_context.write() = Some(ctx.clone());
 
-        tokio::spawn(async move {
+        ctx.spawn(async move {
             Self::start_all_listeners(
                 dispatcher,
                 authenticator,
                 inbound_handlers,
                 cancellation_token,
+                Some(ctx_clone),
             )
             .await;
         });
+
+        Ok(())
     }
 
-    fn shutdown(&self) {
-        self.cancellation_token.cancel();
-    }
-
-    fn join(&self) -> BoxFuture<'_, Result<(), crate::Error>> {
-        Box::pin(async move { self.join_all_listeners().await })
+    async fn stop(&self) -> Result<(), crate::Error> {
+        self.shutdown();
+        self.join_all_listeners().await
     }
 }
+
 impl InboundManager {
+    pub fn shutdown(&self) {
+        self.cancellation_token.cancel();
+    }
     pub async fn new(
         dispatcher: Arc<Dispatcher>,
         authenticator: ThreadSafeAuthenticator,
@@ -135,6 +146,8 @@ impl InboundManager {
                             opts,
                             StaticHandleEntry {
                                 handle: None,
+                                stop_token: tokio_util::sync::CancellationToken::new(
+                                ),
                                 users_tx: None,
                             },
                         )
@@ -146,6 +159,7 @@ impl InboundManager {
             dispatcher,
             authenticator,
             cancellation_token: cancellation_token.unwrap_or_default(),
+            service_context: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -205,6 +219,7 @@ impl InboundManager {
             let authenticator = self.authenticator.clone();
             let cancellation_token = self.cancellation_token.clone();
             let provider_name = name.clone();
+            let service_context = self.service_context.clone();
 
             let on_update = move |new_opts: Vec<InboundOpts>| {
                 let provider_handles = provider_handles.clone();
@@ -212,6 +227,7 @@ impl InboundManager {
                 let authenticator = authenticator.clone();
                 let cancellation_token = cancellation_token.clone();
                 let provider_name = provider_name.clone();
+                let service_context = service_context.clone();
 
                 Box::pin(async move {
                     let mut old_handles = {
@@ -257,29 +273,30 @@ impl InboundManager {
                         }
                     }
 
-                    // Abort removed handles BEFORE starting new ones so UDP
-                    // ports are released before we try to bind them again.
-                    let has_removed = !old_handles.is_empty();
+                    // Stop removed handles before starting new ones so their
+                    // sockets are released without reporting a fatal task exit.
                     for (removed_opts, entry) in old_handles {
                         info!(
                             "inbound provider {provider_name}: removing listener \
                              '{}'",
                             removed_opts.common_opts().name
                         );
-                        if let Some(h) = entry.handle {
-                            h.abort();
+                        entry.stop_token.cancel();
+                        if let Some(h) = entry.handle
+                            && let Err(e) = h.await
+                        {
+                            warn!(
+                                "provider inbound '{}' stopped with error: {}",
+                                removed_opts.common_opts().name,
+                                e
+                            );
                         }
-                    }
-
-                    // Yield so aborted tasks can drop their sockets before we
-                    // attempt to bind the same ports again.
-                    if has_removed && !opts_to_start.is_empty() {
-                        tokio::task::yield_now().await;
                     }
 
                     // Start listeners for new opts.
                     for opts in opts_to_start {
-                        let ct = cancellation_token.clone();
+                        let stop_token = cancellation_token.child_token();
+                        let task_stop_token = stop_token.clone();
                         let listener_name = opts.common_opts().name.clone();
                         info!(
                             "inbound provider {provider_name}: starting listener \
@@ -324,19 +341,35 @@ impl InboundManager {
                             users_rx,
                         )
                         .map(|runners| {
-                            tokio::spawn(async move {
+                            let critical_name = format!("provider_inbound_{listener_name}");
+                            let task = async move {
                                 tokio::select! {
                                     _ = futures::future::join_all(runners) => {
-                                        warn!("Provider inbound {} exited", listener_name);
+                                        warn!("Provider inbound {} exited unexpectedly", listener_name);
                                     }
-                                    _ = ct.cancelled() => {
+                                    _ = task_stop_token.cancelled() => {
                                         info!("Provider inbound {} closed", listener_name);
                                     }
                                 }
-                            })
+                            };
+                            if let Some(ref ctx) = *service_context.read() {
+                                ctx.spawn_critical_with_token(
+                                    critical_name,
+                                    stop_token.clone(),
+                                    task,
+                                )
+                            } else {
+                                tokio::spawn(task)
+                            }
                         });
-                        new_handles
-                            .insert(opts, ProviderHandleEntry { handle, users_tx });
+                        new_handles.insert(
+                            opts,
+                            ProviderHandleEntry {
+                                handle,
+                                stop_token,
+                                users_tx,
+                            },
+                        );
                     }
 
                     {
@@ -376,9 +409,11 @@ impl InboundManager {
         authenticator: ThreadSafeAuthenticator,
         inbound_handlers: Arc<RwLock<HashMap<InboundOpts, StaticHandleEntry>>>,
         cancellation_token: tokio_util::sync::CancellationToken,
+        ctx: Option<ServiceContext>,
     ) {
         for (opts, entry) in inbound_handlers.write().iter_mut() {
-            let cancellation_token = cancellation_token.clone();
+            let stop_token = cancellation_token.child_token();
+            let task_stop_token = stop_token.clone();
             let name = opts.common_opts().name.clone();
 
             // For AnyTLS (and Shadowsocks), create a watch channel so user-list
@@ -411,17 +446,28 @@ impl InboundManager {
                 users_rx,
             )
             .map(|r| {
-                tokio::spawn(async move {
+                let critical_name = format!("inbound_{name}");
+                let task = async move {
                     tokio::select! {
                         _ = futures::future::join_all(r) => {
-                            warn!("Inbound handler {} has exited", name);
+                            warn!("Inbound handler {} has exited unexpectedly", name);
                         },
-                        _ = cancellation_token.cancelled() => {
+                        _ = task_stop_token.cancelled() => {
                             info!("Inbound handler {} is closed", name);
                         },
                     }
-                })
+                };
+                if let Some(ref ctx) = ctx {
+                    ctx.spawn_critical_with_token(
+                        critical_name,
+                        stop_token.clone(),
+                        task,
+                    )
+                } else {
+                    tokio::spawn(task)
+                }
             });
+            entry.stop_token = stop_token;
         }
     }
 
@@ -435,12 +481,13 @@ impl InboundManager {
                         "Shutting down inbound handler: {}",
                         opt.common_opts().name
                     );
+                    entry.stop_token.cancel();
                     handles.push(h);
                 }
             }
         }
         for h in handles {
-            h.abort();
+            let _ = h.await;
         }
 
         let mut provider_handles = Vec::new();
@@ -453,13 +500,14 @@ impl InboundManager {
                             "Shutting down provider inbound handler: {}",
                             opt.common_opts().name
                         );
+                        entry.stop_token.cancel();
                         provider_handles.push(h);
                     }
                 }
             }
         }
         for h in provider_handles {
-            h.abort();
+            let _ = h.await;
         }
     }
 
@@ -471,6 +519,7 @@ impl InboundManager {
             let mut guard = self.inbound_handlers.write();
             for (opt, entry) in guard.iter_mut() {
                 if let Some(h) = entry.handle.take() {
+                    entry.stop_token.cancel();
                     handles.push((opt.common_opts().name.clone(), h));
                 }
             }
@@ -489,6 +538,7 @@ impl InboundManager {
             for handles in guard.values_mut() {
                 for (opt, entry) in handles.iter_mut() {
                     if let Some(h) = entry.handle.take() {
+                        entry.stop_token.cancel();
                         provider_handles.push((opt.common_opts().name.clone(), h));
                     }
                 }
@@ -518,11 +568,13 @@ impl InboundManager {
         let dispatcher = self.dispatcher.clone();
         let authenticator = self.authenticator.clone();
         let cancellation_token = self.cancellation_token.clone();
+        let ctx = self.service_context.read().clone();
         Self::start_all_listeners(
             dispatcher,
             authenticator,
             inbound_handlers,
             cancellation_token,
+            ctx,
         )
         .await;
         Ok(())
