@@ -39,11 +39,15 @@ use crate::app::sniffer::ArcSniffer;
 // Classic AEAD ciphers cap at 0x3FFF (16383 bytes) so they are unaffected.
 const DEFAULT_BUFFER_SIZE: usize = 16 * 1024;
 const DEFAULT_UDP_SESSION_TIMEOUT_SECS: u64 = 60;
-const UDP_CHANNEL_CAPACITY: usize = 1024;
+const UDP_CHANNEL_CAPACITY: usize = 64;
 const MAX_PENDING_SNIFF_PACKETS: usize = 4;
 const MAX_CONNECTING_PACKETS: usize = 8;
 const MAX_CONNECTING_SESSIONS: usize = 256;
-const MAX_GLOBAL_CONNECTING_SESSIONS: usize = 1024;
+/// Bound all resident UDP outbound state, not just concurrent connection
+/// attempts. A permit is retained by an established session until it is
+/// expired or otherwise removed.
+const MAX_UDP_SESSIONS_PER_ACTOR: usize = 4096;
+const MAX_GLOBAL_UDP_SESSIONS: usize = 4096;
 const PENDING_SNIFF_TIMEOUT: Duration = Duration::from_millis(100);
 const CONNECTING_SESSION_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -56,7 +60,7 @@ pub struct Dispatcher {
     manager: Arc<Manager>,
     sniffer: Option<ArcSniffer>,
     tcp_buffer_size: usize,
-    udp_connect_semaphore: Arc<tokio::sync::Semaphore>,
+    udp_session_semaphore: Arc<tokio::sync::Semaphore>,
 }
 
 type SessionKey = (SocketAddr, SocksAddr);
@@ -68,6 +72,7 @@ struct OutboundSession {
     sender: OutboundPacketSender,
     delay_key: tokio_util::time::delay_queue::Key,
     _relay_handle: JoinHandle<()>,
+    _capacity_permit: tokio::sync::OwnedSemaphorePermit,
 }
 
 impl Drop for OutboundSession {
@@ -86,7 +91,7 @@ struct EstablishedSession {
 }
 
 enum EstablishOutcome {
-    Success(EstablishedSession),
+    Success(EstablishedSession, tokio::sync::OwnedSemaphorePermit),
     Failed(SessionKey, u64),
     Terminated(SessionKey, u64),
 }
@@ -125,7 +130,7 @@ struct UdpDispatchContext {
     manager: Arc<Manager>,
     mode: Arc<AtomicU8>,
     remote_receiver_w: tokio::sync::mpsc::Sender<UdpPacket>,
-    connect_semaphore: Arc<tokio::sync::Semaphore>,
+    session_semaphore: Arc<tokio::sync::Semaphore>,
 }
 
 fn make_udp_flow_session(
@@ -173,8 +178,8 @@ impl Dispatcher {
             manager,
             sniffer,
             tcp_buffer_size: tcp_buffer_size.unwrap_or(DEFAULT_BUFFER_SIZE),
-            udp_connect_semaphore: Arc::new(tokio::sync::Semaphore::new(
-                MAX_GLOBAL_CONNECTING_SESSIONS,
+            udp_session_semaphore: Arc::new(tokio::sync::Semaphore::new(
+                MAX_GLOBAL_UDP_SESSIONS,
             )),
         }
     }
@@ -418,7 +423,7 @@ impl Dispatcher {
             manager: self.manager.clone(),
             mode: self.mode.clone(),
             remote_receiver_w,
-            connect_semaphore: self.udp_connect_semaphore.clone(),
+            session_semaphore: self.udp_session_semaphore.clone(),
         };
         let sniffer = self.sniffer.clone();
         let force_dns_mapping = sniffer
@@ -472,7 +477,7 @@ impl Dispatcher {
                         // 3. Asynchronously established outbound session ready
                         Some(outcome) = session_established_rx.recv() => {
                             match outcome {
-                                EstablishOutcome::Success(established) => {
+                                EstablishOutcome::Success(established, capacity_permit) => {
                                     let session_key = established.session_key.clone();
                                     let Some(mut connecting) = connecting_sessions.remove(&session_key) else {
                                         // The connect attempt timed out or was superseded while
@@ -518,6 +523,7 @@ impl Dispatcher {
                                             sender,
                                             delay_key,
                                             _relay_handle: relay_handle,
+                                            _capacity_permit: capacity_permit,
                                         },
                                     );
                                     let _ = relay_start.send(());
@@ -562,6 +568,7 @@ impl Dispatcher {
                                             false,
                                             &ctx,
                                             &session_established_tx,
+                                            sessions.len(),
                                             &mut connecting_sessions,
                                             &mut delay_queue,
                                         );
@@ -674,6 +681,7 @@ impl Dispatcher {
                                             false,
                                             &ctx,
                                             &session_established_tx,
+                                            sessions.len(),
                                             &mut connecting_sessions,
                                             &mut delay_queue,
                                         );
@@ -693,6 +701,7 @@ impl Dispatcher {
                                             should_override,
                                             &ctx,
                                             &session_established_tx,
+                                            sessions.len(),
                                             &mut connecting_sessions,
                                             &mut delay_queue,
                                         );
@@ -710,6 +719,7 @@ impl Dispatcher {
                                             false,
                                             &ctx,
                                             &session_established_tx,
+                                            sessions.len(),
                                             &mut connecting_sessions,
                                             &mut delay_queue,
                                         );
@@ -762,6 +772,7 @@ impl Dispatcher {
                                     false,
                                     &ctx,
                                     &session_established_tx,
+                                    sessions.len(),
                                     &mut connecting_sessions,
                                     &mut delay_queue,
                                 );
@@ -818,6 +829,7 @@ impl Dispatcher {
                                 override_dest,
                                 &ctx,
                                 &session_established_tx,
+                                sessions.len(),
                                 &mut connecting_sessions,
                                 &mut delay_queue,
                             );
@@ -839,6 +851,7 @@ fn start_connecting_session(
     override_dest: bool,
     ctx: &UdpDispatchContext,
     established_tx: &tokio::sync::mpsc::Sender<EstablishOutcome>,
+    active_session_count: usize,
     connecting_sessions: &mut HashMap<SessionKey, ConnectingSession>,
     delay_queue: &mut DelayQueue<UdpQueueEvent>,
 ) {
@@ -849,10 +862,18 @@ fn start_connecting_session(
         );
         return;
     }
-    let Ok(connect_permit) = ctx.connect_semaphore.clone().try_acquire_owned()
+    if active_session_count + connecting_sessions.len() >= MAX_UDP_SESSIONS_PER_ACTOR
+    {
+        debug!(
+            "UDP outbound session limit reached for actor, dropping flow {} -> {}",
+            sess.source, sess.destination
+        );
+        return;
+    }
+    let Ok(capacity_permit) = ctx.session_semaphore.clone().try_acquire_owned()
     else {
         debug!(
-            "global UDP outbound connection limit reached, dropping flow {} -> {}",
+            "global UDP outbound session limit reached, dropping flow {} -> {}",
             sess.source, sess.destination
         );
         return;
@@ -874,7 +895,7 @@ fn start_connecting_session(
         override_dest,
         ctx,
         established_tx,
-        connect_permit,
+        capacity_permit,
     );
 
     connecting_sessions.insert(
@@ -893,7 +914,7 @@ fn spawn_establish_session(
     override_dest: bool,
     ctx: &UdpDispatchContext,
     established_tx: &tokio::sync::mpsc::Sender<EstablishOutcome>,
-    connect_permit: tokio::sync::OwnedSemaphorePermit,
+    capacity_permit: tokio::sync::OwnedSemaphorePermit,
 ) -> JoinHandle<()> {
     let ctx = ctx.clone();
     let established_tx = established_tx.clone();
@@ -906,7 +927,6 @@ fn spawn_establish_session(
     );
 
     tokio::spawn(async move {
-        let _connect_permit = connect_permit;
         let outcome = match establish_outbound_session(
             sess,
             override_dest,
@@ -915,7 +935,9 @@ fn spawn_establish_session(
         )
         .await
         {
-            Some(established) => EstablishOutcome::Success(established),
+            Some(established) => {
+                EstablishOutcome::Success(established, capacity_permit)
+            }
             None => EstablishOutcome::Failed(session_key, sess_id),
         };
         let _ = established_tx.send(outcome).await;
@@ -1270,5 +1292,34 @@ mod tests {
             .await
             .expect("aborted establish task was not dropped")
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn active_session_retains_global_capacity_permit_until_drop() {
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = semaphore.clone().acquire_owned().await.unwrap();
+        let (sender, _receiver) = tokio::sync::mpsc::channel(1);
+        let mut delay_queue = DelayQueue::new();
+        let delay_key = delay_queue.insert(
+            UdpQueueEvent::SessionIdle((
+                "127.0.0.1:12345".parse().unwrap(),
+                SocksAddr::Domain("example.com".into(), 443),
+            )),
+            Duration::from_secs(60),
+        );
+        let relay_handle = tokio::spawn(std::future::pending::<()>());
+
+        let session = OutboundSession {
+            id: 42,
+            dest: SocksAddr::Domain("example.com".into(), 443),
+            sender,
+            delay_key,
+            _relay_handle: relay_handle,
+            _capacity_permit: permit,
+        };
+
+        assert_eq!(semaphore.available_permits(), 0);
+        drop(session);
+        assert_eq!(semaphore.available_permits(), 1);
     }
 }

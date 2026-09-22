@@ -4,9 +4,13 @@ use crate::{
     session::SocksAddr,
 };
 use futures::ready;
-use shadowsocks::{ProxySocket, relay::udprelay::options::UdpSocketControlData};
+use shadowsocks::{
+    ProxySocket,
+    relay::udprelay::options::UdpSocketControlData,
+    security::replay::PacketWindow,
+};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet, hash_map::Entry},
     net::SocketAddr,
     pin::Pin,
     task::{Context, Poll},
@@ -16,7 +20,7 @@ use tokio::io::ReadBuf;
 use tracing::{debug, error};
 
 pub(crate) struct InboundShadowsocksDatagram {
-    // Per-client control data keyed by the client's SocketAddr.
+    // Per-client control data keyed by the authenticated SS2022 session.
     //
     // SS2022 multi-user UDP: the server must encrypt each response with the
     // same uPSK (user key) that was used to authenticate the corresponding
@@ -27,11 +31,9 @@ pub(crate) struct InboundShadowsocksDatagram {
     // causing responses for earlier clients to be encrypted with the wrong
     // key (MAC failure on the client side).
     //
-    // The server_session_id is the same for all clients (it identifies this
-    // server-side socket session). packet_id is tracked per-client to satisfy
-    // the monotonic-ID replay-protection requirement at each individual client.
-    server_session_id: u64,
-    client_controls: HashMap<SocketAddr, ClientControl>,
+    client_controls: HashMap<ClientSessionKey, ClientControl>,
+    address_sessions: HashMap<SocketAddr, ClientSessionKey>,
+    server_session_ids: HashSet<u64>,
 
     socket: ProxySocket<shadowsocks::net::UdpSocket>,
 
@@ -48,13 +50,23 @@ pub(crate) struct InboundShadowsocksDatagram {
 /// map can be bounded — see [`InboundShadowsocksDatagram::evict_stale_clients`].
 struct ClientControl {
     ctrl: UdpSocketControlData,
+    logical_addr: SocketAddr,
+    client_addr: SocketAddr,
     last_seen: Instant,
+    window: PacketWindow,
 }
 
-/// Cap on tracked clients. Entries are only added for clients that successfully
-/// authenticated, but a long-lived server still accumulates one per source
-/// address forever without a bound.
-const MAX_TRACKED_CLIENTS: usize = 4096;
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum ClientSessionKey {
+    Aead2022 {
+        client_session_id: u64,
+        user_hash: Option<bytes::Bytes>,
+    },
+    Legacy(SocketAddr),
+}
+
+/// Cap on tracked sessions. SS2022 entries are only added after authentication.
+const MAX_TRACKED_CLIENTS: usize = 65_536;
 
 /// Idle time after which a client's control block may be reclaimed. Well beyond
 /// any reasonable UDP session, so an active client is never evicted.
@@ -67,7 +79,6 @@ const MAX_CONSECUTIVE_RECV_ERRORS: usize = 32;
 impl std::fmt::Debug for InboundShadowsocksDatagram {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("InboundShadowsocksDatagram")
-            .field("server_session_id", &self.server_session_id)
             .field("socket", &self.socket)
             .finish()
     }
@@ -78,8 +89,9 @@ impl InboundShadowsocksDatagram {
         Self {
             buf: bytes::BytesMut::with_capacity(65535),
             socket,
-            server_session_id: rand::random::<u64>(),
             client_controls: HashMap::new(),
+            address_sessions: HashMap::new(),
+            server_session_ids: HashSet::new(),
             consecutive_recv_errors: 0,
 
             flushed: true,
@@ -87,11 +99,12 @@ impl InboundShadowsocksDatagram {
         }
     }
 
-    /// Drop control blocks for clients that have gone quiet, and if that is not
-    /// enough, the least recently seen ones. Only runs once the map is over its
-    /// cap, so the common case costs nothing.
+    /// Drop expired control blocks once the map reaches its cap. Live sessions
+    /// are retained for the full timeout so their IDs cannot be replayed early.
     fn evict_stale_clients(
-        client_controls: &mut HashMap<SocketAddr, ClientControl>,
+        client_controls: &mut HashMap<ClientSessionKey, ClientControl>,
+        address_sessions: &mut HashMap<SocketAddr, ClientSessionKey>,
+        server_session_ids: &mut HashSet<u64>,
         now: Instant,
     ) {
         if client_controls.len() < MAX_TRACKED_CLIENTS {
@@ -101,18 +114,37 @@ impl InboundShadowsocksDatagram {
         client_controls
             .retain(|_, c| now.duration_since(c.last_seen) < CLIENT_CONTROL_TTL);
 
-        // Still full of live-looking entries: shed the oldest until we are back
-        // under the cap.
-        while client_controls.len() >= MAX_TRACKED_CLIENTS {
-            let Some(oldest) = client_controls
-                .iter()
-                .min_by_key(|(_, c)| c.last_seen)
-                .map(|(addr, _)| *addr)
-            else {
-                break;
-            };
-            debug!("evicting shadowsocks udp control entry for {oldest}");
-            client_controls.remove(&oldest);
+        address_sessions.retain(|_, key| client_controls.contains_key(key));
+        server_session_ids.clear();
+        server_session_ids.extend(
+            client_controls
+                .values()
+                .map(|client| client.ctrl.server_session_id),
+        );
+    }
+
+    fn new_server_session_id(server_session_ids: &HashSet<u64>) -> u64 {
+        loop {
+            let id = rand::random::<u64>();
+            if !server_session_ids.contains(&id) {
+                return id;
+            }
+        }
+    }
+
+    fn new_logical_addr(
+        client_addr: SocketAddr,
+        address_sessions: &HashMap<SocketAddr, ClientSessionKey>,
+    ) -> SocketAddr {
+        if !address_sessions.contains_key(&client_addr) {
+            return client_addr;
+        }
+        loop {
+            let port = rand::random::<u16>();
+            let addr = SocketAddr::new(client_addr.ip(), port);
+            if port != 0 && !address_sessions.contains_key(&addr) {
+                return addr;
+            }
         }
     }
 }
@@ -127,8 +159,9 @@ impl futures::Stream for InboundShadowsocksDatagram {
         let Self {
             ref mut buf,
             ref socket,
-            ref server_session_id,
             ref mut client_controls,
+            ref mut address_sessions,
+            ref mut server_session_ids,
             ref mut consecutive_recv_errors,
             ..
         } = *self.get_mut();
@@ -159,25 +192,69 @@ impl futures::Stream for InboundShadowsocksDatagram {
                     // correct client_session_id.  packet_id is kept per-client
                     // for monotonic replay protection at each individual client.
                     let now = Instant::now();
-                    Self::evict_stale_clients(client_controls, now);
+                    Self::evict_stale_clients(
+                        client_controls,
+                        address_sessions,
+                        server_session_ids,
+                        now,
+                    );
 
-                    let entry = client_controls.entry(src).or_insert_with(|| {
-                        let mut d = UdpSocketControlData::default();
-                        d.server_session_id = *server_session_id;
-                        ClientControl {
-                            ctrl: d,
-                            last_seen: now,
+                    let session_key = match ctrl.as_ref() {
+                        Some(control) => ClientSessionKey::Aead2022 {
+                            client_session_id: control.client_session_id,
+                            user_hash: control.user.as_ref().map(|user| {
+                                bytes::Bytes::copy_from_slice(user.identity_hash())
+                            }),
+                        },
+                        None => ClientSessionKey::Legacy(src),
+                    };
+                    if !client_controls.contains_key(&session_key)
+                        && client_controls.len() >= MAX_TRACKED_CLIENTS
+                    {
+                        error!(
+                            "shadowsocks udp session limit reached; dropping new session"
+                        );
+                        continue;
+                    }
+                    let entry = match client_controls.entry(session_key) {
+                        Entry::Occupied(entry) => entry.into_mut(),
+                        Entry::Vacant(entry) => {
+                            let new_logical_addr =
+                                Self::new_logical_addr(src, address_sessions);
+                            address_sessions
+                                .insert(new_logical_addr, entry.key().clone());
+                            let server_session_id =
+                                Self::new_server_session_id(server_session_ids);
+                            server_session_ids.insert(server_session_id);
+                            let mut d = UdpSocketControlData::default();
+                            d.server_session_id = server_session_id;
+                            entry.insert(ClientControl {
+                                ctrl: d,
+                                logical_addr: new_logical_addr,
+                                client_addr: src,
+                                last_seen: now,
+                                window: PacketWindow::new(),
+                            })
                         }
-                    });
+                    };
                     entry.last_seen = now;
+                    entry.client_addr = src;
                     if let Some(ref c) = ctrl {
+                        if entry.window.check_and_set(c.packet_id) {
+                            debug!(
+                                "shadowsocks inbound udp replay detected: client_session_id={}, packet_id={}",
+                                c.client_session_id, c.packet_id
+                            );
+                            continue;
+                        }
                         entry.ctrl.client_session_id = c.client_session_id;
                         entry.ctrl.user = c.user.clone();
                     }
+                    let logical_addr = entry.logical_addr;
 
                     return Poll::Ready(Some(UdpPacket {
                         data: bytes::Bytes::copy_from_slice(&read_buf.filled()[..n]),
-                        src_addr: src.into(),
+                        src_addr: logical_addr.into(),
                         dst_addr: match target {
                             shadowsocks::relay::Address::SocketAddress(a) => {
                                 a.into()
@@ -193,6 +270,14 @@ impl futures::Stream for InboundShadowsocksDatagram {
                     }));
                 }
                 Err(e) => {
+                    if e.is_packet_error() {
+                        // Authentication, replay and malformed-packet errors
+                        // consume exactly one datagram. They are untrusted
+                        // network input, not evidence that the socket is bad.
+                        *consecutive_recv_errors = 0;
+                        debug!("dropping invalid shadowsocks udp packet: {}", e);
+                        continue;
+                    }
                     // Log the error but keep the stream alive. Without looping
                     // here, returning Poll::Pending would leave the task without
                     // a registered waker (the waker was consumed when data
@@ -209,7 +294,7 @@ impl futures::Stream for InboundShadowsocksDatagram {
                         );
                         return Poll::Ready(None);
                     }
-                    error!("failed to receive udp packet: {}", e);
+                    error!("failed to receive udp packet from socket: {}", e);
                     // Fall through to the next loop iteration: if the socket
                     // is empty, poll_recv_from_with_ctrl will re-register the
                     // waker and return Poll::Pending via ready!().
@@ -257,6 +342,7 @@ impl futures::Sink<UdpPacket> for InboundShadowsocksDatagram {
             ref mut pkt,
             ref mut flushed,
             ref mut client_controls,
+            ref address_sessions,
             ..
         } = *self;
 
@@ -295,8 +381,12 @@ impl futures::Sink<UdpPacket> for InboundShadowsocksDatagram {
                 *flushed = true;
                 return Poll::Ready(Ok(()));
             };
-            let control = match client_controls.get_mut(&client_addr) {
-                Some(c) => &mut c.ctrl,
+            let control_key = address_sessions.get(&client_addr).cloned();
+            let client = match control_key
+                .as_ref()
+                .and_then(|key| client_controls.get_mut(key))
+            {
+                Some(c) => c,
                 None => {
                     error!(
                         "no control entry for client {client_addr} - dropping \
@@ -307,9 +397,11 @@ impl futures::Sink<UdpPacket> for InboundShadowsocksDatagram {
                     return Poll::Ready(Ok(()));
                 }
             };
+            let target_addr = client.client_addr;
+            let control = &mut client.ctrl;
 
             let n = ready!(socket.poll_send_to_with_ctrl(
-                client_addr,
+                target_addr,
                 &addr,
                 control,
                 pkt.data.as_ref(),

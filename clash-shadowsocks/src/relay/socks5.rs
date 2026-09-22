@@ -74,8 +74,8 @@ impl Address {
             }
             consts::SOCKS5_ADDR_TYPE_DOMAIN_NAME => {
                 let domain_len = cur.get_u8() as usize;
-                if cur.remaining() < domain_len {
-                    return Err(Error::AddressDomainInvalidEncoding);
+                if cur.remaining() < domain_len + 2 {
+                    return Err(io::Error::other("invalid buf").into());
                 }
                 let mut buf = vec![0u8; domain_len];
                 cur.copy_to_slice(&mut buf);
@@ -267,5 +267,17 @@ fn get_addr_len(atyp: &Address) -> usize {
         Address::SocketAddress(SocketAddr::V4(..)) => 1 + 4 + 2,
         Address::SocketAddress(SocketAddr::V6(..)) => 1 + 8 * 2 + 2,
         Address::DomainNameAddress(ref dmname, _) => 1 + 1 + dmname.len() + 2,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Address;
+    use std::io::Cursor;
+
+    #[test]
+    fn truncated_domain_port_returns_error() {
+        let packet = [0x03, 0x01, b'a'];
+        assert!(Address::read_cursor(&mut Cursor::new(packet)).is_err());
     }
 }

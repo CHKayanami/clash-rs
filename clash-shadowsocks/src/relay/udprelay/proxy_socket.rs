@@ -61,6 +61,19 @@ pub enum ProxySocketError {
     InvalidServerUser(Bytes),
 }
 
+impl ProxySocketError {
+    /// Whether this error belongs to one consumed datagram. These errors must
+    /// not be treated as a persistent socket failure by receive loops.
+    pub fn is_packet_error(&self) -> bool {
+        matches!(
+            self,
+            Self::ProtocolError(..)
+                | Self::ProtocolErrorWithPeer(..)
+                | Self::InvalidServerUser(..)
+        )
+    }
+}
+
 impl From<ProxySocketError> for io::Error {
     fn from(e: ProxySocketError) -> Self {
         match e {
@@ -243,20 +256,46 @@ where
         match self.socket_type {
             UdpSocketType::Client => {
                 #[cfg(feature = "aead-cipher-2022")]
-                return decrypt_server_payload_cached(
-                    &self.context,
-                    self.method,
-                    &self.key,
-                    recv_buf,
-                    Some(&self.cipher_cache),
-                );
+                {
+                    decrypt_server_payload_cached(
+                        &self.context,
+                        self.method,
+                        &self.key,
+                        recv_buf,
+                        Some(&self.cipher_cache),
+                    )
+                }
 
                 #[cfg(not(feature = "aead-cipher-2022"))]
-                return decrypt_server_payload(&self.context, self.method, &self.key, recv_buf);
+                {
+                    decrypt_server_payload(
+                        &self.context,
+                        self.method,
+                        &self.key,
+                        recv_buf,
+                    )
+                }
             }
             UdpSocketType::Server => {
                 decrypt_client_payload(&self.context, self.method, &self.key, recv_buf, user_manager)
             }
+        }
+    }
+
+    /// Poll family function to receive decrypted packet from Shadowsocks' UDP server with control
+    #[allow(clippy::type_complexity)]
+    pub fn poll_recv_with_ctrl(
+        &self,
+        cx: &mut Context<'_>,
+        recv_buf: &mut ReadBuf<'_>,
+    ) -> Poll<ProxySocketResult<(usize, Address, usize, Option<UdpSocketControlData>)>> {
+        ready!(self.io.poll_recv(cx, recv_buf))?;
+
+        let n_recv = recv_buf.filled().len();
+
+        match self.decrypt_recv_buffer(recv_buf.filled_mut(), self.user_manager.as_deref()) {
+            Ok(x) => Poll::Ready(Ok((x.0, x.1, n_recv, x.2))),
+            Err(err) => Poll::Ready(Err(ProxySocketError::ProtocolError(err))),
         }
     }
 
@@ -267,14 +306,8 @@ where
         cx: &mut Context<'_>,
         recv_buf: &mut ReadBuf<'_>,
     ) -> Poll<ProxySocketResult<(usize, Address, usize)>> {
-        ready!(self.io.poll_recv(cx, recv_buf))?;
-
-        let n_recv = recv_buf.filled().len();
-
-        match self.decrypt_recv_buffer(recv_buf.filled_mut(), self.user_manager.as_deref()) {
-            Ok(x) => Poll::Ready(Ok((x.0, x.1, n_recv))),
-            Err(err) => Poll::Ready(Err(ProxySocketError::ProtocolError(err))),
-        }
+        self.poll_recv_with_ctrl(cx, recv_buf)
+            .map_ok(|(n, a, nr, _)| (n, a, nr))
     }
 
     /// Poll family function to receive packet from Shadowsocks' UDP server with source address and control

@@ -107,8 +107,21 @@ pub type ProtocolResult<T> = Result<T, ProtocolError>;
 #[derive(PartialEq, Eq, Hash, Clone, Copy, Debug)]
 struct CipherKey {
     method: CipherKind,
-    key: usize,
+    /// Stable, non-secret identity for the key material. A pointer cannot be
+    /// used here because allocator address reuse could return an old cipher.
+    key_hash: [u8; 32],
     session_id: u64,
+}
+
+impl CipherKey {
+    #[inline]
+    fn new(method: CipherKind, key: &[u8], session_id: u64) -> Self {
+        Self {
+            method,
+            key_hash: *blake3::hash(key).as_bytes(),
+            session_id,
+        }
+    }
 }
 
 const CIPHER_CACHE_LIMIT: usize = 4096;
@@ -135,15 +148,16 @@ impl UdpCipherCache {
     pub fn get_or_create(&self, is_send: bool, method: CipherKind, key: &[u8], session_id: u64) -> Arc<UdpCipher> {
         let slot = if is_send { &self.send } else { &self.recv };
         {
-            if let Ok(guard) = slot.lock() {
-                if let Some((s_id, ref cipher)) = *guard {
-                    if s_id == session_id {
-                        return cipher.clone();
-                    }
-                }
+            if let Ok(guard) = slot.lock()
+                && let Some((s_id, ref cipher)) = *guard
+                && s_id == session_id
+            {
+                return cipher.clone();
             }
         }
-        let cipher = get_cipher(method, key, session_id);
+        // A ProxySocket owns this cache and its method/key never change. Avoid
+        // the global multi-session cache on a local one-slot cache miss.
+        let cipher = Arc::new(UdpCipher::new(method, key, session_id));
         if let Ok(mut guard) = slot.lock() {
             *guard = Some((session_id, cipher.clone()));
         }
@@ -168,20 +182,15 @@ pub fn get_now_timestamp() -> u64 {
 }
 
 fn get_cipher(method: CipherKind, key: &[u8], session_id: u64) -> Arc<UdpCipher> {
-    let cache_key = CipherKey {
-        method,
-        // The key is stored in ServerConfig structure, so the address of it won't change.
-        key: key.as_ptr() as usize,
-        session_id,
-    };
+    let cache_key = CipherKey::new(method, key, session_id);
 
     FAST_PATH.with(|fast| {
         let mut fast = fast.borrow_mut();
 
-        if let Some((ref k, ref cipher)) = *fast {
-            if *k == cache_key {
-                return cipher.clone();
-            }
+        if let Some((ref k, ref cipher)) = *fast
+            && *k == cache_key
+        {
+            return cipher.clone();
         }
 
         let cipher = CIPHER_CACHE
@@ -723,7 +732,7 @@ pub fn decrypt_server_payload_aead_2022_cached(
 ) -> ProtocolResult<(usize, Address, UdpSocketControlData)> {
     let nonce_len = get_nonce_len(method);
     let tag_len = method.tag_len();
-    let header_len = nonce_len + tag_len + 8 + 8 + 1 + 8 + 2;
+    let header_len = nonce_len + tag_len + 8 + 8 + 1 + 8 + 8 + 2;
     if payload.len() < header_len {
         return Err(ProtocolError::PacketTooShort(header_len, payload.len()));
     }
@@ -772,4 +781,35 @@ pub fn decrypt_server_payload_aead_2022_cached(
     payload.copy_within(nonce_len + payload_start..nonce_len + payload_start + payload_len, 0);
 
     Ok((payload_len, addr, control))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const METHOD: CipherKind = CipherKind::AEAD2022_BLAKE3_CHACHA20_POLY1305;
+
+    #[test]
+    fn cipher_key_depends_on_key_material_not_allocation_address() {
+        let first = vec![7_u8; 32];
+        let same_contents_different_allocation = first.clone();
+        let different = vec![8_u8; 32];
+
+        let first_key = CipherKey::new(METHOD, &first, 42);
+        assert_eq!(first_key, CipherKey::new(METHOD, &same_contents_different_allocation, 42));
+        assert_ne!(first_key, CipherKey::new(METHOD, &different, 42));
+    }
+
+    #[test]
+    fn per_socket_cache_reuses_only_the_matching_session() {
+        let cache = UdpCipherCache::new();
+        let key = [9_u8; 32];
+
+        let first = cache.get_or_create(true, METHOD, &key, 1);
+        let reused = cache.get_or_create(true, METHOD, &key, 1);
+        let next_session = cache.get_or_create(true, METHOD, &key, 2);
+
+        assert!(Arc::ptr_eq(&first, &reused));
+        assert!(!Arc::ptr_eq(&first, &next_session));
+    }
 }

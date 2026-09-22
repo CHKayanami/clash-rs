@@ -496,4 +496,199 @@ mod tests {
 
         Ok(())
     }
+
+    #[tokio::test]
+    async fn test_aead2022_udp_sessions_and_replay_protection() -> anyhow::Result<()> {
+        use crate::proxy::datagram::UdpPacket;
+        use crate::proxy::shadowsocks::inbound::datagram::InboundShadowsocksDatagram;
+        use futures::{SinkExt, StreamExt, future::poll_fn};
+        use shadowsocks::{
+            config::{ServerConfig, ServerType},
+            context::Context,
+            relay::udprelay::{
+                options::UdpSocketControlData,
+                proxy_socket::{ProxySocket, UdpSocketType},
+            },
+        };
+        use tokio::{io::ReadBuf, net::UdpSocket};
+
+        let server_socket = UdpSocket::bind("127.0.0.1:0").await?;
+        let server_addr = server_socket.local_addr()?;
+        let method = shadowsocks::crypto::CipherKind::AEAD2022_BLAKE3_AES_128_GCM;
+        let config = ServerConfig::new(
+            server_addr,
+            "AAAAAAAAAAAAAAAAAAAAAA==".to_owned(),
+            method,
+        )?;
+        let server = ProxySocket::from_socket(
+            UdpSocketType::Server,
+            Context::new_shared(ServerType::Server),
+            &config,
+            server_socket.into(),
+        );
+        let mut inbound = InboundShadowsocksDatagram::new(server);
+
+        let client1_socket = UdpSocket::bind("127.0.0.1:0").await?;
+        let client1_addr = client1_socket.local_addr()?;
+        let client1: ProxySocket<shadowsocks::net::UdpSocket> =
+            ProxySocket::from_socket(
+                UdpSocketType::Client,
+                Context::new_shared(ServerType::Local),
+                &config,
+                client1_socket.into(),
+            );
+        let client2_socket = UdpSocket::bind("127.0.0.1:0").await?;
+        let client2_addr = client2_socket.local_addr()?;
+        let client2: ProxySocket<shadowsocks::net::UdpSocket> =
+            ProxySocket::from_socket(
+                UdpSocketType::Client,
+                Context::new_shared(ServerType::Local),
+                &config,
+                client2_socket.into(),
+            );
+        let target = shadowsocks::relay::Address::SocketAddress(
+            "1.1.1.1:53".parse().unwrap(),
+        );
+
+        let mut control1 = UdpSocketControlData::default();
+        control1.client_session_id = 101;
+        let mut control2 = UdpSocketControlData::default();
+        control2.client_session_id = 202;
+        poll_fn(|cx| {
+            client1.poll_send_to_with_ctrl(
+                server_addr,
+                &target,
+                &control1,
+                b"client one",
+                cx,
+            )
+        })
+        .await?;
+        poll_fn(|cx| {
+            client2.poll_send_to_with_ctrl(
+                server_addr,
+                &target,
+                &control2,
+                b"client two",
+                cx,
+            )
+        })
+        .await?;
+
+        let request1 = inbound.next().await.unwrap();
+        let request2 = inbound.next().await.unwrap();
+        assert_eq!(request1.data.as_ref(), b"client one");
+        assert_eq!(request2.data.as_ref(), b"client two");
+
+        inbound
+            .send(UdpPacket {
+                data: bytes::Bytes::from_static(b"response one"),
+                src_addr: SocksAddr::Ip("1.1.1.1:53".parse().unwrap()),
+                dst_addr: SocksAddr::Ip(client1_addr),
+                inbound_user: None,
+            })
+            .await?;
+        inbound
+            .send(UdpPacket {
+                data: bytes::Bytes::from_static(b"response two"),
+                src_addr: SocksAddr::Ip("1.1.1.1:53".parse().unwrap()),
+                dst_addr: SocksAddr::Ip(client2_addr),
+                inbound_user: None,
+            })
+            .await?;
+
+        let mut response1 = [0_u8; 2048];
+        let (_, _, _, _, response_control1) = poll_fn(|cx| {
+            let mut buf = ReadBuf::new(&mut response1);
+            client1.poll_recv_from_with_ctrl(cx, &mut buf)
+        })
+        .await?;
+        let mut response2 = [0_u8; 2048];
+        let (_, _, _, _, response_control2) = poll_fn(|cx| {
+            let mut buf = ReadBuf::new(&mut response2);
+            client2.poll_recv_from_with_ctrl(cx, &mut buf)
+        })
+        .await?;
+        let response_control1 = response_control1.unwrap();
+        let response_control2 = response_control2.unwrap();
+        assert_eq!(response_control1.client_session_id, 101);
+        assert_eq!(response_control2.client_session_id, 202);
+        assert_ne!(
+            response_control1.server_session_id,
+            response_control2.server_session_id
+        );
+
+        // The same client session may move to a new network address. Replies
+        // queued against the old address must follow the session to the latest
+        // validated address and keep the same server session ID.
+        let migrated_socket = UdpSocket::bind("127.0.0.1:0").await?;
+        let migrated: ProxySocket<shadowsocks::net::UdpSocket> =
+            ProxySocket::from_socket(
+                UdpSocketType::Client,
+                Context::new_shared(ServerType::Local),
+                &config,
+                migrated_socket.into(),
+            );
+        control1.packet_id = 1;
+        poll_fn(|cx| {
+            migrated.poll_send_to_with_ctrl(
+                server_addr,
+                &target,
+                &control1,
+                b"migrated",
+                cx,
+            )
+        })
+        .await?;
+        let migrated_request = inbound.next().await.unwrap();
+        assert_eq!(migrated_request.data.as_ref(), b"migrated");
+        inbound
+            .send(UdpPacket {
+                data: bytes::Bytes::from_static(b"migrated response"),
+                src_addr: SocksAddr::Ip("1.1.1.1:53".parse().unwrap()),
+                dst_addr: SocksAddr::Ip(client1_addr),
+                inbound_user: None,
+            })
+            .await?;
+        let mut migrated_response = [0_u8; 2048];
+        let (_, _, _, _, migrated_control) = poll_fn(|cx| {
+            let mut buf = ReadBuf::new(&mut migrated_response);
+            migrated.poll_recv_from_with_ctrl(cx, &mut buf)
+        })
+        .await?;
+        assert_eq!(
+            migrated_control.unwrap().server_session_id,
+            response_control1.server_session_id
+        );
+
+        // Invalid datagrams are per-packet failures. Even more than the socket
+        // error threshold must not terminate the inbound UDP service.
+        for _ in 0..64 {
+            poll_fn(|cx| {
+                migrated.poll_send_to_with_ctrl(
+                    server_addr,
+                    &target,
+                    &control1,
+                    b"duplicate",
+                    cx,
+                )
+            })
+            .await?;
+        }
+        control1.packet_id = 2;
+        poll_fn(|cx| {
+            migrated.poll_send_to_with_ctrl(
+                server_addr,
+                &target,
+                &control1,
+                b"after replay",
+                cx,
+            )
+        })
+        .await?;
+        let after_replay = inbound.next().await.unwrap();
+        assert_eq!(after_replay.data.as_ref(), b"after replay");
+
+        Ok(())
+    }
 }

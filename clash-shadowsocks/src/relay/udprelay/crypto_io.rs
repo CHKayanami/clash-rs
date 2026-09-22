@@ -55,6 +55,18 @@ pub enum ProtocolError {
     #[cfg(feature = "aead-cipher-2022")]
     #[error(transparent)]
     Aead2022Error(#[from] super::aead_2022::ProtocolError),
+    #[cfg(feature = "aead-cipher-2022")]
+    #[error("replayed or out-of-window UDP packet")]
+    UdpReplay,
+    #[cfg(feature = "aead-cipher-2022")]
+    #[error("UDP response belongs to an unknown client session")]
+    UnknownClientSession,
+    #[cfg(feature = "aead-cipher-2022")]
+    #[error("too many active UDP sessions")]
+    TooManyUdpSessions,
+    #[cfg(feature = "aead-cipher-2022")]
+    #[error("UDP replay state lock is poisoned")]
+    ReplayStatePoisoned,
 }
 
 /// UDP shadowsocks protocol errors

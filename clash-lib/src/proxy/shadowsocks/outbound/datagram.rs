@@ -17,6 +17,7 @@ use shadowsocks::{
     relay::udprelay::{
         DatagramReceive, DatagramSend, options::UdpSocketControlData,
     },
+    security::replay::PacketWindow,
 };
 use tokio::io::ReadBuf;
 use tracing::{debug, error, instrument};
@@ -55,6 +56,8 @@ pub struct OutboundDatagramShadowsocks<S> {
     consecutive_recv_errors: usize,
 
     ss_control: UdpSocketControlData,
+    server_session_id: Option<u64>,
+    window: PacketWindow,
 }
 
 impl<S> OutboundDatagramShadowsocks<S> {
@@ -70,6 +73,8 @@ impl<S> OutboundDatagramShadowsocks<S> {
             consecutive_recv_errors: 0,
 
             ss_control,
+            server_session_id: None,
+            window: PacketWindow::new(),
         }
     }
 }
@@ -193,12 +198,32 @@ where
             loop {
                 let mut read_buf = ReadBuf::new(recv_buf.as_mut());
 
-                let rv = ready!(me.inner.poll_recv(cx, &mut read_buf));
+                let rv = ready!(me.inner.poll_recv_with_ctrl(cx, &mut read_buf));
                 debug!("recv udp packet from remote ss server: {:?}", rv);
 
                 match rv {
-                    Ok((n, src, ..)) => {
+                    Ok((n, src, _dst, ctrl)) => {
                         me.consecutive_recv_errors = 0;
+                        if let Some(control) = ctrl {
+                            if control.client_session_id != me.ss_control.client_session_id {
+                                debug!(
+                                    "dropping packet with mismatched client_session_id: expected {}, got {}",
+                                    me.ss_control.client_session_id, control.client_session_id
+                                );
+                                continue;
+                            }
+                            if me.server_session_id != Some(control.server_session_id) {
+                                me.server_session_id = Some(control.server_session_id);
+                                me.window = PacketWindow::new();
+                            }
+                            if me.window.check_and_set(control.packet_id) {
+                                debug!(
+                                    "shadowsocks outbound udp replay detected: server_session_id={}, packet_id={}",
+                                    control.server_session_id, control.packet_id
+                                );
+                                continue;
+                            }
+                        }
                         let data = Bytes::copy_from_slice(&recv_buf[..n]);
                         return Poll::Ready(Some(UdpPacket {
                             data,
@@ -222,6 +247,14 @@ where
                     // `while let Some(..)`, so `None` tears down the relay task.
                     // Drop the packet and keep the session alive instead.
                     Err(e) => {
+                        if e.is_packet_error() {
+                            me.consecutive_recv_errors = 0;
+                            debug!(
+                                "dropping invalid shadowsocks udp packet: {}",
+                                e
+                            );
+                            continue;
+                        }
                         me.consecutive_recv_errors += 1;
                         if me.consecutive_recv_errors >= MAX_CONSECUTIVE_RECV_ERRORS {
                             error!(
