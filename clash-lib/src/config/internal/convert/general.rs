@@ -30,6 +30,7 @@ pub(super) fn convert(c: &def::Config) -> Result<General, crate::Error> {
         mode: c.mode,
         log_level: c.log_level,
         ipv6: c.ipv6,
+        quic: c.quic,
         interface: c.interface.as_ref().map(|iface| {
             if let Ok(addr) = iface.parse::<IpAddr>() {
                 Interface::IpAddr(addr)

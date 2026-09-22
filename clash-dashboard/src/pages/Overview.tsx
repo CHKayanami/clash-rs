@@ -6,7 +6,7 @@ import { TrafficChart } from '../components/TrafficChart';
 import { ProxyGroups } from '../components/ProxyGroups';
 import {
   ArrowUp, ArrowDown, Activity, HardDrive,
-  Globe, Router, Sliders, Server, Wifi, FileText, Shield,
+  Globe, Router, Sliders, Server, Wifi, FileText, Shield, Zap,
   RefreshCw, ChevronDown, ChevronUp,
 } from 'lucide-react';
 import type { PatchableConfig, ClashConfig } from '../lib/api';
@@ -360,6 +360,9 @@ export function Overview() {
               </EditRow>
               <EditRow label="IPv6" icon={<Globe size={14} color="white" />} iconBg="#0071e3">
                 <ToggleSwitch value={cfg.ipv6 ?? false} onChange={(v) => patch({ ipv6: v })} />
+              </EditRow>
+              <EditRow label="QUIC (UDP 443)" icon={<Zap size={14} color="white" />} iconBg="#af52de">
+                <ToggleSwitch value={cfg.quic ?? true} onChange={(v) => patch({ quic: v })} />
               </EditRow>
             </EditSection>
 

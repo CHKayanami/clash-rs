@@ -18,7 +18,7 @@ use std::{
     net::SocketAddr,
     sync::{
         Arc,
-        atomic::{AtomicU8, Ordering},
+        atomic::{AtomicBool, AtomicU8, Ordering},
     },
     time::Duration,
 };
@@ -52,6 +52,7 @@ pub struct Dispatcher {
     router: ArcRouter,
     resolver: ThreadSafeDNSResolver,
     mode: Arc<AtomicU8>,
+    allow_quic: Arc<AtomicBool>,
     manager: Arc<Manager>,
     sniffer: Option<ArcSniffer>,
     tcp_buffer_size: usize,
@@ -161,12 +162,14 @@ impl Dispatcher {
         manager: Arc<Manager>,
         tcp_buffer_size: Option<usize>,
         sniffer: Option<ArcSniffer>,
+        allow_quic: bool,
     ) -> Self {
         Self {
             outbound_manager,
             router,
             resolver,
             mode: Arc::new(AtomicU8::new(mode as u8)),
+            allow_quic: Arc::new(AtomicBool::new(allow_quic)),
             manager,
             sniffer,
             tcp_buffer_size: tcp_buffer_size.unwrap_or(DEFAULT_BUFFER_SIZE),
@@ -184,6 +187,15 @@ impl Dispatcher {
 
     pub fn get_mode(&self) -> RunMode {
         decode_mode(self.mode.load(Ordering::Relaxed))
+    }
+
+    pub fn set_quic(&self, allow: bool) {
+        info!("QUIC traffic {}", if allow { "allowed" } else { "blocked" });
+        self.allow_quic.store(allow, Ordering::Relaxed);
+    }
+
+    pub fn get_quic(&self) -> bool {
+        self.allow_quic.load(Ordering::Relaxed)
     }
 
     pub fn router(&self) -> &ArcRouter {
@@ -412,6 +424,7 @@ impl Dispatcher {
         let force_dns_mapping = sniffer
             .as_ref()
             .map_or(false, |s| s.config.force_dns_mapping);
+        let allow_quic = self.allow_quic.clone();
 
         let current_span = tracing::Span::current();
 
@@ -435,6 +448,14 @@ impl Dispatcher {
 
                         // 2. Reply packets from remote outbounds -> send to local_w
                         Some(packet) = remote_receiver_r.recv() => {
+                            if !allow_quic.load(Ordering::Relaxed) && packet.src_addr.port() == 443 {
+                                trace!(
+                                    "QUIC reply packet dropped (UDP 443) from {}",
+                                    packet.src_addr
+                                );
+                                continue;
+                            }
+
                             // Refresh session activity on downstream reply packets
                             if let Some(src_addr) = packet.dst_addr.clone().try_into_socket_addr() {
                                 let session_key = (src_addr, packet.src_addr.clone());
@@ -576,6 +597,14 @@ impl Dispatcher {
                             }
                             if let SocksAddr::Ip(addr) = &mut packet.src_addr {
                                 addr.set_ip(addr.ip().to_canonical());
+                            }
+
+                            if !allow_quic.load(Ordering::Relaxed) && packet.dst_addr.port() == 443 {
+                                trace!(
+                                    "QUIC packet dropped (UDP 443) from {} to {}",
+                                    packet.src_addr, packet.dst_addr
+                                );
+                                continue;
                             }
 
                             let Some(src_addr) = (match packet.src_addr {

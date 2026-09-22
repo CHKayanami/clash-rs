@@ -98,6 +98,7 @@ pub struct General {
     pub mode: RunMode,
     pub log_level: LogLevel,
     pub ipv6: bool,
+    pub quic: bool,
     pub interface: Option<Interface>,
     pub routing_mask: Option<u32>,
     pub mmdb: Option<String>,

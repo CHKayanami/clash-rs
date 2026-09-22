@@ -1713,6 +1713,86 @@ async fn test_patch_mode_and_log_level_together() {
     );
 }
 
+/// PATCH /configs with quic (and alias allow-quic) should toggle quic setting.
+#[tokio::test(flavor = "current_thread")]
+async fn test_patch_quic() {
+    let (_clash, api_port) = start_unique_client();
+    let url = format!("http://127.0.0.1:{}/configs", api_port);
+
+    // Initial GET should return quic: true (default enabled)
+    let initial_res = send_http_request(
+        url.parse().unwrap(),
+        auth_get(&url),
+    )
+    .await
+    .expect("Failed to GET /configs");
+    let initial_json = parse_json(initial_res).await;
+    assert_eq!(
+        initial_json.get("quic").and_then(|v| v.as_bool()),
+        Some(true),
+        "quic should default to true"
+    );
+
+    // PATCH with {"quic": false}
+    let patch_req = hyper::Request::builder()
+        .uri(&url)
+        .header(hyper::header::AUTHORIZATION, "Bearer clash-rs")
+        .header(hyper::header::CONTENT_TYPE, "application/json")
+        .method(http::method::Method::PATCH)
+        .body(http_body_util::Full::new(Bytes::from(r#"{"quic": false}"#)))
+        .expect("Failed to build PATCH request");
+
+    let patch_res = send_http_request(url.parse().unwrap(), patch_req)
+        .await
+        .expect("Failed to PATCH /configs quic=false");
+    assert_eq!(
+        patch_res.status(),
+        http::StatusCode::ACCEPTED,
+        "PATCH /configs quic should return 202"
+    );
+
+    let after_json = parse_json(
+        send_http_request(url.parse().unwrap(), auth_get(&url))
+            .await
+            .expect("Failed to GET /configs after quic PATCH"),
+    )
+    .await;
+    assert_eq!(
+        after_json.get("quic").and_then(|v| v.as_bool()),
+        Some(false),
+        "quic should be false after PATCH"
+    );
+
+    // PATCH with alias {"allow-quic": true}
+    let patch_req2 = hyper::Request::builder()
+        .uri(&url)
+        .header(hyper::header::AUTHORIZATION, "Bearer clash-rs")
+        .header(hyper::header::CONTENT_TYPE, "application/json")
+        .method(http::method::Method::PATCH)
+        .body(http_body_util::Full::new(Bytes::from(r#"{"allow-quic": true}"#)))
+        .expect("Failed to build PATCH request");
+
+    let patch_res2 = send_http_request(url.parse().unwrap(), patch_req2)
+        .await
+        .expect("Failed to PATCH /configs allow-quic=true");
+    assert_eq!(
+        patch_res2.status(),
+        http::StatusCode::ACCEPTED,
+    );
+
+    let after_json2 = parse_json(
+        send_http_request(url.parse().unwrap(), auth_get(&url))
+            .await
+            .expect("Failed to GET /configs after allow-quic PATCH"),
+    )
+    .await;
+    assert_eq!(
+        after_json2.get("quic").and_then(|v| v.as_bool()),
+        Some(true),
+        "quic should be true after alias allow-quic PATCH"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // GET /proxies/{name}/delay  – measures latency of a single proxy
 // ---------------------------------------------------------------------------

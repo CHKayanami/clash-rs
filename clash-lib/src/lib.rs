@@ -1018,6 +1018,7 @@ async fn create_components(
         statistics_manager.clone(),
         config.experimental.and_then(|e| e.tcp_buffer_size),
         sniffer,
+        config.general.quic,
     ));
 
     debug!("initializing authenticator");

@@ -33,6 +33,7 @@ export interface ClashConfig {
   'log-level'?: string;
   ipv6?: boolean;
   'allow-lan'?: boolean;
+  quic?: boolean;
   listeners?: InboundEndpoint[];
   'lan-ips'?: string[];
   'dns-listen'?: DnsListenInfo;

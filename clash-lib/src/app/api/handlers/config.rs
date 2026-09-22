@@ -132,6 +132,7 @@ async fn get_configs(State(state): State<ConfigState>) -> impl IntoResponse {
         log_level: Some(log_level),
         ipv6: Some(state.dns_resolver.ipv6()),
         allow_lan: Some(allow_lan),
+        quic: Some(state.dispatcher.get_quic()),
         listeners: Some(listeners),
         lan_ips,
         dns_listen,
@@ -234,6 +235,8 @@ struct GetConfigResponse {
     ipv6: Option<bool>,
     allow_lan: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    quic: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     listeners: Option<Vec<InboundEndpoint>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     lan_ips: Option<Vec<String>>,
@@ -254,6 +257,8 @@ struct PatchConfigRequest {
     log_level: Option<def::LogLevel>,
     ipv6: Option<bool>,
     allow_lan: Option<bool>,
+    #[serde(alias = "allow-quic", alias = "allow_quic")]
+    quic: Option<bool>,
 }
 
 impl PatchConfigRequest {
@@ -314,6 +319,10 @@ async fn patch_configs(
     // established after the restart immediately use the updated mode.
     if let Some(mode) = payload.mode {
         state.dispatcher.set_mode(mode);
+    }
+
+    if let Some(quic) = payload.quic {
+        state.dispatcher.set_quic(quic);
     }
 
     if need_restart {

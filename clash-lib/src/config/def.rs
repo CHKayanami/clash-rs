@@ -626,6 +626,11 @@ pub struct Config {
     /// this will affect the DNS server response to AAAA questions
     /// default is `false`
     pub ipv6: bool,
+    /// whether to allow QUIC traffic (UDP port 443)
+    /// default is `true`
+    #[serde(default = "default_true", alias = "allow-quic", alias = "allow_quic")]
+    #[educe(Default = true)]
+    pub quic: bool,
     /// external controller address
     pub external_controller: Option<String>,
 
@@ -2310,5 +2315,28 @@ proxies:
         let proxies = c.proxy.expect("proxies should be present");
         assert_eq!(proxies.len(), 1);
         assert_eq!(proxies[0].name(), "socks-node");
+    }
+
+    #[test]
+    fn test_quic_config_parsing() {
+        let empty_cfg = "mode: rule\n";
+        let c = empty_cfg.parse::<Config>().expect("parse empty config");
+        assert!(c.quic, "quic should default to true");
+
+        let internal: crate::config::internal::config::Config =
+            c.try_into().expect("convert empty config");
+        assert!(internal.general.quic, "internal general.quic should be true");
+
+        let quic_false_cfg = "mode: rule\nquic: false\n";
+        let c = quic_false_cfg.parse::<Config>().expect("parse quic false");
+        assert!(!c.quic);
+
+        let allow_quic_kebab = "mode: rule\nallow-quic: false\n";
+        let c = allow_quic_kebab.parse::<Config>().expect("parse allow-quic");
+        assert!(!c.quic);
+
+        let allow_quic_snake = "mode: rule\nallow_quic: false\n";
+        let c = allow_quic_snake.parse::<Config>().expect("parse allow_quic");
+        assert!(!c.quic);
     }
 }
