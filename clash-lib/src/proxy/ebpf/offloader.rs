@@ -1,11 +1,12 @@
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::net::IpAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
+use std::time::Duration;
 use tokio::time::Instant;
 
 use super::utils::is_reserved_ip;
-use crate::app::dns::ThreadSafeDNSResolver;
+use crate::app::dns::{ClashResolver, ThreadSafeDNSResolver};
 use crate::app::remote_content_manager::providers::rule_provider::CidrTrie;
 
 pub type DomainKey = Arc<str>;
@@ -98,7 +99,11 @@ impl OffloadDesiredState {
     }
 
     /// Observe a batch of DNS resolution outcomes for optimal batched state recomputation.
-    pub fn observe_batch(&mut self, observations: Vec<DnsObservation>, now: Instant) {
+    pub fn observe_batch(
+        &mut self,
+        observations: Vec<DnsObservation>,
+        now: Instant,
+    ) {
         self.expire(now);
         let mut affected_ips = HashSet::new();
         for obs in observations {
@@ -130,8 +135,10 @@ impl OffloadDesiredState {
         let seq = self.sequence;
         let expires_at = now + ttl;
 
-        let incoming_v4: HashSet<IpAddr> = ips.iter().filter(|ip| ip.is_ipv4()).copied().collect();
-        let incoming_v6: HashSet<IpAddr> = ips.iter().filter(|ip| ip.is_ipv6()).copied().collect();
+        let incoming_v4: HashSet<IpAddr> =
+            ips.iter().filter(|ip| ip.is_ipv4()).copied().collect();
+        let incoming_v6: HashSet<IpAddr> =
+            ips.iter().filter(|ip| ip.is_ipv6()).copied().collect();
         let has_v4 = !incoming_v4.is_empty();
         let has_v6 = !incoming_v6.is_empty();
 
@@ -271,7 +278,12 @@ impl OffloadDesiredState {
         }
     }
 
-    fn add_ip_ownership(&mut self, domain: &DomainKey, ip: IpAddr, action: RoutingAction) {
+    fn add_ip_ownership(
+        &mut self,
+        domain: &DomainKey,
+        ip: IpAddr,
+        action: RoutingAction,
+    ) {
         self.reverse
             .entry(ip)
             .or_default()
@@ -283,7 +295,12 @@ impl OffloadDesiredState {
         }
     }
 
-    fn remove_ip_ownership(&mut self, domain: &str, ip: IpAddr, action: RoutingAction) {
+    fn remove_ip_ownership(
+        &mut self,
+        domain: &str,
+        ip: IpAddr,
+        action: RoutingAction,
+    ) {
         if let Some(domains) = self.reverse.get_mut(&ip) {
             domains.remove(domain);
             if domains.is_empty() {
@@ -295,7 +312,9 @@ impl OffloadDesiredState {
                 RoutingAction::Direct => {
                     counts.direct_count = counts.direct_count.saturating_sub(1)
                 }
-                RoutingAction::Proxy => counts.proxy_count = counts.proxy_count.saturating_sub(1),
+                RoutingAction::Proxy => {
+                    counts.proxy_count = counts.proxy_count.saturating_sub(1)
+                }
             }
             if counts.direct_count == 0 && counts.proxy_count == 0 {
                 self.ip_action_counts.remove(&ip);
@@ -303,13 +322,20 @@ impl OffloadDesiredState {
         }
     }
 
-    fn switch_ip_action(&mut self, ip: IpAddr, old_action: RoutingAction, new_action: RoutingAction) {
+    fn switch_ip_action(
+        &mut self,
+        ip: IpAddr,
+        old_action: RoutingAction,
+        new_action: RoutingAction,
+    ) {
         if let Some(counts) = self.ip_action_counts.get_mut(&ip) {
             match old_action {
                 RoutingAction::Direct => {
                     counts.direct_count = counts.direct_count.saturating_sub(1)
                 }
-                RoutingAction::Proxy => counts.proxy_count = counts.proxy_count.saturating_sub(1),
+                RoutingAction::Proxy => {
+                    counts.proxy_count = counts.proxy_count.saturating_sub(1)
+                }
             }
             match new_action {
                 RoutingAction::Direct => counts.direct_count += 1,
@@ -352,14 +378,19 @@ impl OffloadDesiredState {
         now: Option<Instant>,
         affected_ips: &mut HashSet<IpAddr>,
     ) {
-        let (fully_expired, removed_ips) = match self.owners.get_mut(&deadline.domain) {
+        let (fully_expired, removed_ips) = match self
+            .owners
+            .get_mut(&deadline.domain)
+        {
             Some(owner) => {
                 let mut removed = Vec::new();
                 match deadline.family {
                     AddressFamily::V4 => {
                         let should_expire = owner.v4_sequence == deadline.sequence
                             && match now {
-                                Some(t) => owner.v4_expires_at.is_some_and(|exp| exp <= t),
+                                Some(t) => {
+                                    owner.v4_expires_at.is_some_and(|exp| exp <= t)
+                                }
                                 None => true, // Force eviction regardless of TTL
                             };
                         if should_expire {
@@ -373,7 +404,9 @@ impl OffloadDesiredState {
                     AddressFamily::V6 => {
                         let should_expire = owner.v6_sequence == deadline.sequence
                             && match now {
-                                Some(t) => owner.v6_expires_at.is_some_and(|exp| exp <= t),
+                                Some(t) => {
+                                    owner.v6_expires_at.is_some_and(|exp| exp <= t)
+                                }
                                 None => true, // Force eviction regardless of TTL
                             };
                         if should_expire {
@@ -397,7 +430,8 @@ impl OffloadDesiredState {
         }
 
         if fully_expired {
-            if let Some((domain_key, _)) = self.owners.remove_entry(&deadline.domain) {
+            if let Some((domain_key, _)) = self.owners.remove_entry(&deadline.domain)
+            {
                 if now.is_some() {
                     tracing::info!(
                         "[eBPF DirectOffloader] Domain TTL expired and cleared: {}",
@@ -416,7 +450,8 @@ impl OffloadDesiredState {
     /// Enforce maximum desired IPs and domain owners capacity via Earliest-Deadline Eviction.
     fn enforce_capacity(&mut self) {
         let mut affected_ips = HashSet::new();
-        while (self.desired.len() > self.max_desired_ips || self.owners.len() > self.max_owners)
+        while (self.desired.len() > self.max_desired_ips
+            || self.owners.len() > self.max_owners)
             && !self.expiry_deadlines.is_empty()
         {
             self.prune_stale_heads();
@@ -506,7 +541,7 @@ pub struct DnsObservation {
 #[derive(Clone)]
 pub struct DirectOffloader {
     tx: tokio::sync::mpsc::UnboundedSender<DnsObservation>,
-    resolver: ThreadSafeDNSResolver,
+    resolver: Weak<dyn ClashResolver>,
     bypass_dst_trie: Arc<CidrTrie>,
     proxy_dst_trie: Arc<CidrTrie>,
 }
@@ -521,7 +556,12 @@ impl DirectOffloader {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<DnsObservation>();
 
         tokio::spawn(async move {
+            const INITIAL_RETRY_DELAY: Duration = Duration::from_secs(1);
+            const MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
+
             let mut state = OffloadDesiredState::new();
+            let mut retry_delay = INITIAL_RETRY_DELAY;
+            let mut retry_at = None;
 
             let mut add_v4 = Vec::new();
             let mut add_v6 = Vec::new();
@@ -556,18 +596,24 @@ impl DirectOffloader {
                         }
                     }
 
-                    if !add_v4.is_empty()
+                    let has_updates = !add_v4.is_empty()
                         || !add_v6.is_empty()
                         || !del_v4.is_empty()
-                        || !del_v6.is_empty()
-                    {
+                        || !del_v6.is_empty();
+                    let mut flush_succeeded = !has_updates;
+                    if has_updates {
                         if let Some(mgr) = manager.get() {
                             if let Err(e) = mgr
-                                .update_dynamic_bypass_batch(&add_v4, &add_v6, &del_v4, &del_v6)
+                                .update_dynamic_bypass_batch(
+                                    &add_v4, &add_v6, &del_v4, &del_v6,
+                                )
                                 .await
                             {
-                                tracing::warn!("eBPF dynamic bypass batch update failed: {e}");
+                                tracing::warn!(
+                                    "eBPF dynamic bypass batch update failed: {e} (retrying in {retry_delay:?})"
+                                );
                             } else {
+                                flush_succeeded = true;
                                 if !add_v4.is_empty() || !add_v6.is_empty() {
                                     tracing::info!(
                                         "[eBPF DirectOffloader] Dynamic bypass added: IPv4={:?}, IPv6={:?}",
@@ -595,24 +641,46 @@ impl DirectOffloader {
                                     state.applied.remove(&IpAddr::V6(*v6));
                                 }
                             }
+                        } else {
+                            tracing::debug!(
+                                "eBPF manager not initialized yet, deferring dynamic bypass flush (retrying in {retry_delay:?})"
+                            );
                         }
                     }
-                    state.dirty_ips.clear();
+                    if flush_succeeded {
+                        state.dirty_ips.clear();
+                        retry_at = None;
+                        retry_delay = INITIAL_RETRY_DELAY;
+                    } else {
+                        retry_at = Some(Instant::now() + retry_delay);
+                        retry_delay = (retry_delay * 2).min(MAX_RETRY_DELAY);
+                    }
                 }
 
                 let next_deadline = state.next_deadline();
+                let next_wakeup = match (next_deadline, retry_at) {
+                    (Some(deadline), Some(retry)) => Some(deadline.min(retry)),
+                    (Some(deadline), None) => Some(deadline),
+                    (None, Some(retry)) => Some(retry),
+                    (None, None) => None,
+                };
 
                 tokio::select! {
-                    Some(obs) = rx.recv() => {
-                        let now = Instant::now();
-                        let mut batch = vec![obs];
-                        while let Ok(next_obs) = rx.try_recv() {
-                            batch.push(next_obs);
+                    observation = rx.recv() => {
+                        match observation {
+                            Some(obs) => {
+                                let now = Instant::now();
+                                let mut batch = vec![obs];
+                                while let Ok(next_obs) = rx.try_recv() {
+                                    batch.push(next_obs);
+                                }
+                                state.observe_batch(batch, now);
+                            }
+                            None => break,
                         }
-                        state.observe_batch(batch, now);
                     }
                     _ = async {
-                        if let Some(deadline) = next_deadline {
+                        if let Some(deadline) = next_wakeup {
                             tokio::time::sleep_until(deadline).await;
                         } else {
                             std::future::pending::<()>().await;
@@ -626,7 +694,7 @@ impl DirectOffloader {
 
         Self {
             tx,
-            resolver,
+            resolver: Arc::downgrade(&resolver),
             bypass_dst_trie,
             proxy_dst_trie,
         }
@@ -643,7 +711,11 @@ impl DirectOffloader {
         let mut effective_action = action;
 
         for ip in ips {
-            if is_reserved_ip(ip) || self.resolver.is_fake_ip(ip) {
+            let is_fake_ip = self
+                .resolver
+                .upgrade()
+                .is_some_and(|resolver| resolver.is_fake_ip(ip));
+            if is_reserved_ip(ip) || is_fake_ip {
                 continue;
             }
             if self.proxy_dst_trie.contains(ip) {
@@ -669,6 +741,7 @@ impl DirectOffloader {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::dns::{MockClashResolver, ThreadSafeDNSResolver};
 
     fn observe_one(
         state: &mut OffloadDesiredState,
@@ -687,6 +760,31 @@ mod tests {
             }],
             now,
         );
+    }
+
+    #[tokio::test]
+    async fn direct_offloader_does_not_retain_resolver() {
+        let resolver: ThreadSafeDNSResolver = Arc::new(MockClashResolver::new());
+        let weak_resolver = Arc::downgrade(&resolver);
+        let manager = Arc::new(tokio::sync::OnceCell::new());
+
+        let offloader = DirectOffloader::new(
+            manager,
+            resolver.clone(),
+            Arc::new(CidrTrie::new()),
+            Arc::new(CidrTrie::new()),
+        );
+
+        drop(resolver);
+        assert!(
+            weak_resolver.upgrade().is_none(),
+            "the DNS hook/offloader relationship must not retain the resolver"
+        );
+
+        // Dropping the last sender closes the worker channel, allowing the
+        // background reconciler to terminate instead of surviving a reload.
+        drop(offloader);
+        tokio::task::yield_now().await;
     }
 
     #[test]

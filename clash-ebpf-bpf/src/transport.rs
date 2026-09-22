@@ -312,8 +312,11 @@ impl ParseTransportExt for ParseTransportCtx {
             self.ihl = self.iph.ihl();
             self.l4proto = self.iph.proto;
 
-            let frag_off = u16::from_be(self.iph.frag_offset()) & 0x1FFF;
-            if frag_off != 0 {
+            // Keep every fragment on the normal kernel path. Redirecting only the
+            // first fragment would split one datagram across two network namespaces,
+            // so neither side could reassemble it. DF is not a fragmentation bit.
+            let frag = u16::from_be(self.iph.frag_offset());
+            if frag & 0x3FFF != 0 {
                 return Err(PARSE_FRAGMENT as c_long);
             }
 
@@ -390,7 +393,9 @@ impl ParseTransportExt for ParseTransportCtx {
                     nexthdr = fragh.nexthdr;
                     self.l4proto = nexthdr;
                     offset += mem::size_of::<FragHdr>() as u32;
-                    if (u16::from_be(fragh.frag_off) & 0xFFF8) != 0 {
+                    // Offset bits or M=1 indicate a real fragmented packet. Atomic
+                    // fragments (offset=0, M=0) remain safe to parse normally.
+                    if (u16::from_be(fragh.frag_off) & 0xFFF9) != 0 {
                         return Err(PARSE_FRAGMENT as c_long);
                     }
                     continue;
@@ -538,8 +543,8 @@ impl ParseTransportExt for ParseTransportCtx {
             self.ihl = iph.ihl();
             self.l4proto = iph.proto;
 
-            let frag_off = u16::from_be(iph.frag_offset()) & 0x1FFF;
-            if frag_off != 0 {
+            let frag = u16::from_be(iph.frag_offset());
+            if frag & 0x3FFF != 0 {
                 return Err(PARSE_FRAGMENT as c_long);
             }
 
@@ -606,7 +611,7 @@ impl ParseTransportExt for ParseTransportCtx {
                     nexthdr = fragh.nexthdr;
                     self.l4proto = nexthdr;
                     offset += mem::size_of::<FragHdr>() as u32;
-                    if (u16::from_be(fragh.frag_off) & 0xFFF8) != 0 {
+                    if (u16::from_be(fragh.frag_off) & 0xFFF9) != 0 {
                         return Err(PARSE_FRAGMENT as c_long);
                     }
                     continue;

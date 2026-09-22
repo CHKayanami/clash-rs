@@ -308,10 +308,10 @@ pub mod linux {
             netns: Option<&crate::netns::linux::DaeNs>,
         ) -> Result<(), String> {
             if obj_bytes.is_empty() {
-                warn!(
-                    "eBPF ELF bytecode is empty; skipping eBPF kernel hooks attachment"
+                return Err(
+                    "eBPF ELF bytecode is empty; build clash-ebpf-bpf before enabling eBPF"
+                        .to_string(),
                 );
-                return Ok(());
             }
 
             info!(
@@ -324,15 +324,20 @@ pub mod linux {
                 .map_err(|e| format!("Failed to load eBPF object: {e}"))?;
 
             // 1. Initialize parameter map
-            if let Some(map) = bpf.map_mut("DAE_PARAM") {
-                if let Ok(mut param_map) = Array::<_, DaeParam>::try_from(map) {
-                    let _ = param_map.set(0, *param, 0);
-                    debug!(
-                        "DAE_PARAM map initialized: tproxy_port={}, dae0_ifindex={}",
-                        param.tproxy_port, param.dae0_ifindex
-                    );
-                }
-            }
+            let map = bpf
+                .map_mut("DAE_PARAM")
+                .ok_or_else(|| "required map 'DAE_PARAM' not found".to_string())?;
+            let mut param_map =
+                Array::<_, DaeParam>::try_from(map).map_err(|e| {
+                    format!("map 'DAE_PARAM' has incompatible type: {e}")
+                })?;
+            param_map
+                .set(0, *param, 0)
+                .map_err(|e| format!("failed to initialize DAE_PARAM: {e}"))?;
+            debug!(
+                "DAE_PARAM map initialized: tproxy_port={}, dae0_ifindex={}",
+                param.tproxy_port, param.dae0_ifindex
+            );
 
             // 2. Populate BYPASS_SRC_PORTS map (e.g., local server ports)
             if let Some(map) = bpf.map_mut("BYPASS_SRC_PORTS") {
@@ -609,9 +614,10 @@ pub mod linux {
 
             self.bpf = Some(bpf);
 
-            // 13. Attach cgroup bypass and process tracking hooks
-            if let Err(e) = self.attach_cgroup() {
-                warn!("cgroup bypass attachment: {e}");
+            // Local-process proxying depends on complete cookie/PID tracking and
+            // control-plane bypass coverage. Partial cgroup attachment is unsafe.
+            if param.proxy_local != 0 {
+                self.attach_cgroup()?;
             }
 
             // 14. Attach TC Ingress on configured/detected LAN interfaces (局域网入站拦截)
@@ -635,15 +641,15 @@ pub mod linux {
                     } else {
                         "lan_ingress_l3"
                     };
-                    if let Err(e) = self.attach_tc_interface(lan, true, prog_name) {
-                        warn!(
-                            "Failed to attach TC ingress ({}) on {}: {}",
-                            prog_name, lan, e
-                        );
-                    } else {
-                        info!("Attached TC ingress ({}) on {}", prog_name, lan);
-                    }
+                    self.attach_tc_interface(lan, true, prog_name)?;
+                    info!("Attached TC ingress ({}) on {}", prog_name, lan);
                 }
+            }
+
+            if effective_lan.is_empty() && param.proxy_local == 0 {
+                return Err(
+                    "no LAN interface available for eBPF ingress".to_string()
+                );
             }
 
             // 15. Attach TC Egress on configured WAN interface (or primary LAN interface in single-homed setups)
@@ -658,41 +664,35 @@ pub mod linux {
                 }
                 Some(wan) => Some(wan),
             };
-            if let Some(wan) = effective_wan {
-                if !wan.is_empty() {
-                    let prog_name = if Self::iface_is_ethernet(wan) {
-                        "wan_egress_l2"
-                    } else {
-                        "wan_egress_l3"
-                    };
-                    if let Err(e) = self.attach_tc_interface(wan, false, prog_name) {
-                        warn!(
-                            "Failed to attach TC egress ({}) on {}: {}",
-                            prog_name, wan, e
-                        );
-                    } else {
-                        info!("Attached TC egress ({}) on {}", prog_name, wan);
-                    }
-                }
+            if param.proxy_local != 0 {
+                let wan = effective_wan.filter(|wan| !wan.is_empty()).ok_or_else(
+                    || {
+                        "no WAN interface available for local eBPF proxying"
+                            .to_string()
+                    },
+                )?;
+                let prog_name = if Self::iface_is_ethernet(wan) {
+                    "wan_egress_l2"
+                } else {
+                    "wan_egress_l3"
+                };
+                self.attach_tc_interface(wan, false, prog_name)?;
+                info!("Attached TC egress ({}) on {}", prog_name, wan);
             }
 
             // 16. Attach TC Ingress on dae0 for reply short-circuit and MAC restoration (in host netns)
-            if let Err(e) = self.attach_tc_interface("dae0", true, "dae0_ingress") {
-                warn!("Failed to attach TC ingress on dae0: {}", e);
-            }
+            self.attach_tc_interface("dae0", true, "dae0_ingress")?;
 
             // 17. Attach sk_lookup and TC Ingress on dae0peer inside daens
-            if let Some(ns) = netns {
-                if let Err(e) = self.attach_sk_lookup(ns) {
-                    warn!("Failed to attach sk_lookup in daens: {}", e);
-                }
-                let _ = ns.with_daens(|| -> Result<(), String> {
-                    if let Err(e) = self.attach_tc_interface("dae0peer", true, "dae0peer_ingress") {
-                        warn!("Failed to attach TC ingress on dae0peer inside daens: {}", e);
-                    }
-                    Ok(())
-                });
-            }
+            let ns =
+                netns.ok_or_else(|| "daens namespace is required".to_string())?;
+            self.attach_sk_lookup(ns)?;
+            ns.with_daens(|| {
+                self.attach_tc_interface("dae0peer", true, "dae0peer_ingress")
+            })
+            .map_err(|e| {
+                format!("failed to enter daens for TC attachment: {e}")
+            })??;
 
             info!("eBPF programs and TC/cgroup hooks successfully attached");
             Ok(())
@@ -747,10 +747,9 @@ pub mod linux {
                         for ip in add_v4 {
                             let k = u32::from_ne_bytes(ip.octets());
                             if let Err(e) = bpf_update_elem_raw(raw_fd, &k, &1u8) {
-                                debug!(
-                                    "Failed to insert dynamic bypass IPv4 {}: errno={}",
-                                    ip, e
-                                );
+                                return Err(format!(
+                                    "failed to insert dynamic bypass IPv4 {ip}: errno={e}"
+                                ));
                             }
                         }
                     }
@@ -778,7 +777,13 @@ pub mod linux {
                     if !handled {
                         for ip in remove_v4 {
                             let k = u32::from_ne_bytes(ip.octets());
-                            let _ = bpf_delete_elem_raw(raw_fd, &k);
+                            if let Err(e) = bpf_delete_elem_raw(raw_fd, &k)
+                                && e != libc::ENOENT as i64
+                            {
+                                return Err(format!(
+                                    "failed to remove dynamic bypass IPv4 {ip}: errno={e}"
+                                ));
+                            }
                         }
                     }
                 }
@@ -822,10 +827,9 @@ pub mod linux {
                         for ip in add_v6 {
                             let k = ip.octets();
                             if let Err(e) = bpf_update_elem_raw(raw_fd, &k, &1u8) {
-                                debug!(
-                                    "Failed to insert dynamic bypass IPv6 {}: errno={}",
-                                    ip, e
-                                );
+                                return Err(format!(
+                                    "failed to insert dynamic bypass IPv6 {ip}: errno={e}"
+                                ));
                             }
                         }
                     }
@@ -855,7 +859,13 @@ pub mod linux {
                     if !handled {
                         for ip in remove_v6 {
                             let k = ip.octets();
-                            let _ = bpf_delete_elem_raw(raw_fd, &k);
+                            if let Err(e) = bpf_delete_elem_raw(raw_fd, &k)
+                                && e != libc::ENOENT as i64
+                            {
+                                return Err(format!(
+                                    "failed to remove dynamic bypass IPv6 {ip}: errno={e}"
+                                ));
+                            }
                         }
                     }
                 }
@@ -942,12 +952,9 @@ pub mod linux {
                 return Err("eBPF not loaded".to_string());
             };
 
-            let Some(cgroup_path) = Self::detect_cgroup_path() else {
-                warn!(
-                    "cgroup2 not mounted; cgroup bypass & process tracking hooks skipped"
-                );
-                return Ok(());
-            };
+            let cgroup_path = Self::detect_cgroup_path().ok_or_else(|| {
+                "cgroup2 not mounted; local-process proxying requires cgroup hooks".to_string()
+            })?;
 
             let cgroup_file = File::open(&cgroup_path).map_err(|e| {
                 format!("Failed to open cgroup {}: {e}", cgroup_path)
@@ -1073,17 +1080,17 @@ pub mod linux {
                 }
             }
 
-            if attached_count > 0 {
-                info!(
-                    "Successfully attached {attached_count} cgroup programs to {}",
-                    cgroup_path
-                );
-            } else {
-                warn!(
-                    "No cgroup programs were successfully attached to {}",
-                    cgroup_path
-                );
+            const REQUIRED_CGROUP_PROGRAMS: usize = 6;
+            if attached_count != REQUIRED_CGROUP_PROGRAMS {
+                return Err(format!(
+                    "attached only {attached_count}/{REQUIRED_CGROUP_PROGRAMS} required cgroup programs to {cgroup_path}"
+                ));
             }
+
+            info!(
+                "Successfully attached {attached_count} cgroup programs to {}",
+                cgroup_path
+            );
 
             Ok(())
         }
@@ -1344,6 +1351,46 @@ pub mod linux {
                 }
             }
             guard.clear_ready();
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn empty_object_is_a_startup_error() {
+            let mut manager = BpfProgramManager::new();
+            let empty_strings = Vec::<String>::new();
+            let empty_ports = Vec::<u16>::new();
+            let empty_u8 = Vec::<u8>::new();
+            let empty_u32 = Vec::<u32>::new();
+
+            let error = manager
+                .load_and_attach(
+                    &[],
+                    &DaeParam::default(),
+                    &empty_strings,
+                    None,
+                    &empty_ports,
+                    &empty_ports,
+                    &empty_strings,
+                    &empty_strings,
+                    &empty_ports,
+                    &empty_ports,
+                    &empty_strings,
+                    &empty_strings,
+                    &empty_strings,
+                    &empty_strings,
+                    &empty_u8,
+                    &empty_u32,
+                    None,
+                )
+                .expect_err(
+                    "an empty object must not produce a successful datapath",
+                );
+
+            assert!(error.contains("bytecode is empty"));
         }
     }
 }

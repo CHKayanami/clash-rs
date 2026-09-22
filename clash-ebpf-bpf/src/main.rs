@@ -19,8 +19,8 @@ use aya_ebpf_bindings::helpers::{
     bpf_skb_change_head, bpf_skb_store_bytes,
 };
 use clash_ebpf_common::{
-    DIRECT_TRACK_STATE_ACTIVE, DAE_BYPASS_MARK, DAE_TPROXY_MARK, DaeEvent, DaeEventType, DaeParam,
-    DirectTrackEntry, PIDName, RedirectEntry, RedirectTuple,
+    DAE_BYPASS_MARK, DAE_TPROXY_MARK, DIRECT_TRACK_STATE_ACTIVE, DaeEvent,
+    DaeEventType, DaeParam, DirectTrackEntry, PIDName, RedirectEntry, RedirectTuple,
 };
 use core::mem;
 use maps::*;
@@ -42,7 +42,6 @@ const SK_TCP4: u32 = 0;
 const SK_TCP6: u32 = 1;
 const SK_UDP4: u32 = 2;
 const SK_UDP6: u32 = 3;
-
 
 // ── Helper functions ──
 
@@ -152,7 +151,6 @@ fn is_src_ip4_bypassed(ip_be: [u8; 4]) -> bool {
     BYPASS_SRC_IPS.get(&key).is_some()
 }
 
-
 #[inline(always)]
 fn is_dst_ip4_bypassed(ip_be: [u8; 4]) -> bool {
     let ip_u32 = u32::from_ne_bytes(ip_be);
@@ -185,7 +183,6 @@ fn is_src_ip6_bypassed(ip: [u8; 16]) -> bool {
     let key = Key::new(128, ip);
     BYPASS_SRC_IP6S.get(&key).is_some()
 }
-
 
 #[inline(always)]
 fn is_dst_ip6_bypassed(ip: [u8; 16]) -> bool {
@@ -244,7 +241,8 @@ fn check_direct_track(
         if is_tcp {
             if is_fin_rst {
                 let _ = DIRECT_TRACK.remove(tuple);
-            } else if now.wrapping_sub(last_seen_ns) > CONN_TRACK_UPDATE_INTERVAL_NS {
+            } else if now.wrapping_sub(last_seen_ns) > CONN_TRACK_UPDATE_INTERVAL_NS
+            {
                 let updated = DirectTrackEntry {
                     last_seen_ns: now,
                     state: DIRECT_TRACK_STATE_ACTIVE,
@@ -398,7 +396,9 @@ fn handle_lan_ipv4(
         }
 
         // 静态目标 IP / 目标端口 Bypass 判定 (无需入表)
-        if is_dst_ip4_bypassed(ip_be) || is_dst_port_bypassed(dst_port, param.tproxy_port as u16) {
+        if is_dst_ip4_bypassed(ip_be)
+            || is_dst_port_bypassed(dst_port, param.tproxy_port as u16)
+        {
             return TC_ACT_OK;
         }
 
@@ -513,7 +513,9 @@ fn handle_lan_ipv6(
     // 2. 常规业务流量目标过滤 (DNS 53 强制劫持到代理)
     if dst_port != 53 {
         // 静态目标 IP / 目标端口 Bypass 判定 (无需入表)
-        if is_dst_ip6_bypassed(dst_ip) || is_dst_port_bypassed(dst_port, param.tproxy_port as u16) {
+        if is_dst_ip6_bypassed(dst_ip)
+            || is_dst_port_bypassed(dst_port, param.tproxy_port as u16)
+        {
             return TC_ACT_OK;
         }
 
@@ -609,7 +611,8 @@ fn handle_lan_ingress_impl(tc_ctx: &TcContext, link_h_len: usize) -> i32 {
 
     if mark == DAE_BYPASS_MARK
         || (param.dae_socket_mark != 0 && mark == param.dae_socket_mark)
-        || (param.has_bypass_fwmarks != 0 && unsafe { BYPASS_FWMARKS.get(&mark).is_some() })
+        || (param.has_bypass_fwmarks != 0
+            && unsafe { BYPASS_FWMARKS.get(&mark).is_some() })
     {
         return TC_ACT_OK;
     }
@@ -619,7 +622,9 @@ fn handle_lan_ingress_impl(tc_ctx: &TcContext, link_h_len: usize) -> i32 {
         Err(_) => return TC_ACT_OK,
     };
 
-    if param.has_bypass_dscps != 0 && unsafe { BYPASS_DSCPS.get(&pkt.tuples.dscp).is_some() } {
+    if param.has_bypass_dscps != 0
+        && unsafe { BYPASS_DSCPS.get(&pkt.tuples.dscp).is_some() }
+    {
         return TC_ACT_OK;
     }
 
@@ -687,7 +692,9 @@ fn handle_wan_ipv4(
         }
 
         // 静态目标 IP / 目标端口 Bypass 判定 (无需入表)
-        if is_dst_ip4_bypassed(ip_be) || is_dst_port_bypassed(dst_port, param.tproxy_port as u16) {
+        if is_dst_ip4_bypassed(ip_be)
+            || is_dst_port_bypassed(dst_port, param.tproxy_port as u16)
+        {
             return TC_ACT_OK;
         }
 
@@ -789,7 +796,9 @@ fn handle_wan_ipv6(
     // 1. 常规业务流量目标过滤 (DNS 53 强制劫持到代理)
     if dst_port != 53 {
         // 静态目标 IP / 目标端口 Bypass 判定 (无需入表)
-        if is_dst_ip6_bypassed(dst_ip) || is_dst_port_bypassed(dst_port, param.tproxy_port as u16) {
+        if is_dst_ip6_bypassed(dst_ip)
+            || is_dst_port_bypassed(dst_port, param.tproxy_port as u16)
+        {
             return TC_ACT_OK;
         }
 
@@ -888,7 +897,8 @@ fn handle_wan_egress_impl(tc_ctx: &TcContext, link_h_len: usize) -> i32 {
     // 1. Clash 自身发出的出站请求 (带 DAE_BYPASS_MARK 或配置的 dae_socket_mark 或配置的 bypass_fwmarks): 绝对放行防自环/绕过
     if mark == DAE_BYPASS_MARK
         || (param.dae_socket_mark != 0 && mark == param.dae_socket_mark)
-        || (param.has_bypass_fwmarks != 0 && unsafe { BYPASS_FWMARKS.get(&mark).is_some() })
+        || (param.has_bypass_fwmarks != 0
+            && unsafe { BYPASS_FWMARKS.get(&mark).is_some() })
     {
         return TC_ACT_OK;
     }
@@ -904,6 +914,13 @@ fn handle_wan_egress_impl(tc_ctx: &TcContext, link_h_len: usize) -> i32 {
     } else {
         None
     };
+
+    // A configured allow-list must fail closed. Socket metadata can be absent
+    // when a socket predates the cgroup hook or when cookie tracking fails; in
+    // that case we cannot prove that this process was selected for proxying.
+    if param.has_proxy_processes != 0 && pid_pname.is_none() {
+        return TC_ACT_OK;
+    }
 
     // 3. 进程过滤 (提前短路，避免不必要的数据包解析开销)
     if let Some(pp) = pid_pname {
@@ -930,7 +947,9 @@ fn handle_wan_egress_impl(tc_ctx: &TcContext, link_h_len: usize) -> i32 {
         Err(_) => return TC_ACT_OK,
     };
 
-    if param.has_bypass_dscps != 0 && unsafe { BYPASS_DSCPS.get(&pkt.tuples.dscp).is_some() } {
+    if param.has_bypass_dscps != 0
+        && unsafe { BYPASS_DSCPS.get(&pkt.tuples.dscp).is_some() }
+    {
         return TC_ACT_OK;
     }
 
@@ -946,7 +965,6 @@ fn handle_wan_egress_impl(tc_ctx: &TcContext, link_h_len: usize) -> i32 {
         TC_ACT_OK
     }
 }
-
 
 // ─────────────────────────────────────────────────────────────
 // 3. TC Entrypoints

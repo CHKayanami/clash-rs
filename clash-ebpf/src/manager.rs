@@ -27,6 +27,8 @@ pub enum EbpfError {
     Listener(#[from] ListenerError),
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
+    #[error("eBPF datapath failure: {0}")]
+    Bpf(String),
 }
 
 pub struct EbpfManager {
@@ -49,7 +51,6 @@ impl EbpfManager {
         }
     }
 
-
     /// Initializes the eBPF datapath, veth topology, and transparent listener.
     pub async fn start(&mut self) -> Result<Arc<EbpfListener>, EbpfError> {
         #[cfg(not(target_os = "linux"))]
@@ -60,8 +61,8 @@ impl EbpfManager {
         #[cfg(target_os = "linux")]
         {
             use crate::netlink::{
-                self, FAM_V4, FAM_V6, NlSock, PROTO_STATIC, ROUTE_LOCAL, ROUTE_UNICAST,
-                SCOPE_HOST, SCOPE_LINK, SCOPE_UNIVERSE,
+                self, FAM_V4, FAM_V6, NlSock, PROTO_STATIC, ROUTE_LOCAL,
+                ROUTE_UNICAST, SCOPE_HOST, SCOPE_LINK, SCOPE_UNIVERSE,
             };
             use std::net::{Ipv4Addr, Ipv6Addr};
 
@@ -103,121 +104,139 @@ impl EbpfManager {
             let dae_fd = ns.dae_fd();
             // SAFETY: borrowing raw fd from owned fd inside daens
             let borrowed_fd = unsafe { std::os::fd::BorrowedFd::borrow_raw(dae_fd) };
-            let owned_fd = borrowed_fd.try_clone_to_owned().map_err(EbpfError::Io)?;
+            let owned_fd =
+                borrowed_fd.try_clone_to_owned().map_err(EbpfError::Io)?;
             host_nl.set_link_netns_fd(peer_idx, &owned_fd)?;
 
             // Configure within daens
-            let dae0peer_mac = ns.with_daens(|| -> std::io::Result<[u8; 6]> {
-                let mut n = NlSock::new()?;
-                let (lo_idx, _) = n.get_link("lo")?;
-                let (dae0peer_idx, mac) = n.get_link("dae0peer")?;
+            let dae0peer_mac =
+                ns.with_daens(|| -> std::io::Result<[u8; 6]> {
+                    let mut n = NlSock::new()?;
+                    let (lo_idx, _) = n.get_link("lo")?;
+                    let (dae0peer_idx, mac) = n.get_link("dae0peer")?;
 
-                n.set_link_up(lo_idx, true)?;
-                n.set_link_up(dae0peer_idx, true)?;
+                    n.set_link_up(lo_idx, true)?;
+                    n.set_link_up(dae0peer_idx, true)?;
 
-                let final_mac = if mac != [0; 6] {
-                    mac
-                } else {
-                    n.get_link("dae0peer")?.1
-                };
+                    let final_mac = if mac != [0; 6] {
+                        mac
+                    } else {
+                        n.get_link("dae0peer")?.1
+                    };
 
-                // Fwmark -> table 100 with local route
-                n.add_rule_fwmark(FAM_V4, TPROXY_MARK, 100)?;
-                n.add_route(
-                    FAM_V4,
-                    100,
-                    ROUTE_LOCAL,
-                    SCOPE_HOST,
-                    PROTO_STATIC,
-                    None,
-                    None,
-                    Some(lo_idx),
-                )?;
+                    // Fwmark -> table 100 with local route
+                    n.add_rule_fwmark(FAM_V4, TPROXY_MARK, 100)?;
+                    n.add_route(
+                        FAM_V4,
+                        100,
+                        ROUTE_LOCAL,
+                        SCOPE_HOST,
+                        PROTO_STATIC,
+                        None,
+                        None,
+                        Some(lo_idx),
+                    )?;
 
-                let _ = n.add_rule_fwmark(FAM_V6, TPROXY_MARK, 100);
-                let _ = n.add_route(
-                    FAM_V6,
-                    100,
-                    ROUTE_LOCAL,
-                    SCOPE_HOST,
-                    PROTO_STATIC,
-                    None,
-                    None,
-                    Some(lo_idx),
-                );
+                    let _ = n.add_rule_fwmark(FAM_V6, TPROXY_MARK, 100);
+                    let _ = n.add_route(
+                        FAM_V6,
+                        100,
+                        ROUTE_LOCAL,
+                        SCOPE_HOST,
+                        PROTO_STATIC,
+                        None,
+                        None,
+                        Some(lo_idx),
+                    );
 
-                // Add peer IP & default route to host via dae0peer
-                n.addr_op(true, dae0peer_idx, FAM_V4, &peer_v4.octets(), 32)?;
-                n.add_route(
-                    FAM_V4,
-                    254,
-                    ROUTE_UNICAST,
-                    SCOPE_LINK,
-                    PROTO_STATIC,
-                    Some((&host_v4.octets(), 32)),
-                    None,
-                    Some(dae0peer_idx),
-                )?;
-                n.add_route(
-                    FAM_V4,
-                    254,
-                    ROUTE_UNICAST,
-                    SCOPE_UNIVERSE,
-                    PROTO_STATIC,
-                    None,
-                    Some(&host_v4.octets()),
-                    Some(dae0peer_idx),
-                )?;
+                    // Add peer IP & default route to host via dae0peer
+                    n.addr_op(true, dae0peer_idx, FAM_V4, &peer_v4.octets(), 32)?;
+                    n.add_route(
+                        FAM_V4,
+                        254,
+                        ROUTE_UNICAST,
+                        SCOPE_LINK,
+                        PROTO_STATIC,
+                        Some((&host_v4.octets(), 32)),
+                        None,
+                        Some(dae0peer_idx),
+                    )?;
+                    n.add_route(
+                        FAM_V4,
+                        254,
+                        ROUTE_UNICAST,
+                        SCOPE_UNIVERSE,
+                        PROTO_STATIC,
+                        None,
+                        Some(&host_v4.octets()),
+                        Some(dae0peer_idx),
+                    )?;
 
-                let _ = n.addr_op(true, dae0peer_idx, FAM_V6, &peer_v6.octets(), 64);
-                let _ = n.add_route(
-                    FAM_V6,
-                    254,
-                    ROUTE_UNICAST,
-                    SCOPE_UNIVERSE,
-                    PROTO_STATIC,
-                    None,
-                    Some(&host_v6.octets()),
-                    Some(dae0peer_idx),
-                );
+                    let _ =
+                        n.addr_op(true, dae0peer_idx, FAM_V6, &peer_v6.octets(), 64);
+                    let _ = n.add_route(
+                        FAM_V6,
+                        254,
+                        ROUTE_UNICAST,
+                        SCOPE_UNIVERSE,
+                        PROTO_STATIC,
+                        None,
+                        Some(&host_v6.octets()),
+                        Some(dae0peer_idx),
+                    );
 
-                // Static neighbour entry for dae0
-                n.neigh_replace(dae0peer_idx, FAM_V4, &host_v4.octets(), &dae0_mac)?;
-                let _ = n.neigh_replace(dae0peer_idx, FAM_V6, &host_v6.octets(), &dae0_mac);
+                    // Static neighbour entry for dae0
+                    n.neigh_replace(
+                        dae0peer_idx,
+                        FAM_V4,
+                        &host_v4.octets(),
+                        &dae0_mac,
+                    )?;
+                    let _ = n.neigh_replace(
+                        dae0peer_idx,
+                        FAM_V6,
+                        &host_v6.octets(),
+                        &dae0_mac,
+                    );
 
-                // Netns sysctls
-                for (key, val) in [
-                    ("net.ipv4.ip_nonlocal_bind", "1"),
-                    ("net.ipv6.ip_nonlocal_bind", "1"),
-                    ("net.ipv4.conf.all.rp_filter", "0"),
-                    ("net.ipv4.conf.all.accept_local", "1"),
-                    ("net.ipv4.conf.all.route_localnet", "1"),
-                    ("net.ipv4.conf.dae0peer.rp_filter", "0"),
-                    ("net.ipv4.conf.dae0peer.accept_local", "1"),
-                    ("net.ipv4.conf.dae0peer.route_localnet", "1"),
-                    ("net.ipv4.conf.lo.accept_local", "1"),
-                    ("net.ipv4.conf.lo.route_localnet", "1"),
-                    ("net.ipv6.conf.all.forwarding", "1"),
-                    ("net.ipv6.conf.dae0peer.forwarding", "1"),
-                    ("net.ipv6.conf.dae0peer.accept_ra", "0"),
-                ] {
-                    let _ = netlink::set_sysctl(key, val);
-                }
+                    // Netns sysctls
+                    for (key, val) in [
+                        ("net.ipv4.ip_nonlocal_bind", "1"),
+                        ("net.ipv6.ip_nonlocal_bind", "1"),
+                        ("net.ipv4.conf.all.rp_filter", "0"),
+                        ("net.ipv4.conf.all.accept_local", "1"),
+                        ("net.ipv4.conf.all.route_localnet", "1"),
+                        ("net.ipv4.conf.dae0peer.rp_filter", "0"),
+                        ("net.ipv4.conf.dae0peer.accept_local", "1"),
+                        ("net.ipv4.conf.dae0peer.route_localnet", "1"),
+                        ("net.ipv4.conf.lo.accept_local", "1"),
+                        ("net.ipv4.conf.lo.route_localnet", "1"),
+                        ("net.ipv6.conf.all.forwarding", "1"),
+                        ("net.ipv6.conf.dae0peer.forwarding", "1"),
+                        ("net.ipv6.conf.dae0peer.accept_ra", "0"),
+                    ] {
+                        let _ = netlink::set_sysctl(key, val);
+                    }
 
-                Ok(final_mac)
-            })??;
+                    Ok(final_mac)
+                })??;
 
             // Bind transparent listener inside daens
             let listener = Arc::new(EbpfListener::bind(&ns, self.config.clone())?);
 
             // Resolve effective WAN interface (handling "auto", OpenWrt PPPoE/VLAN, multi-metric routes)
             let effective_wan = match self.config.wan_interface.as_deref() {
-                Some("auto") | None | Some("") => detect_default_wan_interface(&self.config.lan_interface),
+                Some("auto") | None | Some("") => {
+                    detect_default_wan_interface(&self.config.lan_interface)
+                }
                 Some(w) => Some(w.to_string()),
             };
 
             // Resolve effective LAN interfaces (handling "auto", OpenWrt br-lan, multi-NIC and single-NIC setups)
-            let effective_lan = detect_lan_interfaces(&self.config.lan_interface, effective_wan.as_deref());
+            let effective_lan = detect_lan_interfaces(
+                &self.config.lan_interface,
+                effective_wan.as_deref(),
+            );
 
             info!(
                 "Resolved network topology -> LAN interfaces: {:?}, WAN interface: {:?}",
@@ -225,11 +244,15 @@ impl EbpfManager {
             );
 
             let mut all_dst_ips = self.config.target.bypass_dst_ips.clone();
-            let detected_ips = detect_interface_ips(&effective_lan, effective_wan.as_deref());
+            let detected_ips =
+                detect_interface_ips(&effective_lan, effective_wan.as_deref());
             let mut local_ip_u32 = 0u32;
             for ip in &detected_ips {
                 if !all_dst_ips.contains(ip) {
-                    info!("Auto-detected host interface IP: {}, injected into bypass whitelist", ip);
+                    info!(
+                        "Auto-detected host interface IP: {}, injected into bypass whitelist",
+                        ip
+                    );
                     all_dst_ips.push(ip.clone());
                 }
                 if local_ip_u32 == 0 {
@@ -240,16 +263,56 @@ impl EbpfManager {
             }
             all_dst_ips = crate::config::aggregate_ip_cidrs(&all_dst_ips);
 
-            let has_proxy_src_ips = if !self.config.lan.proxy_src_ips.is_empty() { 1 } else { 0 };
-            let has_proxy_dst_ips = if !self.config.target.proxy_dst_ips.is_empty() { 1 } else { 0 };
-            let has_proxy_src_ports = if !self.config.lan.proxy_src_ports.is_empty() { 1 } else { 0 };
-            let has_proxy_dst_ports = if !self.config.target.proxy_dst_ports.is_empty() { 1 } else { 0 };
-            let direct_offload_enabled = if self.config.auto_direct_offload { 1 } else { 0 };
+            let has_proxy_src_ips = if !self.config.lan.proxy_src_ips.is_empty() {
+                1
+            } else {
+                0
+            };
+            let has_proxy_dst_ips = if !self.config.target.proxy_dst_ips.is_empty() {
+                1
+            } else {
+                0
+            };
+            let has_proxy_src_ports = if !self.config.lan.proxy_src_ports.is_empty()
+            {
+                1
+            } else {
+                0
+            };
+            let has_proxy_dst_ports =
+                if !self.config.target.proxy_dst_ports.is_empty() {
+                    1
+                } else {
+                    0
+                };
+            let direct_offload_enabled = if self.config.auto_direct_offload {
+                1
+            } else {
+                0
+            };
             let proxy_local = if self.config.host.proxy_local { 1 } else { 0 };
-            let has_proxy_processes = if !self.config.host.proxy_processes.is_empty() { 1 } else { 0 };
-            let has_bypass_processes = if !self.config.host.bypass_processes.is_empty() { 1 } else { 0 };
-            let has_bypass_dscps = if !self.config.bypass_dscps.is_empty() { 1 } else { 0 };
-            let has_bypass_fwmarks = if !self.config.bypass_fwmarks.is_empty() { 1 } else { 0 };
+            let has_proxy_processes = if !self.config.host.proxy_processes.is_empty()
+            {
+                1
+            } else {
+                0
+            };
+            let has_bypass_processes =
+                if !self.config.host.bypass_processes.is_empty() {
+                    1
+                } else {
+                    0
+                };
+            let has_bypass_dscps = if !self.config.bypass_dscps.is_empty() {
+                1
+            } else {
+                0
+            };
+            let has_bypass_fwmarks = if !self.config.bypass_fwmarks.is_empty() {
+                1
+            } else {
+                0
+            };
 
             // Initialize eBPF programs and attach TC/cgroup hooks via Aya
             let bpf_param = clash_ebpf_common::DaeParam {
@@ -259,7 +322,10 @@ impl EbpfManager {
                 dae0peer_mac,
                 use_redirect_peer: 0,
                 proxy_local,
-                dae_socket_mark: self.config.routing_mark.unwrap_or(clash_ebpf_common::DAE_BYPASS_MARK),
+                dae_socket_mark: self
+                    .config
+                    .routing_mark
+                    .unwrap_or(clash_ebpf_common::DAE_BYPASS_MARK),
                 control_plane_pid: std::process::id(),
                 local_ip: local_ip_u32,
                 has_proxy_src_ips,
@@ -293,7 +359,9 @@ impl EbpfManager {
                 &self.config.bypass_fwmarks,
                 Some(&ns),
             ) {
-                tracing::warn!("eBPF hooks attachment: {e}");
+                self.bpf_manager.unload();
+                let _ = host_nl.del_link(dae0_idx);
+                return Err(EbpfError::Bpf(e));
             }
 
             // Publish listener socket fds into LISTEN_SOCKET_MAP for bpf_sk_assign.
@@ -304,7 +372,9 @@ impl EbpfManager {
                 listener.udp_v4_raw_fd(),
                 listener.udp_v6_raw_fd(),
             ) {
-                tracing::warn!("Failed to publish listener sockets to SOCKMAP: {e}");
+                self.bpf_manager.unload();
+                let _ = host_nl.del_link(dae0_idx);
+                return Err(EbpfError::Bpf(e));
             }
 
             self.netns = Some(ns);
@@ -316,10 +386,8 @@ impl EbpfManager {
             );
 
             Ok(listener)
-
         }
     }
-
 
     /// Stops the eBPF datapath and cleans up all hooks, interfaces and namespaces.
     pub async fn stop(&self) {
@@ -338,8 +406,6 @@ impl EbpfManager {
 
         info!("clash-ebpf datapath stopped successfully");
     }
-
-
 
     /// Dynamically update direct bypass IP destinations in batch.
     pub async fn update_dynamic_bypass_batch(
@@ -371,7 +437,9 @@ pub fn detect_default_wan_interface(lan_interfaces: &[String]) -> Option<String>
                     let metric = fields[6].parse::<u32>().unwrap_or(u32::MAX);
 
                     let flags = u32::from_str_radix(flags_hex, 16).unwrap_or(0);
-                    if (dest == "00000000" && mask == "00000000") || (flags & 0x1 != 0 && dest == "00000000") {
+                    if (dest == "00000000" && mask == "00000000")
+                        || (flags & 0x1 != 0 && dest == "00000000")
+                    {
                         if iface != "lo"
                             && iface != "dae0"
                             && iface != "dae0peer"
@@ -399,9 +467,12 @@ pub fn detect_default_wan_interface(lan_interfaces: &[String]) -> Option<String>
                 if fields.len() >= 10 {
                     let dest = fields[0];
                     let prefix_len = fields[1];
-                    let metric = u32::from_str_radix(fields[5], 16).unwrap_or(u32::MAX);
+                    let metric =
+                        u32::from_str_radix(fields[5], 16).unwrap_or(u32::MAX);
                     let iface = fields[9];
-                    if dest == "00000000000000000000000000000000" && prefix_len == "00" {
+                    if dest == "00000000000000000000000000000000"
+                        && prefix_len == "00"
+                    {
                         if iface != "lo"
                             && iface != "dae0"
                             && iface != "dae0peer"
@@ -464,9 +535,7 @@ pub fn detect_default_wan_interface(lan_interfaces: &[String]) -> Option<String>
             valid_ifaces.push((name, prio, has_non_local_ip));
         }
 
-        valid_ifaces.sort_by(|a, b| {
-            b.2.cmp(&a.2).then_with(|| a.1.cmp(&b.1))
-        });
+        valid_ifaces.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.1.cmp(&b.1)));
 
         if let Some((name, _, _)) = valid_ifaces.first() {
             return Some(name.clone());
@@ -478,7 +547,10 @@ pub fn detect_default_wan_interface(lan_interfaces: &[String]) -> Option<String>
 }
 
 /// Detect effective LAN ingress interfaces for Linux and OpenWrt router environments.
-pub fn detect_lan_interfaces(configured_lan: &[String], effective_wan: Option<&str>) -> Vec<String> {
+pub fn detect_lan_interfaces(
+    configured_lan: &[String],
+    effective_wan: Option<&str>,
+) -> Vec<String> {
     let non_auto_lan: Vec<String> = configured_lan
         .iter()
         .filter(|s| !s.is_empty() && s.as_str() != "auto")
@@ -492,7 +564,9 @@ pub fn detect_lan_interfaces(configured_lan: &[String], effective_wan: Option<&s
     // 1. OpenWrt Bridge preference: look for "br-lan" or bridge interface
     if let Ok(interface_list) = network_interface::NetworkInterface::show() {
         for iface in &interface_list {
-            if (iface.name == "br-lan" || iface.name == "lan") && effective_wan != Some(iface.name.as_str()) {
+            if (iface.name == "br-lan" || iface.name == "lan")
+                && effective_wan != Some(iface.name.as_str())
+            {
                 return vec![iface.name.clone()];
             }
         }
@@ -553,11 +627,17 @@ fn detect_interface_ips(lan: &[String], wan: Option<&str>) -> Vec<String> {
     let mut ips = Vec::new();
     if let Ok(interface_list) = NetworkInterface::show() {
         for iface in interface_list {
-            let matched = target_ifaces.is_empty() || target_ifaces.iter().any(|&name| name == iface.name.as_str());
+            let matched = target_ifaces.is_empty()
+                || target_ifaces
+                    .iter()
+                    .any(|&name| name == iface.name.as_str());
             if matched && iface.name != "dae0" && iface.name != "dae0peer" {
                 for addr in iface.addr {
                     let ip_str = addr.ip().to_string();
-                    if !ip_str.is_empty() && !ip_str.starts_with("127.") && ip_str != "::1" {
+                    if !ip_str.is_empty()
+                        && !ip_str.starts_with("127.")
+                        && ip_str != "::1"
+                    {
                         ips.push(ip_str);
                     }
                 }
@@ -566,5 +646,3 @@ fn detect_interface_ips(lan: &[String], wan: Option<&str>) -> Vec<String> {
     }
     ips
 }
-
-
