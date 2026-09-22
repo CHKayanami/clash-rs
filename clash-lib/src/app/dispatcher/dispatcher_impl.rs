@@ -1,7 +1,6 @@
 use crate::{
     app::{
-        dns::ClashResolver,
-        outbound::manager::ThreadSafeOutboundManager,
+        dns::ClashResolver, outbound::manager::ThreadSafeOutboundManager,
         router::ArcRouter,
     },
     common::io::copy_bidirectional,
@@ -43,7 +42,10 @@ const DEFAULT_UDP_SESSION_TIMEOUT_SECS: u64 = 60;
 const UDP_CHANNEL_CAPACITY: usize = 1024;
 const MAX_PENDING_SNIFF_PACKETS: usize = 4;
 const MAX_CONNECTING_PACKETS: usize = 8;
+const MAX_CONNECTING_SESSIONS: usize = 256;
+const MAX_GLOBAL_CONNECTING_SESSIONS: usize = 1024;
 const PENDING_SNIFF_TIMEOUT: Duration = Duration::from_millis(100);
+const CONNECTING_SESSION_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub struct Dispatcher {
     outbound_manager: ThreadSafeOutboundManager,
@@ -53,6 +55,7 @@ pub struct Dispatcher {
     manager: Arc<Manager>,
     sniffer: Option<ArcSniffer>,
     tcp_buffer_size: usize,
+    udp_connect_semaphore: Arc<tokio::sync::Semaphore>,
 }
 
 type SessionKey = (SocketAddr, SocksAddr);
@@ -78,23 +81,39 @@ struct EstablishedSession {
     dest: SocksAddr,
     sender: OutboundPacketSender,
     relay_handle: JoinHandle<()>,
+    relay_start: tokio::sync::oneshot::Sender<()>,
 }
 
 enum EstablishOutcome {
     Success(EstablishedSession),
-    Failed(SessionKey),
+    Failed(SessionKey, u64),
+    Terminated(SessionKey, u64),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum UdpQueueEvent {
-    SessionExpired(SessionKey),
-    PendingSniffExpired(SessionKey),
+    SessionIdle(SessionKey),
+    PendingSniff(SessionKey),
+    Connecting(SessionKey, u64),
 }
 
 struct PendingSniffSession {
     delay_key: tokio_util::time::delay_queue::Key,
     packets: Vec<UdpPacket>,
     sess: Session,
+}
+
+struct ConnectingSession {
+    id: u64,
+    delay_key: tokio_util::time::delay_queue::Key,
+    packets: Vec<UdpPacket>,
+    establish_handle: JoinHandle<()>,
+}
+
+impl Drop for ConnectingSession {
+    fn drop(&mut self) {
+        self.establish_handle.abort();
+    }
 }
 
 #[derive(Clone)]
@@ -105,6 +124,7 @@ struct UdpDispatchContext {
     manager: Arc<Manager>,
     mode: Arc<AtomicU8>,
     remote_receiver_w: tokio::sync::mpsc::Sender<UdpPacket>,
+    connect_semaphore: Arc<tokio::sync::Semaphore>,
 }
 
 fn make_udp_flow_session(
@@ -150,6 +170,9 @@ impl Dispatcher {
             manager,
             sniffer,
             tcp_buffer_size: tcp_buffer_size.unwrap_or(DEFAULT_BUFFER_SIZE),
+            udp_connect_semaphore: Arc::new(tokio::sync::Semaphore::new(
+                MAX_GLOBAL_CONNECTING_SESSIONS,
+            )),
         }
     }
 
@@ -259,10 +282,8 @@ impl Dispatcher {
                 self.manager.track(sess.id, tracker_info.clone(), close_tx);
                 let _track_guard = TrackGuard::new(sess.id, self.manager.clone());
 
-                let tracker = TrafficTracker::new(
-                    tracker_info,
-                    self.manager.clone(),
-                );
+                let tracker =
+                    TrafficTracker::new(tracker_info, self.manager.clone());
 
                 let copy_fut = copy_bidirectional(
                     lhs,
@@ -385,16 +406,19 @@ impl Dispatcher {
             manager: self.manager.clone(),
             mode: self.mode.clone(),
             remote_receiver_w,
+            connect_semaphore: self.udp_connect_semaphore.clone(),
         };
         let sniffer = self.sniffer.clone();
-        let force_dns_mapping = sniffer.as_ref().map_or(false, |s| s.config.force_dns_mapping);
+        let force_dns_mapping = sniffer
+            .as_ref()
+            .map_or(false, |s| s.config.force_dns_mapping);
 
         let current_span = tracing::Span::current();
 
         tokio::spawn(
             async move {
                 let mut sessions: HashMap<SessionKey, OutboundSession> = HashMap::new();
-                let mut connecting_sessions: HashMap<SessionKey, Vec<UdpPacket>> = HashMap::new();
+                let mut connecting_sessions: HashMap<SessionKey, ConnectingSession> = HashMap::new();
                 let mut pending_sniff_sessions: HashMap<SessionKey, PendingSniffSession> = HashMap::new();
                 let mut delay_queue: DelayQueue<UdpQueueEvent> = DelayQueue::new();
                 let timeout_duration = sess
@@ -403,8 +427,6 @@ impl Dispatcher {
 
                 loop {
                     tokio::select! {
-                        biased;
-
                         // 1. Close signal from caller (explicit close or sender drop)
                         _ = &mut close_receiver => {
                             debug!("UDP close signal received for {}, closing session actor", sess);
@@ -431,30 +453,71 @@ impl Dispatcher {
                             match outcome {
                                 EstablishOutcome::Success(established) => {
                                     let session_key = established.session_key.clone();
-                                    let buffered_packets = connecting_sessions.remove(&session_key).unwrap_or_default();
+                                    let Some(mut connecting) = connecting_sessions.remove(&session_key) else {
+                                        // The connect attempt timed out or was superseded while
+                                        // its result was in flight. Do not resurrect the flow.
+                                        established.relay_handle.abort();
+                                        continue;
+                                    };
+                                    if connecting.id != established.sess_id {
+                                        connecting_sessions.insert(session_key, connecting);
+                                        established.relay_handle.abort();
+                                        continue;
+                                    }
+                                    delay_queue.remove(&connecting.delay_key);
+                                    let buffered_packets = std::mem::take(&mut connecting.packets);
+                                    let EstablishedSession {
+                                        sess_id,
+                                        dest,
+                                        sender,
+                                        relay_handle,
+                                        relay_start,
+                                        ..
+                                    } = established;
 
                                     for packet in buffered_packets {
-                                        forward_to_remote(&established.sender, packet, established.dest.clone(), established.sess_id);
+                                        let _ = forward_to_remote(
+                                            &sender,
+                                            packet,
+                                            dest.clone(),
+                                            sess_id,
+                                        );
                                     }
 
                                     let delay_key = delay_queue.insert(
-                                        UdpQueueEvent::SessionExpired(session_key.clone()),
+                                        UdpQueueEvent::SessionIdle(session_key.clone()),
                                         timeout_duration,
                                     );
 
                                     sessions.insert(
                                         session_key,
                                         OutboundSession {
-                                            id: established.sess_id,
-                                            dest: established.dest,
-                                            sender: established.sender,
+                                            id: sess_id,
+                                            dest,
+                                            sender,
                                             delay_key,
-                                            _relay_handle: established.relay_handle,
+                                            _relay_handle: relay_handle,
                                         },
                                     );
+                                    let _ = relay_start.send(());
                                 }
-                                EstablishOutcome::Failed(session_key) => {
-                                    connecting_sessions.remove(&session_key);
+                                EstablishOutcome::Failed(session_key, sess_id) => {
+                                    if connecting_sessions
+                                        .get(&session_key)
+                                        .is_some_and(|connecting| connecting.id == sess_id)
+                                        && let Some(connecting) = connecting_sessions.remove(&session_key)
+                                    {
+                                        delay_queue.remove(&connecting.delay_key);
+                                    }
+                                }
+                                EstablishOutcome::Terminated(session_key, sess_id) => {
+                                    if sessions
+                                        .get(&session_key)
+                                        .is_some_and(|session| session.id == sess_id)
+                                        && let Some(session) = sessions.remove(&session_key)
+                                    {
+                                        delay_queue.remove(&session.delay_key);
+                                    }
                                 }
                             }
                         }
@@ -462,23 +525,37 @@ impl Dispatcher {
                         // 4. Idle timeout expiration or pending sniff timeout from DelayQueue
                         Some(expired) = delay_queue.next() => {
                             match expired.into_inner() {
-                                UdpQueueEvent::SessionExpired(key) => {
+                                UdpQueueEvent::SessionIdle(key) => {
                                     trace!("UDP session expired for src: {}, dst: {}", key.0, key.1);
                                     sessions.remove(&key);
                                 }
-                                UdpQueueEvent::PendingSniffExpired(key) => {
+                                UdpQueueEvent::PendingSniff(key) => {
                                     if let Some(pending) = pending_sniff_sessions.remove(&key) {
                                         trace!(
                                             "UDP pending sniff timed out for src: {}, dst: {}, flushing buffered packets",
                                             key.0, key.1
                                         );
-                                        connecting_sessions.insert(key, pending.packets);
-                                        spawn_establish_session(
+                                        start_connecting_session(
                                             pending.sess,
+                                            pending.packets,
                                             false,
                                             &ctx,
                                             &session_established_tx,
+                                            &mut connecting_sessions,
+                                            &mut delay_queue,
                                         );
+                                    }
+                                }
+                                UdpQueueEvent::Connecting(key, sess_id) => {
+                                    if connecting_sessions
+                                        .get(&key)
+                                        .is_some_and(|connecting| connecting.id == sess_id)
+                                    {
+                                        trace!(
+                                            "UDP outbound connection timed out for src: {}, dst: {}",
+                                            key.0, key.1
+                                        );
+                                        connecting_sessions.remove(&key);
                                     }
                                 }
                             }
@@ -519,14 +596,24 @@ impl Dispatcher {
                             if let Some(session) = sessions.get_mut(&session_key) {
                                 debug!("reusing session #{} sent to remote {}", session.id, session.dest);
                                 delay_queue.reset(&session.delay_key, timeout_duration);
-                                forward_to_remote(&session.sender, packet, session.dest.clone(), session.id);
-                                continue;
+                                if let Some(returned_packet) = forward_to_remote(
+                                    &session.sender,
+                                    packet,
+                                    session.dest.clone(),
+                                    session.id,
+                                ) {
+                                    packet = returned_packet;
+                                    let dead_session = sessions.remove(&session_key).unwrap();
+                                    delay_queue.remove(&dead_session.delay_key);
+                                } else {
+                                    continue;
+                                }
                             }
 
                             // If this flow is currently establishing an outbound session, buffer the packet
                             if let Some(buf) = connecting_sessions.get_mut(&session_key) {
-                                if buf.len() < MAX_CONNECTING_PACKETS {
-                                    buf.push(packet);
+                                if buf.packets.len() < MAX_CONNECTING_PACKETS {
+                                    buf.packets.push(packet);
                                 }
                                 continue;
                             }
@@ -552,12 +639,14 @@ impl Dispatcher {
                                         let mut packets = pending.packets;
                                         packets.push(packet);
 
-                                        connecting_sessions.insert(session_key, packets);
-                                        spawn_establish_session(
+                                        start_connecting_session(
                                             pending.sess,
+                                            packets,
                                             false,
                                             &ctx,
                                             &session_established_tx,
+                                            &mut connecting_sessions,
+                                            &mut delay_queue,
                                         );
                                     }
                                     crate::app::sniffer::SniffUdpOutcome::Domain(domain, should_override) => {
@@ -569,12 +658,14 @@ impl Dispatcher {
                                         let mut packets = pending.packets;
                                         packets.push(packet);
 
-                                        connecting_sessions.insert(session_key, packets);
-                                        spawn_establish_session(
+                                        start_connecting_session(
                                             pending.sess,
+                                            packets,
                                             should_override,
                                             &ctx,
                                             &session_established_tx,
+                                            &mut connecting_sessions,
+                                            &mut delay_queue,
                                         );
                                     }
                                     _ => {
@@ -584,12 +675,14 @@ impl Dispatcher {
                                         let mut packets = pending.packets;
                                         packets.push(packet);
 
-                                        connecting_sessions.insert(session_key, packets);
-                                        spawn_establish_session(
+                                        start_connecting_session(
                                             pending.sess,
+                                            packets,
                                             false,
                                             &ctx,
                                             &session_established_tx,
+                                            &mut connecting_sessions,
+                                            &mut delay_queue,
                                         );
                                     }
                                 }
@@ -598,8 +691,14 @@ impl Dispatcher {
 
                             // Fresh flow (first packet):
                             // 1. DNS / Fake-IP reverse lookup to resolve destination (Fake-IP > original target)
-                            let reversed_dest = reverse_lookup(&ctx.resolver, &orig_inbound_dst, force_dns_mapping);
-                            let target_dest = reversed_dest.unwrap_or_else(|| orig_inbound_dst.clone());
+                            let Some(target_dest) = reverse_lookup(
+                                &ctx.resolver,
+                                &orig_inbound_dst,
+                                force_dns_mapping,
+                            ) else {
+                                warn!("failed to resolve UDP destination {}", orig_inbound_dst);
+                                continue;
+                            };
                             let mapped_domain = if !orig_inbound_dst.is_domain() {
                                 target_dest.domain().map(|d| d.to_string())
                             } else {
@@ -628,12 +727,14 @@ impl Dispatcher {
 
                             // 3. Fast-path: no sniffing needed (Fake-IP / domain inbound / pure IP with parse_pure_ip=false)
                             if !should_sniff {
-                                connecting_sessions.insert(session_key, vec![packet]);
-                                spawn_establish_session(
+                                start_connecting_session(
                                     flow_sess,
+                                    vec![packet],
                                     false,
                                     &ctx,
                                     &session_established_tx,
+                                    &mut connecting_sessions,
+                                    &mut delay_queue,
                                 );
                                 continue;
                             }
@@ -668,7 +769,7 @@ impl Dispatcher {
                             if should_buffer {
                                 trace!("buffering incomplete QUIC packet for {} -> {}", src_addr, orig_inbound_dst);
                                 let delay_key = delay_queue.insert(
-                                    UdpQueueEvent::PendingSniffExpired(session_key.clone()),
+                                    UdpQueueEvent::PendingSniff(session_key.clone()),
                                     PENDING_SNIFF_TIMEOUT,
                                 );
                                 pending_sniff_sessions.insert(
@@ -682,12 +783,14 @@ impl Dispatcher {
                                 continue;
                             }
 
-                            connecting_sessions.insert(session_key, vec![packet]);
-                            spawn_establish_session(
+                            start_connecting_session(
                                 flow_sess,
+                                vec![packet],
                                 override_dest,
                                 &ctx,
                                 &session_established_tx,
+                                &mut connecting_sessions,
+                                &mut delay_queue,
                             );
                         }
                     }
@@ -701,14 +804,71 @@ impl Dispatcher {
     }
 }
 
+fn start_connecting_session(
+    sess: Session,
+    packets: Vec<UdpPacket>,
+    override_dest: bool,
+    ctx: &UdpDispatchContext,
+    established_tx: &tokio::sync::mpsc::Sender<EstablishOutcome>,
+    connecting_sessions: &mut HashMap<SessionKey, ConnectingSession>,
+    delay_queue: &mut DelayQueue<UdpQueueEvent>,
+) {
+    if connecting_sessions.len() >= MAX_CONNECTING_SESSIONS {
+        debug!(
+            "too many UDP outbound connections in progress, dropping flow {} -> {}",
+            sess.source, sess.destination
+        );
+        return;
+    }
+    let Ok(connect_permit) = ctx.connect_semaphore.clone().try_acquire_owned()
+    else {
+        debug!(
+            "global UDP outbound connection limit reached, dropping flow {} -> {}",
+            sess.source, sess.destination
+        );
+        return;
+    };
+
+    let session_key = (
+        sess.source,
+        sess.orig_destination
+            .clone()
+            .unwrap_or_else(|| sess.destination.clone()),
+    );
+    let sess_id = sess.id;
+    let delay_key = delay_queue.insert(
+        UdpQueueEvent::Connecting(session_key.clone(), sess_id),
+        CONNECTING_SESSION_TIMEOUT,
+    );
+    let establish_handle = spawn_establish_session(
+        sess,
+        override_dest,
+        ctx,
+        established_tx,
+        connect_permit,
+    );
+
+    connecting_sessions.insert(
+        session_key,
+        ConnectingSession {
+            id: sess_id,
+            delay_key,
+            packets,
+            establish_handle,
+        },
+    );
+}
+
 fn spawn_establish_session(
     sess: Session,
     override_dest: bool,
     ctx: &UdpDispatchContext,
     established_tx: &tokio::sync::mpsc::Sender<EstablishOutcome>,
-) {
+    connect_permit: tokio::sync::OwnedSemaphorePermit,
+) -> JoinHandle<()> {
     let ctx = ctx.clone();
     let established_tx = established_tx.clone();
+    let sess_id = sess.id;
     let session_key = (
         sess.source,
         sess.orig_destination
@@ -717,18 +877,27 @@ fn spawn_establish_session(
     );
 
     tokio::spawn(async move {
-        let outcome = match establish_outbound_session(sess, override_dest, &ctx).await {
+        let _connect_permit = connect_permit;
+        let outcome = match establish_outbound_session(
+            sess,
+            override_dest,
+            &ctx,
+            established_tx.clone(),
+        )
+        .await
+        {
             Some(established) => EstablishOutcome::Success(established),
-            None => EstablishOutcome::Failed(session_key),
+            None => EstablishOutcome::Failed(session_key, sess_id),
         };
         let _ = established_tx.send(outcome).await;
-    });
+    })
 }
 
 async fn establish_outbound_session(
     mut sess: Session,
     override_dest: bool,
     ctx: &UdpDispatchContext,
+    established_tx: tokio::sync::mpsc::Sender<EstablishOutcome>,
 ) -> Option<EstablishedSession> {
     let orig_inbound_dst = sess
         .orig_destination
@@ -795,10 +964,7 @@ async fn establish_outbound_session(
                     sess
                 );
             } else {
-                error!(
-                    "failed to connect outbound: sess = {} ,err = {}",
-                    sess, err
-                );
+                error!("failed to connect outbound: sess = {} ,err = {}", sess, err);
             }
             return None;
         }
@@ -813,26 +979,28 @@ async fn establish_outbound_session(
 
     let (mut remote_w, mut remote_r) = outbound_datagram.split();
     let (remote_sender, mut remote_forwarder) =
-        tokio::sync::mpsc::channel::<(UdpPacket, SocksAddr)>(
-            UDP_CHANNEL_CAPACITY,
-        );
+        tokio::sync::mpsc::channel::<(UdpPacket, SocksAddr)>(UDP_CHANNEL_CAPACITY);
 
     let orig_inbound_dst_for_relay = orig_inbound_dst.clone();
     let relay_sess = sess.clone();
+    let relay_session_key = (sess.source, orig_inbound_dst.clone());
+    let relay_sess_id = sess.id;
     let remote_receiver_w_clone = ctx.remote_receiver_w.clone();
-    let tracker = TrafficTracker::new(
-        tracker_info,
-        ctx.manager.clone(),
-    );
+    let tracker = TrafficTracker::new(tracker_info, ctx.manager.clone());
+    let (relay_start, relay_start_rx) = tokio::sync::oneshot::channel();
 
     let relay_handle = tokio::spawn(async move {
         let _guard = track_guard;
+        // Do not let a short-lived outbound report termination before the
+        // actor has installed the corresponding session entry.
+        if relay_start_rx.await.is_err() {
+            return;
+        }
+
         // local -> remote
         let tracker_out = tracker.clone();
         let outgoing = async move {
-            while let Some((mut packet, dest_addr)) =
-                remote_forwarder.recv().await
-            {
+            while let Some((mut packet, dest_addr)) = remote_forwarder.recv().await {
                 let len = packet.data.len();
                 packet.dst_addr = dest_addr;
                 if let Err(err) = remote_w.send(packet).await {
@@ -851,10 +1019,7 @@ async fn establish_outbound_session(
 
                 packet.src_addr = orig_inbound_dst_for_relay.clone();
                 packet.dst_addr = relay_sess.source.into();
-                debug!(
-                    "UDP NAT for packet: {:?}, session: {}",
-                    packet, relay_sess
-                );
+                debug!("UDP NAT for packet: {:?}, session: {}", packet, relay_sess);
                 match remote_receiver_w_clone.try_send(packet) {
                     Ok(_) => {}
                     Err(TrySendError::Full(_)) => {
@@ -879,6 +1044,13 @@ async fn establish_outbound_session(
             _ = incoming => {}
             _ = close_rx => {}
         }
+
+        let _ = established_tx
+            .send(EstablishOutcome::Terminated(
+                relay_session_key,
+                relay_sess_id,
+            ))
+            .await;
     });
 
     Some(EstablishedSession {
@@ -887,6 +1059,7 @@ async fn establish_outbound_session(
         dest: sess.destination,
         sender: remote_sender,
         relay_handle,
+        relay_start,
     })
 }
 
@@ -910,19 +1083,28 @@ fn is_reject_error(err: &std::io::Error) -> bool {
 }
 
 /// Hand a packet to a session's relay task without ever awaiting.
+///
+/// A packet is returned only when the relay has already gone away, allowing
+/// the actor to remove the stale session and route that packet through a new
+/// outbound association.
 fn forward_to_remote(
     sender: &OutboundPacketSender,
     packet: UdpPacket,
     dest: SocksAddr,
     sess_id: u64,
-) {
+) -> Option<UdpPacket> {
     match sender.try_send((packet, dest)) {
-        Ok(_) => {}
+        Ok(_) => None,
         Err(TrySendError::Full(_)) => {
-            debug!("[UDP] outbound queue full, dropping packet for session #{}", sess_id);
+            debug!(
+                "[UDP] outbound queue full, dropping packet for session #{}",
+                sess_id
+            );
+            None
         }
-        Err(TrySendError::Closed(_)) => {
-            debug!("[UDP] outbound relay gone, dropping packet for session #{}", sess_id);
+        Err(TrySendError::Closed((packet, _))) => {
+            debug!("[UDP] outbound relay gone, rebuilding session #{}", sess_id);
+            Some(packet)
         }
     }
 }
@@ -974,4 +1156,90 @@ fn reverse_lookup(
         SocksAddr::Domain(host, port) => SocksAddr::Domain(host.clone(), *port),
     };
     Some(dst)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::dns::MockClashResolver;
+    use bytes::Bytes;
+    use std::net::{IpAddr, Ipv4Addr};
+
+    #[test]
+    fn reverse_lookup_rejects_unmapped_fake_ip() {
+        let fake_ip = IpAddr::V4(Ipv4Addr::new(198, 18, 0, 1));
+        let mut resolver = MockClashResolver::new();
+        resolver.expect_fake_ip_enabled().return_const(true);
+        resolver
+            .expect_is_fake_ip()
+            .returning(move |ip| ip == fake_ip);
+        resolver.expect_reverse_lookup().return_const(None);
+        let resolver: Arc<dyn ClashResolver> = Arc::new(resolver);
+
+        let dst = SocksAddr::Ip(SocketAddr::new(fake_ip, 443));
+        assert_eq!(reverse_lookup(&resolver, &dst, false), None);
+    }
+
+    #[tokio::test]
+    async fn closed_relay_returns_packet_for_reconnect() {
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        drop(receiver);
+
+        let src = SocksAddr::Ip("127.0.0.1:12345".parse().unwrap());
+        let dst = SocksAddr::Domain("example.com".into(), 443);
+        let packet =
+            UdpPacket::new(Bytes::from_static(b"hello"), src.clone(), dst.clone());
+
+        let returned = forward_to_remote(&sender, packet, dst.clone(), 42)
+            .expect("closed relay must return the packet");
+        assert_eq!(returned.data, Bytes::from_static(b"hello"));
+        assert_eq!(returned.src_addr, src);
+        assert_eq!(returned.dst_addr, dst);
+    }
+
+    #[tokio::test]
+    async fn dropping_connecting_session_aborts_establish_task() {
+        struct NotifyOnDrop(Option<tokio::sync::oneshot::Sender<()>>);
+
+        impl Drop for NotifyOnDrop {
+            fn drop(&mut self) {
+                if let Some(tx) = self.0.take() {
+                    let _ = tx.send(());
+                }
+            }
+        }
+
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
+        let establish_handle = tokio::spawn(async move {
+            let _notify = NotifyOnDrop(Some(dropped_tx));
+            let _ = started_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        started_rx.await.unwrap();
+
+        let mut delay_queue = DelayQueue::new();
+        let delay_key = delay_queue.insert(
+            UdpQueueEvent::Connecting(
+                (
+                    "127.0.0.1:12345".parse().unwrap(),
+                    SocksAddr::Domain("example.com".into(), 443),
+                ),
+                42,
+            ),
+            CONNECTING_SESSION_TIMEOUT,
+        );
+        let connecting = ConnectingSession {
+            id: 42,
+            delay_key,
+            packets: Vec::new(),
+            establish_handle,
+        };
+
+        drop(connecting);
+        tokio::time::timeout(Duration::from_secs(1), dropped_rx)
+            .await
+            .expect("aborted establish task was not dropped")
+            .unwrap();
+    }
 }
