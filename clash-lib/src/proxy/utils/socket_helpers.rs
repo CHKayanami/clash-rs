@@ -1,4 +1,6 @@
 use super::platform::must_bind_socket_on_interface;
+#[cfg(target_os = "linux")]
+use crate::app::net::get_tun_somark;
 use crate::{
     app::{dns::ThreadSafeDNSResolver, net::OutboundInterface},
     proxy::AnyStream,
@@ -55,9 +57,7 @@ pub(crate) fn resolve_so_mark(so_mark: Option<u32>) -> Option<u32> {
     if let Some(mark) = so_mark {
         return Some(mark);
     }
-    if let Ok(guard) = crate::app::net::TUN_SOMARK.try_read()
-        && let Some(mark) = *guard
-    {
+    if let Some(mark) = get_tun_somark() {
         return Some(mark);
     }
     #[cfg(all(target_os = "linux", feature = "ebpf"))]

@@ -9,7 +9,7 @@ use crate::{
         dns::{self, SystemResolver, ThreadSafeDNSResolver, config::DNSListenAddr},
         inbound::manager::InboundManager,
         logging::LogEvent,
-        net::init_net_config,
+        net::{init_net_config, set_tun_somark},
         outbound::manager::OutboundManager,
         profile,
         router::Router,
@@ -739,7 +739,7 @@ async fn create_components(
             debug!(
                 "tun enabled without auto-route/auto-detect, skipping default outbound interface binding"
             );
-            *crate::app::net::TUN_SOMARK.write().await = mark;
+            set_tun_somark(mark);
         }
     }
 
@@ -753,7 +753,7 @@ async fn create_components(
             .or(ebpf_cfg.routing_mark)
             .or(Some(clash_ebpf::DAE_BYPASS_MARK));
         debug!("ebpf enabled, setting default outbound SO_MARK to {:?}", mark);
-        *crate::app::net::TUN_SOMARK.write().await = mark;
+        set_tun_somark(mark);
     }
 
     let cancellation_token = tokio_util::sync::CancellationToken::new();

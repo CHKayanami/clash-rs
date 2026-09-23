@@ -8,7 +8,14 @@ use url::Url;
 
 use crate::{
     Error,
-    app::{dispatcher::Dispatcher, dns::ThreadSafeDNSResolver},
+    app::{
+        dispatcher::Dispatcher,
+        dns::ThreadSafeDNSResolver,
+        net::{
+            get_outbound_interface,
+            update_default_outbound_interface_if_changed,
+        },
+    },
     config::config::TunConfig,
     proxy::tun::{datagram::handle_inbound_datagram, routes},
     runner::{AsyncService, ServiceContext},
@@ -344,27 +351,15 @@ impl AsyncService for TunRunner {
                     tokio::select! {
                         _ = auto_detect_cancel.cancelled() => break,
                         _ = interval.tick() => {
-                            if let Some(new_iface) =
-                                crate::app::net::get_outbound_interface()
-                            {
-                                let mut current =
-                                    crate::app::net::DEFAULT_OUTBOUND_INTERFACE
-                                        .write()
-                                        .await;
-                                let changed = match &*current {
-                                    Some(old) => {
-                                        old.name != new_iface.name
-                                            || old.index != new_iface.index
-                                    }
-                                    None => true,
-                                };
-                                if changed {
+                            if let Some(new_iface) = get_outbound_interface() {
+                                if update_default_outbound_interface_if_changed(
+                                    new_iface.clone(),
+                                ) {
                                     info!(
                                         "auto-detected default outbound interface \
                                          changed to {} (index: {})",
                                         new_iface.name, new_iface.index
                                     );
-                                    *current = Some(new_iface);
                                 }
                             }
                         }

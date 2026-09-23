@@ -1,5 +1,5 @@
 use crate::{
-    app::{dns::ThreadSafeDNSResolver, net::DEFAULT_OUTBOUND_INTERFACE},
+    app::{dns::ThreadSafeDNSResolver, net::get_default_outbound_interface},
     proxy::{datagram::UdpPacket, utils::new_udp_socket},
     session::SocksAddr as ClashSocksAddr,
 };
@@ -44,10 +44,10 @@ impl TuicEndpoint {
                 debug!("rebinding endpoint UDP socket");
 
                 let socket = {
-                    let iface = DEFAULT_OUTBOUND_INTERFACE.read().await;
+                    let iface = get_default_outbound_interface();
                     new_udp_socket(
                         None,
-                        iface.as_ref(),
+                        iface.as_deref(),
                         #[cfg(target_os = "linux")]
                         None,
                         Some(remote_addr),

@@ -6,7 +6,7 @@ use crate::{
     app::{
         dispatcher::Dispatcher,
         dns::{ThreadSafeDNSResolver, exchange_with_resolver},
-        net::DEFAULT_OUTBOUND_INTERFACE,
+        net::get_default_outbound_interface_cloned,
     },
     proxy::ProxyStream,
     session::{Network, Session, Type},
@@ -42,16 +42,12 @@ pub(crate) async fn handle_inbound_stream<S: ProxyStream + 'static>(
         typ: Type::Tun,
         source,
         destination: destination.into(),
-        iface: DEFAULT_OUTBOUND_INTERFACE
-            .read()
-            .await
-            .clone()
-            .inspect(|x| {
-                debug!(
-                    "selecting outbound interface: {:?} for tun TCP connection",
-                    x
-                );
-            }),
+        iface: get_default_outbound_interface_cloned().inspect(|x| {
+            debug!(
+                "selecting outbound interface: {:?} for tun TCP connection",
+                x
+            );
+        }),
         so_mark,
         ..Default::default()
     };

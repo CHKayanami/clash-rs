@@ -9,6 +9,7 @@ use super::offloader::{DirectOffloader, RoutingAction};
 use super::utils::resolve_and_aggregate_ip_cidrs;
 use crate::app::dispatcher::Dispatcher;
 use crate::app::dns::ThreadSafeDNSResolver;
+use crate::app::net::get_default_outbound_interface_cloned;
 use crate::app::remote_content_manager::providers::rule_provider::CidrTrie;
 use crate::config::def::EbpfConfig;
 use crate::proxy::datagram::{ChannelDatagram, UdpPacket};
@@ -238,11 +239,11 @@ impl InboundHandlerTrait for EbpfInbound {
 
         let udp_stream = ChannelDatagram::new(l_tx, d_rx);
 
-        let default_outbound = crate::app::net::DEFAULT_OUTBOUND_INTERFACE.read().await;
+        let default_outbound = get_default_outbound_interface_cloned();
         let sess = Session {
             network: Network::Udp,
             typ: Type::Ebpf,
-            iface: default_outbound.clone(),
+            iface: default_outbound,
             so_mark: Some(clash_ebpf::DAE_BYPASS_MARK),
             ..Default::default()
         };

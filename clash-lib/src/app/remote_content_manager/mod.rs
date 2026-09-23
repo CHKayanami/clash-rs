@@ -1,6 +1,6 @@
 use super::dns::ThreadSafeDNSResolver;
 use crate::{
-    app::net::DEFAULT_OUTBOUND_INTERFACE,
+    app::net::get_default_outbound_interface_cloned,
     common::{
         errors::{IntoIoResultExt as _, new_io_error},
         timed_future::TimedFuture,
@@ -768,7 +768,7 @@ impl ProxyManager {
                 destination: (host.to_owned(), port)
                     .try_into()
                     .expect("must be valid destination"),
-                iface: DEFAULT_OUTBOUND_INTERFACE.read().await.clone(),
+                iface: get_default_outbound_interface_cloned(),
                 so_mark: self.fw_mark,
                 ..Default::default()
             };
