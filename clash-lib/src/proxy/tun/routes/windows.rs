@@ -4,18 +4,25 @@ use crate::{
 };
 use anyhow::anyhow;
 use ipnet::IpNet;
+use parking_lot::Mutex;
 use std::{
+    collections::HashMap,
     io,
     net::{Ipv4Addr, Ipv6Addr, SocketAddr},
     ptr::null_mut,
+    sync::LazyLock,
 };
 use tracing::{error, info, warn};
+
+static ADDED_CLASH_ROUTES: LazyLock<Mutex<HashMap<(u32, IpNet), OutboundInterface>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 use windows::{
     Win32::{
         Foundation::{ERROR_SUCCESS, GetLastError},
         NetworkManagement::{
             IpHelper::{
                 CreateIpForwardEntry2, CreateUnicastIpAddressEntry,
+                DeleteIpForwardEntry2,
                 DNS_INTERFACE_SETTINGS, DNS_INTERFACE_SETTINGS_VERSION1,
                 DNS_SETTING_IPV6, DNS_SETTING_NAMESERVER, GetIfEntry2,
                 IP_ADDRESS_PREFIX, InitializeIpForwardEntry, MIB_IF_ROW2,
@@ -90,16 +97,31 @@ pub fn add_route(via: &OutboundInterface, dest: &IpNet) -> io::Result<()> {
     row.NextHop = next_hop.into();
     row.Metric = metric;
 
-    unsafe { CreateIpForwardEntry2(&row) }
-        .to_hresult()
-        .ok()
-        .inspect_err(|e| {
-            error!(
-                "failed to add route to destination {} via {}: {}",
-                dest, via.name, e
+    let res = unsafe { CreateIpForwardEntry2(&row) };
+    if res.is_err() {
+        let err = res.to_hresult();
+        let code = err.0 as u32;
+        let win32_code = res.0;
+        // 5010 / 0x80071392: ERROR_OBJECT_ALREADY_EXISTS, 80 / 0x80070050: ERROR_FILE_EXISTS
+        if code == 0x80071392 || code == 0x80070050 || win32_code == 5010 || win32_code == 80 {
+            warn!(
+                "route to destination {} via {} already exists, keeping existing route",
+                dest, via.name
             );
-        })
-        .map_err(new_io_error)
+            // Route already existed prior to clash; do not modify it and do not record in ADDED_CLASH_ROUTES
+            return Ok(());
+        }
+
+        error!(
+            "failed to add route to destination {} via {}: {}",
+            dest, via.name, err.message()
+        );
+        return Err(new_io_error(err.message()));
+    }
+
+    // Only routes newly created by clash are recorded for cleanup on exit
+    ADDED_CLASH_ROUTES.lock().insert((via.index, *dest), via.clone());
+    Ok(())
 }
 
 fn get_guid(iface: &OutboundInterface) -> Option<GUID> {
@@ -239,7 +261,84 @@ pub fn add_address(
             })
     }
 }
-pub fn maybe_routes_clean_up(_: &TunConfig) -> std::io::Result<()> {
+
+pub fn delete_route(via: &OutboundInterface, dest: &IpNet) -> io::Result<()> {
+    warn!("deleting route to destination {} via {}", dest, via.name);
+    let mut row = MIB_IPFORWARD_ROW2::default();
+    unsafe {
+        InitializeIpForwardEntry(&mut row);
+    }
+
+    row.InterfaceIndex = via.index;
+    row.DestinationPrefix = IP_ADDRESS_PREFIX {
+        Prefix: match dest {
+            IpNet::V4(ipv4) => {
+                let mut s = SOCKADDR_INET::default();
+                s.Ipv4.sin_family = AF_INET;
+                s.Ipv4.sin_addr = ipv4.addr().into();
+                s
+            }
+            IpNet::V6(ipv6) => {
+                let mut s = SOCKADDR_INET::default();
+                s.Ipv6.sin6_family = AF_INET6;
+                s.Ipv6.sin6_addr = ipv6.addr().into();
+                s
+            }
+        },
+        PrefixLength: dest.prefix_len(),
+    };
+
+    let next_hop: SocketAddr = if dest.addr().is_ipv4() {
+        (
+            via.addr_v4
+                .ok_or(std::io::Error::other("tun interface has no ipv4 address"))?,
+            0,
+        )
+            .into()
+    } else {
+        (
+            via.addr_v6
+                .ok_or(std::io::Error::other("tun interface has no ipv6 address"))?,
+            0,
+        )
+            .into()
+    };
+    row.NextHop = next_hop.into();
+
+    let res = unsafe { DeleteIpForwardEntry2(&row) };
+    if res.is_err() {
+        let err = res.to_hresult();
+        let code = err.0 as u32;
+        let win32_code = res.0;
+        // 1168 / 0x80070490: ERROR_NOT_FOUND, route already removed or not found
+        if code != 0x80070490 && win32_code != 1168 {
+            warn!(
+                "failed to delete route to destination {} via {}: {}",
+                dest, via.name, err.message()
+            );
+            return Err(new_io_error(err.message()));
+        }
+    }
+
+    ADDED_CLASH_ROUTES.lock().remove(&(via.index, *dest));
+    Ok(())
+}
+
+pub fn maybe_routes_clean_up(cfg: &TunConfig) -> std::io::Result<()> {
+    if !cfg.route_all && cfg.routes.is_empty() && cfg.route_exclude_address.is_empty() {
+        return Ok(());
+    }
+
+    let routes_to_delete = std::mem::take(&mut *ADDED_CLASH_ROUTES.lock());
+
+    for ((_, r), iface) in routes_to_delete {
+        warn!(
+            "deleting clash-created route to destination {} via {}",
+            r, iface.name
+        );
+        let _ = delete_route(&iface, &r);
+    }
+
     Ok(())
 }
 

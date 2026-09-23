@@ -35,7 +35,7 @@ pub async fn init_net_config(explicit_iface: Option<&str>, tun_somark: Option<u3
 }
 
 /// Represents a parsed outbound interface for use in runtime.
-#[derive(Serialize, Debug, Clone)]
+#[derive(Serialize, Debug, Clone, Default)]
 pub struct OutboundInterface {
     pub name: String,
     pub addr_v4: Option<Ipv4Addr>,

@@ -1,7 +1,6 @@
 use bytes::{Bytes, BytesMut};
 use smoltcp::wire::{
-    IpAddress, IpProtocol, IpVersion, Ipv4Packet, Ipv6Packet, TcpControl, TcpPacket,
-    TcpRepr,
+    IpAddress, IpProtocol, IpVersion, Ipv4Packet, Ipv6Packet, TcpPacket,
 };
 
 /// Splits a large GSO IP packet into standard MTU-sized IP packets.
@@ -14,20 +13,6 @@ pub fn split_gso_packet(packet: Bytes, mtu: usize) -> Vec<BytesMut> {
         Ok(IpVersion::Ipv4) => split_ipv4_gso(packet, mtu),
         Ok(IpVersion::Ipv6) => split_ipv6_gso(packet, mtu),
         Err(_) => vec![BytesMut::from(&packet[..])],
-    }
-}
-
-fn extract_tcp_control(tcp: &TcpPacket<&[u8]>) -> TcpControl {
-    if tcp.syn() {
-        TcpControl::Syn
-    } else if tcp.fin() {
-        TcpControl::Fin
-    } else if tcp.rst() {
-        TcpControl::Rst
-    } else if tcp.psh() {
-        TcpControl::Psh
-    } else {
-        TcpControl::None
     }
 }
 
@@ -66,11 +51,6 @@ fn split_ipv4_gso(packet: Bytes, mtu: usize) -> Vec<BytesMut> {
     let src_ip = ipv4.src_addr();
     let dst_ip = ipv4.dst_addr();
     let mut seq_num = tcp.seq_number();
-    let ack_num = tcp.ack_number();
-    let window_len = tcp.window_len();
-    let src_port = tcp.src_port();
-    let dst_port = tcp.dst_port();
-    let base_control = extract_tcp_control(&tcp);
 
     for (i, chunk) in payload.chunks(max_seg_payload).enumerate() {
         let is_last = (i + 1) * max_seg_payload >= payload.len();
@@ -84,38 +64,21 @@ fn split_ipv4_gso(packet: Bytes, mtu: usize) -> Vec<BytesMut> {
         new_ip.set_total_len(total_packet_len as u16);
         new_ip.fill_checksum();
 
-        // 2. Build TCP header
-        let tcp_control = if is_last {
-            base_control
-        } else {
-            match base_control {
-                TcpControl::Psh | TcpControl::Fin => TcpControl::None,
-                other => other,
-            }
-        };
+        // 2. Copy original TCP header (preserving all TCP options)
+        buf[ip_header_len..headers_len].copy_from_slice(&packet[ip_header_len..headers_len]);
 
-        let tcp_repr = TcpRepr {
-            src_port,
-            dst_port,
-            control: tcp_control,
-            seq_number: seq_num,
-            ack_number: Some(ack_num),
-            window_len,
-            window_scale: None,
-            max_seg_size: None,
-            sack_permitted: false,
-            sack_ranges: [None, None, None],
-            timestamp: None,
-            payload: chunk,
-        };
+        // 3. Copy payload chunk
+        buf[headers_len..total_packet_len].copy_from_slice(chunk);
 
-        let mut new_tcp = TcpPacket::new_unchecked(&mut buf[ip_header_len..]);
-        tcp_repr.emit(
-            &mut new_tcp,
-            &IpAddress::Ipv4(src_ip),
-            &IpAddress::Ipv4(dst_ip),
-            &smoltcp::phy::ChecksumCapabilities::default(),
-        );
+        // 4. Update TCP header fields & recalculate checksum
+        let mut new_tcp =
+            TcpPacket::new_unchecked(&mut buf[ip_header_len..total_packet_len]);
+        new_tcp.set_seq_number(seq_num);
+        if !is_last {
+            new_tcp.set_fin(false);
+            new_tcp.set_psh(false);
+        }
+        new_tcp.fill_checksum(&IpAddress::Ipv4(src_ip), &IpAddress::Ipv4(dst_ip));
 
         segments.push(buf);
         seq_num = seq_num + chunk.len();
@@ -159,11 +122,6 @@ fn split_ipv6_gso(packet: Bytes, mtu: usize) -> Vec<BytesMut> {
     let src_ip = ipv6.src_addr();
     let dst_ip = ipv6.dst_addr();
     let mut seq_num = tcp.seq_number();
-    let ack_num = tcp.ack_number();
-    let window_len = tcp.window_len();
-    let src_port = tcp.src_port();
-    let dst_port = tcp.dst_port();
-    let base_control = extract_tcp_control(&tcp);
 
     for (i, chunk) in payload.chunks(max_seg_payload).enumerate() {
         let is_last = (i + 1) * max_seg_payload >= payload.len();
@@ -176,38 +134,21 @@ fn split_ipv6_gso(packet: Bytes, mtu: usize) -> Vec<BytesMut> {
         let mut new_ip = Ipv6Packet::new_unchecked(&mut buf[..ip_header_len]);
         new_ip.set_payload_len((tcp_header_len + chunk.len()) as u16);
 
-        // 2. Build TCP header
-        let tcp_control = if is_last {
-            base_control
-        } else {
-            match base_control {
-                TcpControl::Psh | TcpControl::Fin => TcpControl::None,
-                other => other,
-            }
-        };
+        // 2. Copy original TCP header (preserving all TCP options)
+        buf[ip_header_len..headers_len].copy_from_slice(&packet[ip_header_len..headers_len]);
 
-        let tcp_repr = TcpRepr {
-            src_port,
-            dst_port,
-            control: tcp_control,
-            seq_number: seq_num,
-            ack_number: Some(ack_num),
-            window_len,
-            window_scale: None,
-            max_seg_size: None,
-            sack_permitted: false,
-            sack_ranges: [None, None, None],
-            timestamp: None,
-            payload: chunk,
-        };
+        // 3. Copy payload chunk
+        buf[headers_len..total_packet_len].copy_from_slice(chunk);
 
-        let mut new_tcp = TcpPacket::new_unchecked(&mut buf[ip_header_len..]);
-        tcp_repr.emit(
-            &mut new_tcp,
-            &IpAddress::Ipv6(src_ip),
-            &IpAddress::Ipv6(dst_ip),
-            &smoltcp::phy::ChecksumCapabilities::default(),
-        );
+        // 4. Update TCP header fields & recalculate checksum
+        let mut new_tcp =
+            TcpPacket::new_unchecked(&mut buf[ip_header_len..total_packet_len]);
+        new_tcp.set_seq_number(seq_num);
+        if !is_last {
+            new_tcp.set_fin(false);
+            new_tcp.set_psh(false);
+        }
+        new_tcp.fill_checksum(&IpAddress::Ipv6(src_ip), &IpAddress::Ipv6(dst_ip));
 
         segments.push(buf);
         seq_num = seq_num + chunk.len();
@@ -219,7 +160,7 @@ fn split_ipv6_gso(packet: Bytes, mtu: usize) -> Vec<BytesMut> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use smoltcp::wire::{Ipv4Address, Ipv4Repr, TcpControl};
+    use smoltcp::wire::{Ipv4Address, Ipv4Repr, TcpControl, TcpRepr, TcpTimestampRepr};
 
     #[test]
     fn test_gso_split_small_packet() {
@@ -350,5 +291,83 @@ mod tests {
             assert_eq!(seg_tcp.src_port(), 54321);
             assert_eq!(seg_tcp.dst_port(), 443);
         }
+    }
+
+    #[test]
+    fn test_gso_split_ipv4_tcp_with_options() {
+        let src = Ipv4Address::new(192, 168, 1, 100);
+        let dst = Ipv4Address::new(1, 1, 1, 1);
+        let mut payload = vec![0u8; 3000];
+        for (i, b) in payload.iter_mut().enumerate() {
+            *b = (i % 256) as u8;
+        }
+
+        let tcp_repr = TcpRepr {
+            src_port: 12345,
+            dst_port: 80,
+            control: TcpControl::Psh,
+            seq_number: smoltcp::wire::TcpSeqNumber(1000),
+            ack_number: Some(smoltcp::wire::TcpSeqNumber(2000)),
+            window_len: 65535,
+            window_scale: None,
+            max_seg_size: None,
+            sack_permitted: false,
+            sack_ranges: [None, None, None],
+            timestamp: Some(TcpTimestampRepr {
+                tsval: 123456,
+                tsecr: 654321,
+            }), // 12-byte TCP option -> 32-byte header
+            payload: &payload,
+        };
+
+        let ip_repr = Ipv4Repr {
+            src_addr: src,
+            dst_addr: dst,
+            next_header: IpProtocol::Tcp,
+            payload_len: tcp_repr.header_len() + payload.len(),
+            hop_limit: 64,
+        };
+
+        let mut buffer = vec![0u8; ip_repr.buffer_len() + tcp_repr.buffer_len()];
+        let mut ip_packet = Ipv4Packet::new_unchecked(&mut buffer);
+        ip_repr.emit(&mut ip_packet, &smoltcp::phy::ChecksumCapabilities::default());
+
+        let mut tcp_packet = TcpPacket::new_unchecked(ip_packet.payload_mut());
+        tcp_repr.emit(
+            &mut tcp_packet,
+            &IpAddress::Ipv4(src),
+            &IpAddress::Ipv4(dst),
+            &smoltcp::phy::ChecksumCapabilities::default(),
+        );
+
+        let gso_pkt = Bytes::from(buffer);
+        let segments = split_gso_packet(gso_pkt, 1500);
+
+        // Header is 20 (IP) + 32 (TCP with timestamp) = 52 bytes
+        // Max payload per segment is 1500 - 52 = 1448
+        // 3000 payload -> 1448 + 1448 + 104 = 3 segments
+        assert_eq!(segments.len(), 3);
+        assert_eq!(segments[0].len(), 52 + 1448);
+        assert_eq!(segments[1].len(), 52 + 1448);
+        assert_eq!(segments[2].len(), 52 + 104);
+
+        let mut reconstructed_payload = Vec::new();
+        for (i, seg) in segments.iter().enumerate() {
+            let seg_ip = Ipv4Packet::new_checked(&seg[..]).unwrap();
+            assert_eq!(seg_ip.next_header(), IpProtocol::Tcp);
+            let seg_tcp = TcpPacket::new_checked(seg_ip.payload()).unwrap();
+            assert_eq!(seg_tcp.header_len(), 32, "TCP options must be preserved");
+            assert_eq!(seg_tcp.src_port(), 12345);
+            assert_eq!(seg_tcp.dst_port(), 80);
+            if i < segments.len() - 1 {
+                assert!(!seg_tcp.psh());
+                assert!(!seg_tcp.fin());
+            } else {
+                assert!(seg_tcp.psh());
+            }
+            reconstructed_payload.extend_from_slice(seg_tcp.payload());
+        }
+
+        assert_eq!(reconstructed_payload, payload, "Payload must not be corrupted");
     }
 }

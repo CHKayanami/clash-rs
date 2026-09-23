@@ -3,7 +3,8 @@ use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     sync::{
         Arc,
-        atomic::{AtomicU16, Ordering},
+        atomic::{AtomicU16, AtomicU64, Ordering},
+        LazyLock,
     },
     time::{Duration, Instant},
 };
@@ -15,15 +16,43 @@ use smoltcp::wire::{
 };
 use tracing::{debug, error, trace};
 
+static START_TIME: LazyLock<Instant> = LazyLock::new(Instant::now);
+
+#[inline]
+fn current_monotonic_us() -> u64 {
+    START_TIME.elapsed().as_micros() as u64
+}
+
 pub struct TcpSession {
     pub source: SocketAddr,
     pub destination: SocketAddr,
-    pub last_active: RwLock<Instant>,
+    pub last_active_us: AtomicU64,
+}
+
+impl TcpSession {
+    pub fn new(source: SocketAddr, destination: SocketAddr) -> Self {
+        Self {
+            source,
+            destination,
+            last_active_us: AtomicU64::new(current_monotonic_us()),
+        }
+    }
+
+    #[inline]
+    pub fn touch(&self) {
+        self.last_active_us
+            .store(current_monotonic_us(), Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub fn last_active_us(&self) -> u64 {
+        self.last_active_us.load(Ordering::Relaxed)
+    }
 }
 
 pub struct SystemTcpNat {
     port_index: AtomicU16,
-    addr_map: RwLock<HashMap<SocketAddr, u16>>,
+    addr_map: RwLock<HashMap<(SocketAddr, SocketAddr), u16>>,
     port_map: RwLock<HashMap<u16, Arc<TcpSession>>>,
 }
 
@@ -43,12 +72,13 @@ impl SystemTcpNat {
     }
 
     pub fn lookup(&self, source: SocketAddr, destination: SocketAddr) -> u16 {
+        let key = (source, destination);
         {
             let addr_map = self.addr_map.read();
-            if let Some(&port) = addr_map.get(&source) {
+            if let Some(&port) = addr_map.get(&key) {
                 let port_map = self.port_map.read();
                 if let Some(session) = port_map.get(&port) {
-                    *session.last_active.write() = Instant::now();
+                    session.touch();
                     return port;
                 }
             }
@@ -58,9 +88,9 @@ impl SystemTcpNat {
         let mut port_map = self.port_map.write();
 
         // Double check after acquiring write locks
-        if let Some(&port) = addr_map.get(&source) {
+        if let Some(&port) = addr_map.get(&key) {
             if let Some(session) = port_map.get(&port) {
-                *session.last_active.write() = Instant::now();
+                session.touch();
                 return port;
             }
         }
@@ -87,13 +117,9 @@ impl SystemTcpNat {
             }
         }
 
-        let session = Arc::new(TcpSession {
-            source,
-            destination,
-            last_active: RwLock::new(Instant::now()),
-        });
+        let session = Arc::new(TcpSession::new(source, destination));
 
-        addr_map.insert(source, port);
+        addr_map.insert(key, port);
         port_map.insert(port, session);
         port
     }
@@ -101,19 +127,20 @@ impl SystemTcpNat {
     pub fn lookup_back(&self, port: u16) -> Option<Arc<TcpSession>> {
         let port_map = self.port_map.read();
         let session = port_map.get(&port)?.clone();
-        *session.last_active.write() = Instant::now();
+        session.touch();
         Some(session)
     }
 
     pub fn cleanup_timeout(&self, timeout: Duration) {
-        let now = Instant::now();
+        let now = current_monotonic_us();
+        let timeout_us = timeout.as_micros() as u64;
         let mut addr_map = self.addr_map.write();
         let mut port_map = self.port_map.write();
 
         port_map.retain(|_port, session| {
-            let last = *session.last_active.read();
-            if now.duration_since(last) > timeout {
-                addr_map.remove(&session.source);
+            let last = session.last_active_us();
+            if timeout.is_zero() || now.saturating_sub(last) > timeout_us {
+                addr_map.remove(&(session.source, session.destination));
                 false
             } else {
                 true
@@ -462,5 +489,27 @@ mod tests {
         assert_eq!(restored_ip.dst_addr(), client_src);
         assert_eq!(restored_tcp.src_port(), target_port);
         assert_eq!(restored_tcp.dst_port(), client_port);
+    }
+
+    #[test]
+    fn test_system_tcp_nat_different_destinations() {
+        let nat = SystemTcpNat::new();
+        let src: SocketAddr = "192.168.1.100:54321".parse().unwrap();
+        let dst1: SocketAddr = "8.8.8.8:443".parse().unwrap();
+        let dst2: SocketAddr = "1.1.1.1:443".parse().unwrap();
+
+        let port1 = nat.lookup(src, dst1);
+        let port2 = nat.lookup(src, dst2);
+        assert_ne!(port1, port2, "different destinations must not share the same nat port");
+
+        let session1 = nat.lookup_back(port1).expect("session1 must exist");
+        let session2 = nat.lookup_back(port2).expect("session2 must exist");
+        assert_eq!(session1.destination, dst1);
+        assert_eq!(session2.destination, dst2);
+
+        // Verify cleanup removes specific 4-tuple
+        nat.cleanup_timeout(Duration::from_secs(0));
+        assert!(nat.lookup_back(port1).is_none());
+        assert!(nat.lookup_back(port2).is_none());
     }
 }

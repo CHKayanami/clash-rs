@@ -47,15 +47,60 @@ pub(super) fn convert(mut c: def::Config) -> Result<config::Config, crate::Error
              will not allow any connections from the local network."
         );
     }
-    if let Some(tun) = &mut c.tun
-        && tun.so_mark.is_none()
-    {
-        tun.so_mark = c.routing_mark;
+    let ebpf_enabled = c.ebpf.as_ref().map(|e| e.enable).unwrap_or(false);
+    let tun_route_all = c.tun.as_ref().map(|t| t.route_all).unwrap_or(false);
+
+    let conf_routing_mark = c.routing_mark;
+    let conf_tun_mark = c.tun.as_ref().and_then(|t| t.so_mark);
+    let conf_ebpf_mark = c.ebpf.as_ref().and_then(|e| e.routing_mark);
+
+    if let (Some(rm), Some(tsm)) = (conf_routing_mark, conf_tun_mark) {
+        if rm != tsm {
+            warn!(
+                "routing-mark ({rm}) and tun.so-mark ({tsm}) conflict; overriding tun.so-mark with routing-mark ({rm}) to prevent routing loop"
+            );
+        }
     }
-    if let Some(ebpf) = &mut c.ebpf
-        && ebpf.routing_mark.is_none()
-    {
-        ebpf.routing_mark = c.routing_mark;
+    if let (Some(rm), Some(erm)) = (conf_routing_mark, conf_ebpf_mark) {
+        if rm != erm {
+            warn!(
+                "routing-mark ({rm}) and ebpf.routing-mark ({erm}) conflict; overriding ebpf.routing-mark with routing-mark ({rm}) to prevent routing loop"
+            );
+        }
+    }
+    if let (Some(tsm), Some(erm)) = (conf_tun_mark, conf_ebpf_mark) {
+        if tsm != erm && conf_routing_mark.is_none() {
+            warn!(
+                "tun.so-mark ({tsm}) and ebpf.routing-mark ({erm}) conflict; unifying mark to tun.so-mark ({tsm}) to prevent routing loop"
+            );
+        }
+    }
+
+    let explicit_mark = conf_routing_mark.or(conf_tun_mark).or(conf_ebpf_mark);
+
+    let default_mark = if ebpf_enabled {
+        #[cfg(all(target_os = "linux", feature = "ebpf"))]
+        {
+            Some(clash_ebpf::DAE_BYPASS_MARK)
+        }
+        #[cfg(not(all(target_os = "linux", feature = "ebpf")))]
+        {
+            Some(0x2dae)
+        }
+    } else if tun_route_all {
+        Some(0x162)
+    } else {
+        None
+    };
+
+    let effective_mark = explicit_mark.or(default_mark);
+    c.routing_mark = effective_mark;
+
+    if let Some(tun) = &mut c.tun {
+        tun.so_mark = effective_mark;
+    }
+    if let Some(ebpf) = &mut c.ebpf {
+        ebpf.routing_mark = effective_mark;
     }
     config::Config {
         general: general::convert(&c)?,
@@ -164,5 +209,36 @@ impl TryFrom<HashMap<String, Value>> for OutboundGroupProtocol {
             .to_owned();
         OutboundGroupProtocol::deserialize(MapDeserializer::new(mapping.into_iter()))
             .map_err(map_serde_error(name))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_mark_conflict_resolution_tun() {
+        let yaml = r#"
+        routing-mark: 100
+        tun:
+          enable: true
+          so-mark: 200
+        "#;
+        let def_cfg: def::Config = serde_yaml::from_str(yaml).unwrap();
+        let cfg = convert(def_cfg).unwrap();
+        assert_eq!(cfg.tun.so_mark, Some(100));
+    }
+
+    #[test]
+    fn test_mark_conflict_resolution_ebpf() {
+        let yaml = r#"
+        routing-mark: 100
+        ebpf:
+          enable: true
+          routing-mark: 300
+        "#;
+        let def_cfg: def::Config = serde_yaml::from_str(yaml).unwrap();
+        let cfg = convert(def_cfg).unwrap();
+        assert_eq!(cfg.ebpf.as_ref().unwrap().routing_mark, Some(100));
     }
 }

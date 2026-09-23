@@ -729,16 +729,17 @@ async fn create_components(
         let need_iface = explicit_iface.is_some()
             || config.tun.route_all
             || config.tun.auto_detect_interface;
+        let mark = config.tun.so_mark;
         if need_iface {
             debug!(
                 "tun enabled with auto-route or explicit interface, initializing default outbound interface"
             );
-            init_net_config(explicit_iface.as_deref(), config.tun.so_mark).await;
+            init_net_config(explicit_iface.as_deref(), mark).await;
         } else {
             debug!(
                 "tun enabled without auto-route/auto-detect, skipping default outbound interface binding"
             );
-            *crate::app::net::TUN_SOMARK.write().await = config.tun.so_mark;
+            *crate::app::net::TUN_SOMARK.write().await = mark;
         }
     }
 
@@ -746,9 +747,13 @@ async fn create_components(
     if let Some(ebpf_cfg) = &config.ebpf
         && ebpf_cfg.enable
     {
-        debug!("ebpf enabled, setting default outbound SO_MARK to DAE_BYPASS_MARK");
-        *crate::app::net::TUN_SOMARK.write().await =
-            Some(clash_ebpf::DAE_BYPASS_MARK);
+        let mark = config
+            .tun
+            .so_mark
+            .or(ebpf_cfg.routing_mark)
+            .or(Some(clash_ebpf::DAE_BYPASS_MARK));
+        debug!("ebpf enabled, setting default outbound SO_MARK to {:?}", mark);
+        *crate::app::net::TUN_SOMARK.write().await = mark;
     }
 
     let cancellation_token = tokio_util::sync::CancellationToken::new();

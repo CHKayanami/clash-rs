@@ -264,12 +264,10 @@ impl TunRunner {
                         };
                         return Err(Error::Operation(err_msg));
                     }
-
-                    info!("setting up routes for tun {}", &tun_name);
-                    maybe_add_routes(cfg, &tun_name)?;
-                } else {
-                    info!("skipping route setup for existing tun {}", &tun_name);
                 }
+
+                info!("setting up routes for tun {}", &tun_name);
+                maybe_add_routes(cfg, &tun_name)?;
 
                 dev
             }
