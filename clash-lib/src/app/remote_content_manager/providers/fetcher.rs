@@ -84,23 +84,28 @@ where
     pub async fn initial(&self) -> anyhow::Result<T> {
         let mut is_local = false;
         let mut immediately_update = false;
+        let mut should_save_cache = false;
 
         let vehicle_path = self.vehicle.path().to_owned();
 
         let mut inner = self.inner.write().await;
 
-        let content = match metadata(&vehicle_path) {
+        let mut content = match metadata(&vehicle_path) {
             Ok(meta) if meta.is_file() => {
                 let content = fs::read(&vehicle_path)?;
                 is_local = true;
                 inner.updated_at = meta.modified()?;
                 immediately_update = SystemTime::now()
                     .duration_since(inner.updated_at)
-                    .expect("wrong system clock")
-                    > self.interval;
+                    .map(|d| d > self.interval)
+                    .unwrap_or(true);
                 content
             }
-            _ => self.vehicle.read().await?,
+            _ => {
+                should_save_cache = true;
+                inner.updated_at = SystemTime::now();
+                self.vehicle.read().await?
+            }
         };
 
         let parser_guard = &self.parser;
@@ -111,12 +116,20 @@ where
                 if !is_local {
                     return Err(e);
                 }
-                let content = self.vehicle.read().await?;
-                (parser_guard)(&content)?
+                warn!(
+                    "failed to parse local cache for {}, falling back to remote: {}",
+                    self.name, e
+                );
+                let fetched = self.vehicle.read().await?;
+                let proxies = (parser_guard)(&fetched)?;
+                content = fetched;
+                should_save_cache = true;
+                inner.updated_at = SystemTime::now();
+                proxies
             }
         };
 
-        if self.vehicle_type() != ProviderVehicleType::File && !is_local {
+        if self.vehicle_type() != ProviderVehicleType::File && should_save_cache {
             let p = self.vehicle.path().to_owned();
             let path = Path::new(p.as_str());
             if let Some(prefix) = path.parent() {
@@ -282,13 +295,18 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::{path::Path, sync::Arc, time::Duration};
+    use std::{
+        path::Path,
+        sync::Arc,
+        time::{Duration, SystemTime},
+    };
 
     use futures::future::BoxFuture;
     use tokio::time::sleep;
 
-    use crate::app::remote_content_manager::providers::{
-        MockProviderVehicle, ProviderVehicleType,
+    use crate::{
+        app::remote_content_manager::providers::{MockProviderVehicle, ProviderVehicleType},
+        common::utils,
     };
 
     use super::Fetcher;
@@ -354,5 +372,105 @@ mod tests {
         assert!(parsed.len() > 5);
         assert_eq!(parsed[0], vec![1, 2, 3]);
         assert_eq!(parsed[1], vec![4, 5, 6]);
+    }
+
+    #[tokio::test]
+    async fn test_fetcher_corrupt_cache_repaired_and_hash_updated() {
+        let mut mock_vehicle = MockProviderVehicle::new();
+        let mock_file = std::env::temp_dir().join(format!(
+            "{}-{}",
+            "mock_corrupt_cache",
+            uuid::Uuid::new_v4()
+        ));
+        let mock_path_str = mock_file.to_str().unwrap().to_owned();
+
+        // Write corrupt bytes to cache file
+        std::fs::write(&mock_file, b"corrupted").unwrap();
+
+        mock_vehicle.expect_path().return_const(mock_path_str.clone());
+        mock_vehicle
+            .expect_read()
+            .returning(|| Ok(b"repaired content".to_vec()));
+        mock_vehicle
+            .expect_typ()
+            .return_const(ProviderVehicleType::Http);
+
+        let parser = |i: &[u8]| -> anyhow::Result<String> {
+            if i == b"corrupted" {
+                anyhow::bail!("corrupted local cache");
+            }
+            Ok(String::from_utf8_lossy(i).to_string())
+        };
+
+        let mut f = Fetcher::new(
+            "test_corrupt_cache".to_string(),
+            Duration::from_secs(60),
+            Arc::new(mock_vehicle),
+            parser,
+            None::<fn(String) -> BoxFuture<'static, ()>>,
+        );
+
+        let res = f.initial().await;
+        assert!(res.is_ok());
+        assert_eq!(res.unwrap(), "repaired content");
+
+        // Verify the cache file on disk has been repaired
+        let disk_content = std::fs::read(&mock_file).unwrap();
+        assert_eq!(disk_content, b"repaired content");
+
+        // Verify the hash in inner matches the repaired content
+        let expected_hash: [u8; 16] = utils::md5(b"repaired content")[..16]
+            .try_into()
+            .unwrap();
+        assert_eq!(f.inner.read().await.hash, expected_hash);
+
+        f.destroy().await;
+        let _ = std::fs::remove_file(&mock_file);
+    }
+
+    #[tokio::test]
+    async fn test_fetcher_future_timestamp_does_not_panic() {
+        let mut mock_vehicle = MockProviderVehicle::new();
+        let mock_file = std::env::temp_dir().join(format!(
+            "{}-{}",
+            "mock_future_ts",
+            uuid::Uuid::new_v4()
+        ));
+        let mock_path_str = mock_file.to_str().unwrap().to_owned();
+
+        std::fs::write(&mock_file, b"valid content").unwrap();
+
+        // Set modification time 1 hour into the future
+        let future_time = SystemTime::now() + Duration::from_secs(3600);
+        filetime::set_file_times(&mock_file, future_time.into(), future_time.into())
+            .unwrap();
+
+        mock_vehicle.expect_path().return_const(mock_path_str.clone());
+        mock_vehicle
+            .expect_read()
+            .returning(|| Ok(b"remote content".to_vec()));
+        mock_vehicle
+            .expect_typ()
+            .return_const(ProviderVehicleType::Http);
+
+        let parser = |i: &[u8]| -> anyhow::Result<String> {
+            Ok(String::from_utf8_lossy(i).to_string())
+        };
+
+        let mut f = Fetcher::new(
+            "test_future_ts".to_string(),
+            Duration::from_secs(60),
+            Arc::new(mock_vehicle),
+            parser,
+            None::<fn(String) -> BoxFuture<'static, ()>>,
+        );
+
+        // initial() should succeed without panicking on duration_since
+        let res = f.initial().await;
+        assert!(res.is_ok());
+        assert_eq!(res.unwrap(), "valid content");
+
+        f.destroy().await;
+        let _ = std::fs::remove_file(&mock_file);
     }
 }

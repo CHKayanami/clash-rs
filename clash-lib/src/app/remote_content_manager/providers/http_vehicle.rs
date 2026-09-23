@@ -12,7 +12,10 @@ use async_trait::async_trait;
 
 use http::{
     Request,
-    header::{HeaderName, HeaderValue, LOCATION, USER_AGENT},
+    header::{
+        AUTHORIZATION, COOKIE, HeaderName, HeaderValue, LOCATION, PROXY_AUTHORIZATION,
+        USER_AGENT,
+    },
 };
 use http_body_util::BodyExt;
 use hyper::Uri;
@@ -64,19 +67,39 @@ impl Vehicle {
     }
 }
 
+#[inline]
+fn is_sensitive_header(header: &HeaderName) -> bool {
+    header == AUTHORIZATION || header == COOKIE || header == PROXY_AUTHORIZATION
+}
+
 #[async_trait]
 impl ProviderVehicle for Vehicle {
     async fn read(&self) -> std::io::Result<Vec<u8>> {
         let mut current_uri = self.url.clone();
         let mut max_redirects = 10;
 
+        let initial_url = url::Url::parse(&self.url.to_string())
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        let initial_origin = initial_url.origin();
+
         loop {
             let mut req = Request::default();
             let mut has_user_agent = false;
+
+            let current_url = url::Url::parse(&current_uri.to_string())
+                .map_err(|e| io::Error::other(e.to_string()))?;
+            let is_cross_origin = current_url.origin() != initial_origin;
+
             if let Some(headers) = &self.headers {
                 for (key, values) in headers {
                     match HeaderName::from_bytes(key.as_bytes()) {
                         Ok(header_name) => {
+                            if is_cross_origin && is_sensitive_header(&header_name) {
+                                debug!(
+                                    "stripping sensitive header '{header_name}' on cross-origin redirect to {current_uri}"
+                                );
+                                continue;
+                            }
                             if header_name == USER_AGENT {
                                 has_user_agent = true;
                             }
@@ -376,6 +399,122 @@ mod tests {
         let data = v.read().await.unwrap();
         mock.assert();
         assert_eq!(str::from_utf8(&data).unwrap(), "ua ok");
+    }
+
+    #[tokio::test]
+    async fn test_http_vehicle_cross_origin_redirect_strips_sensitive_headers() {
+        initialize();
+        let server1 = MockServer::start();
+        let server2 = MockServer::start();
+
+        let target_url = server2.url("/target");
+
+        let mock1 = server1.mock(|when, then| {
+            when.method(GET)
+                .path("/redirect")
+                .header("authorization", "Bearer token123")
+                .header("cookie", "foo=bar")
+                .header("x-custom-key", "custom-val");
+            then.status(302).header("location", target_url.clone());
+        });
+
+        let mock_auth_leak = server2.mock(|when, then| {
+            when.method(GET)
+                .path("/target")
+                .header_exists("authorization");
+            then.status(403).body("auth leaked");
+        });
+
+        let mock_cookie_leak = server2.mock(|when, then| {
+            when.method(GET)
+                .path("/target")
+                .header_exists("cookie");
+            then.status(403).body("cookie leaked");
+        });
+
+        let mock_ok = server2.mock(|when, then| {
+            when.method(GET)
+                .path("/target")
+                .header("x-custom-key", "custom-val");
+            then.status(200).body("cross origin ok");
+        });
+
+        let u = server1.url("/redirect").parse::<Uri>().unwrap();
+        let p = std::env::temp_dir().join("test_http_vehicle_cross_origin");
+        let r = Arc::new(EnhancedResolver::new_default().await);
+
+        let mut headers = std::collections::HashMap::new();
+        headers.insert(
+            "Authorization".to_string(),
+            vec!["Bearer token123".to_string()],
+        );
+        headers.insert("Cookie".to_string(), vec!["foo=bar".to_string()]);
+        headers.insert(
+            "X-Custom-Key".to_string(),
+            vec!["custom-val".to_string()],
+        );
+
+        let v = super::Vehicle::new(
+            u,
+            p,
+            None,
+            r.clone() as ThreadSafeDNSResolver,
+            None,
+            None,
+            Some(headers),
+        );
+
+        let data = v.read().await.unwrap();
+        mock1.assert();
+        assert_eq!(mock_auth_leak.calls(), 0);
+        assert_eq!(mock_cookie_leak.calls(), 0);
+        mock_ok.assert();
+        assert_eq!(str::from_utf8(&data).unwrap(), "cross origin ok");
+    }
+
+    #[tokio::test]
+    async fn test_http_vehicle_same_origin_redirect_keeps_sensitive_headers() {
+        initialize();
+        let server = MockServer::start();
+
+        let mock_redirect = server.mock(|when, then| {
+            when.method(GET)
+                .path("/redirect")
+                .header("authorization", "Bearer token123");
+            then.status(302).header("location", "/target");
+        });
+
+        let mock_target = server.mock(|when, then| {
+            when.method(GET)
+                .path("/target")
+                .header("authorization", "Bearer token123");
+            then.status(200).body("same origin ok");
+        });
+
+        let u = server.url("/redirect").parse::<Uri>().unwrap();
+        let p = std::env::temp_dir().join("test_http_vehicle_same_origin");
+        let r = Arc::new(EnhancedResolver::new_default().await);
+
+        let mut headers = std::collections::HashMap::new();
+        headers.insert(
+            "Authorization".to_string(),
+            vec!["Bearer token123".to_string()],
+        );
+
+        let v = super::Vehicle::new(
+            u,
+            p,
+            None,
+            r.clone() as ThreadSafeDNSResolver,
+            None,
+            None,
+            Some(headers),
+        );
+
+        let data = v.read().await.unwrap();
+        mock_redirect.assert();
+        mock_target.assert();
+        assert_eq!(str::from_utf8(&data).unwrap(), "same origin ok");
     }
 }
 
