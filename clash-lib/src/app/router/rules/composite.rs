@@ -139,7 +139,7 @@ impl CompositeRule {
             rule_provider_registry,
         )?;
 
-        match operator {
+        match operator.to_ascii_uppercase().as_str() {
             "AND" => Ok(RuleExpression::And(sub_exprs)),
             "OR" => Ok(RuleExpression::Or(sub_exprs)),
             "NOT" => {
@@ -272,12 +272,13 @@ impl CompositeRule {
         let rule_type = inner[..first_comma_pos].trim();
         let rest = &inner[first_comma_pos + 1..];
 
+        let rule_type_upper = rule_type.to_ascii_uppercase();
         // Check if this is a composite operator
-        if matches!(rule_type, "AND" | "OR" | "NOT") {
+        if matches!(rule_type_upper.as_str(), "AND" | "OR" | "NOT") {
             // Recursively parse as composite rule
             // rest should be like: ((expr1),(expr2),...)
             return Self::parse_expression(
-                rule_type,
+                &rule_type_upper,
                 rest,
                 mmdb,
                 geodata,
@@ -292,7 +293,7 @@ impl CompositeRule {
         // (DOMAIN-REGEX, most obviously) survive intact.
         let (payload, params) = split_trailing_params(rest);
         let rule = RuleType::new(rule_type, payload, "", params)?;
-        let matcher = map_rule_type(rule, mmdb, geodata, rule_provider_registry);
+        let matcher = map_rule_type(rule, mmdb, geodata, rule_provider_registry)?;
         Ok(RuleExpression::Rule(Box::new(matcher)))
     }
 }
@@ -308,7 +309,7 @@ fn split_trailing_params(rest: &str) -> (&str, Option<Vec<&str>>) {
 
     while let Some(comma) = payload.rfind(',') {
         let candidate = payload[comma + 1..].trim();
-        if !RULE_PARAMS.contains(&candidate) {
+        if !RULE_PARAMS.iter().any(|&p| p.eq_ignore_ascii_case(candidate)) {
             break;
         }
         params.push(candidate);
@@ -801,6 +802,31 @@ mod tests {
         assert!(!rule.apply(&sess));
 
         let sess = create_test_session("b.com", 443, Network::Tcp);
+        assert!(!rule.apply(&sess));
+    }
+
+    #[test]
+    fn test_lowercase_nested_composite_rule() {
+        let rule = CompositeRule::new(
+            "or",
+            "((and,((DOMAIN,a.com),(NETWORK,TCP))),(not,((DOMAIN,b.com))))",
+            "TEST",
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        // Matches a.com + TCP
+        let sess = create_test_session("a.com", 443, Network::Tcp);
+        assert!(rule.apply(&sess));
+
+        // Matches c.com because not b.com is true
+        let sess = create_test_session("c.com", 80, Network::Tcp);
+        assert!(rule.apply(&sess));
+
+        // Does not match b.com + UDP
+        let sess = create_test_session("b.com", 53, Network::Udp);
         assert!(!rule.apply(&sess));
     }
 }

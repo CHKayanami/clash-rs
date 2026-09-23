@@ -3,7 +3,7 @@ use crate::{
     app::dns::ThreadSafeDNSResolver,
     common::{
         errors::map_io_error,
-        http::{ClashHTTPClientExt, HttpClient, DEFAULT_USER_AGENT, new_http_client},
+        http::{ClashHTTPClientExt, HttpClient, DEFAULT_USER_AGENT},
     },
     proxy::utils::OutboundHandlerRegistry,
 };
@@ -44,7 +44,29 @@ impl Vehicle {
         outbounds: Option<OutboundHandlerRegistry>,
         headers: Option<HashMap<String, Vec<String>>>,
     ) -> Self {
-        let client = new_http_client(dns_resolver, outbounds)
+        Self::new_with_timeout(
+            url,
+            path,
+            cwd,
+            dns_resolver,
+            outbound,
+            outbounds,
+            headers,
+            None,
+        )
+    }
+
+    pub fn new_with_timeout<T: Into<Uri>, P: AsRef<Path>>(
+        url: T,
+        path: P,
+        cwd: Option<P>,
+        dns_resolver: ThreadSafeDNSResolver,
+        outbound: Option<String>,
+        outbounds: Option<OutboundHandlerRegistry>,
+        headers: Option<HashMap<String, Vec<String>>>,
+        timeout: Option<tokio::time::Duration>,
+    ) -> Self {
+        let client = HttpClient::new(dns_resolver, outbounds, timeout)
             .expect("failed to create http client");
         let uri = url.into();
         let path_ref = path.as_ref();
@@ -75,120 +97,125 @@ fn is_sensitive_header(header: &HeaderName) -> bool {
 #[async_trait]
 impl ProviderVehicle for Vehicle {
     async fn read(&self) -> std::io::Result<Vec<u8>> {
-        let mut current_uri = self.url.clone();
-        let mut max_redirects = 10;
+        tokio::time::timeout(self.http_client.timeout(), async {
+            let mut current_uri = self.url.clone();
+            let mut max_redirects = 10;
 
-        let initial_url = url::Url::parse(&self.url.to_string())
-            .map_err(|e| io::Error::other(e.to_string()))?;
-        let initial_origin = initial_url.origin();
-
-        loop {
-            let mut req = Request::default();
-            let mut has_user_agent = false;
-
-            let current_url = url::Url::parse(&current_uri.to_string())
+            let initial_url = url::Url::parse(&self.url.to_string())
                 .map_err(|e| io::Error::other(e.to_string()))?;
-            let is_cross_origin = current_url.origin() != initial_origin;
+            let initial_origin = initial_url.origin();
 
-            if let Some(headers) = &self.headers {
-                for (key, values) in headers {
-                    match HeaderName::from_bytes(key.as_bytes()) {
-                        Ok(header_name) => {
-                            if is_cross_origin && is_sensitive_header(&header_name) {
-                                debug!(
-                                    "stripping sensitive header '{header_name}' on cross-origin redirect to {current_uri}"
-                                );
-                                continue;
-                            }
-                            if header_name == USER_AGENT {
-                                has_user_agent = true;
-                            }
-                            for val in values {
-                                match HeaderValue::from_str(val) {
-                                    Ok(header_val) => {
-                                        req.headers_mut().append(header_name.clone(), header_val);
-                                    }
-                                    Err(e) => {
-                                        warn!(
-                                            "invalid header value for {key}: {val}, error: {e}"
-                                        );
+            loop {
+                let mut req = Request::default();
+                let mut has_user_agent = false;
+
+                let current_url = url::Url::parse(&current_uri.to_string())
+                    .map_err(|e| io::Error::other(e.to_string()))?;
+                let is_cross_origin = current_url.origin() != initial_origin;
+
+                if let Some(headers) = &self.headers {
+                    for (key, values) in headers {
+                        match HeaderName::from_bytes(key.as_bytes()) {
+                            Ok(header_name) => {
+                                if is_cross_origin && is_sensitive_header(&header_name) {
+                                    debug!(
+                                        "stripping sensitive header '{header_name}' on cross-origin redirect to {current_uri}"
+                                    );
+                                    continue;
+                                }
+                                if header_name == USER_AGENT {
+                                    has_user_agent = true;
+                                }
+                                for val in values {
+                                    match HeaderValue::from_str(val) {
+                                        Ok(header_val) => {
+                                            req.headers_mut().append(header_name.clone(), header_val);
+                                        }
+                                        Err(e) => {
+                                            warn!(
+                                                "invalid header value for {key}: {val}, error: {e}"
+                                            );
+                                        }
                                     }
                                 }
                             }
-                        }
-                        Err(e) => {
-                            warn!("invalid header name: {key}, error: {e}");
+                            Err(e) => {
+                                warn!("invalid header name: {key}, error: {e}");
+                            }
                         }
                     }
                 }
-            }
-            if !has_user_agent {
-                req.headers_mut().insert(
-                    USER_AGENT,
-                    DEFAULT_USER_AGENT.parse().expect("must parse user agent"),
-                );
-            }
-            if let Some(outbound) = &self.outbound {
-                req.extensions_mut().insert(ClashHTTPClientExt {
-                    outbound: Some(outbound.clone()),
-                });
-            }
-            *req.body_mut() = http_body_util::Empty::<bytes::Bytes>::new();
-            *req.uri_mut() = current_uri.clone();
-
-            let res = self
-                .http_client
-                .request(req)
-                .await
-                .map_err(|x| io::Error::other(x.to_string()))?;
-
-            let status = res.status();
-            if status.is_redirection() {
-                if max_redirects == 0 {
-                    return Err(io::Error::other("too many redirects"));
+                if !has_user_agent {
+                    req.headers_mut().insert(
+                        USER_AGENT,
+                        DEFAULT_USER_AGENT.parse().expect("must parse user agent"),
+                    );
                 }
-                max_redirects -= 1;
+                if let Some(outbound) = &self.outbound {
+                    req.extensions_mut().insert(ClashHTTPClientExt {
+                        outbound: Some(outbound.clone()),
+                    });
+                }
+                *req.body_mut() = http_body_util::Empty::<bytes::Bytes>::new();
+                *req.uri_mut() = current_uri.clone();
 
-                let location = res
-                    .headers()
-                    .get(LOCATION)
-                    .ok_or_else(|| {
-                        io::Error::other(format!(
-                            "redirect response ({status}) missing Location header"
-                        ))
-                    })?
-                    .to_str()
-                    .map_err(|e| io::Error::other(e.to_string()))?;
+                let res = self.http_client.request(req).await?;
 
-                let base_url = url::Url::parse(&current_uri.to_string())
-                    .map_err(|e| io::Error::other(e.to_string()))?;
-                let redirected_url = base_url
-                    .join(location)
-                    .map_err(|e| io::Error::other(e.to_string()))?;
+                let status = res.status();
+                if status.is_redirection() {
+                    if max_redirects == 0 {
+                        return Err(io::Error::other("too many redirects"));
+                    }
+                    max_redirects -= 1;
 
-                current_uri = redirected_url
-                    .as_str()
-                    .parse::<Uri>()
-                    .map_err(|e| io::Error::other(e.to_string()))?;
+                    let location = res
+                        .headers()
+                        .get(LOCATION)
+                        .ok_or_else(|| {
+                            io::Error::other(format!(
+                                "redirect response ({status}) missing Location header"
+                            ))
+                        })?
+                        .to_str()
+                        .map_err(|e| io::Error::other(e.to_string()))?;
 
-                debug!("HttpVehicle redirecting to {}", current_uri);
-                continue;
+                    let base_url = url::Url::parse(&current_uri.to_string())
+                        .map_err(|e| io::Error::other(e.to_string()))?;
+                    let redirected_url = base_url
+                        .join(location)
+                        .map_err(|e| io::Error::other(e.to_string()))?;
+
+                    current_uri = redirected_url
+                        .as_str()
+                        .parse::<Uri>()
+                        .map_err(|e| io::Error::other(e.to_string()))?;
+
+                    debug!("HttpVehicle redirecting to {}", current_uri);
+                    continue;
+                }
+
+                if !status.is_success() {
+                    return Err(io::Error::other(format!(
+                        "HTTP request failed with status: {}",
+                        status
+                    )));
+                }
+
+                return res
+                    .into_body()
+                    .collect()
+                    .await
+                    .map(|x| x.to_bytes().to_vec())
+                    .map_err(map_io_error);
             }
-
-            if !status.is_success() {
-                return Err(io::Error::other(format!(
-                    "HTTP request failed with status: {}",
-                    status
-                )));
-            }
-
-            return res
-                .into_body()
-                .collect()
-                .await
-                .map(|x| x.to_bytes().to_vec())
-                .map_err(map_io_error);
-        }
+        })
+        .await
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                "HTTP vehicle read timed out",
+            )
+        })?
     }
 
     fn path(&self) -> &str {
@@ -515,6 +542,36 @@ mod tests {
         mock_redirect.assert();
         mock_target.assert();
         assert_eq!(str::from_utf8(&data).unwrap(), "same origin ok");
+    }
+
+    #[tokio::test]
+    async fn test_http_vehicle_timeout() {
+        initialize();
+        let server = MockServer::start();
+        let _mock = server.mock(|when, then| {
+            when.method(GET).path("/slow_vehicle");
+            then.delay(std::time::Duration::from_millis(500))
+                .status(200)
+                .body("slow body");
+        });
+
+        let u = server.url("/slow_vehicle").parse::<Uri>().unwrap();
+        let p = std::env::temp_dir().join("test_http_vehicle_timeout");
+        let r = Arc::new(EnhancedResolver::new_default().await);
+        let v = super::Vehicle::new_with_timeout(
+            u,
+            p,
+            None,
+            r.clone() as ThreadSafeDNSResolver,
+            None,
+            None,
+            None,
+            Some(tokio::time::Duration::from_millis(50)),
+        );
+
+        let res = v.read().await;
+        assert!(res.is_err());
+        assert_eq!(res.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
     }
 }
 

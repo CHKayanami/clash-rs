@@ -17,8 +17,9 @@ use crate::{
     session::Session,
 };
 
-use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Duration};
+use std::{collections::HashMap, io, path::PathBuf, sync::Arc, time::Duration};
 
+use futures::future::join_all;
 use hyper::Uri;
 use rules::domain_regex::DomainRegex;
 use tracing::{error, info, trace};
@@ -49,6 +50,8 @@ pub type ThreadSafeRouter = ArcRouter;
 
 const MATCH: &str = "MATCH";
 
+pub const DEFAULT_RULE_PROVIDER_INIT_TIMEOUT: Duration = Duration::from_secs(30);
+
 impl Router {
     pub async fn new(
         rules: Vec<RuleType>,
@@ -60,7 +63,34 @@ impl Router {
         asn_mmdb: Option<MmdbLookup>,
         geodata: Option<GeoDataLookup>,
         cwd: String,
-    ) -> Self {
+    ) -> Result<Self, Error> {
+        Self::new_with_timeout(
+            rules,
+            rule_providers,
+            dns_resolver,
+            system_resolver,
+            outbound_registry,
+            country_mmdb,
+            asn_mmdb,
+            geodata,
+            cwd,
+            DEFAULT_RULE_PROVIDER_INIT_TIMEOUT,
+        )
+        .await
+    }
+
+    pub async fn new_with_timeout(
+        rules: Vec<RuleType>,
+        rule_providers: HashMap<String, RuleProviderDef>,
+        dns_resolver: ThreadSafeDNSResolver,
+        system_resolver: Option<ThreadSafeDNSResolver>,
+        outbound_registry: Option<OutboundHandlerRegistry>,
+        country_mmdb: Option<MmdbLookup>,
+        asn_mmdb: Option<MmdbLookup>,
+        geodata: Option<GeoDataLookup>,
+        cwd: String,
+        provider_init_timeout: Duration,
+    ) -> Result<Self, Error> {
         let mut rule_provider_registry = HashMap::new();
 
         Self::load_rule_providers(
@@ -72,29 +102,31 @@ impl Router {
             country_mmdb.clone(),
             geodata.clone(),
             cwd,
+            provider_init_timeout,
         )
-        .await
-        .ok();
+        .await?;
 
-        Self {
-            rules: rules
-                .into_iter()
-                .map(|r| {
-                    map_rule_type(
-                        r,
-                        country_mmdb.clone(),
-                        geodata.clone(),
-                        Some(&rule_provider_registry),
-                    )
-                })
-                .collect(),
+        let parsed_rules = rules
+            .into_iter()
+            .map(|r| {
+                map_rule_type(
+                    r,
+                    country_mmdb.clone(),
+                    geodata.clone(),
+                    Some(&rule_provider_registry),
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(Self {
+            rules: parsed_rules,
             dns_resolver,
 
             country_mmdb,
             asn_mmdb,
             geodata,
             rule_providers: rule_provider_registry,
-        }
+        })
     }
 
     pub fn get_rule_providers(&self) -> &HashMap<String, ThreadSafeRuleProvider> {
@@ -270,6 +302,7 @@ impl Router {
         mmdb: Option<MmdbLookup>,
         geodata: Option<GeoDataLookup>,
         cwd: String,
+        provider_init_timeout: Duration,
     ) -> Result<(), Error> {
         for (name, provider) in rule_providers.into_iter() {
             match provider {
@@ -348,23 +381,53 @@ impl Router {
             }
         }
 
-        for p in rule_provider_registry.values() {
-            let p = p.clone();
-            tokio::spawn(async move {
+        let tasks: Vec<_> = rule_provider_registry
+            .values()
+            .cloned()
+            .map(|p| async move {
                 info!("initializing rule provider {}", p.name());
-                match p.initialize().await {
-                    Ok(_) => {
+                match tokio::time::timeout(provider_init_timeout, p.initialize()).await {
+                    Ok(Ok(_)) => {
                         info!("rule provider {} initialized", p.name());
+                        Ok(())
                     }
-                    Err(err) => {
+                    Ok(Err(err)) => {
                         error!(
                             "failed to initialize rule provider {}: {}",
                             p.name(),
                             err
                         );
+                        Err((p.name().to_string(), err))
+                    }
+                    Err(_) => {
+                        let err = io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            format!("rule provider {} initialization timed out", p.name()),
+                        );
+                        error!("{}", err);
+                        Err((p.name().to_string(), err))
                     }
                 }
-            });
+            })
+            .collect();
+
+        let results = join_all(tasks).await;
+        let mut failed = Vec::new();
+        for res in results {
+            if let Err((name, err)) = res {
+                failed.push((name, err));
+            }
+        }
+        if !failed.is_empty() {
+            let failed_info: Vec<String> = failed
+                .into_iter()
+                .map(|(name, err)| format!("{name}: {err}"))
+                .collect();
+            error!("failed to initialize rule providers: {}", failed_info.join("; "));
+            return Err(Error::InvalidConfig(format!(
+                "failed to initialize rule provider(s): {}",
+                failed_info.join("; ")
+            )));
         }
 
         Ok(())
@@ -381,176 +444,158 @@ pub fn map_rule_type(
     mmdb: Option<MmdbLookup>,
     geodata: Option<GeoDataLookup>,
     rule_provider_registry: Option<&HashMap<String, ThreadSafeRuleProvider>>,
-) -> Rule {
+) -> Result<Rule, Error> {
     match rule_type {
         RuleType::Domain { domain, target } => {
-            Rule::Domain(Domain { domain, target })
+            Ok(Rule::Domain(Domain { domain, target }))
         }
         RuleType::DomainRegex { regex, target } => {
-            Rule::DomainRegex(DomainRegex { regex, target })
+            Ok(Rule::DomainRegex(DomainRegex { regex, target }))
         }
         RuleType::DomainSuffix {
             domain_suffix,
             target,
-        } => Rule::DomainSuffix(DomainSuffix {
+        } => Ok(Rule::DomainSuffix(DomainSuffix {
             suffix: domain_suffix,
             target,
-        }),
+        })),
         RuleType::DomainKeyword {
             domain_keyword,
             target,
-        } => Rule::DomainKeyword(DomainKeyword {
+        } => Ok(Rule::DomainKeyword(DomainKeyword {
             keyword: domain_keyword,
             target,
-        }),
+        })),
         RuleType::IpCidr {
             ipnet,
             target,
             no_resolve,
-        } => Rule::IpCidr(IpCidr {
+        } => Ok(Rule::IpCidr(IpCidr {
             ipnet,
             target,
             no_resolve,
             match_src: false,
-        }),
+        })),
         RuleType::SrcCidr {
             ipnet,
             target,
             no_resolve,
-        } => Rule::IpCidr(IpCidr {
+        } => Ok(Rule::IpCidr(IpCidr {
             ipnet,
             target,
             no_resolve,
             match_src: true,
-        }),
+        })),
 
         RuleType::GeoIP {
             target,
             country_code,
             no_resolve,
-        } => Rule::GeoIP(rules::geoip::GeoIP {
+        } => Ok(Rule::GeoIP(rules::geoip::GeoIP {
             target,
             country_code,
             no_resolve,
             mmdb: mmdb.clone(),
-        }),
+        })),
         RuleType::GeoSite {
             target,
             country_code,
-        } => match rules::geodata::GeoSiteMatcher::new(
-            country_code.clone(),
-            target,
-            geodata.as_ref(),
-        ) {
-            Ok(res) => Rule::GeoSite(res),
-            // a missing geosite.dat or a typo'd code used to abort the whole
-            // process here; degrade the way a broken composite rule does
-            Err(e) => {
-                error!(
-                    "failed to create GEOSITE rule for {}: {}. Using REJECT as \
-                     fallback.",
-                    country_code, e
-                );
-                Rule::Final(Final {
-                    target: "REJECT".to_string(),
-                })
-            }
-        },
-        RuleType::SRCPort { target, port } => Rule::Port(rules::port::Port {
+        } => {
+            let res = rules::geodata::GeoSiteMatcher::new(
+                country_code,
+                target,
+                geodata.as_ref(),
+            )?;
+            Ok(Rule::GeoSite(res))
+        }
+        RuleType::SRCPort { target, port } => Ok(Rule::Port(rules::port::Port {
             port,
             target,
             is_src: true,
-        }),
-        RuleType::DSTPort { target, port } => Rule::Port(rules::port::Port {
+        })),
+        RuleType::DSTPort { target, port } => Ok(Rule::Port(rules::port::Port {
             port,
             target,
             is_src: false,
-        }),
+        })),
         RuleType::ProcessName {
             process_name,
             target,
-        } => Rule::Process(rules::process::Process {
+        } => Ok(Rule::Process(rules::process::Process {
             name: process_name,
             target,
             name_only: true,
-        }),
+        })),
         RuleType::ProcessPath {
             process_path,
             target,
-        } => Rule::Process(rules::process::Process {
+        } => Ok(Rule::Process(rules::process::Process {
             name: process_path,
             target,
             name_only: false,
-        }),
+        })),
         RuleType::RuleSet {
             rule_set,
             target,
             no_resolve,
         } => match rule_provider_registry {
-            Some(rule_provider_registry) => Rule::RuleSet(RuleSet::new(
-                rule_set.clone(),
-                target,
-                rule_provider_registry
+            Some(rule_provider_registry) => {
+                let provider = rule_provider_registry
                     .get(&rule_set)
-                    .unwrap_or_else(|| {
-                        print_and_exit!("rule provider {} not found", rule_set)
-                    })
-                    .clone(),
-                no_resolve,
-            )),
-            None => {
-                // this is called in remote rule provider with no rule provider
-                // registry, in this case, we should panic
-                unreachable!("you shouldn't nest rule-set within another rule-set")
+                    .ok_or_else(|| Error::InvalidConfig(format!("rule provider {} not found", rule_set)))?;
+                Ok(Rule::RuleSet(RuleSet::new(
+                    rule_set,
+                    target,
+                    provider.clone(),
+                    no_resolve,
+                )))
             }
+            None => Err(Error::InvalidConfig(format!(
+                "nested RULE-SET is not supported: {rule_set}"
+            ))),
         },
         RuleType::Network { network, target } => {
-            Rule::Network(rules::network::NetworkRule { network, target })
+            Ok(Rule::Network(rules::network::NetworkRule { network, target }))
         }
         RuleType::Composite {
             operator,
             expression,
             target,
         } => {
-            match rules::composite::CompositeRule::new(
+            let rule = rules::composite::CompositeRule::new(
                 &operator,
                 &expression,
                 &target,
                 mmdb,
                 geodata,
                 rule_provider_registry,
-            ) {
-                Ok(rule) => Rule::Composite(rule),
-                Err(e) => {
-                    error!(
-                        "failed to create composite rule: {}, expression: {}. \
-                         Using REJECT as fallback.",
-                        e, expression
-                    );
-                    Rule::Final(Final {
-                        target: "REJECT".to_string(),
-                    })
-                }
-            }
+            )?;
+            Ok(Rule::Composite(rule))
         }
-        RuleType::Match { target } => Rule::Final(Final { target }),
+        RuleType::Match { target } => Ok(Rule::Final(Final { target })),
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{collections::HashMap, sync::Arc};
 
     use anyhow::Ok;
 
     use crate::{
-        app::dns::{MockClashResolver, SystemResolver},
+        app::{
+            dns::{MockClashResolver, SystemResolver},
+            remote_content_manager::providers::rule_provider::RuleSetBehavior,
+        },
         common::{
             geodata::{DEFAULT_GEOSITE_DOWNLOAD_URL, GeoData},
             http::new_http_client,
             mmdb::{DEFAULT_COUNTRY_MMDB_DOWNLOAD_URL, Mmdb},
         },
-        config::internal::rule::RuleType,
+        config::internal::{
+            config::{InlineRuleProvider, RuleProviderDef},
+            rule::RuleType,
+        },
         session::Session,
         tests::initialize,
     };
@@ -631,7 +676,8 @@ mod tests {
             Some(Arc::new(geodata)),
             temp_dir.path().to_str().unwrap().to_string(),
         )
-        .await;
+        .await
+        .unwrap();
 
         let cases = vec![
             ("china.com", "DIRECT", "should resolve and match IP"),
@@ -697,7 +743,8 @@ mod tests {
             None,
             std::env::temp_dir().to_str().unwrap().to_string(),
         )
-        .await;
+        .await
+        .unwrap();
 
         // Test TCP network rule
         let mut tcp_session = Session {
@@ -728,5 +775,287 @@ mod tests {
             "UDP-PROXY",
             "should match UDP network rule"
         );
+    }
+
+    #[tokio::test]
+    async fn test_router_rule_provider_initialization() {
+        initialize();
+        let mut mock_resolver = MockClashResolver::new();
+        mock_resolver.expect_resolve().returning(|_, _| Ok(None));
+        let mock_resolver = Arc::new(mock_resolver);
+
+        let mut providers = HashMap::new();
+        providers.insert(
+            "test_provider".to_string(),
+            RuleProviderDef::Inline(InlineRuleProvider {
+                path: "rules/test".to_string(),
+                behavior: RuleSetBehavior::Domain,
+                inline_rules: vec!["custom.domain.com".to_string()],
+            }),
+        );
+
+        let router = super::Router::new(
+            vec![
+                RuleType::RuleSet {
+                    rule_set: "test_provider".to_string(),
+                    target: "RULESET-HIT".to_string(),
+                    no_resolve: true,
+                },
+            ],
+            providers,
+            mock_resolver,
+            None,
+            None,
+            None,
+            None,
+            None,
+            std::env::temp_dir().to_str().unwrap().to_string(),
+        )
+        .await
+        .unwrap();
+
+        let provider = router.get_rule_providers().get("test_provider").unwrap();
+        // Provider must already be initialized upon Router::new return
+        assert_eq!(provider.count(), 1);
+
+        let mut sess = Session {
+            destination: crate::session::SocksAddr::Domain("custom.domain.com".into(), 80),
+            ..Default::default()
+        };
+        assert_eq!(router.match_route(&mut sess).await.0, "RULESET-HIT");
+    }
+
+    #[tokio::test]
+    async fn test_router_failed_rule_provider_returns_err() {
+        initialize();
+        let mut mock_resolver = MockClashResolver::new();
+        mock_resolver.expect_resolve().returning(|_, _| Ok(None));
+        let mock_resolver = Arc::new(mock_resolver);
+
+        use crate::config::internal::config::FileRuleProvider;
+
+        let mut providers = HashMap::new();
+        providers.insert(
+            "broken_provider".to_string(),
+            RuleProviderDef::File(FileRuleProvider {
+                path: "non_existent_file_xyz_123.yaml".to_string(),
+                behavior: RuleSetBehavior::Domain,
+                interval: None,
+                format: None,
+                inline_rules: None,
+            }),
+        );
+
+        let res = super::Router::new(
+            vec![],
+            providers,
+            mock_resolver,
+            None,
+            None,
+            None,
+            None,
+            None,
+            std::env::temp_dir().to_str().unwrap().to_string(),
+        )
+        .await;
+
+        assert!(res.is_err(), "Router::new should fail when provider fails to load");
+    }
+
+    #[tokio::test]
+    async fn test_router_unknown_rule_set_returns_err() {
+        initialize();
+        let mut mock_resolver = MockClashResolver::new();
+        mock_resolver.expect_resolve().returning(|_, _| Ok(None));
+        let mock_resolver = Arc::new(mock_resolver);
+
+        let res = super::Router::new(
+            vec![
+                RuleType::RuleSet {
+                    rule_set: "non_existent_provider".to_string(),
+                    target: "HIT".to_string(),
+                    no_resolve: true,
+                },
+            ],
+            HashMap::new(),
+            mock_resolver,
+            None,
+            None,
+            None,
+            None,
+            None,
+            std::env::temp_dir().to_str().unwrap().to_string(),
+        )
+        .await;
+
+        assert!(res.is_err(), "Router::new should fail when rule set is not found");
+    }
+
+    #[tokio::test]
+    async fn test_domain_regex_with_parentheses_in_router() {
+        initialize();
+        let mut mock_resolver = MockClashResolver::new();
+        mock_resolver.expect_resolve().returning(|_, _| Ok(None));
+        let mock_resolver = Arc::new(mock_resolver);
+
+        // A rule with parentheses like DOMAIN-REGEX,^foo(bar)\.com$,PROXY
+        // followed by a fallback DIRECT rule
+        let rule1 = RuleType::try_from("DOMAIN-REGEX,^foo(bar)\\.com$,PROXY".to_string()).unwrap();
+        let rule2 = RuleType::try_from("MATCH,DIRECT".to_string()).unwrap();
+
+        let router = super::Router::new(
+            vec![rule1, rule2],
+            HashMap::new(),
+            mock_resolver,
+            None,
+            None,
+            None,
+            None,
+            None,
+            std::env::temp_dir().to_str().unwrap().to_string(),
+        )
+        .await
+        .unwrap();
+
+        // Matching domain hits PROXY
+        let mut sess1 = Session {
+            destination: crate::session::SocksAddr::Domain("foobar.com".into(), 80),
+            ..Default::default()
+        };
+        assert_eq!(router.match_route(&mut sess1).await.0, "PROXY");
+
+        // Non-matching domain must fall through to DIRECT (NOT get rejected!)
+        let mut sess2 = Session {
+            destination: crate::session::SocksAddr::Domain("other.com".into(), 80),
+            ..Default::default()
+        };
+        assert_eq!(router.match_route(&mut sess2).await.0, "DIRECT");
+    }
+
+    #[tokio::test]
+    async fn test_lowercase_composite_rule_in_router() {
+        initialize();
+        let mut mock_resolver = MockClashResolver::new();
+        mock_resolver.expect_resolve().returning(|_, _| Ok(None));
+        let mock_resolver = Arc::new(mock_resolver);
+
+        let rule = RuleType::try_from("and,((DOMAIN,example.com),(NETWORK,TCP)),COMPOSITE-HIT".to_string()).unwrap();
+
+        let router = super::Router::new(
+            vec![rule],
+            HashMap::new(),
+            mock_resolver,
+            None,
+            None,
+            None,
+            None,
+            None,
+            std::env::temp_dir().to_str().unwrap().to_string(),
+        )
+        .await
+        .unwrap();
+
+        let mut sess = Session {
+            network: crate::session::Network::Tcp,
+            destination: crate::session::SocksAddr::Domain("example.com".into(), 80),
+            ..Default::default()
+        };
+        assert_eq!(router.match_route(&mut sess).await.0, "COMPOSITE-HIT");
+    }
+
+    #[tokio::test]
+    async fn test_domain_regex_with_commas_in_router() {
+        initialize();
+        let mut mock_resolver = MockClashResolver::new();
+        mock_resolver.expect_resolve().returning(|_, _| Ok(None));
+        let mock_resolver = Arc::new(mock_resolver);
+
+        let rule = RuleType::try_from("DOMAIN-REGEX,^foo,bar$,REGEX-HIT".to_string()).unwrap();
+
+        let router = super::Router::new(
+            vec![rule],
+            HashMap::new(),
+            mock_resolver,
+            None,
+            None,
+            None,
+            None,
+            None,
+            std::env::temp_dir().to_str().unwrap().to_string(),
+        )
+        .await
+        .unwrap();
+
+        let mut sess = Session {
+            destination: crate::session::SocksAddr::Domain("foo,bar".into(), 80),
+            ..Default::default()
+        };
+        assert_eq!(router.match_route(&mut sess).await.0, "REGEX-HIT");
+    }
+
+    #[tokio::test]
+    async fn test_router_rule_provider_timeout_returns_err() {
+        initialize();
+        use httpmock::{Method::GET, MockServer};
+        use std::{
+            result::Result::{Err, Ok},
+            time::Duration,
+        };
+
+        let server = MockServer::start();
+        let _mock = server.mock(|when, then| {
+            when.method(GET).path("/slow_provider.yaml");
+            then.delay(Duration::from_millis(500))
+                .status(200)
+                .body("payload:\n  - DOMAIN,example.com");
+        });
+
+        let mut mock_resolver = MockClashResolver::new();
+        mock_resolver.expect_resolve().returning(|_, _| Ok(None));
+        let mock_resolver = Arc::new(mock_resolver);
+
+        use crate::config::internal::config::HttpRuleProvider;
+
+        let mut providers = HashMap::new();
+        providers.insert(
+            "timeout_provider".to_string(),
+            RuleProviderDef::Http(HttpRuleProvider {
+                url: server.url("/slow_provider.yaml"),
+                path: "cache/slow_provider.yaml".to_string(),
+                interval: 3600,
+                behavior: RuleSetBehavior::Domain,
+                format: Some(crate::app::remote_content_manager::providers::rule_provider::RuleSetFormat::Yaml),
+                proxy: None,
+                header: None,
+                inline_rules: None,
+            }),
+        );
+
+        let temp_dir = tempfile::tempdir().unwrap();
+
+        let res = super::Router::new_with_timeout(
+            vec![],
+            providers,
+            mock_resolver,
+            None,
+            None,
+            None,
+            None,
+            None,
+            temp_dir.path().to_str().unwrap().to_string(),
+            Duration::from_millis(50),
+        )
+        .await;
+
+        match res {
+            Ok(_) => panic!("Router::new should fail when provider times out"),
+            Err(err) => {
+                let err_msg = err.to_string();
+                assert!(
+                    err_msg.contains("timed out"),
+                    "Error should mention timed out, got: {err_msg}"
+                );
+            }
+        }
     }
 }

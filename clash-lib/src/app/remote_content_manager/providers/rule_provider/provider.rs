@@ -21,7 +21,7 @@ use crate::{
         errors::map_io_error, geodata::GeoDataLookup, mmdb::MmdbLookup,
         succinct_set, trie,
     },
-    config::internal::rule::RuleType,
+    config::internal::rule::{RuleType, proto_supports_params},
     session::Session,
 };
 
@@ -563,21 +563,44 @@ fn make_classical_rules(
 ) -> Result<Vec<Rule>, Error> {
     let mut rv = vec![];
     for rule in rules {
-        let parts = rule.split(',').map(str::trim).collect::<Vec<&str>>();
-
         // the rule inside RULE-SET is slightly different from the rule in
-        // config the target is always empty as it's held in the
-        // RULE-SET container let's parse it manually
-        let rule_type = match parts.as_slice() {
-            [proto, payload] => RuleType::new(proto, payload, "", None),
-            [proto, payload, params @ ..] => {
-                RuleType::new(proto, payload, "", Some(params.to_vec()))
+        // config: the target is always empty as it's held in the
+        // RULE-SET container.
+        // We parse proto from the left, trailing params (e.g. no-resolve) from the right,
+        // preserving any commas inside payload (e.g. DOMAIN-REGEX).
+        let first_comma = rule.find(',').ok_or_else(|| {
+            Error::InvalidConfig(format!("invalid rule line (no comma): {rule}"))
+        })?;
+
+        let proto = rule[..first_comma].trim();
+        let mut rest = rule[first_comma + 1..].trim();
+        let mut params = Vec::new();
+
+        if proto_supports_params(proto) {
+            while let Some(comma) = rest.rfind(',') {
+                let candidate = rest[comma + 1..].trim();
+                if candidate.eq_ignore_ascii_case("no-resolve") {
+                    params.push(candidate);
+                    rest = rest[..comma].trim_end();
+                } else {
+                    break;
+                }
             }
-            _ => Err(Error::InvalidConfig(format!("invalid rule line: {rule}"))),
-        }?;
+            params.reverse();
+        }
+
+        let payload = rest;
+        let params_opt = if params.is_empty() { None } else { Some(params) };
+        let rule_type = RuleType::new(proto, payload, "", params_opt)?;
+
+        if matches!(rule_type, RuleType::RuleSet { .. }) {
+            return Err(Error::InvalidConfig(format!(
+                "nested RULE-SET is not supported in rule provider: {rule}"
+            )));
+        }
 
         let rule_matcher =
-            map_rule_type(rule_type, mmdb.clone(), geodata.clone(), None);
+            map_rule_type(rule_type, mmdb.clone(), geodata.clone(), None)?;
         rv.push(rule_matcher);
     }
     Ok(rv)
@@ -707,5 +730,50 @@ payload:
             destination: SocksAddr::Domain("example.com".into(), 80),
             ..Default::default()
         }));
+    }
+
+    #[tokio::test]
+    async fn test_nested_rule_set_rejected() {
+        use super::make_classical_rules;
+
+        let rules = vec!["RULE-SET,nested-provider".to_string()];
+        let result = make_classical_rules(rules, None, None);
+        let err_msg = match result {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("expected make_classical_rules to fail on nested RULE-SET"),
+        };
+        assert!(
+            err_msg.contains("nested RULE-SET is not supported"),
+            "unexpected error message: {}",
+            err_msg
+        );
+    }
+
+    #[tokio::test]
+    async fn test_classical_rules_with_commas_in_regex() {
+        use super::make_classical_rules;
+        use crate::app::router::RuleMatcher;
+        use crate::session::{Session, SocksAddr};
+
+        let rules = vec![
+            "DOMAIN-REGEX,^foo,bar$".to_string(),
+            "IP-CIDR,10.0.0.0/8,no-resolve".to_string(),
+        ];
+        let result = make_classical_rules(rules, None, None);
+        assert!(result.is_ok());
+        let matchers = result.unwrap();
+        assert_eq!(matchers.len(), 2);
+
+        let sess1 = Session {
+            destination: SocksAddr::Domain("foo,bar".into(), 80),
+            ..Default::default()
+        };
+        assert!(matchers[0].apply(&sess1));
+
+        let sess2 = Session {
+            destination: SocksAddr::Domain("foo".into(), 80),
+            ..Default::default()
+        };
+        assert!(!matchers[0].apply(&sess2));
     }
 }

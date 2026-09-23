@@ -48,6 +48,10 @@ impl HttpClient {
         })
     }
 
+    pub fn timeout(&self) -> tokio::time::Duration {
+        self.timeout
+    }
+
     pub async fn request<T>(
         &self,
         mut req: http::Request<T>,
@@ -132,9 +136,18 @@ impl HttpClient {
         let resp = match uri.scheme() {
             Some(scheme) if scheme == &http::uri::Scheme::HTTP => {
                 let io = TokioIo::new(stream);
-                let (mut sender, conn) = hyper::client::conn::http1::handshake(io)
-                    .await
-                    .map_err(std::io::Error::other)?;
+                let (mut sender, conn) = tokio::time::timeout(
+                    self.timeout,
+                    hyper::client::conn::http1::handshake(io),
+                )
+                .await
+                .map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "HTTP handshake timed out",
+                    )
+                })?
+                .map_err(std::io::Error::other)?;
 
                 tokio::task::spawn(async move {
                     if let Err(err) = conn.await {
@@ -159,9 +172,18 @@ impl HttpClient {
 
                 let io = TokioIo::new(stream);
 
-                let (mut sender, conn) = hyper::client::conn::http1::handshake(io)
-                    .await
-                    .map_err(std::io::Error::other)?;
+                let (mut sender, conn) = tokio::time::timeout(
+                    self.timeout,
+                    hyper::client::conn::http1::handshake(io),
+                )
+                .await
+                .map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "HTTP handshake timed out",
+                    )
+                })?
+                .map_err(std::io::Error::other)?;
 
                 tokio::task::spawn(async move {
                     if let Err(err) = conn.await {
@@ -179,7 +201,14 @@ impl HttpClient {
             }
         };
 
-        resp.await
+        tokio::time::timeout(self.timeout, resp)
+            .await
+            .map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "HTTP response timed out",
+                )
+            })?
             .map_err(|e| std::io::Error::other(format!("HTTP request failed: {e}")))
     }
 }
@@ -191,4 +220,44 @@ pub fn new_http_client(
     bootstrap_outbounds: Option<OutboundHandlerRegistry>,
 ) -> std::io::Result<HttpClient> {
     HttpClient::new(dns_resolver, bootstrap_outbounds, None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::dns::{EnhancedResolver, ThreadSafeDNSResolver};
+    use httpmock::{Method::GET, MockServer};
+    use hyper::Uri;
+
+    #[tokio::test]
+    async fn test_http_client_response_timeout() {
+        crate::tests::initialize();
+        let server = MockServer::start();
+        let _mock = server.mock(|when, then| {
+            when.method(GET).path("/slow");
+            then.delay(std::time::Duration::from_millis(500))
+                .status(200)
+                .body("slow response");
+        });
+
+        let resolver = Arc::new(EnhancedResolver::new_default().await) as ThreadSafeDNSResolver;
+        let client = HttpClient::new(
+            resolver,
+            None,
+            Some(tokio::time::Duration::from_millis(50)),
+        )
+        .unwrap();
+
+        let uri = server.url("/slow").parse::<Uri>().unwrap();
+        let req = http::Request::builder()
+            .method(http::Method::GET)
+            .uri(uri)
+            .body(http_body_util::Empty::<bytes::Bytes>::new())
+            .unwrap();
+
+        let res = client.request(req).await;
+        assert!(res.is_err());
+        let err = res.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+    }
 }

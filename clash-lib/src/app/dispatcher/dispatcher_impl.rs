@@ -1562,7 +1562,8 @@ mod tests {
                 None,
                 "".to_string(),
             )
-            .await,
+            .await
+            .unwrap(),
         );
 
         let manager = StatisticsManager::new();
@@ -1695,7 +1696,8 @@ mod tests {
                 None,
                 "".to_string(),
             )
-            .await,
+            .await
+            .unwrap(),
         );
 
         let manager = StatisticsManager::new();

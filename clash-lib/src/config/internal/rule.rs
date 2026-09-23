@@ -130,7 +130,13 @@ impl RuleType {
         target: &str,
         params: Option<Vec<&str>>,
     ) -> Result<Self, Error> {
-        match proto {
+        let no_resolve = params
+            .as_ref()
+            .map_or(false, |p| p.iter().any(|s| s.eq_ignore_ascii_case("no-resolve")));
+
+        let proto_upper = proto.to_ascii_uppercase();
+
+        match proto_upper.as_str() {
             "DOMAIN" => Ok(RuleType::Domain {
                 domain: payload.to_string(),
                 target: target.to_string(),
@@ -155,29 +161,17 @@ impl RuleType {
             "GEOIP" => Ok(RuleType::GeoIP {
                 target: target.to_string(),
                 country_code: payload.to_string(),
-                no_resolve: if let Some(params) = params {
-                    params.contains(&"no-resolve")
-                } else {
-                    false
-                },
+                no_resolve,
             }),
             "IP-CIDR" | "IP-CIDR6" => Ok(RuleType::IpCidr {
                 ipnet: payload.parse()?,
                 target: target.to_string(),
-                no_resolve: if let Some(params) = params {
-                    params.contains(&"no-resolve")
-                } else {
-                    false
-                },
+                no_resolve,
             }),
             "SRC-IP-CIDR" => Ok(RuleType::SrcCidr {
                 ipnet: payload.parse()?,
                 target: target.to_string(),
-                no_resolve: if let Some(params) = params {
-                    params.contains(&"no-resolve")
-                } else {
-                    false
-                },
+                no_resolve,
             }),
             "SRC-PORT" => Ok(RuleType::SRCPort {
                 target: target.to_string(),
@@ -202,11 +196,7 @@ impl RuleType {
             "RULE-SET" => Ok(RuleType::RuleSet {
                 rule_set: payload.to_string(),
                 target: target.to_string(),
-                no_resolve: if let Some(params) = params {
-                    params.contains(&"no-resolve")
-                } else {
-                    false
-                },
+                no_resolve,
             }),
             "MATCH" => Ok(RuleType::Match {
                 target: target.to_string(),
@@ -228,7 +218,7 @@ impl RuleType {
                 })
             }
             "AND" | "OR" | "NOT" => Ok(RuleType::Composite {
-                operator: proto.to_string(),
+                operator: proto_upper,
                 expression: payload.to_string(),
                 target: target.to_string(),
             }),
@@ -240,18 +230,31 @@ impl RuleType {
     }
 }
 
+pub const RULE_PARAMS: &[&str] = &["no-resolve"];
+
+pub fn proto_supports_params(proto: &str) -> bool {
+    matches!(
+        proto.to_ascii_uppercase().as_str(),
+        "GEOIP" | "IP-CIDR" | "IP-CIDR6" | "SRC-IP-CIDR" | "RULE-SET"
+    )
+}
+
 impl TryFrom<String> for RuleType {
     type Error = crate::Error;
 
     fn try_from(line: String) -> Result<Self, Self::Error> {
-        // Check if this is a composite rule (contains parentheses)
-        if line.contains('(') {
-            // For composite rules: OPERATOR,((expression)),TARGET
-            // Split on first and last comma
-            let first_comma = line.find(',').ok_or_else(|| {
-                Error::InvalidConfig(format!("invalid rule line (no comma): {line}"))
-            })?;
+        let first_comma = line.find(',').ok_or_else(|| {
+            Error::InvalidConfig(format!("invalid rule line (no comma): {line}"))
+        })?;
 
+        let proto = line[..first_comma].trim();
+
+        // 1. Check if this is a composite rule: OPERATOR,((expression)),TARGET
+        // Composite rules must start with AND, OR, or NOT followed by a comma
+        if proto.eq_ignore_ascii_case("AND")
+            || proto.eq_ignore_ascii_case("OR")
+            || proto.eq_ignore_ascii_case("NOT")
+        {
             let last_comma = line.rfind(',').ok_or_else(|| {
                 Error::InvalidConfig(format!("invalid rule line (no comma): {line}"))
             })?;
@@ -262,28 +265,63 @@ impl TryFrom<String> for RuleType {
                 )));
             }
 
-            let operator = line[..first_comma].trim();
+            let operator = proto.to_ascii_uppercase();
             let expression = line[first_comma + 1..last_comma].trim();
             let target = line[last_comma + 1..].trim();
 
             return Ok(RuleType::Composite {
-                operator: operator.to_string(),
+                operator,
                 expression: expression.to_string(),
                 target: target.to_string(),
             });
         }
 
-        // For non-composite rules, use simple split
-        let parts = line.split(',').map(str::trim).collect::<Vec<&str>>();
-
-        match parts.as_slice() {
-            [proto, target] => RuleType::new(proto, "", target, None),
-            [proto, payload, target] => RuleType::new(proto, payload, target, None),
-            [proto, payload, target, params @ ..] => {
-                RuleType::new(proto, payload, target, Some(params.to_vec()))
-            }
-            _ => Err(Error::InvalidConfig(format!("invalid rule line: {line}"))),
+        // 2. Check if this is MATCH rule: MATCH,TARGET
+        if proto.eq_ignore_ascii_case("MATCH") {
+            let target = line[first_comma + 1..].trim();
+            return RuleType::new("MATCH", "", target, None);
         }
+
+        // 3. For other rules: PROTO,PAYLOAD,TARGET[,PARAMS...]
+        // We recognize PROTO from the left, and PARAMS/TARGET from the right,
+        // preserving any commas inside PAYLOAD (such as in regular expressions).
+        let mut rest = line[first_comma + 1..].trim();
+        let mut params = Vec::new();
+
+        // Only protocols that actually support trailing parameters (e.g. no-resolve)
+        // should extract params from the right. Additionally, there must be at least 2
+        // commas in `rest` (meaning total rule has >= 4 parts: PROTO,PAYLOAD,TARGET,PARAMS...),
+        // so that for a 3-part rule like `IP-CIDR,192.168.1.0/24,no-resolve`, `no-resolve`
+        // is properly recognized as the TARGET rather than a param with missing target.
+        if proto_supports_params(proto) {
+            while rest.matches(',').count() >= 2 {
+                if let Some(comma) = rest.rfind(',') {
+                    let candidate = rest[comma + 1..].trim();
+                    if RULE_PARAMS.iter().any(|&p| p.eq_ignore_ascii_case(candidate)) {
+                        params.push(candidate);
+                        rest = rest[..comma].trim_end();
+                    } else {
+                        break;
+                    }
+                } else {
+                    break;
+                }
+            }
+            params.reverse();
+        }
+
+        // The last comma in remaining `rest` separates PAYLOAD and TARGET
+        let last_comma = rest.rfind(',').ok_or_else(|| {
+            Error::InvalidConfig(format!(
+                "rule '{proto}' requires at least payload and target: {line}"
+            ))
+        })?;
+
+        let payload = rest[..last_comma].trim();
+        let target = rest[last_comma + 1..].trim();
+
+        let params_opt = if params.is_empty() { None } else { Some(params) };
+        RuleType::new(proto, payload, target, params_opt)
     }
 }
 
@@ -298,6 +336,79 @@ impl FromStr for RuleType {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_domain_regex_with_parentheses() {
+        let rule = RuleType::try_from("DOMAIN-REGEX,^foo(bar)\\.com$,PROXY".to_string()).unwrap();
+        match rule {
+            RuleType::DomainRegex { regex, target } => {
+                assert_eq!(target, "PROXY");
+                assert!(regex.is_match("foobar.com"));
+                assert!(!regex.is_match("foo.com"));
+            }
+            _ => panic!("Expected DomainRegex rule"),
+        }
+    }
+
+    #[test]
+    fn test_domain_regex_with_commas() {
+        let rule = RuleType::try_from("DOMAIN-REGEX,^foo,bar$,PROXY".to_string()).unwrap();
+        match rule {
+            RuleType::DomainRegex { regex, target } => {
+                assert_eq!(target, "PROXY");
+                assert!(regex.is_match("foo,bar"));
+                assert!(!regex.is_match("foo"));
+            }
+            _ => panic!("Expected DomainRegex rule"),
+        }
+
+        // Quantifier with comma
+        let rule = RuleType::try_from("DOMAIN-REGEX,^a{1,3}$,PROXY".to_string()).unwrap();
+        match rule {
+            RuleType::DomainRegex { regex, target } => {
+                assert_eq!(target, "PROXY");
+                assert!(regex.is_match("aa"));
+                assert!(!regex.is_match("aaaa"));
+            }
+            _ => panic!("Expected DomainRegex rule"),
+        }
+    }
+
+    #[test]
+    fn test_lowercase_composite_rule_parsing() {
+        let rule = RuleType::try_from("and,((DOMAIN,example.com)),PROXY".to_string()).unwrap();
+        match rule {
+            RuleType::Composite { operator, expression, target } => {
+                assert_eq!(operator, "AND");
+                assert_eq!(expression, "((DOMAIN,example.com))");
+                assert_eq!(target, "PROXY");
+            }
+            _ => panic!("Expected Composite rule"),
+        }
+    }
+
+    #[test]
+    fn test_composite_rule_parsing() {
+        let rule = RuleType::try_from("AND,((DOMAIN,example.com),(NETWORK,TCP)),PROXY".to_string()).unwrap();
+        match rule {
+            RuleType::Composite { operator, expression, target } => {
+                assert_eq!(operator, "AND");
+                assert_eq!(expression, "((DOMAIN,example.com),(NETWORK,TCP))");
+                assert_eq!(target, "PROXY");
+            }
+            _ => panic!("Expected Composite rule"),
+        }
+
+        let rule = RuleType::try_from("NOT,((DOMAIN,example.com)),DIRECT".to_string()).unwrap();
+        match rule {
+            RuleType::Composite { operator, expression, target } => {
+                assert_eq!(operator, "NOT");
+                assert_eq!(expression, "((DOMAIN,example.com))");
+                assert_eq!(target, "DIRECT");
+            }
+            _ => panic!("Expected Composite rule"),
+        }
+    }
 
     #[test]
     fn test_network_rule_parsing() {
@@ -363,6 +474,114 @@ mod tests {
                 assert!(no_resolve);
             }
             _ => panic!("Expected RuleSet rule"),
+        }
+    }
+
+    #[test]
+    fn test_no_resolve_case_insensitivity() {
+        // Uppercase NO-RESOLVE in IP-CIDR
+        let rule = RuleType::try_from("IP-CIDR,192.168.1.0/24,DIRECT,NO-RESOLVE".to_string()).unwrap();
+        match rule {
+            RuleType::IpCidr { no_resolve, target, .. } => {
+                assert_eq!(target, "DIRECT");
+                assert!(no_resolve, "Uppercase NO-RESOLVE should be set to true");
+            }
+            _ => panic!("Expected IpCidr rule"),
+        }
+
+        // Mixed case No-Resolve in RULE-SET
+        let rule = RuleType::try_from("RULE-SET,my-rules,PROXY,No-Resolve".to_string()).unwrap();
+        match rule {
+            RuleType::RuleSet { no_resolve, target, .. } => {
+                assert_eq!(target, "PROXY");
+                assert!(no_resolve, "Mixed case No-Resolve should be set to true");
+            }
+            _ => panic!("Expected RuleSet rule"),
+        }
+
+        // Uppercase NO-RESOLVE in GEOIP
+        let rule = RuleType::try_from("GEOIP,CN,DIRECT,NO-RESOLVE".to_string()).unwrap();
+        match rule {
+            RuleType::GeoIP { no_resolve, target, .. } => {
+                assert_eq!(target, "DIRECT");
+                assert!(no_resolve, "Uppercase NO-RESOLVE should be set to true");
+            }
+            _ => panic!("Expected GeoIP rule"),
+        }
+    }
+
+    #[test]
+    fn test_target_named_no_resolve() {
+        // 1. Protocols that do not support trailing parameters (e.g. DOMAIN, DOMAIN-REGEX, PROCESS-NAME)
+        // should always treat 'no-resolve' as target.
+        let rule = RuleType::try_from("DOMAIN,example.com,no-resolve".to_string()).unwrap();
+        match rule {
+            RuleType::Domain { domain, target } => {
+                assert_eq!(domain, "example.com");
+                assert_eq!(target, "no-resolve");
+            }
+            _ => panic!("Expected Domain rule"),
+        }
+
+        let rule = RuleType::try_from("DOMAIN-REGEX,^foo,bar$,no-resolve".to_string()).unwrap();
+        match rule {
+            RuleType::DomainRegex { regex, target } => {
+                assert_eq!(target, "no-resolve");
+                assert!(regex.is_match("foo,bar"));
+            }
+            _ => panic!("Expected DomainRegex rule"),
+        }
+
+        // 2. Protocols supporting parameters: 3-part rule should treat 'no-resolve' as target!
+        let rule = RuleType::try_from("IP-CIDR,192.168.1.0/24,no-resolve".to_string()).unwrap();
+        match rule {
+            RuleType::IpCidr { ipnet, target, no_resolve } => {
+                assert_eq!(ipnet.to_string(), "192.168.1.0/24");
+                assert_eq!(target, "no-resolve");
+                assert!(!no_resolve, "3-part rule should have no_resolve=false");
+            }
+            _ => panic!("Expected IpCidr rule"),
+        }
+
+        // 3. Protocols supporting parameters: 4-part rule with target=no-resolve and param=no-resolve
+        let rule = RuleType::try_from("IP-CIDR,192.168.1.0/24,no-resolve,no-resolve".to_string()).unwrap();
+        match rule {
+            RuleType::IpCidr { ipnet, target, no_resolve } => {
+                assert_eq!(ipnet.to_string(), "192.168.1.0/24");
+                assert_eq!(target, "no-resolve");
+                assert!(no_resolve, "4-part rule with trailing no-resolve should have no_resolve=true");
+            }
+            _ => panic!("Expected IpCidr rule"),
+        }
+
+        // 4. RULE-SET with target no-resolve
+        let rule = RuleType::try_from("RULE-SET,my-rules,no-resolve".to_string()).unwrap();
+        match rule {
+            RuleType::RuleSet { rule_set, target, no_resolve } => {
+                assert_eq!(rule_set, "my-rules");
+                assert_eq!(target, "no-resolve");
+                assert!(!no_resolve);
+            }
+            _ => panic!("Expected RuleSet rule"),
+        }
+    }
+
+    #[test]
+    fn test_match_rule_case_insensitivity() {
+        let rule = RuleType::try_from("match,DIRECT".to_string()).unwrap();
+        match rule {
+            RuleType::Match { target } => {
+                assert_eq!(target, "DIRECT");
+            }
+            _ => panic!("Expected Match rule"),
+        }
+
+        let rule = RuleType::try_from("Match,PROXY".to_string()).unwrap();
+        match rule {
+            RuleType::Match { target } => {
+                assert_eq!(target, "PROXY");
+            }
+            _ => panic!("Expected Match rule"),
         }
     }
 }

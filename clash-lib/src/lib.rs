@@ -994,7 +994,7 @@ async fn create_components(
             geodata.clone(),
             cwd_str.clone(),
         )
-        .await,
+        .await?,
     );
 
     if let Some(rd) = &rule_dispatch
