@@ -264,6 +264,18 @@ impl OutboundManager {
         self.proxy_providers.clone()
     }
 
+    #[cfg(test)]
+    pub fn new_for_test(handlers: HashMap<String, AnyOutboundHandler>) -> Self {
+        let registry = Arc::new(parking_lot::RwLock::new(handlers));
+        let proxy_manager = ProxyManager::new(Arc::new(crate::app::dns::MockClashResolver::new()), None);
+        Self {
+            registry,
+            proxy_providers: HashMap::new(),
+            proxy_manager,
+            selector_control: HashMap::new(),
+        }
+    }
+
     // API handlers end
 
     fn load_single_plain_outbound(

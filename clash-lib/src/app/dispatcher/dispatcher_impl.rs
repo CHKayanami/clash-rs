@@ -24,6 +24,7 @@ use std::{
 };
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::task::JoinHandle;
+use tokio::time::Instant;
 use tokio_util::time::DelayQueue;
 use tracing::{Instrument, debug, error, info, info_span, instrument, trace, warn};
 
@@ -49,7 +50,14 @@ const MAX_CONNECTING_SESSIONS: usize = 256;
 const MAX_UDP_SESSIONS_PER_ACTOR: usize = 4096;
 const MAX_GLOBAL_UDP_SESSIONS: usize = 4096;
 const PENDING_SNIFF_TIMEOUT: Duration = Duration::from_millis(100);
-const CONNECTING_SESSION_TIMEOUT: Duration = Duration::from_secs(30);
+const CONNECTING_SESSION_TIMEOUT: Duration = Duration::from_secs(10);
+const SHORT_FLOW_INIT_TIMEOUT: Duration = Duration::from_secs(5);
+const FAST_RESPONSE_TIMEOUT: Duration = Duration::from_secs(3);
+
+#[inline]
+fn is_short_flow_port(port: u16) -> bool {
+    matches!(port, 53 | 123 | 5353)
+}
 
 pub struct Dispatcher {
     outbound_manager: ThreadSafeOutboundManager,
@@ -64,15 +72,35 @@ pub struct Dispatcher {
 }
 
 type SessionKey = (SocketAddr, SocksAddr);
-type OutboundPacketSender = tokio::sync::mpsc::Sender<(UdpPacket, SocksAddr)>;
+type OutboundPacketSender = tokio::sync::mpsc::Sender<UdpPacket>;
 
 struct OutboundSession {
     id: u64,
     dest: SocksAddr,
     sender: OutboundPacketSender,
     delay_key: tokio_util::time::delay_queue::Key,
+    idle_deadline: Instant,
+    scheduled_deadline: Instant,
     _relay_handle: JoinHandle<()>,
     _capacity_permit: tokio::sync::OwnedSemaphorePermit,
+    upload_count: u32,
+    is_short_flow: bool,
+}
+
+impl OutboundSession {
+    fn refresh_idle(
+        &mut self,
+        delay_queue: &mut DelayQueue<UdpQueueEvent>,
+        timeout: Duration,
+    ) {
+        self.idle_deadline = Instant::now() + timeout;
+        // Keep an earlier timer in place. When it fires, the actor will check
+        // the latest activity and reschedule only if the flow is still active.
+        if self.idle_deadline < self.scheduled_deadline {
+            delay_queue.reset_at(&self.delay_key, self.idle_deadline);
+            self.scheduled_deadline = self.idle_deadline;
+        }
+    }
 }
 
 impl Drop for OutboundSession {
@@ -123,13 +151,19 @@ impl Drop for ConnectingSession {
 }
 
 #[derive(Clone)]
+struct DownstreamPacket {
+    packet: UdpPacket,
+    session_key: Arc<SessionKey>,
+}
+
+#[derive(Clone)]
 struct UdpDispatchContext {
     outbound_manager: ThreadSafeOutboundManager,
     router: ArcRouter,
     resolver: ThreadSafeDNSResolver,
     manager: Arc<Manager>,
     mode: Arc<AtomicU8>,
-    remote_receiver_w: tokio::sync::mpsc::Sender<UdpPacket>,
+    remote_receiver_w: tokio::sync::mpsc::Sender<DownstreamPacket>,
     session_semaphore: Arc<tokio::sync::Semaphore>,
 }
 
@@ -410,7 +444,7 @@ impl Dispatcher {
     ) -> tokio::sync::oneshot::Sender<u8> {
         let (mut local_w, mut local_r) = udp_inbound.split();
         let (remote_receiver_w, mut remote_receiver_r) =
-            tokio::sync::mpsc::channel::<UdpPacket>(UDP_CHANNEL_CAPACITY);
+            tokio::sync::mpsc::channel::<DownstreamPacket>(UDP_CHANNEL_CAPACITY);
         let (session_established_tx, mut session_established_rx) =
             tokio::sync::mpsc::channel::<EstablishOutcome>(64);
         let (close_sender, mut close_receiver) =
@@ -439,6 +473,7 @@ impl Dispatcher {
                 let mut connecting_sessions: HashMap<SessionKey, ConnectingSession> = HashMap::new();
                 let mut pending_sniff_sessions: HashMap<SessionKey, PendingSniffSession> = HashMap::new();
                 let mut delay_queue: DelayQueue<UdpQueueEvent> = DelayQueue::new();
+                let has_explicit_timeout = sess.udp_timeout.is_some();
                 let timeout_duration = sess
                     .udp_timeout
                     .unwrap_or_else(|| Duration::from_secs(DEFAULT_UDP_SESSION_TIMEOUT_SECS));
@@ -452,7 +487,7 @@ impl Dispatcher {
                         }
 
                         // 2. Reply packets from remote outbounds -> send to local_w
-                        Some(packet) = remote_receiver_r.recv() => {
+                        Some(DownstreamPacket { packet, session_key }) = remote_receiver_r.recv() => {
                             if !allow_quic.load(Ordering::Relaxed) && packet.src_addr.port() == 443 {
                                 trace!(
                                     "QUIC reply packet dropped (UDP 443) from {}",
@@ -462,11 +497,13 @@ impl Dispatcher {
                             }
 
                             // Refresh session activity on downstream reply packets
-                            if let Some(src_addr) = packet.dst_addr.clone().try_into_socket_addr() {
-                                let session_key = (src_addr, packet.src_addr.clone());
-                                if let Some(session) = sessions.get_mut(&session_key) {
-                                    delay_queue.reset(&session.delay_key, timeout_duration);
-                                }
+                            if let Some(session) = sessions.get_mut(session_key.as_ref()) {
+                                let next_timeout = if !has_explicit_timeout && session.is_short_flow {
+                                    FAST_RESPONSE_TIMEOUT
+                                } else {
+                                    timeout_duration
+                                };
+                                session.refresh_idle(&mut delay_queue, next_timeout);
                             }
 
                             if let Err(err) = local_w.send(packet).await {
@@ -501,18 +538,23 @@ impl Dispatcher {
                                         ..
                                     } = established;
 
+                                    let initial_upload_count = (buffered_packets.len() as u32).max(1);
                                     for packet in buffered_packets {
-                                        let _ = forward_to_remote(
-                                            &sender,
-                                            packet,
-                                            dest.clone(),
-                                            sess_id,
-                                        );
+                                        let _ = forward_to_remote(&sender, packet, sess_id);
                                     }
+                                    let is_short_flow = !has_explicit_timeout
+                                        && initial_upload_count <= 2
+                                        && is_short_flow_port(session_key.1.port());
+                                    let initial_timeout = if is_short_flow {
+                                        SHORT_FLOW_INIT_TIMEOUT
+                                    } else {
+                                        timeout_duration
+                                    };
 
-                                    let delay_key = delay_queue.insert(
+                                    let idle_deadline = Instant::now() + initial_timeout;
+                                    let delay_key = delay_queue.insert_at(
                                         UdpQueueEvent::SessionIdle(session_key.clone()),
-                                        timeout_duration,
+                                        idle_deadline,
                                     );
 
                                     sessions.insert(
@@ -522,8 +564,12 @@ impl Dispatcher {
                                             dest,
                                             sender,
                                             delay_key,
+                                            idle_deadline,
+                                            scheduled_deadline: idle_deadline,
                                             _relay_handle: relay_handle,
                                             _capacity_permit: capacity_permit,
+                                            upload_count: initial_upload_count,
+                                            is_short_flow,
                                         },
                                     );
                                     let _ = relay_start.send(());
@@ -553,8 +599,18 @@ impl Dispatcher {
                         Some(expired) = delay_queue.next() => {
                             match expired.into_inner() {
                                 UdpQueueEvent::SessionIdle(key) => {
-                                    trace!("UDP session expired for src: {}, dst: {}", key.0, key.1);
-                                    sessions.remove(&key);
+                                    if let Some(session) = sessions.get_mut(&key) {
+                                        if session.idle_deadline > Instant::now() {
+                                            session.delay_key = delay_queue.insert_at(
+                                                UdpQueueEvent::SessionIdle(key.clone()),
+                                                session.idle_deadline,
+                                            );
+                                            session.scheduled_deadline = session.idle_deadline;
+                                        } else {
+                                            trace!("UDP session expired for src: {}, dst: {}", key.0, key.1);
+                                            sessions.remove(&key);
+                                        }
+                                    }
                                 }
                                 UdpQueueEvent::PendingSniff(key) => {
                                     if let Some(pending) = pending_sniff_sessions.remove(&key) {
@@ -631,11 +687,21 @@ impl Dispatcher {
                             // Fast-path: Check if an active session already exists for this exact flow
                             if let Some(session) = sessions.get_mut(&session_key) {
                                 debug!("reusing session #{} sent to remote {}", session.id, session.dest);
-                                delay_queue.reset(&session.delay_key, timeout_duration);
+                                if session.is_short_flow {
+                                    session.upload_count += 1;
+                                    if session.upload_count > 2 {
+                                        session.is_short_flow = false;
+                                    }
+                                }
+                                let next_timeout = if session.is_short_flow {
+                                    SHORT_FLOW_INIT_TIMEOUT
+                                } else {
+                                    timeout_duration
+                                };
+                                session.refresh_idle(&mut delay_queue, next_timeout);
                                 if let Some(returned_packet) = forward_to_remote(
                                     &session.sender,
                                     packet,
-                                    session.dest.clone(),
                                     session.id,
                                 ) {
                                     packet = returned_packet;
@@ -955,8 +1021,9 @@ async fn establish_outbound_session(
         .clone()
         .unwrap_or_else(|| sess.destination.clone());
     let orig_dst_ip = orig_inbound_dst.ip();
+    let is_fake_ip = orig_dst_ip.map_or(false, |ip| ctx.resolver.is_fake_ip(ip));
     let is_real_ip = match orig_dst_ip {
-        Some(ip) => !ctx.resolver.is_fake_ip(ip),
+        Some(_) => !is_fake_ip,
         None => false,
     };
     if is_real_ip {
@@ -990,6 +1057,7 @@ async fn establish_outbound_session(
     } else {
         handler.proto()
     };
+    let is_direct = matches!(effective_proto, OutboundType::Direct);
 
     if matches!(effective_proto, OutboundType::Reject) {
         trace!(
@@ -1030,11 +1098,13 @@ async fn establish_outbound_session(
 
     let (mut remote_w, mut remote_r) = outbound_datagram.split();
     let (remote_sender, mut remote_forwarder) =
-        tokio::sync::mpsc::channel::<(UdpPacket, SocksAddr)>(UDP_CHANNEL_CAPACITY);
+        tokio::sync::mpsc::channel::<UdpPacket>(UDP_CHANNEL_CAPACITY);
 
+    let relay_dest = sess.destination.clone();
     let orig_inbound_dst_for_relay = orig_inbound_dst.clone();
     let relay_sess = sess.clone();
     let relay_session_key = (sess.source, orig_inbound_dst.clone());
+    let relay_session_key_for_incoming = Arc::new(relay_session_key.clone());
     let relay_sess_id = sess.id;
     let remote_receiver_w_clone = ctx.remote_receiver_w.clone();
     let tracker = TrafficTracker::new(tracker_info, ctx.manager.clone());
@@ -1051,9 +1121,13 @@ async fn establish_outbound_session(
         // local -> remote
         let tracker_out = tracker.clone();
         let outgoing = async move {
-            while let Some((mut packet, dest_addr)) = remote_forwarder.recv().await {
+            while let Some(mut packet) = remote_forwarder.recv().await {
                 let len = packet.data.len();
-                packet.dst_addr = dest_addr;
+                // Most packets already carry the routed destination. Only
+                // replace it when routing changed the original address.
+                if packet.dst_addr != relay_dest {
+                    packet.dst_addr = relay_dest.clone();
+                }
                 if let Err(err) = remote_w.send(packet).await {
                     warn!("failed to send packet to remote: {err:?}");
                 } else {
@@ -1068,10 +1142,25 @@ async fn establish_outbound_session(
             while let Some(mut packet) = remote_r.next().await {
                 tracker_in.push_download(packet.data.len());
 
-                packet.src_addr = orig_inbound_dst_for_relay.clone();
+                // Only allow preserving unmapped peer source addresses (for Full-Cone NAT P2P hole punching)
+                // when using Direct outbound and the destination is not Fake-IP.
+                // In all other cases (e.g. Fake-IP sessions, or proxy outbounds like Shadowsocks returning
+                // physical server IPs), the packet's source address must always be restored to orig_inbound_dst.
+                let should_rewrite_source = is_fake_ip
+                    || !is_direct
+                    || packet.src_addr == orig_inbound_dst_for_relay
+                    || packet.src_addr == relay_sess.destination;
+                if should_rewrite_source {
+                    packet.src_addr = orig_inbound_dst_for_relay.clone();
+                }
+
                 packet.dst_addr = relay_sess.source.into();
                 debug!("UDP NAT for packet: {:?}, session: {}", packet, relay_sess);
-                match remote_receiver_w_clone.try_send(packet) {
+                let msg = DownstreamPacket {
+                    packet,
+                    session_key: relay_session_key_for_incoming.clone(),
+                };
+                match remote_receiver_w_clone.try_send(msg) {
                     Ok(_) => {}
                     Err(TrySendError::Full(_)) => {
                         debug!(
@@ -1141,10 +1230,9 @@ fn is_reject_error(err: &std::io::Error) -> bool {
 fn forward_to_remote(
     sender: &OutboundPacketSender,
     packet: UdpPacket,
-    dest: SocksAddr,
     sess_id: u64,
 ) -> Option<UdpPacket> {
-    match sender.try_send((packet, dest)) {
+    match sender.try_send(packet) {
         Ok(_) => None,
         Err(TrySendError::Full(_)) => {
             debug!(
@@ -1153,7 +1241,7 @@ fn forward_to_remote(
             );
             None
         }
-        Err(TrySendError::Closed((packet, _))) => {
+        Err(TrySendError::Closed(packet)) => {
             debug!("[UDP] outbound relay gone, rebuilding session #{}", sess_id);
             Some(packet)
         }
@@ -1212,9 +1300,17 @@ fn reverse_lookup(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::dispatcher::StatisticsManager;
     use crate::app::dns::MockClashResolver;
+    use crate::app::outbound::manager::OutboundManager;
+    use crate::app::router::Router;
+    use crate::proxy::AnyOutboundHandler;
+    use crate::proxy::direct::Handler as DirectHandler;
+    use crate::session::{Network, Type};
     use bytes::Bytes;
-    use std::net::{IpAddr, Ipv4Addr};
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::pin::Pin;
+    use tokio::net::UdpSocket;
 
     #[test]
     fn reverse_lookup_rejects_unmapped_fake_ip() {
@@ -1241,7 +1337,7 @@ mod tests {
         let packet =
             UdpPacket::new(Bytes::from_static(b"hello"), src.clone(), dst.clone());
 
-        let returned = forward_to_remote(&sender, packet, dst.clone(), 42)
+        let returned = forward_to_remote(&sender, packet, 42)
             .expect("closed relay must return the packet");
         assert_eq!(returned.data, Bytes::from_static(b"hello"));
         assert_eq!(returned.src_addr, src);
@@ -1314,12 +1410,356 @@ mod tests {
             dest: SocksAddr::Domain("example.com".into(), 443),
             sender,
             delay_key,
+            idle_deadline: Instant::now() + Duration::from_secs(60),
+            scheduled_deadline: Instant::now() + Duration::from_secs(60),
             _relay_handle: relay_handle,
             _capacity_permit: permit,
+            upload_count: 1,
+            is_short_flow: false,
         };
 
         assert_eq!(semaphore.available_permits(), 0);
         drop(session);
         assert_eq!(semaphore.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn active_session_defers_timer_reset_until_its_scheduled_deadline() {
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = semaphore.acquire_owned().await.unwrap();
+        let (sender, _receiver) = tokio::sync::mpsc::channel(1);
+        let mut delay_queue = DelayQueue::new();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let delay_key = delay_queue.insert_at(
+            UdpQueueEvent::SessionIdle((
+                "127.0.0.1:12345".parse().unwrap(),
+                SocksAddr::Ip("1.1.1.1:53".parse().unwrap()),
+            )),
+            deadline,
+        );
+        let relay_handle = tokio::spawn(std::future::pending::<()>());
+        let mut session = OutboundSession {
+            id: 42,
+            dest: SocksAddr::Ip("1.1.1.1:53".parse().unwrap()),
+            sender,
+            delay_key,
+            idle_deadline: deadline,
+            scheduled_deadline: deadline,
+            _relay_handle: relay_handle,
+            _capacity_permit: permit,
+            upload_count: 1,
+            is_short_flow: true,
+        };
+
+        let queued_deadline = delay_queue.deadline(&session.delay_key);
+        session.refresh_idle(&mut delay_queue, Duration::from_secs(60));
+        assert_eq!(delay_queue.deadline(&session.delay_key), queued_deadline);
+        assert!(session.idle_deadline > session.scheduled_deadline);
+
+        session.refresh_idle(&mut delay_queue, Duration::from_secs(1));
+        assert!(delay_queue.deadline(&session.delay_key) < queued_deadline);
+        assert_eq!(session.idle_deadline, session.scheduled_deadline);
+    }
+
+    #[test]
+    fn test_short_flow_ports() {
+        assert!(is_short_flow_port(53));
+        assert!(is_short_flow_port(123));
+        assert!(is_short_flow_port(5353));
+        assert!(!is_short_flow_port(3478));
+        assert!(!is_short_flow_port(5349));
+        assert!(!is_short_flow_port(443));
+        assert!(!is_short_flow_port(80));
+    }
+
+    #[derive(Debug)]
+    struct MockInboundDatagram {
+        rx: tokio::sync::mpsc::Receiver<UdpPacket>,
+        tx: tokio::sync::mpsc::Sender<UdpPacket>,
+    }
+
+    impl futures::Stream for MockInboundDatagram {
+        type Item = UdpPacket;
+
+        fn poll_next(
+            mut self: Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Self::Item>> {
+            self.rx.poll_recv(cx)
+        }
+    }
+
+    impl futures::Sink<UdpPacket> for MockInboundDatagram {
+        type Error = std::io::Error;
+
+        fn poll_ready(
+            self: Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn start_send(
+            self: Pin<&mut Self>,
+            item: UdpPacket,
+        ) -> Result<(), Self::Error> {
+            self.tx
+                .try_send(item)
+                .map_err(|e| std::io::Error::other(e.to_string()))
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(
+            self: Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn test_dispatcher_full_cone_relay_preserves_peer_source_address_end_to_end()
+     {
+        let server_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = server_socket.local_addr().unwrap();
+
+        let peer_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = peer_socket.local_addr().unwrap();
+
+        let direct_handler: AnyOutboundHandler =
+            Arc::new(DirectHandler::new("DIRECT"));
+        let mut mock_resolver = MockClashResolver::new();
+        mock_resolver.expect_fake_ip_enabled().returning(|| false);
+        mock_resolver.expect_is_fake_ip().returning(|_| false);
+        mock_resolver.expect_cached_for().returning(|_| None);
+        mock_resolver
+            .expect_resolve_v4()
+            .returning(|_, _| Ok(Some(std::net::Ipv4Addr::LOCALHOST)));
+        mock_resolver.expect_resolve().returning(|_, _| {
+            Ok(Some(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)))
+        });
+        let resolver: ThreadSafeDNSResolver = Arc::new(mock_resolver);
+
+        let mut handlers = HashMap::new();
+        handlers.insert("DIRECT".to_string(), direct_handler);
+        let outbound_manager = Arc::new(OutboundManager::new_for_test(handlers));
+
+        let router = Arc::new(
+            Router::new(
+                vec![],
+                HashMap::new(),
+                resolver.clone(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                "".to_string(),
+            )
+            .await,
+        );
+
+        let manager = StatisticsManager::new();
+        let dispatcher = Arc::new(Dispatcher::new(
+            outbound_manager,
+            router,
+            resolver,
+            RunMode::Direct,
+            manager,
+            None,
+            None,
+            true,
+        ));
+
+        let client_src: SocketAddr = "127.0.0.1:54321".parse().unwrap();
+        let sess = Session {
+            network: Network::Udp,
+            typ: Type::Socks5,
+            source: client_src,
+            destination: SocksAddr::Ip(server_addr),
+            ..Default::default()
+        };
+
+        let (client_tx, inbound_rx) = tokio::sync::mpsc::channel(16);
+        let (inbound_tx, mut client_rx) = tokio::sync::mpsc::channel(16);
+
+        let inbound = Box::new(MockInboundDatagram {
+            rx: inbound_rx,
+            tx: inbound_tx,
+        });
+
+        let _close_tx = dispatcher.dispatch_datagram(sess, inbound).await;
+
+        // 1. Client sends UDP to Server via Dispatcher
+        client_tx
+            .send(UdpPacket {
+                data: Bytes::from_static(b"hello-server"),
+                src_addr: SocksAddr::Ip(client_src),
+                dst_addr: SocksAddr::Ip(server_addr),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        // 2. Server receives packet from Direct Outbound socket
+        let mut buf = [0u8; 1024];
+        let (n, direct_outbound_addr) =
+            server_socket.recv_from(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"hello-server");
+
+        // 3. A third-party peer sends an unsolicited hole-punching UDP packet to Direct Outbound
+        peer_socket
+            .send_to(b"peer-hole-punch", direct_outbound_addr)
+            .await
+            .unwrap();
+
+        // 4. Client receives packet from Dispatcher
+        let peer_reply =
+            tokio::time::timeout(Duration::from_secs(2), client_rx.recv())
+                .await
+                .expect("timeout waiting for peer reply")
+                .expect("channel closed");
+
+        assert_eq!(peer_reply.data.as_ref(), b"peer-hole-punch");
+        // CRITICAL: Full-Cone unsolicited peer packet's source address MUST be preserved
+        // as the actual physical address of the peer, NOT rewritten to server_addr!
+        assert_eq!(peer_reply.src_addr, SocksAddr::Ip(peer_addr));
+        assert_eq!(peer_reply.dst_addr, SocksAddr::Ip(client_src));
+
+        // 5. Server also replies normally
+        server_socket
+            .send_to(b"server-reply", direct_outbound_addr)
+            .await
+            .unwrap();
+
+        let server_reply =
+            tokio::time::timeout(Duration::from_secs(2), client_rx.recv())
+                .await
+                .expect("timeout waiting for server reply")
+                .expect("channel closed");
+
+        assert_eq!(server_reply.data.as_ref(), b"server-reply");
+        // Normal reply from server should have source matching server_addr
+        assert_eq!(server_reply.src_addr, SocksAddr::Ip(server_addr));
+        assert_eq!(server_reply.dst_addr, SocksAddr::Ip(client_src));
+    }
+
+    #[tokio::test]
+    async fn test_dispatcher_fake_ip_relay_restores_fake_ip_source_address() {
+        let server_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = server_socket.local_addr().unwrap();
+
+        let fake_ip = SocketAddr::new(
+            std::net::IpAddr::V4(std::net::Ipv4Addr::new(198, 18, 0, 5)),
+            server_addr.port(),
+        );
+
+        let direct_handler: AnyOutboundHandler =
+            Arc::new(DirectHandler::new("DIRECT"));
+        let mut mock_resolver = MockClashResolver::new();
+        mock_resolver.expect_fake_ip_enabled().returning(|| true);
+        mock_resolver.expect_is_fake_ip().returning(|ip| {
+            ip == std::net::IpAddr::V4(std::net::Ipv4Addr::new(198, 18, 0, 5))
+        });
+        mock_resolver
+            .expect_reverse_lookup()
+            .returning(|_| Some("fake.domain.com".to_string()));
+        mock_resolver.expect_cached_for().returning(|_| None);
+        mock_resolver
+            .expect_resolve_v4()
+            .returning(move |_, _| Ok(Some(std::net::Ipv4Addr::LOCALHOST)));
+        mock_resolver.expect_resolve().returning(move |_, _| {
+            Ok(Some(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)))
+        });
+        let resolver: ThreadSafeDNSResolver = Arc::new(mock_resolver);
+
+        let mut handlers = HashMap::new();
+        handlers.insert("DIRECT".to_string(), direct_handler);
+        let outbound_manager = Arc::new(OutboundManager::new_for_test(handlers));
+
+        let router = Arc::new(
+            Router::new(
+                vec![],
+                HashMap::new(),
+                resolver.clone(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                "".to_string(),
+            )
+            .await,
+        );
+
+        let manager = StatisticsManager::new();
+        let dispatcher = Arc::new(Dispatcher::new(
+            outbound_manager,
+            router,
+            resolver,
+            RunMode::Direct,
+            manager,
+            None,
+            None,
+            true,
+        ));
+
+        let client_src: SocketAddr = "127.0.0.1:54322".parse().unwrap();
+        let sess = Session {
+            network: Network::Udp,
+            typ: Type::Socks5,
+            source: client_src,
+            destination: SocksAddr::Ip(fake_ip),
+            ..Default::default()
+        };
+
+        let (client_tx, inbound_rx) = tokio::sync::mpsc::channel(16);
+        let (inbound_tx, mut client_rx) = tokio::sync::mpsc::channel(16);
+
+        let inbound = Box::new(MockInboundDatagram {
+            rx: inbound_rx,
+            tx: inbound_tx,
+        });
+
+        let _close_tx = dispatcher.dispatch_datagram(sess, inbound).await;
+
+        // 1. Client sends UDP to Fake-IP via Dispatcher
+        client_tx
+            .send(UdpPacket {
+                data: Bytes::from_static(b"hello-fake-ip"),
+                src_addr: SocksAddr::Ip(client_src),
+                dst_addr: SocksAddr::Ip(fake_ip),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        // 2. Server receives packet from Direct Outbound socket
+        let mut buf = [0u8; 1024];
+        let (n, direct_outbound_addr) =
+            server_socket.recv_from(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"hello-fake-ip");
+
+        // 3. Server replies back with its physical server_addr
+        server_socket
+            .send_to(b"reply-from-real-server", direct_outbound_addr)
+            .await
+            .unwrap();
+
+        // 4. Client receives reply, source address MUST be restored to fake_ip, NOT server_addr!
+        let reply = tokio::time::timeout(Duration::from_secs(2), client_rx.recv())
+            .await
+            .expect("timeout waiting for server reply")
+            .expect("channel closed");
+
+        assert_eq!(reply.data.as_ref(), b"reply-from-real-server");
+        assert_eq!(reply.src_addr, SocksAddr::Ip(fake_ip));
+        assert_eq!(reply.dst_addr, SocksAddr::Ip(client_src));
     }
 }
