@@ -3,8 +3,8 @@ pub mod quic;
 pub mod stream;
 pub mod tls;
 
+use dashmap::DashMap;
 use parking_lot::Mutex;
-use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -21,11 +21,14 @@ const DEFAULT_SNIFF_TIMEOUT: Duration = Duration::from_millis(200);
 const MAX_SNIFF_BUFFER_SIZE: usize = 4096;
 const SNIFF_FAILURE_THRESHOLD: u8 = 3;
 const NEGATIVE_CACHE_TTL: Duration = Duration::from_secs(600);
+const MAX_NEG_CACHE_ENTRIES: usize = 4096;
+const TARGET_NEG_CACHE_ENTRIES: usize = 3072;
 
 /// TCP sniffing negative cache for suppressing sniffing on non-HTTP/TLS destinations.
-#[derive(Debug, Clone, Default)]
+#[derive(Default)]
 pub struct TcpSniffNegCache {
-    entries: HashMap<SocketAddr, (u8, Instant)>,
+    entries: DashMap<SocketAddr, (u8, Instant)>,
+    eviction_lock: Mutex<()>,
 }
 
 impl TcpSniffNegCache {
@@ -33,8 +36,17 @@ impl TcpSniffNegCache {
         Self::default()
     }
 
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
     pub fn should_skip(&self, addr: &SocketAddr, now: Instant) -> bool {
-        if let Some(&(failures, expires_at)) = self.entries.get(addr) {
+        if let Some(entry) = self.entries.get(addr) {
+            let (failures, expires_at) = *entry.value();
             if now < expires_at && failures >= SNIFF_FAILURE_THRESHOLD {
                 return true;
             }
@@ -42,23 +54,57 @@ impl TcpSniffNegCache {
         false
     }
 
-    pub fn note_failure(&mut self, addr: SocketAddr, now: Instant) {
-        if self.entries.len() > 4096 {
+    pub fn note_failure(&self, addr: SocketAddr, now: Instant) {
+        // Fast path: if the key already exists, update in-place without triggering eviction.
+        if let Some(mut entry) = self.entries.get_mut(&addr) {
+            let (failures, expires_at) = entry.value_mut();
+            if now >= *expires_at {
+                *failures = 0;
+            }
+            *failures = failures.saturating_add(1).min(SNIFF_FAILURE_THRESHOLD);
+            *expires_at = now + NEGATIVE_CACHE_TTL;
+            return;
+        }
+
+        // Slow path: inserting a new key.
+        // Synchronize under eviction_lock to ensure atomic capacity check and insertion under concurrency.
+        let _guard = self.eviction_lock.lock();
+
+        // Double check if another thread inserted it while waiting for the lock
+        if let Some(mut entry) = self.entries.get_mut(&addr) {
+            let (failures, expires_at) = entry.value_mut();
+            if now >= *expires_at {
+                *failures = 0;
+            }
+            *failures = failures.saturating_add(1).min(SNIFF_FAILURE_THRESHOLD);
+            *expires_at = now + NEGATIVE_CACHE_TTL;
+            return;
+        }
+
+        if self.entries.len() >= MAX_NEG_CACHE_ENTRIES {
             self.prune(now);
+            if self.entries.len() >= MAX_NEG_CACHE_ENTRIES {
+                let to_evict =
+                    (self.entries.len() + 1).saturating_sub(TARGET_NEG_CACHE_ENTRIES);
+                let mut evicted = 0;
+                self.entries.retain(|_, _| {
+                    if evicted < to_evict {
+                        evicted += 1;
+                        false
+                    } else {
+                        true
+                    }
+                });
+            }
         }
-        let entry = self.entries.entry(addr).or_insert((0, now));
-        if now >= entry.1 {
-            entry.0 = 0;
-        }
-        entry.0 = entry.0.saturating_add(1).min(SNIFF_FAILURE_THRESHOLD);
-        entry.1 = now + NEGATIVE_CACHE_TTL;
+        self.entries.insert(addr, (1, now + NEGATIVE_CACHE_TTL));
     }
 
-    pub fn note_success(&mut self, addr: &SocketAddr) {
+    pub fn note_success(&self, addr: &SocketAddr) {
         self.entries.remove(addr);
     }
 
-    pub fn prune(&mut self, now: Instant) {
+    pub fn prune(&self, now: Instant) {
         self.entries.retain(|_, (_, expires_at)| now < *expires_at);
     }
 }
@@ -165,7 +211,7 @@ pub enum SniffUdpOutcome {
 
 pub struct Sniffer {
     pub config: SnifferConfig,
-    pub tcp_neg_cache: Mutex<TcpSniffNegCache>,
+    pub tcp_neg_cache: TcpSniffNegCache,
     pub quic_pool: quic::PacketSnifferPool,
 }
 
@@ -175,7 +221,7 @@ impl Sniffer {
     pub fn new(config: SnifferConfig) -> Self {
         Self {
             config,
-            tcp_neg_cache: Mutex::new(TcpSniffNegCache::new()),
+            tcp_neg_cache: TcpSniffNegCache::new(),
             quic_pool: quic::PacketSnifferPool::new(),
         }
     }
@@ -289,7 +335,7 @@ impl Sniffer {
         };
 
         if let Some(addr) = ip_target {
-            if !force && self.tcp_neg_cache.lock().should_skip(&addr, now) {
+            if !force && self.tcp_neg_cache.should_skip(&addr, now) {
                 trace!("skip sniffing for {} by negative cache", addr);
                 return (None, stream, false);
             }
@@ -329,7 +375,7 @@ impl Sniffer {
                 if !self.is_domain_skipped(&domain) {
                     debug!("sniffed TLS SNI domain `{}` for {}", domain, sess);
                     if let Some(addr) = ip_target {
-                        self.tcp_neg_cache.lock().note_success(&addr);
+                        self.tcp_neg_cache.note_success(&addr);
                     }
                     let override_dest = self
                         .config
@@ -350,7 +396,7 @@ impl Sniffer {
                 if !self.is_domain_skipped(&domain) {
                     debug!("sniffed HTTP Host domain `{}` for {}", domain, sess);
                     if let Some(addr) = ip_target {
-                        self.tcp_neg_cache.lock().note_success(&addr);
+                        self.tcp_neg_cache.note_success(&addr);
                     }
                     let override_dest = self
                         .config
@@ -367,7 +413,7 @@ impl Sniffer {
 
         // Sniffing yielded no usable domain: record failure in negative cache if target is an IP
         if let Some(addr) = ip_target {
-            self.tcp_neg_cache.lock().note_failure(addr, now);
+            self.tcp_neg_cache.note_failure(addr, now);
         }
 
         let wrapped = Box::new(PrefixedStream::new(buf, stream));
@@ -469,21 +515,93 @@ fn sniff_required_len(data: &[u8]) -> usize {
         if data.len() < 5 {
             return 5;
         }
-        let record_end = 5 + u16::from_be_bytes([data[3], data[4]]) as usize;
-        if record_end > MAX_SNIFF_BUFFER_SIZE {
-            return MAX_SNIFF_BUFFER_SIZE;
+
+        // Phase 1: We need at least the 4-byte Handshake header ([msg_type, len, len, len]).
+        // The Handshake header may be split across multiple TLS records (e.g. first record has 1..3 bytes).
+        let mut header = [0u8; 4];
+        let mut header_bytes_read = 0;
+        let mut offset = 0;
+
+        while header_bytes_read < 4 {
+            if offset + 5 > data.len() {
+                // Not enough bytes in buffer to read this record's 5-byte header.
+                // We need at least this record's header plus whatever handshake header bytes remain.
+                let needed = 4 - header_bytes_read;
+                return offset
+                    .saturating_add(5)
+                    .saturating_add(needed)
+                    .min(MAX_SNIFF_BUFFER_SIZE);
+            }
+            if data[offset] != 0x16 || data[offset + 1] != 0x03 {
+                // Not a TLS handshake record continuation
+                return offset.max(5).min(MAX_SNIFF_BUFFER_SIZE);
+            }
+            let r_len =
+                u16::from_be_bytes([data[offset + 3], data[offset + 4]]) as usize;
+            let needed = 4 - header_bytes_read;
+
+            let payload_available = if data.len() >= offset + 5 {
+                (data.len() - (offset + 5)).min(r_len)
+            } else {
+                0
+            };
+
+            let take = payload_available.min(needed);
+            for i in 0..take {
+                header[header_bytes_read + i] = data[offset + 5 + i];
+            }
+            header_bytes_read += take;
+
+            if header_bytes_read < 4 {
+                if r_len > payload_available {
+                    // This record has more payload to provide
+                    let remaining_in_this_record =
+                        (r_len - payload_available).min(4 - header_bytes_read);
+                    return (data.len() + remaining_in_this_record)
+                        .min(MAX_SNIFF_BUFFER_SIZE);
+                }
+                // Advance to the next record
+                offset += 5 + r_len;
+            }
         }
-        if data.len() < 9 {
-            return record_end;
+
+        // Handshake Type: 0x01 is ClientHello
+        if header[0] != 0x01 {
+            let first_record_len =
+                u16::from_be_bytes([data[3], data[4]]) as usize;
+            return (5 + first_record_len).min(MAX_SNIFF_BUFFER_SIZE);
         }
-        if data[5] != 0x01 {
-            return record_end;
+
+        let hello_len = ((header[1] as usize) << 16)
+            | ((header[2] as usize) << 8)
+            | (header[3] as usize);
+        let total_hello_len = 4 + hello_len;
+
+        // Phase 2: Traverse records to calculate total wire bytes needed for ClientHello
+        let mut remaining_hello = total_hello_len;
+        let mut offset = 0;
+        while remaining_hello > 0 && offset < MAX_SNIFF_BUFFER_SIZE {
+            if offset + 5 > data.len() {
+                // Next record header not fully read yet.
+                // We need at least the 5-byte header plus remaining handshake bytes.
+                offset =
+                    offset.saturating_add(5).saturating_add(remaining_hello);
+                break;
+            }
+            if data[offset] != 0x16 || data[offset + 1] != 0x03 {
+                break;
+            }
+            let r_len =
+                u16::from_be_bytes([data[offset + 3], data[offset + 4]]) as usize;
+            if r_len >= remaining_hello {
+                offset += 5 + remaining_hello;
+                break;
+            } else {
+                remaining_hello -= r_len;
+                offset += 5 + r_len;
+            }
         }
-        let hello_len = ((data[6] as usize) << 16)
-            | ((data[7] as usize) << 8)
-            | (data[8] as usize);
-        let hello_end = 9 + hello_len;
-        return record_end.max(hello_end).min(MAX_SNIFF_BUFFER_SIZE);
+        return offset.min(MAX_SNIFF_BUFFER_SIZE);
     }
     if is_http_request_prefix(data) {
         return if data.windows(4).any(|w| w == b"\r\n\r\n") {

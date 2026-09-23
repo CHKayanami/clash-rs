@@ -13,13 +13,39 @@ pub fn parse_tls_sni(data: &[u8]) -> Option<String> {
         return None;
     }
 
-    let record_len = u16::from_be_bytes([data[3], data[4]]) as usize;
-    let payload = &data[5..];
-    if payload.len() < record_len && payload.len() < 4 {
-        // Even if the entire record isn't in buffer yet, try parsing what we have if long enough
+    let first_record_len = u16::from_be_bytes([data[3], data[4]]) as usize;
+    if data.len() <= 5 + first_record_len {
+        // Single record (or partial single record).
+        // Zero allocation: no subsequent record headers can corrupt the handshake payload.
+        return parse_client_hello_handshake(&data[5..]);
     }
 
-    parse_client_hello_handshake(payload)
+    // ClientHello may be fragmented across multiple TLS records.
+    // Strip TLS record headers and reassemble consecutive handshake fragments.
+    let mut handshake_data = Vec::with_capacity(data.len() - 5);
+    let mut offset = 0;
+    while offset + 5 <= data.len() {
+        if data[offset] != 0x16 || data[offset + 1] != 0x03 {
+            break;
+        }
+        let record_len = u16::from_be_bytes([data[offset + 3], data[offset + 4]]) as usize;
+        let payload_start = offset + 5;
+        let payload_end = (payload_start + record_len).min(data.len());
+        if payload_start < payload_end {
+            handshake_data.extend_from_slice(&data[payload_start..payload_end]);
+        }
+        if handshake_data.len() >= 4 && handshake_data[0] == 0x01 {
+            let hello_len = ((handshake_data[1] as usize) << 16)
+                | ((handshake_data[2] as usize) << 8)
+                | (handshake_data[3] as usize);
+            if handshake_data.len() >= 4 + hello_len {
+                break;
+            }
+        }
+        offset += 5 + record_len;
+    }
+
+    parse_client_hello_handshake(&handshake_data)
 }
 
 /// Parse raw TLS Handshake ClientHello (starting from Handshake Type `0x01`)
@@ -201,5 +227,44 @@ mod tests {
     fn test_non_tls() {
         let sample = b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
         assert_eq!(parse_tls_sni(sample), None);
+    }
+
+    #[test]
+    fn test_tls_sni_multi_record() {
+        // TLS 1.2 / 1.3 ClientHello with SNI = "example.com" (total handshake payload = 67 bytes)
+        #[rustfmt::skip]
+        let handshake_payload = [
+            0x01, 0x00, 0x00, 0x3f,       // ClientHello, len 63
+            0x03, 0x03,                   // TLS 1.2
+            // 32 bytes Random
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+            0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
+            0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
+            0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f,
+            0x00,                         // Session ID len 0
+            0x00, 0x02, 0x13, 0x01,       // Cipher Suites (len 2, TLS_AES_128_GCM_SHA256)
+            0x01, 0x00,                   // Compression Methods (len 1, 0x00)
+            0x00, 0x14,                   // Extensions length 20
+            0x00, 0x00, 0x00, 0x10,       // Extension server_name (len 16)
+            0x00, 0x0e,                   // ServerNameList len 14
+            0x00, 0x00, 0x0b,             // HostName type 0, len 11
+            b'e', b'x', b'a', b'm', b'p', b'l', b'e', b'.', b'c', b'o', b'm'
+        ];
+
+        // Split handshake across two TLS records (e.g. 25 bytes and 42 bytes)
+        let split_pos = 25;
+        let mut multi_record = Vec::new();
+
+        // Record 1
+        multi_record.extend_from_slice(&[0x16, 0x03, 0x01, 0x00, split_pos as u8]);
+        multi_record.extend_from_slice(&handshake_payload[..split_pos]);
+
+        // Record 2
+        let rem_len = handshake_payload.len() - split_pos;
+        multi_record.extend_from_slice(&[0x16, 0x03, 0x01, 0x00, rem_len as u8]);
+        multi_record.extend_from_slice(&handshake_payload[split_pos..]);
+
+        let sni = parse_tls_sni(&multi_record);
+        assert_eq!(sni, Some("example.com".to_string()));
     }
 }

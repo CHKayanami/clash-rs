@@ -1,6 +1,8 @@
 /// QUIC Initial packet decryptor and TLS 1.3 ClientHello SNI extractor.
 /// Supports RFC 9000/9001 (QUIC v1), RFC 9369 (QUIC v2), and draft-29.
 use std::collections::BTreeMap;
+use std::net::SocketAddr;
+use std::time::{Duration, Instant};
 
 use aes::Aes128;
 use aes::cipher::{BlockCipherEncrypt, KeyInit as AesKeyInit};
@@ -8,7 +10,9 @@ use aes_gcm::{
     Aes128Gcm,
     aead::{Aead, Payload},
 };
+use dashmap::DashMap;
 use hmac::{Hmac, Mac};
+use parking_lot::Mutex;
 use sha2::Sha256;
 
 use super::tls::parse_client_hello_handshake;
@@ -437,6 +441,10 @@ const SNIFFER_TTL: std::time::Duration = std::time::Duration::from_secs(5);
 const NO_SNI_THRESHOLD: u32 = 3;
 const FAILED_DCID_TTL: std::time::Duration = std::time::Duration::from_secs(1);
 const MAX_INITIAL_SNIFF_PACKETS: u32 = 8;
+const MAX_FAILED_DCIDS: usize = 4096;
+const TARGET_FAILED_DCIDS: usize = 3072;
+const MAX_SESSIONS: usize = 4096;
+const TARGET_SESSIONS: usize = 3072;
 
 struct SnifferSession {
     domain: Option<String>,
@@ -466,11 +474,10 @@ impl SnifferSession {
 
 /// Pool of packet sniffers with DCID negative caching and multi-packet ClientHello reassembly.
 pub struct PacketSnifferPool {
-    sessions:
-        parking_lot::Mutex<std::collections::HashMap<UdpFlowKey, SnifferSession>>,
-    failed_dcids: parking_lot::Mutex<
-        std::collections::HashMap<UdpFlowKey, std::time::Instant>,
-    >,
+    sessions: DashMap<UdpFlowKey, SnifferSession>,
+    failed_dcids: DashMap<UdpFlowKey, Instant>,
+    sessions_eviction_lock: Mutex<()>,
+    failed_dcids_eviction_lock: Mutex<()>,
 }
 
 impl Default for PacketSnifferPool {
@@ -482,14 +489,24 @@ impl Default for PacketSnifferPool {
 impl PacketSnifferPool {
     pub fn new() -> Self {
         Self {
-            sessions: parking_lot::Mutex::new(std::collections::HashMap::new()),
-            failed_dcids: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            sessions: DashMap::new(),
+            failed_dcids: DashMap::new(),
+            sessions_eviction_lock: Mutex::new(()),
+            failed_dcids_eviction_lock: Mutex::new(()),
         }
     }
 
-    pub fn is_dcid_failed(&self, key: &UdpFlowKey, now: std::time::Instant) -> bool {
-        if let Some(&expires_at) = self.failed_dcids.lock().get(key) {
-            if now < expires_at {
+    pub fn sessions_len(&self) -> usize {
+        self.sessions.len()
+    }
+
+    pub fn failed_dcids_len(&self) -> usize {
+        self.failed_dcids.len()
+    }
+
+    pub fn is_dcid_failed(&self, key: &UdpFlowKey, now: Instant) -> bool {
+        if let Some(expires_at) = self.failed_dcids.get(key) {
+            if now < *expires_at {
                 return true;
             }
         }
@@ -499,25 +516,52 @@ impl PacketSnifferPool {
     pub fn mark_dcid_failed(
         &self,
         key: UdpFlowKey,
-        now: std::time::Instant,
-        ttl: std::time::Duration,
+        now: Instant,
+        ttl: Duration,
     ) {
-        let mut failed = self.failed_dcids.lock();
-        if failed.len() > 4096 {
-            failed.retain(|_, expires_at| now < *expires_at);
+        // Fast path: if key already exists, update in-place without triggering eviction.
+        if let Some(mut entry) = self.failed_dcids.get_mut(&key) {
+            *entry.value_mut() = now + ttl;
+            return;
         }
-        failed.insert(key, now + ttl);
+
+        // Slow path: inserting a new key.
+        // Synchronize under eviction_lock to ensure atomic capacity check and insertion under concurrency.
+        let _guard = self.failed_dcids_eviction_lock.lock();
+
+        // Double check
+        if let Some(mut entry) = self.failed_dcids.get_mut(&key) {
+            *entry.value_mut() = now + ttl;
+            return;
+        }
+
+        if self.failed_dcids.len() >= MAX_FAILED_DCIDS {
+            self.failed_dcids.retain(|_, expires_at| now < *expires_at);
+            if self.failed_dcids.len() >= MAX_FAILED_DCIDS {
+                let to_evict = (self.failed_dcids.len() + 1).saturating_sub(TARGET_FAILED_DCIDS);
+                let mut evicted = 0;
+                self.failed_dcids.retain(|_, _| {
+                    if evicted < to_evict {
+                        evicted += 1;
+                        false
+                    } else {
+                        true
+                    }
+                });
+            }
+        }
+        self.failed_dcids.insert(key, now + ttl);
     }
 
     /// Feed a UDP datagram to the QUIC sniffer for the flow.
     pub fn feed_quic_datagram(
         &self,
-        src: std::net::SocketAddr,
-        dst: std::net::SocketAddr,
+        src: SocketAddr,
+        dst: SocketAddr,
         data: &[u8],
     ) -> QuicSniffOutcome {
         let key = UdpFlowKey { src, dst };
-        let now = std::time::Instant::now();
+        let now = Instant::now();
 
         if self.is_dcid_failed(&key, now) {
             return QuicSniffOutcome::NotQuic;
@@ -526,12 +570,38 @@ impl PacketSnifferPool {
         // Decrypt fragments from datagram
         let fragments = decrypt_initial_datagram(data);
 
-        let mut sessions = self.sessions.lock();
-        if sessions.len() > 4096 {
-            sessions.retain(|_, s| !s.is_expired(now));
-        }
+        let mut session = if let Some(s) = self.sessions.get_mut(&key) {
+            s
+        } else {
+            let _guard = self.sessions_eviction_lock.lock();
+            let s = if let Some(s) = self.sessions.get_mut(&key) {
+                s
+            } else {
+                if self.sessions.len() >= MAX_SESSIONS {
+                    self.sessions.retain(|_, s| !s.is_expired(now));
+                    if self.sessions.len() >= MAX_SESSIONS {
+                        let to_evict =
+                            (self.sessions.len() + 1).saturating_sub(TARGET_SESSIONS);
+                        let mut evicted = 0;
+                        self.sessions.retain(|_, _| {
+                            if evicted < to_evict {
+                                evicted += 1;
+                                false
+                            } else {
+                                true
+                            }
+                        });
+                    }
+                }
+                self.sessions.entry(key).or_insert_with(SnifferSession::new)
+            };
+            drop(_guard);
+            s
+        };
 
-        let session = sessions.entry(key).or_insert_with(SnifferSession::new);
+        if session.is_expired(now) {
+            *session = SnifferSession::new();
+        }
 
         if session.done {
             return session
@@ -543,7 +613,7 @@ impl PacketSnifferPool {
 
         session.packets_seen += 1;
         if session.packets_seen > MAX_INITIAL_SNIFF_PACKETS {
-            drop(sessions);
+            drop(session);
             self.mark_dcid_failed(key, now, FAILED_DCID_TTL);
             return QuicSniffOutcome::NotQuic;
         }
@@ -556,7 +626,7 @@ impl PacketSnifferPool {
                 if failed {
                     session.done = true;
                 }
-                drop(sessions);
+                drop(session);
                 if failed {
                     self.mark_dcid_failed(key, now, FAILED_DCID_TTL);
                 }
@@ -570,7 +640,7 @@ impl PacketSnifferPool {
 
         if session.crypto.is_overflowed() {
             session.done = true;
-            drop(sessions);
+            drop(session);
             self.mark_dcid_failed(key, now, FAILED_DCID_TTL);
             return QuicSniffOutcome::CompleteNoDomain;
         }
@@ -595,8 +665,8 @@ impl PacketSnifferPool {
 
         // Handshake body was complete or invalid, but no SNI was found
         session.done = true;
-        drop(sessions);
-        self.mark_dcid_failed(key, now, std::time::Duration::from_secs(10));
+        drop(session);
+        self.mark_dcid_failed(key, now, Duration::from_secs(10));
         QuicSniffOutcome::CompleteNoDomain
     }
 }
@@ -765,5 +835,115 @@ mod tests {
 
         let outcome = pool.feed_quic_datagram(src, dst, &packet);
         assert_eq!(outcome, QuicSniffOutcome::Domain("example.com".to_string()));
+    }
+
+    #[test]
+    fn test_quic_sniffer_pool_capacity_limit_and_batch_eviction() {
+        let pool = PacketSnifferPool::new();
+        let now = std::time::Instant::now();
+
+        // 1. Fill failed_dcids beyond 4096
+        for i in 0..4100 {
+            let key = UdpFlowKey {
+                src: format!("10.0.0.1:{}", 1024 + (i % 60000)).parse().unwrap(),
+                dst: format!("8.8.8.{}:443", (i / 60000) + 1).parse().unwrap(),
+            };
+            pool.mark_dcid_failed(key, now, std::time::Duration::from_secs(60));
+        }
+
+        // Hard capacity guaranteed <= 4096 (evicted to 3071 + 4 = 3075)
+        assert!(pool.failed_dcids_len() <= 4096);
+        assert_eq!(pool.failed_dcids_len(), 3075);
+
+        // 2. Fill sessions beyond 4096
+        let garbage = [0u8; 40];
+        for i in 0..4100 {
+            let src = format!("10.0.0.2:{}", 1024 + (i % 60000)).parse().unwrap();
+            let dst = format!("8.8.8.{}:443", (i / 60000) + 1).parse().unwrap();
+            pool.feed_quic_datagram(src, dst, &garbage);
+        }
+        assert!(pool.sessions_len() <= 4096);
+        assert_eq!(pool.sessions_len(), 3075);
+    }
+
+    #[test]
+    fn test_quic_sniffer_pool_existing_key_does_not_evict() {
+        let pool = PacketSnifferPool::new();
+        let now = std::time::Instant::now();
+
+        // 1. Fill failed_dcids exactly to 4096
+        for i in 0..4096 {
+            let key = UdpFlowKey {
+                src: format!("10.0.0.1:{}", 1024 + (i % 60000)).parse().unwrap(),
+                dst: format!("8.8.8.{}:443", (i / 60000) + 1).parse().unwrap(),
+            };
+            pool.mark_dcid_failed(key, now, std::time::Duration::from_secs(60));
+        }
+        assert_eq!(pool.failed_dcids_len(), 4096);
+
+        // Updating an existing failed DCID key must NOT trigger eviction
+        let existing_key = UdpFlowKey {
+            src: "10.0.0.1:1024".parse().unwrap(),
+            dst: "8.8.8.1:443".parse().unwrap(),
+        };
+        for _ in 0..10 {
+            pool.mark_dcid_failed(existing_key, now, std::time::Duration::from_secs(60));
+            assert_eq!(pool.failed_dcids_len(), 4096);
+        }
+
+        // 2. Fill sessions exactly to 4096
+        let garbage = [0u8; 40];
+        for i in 0..4096 {
+            let src = format!("10.0.0.2:{}", 1024 + (i % 60000)).parse().unwrap();
+            let dst = format!("8.8.8.{}:443", (i / 60000) + 1).parse().unwrap();
+            pool.feed_quic_datagram(src, dst, &garbage);
+        }
+        assert_eq!(pool.sessions_len(), 4096);
+
+        // Subsequent datagrams for an existing flow session must NOT trigger eviction
+        let existing_src = "10.0.0.2:1024".parse().unwrap();
+        let existing_dst = "8.8.8.1:443".parse().unwrap();
+        for _ in 0..10 {
+            pool.feed_quic_datagram(existing_src, existing_dst, &garbage);
+            assert_eq!(pool.sessions_len(), 4096);
+        }
+    }
+
+    #[test]
+    fn test_quic_sniffer_pool_concurrent_hard_capacity_limit() {
+        use std::sync::Arc;
+
+        let pool = Arc::new(PacketSnifferPool::new());
+        let mut handles = Vec::new();
+
+        // 10 threads concurrently inserting into failed_dcids and sessions
+        for thread_idx in 0..10 {
+            let pool_clone = pool.clone();
+            handles.push(std::thread::spawn(move || {
+                let now = Instant::now();
+                let garbage = [0u8; 40];
+                for i in 0..500 {
+                    let port = 1024 + (thread_idx * 500 + i) as u16;
+                    let key = UdpFlowKey {
+                        src: format!("10.0.0.1:{}", port).parse().unwrap(),
+                        dst: "8.8.8.8:443".parse().unwrap(),
+                    };
+                    pool_clone.mark_dcid_failed(key, now, Duration::from_secs(60));
+                    assert!(pool_clone.failed_dcids_len() <= 4096);
+
+                    let src = format!("10.0.0.2:{}", port).parse().unwrap();
+                    let dst = "8.8.8.8:443".parse().unwrap();
+                    pool_clone.feed_quic_datagram(src, dst, &garbage);
+                    assert!(pool_clone.sessions_len() <= 4096);
+                }
+            }));
+        }
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        assert!(pool.failed_dcids_len() <= 4096);
+        assert!(pool.sessions_len() <= 4096);
     }
 }

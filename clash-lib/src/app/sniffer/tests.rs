@@ -37,6 +37,31 @@ pub(crate) fn build_tls_client_hello(server_name: &str) -> Vec<u8> {
     record
 }
 
+pub(crate) fn build_multi_record_tls_client_hello(
+    server_name: &str,
+    split_pos: usize,
+) -> Vec<u8> {
+    let single = build_tls_client_hello(server_name);
+    let handshake_payload = &single[5..];
+    assert!(split_pos < handshake_payload.len());
+
+    let mut record = Vec::new();
+    // Record 1
+    record.push(0x16);
+    record.extend_from_slice(&[0x03, 0x01]);
+    record.extend_from_slice(&(split_pos as u16).to_be_bytes());
+    record.extend_from_slice(&handshake_payload[..split_pos]);
+
+    // Record 2
+    let rem = handshake_payload.len() - split_pos;
+    record.push(0x16);
+    record.extend_from_slice(&[0x03, 0x01]);
+    record.extend_from_slice(&(rem as u16).to_be_bytes());
+    record.extend_from_slice(&handshake_payload[split_pos..]);
+
+    record
+}
+
 #[test]
 fn test_tls_sni_builder_and_parser() {
     let payload = build_tls_client_hello("www.rust-lang.org");
@@ -269,6 +294,88 @@ async fn test_sniffer_stream_tls_fragmented() {
 }
 
 #[tokio::test]
+async fn test_sniffer_stream_tls_multi_record() {
+    let config = SnifferConfig {
+        enable: true,
+        tls: Some(SniffProtocolConfig {
+            ports: PortMatcher::new(vec![PortRange::Single(443)]),
+            override_destination: None,
+        }),
+        ..Default::default()
+    };
+    let sniffer = Sniffer::new(config);
+
+    let (client, mut server) = tokio::io::duplex(1024);
+    // Split the handshake across 2 TLS records at byte 20
+    let sample = build_multi_record_tls_client_hello("multi-record.rust-lang.org", 20);
+    let sample_clone = sample.clone();
+
+    tokio::spawn(async move {
+        // Send in chunks
+        for chunk in sample_clone.chunks(10) {
+            server.write_all(chunk).await.unwrap();
+            tokio::task::yield_now().await;
+        }
+    });
+
+    let sess = Session {
+        destination: "1.1.1.1:443".parse().unwrap(),
+        ..Default::default()
+    };
+
+    let (domain, mut stream, _) =
+        sniffer.sniff_stream(&sess, Box::new(client)).await;
+    assert_eq!(domain, Some("multi-record.rust-lang.org".to_string()));
+
+    let mut all_bytes = Vec::new();
+    stream.read_to_end(&mut all_bytes).await.unwrap();
+    assert_eq!(all_bytes, sample);
+}
+
+#[tokio::test]
+async fn test_sniffer_stream_tls_handshake_header_split() {
+    let config = SnifferConfig {
+        enable: true,
+        tls: Some(SniffProtocolConfig {
+            ports: PortMatcher::new(vec![PortRange::Single(443)]),
+            override_destination: None,
+        }),
+        ..Default::default()
+    };
+    let sniffer = Sniffer::new(config);
+
+    // Test first record having only 1 byte (only 0x01 HandshakeType)
+    // and 3 bytes (HandshakeType + 2 bytes of length, missing 1 byte length)
+    for split_pos in [1, 2, 3] {
+        let domain_name = format!("split-{}.rust-lang.org", split_pos);
+        let sample = build_multi_record_tls_client_hello(&domain_name, split_pos);
+        let sample_clone = sample.clone();
+
+        let (client, mut server) = tokio::io::duplex(1024);
+        tokio::spawn(async move {
+            // Send in small chunks, yielding to force incremental stream reads
+            for chunk in sample_clone.chunks(3) {
+                server.write_all(chunk).await.unwrap();
+                tokio::task::yield_now().await;
+            }
+        });
+
+        let sess = Session {
+            destination: "1.1.1.1:443".parse().unwrap(),
+            ..Default::default()
+        };
+
+        let (domain, mut stream, _) =
+            sniffer.sniff_stream(&sess, Box::new(client)).await;
+        assert_eq!(domain, Some(domain_name));
+
+        let mut all_bytes = Vec::new();
+        stream.read_to_end(&mut all_bytes).await.unwrap();
+        assert_eq!(all_bytes, sample);
+    }
+}
+
+#[tokio::test]
 async fn test_sniffer_stream_http_fragmented() {
     let config = SnifferConfig {
         enable: true,
@@ -335,7 +442,6 @@ async fn test_sniffer_tcp_negative_cache() {
     assert!(
         sniffer
             .tcp_neg_cache
-            .lock()
             .should_skip(&target_addr, std::time::Instant::now())
     );
 
@@ -370,4 +476,74 @@ fn test_hostname_validation() {
     assert!(!tls::is_valid_hostname("bad-.com"));
     assert!(!tls::is_valid_hostname(".dot.at.start"));
     assert!(!tls::is_valid_hostname("space in.com"));
+}
+
+#[test]
+fn test_tcp_neg_cache_capacity_limit_and_batch_eviction() {
+    let cache = TcpSniffNegCache::new();
+    let now = std::time::Instant::now();
+
+    for i in 0..4100 {
+        let port = (1024 + (i % 60000)) as u16;
+        let ip_last = (i / 60000) as u8;
+        let addr: std::net::SocketAddr =
+            format!("10.0.{}.1:{}", ip_last, port).parse().unwrap();
+        cache.note_failure(addr, now);
+    }
+
+    // Hard capacity guaranteed <= 4096 (evicted to 3071 + 4 = 3075)
+    assert!(cache.len() <= 4096);
+    assert_eq!(cache.len(), 3075);
+}
+
+#[test]
+fn test_tcp_neg_cache_existing_key_does_not_evict() {
+    let cache = TcpSniffNegCache::new();
+    let now = std::time::Instant::now();
+
+    // 1. Fill exactly to 4096 (full capacity)
+    for i in 0..4096 {
+        let addr: std::net::SocketAddr =
+            format!("10.0.{}.1:{}", (i / 60000) as u8, (1024 + (i % 60000)) as u16)
+                .parse()
+                .unwrap();
+        cache.note_failure(addr, now);
+    }
+    assert_eq!(cache.len(), 4096);
+
+    // 2. Accessing existing keys must NOT trigger batch eviction
+    let existing_addr: std::net::SocketAddr = "10.0.0.1:1024".parse().unwrap();
+    for _ in 0..10 {
+        cache.note_failure(existing_addr, now);
+        assert_eq!(cache.len(), 4096);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn test_tcp_neg_cache_concurrent_hard_capacity_limit() {
+    let cache = std::sync::Arc::new(TcpSniffNegCache::new());
+    let now = std::time::Instant::now();
+
+    // Spawn 10 concurrent tasks inserting 500 distinct new IPs each (total 5000 new IPs)
+    let mut handles = Vec::new();
+    for t in 0..10 {
+        let cache_clone = cache.clone();
+        handles.push(tokio::spawn(async move {
+            for i in 0..500 {
+                let addr: std::net::SocketAddr =
+                    format!("10.{}.{}.{}:{}", t, (i / 256) as u8, (i % 256) as u8, 1024 + i)
+                        .parse()
+                        .unwrap();
+                cache_clone.note_failure(addr, now);
+                assert!(cache_clone.len() <= 4096);
+            }
+        }));
+    }
+
+    for h in handles {
+        h.await.unwrap();
+    }
+
+    // Must never exceed 4096 under multi-threaded concurrency
+    assert!(cache.len() <= 4096);
 }

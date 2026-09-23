@@ -1,3 +1,5 @@
+use std::str::from_utf8;
+
 /// HTTP Host parser
 /// Efficiently inspects the initial bytes of an HTTP request and extracts the Host header.
 
@@ -25,37 +27,41 @@ pub fn parse_http_host(data: &[u8]) -> Option<String> {
         return None;
     }
 
+    // Only inspect the headers section before CRLF CRLF or LF LF
+    let header_bytes = if let Some(pos) = data.windows(4).position(|w| w == b"\r\n\r\n") {
+        &data[..pos]
+    } else if let Some(pos) = data.windows(2).position(|w| w == b"\n\n") {
+        &data[..pos]
+    } else {
+        data
+    };
+
     // Search line by line for the `Host:` header (case-insensitive)
-    let s = match std::str::from_utf8(data) {
+    let s = match from_utf8(header_bytes) {
         Ok(s) => s,
         Err(_) => {
             // Even if whole buffer is not valid UTF-8, try converting lossily or slice up to headers
-            let valid_len = match std::str::from_utf8(&data[..data.len().min(4096)])
-            {
+            let valid_len = match from_utf8(&header_bytes[..header_bytes.len().min(4096)]) {
                 Ok(s) => s.len(),
                 Err(e) => e.valid_up_to(),
             };
             if valid_len < 10 {
                 return None;
             }
-            std::str::from_utf8(&data[..valid_len]).unwrap_or("")
+            from_utf8(&header_bytes[..valid_len]).unwrap_or("")
         }
     };
 
     for line in s.lines() {
-        if line.is_empty() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
             // End of headers
             break;
         }
 
-        let trimmed = line.trim();
-        if let Some(rest) = trimmed
-            .strip_prefix("Host:")
-            .or_else(|| trimmed.strip_prefix("host:"))
-            .or_else(|| trimmed.strip_prefix("HOST:"))
+        if trimmed.len() >= 5
+            && trimmed.as_bytes()[..5].eq_ignore_ascii_case(b"host:")
         {
-            return sanitize_host(rest);
-        } else if trimmed.len() > 5 && trimmed[..5].eq_ignore_ascii_case("host:") {
             return sanitize_host(&trimmed[5..]);
         }
     }
@@ -118,5 +124,26 @@ mod tests {
     fn test_parse_non_http() {
         let req = b"\x16\x03\x01\x00\x05hello";
         assert_eq!(parse_http_host(req), None);
+    }
+
+    #[test]
+    fn test_parse_http_unicode_header_no_panic() {
+        // "ééé: value\r\n" - 'é' is 2 bytes in UTF-8 (0xc3, 0xa9). Slicing ..5 will panic if not on char boundary.
+        let req = "POST / HTTP/1.1\r\nééé: value\r\nHost: safe.example.com\r\n\r\n".as_bytes();
+        assert_eq!(parse_http_host(req), Some("safe.example.com".to_string()));
+
+        let req_no_host = "POST / HTTP/1.1\r\nééé: value\r\n\r\n".as_bytes();
+        assert_eq!(parse_http_host(req_no_host), None);
+    }
+
+    #[test]
+    fn test_parse_http_body_host_not_sniffed() {
+        // True header has no Host header, but body has "Host: evil.example.com"
+        let req = b"POST /submit HTTP/1.1\r\nUser-Agent: curl\r\n\r\nHost: evil.example.com\r\n\r\n";
+        assert_eq!(parse_http_host(req), None);
+
+        // Body with CRLF separation
+        let req2 = b"POST /submit HTTP/1.1\r\nContent-Length: 25\r\n\r\nHost: evil.example.com";
+        assert_eq!(parse_http_host(req2), None);
     }
 }
