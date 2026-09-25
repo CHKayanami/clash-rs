@@ -1,6 +1,5 @@
 use axum::{body::Body, extract::Query, http::Request, response::Response};
 use futures::future::BoxFuture;
-
 use serde::Deserialize;
 use tower::{Layer, Service};
 
@@ -12,11 +11,16 @@ struct AuthQuery {
 #[derive(Debug, Clone)]
 pub struct AuthMiddlewareLayer {
     pub token: String,
+    bearer_token: String,
 }
 
 impl AuthMiddlewareLayer {
     pub fn new(token: String) -> Self {
-        Self { token }
+        let bearer_token = format!("Bearer {token}");
+        Self {
+            token,
+            bearer_token,
+        }
     }
 }
 
@@ -24,7 +28,7 @@ impl<S> Layer<S> for AuthMiddlewareLayer {
     type Service = AuthMiddleware<S>;
 
     fn layer(&self, inner: S) -> Self::Service {
-        AuthMiddleware::new(inner, self.token.clone())
+        AuthMiddleware::new(inner, self.token.clone(), self.bearer_token.clone())
     }
 }
 
@@ -32,11 +36,16 @@ impl<S> Layer<S> for AuthMiddlewareLayer {
 pub struct AuthMiddleware<S> {
     inner: S,
     token: String,
+    bearer_token: String,
 }
 
 impl<S> AuthMiddleware<S> {
-    pub fn new(inner: S, token: String) -> Self {
-        Self { inner, token }
+    pub fn new(inner: S, token: String, bearer_token: String) -> Self {
+        Self {
+            inner,
+            token,
+            bearer_token,
+        }
     }
 
     fn is_websocket(&self, req: &Request<Body>) -> bool {
@@ -68,9 +77,13 @@ where
             return Box::pin(self.inner.call(req));
         }
 
-        // /ui is a public endpoint — no auth required regardless of transport
+        // Public endpoints (UI and redirect alias) — no auth required
         let path = req.uri().path();
-        if path == "/ui" || path.starts_with("/ui/") {
+        if path == "/ui"
+            || path.starts_with("/ui/")
+            || path == "/dashboard"
+            || path.starts_with("/dashboard/")
+        {
             return Box::pin(self.inner.call(req));
         }
 
@@ -94,7 +107,7 @@ where
             .map(|x| x.to_str().unwrap_or_default())
             .unwrap_or_default();
 
-        if header == format!("Bearer {}", self.token) {
+        if header == self.bearer_token {
             return Box::pin(self.inner.call(req));
         }
 

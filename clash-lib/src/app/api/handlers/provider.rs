@@ -19,7 +19,8 @@ use serde_json::json;
 
 use crate::{
     app::{
-        api::AppState, outbound::manager::ThreadSafeOutboundManager,
+        api::{AppState, handlers::utils::DelayRequest},
+        outbound::manager::ThreadSafeOutboundManager,
         remote_content_manager::providers::proxy_provider::ArcProxyProvider,
         router::ArcRouter,
     },
@@ -179,11 +180,6 @@ async fn get_proxy(
     axum::response::Json(outbound_manager.get_proxy(&proxy).await)
 }
 
-#[derive(Deserialize)]
-struct DelayRequest {
-    url: String,
-    timeout: u16,
-}
 async fn get_proxy_delay(
     State(state): State<ProviderState>,
     Extension(proxy): Extension<AnyOutboundHandler>,
@@ -195,16 +191,21 @@ async fn get_proxy_delay(
     let result = outbound_manager
         .url_test(&vec![proxy], &q.url, timeout)
         .await;
-    match result.first().unwrap() {
-        Ok((actual, overall)) => {
+    match result.first() {
+        Some(Ok((actual, overall))) => {
             let mut r = HashMap::new();
             r.insert("delay".to_owned(), actual.as_millis());
             r.insert("overall".to_owned(), overall.as_millis());
             axum::response::Json(r).into_response()
         }
-        Err(err) => (
+        Some(Err(err)) => (
             StatusCode::BAD_REQUEST,
             format!("get delay for {n} failed with error: {err}"),
+        )
+            .into_response(),
+        None => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("no delay test result for {n}"),
         )
             .into_response(),
     }
@@ -347,8 +348,17 @@ async fn match_rule_provider(
         }
     }
 
-    // 此时经过洗礼的 target，100% 带有合法端口且格式正确
-    let destination = SocksAddr::from_str(&target).unwrap();
+    // 此时经过智能补全的 target 尝试解析为 SocksAddr
+    let destination = match SocksAddr::from_str(&target) {
+        Ok(dest) => dest,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("invalid target address: {target}"),
+            )
+                .into_response();
+        }
+    };
 
     let sess = Session {
         network: Network::Tcp,

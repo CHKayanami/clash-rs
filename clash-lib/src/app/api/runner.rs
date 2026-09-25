@@ -269,7 +269,10 @@ impl AsyncService for ApiRunner {
         let lifecycle_tokens = vec![cancellation_token.clone(), ctx_cancel.clone()];
 
         ctx.spawn_critical_with_tokens("api_server", lifecycle_tokens, async move {
-            let tcp_fut = tcp_addr.map(|bind_addr| {
+            let tcp_cancel = cancel_child.child_token();
+            let ipc_cancel = cancel_child.child_token();
+
+            let tcp_handle = tcp_addr.map(|bind_addr| {
                 let bind_addr = if bind_addr.starts_with(':') {
                     info!(
                         "TCP API Server address not supplied, listening on \
@@ -282,21 +285,36 @@ impl AsyncService for ApiRunner {
                 let auth_secret = controller_cfg.secret.clone().unwrap_or_default();
                 let cors_allow_origins = controller_cfg.cors_allow_origins.clone();
                 let router = router.clone();
-                async move {
-                    super::tcp::serve_tcp(
-                        bind_addr,
-                        router,
-                        auth_secret,
-                        cors_allow_origins,
-                    )
-                    .await
-                }
+                let cancel = tcp_cancel.clone();
+                tokio::spawn(async move {
+                    tokio::select! {
+                        res = super::tcp::serve_tcp(
+                            bind_addr,
+                            router,
+                            auth_secret,
+                            cors_allow_origins,
+                        ) => res,
+                        _ = cancel.cancelled() => {
+                            debug!("TCP API server gracefully cancelled");
+                            Ok(())
+                        }
+                    }
+                })
             });
 
-            let ipc_fut = ipc_addr.as_ref().map(|ipc_path| {
+            let ipc_handle = ipc_addr.as_ref().map(|ipc_path| {
                 let ipc_path = ipc_path.clone();
                 let router = router.clone();
-                async move { ipc::serve_ipc(router, &ipc_path).await }
+                let cancel = ipc_cancel.clone();
+                tokio::spawn(async move {
+                    tokio::select! {
+                        res = ipc::serve_ipc(router, &ipc_path) => res,
+                        _ = cancel.cancelled() => {
+                            debug!("IPC API server gracefully cancelled");
+                            Ok(())
+                        }
+                    }
+                })
             });
 
             match (tcp_addr_display.as_deref(), ipc_addr_display.as_deref()) {
@@ -309,20 +327,57 @@ impl AsyncService for ApiRunner {
                 (None, None) => unreachable!(),
             }
 
-            let result = tokio::select! {
-                Some(result) = futures::future::OptionFuture::from(tcp_fut) => result,
-                Some(result) = futures::future::OptionFuture::from(ipc_fut) => result,
+            let mut tcp_running = tcp_handle.is_some();
+            let mut ipc_running = ipc_handle.is_some();
+
+            let mut tcp_task = futures::future::OptionFuture::from(tcp_handle);
+            let mut ipc_task = futures::future::OptionFuture::from(ipc_handle);
+
+            tokio::select! {
+                Some(res) = &mut tcp_task => {
+                    tcp_running = false;
+                    match res {
+                        Ok(Err(e)) => {
+                            error!("TCP API server failed: {}", e);
+                        }
+                        Err(join_err) => {
+                            error!("TCP API server task panicked: {}", join_err);
+                        }
+                        Ok(Ok(())) => {
+                            info!("TCP API server stopped");
+                        }
+                    }
+                }
+                Some(res) = &mut ipc_task => {
+                    ipc_running = false;
+                    match res {
+                        Ok(Err(e)) => {
+                            error!("IPC API server failed: {}", e);
+                        }
+                        Err(join_err) => {
+                            error!("IPC API server task panicked: {}", join_err);
+                        }
+                        Ok(Ok(())) => {
+                            info!("IPC API server stopped");
+                        }
+                    }
+                }
                 _ = cancel_child.cancelled() => {
                     info!("API server closed gracefully");
-                    Ok(())
                 }
                 _ = ctx_cancel.cancelled() => {
                     info!("API server closed gracefully via context");
-                    Ok(())
                 }
-            };
-            if let Err(e) = result {
-                error!("API server error: {}", e);
+            }
+
+            tcp_cancel.cancel();
+            ipc_cancel.cancel();
+
+            if tcp_running {
+                let _ = tcp_task.await;
+            }
+            if ipc_running {
+                let _ = ipc_task.await;
             }
         });
 

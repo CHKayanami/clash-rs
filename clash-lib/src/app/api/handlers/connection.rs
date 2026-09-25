@@ -3,15 +3,12 @@ use std::sync::Arc;
 use axum::{
     Json, Router,
     body::Body,
-    extract::{
-        FromRequest, Path, Query, Request, State, WebSocketUpgrade, ws::Message,
-    },
+    extract::{FromRequest, Path, Query, Request, State, WebSocketUpgrade},
     response::IntoResponse,
     routing::{delete, get},
 };
 use http::HeaderMap;
 use serde::Deserialize;
-use tracing::{debug, warn};
 
 use crate::app::{
     api::{AppState, StreamSamplers, handlers::utils::is_request_websocket},
@@ -48,59 +45,20 @@ async fn get_connections(
     q: Query<GetConnectionsQuery>,
     req: Request<Body>,
 ) -> impl IntoResponse {
-    if !is_request_websocket(&headers) {
-        let mgr = state.statistics_manager.clone();
-        let snapshot = mgr.snapshot();
-        return Json(snapshot).into_response();
+    if is_request_websocket(&headers) {
+        if let Ok(ws) = WebSocketUpgrade::from_request(req, &state).await {
+            let interval = std::time::Duration::from_secs(q.interval.unwrap_or(2).max(1));
+            let frames = state
+                .samplers
+                .subscribe_connections(state.statistics_manager.clone(), interval);
+            return crate::app::api::websocket::serve_connections(ws, frames)
+                .into_response();
+        }
     }
 
-    let ws = match WebSocketUpgrade::from_request(req, &state).await {
-        Ok(ws) => ws,
-        Err(e) => {
-            warn!("ws upgrade error: {}", e);
-            return e.into_response();
-        }
-    };
-
-    let interval = std::time::Duration::from_secs(q.interval.unwrap_or(2).max(1));
-    let mut frames = state
-        .samplers
-        .subscribe_connections(state.statistics_manager.clone(), interval);
-
-    ws.on_failed_upgrade(|e| {
-        warn!("ws upgrade error: {}", e);
-    })
-    .on_upgrade(move |mut socket| async move {
-        loop {
-            tokio::select! {
-                res = frames.recv() => {
-                    match res {
-                        Ok(frame) => {
-                            if let Err(e) = socket.send(Message::Text(frame)).await {
-                                debug!("ws connection closed with error: {}", e);
-                                break;
-                            }
-                        }
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                    }
-                }
-                msg = socket.recv() => {
-                    match msg {
-                        Some(Ok(Message::Close(_))) | None => {
-                            debug!("ws connection client disconnected");
-                            break;
-                        }
-                        Some(Err(e)) => {
-                            debug!("ws connection receive error: {}", e);
-                            break;
-                        }
-                        _ => {}
-                    }
-                }
-            }
-        }
-    })
+    let mgr = state.statistics_manager;
+    let snapshot = mgr.snapshot();
+    Json(snapshot).into_response()
 }
 
 async fn close_connection(
@@ -108,10 +66,15 @@ async fn close_connection(
     Path(id): Path<String>,
 ) -> impl IntoResponse {
     let mgr = state.statistics_manager;
-    if let Ok(num_id) = id.parse::<u64>() {
-        mgr.close(num_id);
-    }
-    format!("connection {id} closed").into_response()
+    let Ok(num_id) = id.parse::<u64>() else {
+        return (
+            http::StatusCode::BAD_REQUEST,
+            format!("invalid connection id: {id}"),
+        )
+            .into_response();
+    };
+    mgr.close(num_id);
+    (http::StatusCode::OK, format!("connection {id} closed")).into_response()
 }
 
 async fn close_all_connection(
@@ -119,5 +82,5 @@ async fn close_all_connection(
 ) -> impl IntoResponse {
     let mgr = state.statistics_manager;
     mgr.close_all();
-    "all connections closed".into_response()
+    (http::StatusCode::OK, "all connections closed").into_response()
 }

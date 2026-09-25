@@ -1,3 +1,5 @@
+use std::net::SocketAddr;
+
 use axum::{Router, ServiceExt};
 use tower::{Layer, util::MapRequestLayer};
 use tracing::{error, info};
@@ -52,10 +54,13 @@ pub async fn serve_tcp(
     }
     let app = router.route_layer(AuthMiddlewareLayer::new(auth_secret));
     let app = MapRequestLayer::new(rewrite_websocket_uri).layer(app);
-    axum::serve(listener, app.into_make_service())
-        .await
-        .map_err(|x| {
-            error!("TCP API server error: {}", x);
-            crate::Error::Operation(format!("API server error: {x}"))
-        })
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await
+    .map_err(|x| {
+        error!("TCP API server error: {}", x);
+        crate::Error::Operation(format!("API server error: {x}"))
+    })
 }

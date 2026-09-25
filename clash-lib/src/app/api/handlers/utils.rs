@@ -35,9 +35,13 @@ pub async fn group_url_test(
         .as_ref()
         .and_then(|active| members.iter().position(|p| p.name() == active.name()));
 
+    let mut test_proxies = Vec::with_capacity(1 + members.len());
+    test_proxies.push(proxy);
+    test_proxies.extend(members);
+
     let results = outbound_manager
         .url_test(
-            &[vec![proxy], members].concat(),
+            &test_proxies,
             latency_test_url.as_deref().unwrap_or(fallback_url),
             timeout,
         )
