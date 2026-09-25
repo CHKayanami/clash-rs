@@ -15,8 +15,13 @@ use std::{
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf},
-    sync::mpsc,
+    runtime::Handle,
+    sync::{
+        Notify,
+        mpsc::{self, error::TrySendError},
+    },
 };
+use tokio_util::sync::PollSender;
 use tracing::{debug, trace};
 
 use super::frame::{
@@ -232,7 +237,28 @@ impl XudpCarrier {
             ));
         }
 
-        let session_id = self.allocate_session_id()?;
+        self.active_streams
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |active| {
+                if active < self.max_streams {
+                    Some(active + 1)
+                } else {
+                    None
+                }
+            })
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "XUDP carrier stream limit reached",
+                )
+            })?;
+
+        let session_id = match self.allocate_session_id() {
+            Ok(id) => id,
+            Err(e) => {
+                self.active_streams.fetch_sub(1, Ordering::SeqCst);
+                return Err(e);
+            }
+        };
         let (tx, rx) = mpsc::channel(UDP_BUFFER_CAPACITY);
 
         {
@@ -241,12 +267,11 @@ impl XudpCarrier {
         }
 
         self.last_active_ms.store(current_epoch_ms(), Ordering::Relaxed);
-        self.active_streams.fetch_add(1, Ordering::SeqCst);
 
         Ok(XudpChildDatagram {
             session_id,
             carrier: self.clone(),
-            writer_tx: self.writer_tx.clone(),
+            writer_tx: PollSender::new(self.writer_tx.clone()),
             rx,
             first_packet: true,
             ended: false,
@@ -262,7 +287,7 @@ impl XudpCarrier {
 pub struct XudpChildDatagram {
     session_id: u16,
     carrier: Arc<XudpCarrier>,
-    writer_tx: mpsc::Sender<Bytes>,
+    writer_tx: PollSender<Bytes>,
     rx: mpsc::Receiver<UdpPacket>,
     first_packet: bool,
     ended: bool,
@@ -287,6 +312,12 @@ impl Sink<UdpPacket> for XudpChildDatagram {
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Result<(), Self::Error>> {
+        if self.ended {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "XUDP session is already closed",
+            )));
+        }
         if self.pending_frame.is_some() {
             match self.as_mut().poll_flush(cx)? {
                 Poll::Ready(()) => {}
@@ -303,6 +334,12 @@ impl Sink<UdpPacket> for XudpChildDatagram {
     }
 
     fn start_send(mut self: Pin<&mut Self>, item: UdpPacket) -> Result<(), Self::Error> {
+        if self.ended {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "XUDP session is already closed",
+            ));
+        }
         let frame = XudpFrame::encode_data_frame(
             self.session_id,
             self.first_packet,
@@ -316,22 +353,28 @@ impl Sink<UdpPacket> for XudpChildDatagram {
 
     fn poll_flush(
         mut self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
+        cx: &mut Context<'_>,
     ) -> Poll<Result<(), Self::Error>> {
-        if let Some(frame) = self.pending_frame.take() {
-            match self.writer_tx.try_send(frame) {
-                Ok(()) => Poll::Ready(Ok(())),
-                Err(mpsc::error::TrySendError::Full(frame)) => {
-                    self.pending_frame = Some(frame);
-                    Poll::Pending
+        if self.pending_frame.is_none() {
+            return Poll::Ready(Ok(()));
+        }
+
+        match self.writer_tx.poll_reserve(cx) {
+            Poll::Ready(Ok(())) => {
+                let frame = self.pending_frame.take().unwrap();
+                match self.writer_tx.send_item(frame) {
+                    Ok(()) => Poll::Ready(Ok(())),
+                    Err(_) => Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "XUDP carrier writer closed",
+                    ))),
                 }
-                Err(mpsc::error::TrySendError::Closed(_)) => Poll::Ready(Err(io::Error::new(
-                    io::ErrorKind::BrokenPipe,
-                    "XUDP carrier writer closed",
-                ))),
             }
-        } else {
-            Poll::Ready(Ok(()))
+            Poll::Ready(Err(_)) => Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "XUDP carrier writer closed",
+            ))),
+            Poll::Pending => Poll::Pending,
         }
     }
 
@@ -339,20 +382,69 @@ impl Sink<UdpPacket> for XudpChildDatagram {
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Result<(), Self::Error>> {
-        self.as_mut().poll_flush(cx)
+        futures::ready!(self.as_mut().poll_flush(cx))?;
+
+        if !self.ended {
+            let end_frame = XudpFrame::encode_end_frame(self.session_id);
+            self.pending_frame = Some(end_frame);
+            self.ended = true;
+            self.carrier.remove_child(self.session_id);
+            self.carrier
+                .active_streams
+                .fetch_sub(1, Ordering::SeqCst);
+            futures::ready!(self.as_mut().poll_flush(cx))?;
+        }
+
+        Poll::Ready(Ok(()))
     }
 }
 
 impl Drop for XudpChildDatagram {
     fn drop(&mut self) {
-        if !self.ended {
+        let (pending_data, end_frame) = if !self.ended {
             self.ended = true;
-            let end_frame = XudpFrame::encode_end_frame(self.session_id);
-            let _ = self.writer_tx.try_send(end_frame);
             self.carrier.remove_child(self.session_id);
             self.carrier
                 .active_streams
                 .fetch_sub(1, Ordering::SeqCst);
+            (
+                self.pending_frame.take(),
+                Some(XudpFrame::encode_end_frame(self.session_id)),
+            )
+        } else {
+            (None, self.pending_frame.take())
+        };
+
+        let frames_to_send: Vec<Bytes> = pending_data.into_iter().chain(end_frame).collect();
+        if frames_to_send.is_empty() {
+            return;
+        }
+
+        if let Some(tx) = self.writer_tx.get_ref().cloned() {
+            let mut it = frames_to_send.into_iter();
+            let mut remaining = Vec::new();
+            while let Some(frame) = it.next() {
+                match tx.try_send(frame) {
+                    Ok(()) => {}
+                    Err(TrySendError::Full(f)) => {
+                        remaining.push(f);
+                        remaining.extend(it);
+                        break;
+                    }
+                    Err(TrySendError::Closed(_)) => return,
+                }
+            }
+            if !remaining.is_empty() {
+                if let Ok(handle) = Handle::try_current() {
+                    handle.spawn(async move {
+                        for frame in remaining {
+                            if tx.send(frame).await.is_err() {
+                                break;
+                            }
+                        }
+                    });
+                }
+            }
         }
     }
 }
@@ -361,7 +453,20 @@ pub struct XudpPool {
     carriers: tokio::sync::Mutex<Vec<Arc<XudpCarrier>>>,
     max_carriers: usize,
     max_streams_per_carrier: usize,
-    next_carrier_id: std::sync::atomic::AtomicU64,
+    next_carrier_id: AtomicU64,
+    dialing_carriers: AtomicUsize,
+    dial_notify: Arc<Notify>,
+}
+
+struct DialGuard<'a> {
+    pool: &'a XudpPool,
+}
+
+impl<'a> Drop for DialGuard<'a> {
+    fn drop(&mut self) {
+        self.pool.dialing_carriers.fetch_sub(1, Ordering::SeqCst);
+        self.pool.dial_notify.notify_waiters();
+    }
 }
 
 impl XudpPool {
@@ -378,7 +483,9 @@ impl XudpPool {
             } else {
                 max_streams_per_carrier
             },
-            next_carrier_id: std::sync::atomic::AtomicU64::new(1),
+            next_carrier_id: AtomicU64::new(1),
+            dialing_carriers: AtomicUsize::new(0),
+            dial_notify: Arc::new(Notify::new()),
         })
     }
 
@@ -391,8 +498,9 @@ impl XudpPool {
         F: Fn() -> Fut + Send + Sync,
         Fut: Future<Output = io::Result<AnyStream>> + Send,
     {
-        for _attempt in 0..2 {
-            let carrier = {
+        loop {
+            let notified = self.dial_notify.notified();
+            let (carrier_candidate, can_dial) = {
                 let mut carriers = self.carriers.lock().await;
                 // Retain active, non-expired carriers
                 carriers.retain(|c| !c.is_closed() && !c.is_idle_expired());
@@ -411,52 +519,62 @@ impl XudpPool {
                     }
                 }
 
-                // If no available carrier and we have capacity to dial a new one
-                if best_idx.is_none() && carriers.len() < self.max_carriers {
-                    drop(carriers);
-                    debug!("dialing new carrier connection for XUDP pool");
-                    let stream = dial_carrier().await?;
-                    let cid = self.next_carrier_id.fetch_add(1, Ordering::SeqCst);
-                    let new_carrier =
-                        XudpCarrier::new(stream, cid, self.max_streams_per_carrier);
-                    let mut carriers = self.carriers.lock().await;
-                    carriers.retain(|c| !c.is_closed() && !c.is_idle_expired());
-                    carriers.push(new_carrier.clone());
-                    new_carrier
-                } else if let Some(i) = best_idx {
-                    carriers[i].clone()
+                if let Some(i) = best_idx {
+                    (Some(carriers[i].clone()), false)
                 } else {
-                    // All full and max carriers reached: dial new or take error
-                    drop(carriers);
-                    let stream = dial_carrier().await?;
-                    let cid = self.next_carrier_id.fetch_add(1, Ordering::SeqCst);
-                    let new_carrier =
-                        XudpCarrier::new(stream, cid, self.max_streams_per_carrier);
-                    let mut carriers = self.carriers.lock().await;
-                    carriers.retain(|c| !c.is_closed() && !c.is_idle_expired());
-                    carriers.push(new_carrier.clone());
-                    new_carrier
+                    let total = carriers.len() + self.dialing_carriers.load(Ordering::SeqCst);
+                    if total < self.max_carriers {
+                        self.dialing_carriers.fetch_add(1, Ordering::SeqCst);
+                        (None, true)
+                    } else {
+                        (None, false)
+                    }
                 }
             };
 
-            match carrier.open_child(destination.clone()) {
-                Ok(datagram) => return Ok(datagram),
-                Err(e) => {
-                    debug!("failed to open child on XUDP carrier [{}]: {}, retrying", carrier.carrier_id, e);
+            if let Some(carrier) = carrier_candidate {
+                match carrier.open_child(destination.clone()) {
+                    Ok(datagram) => return Ok(datagram),
+                    Err(e) => {
+                        debug!(
+                            "failed to open child on XUDP carrier [{}]: {}, retrying",
+                            carrier.carrier_id, e
+                        );
+                        continue;
+                    }
                 }
             }
-        }
 
-        // Final attempt
-        let stream = dial_carrier().await?;
-        let cid = self.next_carrier_id.fetch_add(1, Ordering::SeqCst);
-        let new_carrier = XudpCarrier::new(stream, cid, self.max_streams_per_carrier);
-        {
-            let mut carriers = self.carriers.lock().await;
-            carriers.retain(|c| !c.is_closed() && !c.is_idle_expired());
-            carriers.push(new_carrier.clone());
+            if can_dial {
+                let _guard = DialGuard { pool: self };
+                debug!("dialing new carrier connection for XUDP pool");
+                let stream = dial_carrier().await?;
+                let cid = self.next_carrier_id.fetch_add(1, Ordering::SeqCst);
+                let new_carrier =
+                    XudpCarrier::new(stream, cid, self.max_streams_per_carrier);
+                let datagram = new_carrier.open_child(destination.clone())?;
+
+                {
+                    let mut carriers = self.carriers.lock().await;
+                    carriers.retain(|c| !c.is_closed() && !c.is_idle_expired());
+                    carriers.push(new_carrier);
+                }
+
+                return Ok(datagram);
+            }
+
+            // Both carrier acquisition and dial capacity are unavailable.
+            // If another task is currently dialing, wait for it to finish.
+            if self.dialing_carriers.load(Ordering::SeqCst) > 0 {
+                notified.await;
+                continue;
+            } else {
+                return Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    "XUDP carrier limit reached and all carriers are full",
+                ));
+            }
         }
-        new_carrier.open_child(destination.clone())
     }
 }
 
@@ -571,5 +689,307 @@ mod tests {
 
         let resp_pkt2 = dgram2.next().await.expect("dgram2 recv reply");
         assert_eq!(resp_pkt2.data.as_ref(), b"dns response 2");
+    }
+
+    #[tokio::test]
+    async fn test_xudp_pool_carrier_limit_enforced() {
+        let (client_stream, _server_stream) = duplex(64 * 1024);
+        // max 1 carrier, 1 stream per carrier
+        let pool = XudpPool::new(1, 1);
+
+        let target: SocksAddr = "1.1.1.1:53".parse().unwrap();
+        let client_holder = Arc::new(tokio::sync::Mutex::new(Some(Box::new(client_stream) as AnyStream)));
+
+        // 1. Open child 1 (takes the only slot on the only carrier)
+        let _dgram1 = pool
+            .open_stream(&target, {
+                let holder = client_holder.clone();
+                move || {
+                    let holder = holder.clone();
+                    async move {
+                        let mut guard = holder.lock().await;
+                        guard.take().ok_or_else(|| io::Error::new(io::ErrorKind::Other, "already dialed"))
+                    }
+                }
+            })
+            .await
+            .expect("open child 1");
+
+        // 2. Open child 2: carrier is full and max_carriers is reached.
+        // It must fail without dialing a new carrier.
+        let result = pool
+            .open_stream(&target, || async {
+                panic!("should not attempt to dial new carrier when limit reached");
+            })
+            .await;
+
+        assert!(result.is_err(), "should return error when carrier limit reached and carriers are full");
+    }
+
+    #[tokio::test]
+    async fn test_xudp_concurrent_dial_limit() {
+        // max 1 carrier, 4 streams per carrier
+        let pool = XudpPool::new(1, 4);
+        let dial_count = Arc::new(AtomicUsize::new(0));
+        let servers_holder = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let target: SocksAddr = "1.1.1.1:53".parse().unwrap();
+
+        let mut handles = Vec::new();
+        for _ in 0..10 {
+            let pool = pool.clone();
+            let dial_count = dial_count.clone();
+            let servers = servers_holder.clone();
+            let target = target.clone();
+            handles.push(tokio::spawn(async move {
+                pool.open_stream(&target, move || {
+                    let dial_count = dial_count.clone();
+                    let servers = servers.clone();
+                    async move {
+                        dial_count.fetch_add(1, Ordering::SeqCst);
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        let (client, server) = duplex(64 * 1024);
+                        servers.lock().await.push(server);
+                        Ok(Box::new(client) as AnyStream)
+                    }
+                })
+                .await
+            }));
+        }
+
+        let mut successes = 0;
+        let mut dgrams = Vec::new();
+        for h in handles {
+            if let Ok(Ok(dgram)) = h.await {
+                successes += 1;
+                dgrams.push(dgram);
+            }
+        }
+
+        // Must NEVER dial more than max_carriers (1)
+        assert_eq!(
+            dial_count.load(Ordering::SeqCst),
+            1,
+            "must not dial more than max_carriers times concurrently"
+        );
+        // Successes should be at most 4 (max_streams_per_carrier)
+        assert!(successes <= 4, "successes must not exceed max streams");
+        assert!(successes >= 1, "at least one stream must succeed");
+    }
+
+    #[tokio::test]
+    async fn test_xudp_carrier_stream_limit_race() {
+        let (client, _server) = duplex(64 * 1024);
+        // max 2 streams
+        let carrier = XudpCarrier::new(Box::new(client), 1, 2);
+        let target: SocksAddr = "1.1.1.1:53".parse().unwrap();
+
+        let mut handles = Vec::new();
+        for _ in 0..10 {
+            let carrier = carrier.clone();
+            let target = target.clone();
+            handles.push(tokio::spawn(async move {
+                carrier.open_child(target)
+            }));
+        }
+
+        let mut success_count = 0;
+        let mut err_count = 0;
+        let mut dgrams = Vec::new();
+        for h in handles {
+            match h.await.unwrap() {
+                Ok(dgram) => {
+                    success_count += 1;
+                    dgrams.push(dgram);
+                }
+                Err(_) => err_count += 1,
+            }
+        }
+
+        assert_eq!(success_count, 2, "exactly max_streams children must succeed");
+        assert_eq!(err_count, 8, "remaining children must fail due to limit");
+        assert_eq!(carrier.active_streams(), 2, "active streams must not exceed max_streams");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_xudp_wait_carrier_dial_does_not_timeout_prematurely() {
+        let pool = Arc::new(XudpPool::new(1, 4));
+        let target: SocksAddr = "1.1.1.1:53".parse().unwrap();
+
+        let servers = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let servers_clone = servers.clone();
+
+        // Task 1 dials slowly (takes 2 seconds)
+        let pool_1 = pool.clone();
+        let target_1 = target.clone();
+        let h1 = tokio::spawn(async move {
+            pool_1
+                .open_stream(&target_1, || {
+                    let servers_clone = servers_clone.clone();
+                    async move {
+                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                        let (client, server) = duplex(64 * 1024);
+                        servers_clone.lock().unwrap().push(server);
+                        Ok(Box::new(client) as AnyStream)
+                    }
+                })
+                .await
+        });
+
+        // Yield to allow Task 1 to start dialing and register dialing_carriers
+        tokio::task::yield_now().await;
+
+        // Task 2 concurrently tries to open stream, must wait for Task 1's dial without failing prematurely
+        let pool_2 = pool.clone();
+        let target_2 = target.clone();
+        let h2 = tokio::spawn(async move {
+            pool_2
+                .open_stream(&target_2, || async {
+                    panic!("task 2 should not dial since max_carriers is 1");
+                })
+                .await
+        });
+
+        let (res1, res2) = tokio::join!(h1, h2);
+        assert!(res1.unwrap().is_ok());
+        assert!(res2.unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_xudp_poll_close_and_drop_send_end_frame_under_pressure() {
+        let (client_stream, mut server_stream) = duplex(64 * 1024);
+        let carrier = XudpCarrier::new(Box::new(client_stream), 1, 10);
+        let target: SocksAddr = "1.1.1.1:53".parse().unwrap();
+
+        // 1. Test poll_close sends End frame
+        let mut dgram1 = carrier.open_child(target.clone()).unwrap();
+        let sid1 = dgram1.session_id;
+        // Close explicitly
+        dgram1.close().await.unwrap();
+
+        // Server should receive End frame for sid1
+        let mut buf = vec![0u8; 1024];
+        let n = server_stream.read(&mut buf).await.unwrap();
+        let frame = decode_xudp_frame_from_buf(&mut BytesMut::from(&buf[..n])).unwrap().unwrap();
+        assert_eq!(frame.session_id, sid1);
+        assert_eq!(frame.status, SessionStatus::End);
+
+        // 2. Test Drop sends End frame even if writer queue was temporarily full
+        let dgram2 = carrier.open_child(target.clone()).unwrap();
+        let sid2 = dgram2.session_id;
+
+        // Fill writer_tx capacity (WRITER_QUEUE_CAPACITY is 256)
+        let tx = carrier.writer_tx.clone();
+        let dummy_frame = XudpFrame::encode_end_frame(999);
+        while tx.try_send(dummy_frame.clone()).is_ok() {}
+
+        // Dropping dgram2 while channel is full: must spawn background send and eventually deliver
+        drop(dgram2);
+
+        // Drain the server stream to make room in the queue and verify sid2 End frame is received
+        let mut received_sid2_end = false;
+        let mut read_buf = BytesMut::new();
+        let mut temp = [0u8; 4096];
+
+        let start = tokio::time::Instant::now();
+        while start.elapsed() < std::time::Duration::from_secs(2) {
+            if let Ok(Ok(n)) = tokio::time::timeout(std::time::Duration::from_millis(100), server_stream.read(&mut temp)).await {
+                if n > 0 {
+                    read_buf.extend_from_slice(&temp[..n]);
+                    while let Ok(Some(f)) = decode_xudp_frame_from_buf(&mut read_buf) {
+                        if f.session_id == sid2 && f.status == SessionStatus::End {
+                            received_sid2_end = true;
+                            break;
+                        }
+                    }
+                    if received_sid2_end {
+                        break;
+                    }
+                }
+            }
+        }
+
+        assert!(received_sid2_end, "End frame for sid2 must be delivered even when dropped under queue pressure");
+    }
+
+    #[tokio::test]
+    async fn test_xudp_drop_with_pending_data_sends_both_data_and_end_frame() {
+        let (client_stream, mut server_stream) = duplex(64 * 1024);
+        let carrier = XudpCarrier::new(Box::new(client_stream), 1, 10);
+        let target: SocksAddr = "1.1.1.1:53".parse().unwrap();
+
+        let mut dgram = carrier.open_child(target.clone()).unwrap();
+        let sid = dgram.session_id;
+
+        // Queue a packet via start_send without flushing
+        let pkt = UdpPacket {
+            data: Bytes::from_static(b"hello-before-drop"),
+            src_addr: SocksAddr::any_ipv4(),
+            dst_addr: target.clone(),
+            inbound_user: None,
+        };
+        Pin::new(&mut dgram).start_send(pkt).unwrap();
+
+        // Dropping dgram must send both the pending data frame AND the End frame
+        drop(dgram);
+
+        // Read frames on server side
+        let mut read_buf = BytesMut::new();
+        let mut temp = [0u8; 1024];
+
+        let mut received_data = false;
+        let mut received_end = false;
+
+        let start = tokio::time::Instant::now();
+        while start.elapsed() < std::time::Duration::from_secs(2) {
+            if let Ok(Ok(n)) = tokio::time::timeout(std::time::Duration::from_millis(100), server_stream.read(&mut temp)).await {
+                if n > 0 {
+                    read_buf.extend_from_slice(&temp[..n]);
+                    while let Ok(Some(f)) = decode_xudp_frame_from_buf(&mut read_buf) {
+                        if f.session_id == sid {
+                            if matches!(f.status, SessionStatus::New | SessionStatus::Keep) && f.payload.as_deref() == Some(&b"hello-before-drop"[..]) {
+                                received_data = true;
+                            } else if f.status == SessionStatus::End {
+                                received_end = true;
+                            }
+                        }
+                    }
+                    if received_data && received_end {
+                        break;
+                    }
+                }
+            }
+        }
+
+        assert!(received_data, "pending data frame must be delivered on drop");
+        assert!(received_end, "End frame must be delivered on drop");
+    }
+
+    #[tokio::test]
+    async fn test_xudp_send_after_close_rejected() {
+        let (client_stream, _server_stream) = duplex(64 * 1024);
+        let carrier = XudpCarrier::new(Box::new(client_stream), 1, 10);
+        let target: SocksAddr = "1.1.1.1:53".parse().unwrap();
+
+        let mut dgram = carrier.open_child(target.clone()).unwrap();
+        dgram.close().await.unwrap();
+
+        // After close, start_send and poll_ready must return BrokenPipe
+        let waker = futures::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        assert!(Pin::new(&mut dgram).poll_ready(&mut cx).is_ready());
+        match Pin::new(&mut dgram).poll_ready(&mut cx) {
+            Poll::Ready(Err(e)) => assert_eq!(e.kind(), io::ErrorKind::BrokenPipe),
+            other => panic!("expected BrokenPipe, got {:?}", other),
+        }
+
+        let pkt = UdpPacket {
+            data: Bytes::from_static(b"fail"),
+            src_addr: SocksAddr::any_ipv4(),
+            dst_addr: target,
+            inbound_user: None,
+        };
+        let send_res = Pin::new(&mut dgram).start_send(pkt);
+        assert!(send_res.is_err());
+        assert_eq!(send_res.unwrap_err().kind(), io::ErrorKind::BrokenPipe);
     }
 }

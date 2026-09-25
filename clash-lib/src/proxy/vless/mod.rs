@@ -9,9 +9,7 @@ use super::{
     utils::{GLOBAL_DIRECT_CONNECTOR, RemoteConnector},
 };
 use crate::{
-    app::dns::ThreadSafeDNSResolver,
-    impl_default_connector,
-    session::Session,
+    app::dns::ThreadSafeDNSResolver, impl_default_connector, session::Session,
 };
 use async_trait::async_trait;
 use erased_serde::Serialize as ErasedSerialize;
@@ -848,4 +846,3 @@ rules:
             .await
     }
 }
-

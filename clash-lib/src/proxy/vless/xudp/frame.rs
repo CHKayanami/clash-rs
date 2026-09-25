@@ -55,6 +55,17 @@ impl XudpFrame {
         dst_addr: Option<&SocksAddr>,
         payload: &[u8],
     ) -> io::Result<Bytes> {
+        let payload_len = u16::try_from(payload.len()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "XUDP payload length {} exceeds maximum allowed {}",
+                    payload.len(),
+                    MAX_XUDP_PAYLOAD_LEN
+                ),
+            )
+        })?;
+
         let mut buf = BytesMut::with_capacity(128 + payload.len());
         let frame_len_pos = buf.len();
         buf.put_u16(0); // placeholder for metadata length
@@ -79,7 +90,7 @@ impl XudpFrame {
         buf[frame_len_pos..frame_len_pos + 2]
             .copy_from_slice(&(metadata_len as u16).to_be_bytes());
 
-        buf.put_u16(payload.len() as u16);
+        buf.put_u16(payload_len);
         buf.put_slice(payload);
 
         Ok(buf.freeze())
@@ -249,4 +260,25 @@ pub fn decode_xudp_frame_from_buf(
         peer_addr,
         payload,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_encode_oversized_payload_rejected() {
+        let oversized = vec![0u8; 65536];
+        let res = XudpFrame::encode_data_frame(1, true, None, &oversized);
+        assert!(res.is_err());
+        let err = res.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn test_encode_max_payload_accepted() {
+        let max_payload = vec![0u8; 65535];
+        let res = XudpFrame::encode_data_frame(1, true, None, &max_payload);
+        assert!(res.is_ok());
+    }
 }

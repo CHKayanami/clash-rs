@@ -678,9 +678,6 @@ impl AsyncWrite for VisionStream {
                 if let Some(flag) = &this.write_splice_flag {
                     flag.store(true, Ordering::Release);
                 }
-                if let Some(flag) = &this.read_splice_flag {
-                    flag.store(true, Ordering::Release);
-                }
             }
         }
         this.write_buf_consumed = 0;
@@ -689,9 +686,10 @@ impl AsyncWrite for VisionStream {
     }
 
     fn poll_shutdown(
-        self: Pin<&mut Self>,
+        mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<io::Result<()>> {
+        futures::ready!(self.as_mut().poll_flush(cx))?;
         Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
     }
 }
@@ -717,17 +715,24 @@ mod tests {
 
     fn make_vision_pair_with_splice_flags()
     -> (VisionStream, tokio::io::DuplexStream, Arc<AtomicBool>) {
+        let (vs, server, read_flag, _) = make_vision_pair_with_both_splice_flags();
+        (vs, server, read_flag)
+    }
+
+    fn make_vision_pair_with_both_splice_flags()
+    -> (VisionStream, tokio::io::DuplexStream, Arc<AtomicBool>, Arc<AtomicBool>) {
         let (client, server) = tokio::io::duplex(65536);
         let read_flag = Arc::new(AtomicBool::new(false));
         let write_flag = Arc::new(AtomicBool::new(false));
         let opts = VisionOptions {
             read_flag: Arc::clone(&read_flag),
-            write_flag,
+            write_flag: Arc::clone(&write_flag),
         };
         (
             VisionStream::new(Box::new(client), TEST_UUID_STR, Some(opts)).unwrap(),
             server,
             read_flag,
+            write_flag,
         )
     }
 
@@ -1071,5 +1076,151 @@ mod tests {
         let mut expected = part1.to_vec();
         expected.extend_from_slice(part2);
         assert_eq!(out, expected);
+    }
+
+    #[tokio::test]
+    async fn test_flush_client_direct_does_not_enable_read_splice_flag() {
+        let (mut vs, mut server, read_flag, write_flag) =
+            make_vision_pair_with_both_splice_flags();
+
+        // 1. Client sends ClientHello
+        let client_hello = make_client_hello_record();
+        vs.write_all(&client_hello).await.unwrap();
+        vs.flush().await.unwrap();
+
+        let mut buf = vec![0u8; 65536];
+        let _ = server.read(&mut buf).await.unwrap();
+
+        // 2. Server replies with TLS 1.3 ServerHello
+        let server_hello = make_tls13_server_hello_record();
+        server
+            .write_all(&server_first_frame(
+                &TEST_UUID,
+                CMD_PADDING_CONTINUE,
+                &server_hello,
+                0,
+            ))
+            .await
+            .unwrap();
+
+        let mut read_buf = vec![0u8; 64];
+        let _ = vs.read(&mut read_buf).await.unwrap();
+
+        // 3. Client writes Application Data and flushes (sends CMD_PADDING_DIRECT on write side)
+        let app_data = b"\x17\x03\x03\x00\x05hello";
+        vs.write_all(app_data).await.unwrap();
+        vs.flush().await.unwrap();
+
+        // Write splice must be enabled, but read splice must NOT be enabled yet!
+        assert!(
+            write_flag.load(Ordering::Acquire),
+            "client CMD_PADDING_DIRECT must enable write splice flag"
+        );
+        assert!(
+            !read_flag.load(Ordering::Acquire),
+            "client CMD_PADDING_DIRECT must NOT prematurely enable read splice flag"
+        );
+
+        // 4. Server sends CMD_PADDING_DIRECT; only now read splice flag is enabled
+        server
+            .write_all(&server_frame(CMD_PADDING_DIRECT, b"srv-direct"))
+            .await
+            .unwrap();
+        let _ = vs.read(&mut read_buf).await.unwrap();
+        assert!(
+            read_flag.load(Ordering::Acquire),
+            "read splice flag must only be enabled after receiving server CMD_PADDING_DIRECT"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_shutdown_flushes_pending_write_buf() {
+        use std::sync::atomic::AtomicUsize;
+
+        struct ChunkedWriter {
+            written: Arc<std::sync::Mutex<Vec<u8>>>,
+            write_count: Arc<AtomicUsize>,
+            shutdown_called: Arc<AtomicBool>,
+        }
+
+        impl crate::proxy::ProxyStream for ChunkedWriter {}
+
+        impl AsyncRead for ChunkedWriter {
+            fn poll_read(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                _buf: &mut ReadBuf<'_>,
+            ) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        impl AsyncWrite for ChunkedWriter {
+            fn poll_write(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                buf: &[u8],
+            ) -> Poll<Result<usize, io::Error>> {
+                let cnt = self.write_count.fetch_add(1, Ordering::SeqCst);
+                if cnt == 0 {
+                    // First write only accepts 10 bytes then Pending
+                    let n = 10.min(buf.len());
+                    self.written.lock().unwrap().extend_from_slice(&buf[..n]);
+                    Poll::Ready(Ok(n))
+                } else if cnt == 1 {
+                    Poll::Pending
+                } else {
+                    self.written.lock().unwrap().extend_from_slice(buf);
+                    Poll::Ready(Ok(buf.len()))
+                }
+            }
+
+            fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+
+            fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                self.shutdown_called.store(true, Ordering::SeqCst);
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        let written = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let write_count = Arc::new(AtomicUsize::new(0));
+        let shutdown_called = Arc::new(AtomicBool::new(false));
+
+        let mock = ChunkedWriter {
+            written: written.clone(),
+            write_count,
+            shutdown_called: shutdown_called.clone(),
+        };
+
+        let mut vs = VisionStream::new(Box::new(mock), TEST_UUID_STR, None).unwrap();
+
+        // 1. Initial write of 50 bytes of app data
+        let payload = vec![0x42; 50];
+        let waker = futures::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        let res = Pin::new(&mut vs).poll_write(&mut cx, &payload);
+        assert!(res.is_pending());
+
+        // At this point, only 10 bytes were accepted, remaining frame bytes are buffered in write_buf
+        assert_eq!(written.lock().unwrap().len(), 10);
+        assert!(!shutdown_called.load(Ordering::SeqCst));
+
+        // 2. Client calls shutdown: poll_shutdown must flush the remaining write_buf before calling inner.poll_shutdown
+        let res_shut = Pin::new(&mut vs).poll_shutdown(&mut cx);
+        assert!(res_shut.is_ready());
+        assert!(shutdown_called.load(Ordering::SeqCst));
+
+        // Total written bytes must be the complete Vision frame (uuid + header + content + padding)
+        let total_written = written.lock().unwrap().clone();
+        assert!(total_written.len() > 16);
+        assert_eq!(&total_written[..16], &TEST_UUID);
+        let (cmd, content, _plen, next) = parse_frame(&total_written, 16);
+        assert_eq!(cmd, CMD_PADDING_CONTINUE);
+        assert_eq!(content, payload);
+        assert_eq!(next, total_written.len());
     }
 }
