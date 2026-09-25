@@ -3,11 +3,32 @@
 //! Provides configurable packet padding to obfuscate TLS-in-TLS fingerprints.
 //! Based on the AnyTLS protocol specification.
 
+use arc_swap::ArcSwap;
 use md5::{Digest, Md5};
 use rand::RngExt;
 use std::sync::Arc;
 
 use super::types::StringMap;
+
+/// Thread-safe shared padding factory handle that allows atomic runtime updates
+pub type SharedPaddingFactory = Arc<ArcSwap<PaddingFactory>>;
+
+/// Helper trait to convert various padding factory references into a SharedPaddingFactory
+pub trait IntoSharedPadding {
+    fn into_shared_padding(self) -> SharedPaddingFactory;
+}
+
+impl IntoSharedPadding for SharedPaddingFactory {
+    fn into_shared_padding(self) -> SharedPaddingFactory {
+        self
+    }
+}
+
+impl IntoSharedPadding for Arc<PaddingFactory> {
+    fn into_shared_padding(self) -> SharedPaddingFactory {
+        Arc::new(ArcSwap::from(self))
+    }
+}
 
 /// Check mark constant - indicates "stop if no more data" in padding scheme
 pub const CHECK_MARK: i32 = -1;
@@ -70,6 +91,11 @@ impl PaddingFactory {
             Self::new(DEFAULT_PADDING_SCHEME.as_bytes())
                 .expect("default padding scheme should be valid"),
         )
+    }
+
+    /// Create the default shared padding factory
+    pub fn default_shared() -> SharedPaddingFactory {
+        Arc::new(ArcSwap::from(Self::default_factory()))
     }
 
     /// Get the stop value (number of packets to pad)

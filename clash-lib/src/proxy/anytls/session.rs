@@ -3,22 +3,20 @@
 //! Provides AnyTLS client session management for multiplexed outbound connections.
 
 use bytes::{BufMut, Bytes, BytesMut};
-use parking_lot::{Mutex, RwLock};
+use parking_lot::RwLock;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::io;
 use std::sync::Arc;
-use std::sync::atomic::{
-    AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering,
-};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, Mutex as AsyncMutex};
 use tracing::{debug, trace, warn};
 
 use crate::proxy::AnyStream;
 use crate::session::SocksAddr;
 
-use super::padding::PaddingFactory;
+use super::padding::{IntoSharedPadding, PaddingFactory, SharedPaddingFactory};
 use super::stream::{AnyTlsStream, STREAM_CHANNEL_BUFFER};
 use super::types::{
     Command, FRAME_HEADER_SIZE, Frame, FrameCodec, MAX_FRAME_DATA_SIZE, StringMap,
@@ -31,6 +29,21 @@ use super::types::{
 /// match the old per-stream budget (STREAM_CHANNEL_BUFFER) times the
 /// default max streams per connection.
 const OUTGOING_CHANNEL_BUFFER: usize = STREAM_CHANNEL_BUFFER * 8;
+
+pub(super) const PEER_VERSION_UNKNOWN: u8 = 0;
+pub(super) const PEER_VERSION_V2: u8 = 2;
+
+#[inline]
+fn unpack_stream_counts(val: u64) -> (usize, usize) {
+    let active = (val >> 32) as usize;
+    let reserved = (val & 0xFFFF_FFFF) as usize;
+    (active, reserved)
+}
+
+#[inline]
+fn pack_stream_counts(active: usize, reserved: usize) -> u64 {
+    ((active as u64) << 32) | (reserved as u64 & 0xFFFF_FFFF)
+}
 
 /// Outgoing message types for the unified writer channel
 pub(super) enum OutgoingMessage {
@@ -51,12 +64,21 @@ pub(super) enum OutgoingMessage {
     Fin { stream_id: u32 },
 }
 
+/// Active stream entry maintained in the session
+pub(super) struct StreamEntry {
+    pub(super) data_tx: mpsc::Sender<io::Result<Bytes>>,
+    pub(super) ack_tx: Option<oneshot::Sender<Result<(), String>>>,
+    pub(super) err_tx: Option<oneshot::Sender<String>>,
+    pub(super) peer_closed: Arc<AtomicBool>,
+}
+
 /// AnyTLS client session - manages multiplexed streams over a connection
 pub struct AnyTlsClientSession {
-    /// Active streams mapping (stream_id -> data sender)
-    streams: RwLock<HashMap<u32, mpsc::Sender<Bytes>>>,
-    /// Lock-free active stream counter
-    active_streams: AtomicUsize,
+    /// Active streams mapping (stream_id -> StreamEntry)
+    streams: RwLock<HashMap<u32, StreamEntry>>,
+    /// Packed stream counters: high 32 bits for active streams, low 32 bits for reserved streams.
+    /// Packed into a single AtomicU64 to guarantee atomic updates and prevent race conditions.
+    stream_counts: AtomicU64,
     stream_id_counter: AtomicU32,
 
     /// Channel for all outgoing messages (control and data).
@@ -66,22 +88,30 @@ pub struct AnyTlsClientSession {
     /// Session closure flag
     is_closed: Arc<AtomicBool>,
 
-    /// Padding configuration
-    padding: Arc<PaddingFactory>,
+    /// Fixed padding configuration captured at session creation.
+    /// A session must strictly use the scheme it reported in its initial Settings frame
+    /// throughout its entire lifecycle.
+    session_padding: Arc<PaddingFactory>,
+
+    /// Shared padding handle pointing to the Client/Handler's latest scheme.
+    /// Updated when receiving Command::UpdatePaddingScheme so that subsequent
+    /// new sessions adopt the updated scheme.
+    shared_padding: SharedPaddingFactory,
 
     /// Negotiated protocol version
     peer_version: AtomicU8,
-
-    /// Pending stream opens waiting for SynAck (stream_id -> completion sender)
-    pending_opens: Mutex<HashMap<u32, oneshot::Sender<Result<(), String>>>>,
 
     /// Padding enabled state
     send_padding: AtomicBool,
     /// Packet counter for padding calculation
     pkt_counter: AtomicU32,
 
-    /// Initial buffer for coalescing Settings + first SYN + first destination into one TLS record
-    initial_buffer: Mutex<Option<BytesMut>>,
+    /// Mutex protecting the initial Settings frame transmission.
+    /// Ensures that the first stream's Settings frame is committed to outgoing_tx
+    /// before any other concurrent streams can enqueue their SYN frames.
+    initial_settings: AsyncMutex<Option<BytesMut>>,
+    /// Flag indicating that the initial Settings frame has been committed to outgoing_tx
+    settings_sent: AtomicBool,
 
     /// Last active timestamp in Unix seconds
     last_active: AtomicU64,
@@ -109,36 +139,40 @@ impl std::fmt::Debug for AnyTlsClientSession {
 impl Drop for AnyTlsClientSession {
     fn drop(&mut self) {
         self.close_notify.notify_waiters();
+        self.streams.write().clear();
     }
 }
 
 impl AnyTlsClientSession {
     /// Create a new client session on the given transport.
-    pub async fn new(
+    pub async fn new<P: IntoSharedPadding>(
         mut transport: AnyStream,
         password: &str,
-        padding: Arc<PaddingFactory>,
+        padding: P,
     ) -> io::Result<Arc<Self>> {
+        let shared_padding = padding.into_shared_padding();
+        let session_padding = shared_padding.load_full();
         let password_hash = Sha256::digest(password.as_bytes());
 
         // Send authentication packet (packet 0)
-        Self::send_auth(&mut transport, password_hash.as_slice(), &padding).await?;
+        Self::send_auth(&mut transport, password_hash.as_slice(), &session_padding).await?;
 
         let (outgoing_tx, outgoing_rx) = mpsc::channel(OUTGOING_CHANNEL_BUFFER);
-        let initial_buffer = Self::create_initial_buffer(&padding);
+        let initial_buffer = Self::create_initial_buffer(&session_padding);
 
         let session = Arc::new(Self {
             streams: RwLock::new(HashMap::new()),
-            active_streams: AtomicUsize::new(0),
+            stream_counts: AtomicU64::new(0),
             stream_id_counter: AtomicU32::new(0),
             outgoing_tx,
             is_closed: Arc::new(AtomicBool::new(false)),
-            padding: Arc::clone(&padding),
-            peer_version: AtomicU8::new(1), // Assume v1 until server confirms v2
-            pending_opens: Mutex::new(HashMap::new()),
+            session_padding,
+            shared_padding,
+            peer_version: AtomicU8::new(PEER_VERSION_UNKNOWN),
             send_padding: AtomicBool::new(true),
-            pkt_counter: AtomicU32::new(0),
-            initial_buffer: Mutex::new(Some(initial_buffer)),
+            pkt_counter: AtomicU32::new(1),
+            initial_settings: AsyncMutex::new(Some(initial_buffer)),
+            settings_sent: AtomicBool::new(false),
             last_active: AtomicU64::new(current_unix_timestamp()),
             close_notify: Arc::new(tokio::sync::Notify::new()),
         });
@@ -158,11 +192,93 @@ impl AnyTlsClientSession {
     pub fn mark_closed(&self) {
         self.is_closed.store(true, Ordering::Relaxed);
         self.close_notify.notify_waiters();
+        self.streams.write().clear();
     }
 
-    /// Get current active streams count (lock-free atomic load)
-    pub fn active_streams_count(&self) -> usize {
-        self.active_streams.load(Ordering::Relaxed)
+    pub(super) fn decrement_active_streams(&self) {
+        let _ = self.stream_counts.fetch_update(
+            Ordering::AcqRel,
+            Ordering::Relaxed,
+            |val| {
+                let (active, reserved) = unpack_stream_counts(val);
+                Some(pack_stream_counts(active.saturating_sub(1), reserved))
+            },
+        );
+    }
+
+    /// Unregister a stream from active streams map and decrement active_streams counter.
+    /// Returns true if the stream was present and removed (ensuring exactly-once decrement).
+    pub(super) fn unregister_stream(&self, stream_id: u32) -> bool {
+        let mut streams = self.streams.write();
+        if streams.remove(&stream_id).is_some() {
+            self.decrement_active_streams();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Try to reserve a stream slot if (active_streams + reserved_streams) < max_streams.
+    /// Uses a single packed AtomicU64 to guarantee that active and reserved counts are read
+    /// and updated atomically without race conditions.
+    pub fn try_reserve_stream(&self, max_streams: usize) -> bool {
+        self.stream_counts
+            .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |val| {
+                let (active, reserved) = unpack_stream_counts(val);
+                if active + reserved < max_streams {
+                    Some(pack_stream_counts(active, reserved + 1))
+                } else {
+                    None
+                }
+            })
+            .is_ok()
+    }
+
+    /// Explicitly reserve a stream slot without limit checking (used when pool is at max capacity)
+    pub fn force_reserve_stream(&self) {
+        let _ = self.stream_counts.fetch_update(
+            Ordering::AcqRel,
+            Ordering::Relaxed,
+            |val| {
+                let (active, reserved) = unpack_stream_counts(val);
+                Some(pack_stream_counts(active, reserved + 1))
+            },
+        );
+    }
+
+    /// Release a previously reserved stream slot without registering a stream
+    pub fn release_reserved_stream(&self) {
+        let _ = self.stream_counts.fetch_update(
+            Ordering::AcqRel,
+            Ordering::Relaxed,
+            |val| {
+                let (active, reserved) = unpack_stream_counts(val);
+                Some(pack_stream_counts(active, reserved.saturating_sub(1)))
+            },
+        );
+    }
+
+    /// Atomically transition one reserved stream slot to an active stream
+    pub(super) fn commit_reserved_stream(&self) {
+        let _ = self.stream_counts.fetch_update(
+            Ordering::AcqRel,
+            Ordering::Relaxed,
+            |val| {
+                let (active, reserved) = unpack_stream_counts(val);
+                Some(pack_stream_counts(active + 1, reserved.saturating_sub(1)))
+            },
+        );
+    }
+
+    /// Total allocated streams count (active + reserved)
+    pub fn total_streams_count(&self) -> usize {
+        let (active, reserved) = unpack_stream_counts(self.stream_counts.load(Ordering::Relaxed));
+        active + reserved
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_peer_version(&self, v: u8) {
+        self.peer_version.store(v, Ordering::Relaxed);
     }
 
     /// Update last active timestamp to current time
@@ -222,45 +338,6 @@ impl AnyTlsClientSession {
         Ok(())
     }
 
-    /// Send control frame
-    fn send_control_frame(
-        &self,
-        cmd: Command,
-        stream_id: u32,
-        data: Bytes,
-    ) -> io::Result<()> {
-        match self.outgoing_tx.try_send(OutgoingMessage::Control {
-            cmd,
-            stream_id,
-            data,
-        }) {
-            Ok(()) => Ok(()),
-            Err(mpsc::error::TrySendError::Closed(_)) => {
-                self.is_closed.store(true, Ordering::Relaxed);
-                self.close_notify.notify_waiters();
-                Err(io::Error::new(io::ErrorKind::BrokenPipe, "Session writer closed"))
-            }
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                Err(io::Error::new(io::ErrorKind::WouldBlock, "Session writer queue full"))
-            }
-        }
-    }
-
-    /// Send buffered initial frames
-    fn send_buffered(&self, data: Bytes) -> io::Result<()> {
-        match self.outgoing_tx.try_send(OutgoingMessage::Buffered { data }) {
-            Ok(()) => Ok(()),
-            Err(mpsc::error::TrySendError::Closed(_)) => {
-                self.is_closed.store(true, Ordering::Relaxed);
-                self.close_notify.notify_waiters();
-                Err(io::Error::new(io::ErrorKind::BrokenPipe, "Session writer closed"))
-            }
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                Err(io::Error::new(io::ErrorKind::WouldBlock, "Session writer queue full"))
-            }
-        }
-    }
-
     /// Spawn background reader and writer tasks
     fn spawn_tasks<R, W>(
         session: Arc<Self>,
@@ -287,6 +364,7 @@ impl AnyTlsClientSession {
             if let Some(session) = session_weak_w.upgrade() {
                 session.is_closed.store(true, Ordering::Relaxed);
                 session.close_notify.notify_waiters();
+                session.streams.write().clear();
             }
         });
 
@@ -301,6 +379,7 @@ impl AnyTlsClientSession {
             if let Some(session) = session_weak_r.upgrade() {
                 session.is_closed.store(true, Ordering::Relaxed);
                 session.close_notify.notify_waiters();
+                session.streams.write().clear();
             }
         });
     }
@@ -397,11 +476,11 @@ impl AnyTlsClientSession {
                     )
                     .await?;
                     writer.flush().await?;
-
-                    let mut streams = session.streams.write();
-                    if streams.remove(&stream_id).is_some() {
-                        session.active_streams.fetch_sub(1, Ordering::Relaxed);
-                    }
+                    // AnyTLS 协议规范明确规定：收到 FIN 后关闭流，无需向对端回发 FIN。
+                    // 因此 AnyTLS 的 FIN 表示整条流的关闭（而非 TCP 半关闭）。本地 FIN 真正写出后，
+                    // 立即注销流并关闭接收通道（drop data_tx）。流读取侧在排空已经收到并入队的数据后
+                    // 会自然收到 None 并返回 EOF，既能交付已接收数据，又不会无限等待对端回发 FIN 导致挂起。
+                    session.unregister_stream(stream_id);
                 }
             }
         }
@@ -420,36 +499,85 @@ impl AnyTlsClientSession {
     {
         if session.send_padding.load(Ordering::Relaxed) {
             let count = session.pkt_counter.fetch_add(1, Ordering::Relaxed);
-            if count >= session.padding.stop() {
+            if count >= session.session_padding.stop() {
                 session.send_padding.store(false, Ordering::Relaxed);
                 writer.write_all(data).await?;
+                writer.flush().await?;
                 return Ok(());
             }
 
-            let sizes = session.padding.generate_record_payload_sizes(count);
-            if let Some(&target_size) = sizes.first() {
-                let target_size = target_size.max(0) as usize;
-                if target_size > data.len() {
-                    // A frame's length field is 16 bits. Writing more than that
-                    // while declaring the truncated length would put the peer
-                    // permanently out of frame sync, so cap the run instead.
-                    let padding_len =
-                        (target_size - data.len()).min(MAX_FRAME_DATA_SIZE);
+            let sizes = session.session_padding.generate_record_payload_sizes(count);
+            if sizes.is_empty() {
+                writer.write_all(data).await?;
+                writer.flush().await?;
+                return Ok(());
+            }
+
+            let mut offset = 0;
+            for spec in sizes {
+                if spec == super::padding::CHECK_MARK {
+                    if offset >= data.len() {
+                        return Ok(());
+                    }
+                    continue;
+                }
+
+                if spec <= 0 {
+                    continue;
+                }
+
+                let target_size = spec as usize;
+                let remaining = &data[offset..];
+
+                if !remaining.is_empty() {
+                    if remaining.len() >= target_size {
+                        let chunk = &remaining[..target_size];
+                        offset += target_size;
+                        writer.write_all(chunk).await?;
+                        writer.flush().await?;
+                    } else {
+                        let chunk = remaining;
+                        offset = data.len();
+                        if target_size >= chunk.len() + FRAME_HEADER_SIZE {
+                            let padding_len =
+                                (target_size - chunk.len() - FRAME_HEADER_SIZE).min(MAX_FRAME_DATA_SIZE);
+                            padding_buf.clear();
+                            padding_buf.reserve(chunk.len() + FRAME_HEADER_SIZE + padding_len);
+                            padding_buf.extend_from_slice(chunk);
+                            padding_buf.put_u8(Command::Waste as u8);
+                            padding_buf.put_u32(0);
+                            padding_buf.put_u16(padding_len as u16);
+                            padding_buf.put_bytes(0, padding_len);
+                            writer.write_all(padding_buf).await?;
+                            writer.flush().await?;
+                        } else {
+                            writer.write_all(chunk).await?;
+                            writer.flush().await?;
+                        }
+                    }
+                } else if target_size >= FRAME_HEADER_SIZE {
+                    let padding_len = (target_size - FRAME_HEADER_SIZE).min(MAX_FRAME_DATA_SIZE);
                     padding_buf.clear();
-                    padding_buf
-                        .reserve(data.len() + FRAME_HEADER_SIZE + padding_len);
-                    padding_buf.extend_from_slice(data);
+                    padding_buf.reserve(FRAME_HEADER_SIZE + padding_len);
                     padding_buf.put_u8(Command::Waste as u8);
                     padding_buf.put_u32(0);
                     padding_buf.put_u16(padding_len as u16);
                     padding_buf.put_bytes(0, padding_len);
                     writer.write_all(padding_buf).await?;
-                    return Ok(());
+                    writer.flush().await?;
                 }
             }
+
+            // 若所有分包处理完后用户数据仍有剩余，直接将剩余数据发送完毕
+            if offset < data.len() {
+                writer.write_all(&data[offset..]).await?;
+                writer.flush().await?;
+            }
+            return Ok(());
         }
 
         writer.write_all(data).await?;
+        writer.flush().await?;
         Ok(())
     }
 
@@ -501,6 +629,7 @@ impl AnyTlsClientSession {
                 if let Some(session) = session_weak.upgrade() {
                     session.is_closed.store(true, Ordering::Relaxed);
                     session.close_notify.notify_waiters();
+                    session.streams.write().clear();
                 }
                 return Ok(());
             }
@@ -515,9 +644,27 @@ impl AnyTlsClientSession {
                     return Ok(());
                 }
 
+                // 收到流数据说明流已就绪（兼容不回发 SynAck 的情况），同时获取 data_tx
                 let tx = {
                     let streams = self.streams.read();
-                    streams.get(&frame.stream_id).cloned()
+                    if let Some(entry) = streams.get(&frame.stream_id) {
+                        if entry.ack_tx.is_some() {
+                            drop(streams);
+                            let mut streams = self.streams.write();
+                            if let Some(entry) = streams.get_mut(&frame.stream_id) {
+                                if let Some(ack_tx) = entry.ack_tx.take() {
+                                    let _ = ack_tx.send(Ok(()));
+                                }
+                                Some(entry.data_tx.clone())
+                            } else {
+                                None
+                            }
+                        } else {
+                            Some(entry.data_tx.clone())
+                        }
+                    } else {
+                        None
+                    }
                 };
 
                 if let Some(tx) = tx {
@@ -529,7 +676,7 @@ impl AnyTlsClientSession {
                     // silently corrupt a reliable stream, and buffering instead
                     // would be unbounded. Head-of-line blocking is the
                     // protocol's cost, not a bug to code around here.
-                    if tx.send(frame.data).await.is_err() {
+                    if tx.send(Ok(frame.data)).await.is_err() {
                         trace!("Stream {} channel closed", frame.stream_id);
                     }
                 } else {
@@ -538,38 +685,95 @@ impl AnyTlsClientSession {
             }
 
             Command::Fin => {
-                let tx = {
+                let (tx, peer_closed) = {
                     let mut streams = self.streams.write();
                     let removed = streams.remove(&frame.stream_id);
                     if removed.is_some() {
-                        self.active_streams.fetch_sub(1, Ordering::Relaxed);
+                        self.decrement_active_streams();
                     }
-                    removed
+                    match removed {
+                        Some(entry) => (Some(entry.data_tx), Some(entry.peer_closed)),
+                        None => (None, None),
+                    }
                 };
 
+                if let Some(pc) = peer_closed {
+                    pc.store(true, Ordering::Release);
+                }
                 if let Some(tx) = tx {
-                    let _ = tx.send(Bytes::new()).await;
+                    let _ = tx.send(Ok(Bytes::new())).await;
                 }
             }
 
             Command::SynAck => {
-                let mut pending = self.pending_opens.lock();
-                if let Some(sender) = pending.remove(&frame.stream_id) {
-                    if frame.data.is_empty() {
+                if self.peer_version.load(Ordering::Relaxed) < PEER_VERSION_V2 {
+                    self.peer_version.store(PEER_VERSION_V2, Ordering::Relaxed);
+                }
+
+                let error = if frame.data.is_empty() {
+                    None
+                } else {
+                    Some(String::from_utf8_lossy(&frame.data).to_string())
+                };
+
+                if let Some(err_msg) = error {
+                    let err = io::Error::new(
+                        io::ErrorKind::ConnectionRefused,
+                        format!("AnyTLS remote rejected stream: {err_msg}"),
+                    );
+                    let (ack_tx, data_tx, err_tx) = {
+                        let mut streams = self.streams.write();
+                        let removed = streams.remove(&frame.stream_id);
+                        if removed.is_some() {
+                            self.decrement_active_streams();
+                        }
+                        match removed {
+                            Some(entry) => (
+                                entry.ack_tx,
+                                Some(entry.data_tx),
+                                entry.err_tx,
+                            ),
+                            None => (None, None, None),
+                        }
+                    };
+
+                    if let Some(sender) = err_tx {
+                        let _ = sender.send(err_msg.clone());
+                    }
+                    if let Some(sender) = ack_tx {
+                        let _ = sender.send(Err(err_msg.clone()));
+                    }
+                    if let Some(tx) = data_tx {
+                        let _ = tx.send(Err(err)).await;
+                    }
+                } else {
+                    let ack_tx = {
+                        let mut streams = self.streams.write();
+                        streams
+                            .get_mut(&frame.stream_id)
+                            .and_then(|entry| entry.ack_tx.take())
+                    };
+                    if let Some(sender) = ack_tx {
                         let _ = sender.send(Ok(()));
-                    } else {
-                        let error = String::from_utf8_lossy(&frame.data).to_string();
-                        let _ = sender.send(Err(error));
                     }
                 }
             }
 
             Command::ServerSettings => {
                 let settings = StringMap::from_bytes(&frame.data);
-                if let Some(v) = settings.get("v").and_then(|s| s.parse::<u8>().ok())
-                {
-                    self.peer_version.store(v, Ordering::Relaxed);
-                    debug!("AnyTLS server version: {}", v);
+                let v = settings
+                    .get("v")
+                    .and_then(|s| s.parse::<u8>().ok())
+                    .unwrap_or(1);
+                self.peer_version.store(v, Ordering::Relaxed);
+                debug!("AnyTLS server version: {}", v);
+                if v < 2 {
+                    let mut streams = self.streams.write();
+                    for entry in streams.values_mut() {
+                        if let Some(sender) = entry.ack_tx.take() {
+                            let _ = sender.send(Ok(()));
+                        }
+                    }
                 }
             }
 
@@ -578,6 +782,7 @@ impl AnyTlsClientSession {
                 warn!("AnyTLS server alert: {}", msg);
                 self.is_closed.store(true, Ordering::Relaxed);
                 self.close_notify.notify_waiters();
+                self.streams.write().clear();
             }
 
             // Keep-alive. Silently dropping these left servers that use
@@ -597,16 +802,27 @@ impl AnyTlsClientSession {
                 }
             }
 
-            // We deliberately do not adopt a server-supplied padding scheme:
-            // it is attacker-controlled input driving our record sizes, and
-            // `write_with_padding` is only bounded because the scheme is ours.
-            // Say so rather than dropping it silently.
+            // 按 AnyTLS 协议规范：当收到服务端下发的 cmdUpdatePaddingScheme 时，
+            // 客户端应在 Client 对象存储新的 paddingScheme，后续新建会话必须使用该方案。
+            // 正在运行的当前会话必须固定使用创建时的方案，不得中途切换。
             Command::UpdatePaddingScheme => {
-                debug!(
-                    "AnyTLS ignoring server padding scheme update ({} bytes); \
-                     keeping the locally configured scheme",
-                    frame.data.len()
-                );
+                match PaddingFactory::new(&frame.data) {
+                    Ok(new_factory) => {
+                        debug!(
+                            "AnyTLS updated padding scheme from server (md5: {}, stop: {})",
+                            new_factory.md5(),
+                            new_factory.stop()
+                        );
+                        self.shared_padding.store(Arc::new(new_factory));
+                    }
+                    Err(e) => {
+                        warn!(
+                            "AnyTLS failed to parse server padding scheme ({} bytes): {}",
+                            frame.data.len(),
+                            e
+                        );
+                    }
+                }
             }
 
             Command::Waste | Command::HeartResponse => {}
@@ -622,6 +838,7 @@ impl AnyTlsClientSession {
         destination: &SocksAddr,
     ) -> io::Result<AnyTlsStream> {
         if self.is_closed.load(Ordering::Relaxed) {
+            self.release_reserved_stream();
             return Err(io::Error::new(
                 io::ErrorKind::NotConnected,
                 "AnyTLS session is closed",
@@ -631,43 +848,206 @@ impl AnyTlsClientSession {
         self.touch_last_active();
 
         let stream_id = self.stream_id_counter.fetch_add(1, Ordering::Relaxed) + 1;
-
         let (data_tx, data_rx) = mpsc::channel(STREAM_CHANNEL_BUFFER);
+        let (ack_tx, ack_rx) = oneshot::channel();
+        let (err_tx, err_rx) = oneshot::channel();
+        let peer_closed = Arc::new(AtomicBool::new(false));
 
         {
             let mut streams = self.streams.write();
-            streams.insert(stream_id, data_tx);
-            self.active_streams.fetch_add(1, Ordering::Relaxed);
+            streams.insert(
+                stream_id,
+                StreamEntry {
+                    data_tx,
+                    ack_tx: Some(ack_tx),
+                    err_tx: Some(err_tx),
+                    peer_closed: Arc::clone(&peer_closed),
+                },
+            );
+            self.commit_reserved_stream();
         }
+
+        // RAII guard: ensures stream registration and capacity are rolled back
+        // if this future is cancelled, times out, or errors before completion.
+        struct OpenGuard<'a> {
+            session: &'a AnyTlsClientSession,
+            stream_id: u32,
+            syn_sent: bool,
+            committed: bool,
+        }
+
+        impl<'a> Drop for OpenGuard<'a> {
+            fn drop(&mut self) {
+                if !self.committed {
+                    self.session.unregister_stream(self.stream_id);
+
+                    // 若 SYN 已经实际送入写通道，对端已处于开流状态，必须确保 FIN 发送给对端
+                    if self.syn_sent && !self.session.is_closed.load(Ordering::Relaxed) {
+                        let stream_id = self.stream_id;
+                        let outgoing_tx = self.session.outgoing_tx.clone();
+                        match outgoing_tx.try_send(OutgoingMessage::Fin { stream_id }) {
+                            Ok(()) => {}
+                            Err(mpsc::error::TrySendError::Full(msg)) => {
+                                tokio::spawn(async move {
+                                    let _ = outgoing_tx.send(msg).await;
+                                });
+                            }
+                            Err(mpsc::error::TrySendError::Closed(_)) => {}
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut guard = OpenGuard {
+            session: self,
+            stream_id,
+            syn_sent: false,
+            committed: false,
+        };
 
         let mut dest_data = BytesMut::new();
         destination.write_buf(&mut dest_data);
         let dest_bytes = dest_data.freeze();
 
-        let buffered_data = {
-            let mut buf_guard = self.initial_buffer.lock();
-            if let Some(ref mut buf) = *buf_guard {
-                Frame::control(Command::Syn, stream_id).encode_into(buf);
-                Frame::data(stream_id, dest_bytes.clone()).encode_into(buf);
-                buf_guard.take().map(|b| b.freeze())
-            } else {
-                None
-            }
-        };
+        // 确保 SETTINGS 帧的发送绝对先于任何其他流的 SYN：
+        // 若 SETTINGS 尚未确认入队，并发调用必须串行等待握手锁，
+        // 彻底杜绝“前序调用取走 SETTINGS 尚未入队，后序调用抢跑发送纯 SYN”导致的协议违规。
+        if !self.settings_sent.load(Ordering::Acquire) {
+            let mut init_guard = self.initial_settings.lock().await;
+            if let Some(settings_buf) = init_guard.take() {
+                // RAII 保护：若发送等待期间被取消，将 settings_buf 放回锁内以供下一个调用使用
+                struct SettingsGuard<'b> {
+                    slot: &'b mut Option<BytesMut>,
+                    buf: Option<BytesMut>,
+                    committed: bool,
+                }
+                impl<'b> Drop for SettingsGuard<'b> {
+                    fn drop(&mut self) {
+                        if !self.committed {
+                            *self.slot = self.buf.take();
+                        }
+                    }
+                }
 
-        if let Some(data) = buffered_data {
-            self.send_buffered(data)?;
+                let mut s_guard = SettingsGuard {
+                    slot: &mut *init_guard,
+                    buf: Some(settings_buf),
+                    committed: false,
+                };
+
+                let mut open_buf = BytesMut::with_capacity(
+                    s_guard.buf.as_ref().unwrap().len() + FRAME_HEADER_SIZE * 2 + dest_bytes.len(),
+                );
+                open_buf.extend_from_slice(s_guard.buf.as_ref().unwrap());
+                Frame::control(Command::Syn, stream_id).encode_into(&mut open_buf);
+                Frame::data(stream_id, dest_bytes).encode_into(&mut open_buf);
+
+                let open_message = OutgoingMessage::Buffered {
+                    data: open_buf.freeze(),
+                };
+
+                // 在持有锁的情况下发送，确保排在所有并发流的 SYN 之前入队
+                if self.outgoing_tx.send(open_message).await.is_err() {
+                    self.is_closed.store(true, Ordering::Relaxed);
+                    self.close_notify.notify_waiters();
+                    return Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "Session writer closed while opening stream",
+                    ));
+                }
+
+                s_guard.committed = true;
+                drop(s_guard);
+                guard.syn_sent = true;
+                self.settings_sent.store(true, Ordering::Release);
+                drop(init_guard);
+            } else {
+                drop(init_guard);
+                let mut open_buf =
+                    BytesMut::with_capacity(FRAME_HEADER_SIZE * 2 + dest_bytes.len());
+                Frame::control(Command::Syn, stream_id).encode_into(&mut open_buf);
+                Frame::data(stream_id, dest_bytes).encode_into(&mut open_buf);
+
+                if self
+                    .outgoing_tx
+                    .send(OutgoingMessage::Buffered {
+                        data: open_buf.freeze(),
+                    })
+                    .await
+                    .is_err()
+                {
+                    self.is_closed.store(true, Ordering::Relaxed);
+                    self.close_notify.notify_waiters();
+                    return Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "Session writer closed while opening stream",
+                    ));
+                }
+                guard.syn_sent = true;
+            }
         } else {
-            self.send_control_frame(Command::Syn, stream_id, Bytes::new())?;
-            self.send_control_frame(Command::Psh, stream_id, dest_bytes)?;
+            let mut open_buf =
+                BytesMut::with_capacity(FRAME_HEADER_SIZE * 2 + dest_bytes.len());
+            Frame::control(Command::Syn, stream_id).encode_into(&mut open_buf);
+            Frame::data(stream_id, dest_bytes).encode_into(&mut open_buf);
+
+            if self
+                .outgoing_tx
+                .send(OutgoingMessage::Buffered {
+                    data: open_buf.freeze(),
+                })
+                .await
+                .is_err()
+            {
+                self.is_closed.store(true, Ordering::Relaxed);
+                self.close_notify.notify_waiters();
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "Session writer closed while opening stream",
+                ));
+            }
+            guard.syn_sent = true;
         }
 
-        let stream = AnyTlsStream::with_keepalive(
+        let mut ack_rx = ack_rx;
+        if self.peer_version.load(Ordering::Relaxed) >= PEER_VERSION_V2 {
+            // 确认是 v2 后，后续流再等待 SynAck
+            match tokio::time::timeout(std::time::Duration::from_secs(10), &mut ack_rx).await {
+                Ok(Ok(Ok(()))) => {}
+                Ok(Ok(Err(err_msg))) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::ConnectionRefused,
+                        format!("AnyTLS remote rejected stream: {err_msg}"),
+                    ));
+                }
+                Ok(Err(_)) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "Session closed while waiting for stream SynAck",
+                    ));
+                }
+                Err(_) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "Timeout waiting for AnyTLS stream SynAck",
+                    ));
+                }
+            }
+        }
+
+        // 首流请求入队后即可返回；版本仍标为“未知”，不要因超时永久判定为 v1。
+        // 若随后收到 v2 设置和拒绝，错误已通过 err_tx 发送，后续读和写都能看到它。
+        guard.committed = true;
+
+        let stream = AnyTlsStream::new(
             stream_id,
             data_rx,
             self.outgoing_tx.clone(),
             Arc::clone(&self.is_closed),
             Arc::clone(self),
+            err_rx,
+            peer_closed,
         );
 
         Ok(stream)

@@ -59,7 +59,7 @@ impl SessionPoolInner {
         while i < sessions.len() {
             let session = &sessions[i];
             let is_closed = session.is_closed();
-            let streams_count = session.active_streams_count();
+            let streams_count = session.total_streams_count();
             let idle_secs = now.saturating_sub(session.last_active_secs());
 
             let should_prune_idle = streams_count == 0
@@ -122,52 +122,46 @@ impl SessionPool {
         self.inner.prune_sessions();
 
         let guard = self.inner.sessions.read();
-        let mut best_session: Option<(usize, Arc<AnyTlsClientSession>)> = None;
 
-        for session in guard.iter() {
-            if session.is_closed() {
-                continue;
-            }
+        // 收集所有未关闭且当前流计数（活跃+已预占）小于上限的会话候选
+        let mut candidates: Vec<(usize, Arc<AnyTlsClientSession>)> = guard
+            .iter()
+            .filter(|s| !s.is_closed())
+            .map(|s| (s.total_streams_count(), Arc::clone(s)))
+            .filter(|(count, _)| *count < self.inner.config.max_streams_per_connection)
+            .collect();
 
-            let stream_count = session.active_streams_count();
-            if stream_count < self.inner.config.max_streams_per_connection {
-                match &best_session {
-                    None => {
-                        best_session = Some((stream_count, Arc::clone(session)));
-                    }
-                    Some((best_count, _)) => {
-                        if stream_count < *best_count {
-                            best_session = Some((stream_count, Arc::clone(session)));
-                        }
-                    }
-                }
+        // 按流数量从少到多排序，优先复用负载较低的会话
+        candidates.sort_by_key(|(count, _)| *count);
+
+        // 尝试原子预占槽位；CAS 成功则防止并发调用同时选中同一会话导致突破上限
+        for (_, session) in candidates {
+            if session.try_reserve_stream(self.inner.config.max_streams_per_connection) {
+                return Some(session);
             }
         }
 
-        if let Some((_, session)) = best_session {
-            return Some(session);
-        }
-
+        // 若连接池已达到最大连接数限制，回退到全局负载最小的会话并强制分配
         if guard.len() >= self.inner.config.max_connections {
-            let mut min_streams_session: Option<(usize, Arc<AnyTlsClientSession>)> =
-                None;
+            let mut min_session: Option<(usize, Arc<AnyTlsClientSession>)> = None;
             for session in guard.iter() {
                 if session.is_closed() {
                     continue;
                 }
-                let count = session.active_streams_count();
-                match &min_streams_session {
+                let count = session.total_streams_count();
+                match &min_session {
                     None => {
-                        min_streams_session = Some((count, Arc::clone(session)));
+                        min_session = Some((count, Arc::clone(session)));
                     }
                     Some((min_c, _)) => {
                         if count < *min_c {
-                            min_streams_session = Some((count, Arc::clone(session)));
+                            min_session = Some((count, Arc::clone(session)));
                         }
                     }
                 }
             }
-            if let Some((_, session)) = min_streams_session {
+            if let Some((_, session)) = min_session {
+                session.force_reserve_stream();
                 return Some(session);
             }
         }
@@ -198,7 +192,7 @@ mod tests {
     use super::*;
     use crate::proxy::anytls::padding::PaddingFactory;
     use crate::session::SocksAddr;
-    use tokio::io::duplex;
+    use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt};
 
     #[tokio::test]
     async fn test_pool_defaults() {
@@ -226,7 +220,31 @@ mod tests {
         let pool = SessionPool::new(config);
         let padding = PaddingFactory::default_factory();
 
-        let (c1, _s1) = duplex(4096);
+        fn spawn_mock_server(mut server: tokio::io::DuplexStream) {
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 1024];
+                while let Ok(n) = server.read(&mut buf).await {
+                    if n == 0 {
+                        break;
+                    }
+                    let mut settings = crate::proxy::anytls::types::StringMap::new();
+                    settings.insert("v", "1");
+                    let frame = crate::proxy::anytls::types::Frame::with_data(
+                        crate::proxy::anytls::types::Command::ServerSettings,
+                        0,
+                        bytes::Bytes::from(settings.to_bytes()),
+                    );
+                    let mut b = bytes::BytesMut::new();
+                    frame.encode_into(&mut b);
+                    if server.write_all(&b).await.is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+
+        let (c1, s1) = duplex(4096);
+        spawn_mock_server(s1);
         let sess1 =
             AnyTlsClientSession::new(Box::new(c1), "secret", padding.clone())
                 .await
@@ -242,7 +260,8 @@ mod tests {
 
         assert!(pool.get_available_session().await.is_none());
 
-        let (c2, _s2) = duplex(4096);
+        let (c2, s2) = duplex(4096);
+        spawn_mock_server(s2);
         let sess2 = AnyTlsClientSession::new(Box::new(c2), "secret", padding)
             .await
             .unwrap();
