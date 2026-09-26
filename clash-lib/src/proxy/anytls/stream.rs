@@ -307,12 +307,10 @@ impl AsyncWrite for AnyTlsStream {
         if let Some(err) = self.check_stream_error() {
             return Poll::Ready(Err(err));
         }
-        if self.peer_closed.load(Ordering::Acquire) || self.eof {
-            return Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "stream closed by remote (received FIN)",
-            )));
-        }
+        // A remote FIN can follow a complete response while the caller is still
+        // flushing a request. It closes the stream but does not retroactively
+        // make previously accepted writes fail. The session writer owns those
+        // writes and flushes them in order.
         Poll::Ready(Ok(()))
     }
 

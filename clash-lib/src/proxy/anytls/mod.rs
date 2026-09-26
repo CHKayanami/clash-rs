@@ -1482,10 +1482,73 @@ mod tests {
         assert!(write_res.is_err(), "Write after remote FIN must fail");
         assert_eq!(write_res.unwrap_err().kind(), io::ErrorKind::BrokenPipe);
 
-        // flush 也必须返回 BrokenPipe
-        let flush_res = stream.flush().await;
-        assert!(flush_res.is_err(), "Flush after remote FIN must fail");
-        assert_eq!(flush_res.unwrap_err().kind(), io::ErrorKind::BrokenPipe);
+        // flush 不应把服务端正常关闭误报为先前写入失败。
+        // HTTP 客户端在收到完整响应后仍可能轮询 flush。
+        stream.flush().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_http_response_fin_does_not_fail_connection_flush() {
+        use http_body_util::Empty;
+        use hyper_util::rt::TokioIo;
+
+        let (client, mut server) = duplex(65536);
+        let session = session::AnyTlsClientSession::new(
+            Box::new(client),
+            "secret",
+            PaddingFactory::default_factory(),
+        )
+        .await
+        .unwrap();
+
+        let server_task = tokio::spawn(async move {
+            let mut hash_buf = [0u8; 32];
+            server.read_exact(&mut hash_buf).await.unwrap();
+            let pad_len = server.read_u16().await.unwrap() as usize;
+            let mut pad_buf = vec![0u8; pad_len];
+            server.read_exact(&mut pad_buf).await.unwrap();
+            read_frame_raw(&mut server).await; // Settings
+            read_frame_raw(&mut server).await; // Syn
+            read_frame_raw(&mut server).await; // Destination
+
+            loop {
+                let (cmd, _, data) = read_frame_raw(&mut server).await;
+                if cmd == types::Command::Psh as u8 {
+                    assert!(data.starts_with(b"GET "));
+                    break;
+                }
+            }
+
+            let response = types::Frame::data(
+                1,
+                Bytes::from_static(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n"),
+            );
+            let fin = types::Frame::control(types::Command::Fin, 1);
+            let mut frames = BytesMut::new();
+            response.encode_into(&mut frames);
+            fin.encode_into(&mut frames);
+            server.write_all(&frames).await.unwrap();
+        });
+
+        let dst = SocksAddr::try_from(("example.org".to_owned(), 80)).unwrap();
+        let stream = session.open_stream(&dst).await.unwrap();
+        let (mut sender, conn) =
+            hyper::client::conn::http1::handshake(TokioIo::new(stream))
+                .await
+                .unwrap();
+        let conn_task = tokio::spawn(conn);
+        let request = http::Request::get("http://example.org/generate_204")
+            .body(Empty::<Bytes>::new())
+            .unwrap();
+        let response = sender.send_request(request).await.unwrap();
+        assert_eq!(response.status(), http::StatusCode::NO_CONTENT);
+
+        server_task.await.unwrap();
+        let conn_result = tokio::time::timeout(std::time::Duration::from_secs(1), conn_task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(conn_result.is_ok(), "HTTP connection driver: {conn_result:?}");
     }
 
     #[tokio::test]
