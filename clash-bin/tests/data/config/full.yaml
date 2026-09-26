@@ -593,6 +593,16 @@ ebpf:
     # proxy-src-ips:
     #   - "192.168.1.0/24"
 
+    # Specific LAN client MAC addresses to proxy (Source MAC whitelist filtering).
+    # If configured, ONLY traffic originating from these MAC addresses will be proxied / intercepted.
+    # Non-matching MACs and packets whose MAC cannot be obtained (e.g. pure L3 / tun interfaces)
+    # will NOT be forwarded to the proxy (directly bypassed with TC_ACT_OK).
+    # Supports formats with colons or hyphens (e.g. "00:11:22:33:44:55", "AA-BB-CC-DD-EE-FF").
+    # (Alias: proxy-macs, src-macs)
+    # proxy-src-macs:
+    #   - "00:11:22:33:44:55"
+    #   - "aa:bb:cc:dd:ee:ff"
+
   # ── 2. Target Destination Policies (访问目标服务/目的地控制，对 LAN 和 Host 均生效) ──
   target:
     # Destination ports to bypass (e.g. direct NTP, IPSec VPN, direct gaming):

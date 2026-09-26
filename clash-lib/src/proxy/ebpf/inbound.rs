@@ -79,6 +79,10 @@ impl EbpfInbound {
                     EbpfManager,
                 };
 
+                self.config.lan.validate().map_err(|e| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("ebpf.lan: {e}"))
+                })?;
+
                 let rule_providers = self.dispatcher.router().get_rule_providers();
 
                 let bypass_src_ips =
@@ -110,6 +114,7 @@ impl EbpfInbound {
                         proxy_src_ports: self.config.lan.proxy_src_ports.clone(),
                         bypass_src_ips,
                         proxy_src_ips,
+                        proxy_src_macs: self.config.lan.proxy_src_macs.clone(),
                     },
                     target: CoreEbpfTargetConfig {
                         bypass_dst_ports: self.config.target.bypass_dst_ports.clone(),

@@ -66,6 +66,49 @@ pub struct EbpfLanConfig {
     pub bypass_src_ips: Vec<String>,
     #[serde(default, alias = "proxy-clients")]
     pub proxy_src_ips: Vec<String>,
+    #[serde(default, alias = "proxy-macs", alias = "src-macs")]
+    pub proxy_src_macs: Vec<String>,
+}
+
+impl EbpfLanConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.proxy_src_macs.len() > 1024 {
+            return Err(format!(
+                "proxy-src-macs entries count ({}) exceeds maximum allowed limit of 1024",
+                self.proxy_src_macs.len()
+            ));
+        }
+        for mac_str in &self.proxy_src_macs {
+            if parse_mac_addr(mac_str).is_none() {
+                return Err(format!(
+                    "invalid MAC address in proxy-src-macs: '{mac_str}' (expected format: '00:11:22:33:44:55' or '00-11-22-33-44-55')"
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+pub fn parse_mac_addr(s: &str) -> Option<[u8; 6]> {
+    let s = s.trim();
+    let parts: Vec<&str> = if s.contains(':') {
+        s.split(':').collect()
+    } else if s.contains('-') {
+        s.split('-').collect()
+    } else {
+        return None;
+    };
+    if parts.len() != 6 {
+        return None;
+    }
+    let mut mac = [0u8; 6];
+    for (i, part) in parts.iter().enumerate() {
+        if part.is_empty() || part.len() > 2 {
+            return None;
+        }
+        mac[i] = u8::from_str_radix(part, 16).ok()?;
+    }
+    Some(mac)
 }
 
 #[derive(Serialize, Deserialize, Default, Debug, Clone, PartialEq, Eq)]

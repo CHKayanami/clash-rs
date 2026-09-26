@@ -632,6 +632,15 @@ fn handle_lan_ingress_impl(tc_ctx: &TcContext, link_h_len: usize) -> i32 {
         return TC_ACT_OK;
     }
 
+    if param.has_proxy_src_macs != 0 {
+        if link_h_len < EthHdr::LEN {
+            return TC_ACT_OK;
+        }
+        if unsafe { PROXY_SRC_MACS.get(&pkt.ethh.src_addr).is_none() } {
+            return TC_ACT_OK;
+        }
+    }
+
     if pkt.ethh.ether_type == ETH_P_IP.to_be() {
         handle_lan_ipv4(ctx, param, link_h_len, pkt)
     } else if pkt.ethh.ether_type == ETH_P_IPV6.to_be() {
@@ -908,12 +917,18 @@ fn handle_wan_egress_impl(tc_ctx: &TcContext, link_h_len: usize) -> i32 {
         return TC_ACT_OK;
     }
 
+    // 3. 纯转发流量放行: 从 LAN 等网络接口进来的路由转发包 (ingress_ifindex != 0)
+    // 已经在 lan_ingress 中完成准入判定，在 WAN 出口必须放行直连，严禁被当作本机流量误劫持。
+    if unsafe { (*ctx).ingress_ifindex } != 0 {
+        return TC_ACT_OK;
+    }
+
     let cookie = unsafe { bpf_get_socket_cookie(ctx as *mut _) };
-    let pid_pname = if cookie != 0 {
-        unsafe { COOKIE_PID_MAP.get(&cookie) }
-    } else {
-        None
-    };
+    if cookie == 0 {
+        // 无本地 socket 关联的报文（如纯路由转发报文），绝不属于本机出站流量，必须放行
+        return TC_ACT_OK;
+    }
+    let pid_pname = unsafe { COOKIE_PID_MAP.get(&cookie) };
 
     // A configured allow-list must fail closed. Socket metadata can be absent
     // when a socket predates the cgroup hook or when cookie tracking fails; in

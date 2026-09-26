@@ -32,7 +32,8 @@ pub struct DaeParam {
     pub has_bypass_processes: u8,
     pub has_bypass_dscps: u8,
     pub has_bypass_fwmarks: u8,
-    pub _pad1: [u8; 3],
+    pub has_proxy_src_macs: u8,
+    pub _pad1: [u8; 2],
 }
 
 #[repr(C)]

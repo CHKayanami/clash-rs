@@ -300,6 +300,7 @@ pub mod linux {
             proxy_src_ports: &[u16],
             proxy_dst_ports: &[u16],
             proxy_src_ips: &[String],
+            proxy_src_macs: &[String],
             proxy_dst_ips: &[String],
             proxy_processes: &[String],
             bypass_processes: &[String],
@@ -530,6 +531,31 @@ pub mod linux {
                             let _ = ip_trie.insert(&key, 1, 0);
                         }
                     }
+                }
+            }
+
+            // 9.1 Populate PROXY_SRC_MACS map
+            if proxy_src_macs.len() > 1024 {
+                return Err(format!(
+                    "proxy-src-macs entries count ({}) exceeds maximum allowed limit of 1024",
+                    proxy_src_macs.len()
+                ));
+            }
+            if !proxy_src_macs.is_empty() {
+                let map = bpf.map_mut("PROXY_SRC_MACS").ok_or_else(|| {
+                    "required map 'PROXY_SRC_MACS' not found in eBPF object (eBPF bytecode might be outdated; please rebuild clash-ebpf-bpf)".to_string()
+                })?;
+                let mut mac_map = HashMap::<_, [u8; 6], u8>::try_from(map)
+                    .map_err(|e| format!("map 'PROXY_SRC_MACS' has incompatible type: {e}"))?;
+                for mac_str in proxy_src_macs {
+                    let mac_bytes = crate::config::parse_mac_addr(mac_str).ok_or_else(|| {
+                        format!(
+                            "invalid MAC address in proxy-src-macs: '{mac_str}' (expected format: '00:11:22:33:44:55' or '00-11-22-33-44-55')"
+                        )
+                    })?;
+                    mac_map
+                        .insert(mac_bytes, 1, 0)
+                        .map_err(|e| format!("failed to insert MAC '{mac_str}' into PROXY_SRC_MACS: {e}"))?;
                 }
             }
 
@@ -1382,6 +1408,7 @@ pub mod linux {
                     &empty_strings,
                     &empty_strings,
                     &empty_strings,
+                    &empty_strings,
                     &empty_u8,
                     &empty_u32,
                     None,
@@ -1418,6 +1445,7 @@ pub mod non_linux {
             _proxy_src_ports: &[u16],
             _proxy_dst_ports: &[u16],
             _proxy_src_ips: &[String],
+            _proxy_src_macs: &[String],
             _proxy_dst_ips: &[String],
             _proxy_processes: &[String],
             _bypass_processes: &[String],
@@ -1425,6 +1453,19 @@ pub mod non_linux {
             _bypass_fwmarks: &[u32],
             _netns: Option<&crate::netns::non_linux::DaeNs>,
         ) -> Result<(), String> {
+            if _proxy_src_macs.len() > 1024 {
+                return Err(format!(
+                    "proxy-src-macs entries count ({}) exceeds maximum allowed limit of 1024",
+                    _proxy_src_macs.len()
+                ));
+            }
+            for mac_str in _proxy_src_macs {
+                if crate::config::parse_mac_addr(mac_str).is_none() {
+                    return Err(format!(
+                        "invalid MAC address in proxy-src-macs: '{mac_str}' (expected format: '00:11:22:33:44:55' or '00-11-22-33-44-55')"
+                    ));
+                }
+            }
             Ok(())
         }
         pub fn update_dynamic_bypass_batch(

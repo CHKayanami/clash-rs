@@ -17,6 +17,29 @@ pub struct EbpfLanConfig {
     /// Source IPs/CIDRs to proxy (e.g., specific LAN client IPs to be proxied).
     #[serde(default, rename = "proxy-src-ips", alias = "proxy-clients")]
     pub proxy_src_ips: Vec<String>,
+
+    /// Source MAC addresses to proxy (only traffic from these MACs will be proxied).
+    #[serde(default, rename = "proxy-src-macs", alias = "proxy-macs", alias = "src-macs")]
+    pub proxy_src_macs: Vec<String>,
+}
+
+impl EbpfLanConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.proxy_src_macs.len() > 1024 {
+            return Err(format!(
+                "proxy-src-macs entries count ({}) exceeds maximum allowed limit of 1024",
+                self.proxy_src_macs.len()
+            ));
+        }
+        for mac_str in &self.proxy_src_macs {
+            if parse_mac_addr(mac_str).is_none() {
+                return Err(format!(
+                    "invalid MAC address in proxy-src-macs: '{mac_str}' (expected format: '00:11:22:33:44:55' or '00-11-22-33-44-55')"
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Serialize, Deserialize, Default, Debug, Clone, PartialEq, Eq)]
@@ -136,6 +159,7 @@ impl Default for EbpfConfig {
                 proxy_src_ports: Vec::new(),
                 bypass_src_ips: Vec::new(),
                 proxy_src_ips: Vec::new(),
+                proxy_src_macs: Vec::new(),
             },
             target: EbpfTargetConfig {
                 bypass_dst_ports: Vec::new(),
@@ -197,6 +221,30 @@ pub fn aggregate_ip_cidrs(entries: impl IntoIterator<Item = impl AsRef<str>>) ->
     result
 }
 
+/// Parse a MAC address string in either colon-separated (aa:bb:cc:dd:ee:ff) or
+/// hyphen-separated (aa-bb-cc-dd-ee-ff) format into a 6-byte array.
+pub fn parse_mac_addr(s: &str) -> Option<[u8; 6]> {
+    let s = s.trim();
+    let parts: Vec<&str> = if s.contains(':') {
+        s.split(':').collect()
+    } else if s.contains('-') {
+        s.split('-').collect()
+    } else {
+        return None;
+    };
+    if parts.len() != 6 {
+        return None;
+    }
+    let mut mac = [0u8; 6];
+    for (i, part) in parts.iter().enumerate() {
+        if part.is_empty() || part.len() > 2 {
+            return None;
+        }
+        mac[i] = u8::from_str_radix(part, 16).ok()?;
+    }
+    Some(mac)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -250,6 +298,77 @@ bypass-mark:
         let cfg2: EbpfConfig = serde_yaml::from_str(yaml_alias).unwrap();
         assert_eq!(cfg2.bypass_dscps, vec![8]);
         assert_eq!(cfg2.bypass_fwmarks, vec![1000]);
+    }
+
+    #[test]
+    fn test_parse_mac_addr() {
+        assert_eq!(
+            parse_mac_addr("00:11:22:33:44:55"),
+            Some([0x00, 0x11, 0x22, 0x33, 0x44, 0x55])
+        );
+        assert_eq!(
+            parse_mac_addr("AA-BB-CC-DD-EE-FF"),
+            Some([0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff])
+        );
+        assert_eq!(
+            parse_mac_addr("  a:b:c:d:e:f  "),
+            Some([0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f])
+        );
+        assert_eq!(parse_mac_addr("invalid"), None);
+        assert_eq!(parse_mac_addr("00:11:22:33:44"), None);
+        assert_eq!(parse_mac_addr("00:11:22:33:44:55:66"), None);
+        assert_eq!(parse_mac_addr("00:11:22:33:44:GG"), None);
+    }
+
+    #[test]
+    fn test_ebpf_config_lan_macs_parsing() {
+        let yaml = r#"
+enable: true
+lan:
+  proxy-src-macs:
+    - "00:11:22:33:44:55"
+    - "aa:bb:cc:dd:ee:ff"
+"#;
+        let cfg: EbpfConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(
+            cfg.lan.proxy_src_macs,
+            vec!["00:11:22:33:44:55", "aa:bb:cc:dd:ee:ff"]
+        );
+
+        let yaml_alias = r#"
+enable: true
+lan:
+  proxy-macs:
+    - "11-22-33-44-55-66"
+"#;
+        let cfg2: EbpfConfig = serde_yaml::from_str(yaml_alias).unwrap();
+        assert_eq!(cfg2.lan.proxy_src_macs, vec!["11-22-33-44-55-66"]);
+    }
+
+    #[test]
+    fn test_ebpf_lan_config_validation() {
+        let valid = EbpfLanConfig {
+            proxy_src_macs: vec![
+                "00:11:22:33:44:55".to_string(),
+                "AA-BB-CC-DD-EE-FF".to_string(),
+            ],
+            ..Default::default()
+        };
+        assert!(valid.validate().is_ok());
+
+        let invalid_mac = EbpfLanConfig {
+            proxy_src_macs: vec!["not-a-mac".to_string()],
+            ..Default::default()
+        };
+        let err = invalid_mac.validate().unwrap_err();
+        assert!(err.contains("invalid MAC address"));
+
+        let too_many = EbpfLanConfig {
+            proxy_src_macs: (0..1025).map(|_| "00:11:22:33:44:55".to_string()).collect(),
+            ..Default::default()
+        };
+        let err2 = too_many.validate().unwrap_err();
+        assert!(err2.contains("exceeds maximum allowed limit of 1024"));
     }
 }
 

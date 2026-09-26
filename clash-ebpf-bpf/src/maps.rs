@@ -46,6 +46,9 @@ pub static PROXY_DST_IPS: LpmTrie<u32, u8> = LpmTrie::with_max_entries(1024, 0);
 pub static PROXY_DST_IP6S: LpmTrie<[u8; 16], u8> = LpmTrie::with_max_entries(1024, 0);
 
 #[map]
+pub static PROXY_SRC_MACS: HashMap<[u8; 6], u8> = HashMap::with_max_entries(1024, 0);
+
+#[map]
 pub static DYNAMIC_BYPASS_DST_IPS: LruHashMap<u32, u8> = LruHashMap::with_max_entries(16384, 0);
 
 #[map]

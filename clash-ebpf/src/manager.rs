@@ -60,6 +60,8 @@ impl EbpfManager {
 
         #[cfg(target_os = "linux")]
         {
+            self.config.lan.validate().map_err(EbpfError::Bpf)?;
+
             use crate::netlink::{
                 self, FAM_V4, FAM_V6, NlSock, PROTO_STATIC, ROUTE_LOCAL,
                 ROUTE_UNICAST, SCOPE_HOST, SCOPE_LINK, SCOPE_UNIVERSE,
@@ -268,6 +270,11 @@ impl EbpfManager {
             } else {
                 0
             };
+            let has_proxy_src_macs = if !self.config.lan.proxy_src_macs.is_empty() {
+                1
+            } else {
+                0
+            };
             let has_proxy_dst_ips = if !self.config.target.proxy_dst_ips.is_empty() {
                 1
             } else {
@@ -337,7 +344,8 @@ impl EbpfManager {
                 has_bypass_processes,
                 has_bypass_dscps,
                 has_bypass_fwmarks,
-                _pad1: [0; 3],
+                has_proxy_src_macs,
+                _pad1: [0; 2],
             };
 
             if let Err(e) = self.bpf_manager.load_and_attach(
@@ -352,6 +360,7 @@ impl EbpfManager {
                 &self.config.lan.proxy_src_ports,
                 &self.config.target.proxy_dst_ports,
                 &self.config.lan.proxy_src_ips,
+                &self.config.lan.proxy_src_macs,
                 &self.config.target.proxy_dst_ips,
                 &self.config.host.proxy_processes,
                 &self.config.host.bypass_processes,

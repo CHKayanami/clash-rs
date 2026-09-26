@@ -57,6 +57,13 @@ impl Config {
                 "TUN and eBPF cannot be enabled at the same time".to_string(),
             ));
         }
+        if let Some(ebpf) = &self.ebpf {
+            if ebpf.enable {
+                if let Err(e) = ebpf.lan.validate() {
+                    return Err(Error::InvalidConfig(format!("ebpf.lan.{e}")));
+                }
+            }
+        }
         for r in self.rules.iter() {
             if !self.proxies.contains_key(r.target())
                 && !self.proxy_groups.contains_key(r.target())
@@ -541,5 +548,61 @@ ebpf:
         let def_cfg: def::Config = serde_yaml::from_str(ebpf_only_yaml).unwrap();
         let res: Result<super::Config, _> = def_cfg.try_into();
         assert!(res.is_ok());
+    }
+
+    #[test]
+    fn test_validate_ebpf_lan_macs() {
+        let invalid_mac_yaml = r#"
+ebpf:
+  enable: true
+  lan:
+    proxy-src-macs:
+      - "00:11:22:33:44:55"
+      - "not-a-mac"
+"#;
+        let def_cfg: def::Config = serde_yaml::from_str(invalid_mac_yaml).unwrap();
+        let res: Result<super::Config, _> = def_cfg.try_into();
+        match res {
+            Err(e) => {
+                let err_msg = e.to_string();
+                assert!(err_msg.contains("invalid MAC address in proxy-src-macs: 'not-a-mac'"));
+            }
+            Ok(_) => panic!("expected invalid MAC error"),
+        }
+
+        // When eBPF is disabled, invalid MACs should not reject the configuration
+        let disabled_ebpf_invalid_mac_yaml = r#"
+ebpf:
+  enable: false
+  lan:
+    proxy-src-macs:
+      - "not-a-mac"
+"#;
+        let def_cfg: def::Config = serde_yaml::from_str(disabled_ebpf_invalid_mac_yaml).unwrap();
+        let res: Result<super::Config, _> = def_cfg.try_into();
+        assert!(res.is_ok(), "disabled eBPF should not reject configuration due to MAC error");
+
+        let mut macs = String::new();
+        for _ in 0..1025 {
+            macs.push_str("      - \"00:11:22:33:44:55\"\n");
+        }
+        let too_many_yaml = format!(
+            r#"
+ebpf:
+  enable: true
+  lan:
+    proxy-src-macs:
+{macs}
+"#
+        );
+        let def_cfg: def::Config = serde_yaml::from_str(&too_many_yaml).unwrap();
+        let res: Result<super::Config, _> = def_cfg.try_into();
+        match res {
+            Err(e) => {
+                let err_msg = e.to_string();
+                assert!(err_msg.contains("exceeds maximum allowed limit of 1024"));
+            }
+            Ok(_) => panic!("expected exceeds 1024 error"),
+        }
     }
 }
