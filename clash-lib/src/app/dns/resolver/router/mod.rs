@@ -10,7 +10,8 @@ mod tests;
 use std::collections::HashMap;
 use std::net;
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
+use arc_swap::ArcSwapOption;
 
 use anyhow::anyhow;
 use async_trait::async_trait;
@@ -30,7 +31,7 @@ use crate::app::dns::wire::{
     extract_ips_from_dns_response, extract_min_ttl_from_dns_response,
 };
 use crate::app::dns::{
-    ClashResolver, DnsResolutionHook, ResolverKind, ThreadSafeDnsCollector,
+    ClashResolver, DnsResolutionHook, DnsResolutionHookWrapper, ResolverKind, ThreadSafeDnsCollector,
     parse_ip_literal,
 };
 use crate::app::profile::ThreadSafeCacheFile;
@@ -58,7 +59,7 @@ pub struct RouterResolver {
     #[allow(dead_code)]
     cache: DnsCache,
     ipv6: AtomicBool,
-    resolution_hook: Arc<OnceLock<DnsResolutionHook>>,
+    resolution_hook: Arc<ArcSwapOption<DnsResolutionHookWrapper>>,
     proxy_server_domains: Option<StringTrie<bool>>,
     proxy_server_transports: Vec<Transport>,
     notifier: DnsResolvedNotifier,
@@ -131,7 +132,7 @@ impl RouterResolver {
 
         let capacity = cfg.cache_capacity.max(1);
         let reverse_lookup_cache = ReverseLookupCache::new(capacity);
-        let resolution_hook = Arc::new(OnceLock::new());
+        let resolution_hook = Arc::new(ArcSwapOption::new(None));
         let notifier = DnsResolvedNotifier::new(
             reverse_lookup_cache.clone(),
             Arc::clone(&resolution_hook),
@@ -297,7 +298,15 @@ impl RouterResolver {
 #[async_trait]
 impl ClashResolver for RouterResolver {
     fn register_resolution_hook(&self, hook: DnsResolutionHook) {
-        let _ = self.resolution_hook.set(hook);
+        self.resolution_hook
+            .store(Some(Arc::new(DnsResolutionHookWrapper(hook))));
+    }
+
+    fn unregister_resolution_hook(&self, hook: &DnsResolutionHook) {
+        self.resolution_hook.rcu(|current| match current {
+            Some(wrapper) if Arc::ptr_eq(&wrapper.0, hook) => None,
+            _ => current.clone(),
+        });
     }
 
     async fn resolve(

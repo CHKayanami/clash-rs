@@ -13,6 +13,17 @@ members = [
     "clash-ebpf-common",
     "clash-shadowsocks"
 ]
+default-members = [
+    "clash-bin",
+    "clash-lib",
+    "clash-common",
+    "clash-doc",
+    "clash-ffi",
+    "clash-dns",
+    "clash-netstack",
+    "clash-ebpf-common",
+    "clash-shadowsocks"
+]
 exclude = ["clash-ebpf-bpf"]
 
 

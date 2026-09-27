@@ -161,7 +161,6 @@ rust-embed = { version = "8", optional = true }
 # TUN
 tun-rs = { version = "2", features = ["async", "async_framed"], optional = true }
 watfaq-netstack = { path = "../clash-netstack", optional = true }
-clash-ebpf = { path = "../clash-ebpf", optional = true }
 smoltcp = { version = "0.13", default-features = false, features = ["std", "log", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-udp", "socket-tcp"], optional = true }
 
 # WireGuard
@@ -255,6 +254,7 @@ sock2proc = { git = "https://github.com/Watfaq/sock2proc.git", rev = "9f9e630" }
 hyperlocal = { version = "0.9", features = ["client"] }
 
 [target.'cfg(target_os="linux")'.dependencies]
+clash-ebpf = { path = "../clash-ebpf", optional = true }
 unix-udp-sock = { git = "https://github.com/Watfaq/unix-udp-sock.git", rev = "847c80b519f0fd8cff5c887ae708429897d08671" }
 rtnetlink = "0.21"
 netlink-packet-route = "0.30"

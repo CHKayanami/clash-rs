@@ -11,8 +11,9 @@ pub use reverse_cache::ReverseLookupCache;
 use std::collections::{HashMap, HashSet};
 use std::net::{self, IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
+use arc_swap::ArcSwapOption;
 
 use anyhow::anyhow;
 use async_trait::async_trait;
@@ -32,7 +33,7 @@ use crate::app::dns::wire::{
     extract_ips_from_dns_response, extract_min_ttl_from_dns_response, rewrite_dns_response_ttl,
 };
 use crate::app::dns::{
-    ClashResolver, DnsResolutionHook, ResolverKind, RuleDispatch, ThreadSafeDnsCollector,
+    ClashResolver, DnsResolutionHook, DnsResolutionHookWrapper, ResolverKind, RuleDispatch, ThreadSafeDnsCollector,
     parse_ip_literal,
 };
 use crate::app::profile::ThreadSafeCacheFile;
@@ -80,7 +81,7 @@ pub struct EnhancedResolverInner {
     optimistic_cache_ttl: u32,
     stale_cache_retention: Duration,
     fixed_domain_ttl: Option<trie::StringTrie<u32>>,
-    resolution_hook: OnceLock<DnsResolutionHook>,
+    resolution_hook: ArcSwapOption<DnsResolutionHookWrapper>,
     qtype_filter: HashSet<QType>,
 }
 
@@ -296,7 +297,7 @@ impl EnhancedResolver {
             optimistic_cache_ttl: cfg.optimistic_cache_ttl,
             stale_cache_retention: Duration::from_secs(cfg.stale_cache_retention as u64),
             fixed_domain_ttl,
-            resolution_hook: OnceLock::new(),
+            resolution_hook: ArcSwapOption::new(None),
             qtype_filter: cfg.qtype_filter,
         });
 
@@ -504,9 +505,9 @@ impl EnhancedResolver {
         }
 
         // 3. Trigger DNS resolution hook (e.g. for eBPF offloading)
-        if let Some(hook) = self.resolution_hook.get() {
+        if let Some(hook) = self.resolution_hook.load().as_ref() {
             if !ips.is_empty() {
-                hook(host, &ips, Duration::from_secs(ttl as u64));
+                (hook.0)(host, &ips, Duration::from_secs(ttl as u64));
             }
         }
 
@@ -520,7 +521,15 @@ impl EnhancedResolver {
 #[async_trait]
 impl ClashResolver for EnhancedResolver {
     fn register_resolution_hook(&self, hook: DnsResolutionHook) {
-        let _ = self.resolution_hook.set(hook);
+        self.resolution_hook
+            .store(Some(Arc::new(DnsResolutionHookWrapper(hook))));
+    }
+
+    fn unregister_resolution_hook(&self, hook: &DnsResolutionHook) {
+        self.resolution_hook.rcu(|current| match current {
+            Some(wrapper) if Arc::ptr_eq(&wrapper.0, hook) => None,
+            _ => current.clone(),
+        });
     }
 
     async fn resolve(
@@ -1001,4 +1010,3 @@ impl ClashResolver for BootstrapResolver {
         ResolverKind::Clash
     }
 }
-

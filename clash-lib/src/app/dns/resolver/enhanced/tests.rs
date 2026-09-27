@@ -1,7 +1,8 @@
 use std::collections::HashSet;
 use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::time::Duration;
+use arc_swap::ArcSwapOption;
 
 use crate::app::dns::{ClashResolver, EnhancedResolver};
 use crate::app::dns::resolver::enhanced::EnhancedResolverInner;
@@ -38,7 +39,7 @@ impl EnhancedResolver {
                 optimistic_cache_ttl: 0,
                 stale_cache_retention: Duration::from_secs(3600),
                 fixed_domain_ttl: None,
-                resolution_hook: OnceLock::new(),
+                resolution_hook: ArcSwapOption::new(None),
                 qtype_filter: HashSet::new(),
             }),
         }
@@ -99,10 +100,10 @@ async fn test_dns_resolution_hook_triggered() {
     let query_wire = crate::app::dns::query::build_dns_query_wire_with_id(0x1234, &name, QType::A);
 
     // Build mock response and test hook
-    if let Some(hook) = resolver.resolution_hook.get() {
+    if let Some(hook) = resolver.inner.resolution_hook.load().as_ref() {
         let resp = build_dns_ip_response(&query_wire, &["93.184.216.34".parse().unwrap()], 120).unwrap();
         let ips = crate::app::dns::wire::extract_ips_from_dns_response(&resp);
-        hook("hook-test.com", &ips, Duration::from_secs(120));
+        (hook.0)("hook-test.com", &ips, Duration::from_secs(120));
     }
 
     let records = recorded.lock().unwrap().clone();
@@ -110,6 +111,25 @@ async fn test_dns_resolution_hook_triggered() {
     assert_eq!(records[0].0, "hook-test.com");
     assert_eq!(records[0].1, vec!["93.184.216.34".parse::<std::net::IpAddr>().unwrap()]);
     assert_eq!(records[0].2, Duration::from_secs(120));
+}
+
+#[tokio::test]
+async fn unregistering_old_dns_hook_keeps_replacement() {
+    use crate::app::dns::DnsResolutionHook;
+
+    let resolver = EnhancedResolver::new_default().await;
+    let old: DnsResolutionHook = Arc::new(|_, _, _| {});
+    let replacement: DnsResolutionHook = Arc::new(|_, _, _| {});
+
+    resolver.register_resolution_hook(old.clone());
+    resolver.register_resolution_hook(replacement.clone());
+    resolver.unregister_resolution_hook(&old);
+
+    let active = resolver.inner.resolution_hook.load_full().unwrap();
+    assert!(Arc::ptr_eq(&active.0, &replacement));
+
+    resolver.unregister_resolution_hook(&replacement);
+    assert!(resolver.inner.resolution_hook.load_full().is_none());
 }
 
 #[tokio::test]
@@ -180,7 +200,7 @@ async fn test_dns_resolution_hook_end_to_end_on_exchange() {
             optimistic_cache_ttl: 0,
             stale_cache_retention: Duration::from_secs(3600),
             fixed_domain_ttl: None,
-            resolution_hook: OnceLock::new(),
+            resolution_hook: ArcSwapOption::new(None),
             qtype_filter: HashSet::new(),
         }),
     };
@@ -248,7 +268,7 @@ async fn test_fake_ip_exchange() {
             optimistic_cache_ttl: 0,
             stale_cache_retention: Duration::from_secs(3600),
             fixed_domain_ttl: None,
-            resolution_hook: OnceLock::new(),
+            resolution_hook: ArcSwapOption::new(None),
             qtype_filter: HashSet::new(),
         }),
     };
@@ -479,7 +499,7 @@ async fn test_qtype_filter_exchange() {
             optimistic_cache_ttl: 0,
             stale_cache_retention: Duration::from_secs(3600),
             fixed_domain_ttl: None,
-            resolution_hook: OnceLock::new(),
+            resolution_hook: ArcSwapOption::new(None),
             qtype_filter: filter_set,
         }),
     };
@@ -506,6 +526,5 @@ async fn test_qtype_filter_exchange() {
     assert_eq!(rcode, 0);
     assert_eq!(ancount, 0);
 }
-
 
 

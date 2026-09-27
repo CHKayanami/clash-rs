@@ -45,11 +45,11 @@ impl AsyncService for EbpfRunner {
             return Ok(());
         }
 
-        let inbound = Arc::new(EbpfInbound::new(
+        let mut inbound = EbpfInbound::new(
             self.cfg.clone(),
             self.dispatcher.clone(),
             self.dns_resolver.clone(),
-        ));
+        );
         let cancel = self.cancellation_token.clone();
         let lifecycle_token = cancel.clone();
 
@@ -57,6 +57,7 @@ impl AsyncService for EbpfRunner {
         inbound.init().await.map_err(|e| {
             crate::Error::Operation(format!("failed to init ebpf inbound: {e}"))
         })?;
+        let inbound = Arc::new(inbound);
 
         ctx.spawn_critical_with_token("ebpf_inbound", lifecycle_token, async move {
             let inbound_tcp = inbound.clone();
@@ -76,13 +77,19 @@ impl AsyncService for EbpfRunner {
             tokio::select! {
                 _ = cancel.cancelled() => {
                     info!("eBPF inbound cancelled, shutting down");
-                    tcp_task.abort();
-                    udp_task.abort();
-                    inbound.stop().await;
                 }
-                _ = &mut tcp_task => {}
-                _ = &mut udp_task => {}
+                res = &mut tcp_task => {
+                    error!("eBPF TCP inbound task unexpectedly terminated: {res:?}");
+                }
+                res = &mut udp_task => {
+                    error!("eBPF UDP inbound task unexpectedly terminated: {res:?}");
+                }
             }
+            tcp_task.abort();
+            udp_task.abort();
+            let _ = tcp_task.await;
+            let _ = udp_task.await;
+            inbound.stop().await;
         });
 
         Ok(())

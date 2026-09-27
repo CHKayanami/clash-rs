@@ -1,14 +1,13 @@
 use async_trait::async_trait;
 use std::net::IpAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::sync::OnceCell;
 use tracing::{error, info, warn};
 
 use super::offloader::{DirectOffloader, RoutingAction};
 use super::utils::resolve_and_aggregate_ip_cidrs;
 use crate::app::dispatcher::Dispatcher;
-use crate::app::dns::ThreadSafeDNSResolver;
+use crate::app::dns::{DnsResolutionHook, ThreadSafeDNSResolver};
 use crate::app::net::get_default_outbound_interface_cloned;
 use crate::app::remote_content_manager::providers::rule_provider::CidrTrie;
 use crate::config::def::EbpfConfig;
@@ -19,9 +18,14 @@ pub struct EbpfInbound {
     config: EbpfConfig,
     dispatcher: Arc<Dispatcher>,
     dns_resolver: ThreadSafeDNSResolver,
-    manager: Arc<OnceCell<Arc<clash_ebpf::EbpfManager>>>,
-    listener: Arc<OnceCell<Arc<clash_ebpf::EbpfListener>>>,
-    offloader: Arc<OnceCell<DirectOffloader>>,
+    runtime: Mutex<Option<InboundRuntime>>,
+}
+
+struct InboundRuntime {
+    manager: Arc<clash_ebpf::EbpfManager>,
+    listener: Arc<clash_ebpf::EbpfListener>,
+    offloader: Option<DirectOffloader>,
+    dns_hook: Option<DnsResolutionHook>,
 }
 
 impl EbpfInbound {
@@ -34,45 +38,36 @@ impl EbpfInbound {
             config,
             dispatcher,
             dns_resolver,
-            manager: Arc::new(OnceCell::new()),
-            listener: Arc::new(OnceCell::new()),
-            offloader: Arc::new(OnceCell::new()),
+            runtime: Mutex::new(None),
         }
     }
 
-    async fn get_or_init_offloader(&self) -> DirectOffloader {
-        self.offloader
-            .get_or_init(|| async {
-                let rule_providers = self.dispatcher.router().get_rule_providers();
-                let bypass_dst_ips =
-                    resolve_and_aggregate_ip_cidrs(&self.config.target.bypass_dst_ips, rule_providers);
-                let proxy_dst_ips =
-                    resolve_and_aggregate_ip_cidrs(&self.config.target.proxy_dst_ips, rule_providers);
+    fn create_offloader(&self, manager: &Arc<clash_ebpf::EbpfManager>) -> DirectOffloader {
+        let rule_providers = self.dispatcher.router().get_rule_providers();
+        let bypass_dst_ips =
+            resolve_and_aggregate_ip_cidrs(&self.config.target.bypass_dst_ips, rule_providers);
+        let proxy_dst_ips =
+            resolve_and_aggregate_ip_cidrs(&self.config.target.proxy_dst_ips, rule_providers);
 
-                let mut bypass_trie = CidrTrie::new();
-                for ip in bypass_dst_ips.iter() {
-                    bypass_trie.insert(ip);
-                }
+        let mut bypass_trie = CidrTrie::new();
+        for ip in bypass_dst_ips.iter() {
+            bypass_trie.insert(ip);
+        }
 
-                let mut proxy_trie = CidrTrie::new();
-                for ip in proxy_dst_ips.iter() {
-                    proxy_trie.insert(ip);
-                }
+        let mut proxy_trie = CidrTrie::new();
+        for ip in proxy_dst_ips.iter() {
+            proxy_trie.insert(ip);
+        }
 
-                DirectOffloader::new(
-                    self.manager.clone(),
-                    self.dns_resolver.clone(),
-                    Arc::new(bypass_trie),
-                    Arc::new(proxy_trie),
-                )
-            })
-            .await
-            .clone()
+        DirectOffloader::new(
+            Arc::downgrade(manager),
+            self.dns_resolver.clone(),
+            Arc::new(bypass_trie),
+            Arc::new(proxy_trie),
+        )
     }
 
-    async fn get_or_init_listener(&self) -> std::io::Result<Arc<clash_ebpf::EbpfListener>> {
-        self.listener
-            .get_or_try_init(|| async {
+    async fn start_runtime(&self) -> std::io::Result<InboundRuntime> {
                 use clash_ebpf::{
                     EbpfConfig as CoreEbpfConfig, EbpfHostConfig as CoreEbpfHostConfig,
                     EbpfLanConfig as CoreEbpfLanConfig, EbpfTargetConfig as CoreEbpfTargetConfig,
@@ -137,21 +132,25 @@ impl EbpfInbound {
                     .await
                     .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err))?;
 
-                let _ = self.manager.set(Arc::new(manager));
-
-                Ok(listener)
-            })
-            .await
-            .cloned()
+                Ok(InboundRuntime {
+                    manager: Arc::new(manager),
+                    listener,
+                    offloader: None,
+                    dns_hook: None,
+                })
     }
 
-    pub async fn init(&self) -> std::io::Result<()> {
-        let _ = self.get_or_init_listener().await?;
+    pub async fn init(&mut self) -> std::io::Result<()> {
+        if self.runtime.get_mut().unwrap().is_some() {
+            return Ok(());
+        }
+        let mut runtime = self.start_runtime().await?;
         if self.config.auto_direct_offload {
-            let offloader = self.get_or_init_offloader().await;
+            let offloader = self.create_offloader(&runtime.manager);
+            let hook_offloader = offloader.clone();
             let router = self.dispatcher.router().clone();
-            let hook = Arc::new(move |domain: &str, ips: &[IpAddr], ttl: Duration| {
-                let offloader = offloader.clone();
+            let hook: DnsResolutionHook = Arc::new(move |domain: &str, ips: &[IpAddr], ttl: Duration| {
+                let offloader = hook_offloader.clone();
                 let router = router.clone();
                 let domain: Arc<str> = Arc::from(domain);
                 let ips = ips.to_vec();
@@ -165,15 +164,31 @@ impl EbpfInbound {
                     offloader.observe(domain, ips, action, ttl).await;
                 });
             });
-            self.dns_resolver.register_resolution_hook(hook);
+            self.dns_resolver.register_resolution_hook(hook.clone());
+            runtime.dns_hook = Some(hook);
+            runtime.offloader = Some(offloader);
         }
+        *self.runtime.get_mut().unwrap() = Some(runtime);
         Ok(())
     }
 
     pub async fn stop(&self) {
-        if let Some(mgr) = self.manager.get() {
-            mgr.stop().await;
+        let runtime = self.runtime.lock().unwrap().take();
+        if let Some(runtime) = runtime {
+            if let Some(hook) = &runtime.dns_hook {
+                self.dns_resolver.unregister_resolution_hook(hook);
+            }
+            if let Some(offloader) = &runtime.offloader {
+                offloader.stop();
+            }
+            runtime.manager.stop().await;
         }
+    }
+
+    fn listener(&self) -> std::io::Result<Arc<clash_ebpf::EbpfListener>> {
+        self.runtime.lock().unwrap().as_ref()
+            .map(|runtime| runtime.listener.clone())
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotConnected, "eBPF inbound is stopped"))
     }
 }
 
@@ -191,10 +206,12 @@ impl InboundHandlerTrait for EbpfInbound {
         use super::dns::handle_tcp_dns;
         use crate::session::{Network, Session, Type};
 
-        let listener = self.get_or_init_listener().await?;
+        let listener = self.listener()?;
         info!("clash-ebpf TCP inbound worker running");
+        let mut connections = tokio::task::JoinSet::new();
 
         loop {
+            while connections.try_join_next().is_some() {}
             match listener.accept_tcp().await {
                 Ok((stream, session_info)) => {
                     let dst = session_info.destination;
@@ -202,7 +219,7 @@ impl InboundHandlerTrait for EbpfInbound {
                     // 1. Intercept TCP port 53 (DNS-over-TCP)
                     if dst.port() == 53 {
                         let resolver = self.dns_resolver.clone();
-                        tokio::spawn(async move {
+                        connections.spawn(async move {
                             handle_tcp_dns(stream, resolver).await;
                         });
                         continue;
@@ -220,7 +237,7 @@ impl InboundHandlerTrait for EbpfInbound {
                     };
 
                     let dispatcher = self.dispatcher.clone();
-                    tokio::spawn(async move {
+                    connections.spawn(async move {
                         dispatcher.dispatch_stream(session, Box::new(stream)).await;
                     });
                 }
@@ -235,7 +252,7 @@ impl InboundHandlerTrait for EbpfInbound {
     async fn listen_udp(&self) -> std::io::Result<()> {
         use crate::session::{Network, Session, Type};
 
-        let listener = self.get_or_init_listener().await?;
+        let listener = self.listener()?;
         info!("clash-ebpf UDP inbound worker running");
 
         const UDP_CHANNEL_CAPACITY: usize = 1024;
@@ -259,8 +276,9 @@ impl InboundHandlerTrait for EbpfInbound {
                 .await;
 
             let listener_for_send = listener.clone();
+            let mut tasks = tokio::task::JoinSet::new();
             // Dispatcher -> client outbound reply task
-            let send_task = tokio::spawn(async move {
+            tasks.spawn(async move {
                 let mut reply_sockets: std::collections::HashMap<
                     std::net::SocketAddr,
                     (std::sync::Arc<tokio::net::UdpSocket>, std::time::Instant),
@@ -327,7 +345,7 @@ impl InboundHandlerTrait for EbpfInbound {
 
             // Client inbound receive tasks -> Dispatcher / DNS
             let v4_socket = listener.udp_socket_v4();
-            let v4_task = tokio::spawn(udp_listener_loop(
+            tasks.spawn(udp_listener_loop(
                 v4_socket,
                 "IPv4",
                 d_tx.clone(),
@@ -335,29 +353,18 @@ impl InboundHandlerTrait for EbpfInbound {
                 listener.clone(),
             ));
 
-            let v6_task = if let Some(v6_socket) = listener.udp_socket_v6() {
-                Some(tokio::spawn(udp_listener_loop(
+            if let Some(v6_socket) = listener.udp_socket_v6() {
+                tasks.spawn(udp_listener_loop(
                     v6_socket,
                     "IPv6",
                     d_tx,
                     self.dns_resolver.clone(),
                     listener.clone(),
-                )))
-            } else {
-                None
-            };
-
-            tokio::select! {
-                _ = send_task => {},
-                _ = v4_task => {},
-                _ = async {
-                    if let Some(t) = v6_task {
-                        let _ = t.await;
-                    } else {
-                        futures::future::pending::<()>().await;
-                    }
-                } => {},
+                ));
             }
+
+            // Dropping JoinSet aborts all remaining UDP workers, including on cancellation.
+            let _ = tasks.join_next().await;
 
             Ok(())
         }
@@ -371,7 +378,9 @@ async fn udp_listener_loop(
     listener_for_dns: Arc<clash_ebpf::EbpfListener>,
 ) {
     let mut batch = Vec::with_capacity(32);
+    let mut dns_tasks = tokio::task::JoinSet::new();
     loop {
+        while dns_tasks.try_join_next().is_some() {}
         batch.clear();
         match clash_ebpf::EbpfListener::recv_many_from_socket(&socket, &mut batch, 32).await {
             Ok(count) => {
@@ -384,7 +393,7 @@ async fn udp_listener_loop(
                         let req_bytes = payload.to_vec();
                         let resolver = resolver.clone();
                         let listener_for_dns = listener_for_dns.clone();
-                        tokio::spawn(async move {
+                        dns_tasks.spawn(async move {
                             match crate::app::dns::exchange_with_resolver(&resolver, &req_bytes, true)
                                 .await
                             {

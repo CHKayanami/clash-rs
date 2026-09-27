@@ -1553,6 +1553,7 @@ name = "clash-ebpf"
 version = "0.20.10-alpha"
 dependencies = [
  "anyhow",
+ "arc-swap",
  "async-trait",
  "aya",
  "bytes",

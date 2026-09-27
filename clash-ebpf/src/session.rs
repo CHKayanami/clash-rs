@@ -16,7 +16,6 @@ pub enum TransportProtocol {
 }
 
 /// Helper to get the original destination address from a TCP stream with SO_ORIGINAL_DST / IP6T_SO_ORIGINAL_DST.
-#[cfg(target_os = "linux")]
 pub fn get_original_dst(stream: &TcpStream) -> std::io::Result<SocketAddr> {
     use std::os::fd::AsRawFd;
 
@@ -42,7 +41,6 @@ pub fn get_original_dst(stream: &TcpStream) -> std::io::Result<SocketAddr> {
         return Ok(SocketAddr::V4(std::net::SocketAddrV4::new(ip, port)));
     }
 
-
     // Try IPv6 original dst
     let mut addr_v6: libc::sockaddr_in6 = unsafe { std::mem::zeroed() };
     let mut len_v6 = std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t;
@@ -67,9 +65,3 @@ pub fn get_original_dst(stream: &TcpStream) -> std::io::Result<SocketAddr> {
     // is the flow's true original destination address (e.g. Fake-IP / target host).
     stream.local_addr()
 }
-
-#[cfg(not(target_os = "linux"))]
-pub fn get_original_dst(stream: &TcpStream) -> std::io::Result<SocketAddr> {
-    stream.local_addr()
-}
-

@@ -6,152 +6,91 @@
 
 #![allow(dead_code)]
 
-
-#[cfg(target_os = "linux")]
 use std::io;
-#[cfg(target_os = "linux")]
 use std::os::fd::{AsRawFd, OwnedFd};
 
-#[cfg(target_os = "linux")]
 use nix::sys::socket::{
-    AddressFamily, MsgFlags, NetlinkAddr, SockFlag, SockProtocol, SockType, bind, recv, recvfrom,
-    send, setsockopt, socket, sockopt,
+    AddressFamily, MsgFlags, NetlinkAddr, SockFlag, SockProtocol, SockType, bind,
+    recv, recvfrom, send, setsockopt, socket, sockopt,
 };
-#[cfg(target_os = "linux")]
 use nix::sys::time::TimeVal;
 
 // ---- kernel ABI constants ----
 
-#[cfg(target_os = "linux")]
 const AF_INET: i32 = libc::AF_INET;
-#[cfg(target_os = "linux")]
 const AF_INET6: i32 = libc::AF_INET6;
 
-#[cfg(target_os = "linux")]
 const NLM_F_REQUEST: u16 = 0x01;
-#[cfg(target_os = "linux")]
 const NLM_F_ACK: u16 = 0x04;
-#[cfg(target_os = "linux")]
 const NLM_F_EXCL: u16 = 0x200;
-#[cfg(target_os = "linux")]
 const NLM_F_CREATE: u16 = 0x400;
-#[cfg(target_os = "linux")]
 const NLM_F_REPLACE: u16 = 0x100;
 
-#[cfg(target_os = "linux")]
 const NLMSG_ERROR: u16 = 2;
 
-#[cfg(target_os = "linux")]
 const RTM_NEWLINK: u16 = 16;
-#[cfg(target_os = "linux")]
 const RTM_DELLINK: u16 = 17;
-#[cfg(target_os = "linux")]
 const RTM_NEWADDR: u16 = 20;
-#[cfg(target_os = "linux")]
 const RTM_DELADDR: u16 = 21;
-#[cfg(target_os = "linux")]
 const RTM_NEWROUTE: u16 = 24;
-#[cfg(target_os = "linux")]
 const RTM_NEWRULE: u16 = 32;
-#[cfg(target_os = "linux")]
 const RTM_DELRULE: u16 = 33;
-#[cfg(target_os = "linux")]
 const RTM_NEWNEIGH: u16 = 28;
 
-#[cfg(target_os = "linux")]
 const ARPHRD_ETHER: u16 = 1;
-#[cfg(target_os = "linux")]
 const IFF_UP: u32 = 0x1;
 
-#[cfg(target_os = "linux")]
 const IFLA_ADDRESS: u16 = 1;
-#[cfg(target_os = "linux")]
 const IFLA_IFNAME: u16 = 3;
-#[cfg(target_os = "linux")]
 const IFLA_LINKINFO: u16 = 18;
-#[cfg(target_os = "linux")]
 const IFLA_NET_NS_FD: u16 = 28;
-#[cfg(target_os = "linux")]
 const IFLA_INFO_KIND: u16 = 1;
-#[cfg(target_os = "linux")]
 const IFLA_INFO_DATA: u16 = 2;
-#[cfg(target_os = "linux")]
 const VETH_INFO_PEER: u16 = 1;
-#[cfg(target_os = "linux")]
 const IFLA_NETKIT_PEER_INFO: u16 = 1;
-#[cfg(target_os = "linux")]
 const IFLA_NETKIT_PRIMARY: u16 = 2;
-#[cfg(target_os = "linux")]
 const IFLA_NETKIT_POLICY: u16 = 3;
-#[cfg(target_os = "linux")]
 const IFLA_NETKIT_PEER_POLICY: u16 = 4;
-#[cfg(target_os = "linux")]
 const IFLA_NETKIT_MODE: u16 = 5;
-#[cfg(target_os = "linux")]
 const IFLA_NETKIT_SCRUB: u16 = 6;
-#[cfg(target_os = "linux")]
 const IFLA_NETKIT_PEER_SCRUB: u16 = 7;
-#[cfg(target_os = "linux")]
 const NETKIT_PASS: u32 = 0;
-#[cfg(target_os = "linux")]
 const NETKIT_L2: u32 = 0;
 
-#[cfg(target_os = "linux")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LinkPairKind {
     Netkit,
     Veth,
 }
 
-#[cfg(target_os = "linux")]
 fn netkit_unavailable(error: &io::Error) -> bool {
     error.raw_os_error() == Some(libc::EOPNOTSUPP)
 }
 
-#[cfg(target_os = "linux")]
 const IFA_ADDRESS: u16 = 1;
-#[cfg(target_os = "linux")]
 const IFA_LOCAL: u16 = 2;
 
-#[cfg(target_os = "linux")]
 const RTA_DST: u16 = 1;
-#[cfg(target_os = "linux")]
 const RTA_GATEWAY: u16 = 5;
-#[cfg(target_os = "linux")]
 const RTA_OIF: u16 = 4;
-#[cfg(target_os = "linux")]
 const RTA_TABLE: u16 = 15;
 
-#[cfg(target_os = "linux")]
 const NDA_DST: u16 = 1;
-#[cfg(target_os = "linux")]
 const NDA_LLADDR: u16 = 2;
 
-#[cfg(target_os = "linux")]
 const FRA_FWMARK: u16 = 10;
-#[cfg(target_os = "linux")]
 const FRA_TABLE: u16 = 15;
-#[cfg(target_os = "linux")]
 const FRA_FWMASK: u16 = 16;
 
-#[cfg(target_os = "linux")]
 const NUD_PERMANENT: u16 = 0x80;
-#[cfg(target_os = "linux")]
 const RTN_UNICAST: u8 = 1;
-#[cfg(target_os = "linux")]
 const RTN_LOCAL: u8 = 2;
-#[cfg(target_os = "linux")]
 const RTPROT_STATIC: u8 = 4;
-#[cfg(target_os = "linux")]
 const RT_SCOPE_LINK: u8 = 253;
-#[cfg(target_os = "linux")]
 const RT_SCOPE_UNIVERSE: u8 = 0;
-#[cfg(target_os = "linux")]
 const RT_SCOPE_HOST: u8 = 254;
-#[cfg(target_os = "linux")]
 const FR_ACT_TO_TBL: u8 = 1;
 
-#[cfg(target_os = "linux")]
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct IfInfoMsg {
@@ -163,7 +102,6 @@ struct IfInfoMsg {
     ifi_change: u32,
 }
 
-#[cfg(target_os = "linux")]
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct IfAddrMsg {
@@ -174,7 +112,6 @@ struct IfAddrMsg {
     ifa_index: u32,
 }
 
-#[cfg(target_os = "linux")]
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct RtMsg {
@@ -189,7 +126,6 @@ struct RtMsg {
     rtm_flags: u32,
 }
 
-#[cfg(target_os = "linux")]
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct NdMsg {
@@ -202,15 +138,29 @@ struct NdMsg {
     ndm_type: u8,
 }
 
-#[cfg(target_os = "linux")]
+const RTM_DELQDISC: u16 = 37;
+const TC_H_CLSACT_HANDLE: u32 = 0xffff0000;
+const TC_H_CLSACT_PARENT: u32 = 0xfffffff1;
+const TCA_KIND: u16 = 1;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct TcMsg {
+    tcm_family: u8,
+    tcm_pad1: u8,
+    tcm_pad2: u16,
+    tcm_ifindex: i32,
+    tcm_handle: u32,
+    tcm_parent: u32,
+    tcm_info: u32,
+}
+
 const NLMSG_ALIGNTO: usize = 4;
 
-#[cfg(target_os = "linux")]
 fn align(len: usize) -> usize {
     len.div_ceil(NLMSG_ALIGNTO) * NLMSG_ALIGNTO
 }
 
-#[cfg(target_os = "linux")]
 #[derive(Clone, Debug)]
 enum Attr {
     U32(u32),
@@ -219,7 +169,6 @@ enum Attr {
     Nested(Vec<(u16, Attr)>),
 }
 
-#[cfg(target_os = "linux")]
 fn attr_payload(attr: &Attr, out: &mut Vec<u8>) {
     match attr {
         Attr::U32(v) => out.extend_from_slice(&v.to_ne_bytes()),
@@ -236,7 +185,6 @@ fn attr_payload(attr: &Attr, out: &mut Vec<u8>) {
     }
 }
 
-#[cfg(target_os = "linux")]
 fn put_attr(buf: &mut Vec<u8>, rta_type: u16, attr: &Attr) {
     let mut payload = Vec::new();
     attr_payload(attr, &mut payload);
@@ -249,12 +197,15 @@ fn put_attr(buf: &mut Vec<u8>, rta_type: u16, attr: &Attr) {
     }
 }
 
-#[cfg(target_os = "linux")]
 fn pod_bytes<T>(v: &T) -> &[u8] {
-    unsafe { std::slice::from_raw_parts(v as *const T as *const u8, std::mem::size_of::<T>()) }
+    unsafe {
+        std::slice::from_raw_parts(
+            v as *const T as *const u8,
+            std::mem::size_of::<T>(),
+        )
+    }
 }
 
-#[cfg(target_os = "linux")]
 fn ifinfo(ifindex: i32, flags: u32, change: u32) -> IfInfoMsg {
     IfInfoMsg {
         ifi_family: 0,
@@ -266,13 +217,11 @@ fn ifinfo(ifindex: i32, flags: u32, change: u32) -> IfInfoMsg {
     }
 }
 
-#[cfg(target_os = "linux")]
 pub struct NlSock {
     fd: OwnedFd,
     seq: u32,
 }
 
-#[cfg(target_os = "linux")]
 impl NlSock {
     pub fn new() -> io::Result<Self> {
         let fd = socket(
@@ -282,7 +231,8 @@ impl NlSock {
             SockProtocol::NetlinkRoute,
         )
         .map_err(io::Error::from)?;
-        setsockopt(&fd, sockopt::ReceiveTimeout, &TimeVal::new(2, 0)).map_err(io::Error::from)?;
+        setsockopt(&fd, sockopt::ReceiveTimeout, &TimeVal::new(2, 0))
+            .map_err(io::Error::from)?;
         bind(fd.as_raw_fd(), &NetlinkAddr::new(0, 0)).map_err(io::Error::from)?;
         Ok(Self { fd, seq: 0 })
     }
@@ -308,11 +258,12 @@ impl NlSock {
             if needed > buf.len() {
                 buf.resize(needed, 0);
             }
-            let (received, source) = match recvfrom::<NetlinkAddr>(self.fd.as_raw_fd(), buf) {
-                Ok(received) => received,
-                Err(nix::errno::Errno::EINTR) => continue,
-                Err(error) => return Err(io::Error::from(error)),
-            };
+            let (received, source) =
+                match recvfrom::<NetlinkAddr>(self.fd.as_raw_fd(), buf) {
+                    Ok(received) => received,
+                    Err(nix::errno::Errno::EINTR) => continue,
+                    Err(error) => return Err(io::Error::from(error)),
+                };
             if source.is_some_and(|source| source.pid() != 0) {
                 continue;
             }
@@ -321,7 +272,8 @@ impl NlSock {
     }
 
     fn send_datagram(&self, buf: &[u8]) -> io::Result<()> {
-        let sent = send(self.fd.as_raw_fd(), buf, MsgFlags::empty()).map_err(io::Error::from)?;
+        let sent = send(self.fd.as_raw_fd(), buf, MsgFlags::empty())
+            .map_err(io::Error::from)?;
         if sent == buf.len() {
             Ok(())
         } else {
@@ -361,9 +313,12 @@ impl NlSock {
             let n = self.recv_one(&mut resp)?;
             let mut off = 0usize;
             while off + 16 <= n {
-                let hlen = u32::from_ne_bytes(resp[off..off + 4].try_into().unwrap()) as usize;
-                let htype = u16::from_ne_bytes(resp[off + 4..off + 6].try_into().unwrap());
-                let hseq = u32::from_ne_bytes(resp[off + 8..off + 12].try_into().unwrap());
+                let hlen = u32::from_ne_bytes(resp[off..off + 4].try_into().unwrap())
+                    as usize;
+                let htype =
+                    u16::from_ne_bytes(resp[off + 4..off + 6].try_into().unwrap());
+                let hseq =
+                    u32::from_ne_bytes(resp[off + 8..off + 12].try_into().unwrap());
                 if hlen < 16 || off + hlen > n {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
@@ -377,7 +332,9 @@ impl NlSock {
                             "short NLMSG_ERROR",
                         ));
                     }
-                    let err = i32::from_ne_bytes(resp[off + 16..off + 20].try_into().unwrap());
+                    let err = i32::from_ne_bytes(
+                        resp[off + 16..off + 20].try_into().unwrap(),
+                    );
                     if err == 0 {
                         return Ok(());
                     }
@@ -389,11 +346,17 @@ impl NlSock {
     }
 
     /// Create an L2 netkit pair when supported, otherwise fallback to a veth pair.
-    pub fn add_link_pair(&mut self, name: &str, peer: &str) -> io::Result<LinkPairKind> {
+    pub fn add_link_pair(
+        &mut self,
+        name: &str,
+        peer: &str,
+    ) -> io::Result<LinkPairKind> {
         match self.add_netkit_pair(name, peer) {
             Ok(()) => Ok(LinkPairKind::Netkit),
             Err(e) if netkit_unavailable(&e) => {
-                tracing::info!("Netkit pair not supported ({e}), falling back to Veth");
+                tracing::info!(
+                    "Netkit pair not supported ({e}), falling back to Veth"
+                );
                 self.add_veth_pair(name, peer)?;
                 Ok(LinkPairKind::Veth)
             }
@@ -445,7 +408,10 @@ impl NlSock {
                     (IFLA_INFO_KIND, Attr::Str("veth".to_string())),
                     (
                         IFLA_INFO_DATA,
-                        Attr::Nested(vec![(VETH_INFO_PEER, Attr::Bytes(peer_payload))]),
+                        Attr::Nested(vec![(
+                            VETH_INFO_PEER,
+                            Attr::Bytes(peer_payload),
+                        )]),
                     ),
                 ]),
             ),
@@ -470,7 +436,11 @@ impl NlSock {
     }
 
     /// Move a link into the namespace identified by `ns_fd`.
-    pub fn set_link_netns_fd(&mut self, ifindex: u32, ns_fd: &OwnedFd) -> io::Result<()> {
+    pub fn set_link_netns_fd(
+        &mut self,
+        ifindex: u32,
+        ns_fd: &OwnedFd,
+    ) -> io::Result<()> {
         let header = ifinfo(ifindex as i32, 0, 0);
         let fd_no = ns_fd.as_raw_fd() as u32;
         let attrs = [(IFLA_NET_NS_FD, Attr::U32(fd_no))];
@@ -490,6 +460,26 @@ impl NlSock {
             NLM_F_REQUEST | NLM_F_ACK,
             pod_bytes(&header),
             &[],
+        )
+    }
+
+    /// Delete clsact qdisc on an interface by index.
+    pub fn del_qdisc_clsact(&mut self, ifindex: u32) -> io::Result<()> {
+        let msg = TcMsg {
+            tcm_family: 0,
+            tcm_pad1: 0,
+            tcm_pad2: 0,
+            tcm_ifindex: ifindex as i32,
+            tcm_handle: TC_H_CLSACT_HANDLE,
+            tcm_parent: TC_H_CLSACT_PARENT,
+            tcm_info: 0,
+        };
+        let attrs = [(TCA_KIND, Attr::Str("clsact".to_string()))];
+        self.request(
+            RTM_DELQDISC,
+            NLM_F_REQUEST | NLM_F_ACK,
+            pod_bytes(&msg),
+            &attrs,
         )
     }
 
@@ -570,7 +560,13 @@ impl NlSock {
     }
 
     /// Add or delete a fwmark -> table rule.
-    fn rule_fwmark(&mut self, add: bool, family: u8, fwmark: u32, table: u32) -> io::Result<()> {
+    fn rule_fwmark(
+        &mut self,
+        add: bool,
+        family: u8,
+        fwmark: u32,
+        table: u32,
+    ) -> io::Result<()> {
         let header: [u8; 12] = [
             family,
             0,
@@ -600,11 +596,21 @@ impl NlSock {
         self.request(ty, flags, &header, &attrs)
     }
 
-    pub fn add_rule_fwmark(&mut self, family: u8, fwmark: u32, table: u32) -> io::Result<()> {
+    pub fn add_rule_fwmark(
+        &mut self,
+        family: u8,
+        fwmark: u32,
+        table: u32,
+    ) -> io::Result<()> {
         self.rule_fwmark(true, family, fwmark, table)
     }
 
-    pub fn del_rule_fwmark(&mut self, family: u8, fwmark: u32, table: u32) -> io::Result<()> {
+    pub fn del_rule_fwmark(
+        &mut self,
+        family: u8,
+        fwmark: u32,
+        table: u32,
+    ) -> io::Result<()> {
         self.rule_fwmark(false, family, fwmark, table)
     }
 
@@ -663,15 +669,18 @@ impl NlSock {
             let mut done = false;
             let mut off = 0usize;
             while off + 16 <= n {
-                let hlen = u32::from_ne_bytes(resp[off..off + 4].try_into().unwrap()) as usize;
+                let hlen = u32::from_ne_bytes(resp[off..off + 4].try_into().unwrap())
+                    as usize;
                 if hlen < 16 || off + hlen > n {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         "malformed netlink message header",
                     ));
                 }
-                let htype = u16::from_ne_bytes(resp[off + 4..off + 6].try_into().unwrap());
-                let hseq = u32::from_ne_bytes(resp[off + 8..off + 12].try_into().unwrap());
+                let htype =
+                    u16::from_ne_bytes(resp[off + 4..off + 6].try_into().unwrap());
+                let hseq =
+                    u32::from_ne_bytes(resp[off + 8..off + 12].try_into().unwrap());
                 if hseq != seq {
                     break;
                 }
@@ -686,7 +695,9 @@ impl NlSock {
                             "short NLMSG_ERROR",
                         ));
                     }
-                    let err = i32::from_ne_bytes(resp[off + 16..off + 20].try_into().unwrap());
+                    let err = i32::from_ne_bytes(
+                        resp[off + 16..off + 20].try_into().unwrap(),
+                    );
                     return Err(io::Error::from_raw_os_error(-err));
                 }
                 if htype == RTM_NEWLINK && hlen >= 16 + 16 {
@@ -696,9 +707,12 @@ impl NlSock {
                     let mut mac: Option<[u8; 6]> = None;
                     let mut aoff = 16;
                     while aoff + 4 <= ifi.len() {
-                        let alen =
-                            u16::from_ne_bytes(ifi[aoff..aoff + 2].try_into().unwrap()) as usize;
-                        let atype = u16::from_ne_bytes(ifi[aoff + 2..aoff + 4].try_into().unwrap());
+                        let alen = u16::from_ne_bytes(
+                            ifi[aoff..aoff + 2].try_into().unwrap(),
+                        ) as usize;
+                        let atype = u16::from_ne_bytes(
+                            ifi[aoff + 2..aoff + 4].try_into().unwrap(),
+                        );
                         if alen < 4 || aoff + alen > ifi.len() {
                             break;
                         }
@@ -709,8 +723,10 @@ impl NlSock {
                                     .iter()
                                     .position(|&b| b == 0)
                                     .unwrap_or(payload.len());
-                                ifname =
-                                    Some(String::from_utf8_lossy(&payload[..end]).into_owned());
+                                ifname = Some(
+                                    String::from_utf8_lossy(&payload[..end])
+                                        .into_owned(),
+                                );
                             }
                             IFLA_ADDRESS if payload.len() == 6 => {
                                 mac = Some(payload.try_into().unwrap());
@@ -743,41 +759,31 @@ impl NlSock {
     }
 }
 
-
 // Exported constants
-#[cfg(target_os = "linux")]
 pub const FAM_V4: u8 = AF_INET as u8;
-#[cfg(target_os = "linux")]
 pub const FAM_V6: u8 = AF_INET6 as u8;
-#[cfg(target_os = "linux")]
 pub const ROUTE_UNICAST: u8 = RTN_UNICAST;
-#[cfg(target_os = "linux")]
 pub const ROUTE_LOCAL: u8 = RTN_LOCAL;
-#[cfg(target_os = "linux")]
 pub const PROTO_STATIC: u8 = RTPROT_STATIC;
-#[cfg(target_os = "linux")]
 pub const SCOPE_LINK: u8 = RT_SCOPE_LINK;
-#[cfg(target_os = "linux")]
 pub const SCOPE_UNIVERSE: u8 = RT_SCOPE_UNIVERSE;
-#[cfg(target_os = "linux")]
 pub const SCOPE_HOST: u8 = RT_SCOPE_HOST;
 
-#[cfg(target_os = "linux")]
 pub fn ifindex_of(name: &str) -> io::Result<u32> {
     let path = format!("/sys/class/net/{name}/ifindex");
-    let content = std::fs::read_to_string(&path)
-        .map_err(|e| io::Error::new(e.kind(), format!("read ifindex for {name}: {e}")))?;
-    content
-        .trim()
-        .parse::<u32>()
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("parse ifindex: {e}")))
+    let content = std::fs::read_to_string(&path).map_err(|e| {
+        io::Error::new(e.kind(), format!("read ifindex for {name}: {e}"))
+    })?;
+    content.trim().parse::<u32>().map_err(|e| {
+        io::Error::new(io::ErrorKind::InvalidData, format!("parse ifindex: {e}"))
+    })
 }
 
-#[cfg(target_os = "linux")]
 pub fn mac_of(name: &str) -> io::Result<[u8; 6]> {
     let path = format!("/sys/class/net/{name}/address");
-    let content = std::fs::read_to_string(&path)
-        .map_err(|e| io::Error::new(e.kind(), format!("read MAC for {name}: {e}")))?;
+    let content = std::fs::read_to_string(&path).map_err(|e| {
+        io::Error::new(e.kind(), format!("read MAC for {name}: {e}"))
+    })?;
     let mut mac = [0u8; 6];
     let parts: Vec<&str> = content.trim().split(':').collect();
     if parts.len() != 6 {
@@ -788,19 +794,21 @@ pub fn mac_of(name: &str) -> io::Result<[u8; 6]> {
     }
     for (i, part) in parts.iter().enumerate() {
         mac[i] = u8::from_str_radix(part, 16).map_err(|e| {
-            io::Error::new(io::ErrorKind::InvalidData, format!("parse MAC byte: {e}"))
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("parse MAC byte: {e}"),
+            )
         })?;
     }
     Ok(mac)
 }
 
-#[cfg(target_os = "linux")]
 pub fn set_sysctl(path: &str, value: &str) -> io::Result<()> {
     let full_path = format!("/proc/sys/{}", path.replace('.', "/"));
     std::fs::write(&full_path, value)
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -828,4 +836,3 @@ mod tests {
         assert_eq!(IFLA_NETKIT_PEER_SCRUB, 7);
     }
 }
-

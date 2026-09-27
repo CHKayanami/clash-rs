@@ -40,12 +40,17 @@ pub enum ResolverKind {
 
 pub type ThreadSafeDNSResolver = Arc<dyn ClashResolver>;
 
+#[derive(Clone)]
+pub struct DnsResolutionHookWrapper(
+    pub Arc<dyn Fn(&str, &[std::net::IpAddr], std::time::Duration) + Send + Sync>,
+);
 pub type DnsResolutionHook = Arc<dyn Fn(&str, &[std::net::IpAddr], std::time::Duration) + Send + Sync>;
 
 #[cfg_attr(test, automock)]
 #[async_trait]
 pub trait ClashResolver: Sync + Send {
     fn register_resolution_hook(&self, _hook: DnsResolutionHook) {}
+    fn unregister_resolution_hook(&self, _hook: &DnsResolutionHook) {}
 
     async fn resolve(
         &self,

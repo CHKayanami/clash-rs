@@ -544,18 +544,19 @@ pub struct DirectOffloader {
     resolver: Weak<dyn ClashResolver>,
     bypass_dst_trie: Arc<CidrTrie>,
     proxy_dst_trie: Arc<CidrTrie>,
+    abort_handle: Arc<tokio::task::AbortHandle>,
 }
 
 impl DirectOffloader {
     pub fn new(
-        manager: Arc<tokio::sync::OnceCell<Arc<clash_ebpf::EbpfManager>>>,
+        manager: Weak<clash_ebpf::EbpfManager>,
         resolver: ThreadSafeDNSResolver,
         bypass_dst_trie: Arc<CidrTrie>,
         proxy_dst_trie: Arc<CidrTrie>,
     ) -> Self {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<DnsObservation>();
 
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             const INITIAL_RETRY_DELAY: Duration = Duration::from_secs(1);
             const MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
 
@@ -602,7 +603,7 @@ impl DirectOffloader {
                         || !del_v6.is_empty();
                     let mut flush_succeeded = !has_updates;
                     if has_updates {
-                        if let Some(mgr) = manager.get() {
+                        if let Some(mgr) = manager.upgrade() {
                             if let Err(e) = mgr
                                 .update_dynamic_bypass_batch(
                                     &add_v4, &add_v6, &del_v4, &del_v6,
@@ -697,7 +698,12 @@ impl DirectOffloader {
             resolver: Arc::downgrade(&resolver),
             bypass_dst_trie,
             proxy_dst_trie,
+            abort_handle: Arc::new(handle.abort_handle()),
         }
+    }
+
+    pub fn stop(&self) {
+        self.abort_handle.abort();
     }
 
     pub async fn observe(
@@ -766,7 +772,7 @@ mod tests {
     async fn direct_offloader_does_not_retain_resolver() {
         let resolver: ThreadSafeDNSResolver = Arc::new(MockClashResolver::new());
         let weak_resolver = Arc::downgrade(&resolver);
-        let manager = Arc::new(tokio::sync::OnceCell::new());
+        let manager = Weak::new();
 
         let offloader = DirectOffloader::new(
             manager,

@@ -1,6 +1,7 @@
 use std::net::IpAddr;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
+use arc_swap::ArcSwapOption;
 
 use enum_dispatch::enum_dispatch;
 use tracing::debug;
@@ -21,7 +22,7 @@ use crate::app::dns::wire::{
     extract_ips_from_dns_response, extract_min_ttl_from_dns_response,
     rewrite_dns_response_ttl,
 };
-use crate::app::dns::{DnsResolutionHook, ThreadSafeDnsCollector};
+use crate::app::dns::{DnsResolutionHookWrapper, ThreadSafeDnsCollector};
 
 use super::config::UpstreamType;
 
@@ -71,14 +72,14 @@ impl DnsCachePolicy {
 #[derive(Clone)]
 pub struct DnsResolvedNotifier {
     reverse_lookup_cache: ReverseLookupCache,
-    resolution_hook: Arc<OnceLock<DnsResolutionHook>>,
+    resolution_hook: Arc<ArcSwapOption<DnsResolutionHookWrapper>>,
     collector: Option<ThreadSafeDnsCollector>,
 }
 
 impl DnsResolvedNotifier {
     pub fn new(
         reverse_lookup_cache: ReverseLookupCache,
-        resolution_hook: Arc<OnceLock<DnsResolutionHook>>,
+        resolution_hook: Arc<ArcSwapOption<DnsResolutionHookWrapper>>,
         collector: Option<ThreadSafeDnsCollector>,
     ) -> Self {
         Self {
@@ -101,9 +102,9 @@ impl DnsResolvedNotifier {
         }
 
         // 2. 触发 Resolution Hook (例如 eBPF offload)
-        if let Some(hook) = self.resolution_hook.get() {
+        if let Some(hook) = self.resolution_hook.load().as_ref() {
             if !ips.is_empty() {
-                hook(qname, &ips, Duration::from_secs(effective_ttl as u64));
+                (hook.0)(qname, &ips, Duration::from_secs(effective_ttl as u64));
             }
         }
 
