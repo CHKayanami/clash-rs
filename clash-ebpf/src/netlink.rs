@@ -80,15 +80,17 @@ const VETH_INFO_PEER: u16 = 1;
 #[cfg(target_os = "linux")]
 const IFLA_NETKIT_PEER_INFO: u16 = 1;
 #[cfg(target_os = "linux")]
-const IFLA_NETKIT_PRIMARY_POLICY: u16 = 2;
+const IFLA_NETKIT_PRIMARY: u16 = 2;
 #[cfg(target_os = "linux")]
-const IFLA_NETKIT_PEER_POLICY: u16 = 3;
+const IFLA_NETKIT_POLICY: u16 = 3;
 #[cfg(target_os = "linux")]
-const IFLA_NETKIT_PRIMARY_SCRUB: u16 = 4;
+const IFLA_NETKIT_PEER_POLICY: u16 = 4;
 #[cfg(target_os = "linux")]
-const IFLA_NETKIT_PEER_SCRUB: u16 = 5;
+const IFLA_NETKIT_MODE: u16 = 5;
 #[cfg(target_os = "linux")]
-const IFLA_NETKIT_MODE: u16 = 6;
+const IFLA_NETKIT_SCRUB: u16 = 6;
+#[cfg(target_os = "linux")]
+const IFLA_NETKIT_PEER_SCRUB: u16 = 7;
 #[cfg(target_os = "linux")]
 const NETKIT_PASS: u32 = 0;
 #[cfg(target_os = "linux")]
@@ -390,11 +392,12 @@ impl NlSock {
     pub fn add_link_pair(&mut self, name: &str, peer: &str) -> io::Result<LinkPairKind> {
         match self.add_netkit_pair(name, peer) {
             Ok(()) => Ok(LinkPairKind::Netkit),
-            Err(e) => {
-                tracing::info!("Netkit pair not supported or failed ({e}), falling back to Veth");
+            Err(e) if netkit_unavailable(&e) => {
+                tracing::info!("Netkit pair not supported ({e}), falling back to Veth");
                 self.add_veth_pair(name, peer)?;
                 Ok(LinkPairKind::Veth)
             }
+            Err(e) => Err(e),
         }
     }
 
@@ -414,8 +417,6 @@ impl NlSock {
                         IFLA_INFO_DATA,
                         Attr::Nested(vec![
                             (IFLA_NETKIT_MODE, Attr::U32(NETKIT_L2)),
-                            (IFLA_NETKIT_PRIMARY_POLICY, Attr::U32(NETKIT_PASS)),
-                            (IFLA_NETKIT_PEER_POLICY, Attr::U32(NETKIT_PASS)),
                             (IFLA_NETKIT_PEER_INFO, Attr::Bytes(peer_payload)),
                         ]),
                     ),
@@ -814,6 +815,17 @@ mod tests {
         assert!(!netkit_unavailable(&io::Error::from_raw_os_error(
             libc::EPERM
         )));
+    }
+
+    #[test]
+    fn netkit_uapi_constants() {
+        assert_eq!(IFLA_NETKIT_PEER_INFO, 1);
+        assert_eq!(IFLA_NETKIT_PRIMARY, 2);
+        assert_eq!(IFLA_NETKIT_POLICY, 3);
+        assert_eq!(IFLA_NETKIT_PEER_POLICY, 4);
+        assert_eq!(IFLA_NETKIT_MODE, 5);
+        assert_eq!(IFLA_NETKIT_SCRUB, 6);
+        assert_eq!(IFLA_NETKIT_PEER_SCRUB, 7);
     }
 }
 
