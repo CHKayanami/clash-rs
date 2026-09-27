@@ -436,6 +436,12 @@ where
 
                     match this.aead_read_cipher {
                         Some(ref mut cipher) => {
+                            if size < cipher.security.overhead_len() {
+                                return Poll::Ready(Err(std::io::Error::new(
+                                    std::io::ErrorKind::InvalidData,
+                                    "invalid response - chunk shorter than AEAD tag",
+                                )));
+                            }
                             cipher.decrypt_inplace(&mut this.read_buf)?;
                             let data_len = size - cipher.security.overhead_len();
                             this.read_buf.truncate(data_len);
@@ -487,6 +493,12 @@ where
                     }
 
                     let max_payload_size = CHUNK_SIZE - overhead_len;
+                    if this.is_udp && buf.len() > max_payload_size {
+                        return Poll::Ready(Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            "VMess UDP datagram exceeds one chunk",
+                        )));
+                    }
                     let consume_len = std::cmp::min(buf.len(), max_payload_size);
                     let payload_len = consume_len + overhead_len;
 
@@ -575,4 +587,32 @@ fn hash_timestamp(timestamp: u64) -> [u8; 16] {
     hasher.update(timestamp.to_be_bytes());
     hasher.update(timestamp.to_be_bytes());
     hasher.finalize().into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn rejects_udp_datagram_larger_than_one_chunk() {
+        let (client, _server) = tokio::io::duplex(4096);
+        let id = super::super::user::new_id(&uuid::Uuid::nil());
+        let dst = SocksAddr::Ip("127.0.0.1:53".parse().unwrap());
+        let mut stream = VmessStream::new(
+            client,
+            &id,
+            &dst,
+            &SECURITY_AES_128_GCM,
+            true,
+            true,
+        )
+        .await
+        .unwrap();
+
+        let err = stream
+            .write(&vec![0; CHUNK_SIZE - 16 + 1])
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
 }

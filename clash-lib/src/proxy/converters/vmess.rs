@@ -52,18 +52,19 @@ pub fn build_handler(
                 .clone()
                 .map(|x| match x.as_str() {
                     "tcp" => Ok(None),
-                    "ws" => s
-                        .ws_opts
-                        .as_ref()
-                        .map(|x| {
-                            let client: WsClient = (x, &s.common_opts)
-                                .try_into()
-                                .expect("invalid ws options");
-                            Some(TransportLayer::Ws(client))
-                        })
-                        .ok_or(Error::InvalidConfig(
+                    "ws" => {
+                        let opts = s.ws_opts.as_ref().ok_or(Error::InvalidConfig(
                             "ws_opts is required for ws".to_owned(),
-                        )),
+                        ))?;
+                        let client: WsClient = (opts, &s.common_opts)
+                            .try_into()
+                            .map_err(|e| {
+                                Error::InvalidConfig(format!(
+                                    "invalid ws options: {e}"
+                                ))
+                            })?;
+                        Ok(Some(TransportLayer::Ws(client)))
+                    }
                     "http" => {
                         let default_http_opts =
                             crate::config::proxy::HttpOpt::default();
@@ -78,31 +79,33 @@ pub fn build_handler(
                             })?;
                         Ok(Some(TransportLayer::Http(client)))
                     }
-                    "h2" => s
-                        .h2_opts
-                        .as_ref()
-                        .map(|x| {
-                            let client: H2Client = (x, &s.common_opts)
-                                .try_into()
-                                .expect("invalid h2 options");
-                            Some(TransportLayer::H2(client))
-                        })
-                        .ok_or(Error::InvalidConfig(
+                    "h2" => {
+                        let opts = s.h2_opts.as_ref().ok_or(Error::InvalidConfig(
                             "h2_opts is required for h2".to_owned(),
-                        )),
-                    "grpc" => s
-                        .grpc_opts
-                        .as_ref()
-                        .map(|x| {
-                            let client: GrpcClient =
-                                (s.server_name.clone(), x, &s.common_opts)
-                                    .try_into()
-                                    .expect("invalid grpc options");
-                            Some(TransportLayer::Grpc(client))
-                        })
-                        .ok_or(Error::InvalidConfig(
+                        ))?;
+                        let client: H2Client = (opts, &s.common_opts)
+                            .try_into()
+                            .map_err(|e| {
+                                Error::InvalidConfig(format!(
+                                    "invalid h2 options: {e}"
+                                ))
+                            })?;
+                        Ok(Some(TransportLayer::H2(client)))
+                    }
+                    "grpc" => {
+                        let opts = s.grpc_opts.as_ref().ok_or(Error::InvalidConfig(
                             "grpc_opts is required for grpc".to_owned(),
-                        )),
+                        ))?;
+                        let client: GrpcClient =
+                            (s.server_name.clone(), opts, &s.common_opts)
+                                .try_into()
+                                .map_err(|e| {
+                                    Error::InvalidConfig(format!(
+                                        "invalid grpc options: {e}"
+                                    ))
+                                })?;
+                        Ok(Some(TransportLayer::Grpc(client)))
+                    }
                     _ => Err(Error::InvalidConfig(format!(
                         "unsupported network: {x}"
                     ))),
@@ -162,7 +165,9 @@ impl TryFrom<&OutboundVmess> for Handler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::internal::proxy::{CommonConfigOptions, H2Opt, HttpOpt};
+    use crate::config::internal::proxy::{
+        CommonConfigOptions, GrpcOpt, H2Opt, HttpOpt,
+    };
     use std::collections::HashMap;
 
     #[test]
@@ -223,6 +228,43 @@ mod tests {
             handler.is_ok(),
             "VMess handler with network: h2 should parse successfully"
         );
+    }
+
+    #[test]
+    fn invalid_transport_paths_return_config_errors() {
+        let common_opts = CommonConfigOptions {
+            name: "invalid-path".to_string(),
+            server: "example.com".to_string(),
+            port: 443,
+            ..Default::default()
+        };
+
+        let h2 = OutboundVmess {
+            common_opts: common_opts.clone(),
+            network: Some("h2".to_string()),
+            h2_opts: Some(H2Opt {
+                host: None,
+                path: Some("/bad path".to_string()),
+            }),
+            ..Default::default()
+        };
+        assert!(matches!(
+            Handler::try_from(&h2),
+            Err(Error::InvalidConfig(_))
+        ));
+
+        let grpc = OutboundVmess {
+            common_opts,
+            network: Some("grpc".to_string()),
+            grpc_opts: Some(GrpcOpt {
+                grpc_service_name: Some("bad path".to_string()),
+            }),
+            ..Default::default()
+        };
+        assert!(matches!(
+            Handler::try_from(&grpc),
+            Err(Error::InvalidConfig(_))
+        ));
     }
 
     #[test]

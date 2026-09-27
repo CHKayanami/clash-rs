@@ -26,7 +26,7 @@ pub(crate) struct AeadCipher {
     pub security: VmessSecurity,
     nonce: [u8; 32],
     iv: Bytes,
-    count: u16,
+    count: u32,
 }
 
 impl AeadCipher {
@@ -40,14 +40,18 @@ impl AeadCipher {
     }
 
     pub fn decrypt_inplace(&mut self, buf: &mut [u8]) -> std::io::Result<()> {
+        if buf.len() < self.security.overhead_len() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "VMess AEAD chunk is shorter than its authentication tag",
+            ));
+        }
         let mut nonce = self.nonce;
+        nonce[..2].copy_from_slice(&self.next_count()?.to_be_bytes());
         let security = &self.security;
         let iv = &self.iv;
-        let count = &mut self.count;
 
-        nonce[..2].copy_from_slice(&count.to_be_bytes());
         nonce[2..12].copy_from_slice(&iv[2..12]);
-        *count += 1;
 
         let nonce = &nonce[..security.nonce_len()];
         match security {
@@ -78,13 +82,11 @@ impl AeadCipher {
 
     pub fn encrypt_inplace(&mut self, buf: &mut [u8]) -> std::io::Result<()> {
         let mut nonce = self.nonce;
+        nonce[..2].copy_from_slice(&self.next_count()?.to_be_bytes());
         let security = &self.security;
         let iv = &self.iv;
-        let count = &mut self.count;
 
-        nonce[..2].copy_from_slice(&count.to_be_bytes());
         nonce[2..12].copy_from_slice(&iv[2..12]);
-        *count += 1;
 
         let nonce = &nonce[..security.nonce_len()];
         match security {
@@ -97,5 +99,46 @@ impl AeadCipher {
         }
 
         Ok(())
+    }
+
+    fn next_count(&mut self) -> std::io::Result<u16> {
+        let count = u16::try_from(self.count).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "VMess AEAD chunk counter exhausted",
+            )
+        })?;
+        self.count += 1;
+        Ok(count)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cipher() -> AeadCipher {
+        AeadCipher::new(
+            &[0; 16],
+            VmessSecurity::Aes128Gcm(Aes128Gcm::new_with_slice(&[0; 16])),
+        )
+    }
+
+    #[test]
+    fn rejects_short_aead_chunk() {
+        let mut cipher = cipher();
+        let err = cipher.decrypt_inplace(&mut [0; 15]).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(cipher.count, 0);
+    }
+
+    #[test]
+    fn refuses_to_reuse_aead_nonce() {
+        let mut cipher = cipher();
+        cipher.count = u16::MAX as u32;
+        cipher.encrypt_inplace(&mut [0; 16]).unwrap();
+        let err = cipher.encrypt_inplace(&mut [0; 16]).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(cipher.count, u16::MAX as u32 + 1);
     }
 }
