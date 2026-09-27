@@ -39,6 +39,7 @@ pub fn build_handler(
             name: s.common_opts.name.to_owned(),
             common_opts: HandlerCommonOptions {
                 connector: s.common_opts.connect_via.clone(),
+                tfo: s.common_opts.tfo,
                 ..Default::default()
             },
             server: s.common_opts.server.to_owned(),
@@ -90,19 +91,17 @@ pub fn build_handler(
                         .ok_or(Error::InvalidConfig(
                             "ws_opts is required for ws".to_owned(),
                         )),
-                    "grpc" => s
-                        .grpc_opts
-                        .as_ref()
-                        .map(|x| {
-                            let client: GrpcClient =
-                                (s.sni.clone(), x, &s.common_opts)
-                                    .try_into()
-                                    .expect("invalid grpc_opts");
-                            Some(TransportLayer::Grpc(client))
-                        })
-                        .ok_or(Error::InvalidConfig(
-                            "grpc_opts is required for grpc".to_owned(),
-                        )),
+                    "grpc" => {
+                        let opts = s.grpc_opts.as_ref().ok_or_else(|| {
+                            Error::InvalidConfig("grpc_opts is required for grpc".to_owned())
+                        })?;
+                        let client: GrpcClient = (s.sni.clone(), opts, &s.common_opts)
+                            .try_into()
+                            .map_err(|e| {
+                                Error::InvalidConfig(format!("invalid grpc options: {e}"))
+                            })?;
+                        Ok(Some(TransportLayer::Grpc(client)))
+                    }
                     _ => Err(Error::InvalidConfig(format!(
                         "unsupported trojan network: {x}"
                     ))),
@@ -127,7 +126,7 @@ impl TryFrom<&OutboundTrojan> for Handler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::internal::proxy::CommonConfigOptions;
+    use crate::config::internal::proxy::{CommonConfigOptions, GrpcOpt};
 
     #[test]
     fn test_trojan_network_tcp() {
@@ -150,5 +149,29 @@ mod tests {
             handler.is_ok(),
             "Trojan handler with network: tcp should parse successfully"
         );
+    }
+
+    #[test]
+    fn invalid_grpc_service_name_returns_error() {
+        crate::tests::initialize();
+        let config = OutboundTrojan {
+            common_opts: CommonConfigOptions {
+                name: "invalid-grpc".to_owned(),
+                server: "example.com".to_owned(),
+                port: 443,
+                ..Default::default()
+            },
+            password: "test-password".to_owned(),
+            network: Some("grpc".to_owned()),
+            grpc_opts: Some(GrpcOpt {
+                grpc_service_name: Some("invalid service".to_owned()),
+            }),
+            ..Default::default()
+        };
+
+        assert!(matches!(
+            Handler::try_from(&config),
+            Err(Error::InvalidConfig(message)) if message.contains("invalid grpc options")
+        ));
     }
 }
