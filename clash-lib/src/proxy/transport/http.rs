@@ -10,6 +10,8 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use crate::proxy::{AnyStream, transport::Transport};
 
+const MAX_RESPONSE_HEADER_SIZE: usize = 64 * 1024;
+
 pub struct Client {
     host: String,
     port: u16,
@@ -227,7 +229,11 @@ impl AsyncRead for HttpStream {
     ) -> Poll<io::Result<()>> {
         let this = self.get_mut();
 
-        if !this.read_buf.is_empty() {
+        if buf.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
+
+        if !this.first_response && !this.read_buf.is_empty() {
             let to_read = std::cmp::min(buf.remaining(), this.read_buf.len());
             let data = this.read_buf.split_to(to_read);
             buf.put_slice(&data);
@@ -255,6 +261,36 @@ impl AsyncRead for HttpStream {
                             .position(|w| w == needle);
 
                         if let Some(idx) = idx {
+                            if idx + needle.len() > MAX_RESPONSE_HEADER_SIZE {
+                                return Poll::Ready(Err(io::Error::new(
+                                    io::ErrorKind::InvalidData,
+                                    "HTTP response header too large",
+                                )));
+                            }
+                            let status_line_end = this.read_buf[..idx]
+                                .windows(2)
+                                .position(|w| w == b"\r\n")
+                                .unwrap_or(idx);
+                            let status_line = std::str::from_utf8(
+                                &this.read_buf[..status_line_end],
+                            )
+                            .map_err(|e| {
+                                io::Error::new(io::ErrorKind::InvalidData, e)
+                            })?;
+                            let mut parts = status_line.split_whitespace();
+                            let version = parts.next().unwrap_or_default();
+                            let status =
+                                parts.next().and_then(|s| s.parse::<u16>().ok());
+                            if !version.starts_with("HTTP/1.")
+                                || !matches!(status, Some(200..=299))
+                            {
+                                return Poll::Ready(Err(io::Error::new(
+                                    io::ErrorKind::ConnectionRefused,
+                                    format!(
+                                        "HTTP transport rejected response: {status_line}"
+                                    ),
+                                )));
+                            }
                             this.first_response = false;
                             let _ = this.read_buf.split_to(idx + needle.len());
                             let to_read =
@@ -262,8 +298,15 @@ impl AsyncRead for HttpStream {
                             if to_read > 0 {
                                 let data = this.read_buf.split_to(to_read);
                                 buf.put_slice(&data);
+                                return Poll::Ready(Ok(()));
                             }
-                            return Poll::Ready(Ok(()));
+                            return Pin::new(&mut this.inner).poll_read(cx, buf);
+                        }
+                        if this.read_buf.len() > MAX_RESPONSE_HEADER_SIZE {
+                            return Poll::Ready(Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "HTTP response header too large",
+                            )));
                         }
                     }
                     Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
@@ -318,10 +361,7 @@ mod tests {
         let (client_io, mut server_io) = tokio::io::duplex(4096);
 
         let mut headers = HashMap::new();
-        headers.insert(
-            "Host".to_string(),
-            vec!["custom.host.com".to_string()],
-        );
+        headers.insert("Host".to_string(), vec!["custom.host.com".to_string()]);
 
         let client = Client::new(
             "example.com".to_string(),
@@ -352,10 +392,84 @@ mod tests {
 
         // Server responds with fake HTTP response headers + payload
         server_io
-            .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\npong payload")
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\npong payload",
+            )
             .await
             .unwrap();
 
         write_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn rejects_http_error_response() {
+        let (client_io, mut server_io) = tokio::io::duplex(4096);
+        let client = Client::new(
+            "example.com".into(),
+            80,
+            "GET".into(),
+            vec![],
+            HashMap::new(),
+        );
+        let mut stream = client.proxy_stream(Box::new(client_io)).await.unwrap();
+        server_io
+            .write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n")
+            .await
+            .unwrap();
+        let mut data = [0; 1];
+        let err = stream.read(&mut data).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::ConnectionRefused);
+    }
+
+    #[tokio::test]
+    async fn rejects_oversized_http_response_header() {
+        let (client_io, mut server_io) = tokio::io::duplex(4096);
+        let client = Client::new(
+            "example.com".into(),
+            80,
+            "GET".into(),
+            vec![],
+            HashMap::new(),
+        );
+        let mut stream = client.proxy_stream(Box::new(client_io)).await.unwrap();
+        let writer = tokio::spawn(async move {
+            server_io
+                .write_all(b"HTTP/1.1 200 OK\r\nX-Fill: ")
+                .await
+                .unwrap();
+            let _ = server_io
+                .write_all(&vec![b'a'; MAX_RESPONSE_HEADER_SIZE])
+                .await;
+        });
+        let mut data = [0; 1];
+        let err = stream.read(&mut data).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        writer.abort();
+    }
+
+    #[tokio::test]
+    async fn waits_for_payload_after_header_only_response() {
+        let (client_io, mut server_io) = tokio::io::duplex(4096);
+        let client = Client::new(
+            "example.com".into(),
+            80,
+            "GET".into(),
+            vec![],
+            HashMap::new(),
+        );
+        let mut stream = client.proxy_stream(Box::new(client_io)).await.unwrap();
+        server_io
+            .write_all(b"HTTP/1.1 200 OK\r\n\r\n")
+            .await
+            .unwrap();
+
+        let mut data = [0; 4];
+        let read = stream.read(&mut data);
+        tokio::pin!(read);
+        assert!(matches!(futures::poll!(read.as_mut()), Poll::Pending));
+
+        server_io.write_all(b"pong").await.unwrap();
+        assert_eq!(read.await.unwrap(), 4);
+        assert_eq!(&data, b"pong");
     }
 }

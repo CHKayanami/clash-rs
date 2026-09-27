@@ -143,7 +143,8 @@ impl AsyncRead for Http2Stream {
                         |_| Ok(()),
                     )
             }
-            _ => Ok(()),
+            Some(Err(e)) => Err(map_io_error(e)),
+            None => Ok(()),
         })
     }
 }

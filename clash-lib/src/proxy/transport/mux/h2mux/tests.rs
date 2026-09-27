@@ -1,5 +1,9 @@
 use bytes::Bytes;
 use http::Response;
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use super::{pool::H2MuxPool, protocol::*, session::H2MuxSession};
@@ -36,11 +40,13 @@ fn test_mux_option_validation() {
 
 #[test]
 fn test_stream_request_encoding() {
-    let req_ip = StreamRequest::new(SocksAddr::Ip("1.2.3.4:80".parse().unwrap()), false);
+    let req_ip =
+        StreamRequest::new(SocksAddr::Ip("1.2.3.4:80".parse().unwrap()), false);
     let bytes_ip = req_ip.encode().unwrap();
     assert_eq!(&bytes_ip[..3], &[0x00, 0x00, 0x01]); // flags=0, type=1 (ipv4)
 
-    let req_domain = StreamRequest::new(SocksAddr::Domain("example.com".into(), 443), false);
+    let req_domain =
+        StreamRequest::new(SocksAddr::Domain("example.com".into(), 443), false);
     let bytes_domain = req_domain.encode().unwrap();
     assert_eq!(&bytes_domain[..4], &[0x00, 0x00, 0x03, 11]); // flags=0, type=3, len=11
 }
@@ -75,11 +81,13 @@ async fn test_h2mux_session_echo_and_concurrency() {
 
             tokio::spawn(async move {
                 let response = Response::builder().status(200).body(()).unwrap();
-                let mut send_stream = respond.send_response(response, false).unwrap();
+                let mut send_stream =
+                    respond.send_response(response, false).unwrap();
                 let mut recv_stream = req.into_body();
 
                 // Send sing-box StreamResponse success (0x00)
-                let _ = send_stream.send_data(Bytes::from_static(&[STATUS_SUCCESS]), false);
+                let _ = send_stream
+                    .send_data(Bytes::from_static(&[STATUS_SUCCESS]), false);
 
                 let mut first_frame = true;
                 while let Some(Ok(chunk)) = recv_stream.data().await {
@@ -115,6 +123,12 @@ async fn test_h2mux_session_echo_and_concurrency() {
         .await
         .unwrap();
 
+    let invalid = SocksAddr::Domain("x".repeat(256).into(), 80);
+    let err = session.open_stream(&invalid, false).await.err().unwrap();
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    assert!(!session.is_closed());
+    assert_eq!(session.active_streams(), 0);
+
     let dst = SocksAddr::Ip("1.2.3.4:8080".parse().unwrap());
 
     // Test multiple concurrent streams
@@ -136,6 +150,10 @@ async fn test_h2mux_session_echo_and_concurrency() {
     for h in handles {
         h.await.unwrap();
     }
+
+    session.retire();
+    assert!(session.is_closed());
+    assert!(!session.is_available());
 }
 
 #[tokio::test]
@@ -160,10 +178,12 @@ async fn test_h2mux_pool_dispatch() {
             while let Some(Ok((req, mut respond))) = server.accept().await {
                 tokio::spawn(async move {
                     let response = Response::builder().status(200).body(()).unwrap();
-                    let mut send_stream = respond.send_response(response, false).unwrap();
+                    let mut send_stream =
+                        respond.send_response(response, false).unwrap();
                     let mut recv_stream = req.into_body();
 
-                    let _ = send_stream.send_data(Bytes::from_static(&[STATUS_SUCCESS]), false);
+                    let _ = send_stream
+                        .send_data(Bytes::from_static(&[STATUS_SUCCESS]), false);
 
                     let mut first = true;
                     while let Some(Ok(chunk)) = recv_stream.data().await {
@@ -172,7 +192,8 @@ async fn test_h2mux_pool_dispatch() {
                         if first {
                             first = false;
                             if chunk.len() > 9 {
-                                let _ = send_stream.send_data(chunk.slice(9..), false);
+                                let _ =
+                                    send_stream.send_data(chunk.slice(9..), false);
                             }
                         } else {
                             let _ = send_stream.send_data(chunk, false);
@@ -198,4 +219,111 @@ async fn test_h2mux_pool_dispatch() {
     let mut buf2 = [0u8; 4];
     stream2.read_exact(&mut buf2).await.unwrap();
     assert_eq!(&buf2, b"pong");
+}
+
+#[tokio::test]
+async fn test_h2mux_pool_does_not_dial_past_connection_limit() {
+    let opt = MuxOption {
+        enable: true,
+        max_connections: 1,
+        max_streams: 1,
+        padding: false,
+        ..Default::default()
+    };
+    let pool = H2MuxPool::new(opt);
+    let dials = Arc::new(AtomicUsize::new(0));
+    let dialer = || {
+        let dials = dials.clone();
+        async move {
+            dials.fetch_add(1, Ordering::SeqCst);
+            let (client_io, mut server_io) = tokio::io::duplex(4096);
+            tokio::spawn(async move {
+                server_io.read_u8().await.unwrap();
+                server_io.read_u8().await.unwrap();
+                let mut server = h2::server::handshake(server_io).await.unwrap();
+                while let Some(Ok((_req, mut respond))) = server.accept().await {
+                    let response = Response::builder().status(200).body(()).unwrap();
+                    let mut send = respond.send_response(response, false).unwrap();
+                    send.send_data(Bytes::from_static(&[STATUS_SUCCESS]), false)
+                        .unwrap();
+                }
+            });
+            Ok(Box::new(client_io) as AnyStream)
+        }
+    };
+    let dst = SocksAddr::Ip("1.2.3.4:80".parse().unwrap());
+    let first = pool.open_stream(&dst, false, dialer).await.unwrap();
+    let error = pool.open_stream(&dst, false, dialer).await.err().unwrap();
+    assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+    assert_eq!(dials.load(Ordering::SeqCst), 1);
+    drop(first);
+}
+
+#[tokio::test]
+async fn test_h2mux_pool_reuses_session_during_slow_dial() {
+    fn mock_carrier() -> AnyStream {
+        let (client_io, mut server_io) = tokio::io::duplex(4096);
+        tokio::spawn(async move {
+            server_io.read_u8().await.unwrap();
+            server_io.read_u8().await.unwrap();
+            let mut server = h2::server::handshake(server_io).await.unwrap();
+            while let Some(Ok((_req, mut respond))) = server.accept().await {
+                let response = Response::builder().status(200).body(()).unwrap();
+                let mut send = respond.send_response(response, false).unwrap();
+                send.send_data(Bytes::from_static(&[STATUS_SUCCESS]), false)
+                    .unwrap();
+            }
+        });
+        Box::new(client_io)
+    }
+
+    let pool = H2MuxPool::new(MuxOption {
+        enable: true,
+        max_connections: 2,
+        min_streams: 1,
+        max_streams: 10,
+        padding: false,
+        ..Default::default()
+    });
+    let dst = SocksAddr::Ip("1.2.3.4:80".parse().unwrap());
+    let first = pool
+        .open_stream(&dst, false, || async { Ok(mock_carrier()) })
+        .await
+        .unwrap();
+
+    let started = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let release_after_reuse = release.clone();
+    let started_wait = started.notified();
+    let started_for_dial = started.clone();
+    let second_pool = pool.clone();
+    let second_dst = dst.clone();
+    let second = tokio::spawn(async move {
+        second_pool
+            .open_stream(&second_dst, false, || {
+                let started = started_for_dial.clone();
+                let release = release.clone();
+                async move {
+                    started.notify_one();
+                    release.notified().await;
+                    Ok(mock_carrier())
+                }
+            })
+            .await
+    });
+    started_wait.await;
+
+    let third = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        pool.open_stream(&dst, false, || async {
+            Err(std::io::Error::other("unexpected carrier dial"))
+        }),
+    )
+    .await
+    .expect("existing session must remain available during dial")
+    .unwrap();
+
+    release_after_reuse.notify_one();
+    let second = second.await.unwrap().unwrap();
+    drop((first, second, third));
 }

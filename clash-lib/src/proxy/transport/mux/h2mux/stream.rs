@@ -13,7 +13,7 @@ use tokio::{
     sync::oneshot,
 };
 
-use super::protocol::{STATUS_ERROR, STATUS_SUCCESS, StreamRequest};
+use super::protocol::{STATUS_ERROR, STATUS_SUCCESS};
 use crate::proxy::ProxyStream;
 
 pub trait StreamCloser: Send + Sync {
@@ -49,10 +49,9 @@ impl H2MuxStream {
     pub fn new(
         response_future: ResponseFuture,
         send: SendStream<Bytes>,
-        request: StreamRequest,
+        request_bytes: Bytes,
         closer: Option<Arc<dyn StreamCloser>>,
-    ) -> io::Result<Self> {
-        let request_bytes = Bytes::from(request.encode()?);
+    ) -> Self {
         let (tx, rx) = oneshot::channel();
 
         tokio::spawn(async move {
@@ -63,7 +62,10 @@ impl H2MuxStream {
                     } else {
                         let _ = tx.send(Err(io::Error::new(
                             io::ErrorKind::ConnectionRefused,
-                            format!("h2mux server returned status: {}", response.status()),
+                            format!(
+                                "h2mux server returned status: {}",
+                                response.status()
+                            ),
                         )));
                     }
                 }
@@ -76,7 +78,7 @@ impl H2MuxStream {
             }
         });
 
-        Ok(Self {
+        Self {
             recv: None,
             recv_pending: Some(rx),
             send,
@@ -85,7 +87,7 @@ impl H2MuxStream {
             request_bytes: Some(request_bytes),
             pending_write: None,
             response_read: false,
-        })
+        }
     }
 
     fn poll_resolve_recv(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -202,7 +204,10 @@ impl H2MuxStream {
         Ok(msg)
     }
 
-    fn poll_h2_stream(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<Option<Bytes>>> {
+    fn poll_h2_stream(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<io::Result<Option<Bytes>>> {
         let recv = self.recv.as_mut().expect("recv should be resolved");
         match Pin::new(recv).poll_data(cx) {
             Poll::Ready(Some(Ok(data))) => {
@@ -257,14 +262,18 @@ impl AsyncRead for H2MuxStream {
                         if data.is_empty() {
                             continue;
                         }
-                        let mut new_buf = BytesMut::with_capacity(self.recv_buf.len() + data.len());
+                        let mut new_buf = BytesMut::with_capacity(
+                            self.recv_buf.len() + data.len(),
+                        );
                         new_buf.put_slice(&self.recv_buf);
                         new_buf.put_slice(&data);
                         self.recv_buf = new_buf.freeze();
 
                         match self.read_status_response() {
                             Ok(()) => break,
-                            Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
+                            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                                continue;
+                            }
                             Err(e) => return Poll::Ready(Err(e)),
                         }
                     }
@@ -325,13 +334,17 @@ impl AsyncWrite for H2MuxStream {
 
                     let new_sent = sent + to_send;
                     if new_sent < pending_data.len() {
-                        self.pending_write = Some((pending_data, user_len, new_sent));
+                        self.pending_write =
+                            Some((pending_data, user_len, new_sent));
                         return Poll::Pending;
                     }
                     return Poll::Ready(Ok(user_len));
                 }
                 Poll::Ready(Some(Err(e))) => {
-                    return Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, e)));
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        e,
+                    )));
                 }
                 Poll::Ready(None) => {
                     return Poll::Ready(Err(io::Error::new(
@@ -366,7 +379,8 @@ impl AsyncWrite for H2MuxStream {
                         .map_err(|e| io::Error::new(io::ErrorKind::BrokenPipe, e))?;
 
                     if to_send < combined.len() {
-                        let user_written = to_send.saturating_sub(request_len).min(buf.len());
+                        let user_written =
+                            to_send.saturating_sub(request_len).min(buf.len());
                         self.pending_write = Some((combined, user_written, to_send));
                         Poll::Pending
                     } else {
@@ -411,7 +425,10 @@ impl AsyncWrite for H2MuxStream {
         }
     }
 
-    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+    fn poll_flush(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+    ) -> Poll<io::Result<()>> {
         Poll::Ready(Ok(()))
     }
 
@@ -422,12 +439,10 @@ impl AsyncWrite for H2MuxStream {
         self.send.reserve_capacity(0);
         Poll::Ready(match ready!(self.send.poll_capacity(cx)) {
             Some(Ok(_)) | None => {
-                self.send
-                    .send_data(Bytes::new(), true)
-                    .map_or_else(
-                        |e| Err(io::Error::new(io::ErrorKind::BrokenPipe, e)),
-                        |_| Ok(()),
-                    )
+                self.send.send_data(Bytes::new(), true).map_or_else(
+                    |e| Err(io::Error::new(io::ErrorKind::BrokenPipe, e)),
+                    |_| Ok(()),
+                )
             }
             Some(Err(e)) => Err(io::Error::new(io::ErrorKind::BrokenPipe, e)),
         })

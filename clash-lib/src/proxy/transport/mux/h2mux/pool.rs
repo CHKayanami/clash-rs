@@ -1,8 +1,5 @@
-use std::{
-    future::Future,
-    io,
-    sync::Arc,
-};
+use parking_lot::RwLock;
+use std::{future::Future, io, sync::Arc};
 use tokio::sync::Mutex;
 use tracing::{debug, warn};
 
@@ -14,15 +11,35 @@ use crate::{
 
 pub struct H2MuxPool {
     opt: MuxOption,
-    sessions: Mutex<Vec<Arc<H2MuxSession>>>,
+    sessions: RwLock<Vec<Arc<H2MuxSession>>>,
+    connecting: Mutex<()>,
 }
 
 impl H2MuxPool {
     pub fn new(opt: MuxOption) -> Arc<Self> {
         Arc::new(Self {
             opt,
-            sessions: Mutex::new(Vec::new()),
+            sessions: RwLock::new(Vec::new()),
+            connecting: Mutex::new(()),
         })
+    }
+
+    fn choose_session(
+        sessions: &[Arc<H2MuxSession>],
+        min_streams: usize,
+        max_conns: usize,
+    ) -> (Option<Arc<H2MuxSession>>, bool) {
+        let best = sessions
+            .iter()
+            .filter(|s| s.is_available())
+            .min_by_key(|s| s.active_streams())
+            .cloned();
+        let live_count = sessions.iter().filter(|s| !s.is_closed()).count();
+        let should_create = live_count < max_conns
+            && best
+                .as_ref()
+                .is_none_or(|s| s.active_streams() >= min_streams);
+        (best, should_create)
     }
 
     pub async fn open_stream<F, Fut>(
@@ -46,69 +63,75 @@ impl H2MuxPool {
             self.opt.min_streams
         };
 
+        let mut last_error = None;
         for attempt in 0..2 {
-            let session = {
-                let mut sessions = self.sessions.lock().await;
-                // Retain only alive sessions
-                sessions.retain(|s| !s.is_closed());
-
-                // Find candidate with lowest active stream count
-                let mut best_idx = None;
-                let mut min_active = usize::MAX;
-
-                for (i, s) in sessions.iter().enumerate() {
-                    if s.is_available() {
-                        let active = s.active_streams();
-                        if active < min_active {
-                            min_active = active;
-                            best_idx = Some(i);
-                        }
-                    }
-                }
-
-                // If no available session or all sessions have >= min_streams and we can add more connections
-                let need_new = match best_idx {
-                    None => true,
-                    Some(_) if min_active >= min_streams && sessions.len() < max_conns => true,
-                    _ => false,
+            let (existing, should_create) = {
+                let sessions = self.sessions.read();
+                Self::choose_session(&sessions, min_streams, max_conns)
+            };
+            let session = if should_create {
+                // Only new connections wait on this lock. If another dial is
+                // already in progress, an available carrier can be reused.
+                let creation_guard = match self.connecting.try_lock() {
+                    Ok(guard) => Some(guard),
+                    Err(_) if existing.is_some() => None,
+                    Err(_) => Some(self.connecting.lock().await),
                 };
-
-                if need_new && sessions.len() < max_conns {
-                    drop(sessions);
-                    debug!("dialing new carrier connection for h2mux session");
-                    let carrier = dial_carrier().await?;
-                    let new_session = H2MuxSession::new(carrier, self.opt.clone()).await?;
-                    let mut sessions = self.sessions.lock().await;
-                    sessions.retain(|s| !s.is_closed());
-                    sessions.push(new_session.clone());
-                    new_session
-                } else if let Some(i) = best_idx {
-                    sessions[i].clone()
+                if let Some(_creation_guard) = creation_guard {
+                    // Another creator may have filled the slot while we waited.
+                    let (existing, should_create) = {
+                        let sessions = self.sessions.read();
+                        Self::choose_session(&sessions, min_streams, max_conns)
+                    };
+                    if should_create {
+                        debug!("dialing new carrier connection for h2mux session");
+                        let carrier = dial_carrier().await?;
+                        let new_session =
+                            H2MuxSession::new(carrier, self.opt.clone()).await?;
+                        let mut sessions = self.sessions.write();
+                        sessions.retain(|s| !s.is_closed());
+                        sessions.push(new_session.clone());
+                        new_session
+                    } else {
+                        existing.ok_or_else(|| {
+                            io::Error::new(
+                                io::ErrorKind::WouldBlock,
+                                "h2mux connection and stream limits reached",
+                            )
+                        })?
+                    }
                 } else {
-                    // All sessions full and max_connections reached: try creating or return error
-                    drop(sessions);
-                    let carrier = dial_carrier().await?;
-                    let new_session = H2MuxSession::new(carrier, self.opt.clone()).await?;
-                    let mut sessions = self.sessions.lock().await;
-                    sessions.retain(|s| !s.is_closed());
-                    sessions.push(new_session.clone());
-                    new_session
+                    existing.expect("available session was checked above")
                 }
+            } else {
+                existing.ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::WouldBlock,
+                        "h2mux connection and stream limits reached",
+                    )
+                })?
             };
 
             match session.open_stream(destination, is_udp).await {
                 Ok(stream) => return Ok(stream),
                 Err(e) => {
                     warn!("h2mux open_stream failed (attempt {attempt}): {e}");
-                    let mut sessions = self.sessions.lock().await;
+                    if e.kind() == io::ErrorKind::InvalidInput {
+                        return Err(e);
+                    }
+                    session.retire();
+                    let mut sessions = self.sessions.write();
                     sessions.retain(|s| !Arc::ptr_eq(s, &session) && !s.is_closed());
+                    last_error = Some(e);
                 }
             }
         }
 
-        Err(io::Error::new(
-            io::ErrorKind::ConnectionAborted,
-            "failed to open h2mux stream after retry",
-        ))
+        Err(last_error.unwrap_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "failed to open h2mux stream after retry",
+            )
+        }))
     }
 }

@@ -8,6 +8,7 @@ use std::{
     },
 };
 use tokio::sync::Mutex;
+use tokio::task::AbortHandle;
 use tracing::debug;
 
 use super::{
@@ -34,11 +35,15 @@ pub struct H2MuxSession {
     send_request: Mutex<SendRequest<Bytes>>,
     active_streams: Arc<AtomicUsize>,
     closed: Arc<AtomicBool>,
+    driver: AbortHandle,
     opt: MuxOption,
 }
 
 impl H2MuxSession {
-    pub async fn new(mut carrier: AnyStream, opt: MuxOption) -> io::Result<Arc<Self>> {
+    pub async fn new(
+        mut carrier: AnyStream,
+        opt: MuxOption,
+    ) -> io::Result<Arc<Self>> {
         // Send sing-box session request header over raw carrier stream
         let session_req = SessionRequest::new_h2mux(opt.padding);
         session_req.write(&mut carrier).await?;
@@ -55,7 +60,7 @@ impl H2MuxSession {
         let closed = Arc::new(AtomicBool::new(false));
         let closed_clone = closed.clone();
 
-        tokio::spawn(async move {
+        let driver = tokio::spawn(async move {
             if let Err(e) = connection.await {
                 debug!("h2mux connection closed: {}", e);
             }
@@ -66,8 +71,15 @@ impl H2MuxSession {
             send_request: Mutex::new(send_request),
             active_streams: Arc::new(AtomicUsize::new(0)),
             closed,
+            driver: driver.abort_handle(),
             opt,
         }))
+    }
+
+    /// Stop using a carrier immediately after a connection-level failure.
+    pub fn retire(&self) {
+        self.closed.store(true, Ordering::SeqCst);
+        self.driver.abort();
     }
 
     pub fn is_closed(&self) -> bool {
@@ -94,6 +106,10 @@ impl H2MuxSession {
         destination: &SocksAddr,
         is_udp: bool,
     ) -> io::Result<AnyStream> {
+        // Validate the destination before opening an H2 stream. A malformed
+        // address is a caller error and must not retire a healthy carrier.
+        let request_bytes =
+            Bytes::from(StreamRequest::new(destination.clone(), is_udp).encode()?);
         let req = build_h2_connect_request()?;
         let (resp, send_stream) = {
             let sender = {
@@ -101,7 +117,9 @@ impl H2MuxSession {
                 guard.clone()
             };
             let mut ready_sender = sender.ready().await.map_err(map_io_error)?;
-            ready_sender.send_request(req, false).map_err(map_io_error)?
+            ready_sender
+                .send_request(req, false)
+                .map_err(map_io_error)?
         };
 
         self.active_streams.fetch_add(1, Ordering::SeqCst);
@@ -110,14 +128,8 @@ impl H2MuxSession {
             active_streams: self.active_streams.clone(),
         });
 
-        let stream_req = StreamRequest::new(destination.clone(), is_udp);
-
-        let stream = H2MuxStream::new(
-            resp,
-            send_stream,
-            stream_req,
-            Some(closer),
-        )?;
+        let stream =
+            H2MuxStream::new(resp, send_stream, request_bytes, Some(closer));
 
         Ok(Box::new(stream))
     }
