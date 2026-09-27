@@ -3,7 +3,12 @@ mod datagram;
 use datagram::TailscaleDatagramOutbound;
 
 use std::{
-    collections::HashMap, fmt::Debug, io, net::IpAddr, path::PathBuf, sync::Arc,
+    collections::{HashMap, HashSet},
+    fmt::Debug,
+    io,
+    net::IpAddr,
+    path::PathBuf,
+    sync::{Arc, Mutex as StdMutex},
 };
 
 use async_trait::async_trait;
@@ -27,6 +32,94 @@ impl crate::proxy::ProxyStream for tailscale::netstack::TcpStream {}
 
 const TAILSCALE_CLIENT_NAME: &str = "clash-rs";
 const TAILSCALE_STATE_FILE_NAME: &str = "tailscale_state.json";
+const UDP_PORT_START: u16 = 49152;
+
+#[derive(Debug)]
+struct UdpPortReservation {
+    ports: Arc<StdMutex<HashSet<u16>>>,
+    port: u16,
+}
+
+impl Drop for UdpPortReservation {
+    fn drop(&mut self) {
+        self.ports.lock().unwrap().remove(&self.port);
+    }
+}
+
+fn reserve_udp_port(
+    ports: &Arc<StdMutex<HashSet<u16>>>,
+) -> io::Result<UdpPortReservation> {
+    let mut used = ports.lock().unwrap();
+    let start = rand::random_range(UDP_PORT_START..=u16::MAX);
+    for offset in 0..=(u16::MAX - UDP_PORT_START) {
+        let port = UDP_PORT_START
+            + (start - UDP_PORT_START + offset) % (u16::MAX - UDP_PORT_START + 1);
+        if used.insert(port) {
+            return Ok(UdpPortReservation {
+                ports: Arc::clone(ports),
+                port,
+            });
+        }
+    }
+    Err(io::Error::other("no tailscale UDP ports available"))
+}
+
+fn normalize_state_path(path: &std::path::Path) -> PathBuf {
+    if path.is_relative()
+        && path
+            .parent()
+            .is_none_or(|parent| parent.as_os_str().is_empty())
+    {
+        std::path::Path::new(".").join(path)
+    } else {
+        path.to_path_buf()
+    }
+}
+
+async fn prepare_key_state_file(path: &std::path::Path) -> io::Result<PathBuf> {
+    let path = normalize_state_path(path);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        use tokio::io::AsyncWriteExt;
+
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        let mut options = tokio::fs::OpenOptions::new();
+        options.write(true).create_new(true).mode(0o600);
+        match options.open(&path).await {
+            Ok(mut file) => {
+                let state = ::tailscale::keys::PersistState::default();
+                let data =
+                    serde_json::to_vec(&serde_json::json!({ "key_state": state }))
+                        .map_err(io::Error::other)?;
+                file.write_all(&data).await?;
+                file.flush().await?;
+            }
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
+                let metadata = tokio::fs::symlink_metadata(&path).await?;
+                if !metadata.file_type().is_file() {
+                    return Err(io::Error::other(
+                        "tailscale state path is not a regular file",
+                    ));
+                }
+                if metadata.permissions().mode() & 0o777 != 0o600 {
+                    tokio::fs::set_permissions(
+                        &path,
+                        std::fs::Permissions::from_mode(0o600),
+                    )
+                    .await?;
+                }
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(path)
+}
 
 #[derive(Clone)]
 pub struct HandlerOptions {
@@ -42,6 +135,7 @@ pub struct HandlerOptions {
 pub struct Handler {
     opts: HandlerOptions,
     device: Mutex<Option<Arc<::tailscale::Device>>>,
+    udp_ports: Arc<StdMutex<HashSet<u16>>>,
 }
 
 impl Debug for Handler {
@@ -57,14 +151,15 @@ impl Handler {
         Self {
             opts,
             device: Mutex::new(None),
+            udp_ports: Arc::new(StdMutex::new(HashSet::new())),
         }
     }
 
     /// Lazily initialise and return the shared [`tailscale::Device`].
     ///
     /// **State persistence**: when `state_dir` is set the device identity is
-    /// loaded from (and automatically written back to) a JSON file so it
-    /// survives process restarts.  When `state_dir` is `None` the identity is
+    /// loaded from a JSON file so it survives process restarts. When
+    /// `state_dir` is `None` the identity is
     /// held in memory only; the device will register a fresh node on every
     /// startup unless `ephemeral: true` is also set.
     async fn get_device(&self) -> io::Result<Arc<::tailscale::Device>> {
@@ -77,11 +172,10 @@ impl Handler {
             Default::default()
         } else if let Some(state_dir) = self.opts.state_dir.as_ref() {
             // load_key_file reads persisted key material so the device keeps
-            // the same Tailscale identity across restarts.  The tailscale-rs
-            // crate writes updated state back to the file automatically while
-            // the Device is alive; no explicit save step is required.
+            // the same Tailscale identity across restarts.
             let state_file =
                 PathBuf::from(state_dir).join(TAILSCALE_STATE_FILE_NAME);
+            let state_file = prepare_key_state_file(&state_file).await?;
             load_key_file(state_file, BadFormatBehavior::Error)
                 .await
                 .map_err(|e| {
@@ -119,13 +213,12 @@ impl Handler {
             })?;
         }
 
-        // tailscale-rs requires this env var as an acknowledgement that the
-        // crate is experimental.  Set it on behalf of the user so they don't
-        // need to configure it themselves.
-        // SAFETY: single-threaded point inside a Mutex-guarded lazy-init block;
-        // no other thread is reading or writing this variable concurrently.
-        unsafe {
-            std::env::set_var("TS_RS_EXPERIMENT", "this_is_unstable_software");
+        if std::env::var("TS_RS_EXPERIMENT").as_deref()
+            != Ok("this_is_unstable_software")
+        {
+            return Err(io::Error::other(
+                "set TS_RS_EXPERIMENT=this_is_unstable_software before starting the process",
+            ));
         }
 
         let device = Arc::new(
@@ -193,10 +286,25 @@ impl OutboundHandler for Handler {
         resolver: ThreadSafeDNSResolver,
     ) -> std::io::Result<AnyOutboundDatagram> {
         let device = self.get_device().await?;
-        let local_ip: IpAddr = match &sess.destination {
-            // Strict: IP literal family must match — fail fast rather than binding
-            // wrong family
-            SocksAddr::Ip(addr) if addr.is_ipv6() => {
+        let destination_ip = match &sess.destination {
+            SocksAddr::Ip(addr) => addr.ip(),
+            SocksAddr::Domain(host, _) => {
+                match resolver.resolve_v4(host, false).await {
+                    Ok(Some(ip)) => IpAddr::V4(ip),
+                    _ => resolver
+                        .resolve_v6(host, false)
+                        .await
+                        .map_err(map_io_error)?
+                        .map(IpAddr::V6)
+                        .ok_or_else(|| {
+                            io::Error::other(format!("no DNS result for {host}"))
+                        })?,
+                }
+            }
+        };
+        let local_ip: IpAddr = match destination_ip {
+            // Bind to the same address family as the resolved destination.
+            IpAddr::V6(_) => {
                 device.ipv6_addr().await.map(IpAddr::V6).map_err(|e| {
                     io::Error::other(format!(
                         "failed to fetch tailscale ipv6 address for ipv6 \
@@ -204,7 +312,7 @@ impl OutboundHandler for Handler {
                     ))
                 })?
             }
-            SocksAddr::Ip(_) => {
+            IpAddr::V4(_) => {
                 device.ipv4_addr().await.map(IpAddr::V4).map_err(|e| {
                     io::Error::other(format!(
                         "failed to fetch tailscale ipv4 address for ipv4 \
@@ -212,19 +320,10 @@ impl OutboundHandler for Handler {
                     ))
                 })?
             }
-            // Domain destination: v4-first with v6 fallback is appropriate
-            SocksAddr::Domain(..) => match device.ipv4_addr().await {
-                Ok(ip) => IpAddr::V4(ip),
-                Err(_) => device.ipv6_addr().await.map(IpAddr::V6).map_err(|e| {
-                    io::Error::other(format!(
-                        "failed to fetch tailscale address: {e}"
-                    ))
-                })?,
-            },
         };
-        let port = rand::random_range(49152u16..=u16::MAX);
+        let port_reservation = reserve_udp_port(&self.udp_ports)?;
         let udp = device
-            .udp_bind((local_ip, port).into())
+            .udp_bind((local_ip, port_reservation.port).into())
             .await
             .map_err(|e| {
                 io::Error::other(format!(
@@ -232,7 +331,7 @@ impl OutboundHandler for Handler {
                 ))
             })?;
 
-        let d = TailscaleDatagramOutbound::new(udp, resolver);
+        let d = TailscaleDatagramOutbound::new(udp, resolver, port_reservation);
         sess.push_chain(self.name());
         Ok(Box::new(d))
     }
@@ -280,8 +379,12 @@ impl PlainProxyAPIResponse for Handler {
 
 #[cfg(test)]
 mod tests {
-    use super::{Handler, HandlerOptions};
+    use super::{Handler, HandlerOptions, reserve_udp_port};
     use crate::proxy::{OutboundHandler, PlainProxyAPIResponse};
+    use std::{
+        collections::HashSet,
+        sync::{Arc, Mutex},
+    };
 
     #[cfg(target_os = "linux")]
     use std::net::SocketAddr;
@@ -295,6 +398,60 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     const DNS_TEST_TXID: u16 = 0xBEEF;
+
+    #[test]
+    fn tailscale_udp_ports_do_not_collide() {
+        let ports = Arc::new(Mutex::new(HashSet::new()));
+        let reservations: Vec<_> = (0..1024)
+            .map(|_| reserve_udp_port(&ports).unwrap())
+            .collect();
+        assert_eq!(ports.lock().unwrap().len(), reservations.len());
+        drop(reservations);
+        assert!(ports.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn tailscale_relative_state_file_has_parent_directory() {
+        let path = super::normalize_state_path(std::path::Path::new("state.json"));
+        assert_eq!(path.parent(), Some(std::path::Path::new(".")));
+        #[cfg(unix)]
+        assert_eq!(
+            super::normalize_state_path(std::path::Path::new("/")),
+            std::path::Path::new("/")
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn tailscale_state_file_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        super::prepare_key_state_file(&path).await.unwrap();
+        let metadata = tokio::fs::metadata(&path).await.unwrap();
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+        let _state = tailscale::config::load_key_file(
+            &path,
+            tailscale::config::BadFormatBehavior::Error,
+        )
+        .await
+        .unwrap();
+
+        tokio::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+            .await
+            .unwrap();
+        super::prepare_key_state_file(&path).await.unwrap();
+        assert_eq!(
+            tokio::fs::metadata(&path)
+                .await
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
 
     #[cfg(target_os = "linux")]
     fn build_dns_query(host: &str, txid: u16) -> Vec<u8> {

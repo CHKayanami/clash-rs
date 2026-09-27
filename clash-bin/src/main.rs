@@ -129,6 +129,13 @@ fn env_truthy(name: &str) -> bool {
 }
 
 fn main() -> anyhow::Result<()> {
+    #[cfg(feature = "tailscale")]
+    // SAFETY: main runs before clash-rs starts its Tokio runtime or worker threads.
+    // Library embedders must set this variable before starting their threads.
+    unsafe {
+        std::env::set_var("TS_RS_EXPERIMENT", "this_is_unstable_software");
+    }
+
     #[cfg(feature = "dhat-heap")]
     let _profiler = {
         let path = std::env::var("DHAT_FILE")
