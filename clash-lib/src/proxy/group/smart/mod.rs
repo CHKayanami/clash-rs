@@ -189,7 +189,11 @@ impl Handler {
     ///
     /// # Returns
     /// Selected proxy handler, or None if no suitable proxy available
-    async fn pick_smart(&self, sess: &Session) -> Option<AnyOutboundHandler> {
+    async fn pick_smart(
+        &self,
+        sess: &Session,
+        excluded: Option<&HashSet<String>>,
+    ) -> Option<AnyOutboundHandler> {
         let proxies = self.get_proxies(false);
         if proxies.is_empty() {
             debug!("{} no proxies available", self.name());
@@ -228,6 +232,9 @@ impl Handler {
         let mut candidates: Vec<(f64, AnyOutboundHandler, String)> = Vec::new();
 
         for proxy in proxies.iter() {
+            if excluded.is_some_and(|names| names.contains(proxy.name())) {
+                continue;
+            }
             let name = proxy.name().to_string();
 
             // Get basic metrics from proxy manager
@@ -460,13 +467,9 @@ impl Handler {
         );
 
         while retries < max_retries {
-            match self.pick_smart(sess).await {
+            match self.pick_smart(sess, Some(&tried)).await {
                 Some(proxy) => {
                     let name = proxy.name().to_string();
-                    if tried.contains(&name) {
-                        retries += 1;
-                        continue;
-                    }
                     tried.insert(name.clone());
 
                     let start = Instant::now();
@@ -671,7 +674,7 @@ impl OutboundHandler for Handler {
         resolver: ThreadSafeDNSResolver,
     ) -> io::Result<AnyOutboundDatagram> {
         // For UDP we use the best proxy without retries for simplicity
-        if let Some(proxy) = self.pick_smart(sess).await {
+        if let Some(proxy) = self.pick_smart(sess, None).await {
             debug!("{} use proxy {} (smart)", self.name(), proxy.name());
             let s = proxy.connect_datagram(sess, resolver).await?;
 
@@ -693,11 +696,13 @@ impl OutboundHandler for Handler {
         resolver: ThreadSafeDNSResolver,
         connector: &dyn RemoteConnector,
     ) -> io::Result<AnyStream> {
-        if let Some(proxy) = self.pick_smart(sess).await {
+        if let Some(proxy) = self.pick_smart(sess, None).await {
             debug!("{} use proxy {} (smart)", self.name(), proxy.name());
-            proxy
+            let stream = proxy
                 .connect_stream_with_connector(sess, resolver, connector)
-                .await
+                .await?;
+            sess.push_chain(self.name());
+            Ok(stream)
         } else {
             Err(io::Error::other("no available proxy in smart group"))
         }
@@ -724,6 +729,61 @@ impl GroupProxyAPIResponse for Handler {
 
     fn icon(&self) -> Option<String> {
         self.opts.common_opts.icon.clone()
+    }
+}
+
+#[cfg(test)]
+mod unit_tests {
+    use super::*;
+    use crate::proxy::{
+        mocks::{MockDummyOutboundHandler, MockDummyProxyProvider},
+        utils::test_utils::noop::NoopResolver,
+    };
+
+    #[tokio::test]
+    async fn retry_tries_another_member_after_a_connection_failure() {
+        let mut failing = MockDummyOutboundHandler::new();
+        failing.expect_name().return_const("fast-but-broken".to_owned());
+        failing.expect_connect_stream().returning(|_, _| {
+            Err(io::Error::other("connection failed"))
+        });
+
+        let mut working = MockDummyOutboundHandler::new();
+        working.expect_name().return_const("slower-but-working".to_owned());
+        working.expect_connect_stream().returning(|_, _| {
+            let (stream, _peer) = tokio::io::duplex(64);
+            Ok(Box::new(stream))
+        });
+
+        let proxies: Arc<Vec<AnyOutboundHandler>> = Arc::new(vec![
+            Arc::new(failing),
+            Arc::new(working),
+        ]);
+        let mut provider = MockDummyProxyProvider::new();
+        provider.expect_proxies().returning(move || proxies.clone());
+
+        let resolver = Arc::new(NoopResolver);
+        let manager = ProxyManager::new(resolver.clone(), None);
+        manager
+            .report_delay("fast-but-broken", true, std::time::Duration::from_millis(1))
+            .await;
+        manager
+            .report_delay("slower-but-working", true, std::time::Duration::from_secs(60))
+            .await;
+
+        let handler = Handler {
+            opts: HandlerOptions {
+                name: "smart".to_owned(),
+                max_retries: Some(2),
+                ..Default::default()
+            },
+            providers: Providers::new(vec![Arc::new(provider)]),
+            proxy_manager: manager,
+            smart_state: Arc::new(tokio::sync::Mutex::new(SmartState::new())),
+        };
+        let sess = Session::default();
+        handler.connect_stream(&sess, resolver).await.unwrap();
+        assert!(sess.proxy_chain.snapshot().contains(&"smart".to_owned()));
     }
 }
 

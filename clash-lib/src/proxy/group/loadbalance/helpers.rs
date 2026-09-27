@@ -100,9 +100,8 @@ const CACHE_HIT: usize = 1;
 const CACHE_UPDATE: usize = 2;
 
 pub fn strategy_sticky_session(proxy_manager: ProxyManager) -> StrategyFn {
-    let max_retry = 5;
     // 10 minutes, 1024 entries
-    let lru_cache: moka::sync::Cache<u64, usize> = moka::sync::Cache::builder()
+    let lru_cache: moka::sync::Cache<u64, String> = moka::sync::Cache::builder()
         .max_capacity(1024)
         .time_to_live(std::time::Duration::from_secs(60 * 10))
         .build();
@@ -119,8 +118,14 @@ pub fn strategy_sticky_session(proxy_manager: ProxyManager) -> StrategyFn {
         };
 
         Box::pin(async move {
-            let buckets = proxies.len() as i32;
-            let (start_index, hit) = match lru_cache_clone.get(&key) {
+            if proxies.is_empty() {
+                return Err(std::io::Error::other("no proxy found"));
+            }
+            let cached_name = lru_cache_clone.get(&key);
+            let cached_index = cached_name.as_deref().and_then(|name| {
+                proxies.iter().position(|proxy| proxy.name() == name)
+            });
+            let (start_index, hit) = match cached_index {
                 Some(index) => {
                     #[cfg(test)]
                     {
@@ -129,22 +134,25 @@ pub fn strategy_sticky_session(proxy_manager: ProxyManager) -> StrategyFn {
                     }
                     (index, true)
                 }
-                None => (jump_hash(key + timestamp(), buckets) as usize, false),
+                None => (
+                    jump_hash(key + timestamp(), proxies.len() as i32) as usize,
+                    false,
+                ),
             };
 
-            // use `do - while` since we have the cached result
-            let mut index = start_index;
-            for _ in 0..max_retry {
-                if let Some(proxy) = proxies.get(index)
-                    && proxy_manager_clone.alive(proxy.name()).await
-                {
+            // Visit each member once, starting with the cached choice when it
+            // is still present. Random retries can miss a healthy member.
+            for offset in 0..proxies.len() {
+                let index = (start_index + offset) % proxies.len();
+                let proxy = &proxies[index];
+                if proxy_manager_clone.alive(proxy.name()).await {
                     // now it's a valid proxy
                     // check if it's the same as the last one(likely)
                     // update the cache if:
                     //   1. the index is not the same as the start_index
                     //   2. the start_index is not fetched from the cache
                     if index != start_index || !hit {
-                        lru_cache_clone.insert(key, index);
+                        lru_cache_clone.insert(key, proxy.name().to_owned());
                         #[cfg(test)]
                         {
                             TEST_LRU_STATE.store(
@@ -155,12 +163,8 @@ pub fn strategy_sticky_session(proxy_manager: ProxyManager) -> StrategyFn {
                     }
                     return Ok(proxy.clone());
                 }
-                // the cached proxy is dead, change the key by a new timestamp and
-                // try again
-                index = jump_hash(key + timestamp(), buckets) as usize;
             }
-            // TODO: if we should just remove the key from the cache?
-            lru_cache_clone.insert(key, 0);
+            lru_cache_clone.invalidate(&key);
             #[cfg(test)]
             {
                 TEST_LRU_STATE
@@ -195,6 +199,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn test_sticky_session() {
         let resolver = Arc::new(NoopResolver);
         let proxies: Arc<Vec<AnyOutboundHandler>> = Arc::new(vec![
@@ -273,5 +278,45 @@ mod tests {
             assert_eq!(res.unwrap().name(), session1_outbound_name_new);
             assert_cache_state!(CACHE_HIT);
         }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_sticky_session_survives_reorder_and_checks_all_members() {
+        let manager = ProxyManager::new(Arc::new(NoopResolver), None);
+        let mut strategy = strategy_sticky_session(manager.clone());
+        let make_proxy = |name: &str| -> AnyOutboundHandler {
+            Arc::new(NoopOutboundHandler {
+                name: name.to_owned(),
+            })
+        };
+        let a = make_proxy("a");
+        let b = make_proxy("b");
+        let sess = Session::default();
+
+        assert_eq!(
+            strategy(Arc::new(vec![a.clone()]), &sess)
+                .await
+                .unwrap()
+                .name(),
+            "a"
+        );
+        assert_eq!(
+            strategy(Arc::new(vec![b.clone(), a.clone()]), &sess)
+                .await
+                .unwrap()
+                .name(),
+            "a"
+        );
+
+        manager.report_alive("a", false, None).await;
+        let mut members = vec![a];
+        for i in 0..6 {
+            let name = format!("dead-{i}");
+            manager.report_alive(&name, false, None).await;
+            members.push(make_proxy(&name));
+        }
+        members.push(b);
+        assert_eq!(strategy(Arc::new(members), &sess).await.unwrap().name(), "b");
     }
 }
