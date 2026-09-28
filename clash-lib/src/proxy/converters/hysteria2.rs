@@ -171,6 +171,8 @@ impl TryFrom<OutboundHysteria2> for Handler {
             ca_str: value.ca_str,
             udp_mtu: value.udp_mtu,
             disable_mtu_discovery: value.disable_mtu_discovery.unwrap_or(false),
+            max_stream_receive_window: value.max_stream_receive_window,
+            max_connection_receive_window: value.max_connection_receive_window,
             tls_cert: value.tls_cert,
             tls_key: value.tls_key,
         };
@@ -259,6 +261,20 @@ impl std::str::FromStr for OutboundHysteria2 {
                 "down" | "down_mbps" => {
                     outbound.down = v.parse().ok();
                 }
+                "max-stream-receive-window" => {
+                    outbound.max_stream_receive_window = Some(v.parse().map_err(|_| {
+                        crate::Error::InvalidConfig(
+                            "invalid hysteria2 max-stream-receive-window".into(),
+                        )
+                    })?);
+                }
+                "max-connection-receive-window" => {
+                    outbound.max_connection_receive_window = Some(v.parse().map_err(|_| {
+                        crate::Error::InvalidConfig(
+                            "invalid hysteria2 max-connection-receive-window".into(),
+                        )
+                    })?);
+                }
                 _ => {}
             }
         }
@@ -313,7 +329,7 @@ mod tests {
     #[test]
     fn test_hysteria2_url_parse() {
         crate::tests::initialize();
-        let url_str = "hysteria2://51e322ae-88ad-42c6-960a-0309448b88e2@example.com:60747?alpn=h3&insecure=1&allowInsecure=1&pinSHA256=A400A045BC82C4EDCB82D2DA0508EDC3351A5C4EFCB71DAA72C2A877D1B92C7C";
+        let url_str = "hysteria2://51e322ae-88ad-42c6-960a-0309448b88e2@example.com:60747?alpn=h3&insecure=1&allowInsecure=1&pinSHA256=A400A045BC82C4EDCB82D2DA0508EDC3351A5C4EFCB71DAA72C2A877D1B92C7C&max-stream-receive-window=16777216&max-connection-receive-window=33554432";
         let outbound: OutboundHysteria2 =
             url_str.parse().expect("failed to parse hysteria2 url");
         assert_eq!(outbound.server, "example.com");
@@ -321,6 +337,8 @@ mod tests {
         assert_eq!(outbound.password, "51e322ae-88ad-42c6-960a-0309448b88e2");
         assert_eq!(outbound.alpn.as_deref(), Some(&["h3".to_string()][..]));
         assert!(outbound.skip_cert_verify);
+        assert_eq!(outbound.max_stream_receive_window, Some(16 * 1024 * 1024));
+        assert_eq!(outbound.max_connection_receive_window, Some(32 * 1024 * 1024));
         assert_eq!(
             outbound.fingerprint.as_deref(),
             Some("A400A045BC82C4EDCB82D2DA0508EDC3351A5C4EFCB71DAA72C2A877D1B92C7C")
@@ -333,6 +351,7 @@ mod tests {
 
     #[test]
     fn test_hysteria2_bandwidth_parsing() {
+        crate::tests::initialize();
         // 双向配置：up 100 Mbps, down 200 Mbps -> 12_500_000, 25_000_000 Bytes/s
         let ob = OutboundHysteria2 {
             name: "test".into(),
@@ -383,5 +402,31 @@ mod tests {
         };
         let h_none = Handler::try_from(ob_none).unwrap();
         assert_eq!(h_none.opts().up_down, None);
+    }
+
+    #[test]
+    fn test_hysteria2_receive_windows() {
+        crate::tests::initialize();
+        let outbound = OutboundHysteria2 {
+            name: "test".into(),
+            server: "1.1.1.1".into(),
+            port: 443,
+            password: "pw".into(),
+            max_stream_receive_window: Some(16 * 1024 * 1024),
+            max_connection_receive_window: Some(32 * 1024 * 1024),
+            ..Default::default()
+        };
+        let handler = Handler::try_from(outbound.clone()).unwrap();
+        assert_eq!(handler.opts().max_stream_receive_window, Some(16 * 1024 * 1024));
+        assert_eq!(handler.opts().max_connection_receive_window, Some(32 * 1024 * 1024));
+
+        let invalid = OutboundHysteria2 {
+            max_connection_receive_window: Some(u64::MAX),
+            ..outbound
+        };
+        assert!(Handler::try_from(invalid)
+            .unwrap_err()
+            .to_string()
+            .contains("max-connection-receive-window"));
     }
 }

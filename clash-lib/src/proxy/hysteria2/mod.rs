@@ -80,6 +80,8 @@ pub struct HystOption {
     pub ca: Option<PathBuf>,
     pub udp_mtu: Option<u32>,
     pub disable_mtu_discovery: bool,
+    pub max_stream_receive_window: Option<u64>,
+    pub max_connection_receive_window: Option<u64>,
     #[allow(dead_code)]
     pub ca_str: Option<String>,
     /// File path or inline PEM client certificate for mTLS.
@@ -194,8 +196,24 @@ impl Handler {
             tracing::debug!("disable mtu discovery");
             transport.mtu_discovery_config(None);
         }
-        transport.stream_receive_window(quinn::VarInt::from_u32(8 * 1024 * 1024));
-        transport.receive_window(quinn::VarInt::from_u32(8 * 1024 * 1024));
+        let receive_window = |value: Option<u64>, default: u64, name: &str| {
+            quinn::VarInt::from_u64(value.unwrap_or(default)).map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("hysteria2: `{name}` exceeds the QUIC maximum"),
+                )
+            })
+        };
+        transport.stream_receive_window(receive_window(
+            opts.max_stream_receive_window,
+            8 * 1024 * 1024,
+            "max-stream-receive-window",
+        )?);
+        transport.receive_window(receive_window(
+            opts.max_connection_receive_window,
+            20 * 1024 * 1024,
+            "max-connection-receive-window",
+        )?);
 
         let up_bytes = opts.up_down.map(|(up, _)| up).unwrap_or(0);
         let factory: Arc<dyn ControllerFactory + Send + Sync> = if up_bytes > 0 {
@@ -1038,6 +1056,8 @@ mod tests {
             ca_str: None,
             udp_mtu: None,
             disable_mtu_discovery: false,
+            max_stream_receive_window: None,
+            max_connection_receive_window: None,
             tls_cert: None,
             tls_key: None,
         };

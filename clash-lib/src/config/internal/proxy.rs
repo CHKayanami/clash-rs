@@ -602,6 +602,10 @@ pub struct OutboundHysteria2 {
     pub fingerprint: Option<String>,
     pub udp_mtu: Option<u32>,
     pub disable_mtu_discovery: Option<bool>,
+    /// Maximum receive window per QUIC stream, in bytes.
+    pub max_stream_receive_window: Option<u64>,
+    /// Maximum receive window for the QUIC connection, in bytes.
+    pub max_connection_receive_window: Option<u64>,
     /// File path or inline PEM client certificate for mTLS.
     /// Must be set together with `tls-key`.
     pub tls_cert: Option<String>,
@@ -1127,12 +1131,16 @@ mod proxy_group_tests {
             password: test-pass
             up: "1000 Mbps"
             down: "50 MB/s"
+            max-stream-receive-window: 16777216
+            max-connection-receive-window: 33554432
         "#;
 
         let proto: OutboundProxyProtocol = yaml_serde::from_str(yaml).unwrap();
         if let OutboundProxyProtocol::Hysteria2(h2) = proto {
             assert_eq!(h2.up, Some(1000));
             assert_eq!(h2.down, Some(400));
+            assert_eq!(h2.max_stream_receive_window, Some(16 * 1024 * 1024));
+            assert_eq!(h2.max_connection_receive_window, Some(32 * 1024 * 1024));
         } else {
             panic!("expected Hysteria2 variant");
         }

@@ -1064,6 +1064,8 @@ proxies:
     # up: 50
     # down: 100
     # QUIC tuning:
+    # max-stream-receive-window: 8388608       # bytes per stream (default: 8 MiB)
+    # max-connection-receive-window: 20971520  # bytes per connection (default: 20 MiB)
     # udp-mtu: 1400
     # disable-mtu-discovery: false
     # Custom CA for self-signed certs:
