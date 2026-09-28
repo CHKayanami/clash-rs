@@ -23,6 +23,7 @@ use tracing::{debug, trace, warn};
 pub struct TproxyInbound {
     addr: SocketAddr,
     allow_lan: bool,
+    udp: bool,
     dispatcher: Arc<Dispatcher>,
     fw_mark: Option<u32>,
 }
@@ -57,12 +58,14 @@ impl TproxyInbound {
     pub fn new(
         addr: SocketAddr,
         allow_lan: bool,
+        udp: bool,
         dispatcher: Arc<Dispatcher>,
         fw_mark: Option<u32>,
     ) -> Self {
         Self {
             addr,
             allow_lan,
+            udp,
             dispatcher,
             fw_mark,
         }
@@ -76,7 +79,7 @@ impl InboundHandlerTrait for TproxyInbound {
     }
 
     fn handle_udp(&self) -> bool {
-        true
+        self.udp
     }
 
     async fn listen_tcp(&self) -> std::io::Result<()> {

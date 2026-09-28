@@ -154,6 +154,8 @@ fn build_handler(
         InboundOpts::TProxy {
             #[cfg(target_os = "linux")]
             common_opts,
+            #[cfg(target_os = "linux")]
+            udp,
             ..
         } => {
             #[cfg(target_os = "linux")]
@@ -161,6 +163,7 @@ fn build_handler(
                 Some(Arc::new(TproxyInbound::new(
                     (common_opts.listen.0, common_opts.port).into(),
                     common_opts.allow_lan,
+                    *udp,
                     dispatcher,
                     fw_mark,
                 )))
