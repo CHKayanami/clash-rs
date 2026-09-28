@@ -1,6 +1,8 @@
 mod compat;
 mod handle_stream;
 mod handle_task;
+pub(crate) mod proto;
+pub(crate) mod stream;
 pub(crate) mod types;
 
 use crate::{
@@ -10,14 +12,13 @@ use crate::{
 use anyhow::Result;
 use async_trait::async_trait;
 
-use tracing::debug;
-use tuic_core::quinn::{
+use quinn::{
     ClientConfig as QuinnConfig, Endpoint as QuinnEndpoint, EndpointConfig,
     TokioRuntime, TransportConfig as QuinnTransportConfig, VarInt,
-    bbr::BbrConfig,
-    congestion::{Bbr3Config, CubicConfig, NewRenoConfig},
     crypto::rustls::QuicClientConfig,
 };
+use quinn_proto::congestion::{BbrConfig, CubicConfig, NewRenoConfig};
+use tracing::debug;
 
 use erased_serde::Serialize as ErasedSerialize;
 use std::{
@@ -231,8 +232,13 @@ impl Handler {
                 .congestion_controller_factory(Arc::new(NewRenoConfig::default())),
             CongestionControl::Bbr => transport_config
                 .congestion_controller_factory(Arc::new(BbrConfig::default())),
-            CongestionControl::Bbr3 => transport_config
-                .congestion_controller_factory(Arc::new(Bbr3Config::default())),
+            CongestionControl::Bbr3 => {
+                tracing::warn!(
+                    "TUIC BBR3 is unavailable with Quinn 0.11; using BBR"
+                );
+                transport_config
+                    .congestion_controller_factory(Arc::new(BbrConfig::default()))
+            }
         };
 
         quinn_config.transport_config(Arc::new(transport_config));
@@ -262,7 +268,7 @@ impl Handler {
 
         debug!("binding socket to: {:?}", socket.local_addr()?);
 
-        let endpoint = QuinnEndpoint::new(
+        let mut endpoint = QuinnEndpoint::new(
             EndpointConfig::default(),
             None,
             socket.into_std()?,
@@ -271,8 +277,12 @@ impl Handler {
 
         endpoint.set_default_client_config(quinn_config);
 
-        // Parse ip field if provided
-        let ip_addr = opts.ip.as_ref().and_then(|ip_str| ip_str.parse().ok());
+        // Parse ip field if provided, or fallback to parsing server as IP literal
+        let ip_addr = opts
+            .ip
+            .as_ref()
+            .and_then(|ip_str| ip_str.parse().ok())
+            .or_else(|| opts.server.parse().ok());
 
         let endpoint = TuicEndpoint {
             ep: endpoint,
@@ -367,16 +377,16 @@ impl TuicDatagramOutbound {
         let (send_tx, send_rx) = tokio::sync::mpsc::channel::<UdpPacket>(32);
         let (recv_tx, recv_rx) = tokio::sync::mpsc::channel::<UdpPacket>(32);
         let udp_sessions = conn.udp_sessions.clone();
+        udp_sessions.write().insert(
+            assoc_id,
+            UdpSession {
+                incoming: recv_tx,
+                local_addr,
+            },
+        );
         tokio::spawn(async move {
             // capture vars
-            let (mut send_rx, recv_tx) = (send_rx, recv_tx);
-            udp_sessions.write().await.insert(
-                assoc_id,
-                UdpSession {
-                    incoming: recv_tx,
-                    local_addr,
-                },
-            );
+            let mut send_rx = send_rx;
             while let Some(next_send) = send_rx.recv().await {
                 let res = conn
                     .outgoing_udp(
@@ -394,7 +404,7 @@ impl TuicDatagramOutbound {
                 "[udp] [dissociate] closing UDP session [{assoc_id:#06x}]"
             );
             _ = conn.dissociate(assoc_id).await;
-            udp_sessions.write().await.remove(&assoc_id);
+            udp_sessions.write().remove(&assoc_id);
             anyhow::Ok(())
         });
 
@@ -412,6 +422,7 @@ pub(crate) mod test_utils;
 mod tests {
     use std::{sync::Arc, time::Duration};
 
+    use futures::{SinkExt, StreamExt};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use super::{test_utils::TuicServerProcess, *};
@@ -527,6 +538,65 @@ mod tests {
         drop(echo);
         Ok(())
     }
+
+    #[tokio::test]
+    #[cfg_attr(
+        qemu_emulated,
+        ignore = "QUIC under qemu-user (cross test) is unreliable"
+    )]
+    async fn test_tuic_native_udp_fragmented_round_trip() -> anyhow::Result<()> {
+        crate::tests::initialize();
+        let server = TuicServerProcess::start().await?;
+        let echo = tokio::net::UdpSocket::bind("127.0.0.1:0").await?;
+        let destination = echo.local_addr()?;
+        let payload = vec![0x5a; 3000];
+
+        let handler = Handler::new(gen_options(server.port())?);
+        let session = Session {
+            network: crate::session::Network::Udp,
+            typ: crate::session::Type::Socks5,
+            source: "127.0.0.1:54321".parse()?,
+            destination: destination.to_string().parse()?,
+            ..Default::default()
+        };
+        let mut datagram = handler
+            .connect_datagram(&session, Arc::new(NoopResolver))
+            .await?;
+        let packet = UdpPacket::new(
+            bytes::Bytes::from(payload.clone()),
+            session.source.into(),
+            session.destination.clone(),
+        );
+        datagram.send(packet).await?;
+
+        let mut buffer = vec![0; payload.len()];
+        let (size, peer) = tokio::time::timeout(
+            Duration::from_secs(5),
+            echo.recv_from(&mut buffer),
+        )
+        .await??;
+        assert_eq!(
+            size,
+            payload.len(),
+            "server received an incomplete UDP packet"
+        );
+        assert!(buffer[..size].iter().all(|byte| *byte == 0x5a));
+        echo.send_to(&buffer[..size], peer).await?;
+
+        let response = tokio::time::timeout(Duration::from_secs(5), datagram.next())
+            .await?
+            .ok_or_else(|| {
+                anyhow::anyhow!("TUIC UDP session closed before reply")
+            })?;
+        assert_eq!(response.data.len(), payload.len());
+        assert!(response.data.iter().all(|byte| *byte == 0x5a));
+        Ok(())
+    }
+
+
+
+
+
 
     /// Verify that connecting with an invalid password fails.
     #[tokio::test]
@@ -1027,5 +1097,3 @@ rules:
             .await
     }
 }
-
-impl crate::proxy::ProxyStream for tuic_core::quinn::Connect {}

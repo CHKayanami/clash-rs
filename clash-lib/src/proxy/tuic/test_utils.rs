@@ -55,6 +55,7 @@ impl TuicServerProcess {
                 },
                 acl: vec![],
                 udp_relay_ipv6,
+                max_external_packet_size: 65535,
                 experimental: tuic_server::config::ExperimentalConfig {
                     drop_loopback: false,
                     drop_private: false,

@@ -32,7 +32,7 @@ ring = [
 
 # Protos
 shadowsocks = ["dep:shadowsocks", "dep:blake3"]
-tuic = ["dep:tuic-core", "dep:register-count"]
+tuic = []
 ssh = ["dep:russh", "dep:dirs", "dep:totp-rs"]
 onion = ["dep:arti-client", "dep:tor-rtcompat", "arti-client/onion-service-client"]
 shadowquic = ["dep:shadowquic", "shadowquic?/shadowquic-quinn"]
@@ -193,10 +193,6 @@ murmur3 = "0.5"
 arti-client = { version = "0.44", optional = true, default-features = false, features = ["tokio", "rustls", "static-sqlite"] }
 tor-rtcompat = { version = "0.44", optional = true, default-features = false, features = ["tokio", "rustls"] }
 
-
-# tuic
-tuic-core= { tag = "v1.8.5", optional = true, git = "https://github.com/Itsusinn/tuic.git", features = ["async_marshal", "marshal", "model"] }
-register-count = { version = "0.1", optional = true }
 
 quinn = { version = "0.11", default-features = false, features = ["futures-io", "runtime-tokio"] }
 
