@@ -65,15 +65,15 @@ impl InboundHandlerTrait for RedirInbound {
             };
             let src_addr = peer_addr.to_canonical();
 
-            let local_ip = match socket.local_addr() {
-                Ok(addr) => addr.ip().to_canonical(),
+            let local_addr = match socket.local_addr() {
+                Ok(addr) => addr.to_canonical(),
                 Err(e) => {
                     warn!("redir failed to get local address for {src_addr}: {e}");
                     continue;
                 }
             };
 
-            if !self.allow_lan && src_addr.ip() != local_ip {
+            if !self.allow_lan && src_addr.ip() != local_addr.ip() {
                 warn!("Connection from {} is not allowed", src_addr);
                 continue;
             }
@@ -93,6 +93,16 @@ impl InboundHandlerTrait for RedirInbound {
                     continue;
                 }
             };
+
+            // SO_ORIGINAL_DST also returns a destination for connections that
+            // were not redirected. Dispatching one aimed at this listener
+            // would connect straight back to it and repeat indefinitely.
+            if orig_dst == local_addr {
+                warn!(
+                    "redir rejected connection from {src_addr} to its own listener at {orig_dst}"
+                );
+                continue;
+            }
 
             let sess = Session {
                 network: Network::Tcp,
