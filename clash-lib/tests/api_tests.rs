@@ -1497,6 +1497,57 @@ async fn test_dns_query_invalid_hostname() {
 }
 
 // ---------------------------------------------------------------------------
+// GET /dns/cache and DELETE /dns/cache
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_dns_cache_endpoints() {
+    let (_clash, api_port) = start_client_clash();
+
+    // 1. GET /dns/upstreams
+    let upstreams_url = format!("http://127.0.0.1:{}/dns/upstreams", api_port);
+    let upstreams_resp = send_http_request(upstreams_url.parse().unwrap(), auth_get(&upstreams_url))
+        .await
+        .expect("Failed to send GET /dns/upstreams");
+    assert_eq!(upstreams_resp.status(), http::StatusCode::OK);
+
+    // 2. GET /dns/cache without upstream should return 400
+    let no_upstream_url = format!("http://127.0.0.1:{}/dns/cache?wildcard=*", api_port);
+    let no_upstream_resp = send_http_request(no_upstream_url.parse().unwrap(), auth_get(&no_upstream_url))
+        .await
+        .expect("Failed to send GET /dns/cache without upstream");
+    assert_eq!(no_upstream_resp.status(), http::StatusCode::BAD_REQUEST);
+
+    // 3. GET /dns/cache?upstream=default&wildcard=*
+    let url = format!("http://127.0.0.1:{}/dns/cache?upstream=default&wildcard=*", api_port);
+    let response = send_http_request(url.parse().unwrap(), auth_get(&url))
+        .await
+        .expect("Failed to send GET /dns/cache");
+
+    assert_eq!(response.status(), http::StatusCode::OK);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("Valid JSON");
+    assert!(json.get("upstream").is_some());
+
+    // 4. DELETE /dns/cache?upstream=default&wildcard=*
+    let del_url = format!("http://127.0.0.1:{}/dns/cache?upstream=default&wildcard=*", api_port);
+    let req = hyper::Request::builder()
+        .uri(&del_url)
+        .header(hyper::header::AUTHORIZATION, "Bearer clash-rs")
+        .method(http::method::Method::DELETE)
+        .body(http_body_util::Empty::<Bytes>::new())
+        .expect("Failed to build DELETE request");
+
+    let del_response = send_http_request(del_url.parse().unwrap(), req)
+        .await
+        .expect("Failed to send DELETE /dns/cache");
+    assert_eq!(del_response.status(), http::StatusCode::OK);
+    let del_body = del_response.into_body().collect().await.unwrap().to_bytes();
+    let del_json: serde_json::Value = serde_json::from_slice(&del_body).expect("Valid JSON");
+    assert!(del_json.get("deleted").is_some());
+}
+
+// ---------------------------------------------------------------------------
 // PATCH /configs – mode field is applied and visible in GET /configs
 // ---------------------------------------------------------------------------
 

@@ -17,6 +17,8 @@ use anyhow::anyhow;
 use async_trait::async_trait;
 use tracing::{debug, info, warn};
 
+use std::time::Instant;
+
 use crate::app::dns::config::NameServer;
 use crate::app::dns::fakeip::{FakeDns, Opts as FakeDnsOpts};
 use crate::app::dns::query::{DnsName, QType, QueryContext, build_dns_query_wire};
@@ -31,7 +33,8 @@ use crate::app::dns::wire::{
     extract_ips_from_dns_response, extract_min_ttl_from_dns_response,
 };
 use crate::app::dns::{
-    ClashResolver, DnsResolutionHook, DnsResolutionHookWrapper, ResolverKind, ThreadSafeDnsCollector,
+    ClashResolver, DnsCacheItem, DnsCacheReport, DnsCacheUpstreamStat, DnsResolutionHook,
+    DnsResolutionHookWrapper, DnsUpstreamInfo, ResolverKind, ThreadSafeDnsCollector,
     parse_ip_literal,
 };
 use crate::app::profile::ThreadSafeCacheFile;
@@ -613,5 +616,210 @@ impl ClashResolver for RouterResolver {
 
     fn kind(&self) -> ResolverKind {
         ResolverKind::Clash
+    }
+
+    fn list_upstreams(&self) -> Vec<DnsUpstreamInfo> {
+        let mut list = Vec::new();
+        for u in &self.cfg.upstreams {
+            let type_str = match u.upstream_type {
+                UpstreamType::FakeIp => "fakeip",
+                UpstreamType::Remote => "remote",
+                UpstreamType::Local => "local",
+            };
+            list.push(DnsUpstreamInfo {
+                tag: u.tag.clone(),
+                r#type: type_str.to_string(),
+            });
+        }
+        list
+    }
+
+    fn search_cache_by_upstream(
+        &self,
+        pattern: &str,
+        upstream: &str,
+    ) -> Option<DnsCacheUpstreamStat> {
+        const MAX_RETURN_ITEMS: usize = 50;
+        let now = Instant::now();
+        if let Some(u) = self.cfg.upstreams.iter().find(|u| u.tag == upstream) {
+            if u.upstream_type == UpstreamType::FakeIp {
+                let (total_count, fake_items) = if let Some(fake) = &self.fake_dns {
+                    fake.search_cache_limited(pattern, MAX_RETURN_ITEMS)
+                } else {
+                    (0, Vec::new())
+                };
+                let items: Vec<DnsCacheItem> = fake_items
+                    .into_iter()
+                    .map(|(ip, host)| {
+                        let qtype = if ip.is_ipv6() { "AAAA" } else { "A" };
+                        DnsCacheItem {
+                            domain: host,
+                            qtype: qtype.to_string(),
+                            ip: Some(ip.to_string()),
+                            ttl: u.ttl,
+                            is_stale: Some(false),
+                        }
+                    })
+                    .collect();
+                Some(DnsCacheUpstreamStat {
+                    name: u.tag.clone(),
+                    count: total_count,
+                    upstream_type: Some("fakeip".to_string()),
+                    items,
+                })
+            } else {
+                let (total_count, cache_entries) =
+                    self.cache
+                        .search_scoped_limited(pattern, Some(&u.tag), MAX_RETURN_ITEMS, now);
+                let items: Vec<DnsCacheItem> = cache_entries
+                    .into_iter()
+                    .map(|e| DnsCacheItem {
+                        domain: e.domain,
+                        qtype: e.qtype,
+                        ip: None,
+                        ttl: Some(e.ttl),
+                        is_stale: Some(e.is_stale),
+                    })
+                    .collect();
+                let type_name = match u.upstream_type {
+                    UpstreamType::Remote => "remote",
+                    UpstreamType::Local => "local",
+                    _ => "unknown",
+                };
+                Some(DnsCacheUpstreamStat {
+                    name: u.tag.clone(),
+                    count: total_count,
+                    upstream_type: Some(type_name.to_string()),
+                    items,
+                })
+            }
+        } else if upstream == "fakeip" && self.fake_dns.is_some() {
+            let (total_count, fake_items) = self
+                .fake_dns
+                .as_ref()
+                .unwrap()
+                .search_cache_limited(pattern, MAX_RETURN_ITEMS);
+            let items: Vec<DnsCacheItem> = fake_items
+                .into_iter()
+                .map(|(ip, host)| {
+                    let qtype = if ip.is_ipv6() { "AAAA" } else { "A" };
+                    DnsCacheItem {
+                        domain: host,
+                        qtype: qtype.to_string(),
+                        ip: Some(ip.to_string()),
+                        ttl: None,
+                        is_stale: Some(false),
+                    }
+                })
+                .collect();
+            Some(DnsCacheUpstreamStat {
+                name: "fakeip".to_string(),
+                count: total_count,
+                upstream_type: Some("fakeip".to_string()),
+                items,
+            })
+        } else {
+            let (total_count, cache_entries) =
+                self.cache
+                    .search_scoped_limited(pattern, Some(upstream), MAX_RETURN_ITEMS, now);
+            if total_count > 0 {
+                let items: Vec<DnsCacheItem> = cache_entries
+                    .into_iter()
+                    .map(|e| DnsCacheItem {
+                        domain: e.domain,
+                        qtype: e.qtype,
+                        ip: None,
+                        ttl: Some(e.ttl),
+                        is_stale: Some(e.is_stale),
+                    })
+                    .collect();
+                Some(DnsCacheUpstreamStat {
+                    name: upstream.to_string(),
+                    count: total_count,
+                    upstream_type: Some("extra".to_string()),
+                    items,
+                })
+            } else {
+                None
+            }
+        }
+    }
+
+    fn clear_cache_by_upstream(&self, pattern: &str, upstream: &str) -> usize {
+        let is_fakeip = match self.cfg.upstreams.iter().find(|u| u.tag == upstream) {
+            Some(u) => u.upstream_type == UpstreamType::FakeIp,
+            None => upstream == "fakeip",
+        };
+
+        if is_fakeip {
+            if let Some(fake) = &self.fake_dns {
+                fake.delete_cache(pattern)
+            } else {
+                0
+            }
+        } else {
+            let deleted = self.cache.delete_scoped(pattern, Some(upstream));
+            if deleted > 0 {
+                self.reverse_lookup_cache.invalidate_matching(pattern);
+            }
+            deleted
+        }
+    }
+
+    fn search_cache(&self, pattern: &str) -> DnsCacheReport {
+        let mut upstreams = Vec::new();
+        let now = Instant::now();
+        let mut processed_scopes = std::collections::HashSet::new();
+
+        for u in &self.cfg.upstreams {
+            processed_scopes.insert(u.tag.clone());
+            if let Some(stat) = self.search_cache_by_upstream(pattern, &u.tag) {
+                upstreams.push(stat);
+            }
+        }
+
+        let all_cached = self.cache.search_scoped(pattern, None, now);
+        let mut extra_scopes: HashMap<String, Vec<DnsCacheItem>> = HashMap::new();
+        for e in all_cached {
+            if !processed_scopes.contains(&e.scope) && !e.scope.is_empty() {
+                extra_scopes.entry(e.scope.clone()).or_default().push(DnsCacheItem {
+                    domain: e.domain,
+                    qtype: e.qtype,
+                    ip: None,
+                    ttl: Some(e.ttl),
+                    is_stale: Some(e.is_stale),
+                });
+            }
+        }
+        for (scope, items) in extra_scopes {
+            let count = items.len();
+            upstreams.push(DnsCacheUpstreamStat {
+                name: scope,
+                count,
+                upstream_type: Some("extra".to_string()),
+                items,
+            });
+        }
+
+        let total = upstreams.iter().map(|u| u.count).sum();
+        DnsCacheReport { upstreams, total }
+    }
+
+    fn clear_cache(&self, pattern: &str, upstream: Option<&str>) -> usize {
+        match upstream {
+            Some(u) => self.clear_cache_by_upstream(pattern, u),
+            None => {
+                let mut deleted = 0;
+                if let Some(fake) = &self.fake_dns {
+                    deleted += fake.delete_cache(pattern);
+                }
+                let regular_deleted = self.cache.delete_scoped(pattern, None);
+                if regular_deleted > 0 {
+                    self.reverse_lookup_cache.invalidate_matching(pattern);
+                }
+                deleted += regular_deleted;
+                deleted
+            }
+        }
     }
 }

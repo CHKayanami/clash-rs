@@ -186,3 +186,63 @@ where
 
     Ok(())
 }
+
+/// Case-insensitive wildcard pattern matching supporting `*` (zero or more characters)
+/// and `?` (exactly one character).
+pub fn wildcard_match(pattern: &str, text: &str) -> bool {
+    wildcard_match_bytes(pattern.as_bytes(), text.as_bytes())
+}
+
+fn wildcard_match_bytes(pattern: &[u8], text: &[u8]) -> bool {
+    let mut p_idx = 0;
+    let mut t_idx = 0;
+    let mut p_star = None;
+    let mut t_match = 0;
+
+    while t_idx < text.len() {
+        if p_idx < pattern.len()
+            && (pattern[p_idx] == b'?'
+                || pattern[p_idx].eq_ignore_ascii_case(&text[t_idx]))
+        {
+            p_idx += 1;
+            t_idx += 1;
+        } else if p_idx < pattern.len() && pattern[p_idx] == b'*' {
+            p_star = Some(p_idx);
+            p_idx += 1;
+            t_match = t_idx;
+        } else if let Some(star) = p_star {
+            p_idx = star + 1;
+            t_match += 1;
+            t_idx = t_match;
+        } else {
+            return false;
+        }
+    }
+
+    while p_idx < pattern.len() && pattern[p_idx] == b'*' {
+        p_idx += 1;
+    }
+
+    p_idx == pattern.len()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_wildcard_match() {
+        assert!(wildcard_match("*", "example.com"));
+        assert!(wildcard_match("*.google.com", "mail.google.com"));
+        assert!(!wildcard_match("*.google.com", "google.com"));
+        assert!(wildcard_match("*google*", "api.google.com"));
+        assert!(wildcard_match("*GOOGLE*", "api.google.com"));
+        assert!(wildcard_match("EXAMPLE.COM", "example.com"));
+        assert!(wildcard_match("example.com", "EXAMPLE.COM"));
+        assert!(wildcard_match("?xample.com", "example.com"));
+        assert!(!wildcard_match("?xample.com", "sample1.com"));
+        assert!(wildcard_match("", ""));
+        assert!(!wildcard_match("", "abc"));
+        assert!(wildcard_match("*", ""));
+    }
+}

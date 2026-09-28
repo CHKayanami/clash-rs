@@ -13,6 +13,73 @@ use super::hosts::HostsSnapshot;
 use super::matcher::DomainMatcher;
 use super::routing::DnsRouter;
 
+#[tokio::test]
+async fn test_cache_delete_prefers_configured_upstream_tag_over_fakeip_alias() {
+    use std::sync::Arc;
+    use std::time::Duration;
+    use crate::app::dns::response::{ResponseTemplate, build_dns_ip_response};
+    use crate::app::dns::ClashResolver;
+    use super::config::{UpstreamConfig, UpstreamType};
+    use super::RouterResolver;
+
+    let mut cfg = RouterConfig::default();
+    cfg.upstreams = vec![
+        UpstreamConfig {
+            tag: "fakeip".to_string(),
+            upstream_type: UpstreamType::Remote,
+            servers: vec![],
+            proxy: None,
+            client_subnet: None,
+            inet4_range: "198.18.0.0/16".parse().unwrap(),
+            inet6_range: "fc00::/64".parse().unwrap(),
+            ttl: None,
+        },
+        UpstreamConfig {
+            tag: "synthetic".to_string(),
+            upstream_type: UpstreamType::FakeIp,
+            servers: vec![],
+            proxy: None,
+            client_subnet: None,
+            inet4_range: "198.18.0.0/16".parse().unwrap(),
+            inet6_range: "fc00::/64".parse().unwrap(),
+            ttl: None,
+        },
+    ];
+    let resolver = RouterResolver::new(
+        cfg,
+        None,
+        None,
+        Arc::new(parking_lot::RwLock::new(HashMap::new())),
+        None,
+    ).await;
+
+    let name = DnsName::from_domain("example.com").unwrap();
+    let wire = build_dns_query_wire(&name, QType::A);
+    let query = QueryContext::parse(&wire).unwrap();
+    let response = build_dns_ip_response(&wire, &["1.2.3.4".parse().unwrap()], 60).unwrap();
+    let template = Arc::new(ResponseTemplate::validate(&query, &response).unwrap());
+    resolver.cache.insert_scoped(
+        &Arc::from("fakeip"),
+        &query,
+        template,
+        60,
+        Duration::from_secs(60),
+    );
+    let fake = resolver.fake_dns.as_ref().unwrap();
+    let fake_ip = fake.lookup("example.com");
+    let real_ip: IpAddr = "1.2.3.4".parse().unwrap();
+    resolver.reverse_lookup_cache.insert(real_ip, "example.com", 60);
+
+    assert_eq!(resolver.search_cache_by_upstream("*", "fakeip").unwrap().count, 1);
+    assert_eq!(resolver.cached_for(real_ip).as_deref(), Some("example.com"));
+    assert_eq!(resolver.clear_cache_by_upstream("*", "missing"), 0);
+    assert_eq!(resolver.cached_for(real_ip).as_deref(), Some("example.com"));
+    assert_eq!(resolver.clear_cache_by_upstream("*", "fakeip"), 1);
+    assert_eq!(resolver.search_cache_by_upstream("*", "fakeip").unwrap().count, 0);
+    assert_eq!(resolver.cached_for(real_ip), None);
+    assert_eq!(fake.reverse_lookup(fake_ip).as_deref(), Some("example.com"));
+}
+
 #[test]
 fn test_domain_matcher() {
     let patterns = vec![
@@ -713,4 +780,3 @@ async fn test_router_resolver_stale_refresh_notification_with_rule_filter() {
 
     server_task.abort();
 }
-

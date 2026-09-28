@@ -461,6 +461,17 @@ async fn test_reverse_lookup_cache_integration_and_conflict() {
 
     // Since domain-b.com and domain-a.com share 1.2.3.4, it should be marked as ambiguous -> None
     assert_eq!(resolver.reverse_lookup(ip), None);
+
+    let other_ip: std::net::IpAddr = "5.6.7.8".parse().unwrap();
+    let name_c = DnsName::from_domain("domain-c.com").unwrap();
+    let query_wire_c = build_dns_query_wire_with_id(0x9abc, &name_c, QType::A);
+    let resp_c = build_dns_ip_response(&query_wire_c, &[other_ip], 120).unwrap();
+    let query_c = QueryContext::parse(&query_wire_c).unwrap();
+    let template_c = Arc::new(crate::app::dns::response::ResponseTemplate::validate(&query_c, &resp_c).unwrap());
+    resolver.process_fresh_response(&query_c, "domain-c.com", &resp_c, Some(template_c)).await;
+    assert_eq!(resolver.reverse_lookup(other_ip).as_deref(), Some("domain-c.com"));
+    assert_eq!(resolver.clear_cache_by_upstream("DOMAIN-C.COM", "default"), 1);
+    assert_eq!(resolver.reverse_lookup(other_ip), None);
 }
 
 #[tokio::test]
@@ -526,5 +537,3 @@ async fn test_qtype_filter_exchange() {
     assert_eq!(rcode, 0);
     assert_eq!(ancount, 0);
 }
-
-

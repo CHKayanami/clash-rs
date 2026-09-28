@@ -84,6 +84,67 @@ pub trait ClashResolver: Sync + Send {
     fn set_ipv6(&self, enable: bool);
 
     fn kind(&self) -> ResolverKind;
+
+    fn list_upstreams(&self) -> Vec<DnsUpstreamInfo> {
+        Vec::new()
+    }
+
+    fn search_cache_by_upstream(
+        &self,
+        _pattern: &str,
+        _upstream: &str,
+    ) -> Option<DnsCacheUpstreamStat> {
+        None
+    }
+
+    fn clear_cache_by_upstream(&self, _pattern: &str, _upstream: &str) -> usize {
+        0
+    }
+
+    fn search_cache(&self, _pattern: &str) -> DnsCacheReport {
+        DnsCacheReport {
+            upstreams: Vec::new(),
+            total: 0,
+        }
+    }
+
+    fn clear_cache<'a>(&self, _pattern: &str, _upstream: Option<&'a str>) -> usize {
+        0
+    }
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct DnsUpstreamInfo {
+    pub tag: String,
+    pub r#type: String,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct DnsCacheItem {
+    pub domain: String,
+    pub qtype: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ip: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ttl: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_stale: Option<bool>,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct DnsCacheUpstreamStat {
+    pub name: String,
+    pub count: usize,
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    pub upstream_type: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub items: Vec<DnsCacheItem>,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct DnsCacheReport {
+    pub upstreams: Vec<DnsCacheUpstreamStat>,
+    pub total: usize,
 }
 
 /// Returns the IP address if `host` is a valid IP literal, otherwise `None`.

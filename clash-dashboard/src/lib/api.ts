@@ -284,6 +284,44 @@ export const closeConnection = (id: string) =>
 export const queryDNS = (name: string, type: string) =>
   request<DNSQueryResult>(`/dns/query?name=${encodeURIComponent(name)}&type=${encodeURIComponent(type)}`);
 
+export interface DnsUpstreamInfo {
+  tag: string;
+  type: string;
+}
+
+export interface DnsCacheItem {
+  domain: string;
+  qtype: string;
+  ip?: string;
+  ttl?: number;
+  is_stale?: boolean;
+}
+
+export interface DnsCacheUpstreamStat {
+  name: string;
+  count: number;
+  type?: string;
+  items?: DnsCacheItem[];
+}
+
+export interface DnsCacheQueryResult {
+  upstream: DnsCacheUpstreamStat;
+}
+
+export const getDnsUpstreams = () =>
+  request<{ upstreams: DnsUpstreamInfo[] }>('/dns/upstreams');
+
+export const getDnsCache = (upstream: string, pattern: string = '*') =>
+  request<DnsCacheQueryResult>(
+    `/dns/cache?upstream=${encodeURIComponent(upstream)}&match=${encodeURIComponent(pattern)}`
+  );
+
+export const deleteDnsCache = (upstream: string, pattern: string = '*') =>
+  request<{ deleted: number; upstream: string; message: string }>(
+    `/dns/cache?upstream=${encodeURIComponent(upstream)}&match=${encodeURIComponent(pattern)}`,
+    { method: 'DELETE' }
+  );
+
 // Memory
 export const getMemory = () => request<MemoryData>('/memory');
 

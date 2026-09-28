@@ -33,6 +33,38 @@ impl InMemStore {
             format!("{}#v4", host)
         }
     }
+
+    pub(crate) fn take_by_wildcard(&self, pattern: &str) -> Vec<(IpAddr, String)> {
+        let pattern = pattern.trim();
+        let is_all = pattern == "*";
+        let is_exact = !pattern.contains('*') && !pattern.contains('?');
+        let matches: Vec<_> = {
+            let inner = self.inner.read();
+            inner.itoh.iter()
+                .filter(|(_, host)| {
+                    is_all
+                        || if is_exact {
+                            host.eq_ignore_ascii_case(pattern)
+                        } else {
+                            crate::common::utils::wildcard_match(pattern, host)
+                        }
+                })
+                .map(|(ip, host)| (*ip, host.clone()))
+                .collect()
+        };
+        let mut inner = self.inner.write();
+        let mut removed = Vec::with_capacity(matches.len());
+        for (ip, expected_host) in matches {
+            if inner.itoh.peek(&ip) != Some(&expected_host) {
+                continue;
+            }
+            if let Some(host) = inner.itoh.pop(&ip) {
+                inner.htoi.pop(&Self::make_host_key(&host, ip.is_ipv6()));
+                removed.push((ip, host));
+            }
+        }
+        removed
+    }
 }
 
 impl Store for InMemStore {
@@ -101,6 +133,39 @@ impl Store for InMemStore {
         // TODO: copy
         // NOTE: use file based persistence store
     }
+
+    fn search_by_wildcard_limited(
+        &self,
+        pattern: &str,
+        limit: usize,
+    ) -> (usize, Vec<(std::net::IpAddr, String)>) {
+        let pattern = pattern.trim();
+        let is_exact = !pattern.contains('*') && !pattern.contains('?');
+
+        let is_wildcard_all = pattern == "*";
+        let inner = self.inner.read();
+        let mut count = 0;
+        let mut results = Vec::new();
+        for (ip, host) in inner.itoh.iter() {
+            let matched = is_wildcard_all
+                || if is_exact {
+                    host.eq_ignore_ascii_case(pattern)
+                } else {
+                    crate::common::utils::wildcard_match(pattern, host)
+                };
+            if matched {
+                count += 1;
+                if results.len() < limit {
+                    results.push((*ip, host.clone()));
+                }
+            }
+        }
+        (count, results)
+    }
+
+    fn del_by_wildcard(&self, pattern: &str) -> usize {
+        self.take_by_wildcard(pattern).len()
+    }
 }
 
 #[cfg(test)]
@@ -130,5 +195,21 @@ mod tests {
         assert!(!store.exist(ip_v4));
         assert_eq!(store.get_by_host(host), None);
         assert_eq!(store.get_v6_by_host(host), Some(ip_v6));
+    }
+
+    #[test]
+    fn test_cache_management_exact_match_ignores_case() {
+        let store = InMemStore::new(100);
+        let ip_v4: IpAddr = "192.168.1.1".parse().unwrap();
+        let ip_v6: IpAddr = "fd00::1".parse().unwrap();
+        store.put_by_ip(ip_v4, "example.com");
+        store.put_by_ip(ip_v6, "Example.COM");
+
+        let (count, items) = store.search_by_wildcard_limited("EXAMPLE.COM", 1);
+        assert_eq!(count, 2);
+        assert_eq!(items.len(), 1);
+        assert_eq!(store.del_by_wildcard("EXAMPLE.COM"), 2);
+        assert!(!store.exist(ip_v4));
+        assert!(!store.exist(ip_v6));
     }
 }

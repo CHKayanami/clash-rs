@@ -38,6 +38,12 @@ pub trait Store: Sync + Send {
     fn del_by_ip(&self, ip: net::IpAddr);
     fn exist(&self, ip: net::IpAddr) -> bool;
     fn copy_to(&self, store: &dyn Store);
+    fn search_by_wildcard_limited(
+        &self,
+        pattern: &str,
+        limit: usize,
+    ) -> (usize, Vec<(net::IpAddr, String)>);
+    fn del_by_wildcard(&self, pattern: &str) -> usize;
 
     fn initial_offset_v4(&self, _min: u32, _max: u32) -> u32 {
         0
@@ -220,6 +226,22 @@ impl FakeDns {
 
     pub fn reverse_lookup(&self, ip: net::IpAddr) -> Option<String> {
         self.store.get_by_ip(ip)
+    }
+
+    pub fn search_cache_limited(
+        &self,
+        pattern: &str,
+        limit: usize,
+    ) -> (usize, Vec<(net::IpAddr, String)>) {
+        self.store.search_by_wildcard_limited(pattern.trim(), limit)
+    }
+
+    pub fn search_cache(&self, pattern: &str) -> Vec<(net::IpAddr, String)> {
+        self.search_cache_limited(pattern, usize::MAX).1
+    }
+
+    pub fn delete_cache(&self, pattern: &str) -> usize {
+        self.store.del_by_wildcard(pattern.trim())
     }
 
     pub async fn add_rule_set(
@@ -815,6 +837,61 @@ mod tests {
         assert_eq!(pool.store.get_by_host("foo.com"), None);
         // v6 lookup should still be there
         assert_eq!(pool.store.get_v6_by_host("foo.com"), Some(first_v6));
+    }
+
+    #[test]
+    fn test_file_store_pattern_delete_updates_both_indexes() {
+        let temp_dir = tempdir().unwrap();
+        let cache_path = temp_dir.path().join("test_pattern_delete.db");
+        let cache_store = ThreadSafeCacheFile::new(cache_path.to_str().unwrap(), true);
+        let v4_net = "198.18.0.0/16".parse().unwrap();
+        let v6_net = "fc00::/64".parse().unwrap();
+        let store = FileStore::new(cache_store.clone(), v4_net, v6_net);
+        let v4: net::IpAddr = "198.18.0.2".parse().unwrap();
+        let v6: net::IpAddr = "fc00::2".parse().unwrap();
+        let other: net::IpAddr = "198.18.0.3".parse().unwrap();
+        store.put_by_ip(v4, "example.com");
+        store.put_by_ip(v6, "example.com");
+        store.put_by_ip(other, "other.org");
+
+        assert_eq!(store.del_by_wildcard("EXAMPLE.COM"), 2);
+        assert_eq!(cache_store.get_fake_ip(&v4.to_string()), None);
+        assert_eq!(cache_store.get_fake_ip(&v6.to_string()), None);
+        assert_eq!(cache_store.get_fake_ip("example.com#v4"), None);
+        assert_eq!(cache_store.get_fake_ip("example.com#v6"), None);
+        assert_eq!(cache_store.get_fake_ip(&other.to_string()).as_deref(), Some("other.org"));
+
+        let reloaded = FileStore::new(cache_store, v4_net, v6_net);
+        assert_eq!(reloaded.get_by_ip(v4), None);
+        assert_eq!(reloaded.get_by_ip(v6), None);
+        assert_eq!(reloaded.get_by_ip(other).as_deref(), Some("other.org"));
+    }
+
+    #[tokio::test]
+    async fn test_file_store_pattern_delete_flushes_queued_puts() {
+        let temp_dir = tempdir().unwrap();
+        let cache_path = temp_dir.path().join("test_queued_pattern_delete.db");
+        let cache_store = ThreadSafeCacheFile::new(cache_path.to_str().unwrap(), true);
+        let v4_net = "198.18.0.0/16".parse().unwrap();
+        let v6_net = "fc00::/64".parse().unwrap();
+        let store = FileStore::new(cache_store.clone(), v4_net, v6_net);
+        let deleted_ip: net::IpAddr = "198.18.0.2".parse().unwrap();
+        let retained_ip: net::IpAddr = "198.18.0.3".parse().unwrap();
+        store.put_by_ip(deleted_ip, "example.com");
+        store.put_by_ip(retained_ip, "other.org");
+        assert_eq!(store.del_by_wildcard("*.com"), 1);
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if cache_store.get_fake_ip(&retained_ip.to_string()).as_deref() == Some("other.org")
+                    && cache_store.get_fake_ip(&deleted_ip.to_string()).is_none()
+                    && cache_store.get_fake_ip("example.com#v4").is_none()
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }).await.unwrap();
     }
 
     #[tokio::test]

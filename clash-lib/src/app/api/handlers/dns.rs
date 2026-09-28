@@ -11,7 +11,7 @@ use serde::Deserialize;
 use serde_json::{Map, Value};
 
 use crate::app::api::AppState;
-use crate::app::dns::ThreadSafeDNSResolver;
+use crate::app::dns::{DnsCacheUpstreamStat, ThreadSafeDNSResolver};
 use crate::app::dns::query::{DnsName, QType};
 use crate::app::dns::wire::parse_dns_response_records;
 
@@ -24,6 +24,8 @@ pub fn routes(resolver: ThreadSafeDNSResolver) -> Router<Arc<AppState>> {
     let state = DNSState { resolver };
     Router::new()
         .route("/query", get(query_dns))
+        .route("/upstreams", get(get_dns_upstreams))
+        .route("/cache", get(get_dns_cache).delete(delete_dns_cache))
         .with_state(state)
 }
 
@@ -109,4 +111,95 @@ async fn query_dns(
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
+}
+
+async fn get_dns_upstreams(State(state): State<DNSState>) -> impl IntoResponse {
+    let upstreams = state.resolver.list_upstreams();
+    let mut resp = Map::new();
+    resp.insert(
+        "upstreams".to_string(),
+        serde_json::to_value(upstreams).unwrap_or(Value::Array(vec![])),
+    );
+    Json(resp).into_response()
+}
+
+#[derive(Deserialize)]
+struct DnsCacheQuery {
+    upstream: Option<String>,
+    #[serde(alias = "wildcard", alias = "pattern", alias = "match")]
+    name: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct DnsCacheDeleteQuery {
+    upstream: Option<String>,
+    #[serde(alias = "wildcard", alias = "pattern", alias = "match")]
+    name: Option<String>,
+}
+
+async fn get_dns_cache(
+    State(state): State<DNSState>,
+    Query(q): Query<DnsCacheQuery>,
+) -> impl IntoResponse {
+    let upstream = match q.upstream.as_deref() {
+        Some(u) if !u.trim().is_empty() => u.trim(),
+        _ => {
+            return (StatusCode::BAD_REQUEST, "Upstream parameter is required")
+                .into_response();
+        }
+    };
+
+    let pattern = q.name.as_deref().unwrap_or("*");
+    let pattern = if pattern.trim().is_empty() {
+        "*"
+    } else {
+        pattern.trim()
+    };
+
+    let stat = state
+        .resolver
+        .search_cache_by_upstream(pattern, upstream)
+        .unwrap_or_else(|| DnsCacheUpstreamStat {
+            name: upstream.to_string(),
+            count: 0,
+            upstream_type: None,
+            items: Vec::new(),
+        });
+
+    let mut resp = Map::new();
+    resp.insert(
+        "upstream".to_string(),
+        serde_json::to_value(stat).unwrap_or(Value::Null),
+    );
+    Json(resp).into_response()
+}
+
+async fn delete_dns_cache(
+    State(state): State<DNSState>,
+    Query(q): Query<DnsCacheDeleteQuery>,
+) -> impl IntoResponse {
+    let upstream = match q.upstream.as_deref() {
+        Some(u) if !u.trim().is_empty() => u.trim(),
+        _ => {
+            return (StatusCode::BAD_REQUEST, "Upstream parameter is required")
+                .into_response();
+        }
+    };
+
+    let pattern = q.name.as_deref().unwrap_or("*");
+    let pattern = if pattern.trim().is_empty() {
+        "*"
+    } else {
+        pattern.trim()
+    };
+
+    let deleted = state.resolver.clear_cache_by_upstream(pattern, upstream);
+    let mut resp = Map::new();
+    resp.insert("deleted".to_string(), deleted.into());
+    resp.insert("upstream".to_string(), upstream.into());
+    resp.insert(
+        "message".to_string(),
+        format!("Deleted {} cache entries from upstream '{}'", deleted, upstream).into(),
+    );
+    Json(resp).into_response()
 }

@@ -162,6 +162,111 @@ impl DnsCache {
     ) {
         self.insert_scoped(&DEFAULT_SCOPE, query, template, min_ttl, stale_retention);
     }
+
+    /// Search cached entries by pattern matching on domain name, optionally filtered by scope.
+    /// Returns `(total_count, limited_items)` where `limited_items` is capped at `limit`.
+    /// Specifically optimized for `*` (matches all) and exact domains without wildcards.
+    pub fn search_scoped_limited(
+        &self,
+        pattern: &str,
+        scope_filter: Option<&str>,
+        limit: usize,
+        now: Instant,
+    ) -> (usize, Vec<DnsCacheEntryDetail>) {
+        let pattern = pattern.trim();
+        let is_wildcard_all = pattern == "*";
+        let is_exact = !pattern.contains('*') && !pattern.contains('?');
+
+        let mut total_count = 0;
+        let mut results = Vec::new();
+
+        for (key, entry) in self.inner.iter() {
+            if let Some(scope) = scope_filter {
+                if key.scope.as_ref() != scope {
+                    continue;
+                }
+            }
+            if !entry.is_fresh(now) && !entry.is_stale_valid(now) {
+                continue;
+            }
+
+            let matched = if is_wildcard_all {
+                true
+            } else if is_exact {
+                key.domain.eq_ignore_ascii_case(pattern)
+            } else {
+                crate::common::utils::wildcard_match(pattern, &key.domain)
+            };
+
+            if matched {
+                total_count += 1;
+                if results.len() < limit {
+                    let is_fresh = entry.is_fresh(now);
+                    results.push(DnsCacheEntryDetail {
+                        scope: key.scope.to_string(),
+                        domain: key.domain.to_string(),
+                        qtype: key.qtype.to_string(),
+                        ttl: entry.remaining_ttl_secs(now),
+                        is_stale: !is_fresh,
+                    });
+                }
+            }
+        }
+        (total_count, results)
+    }
+
+    /// Search cached entries by wildcard matching on domain name (unlimited).
+    pub fn search_scoped(
+        &self,
+        pattern: &str,
+        scope_filter: Option<&str>,
+        now: Instant,
+    ) -> Vec<DnsCacheEntryDetail> {
+        self.search_scoped_limited(pattern, scope_filter, usize::MAX, now).1
+    }
+
+    /// Invalidate/delete cached entries matching a domain pattern, optionally filtered by scope.
+    /// Specifically optimized for `*` (matches all) and exact domains without wildcards.
+    pub fn delete_scoped(&self, pattern: &str, scope_filter: Option<&str>) -> usize {
+        let pattern = pattern.trim();
+        let is_wildcard_all = pattern == "*";
+        let is_exact = !pattern.contains('*') && !pattern.contains('?');
+
+        let mut to_invalidate = Vec::new();
+        for (key, _) in self.inner.iter() {
+            if let Some(scope) = scope_filter {
+                if key.scope.as_ref() != scope {
+                    continue;
+                }
+            }
+
+            let matched = if is_wildcard_all {
+                true
+            } else if is_exact {
+                key.domain.eq_ignore_ascii_case(pattern)
+            } else {
+                crate::common::utils::wildcard_match(pattern, &key.domain)
+            };
+
+            if matched {
+                to_invalidate.push(key);
+            }
+        }
+        let count = to_invalidate.len();
+        for key in to_invalidate {
+            self.inner.invalidate(key.as_ref());
+        }
+        count
+    }
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct DnsCacheEntryDetail {
+    pub scope: String,
+    pub domain: String,
+    pub qtype: String,
+    pub ttl: u32,
+    pub is_stale: bool,
 }
 
 #[cfg(test)]

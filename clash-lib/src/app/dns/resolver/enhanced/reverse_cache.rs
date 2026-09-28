@@ -150,6 +150,29 @@ impl ReverseLookupCache {
         }
         None
     }
+
+    /// Invalidate reverse mappings for domains matching a DNS cache deletion.
+    /// Ambiguous entries have no usable domain mapping and are left to expire.
+    pub fn invalidate_matching(&self, pattern: &str) {
+        let pattern = pattern.trim();
+        let is_all = pattern == "*";
+        let is_exact = !pattern.contains('*') && !pattern.contains('?');
+        let matching_ips: Vec<_> = self.inner.iter()
+            .filter_map(|(ip, entry)| match entry {
+                ReverseEntry::Unique { domain, .. }
+                    if is_all
+                        || (is_exact && domain.eq_ignore_ascii_case(pattern))
+                        || (!is_exact && crate::common::utils::wildcard_match(pattern, &domain)) =>
+                {
+                    Some(ip)
+                }
+                _ => None,
+            })
+            .collect();
+        for ip in matching_ips {
+            self.inner.invalidate(ip.as_ref());
+        }
+    }
 }
 
 #[cfg(test)]
@@ -204,5 +227,21 @@ mod tests {
         // Now insert fresh entry
         cache.insert(ip, "fresh.com", 60);
         assert_eq!(cache.lookup(&ip), Some("fresh.com".to_string()));
+    }
+
+    #[test]
+    fn test_invalidate_matching_domains() {
+        let cache = ReverseLookupCache::new(100);
+        let matching_ip: IpAddr = "1.2.3.4".parse().unwrap();
+        let other_ip: IpAddr = "5.6.7.8".parse().unwrap();
+        cache.insert(matching_ip, "example.com", 60);
+        cache.insert(other_ip, "other.org", 60);
+
+        cache.invalidate_matching("EXAMPLE.COM");
+        assert_eq!(cache.lookup(&matching_ip), None);
+        assert_eq!(cache.lookup(&other_ip).as_deref(), Some("other.org"));
+
+        cache.invalidate_matching("*.org");
+        assert_eq!(cache.lookup(&other_ip), None);
     }
 }

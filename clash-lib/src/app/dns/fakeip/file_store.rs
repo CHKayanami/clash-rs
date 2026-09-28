@@ -15,6 +15,9 @@ enum FakeIpCommand {
         ip: IpAddr,
         host_key: Option<String>,
     },
+    DeleteBatch {
+        items: Vec<(String, Option<String>)>,
+    },
 }
 
 pub struct FileStore {
@@ -192,6 +195,14 @@ impl FileStore {
                                 Some(FakeIpCommand::Delete { ip, host_key }) => {
                                     deletes.push((ip.to_string(), host_key));
                                 }
+                                Some(FakeIpCommand::DeleteBatch { items }) => {
+                                    deletes.extend(items);
+                                    if !puts.is_empty() || !deletes.is_empty() {
+                                        file_clone.apply_fake_ip_batch(&puts, &deletes);
+                                        puts.clear();
+                                        deletes.clear();
+                                    }
+                                }
                                 None => {
                                     // 通道已关闭（FileStore 被 drop），将剩余未刷盘数据写入并退出
                                     if !puts.is_empty() || !deletes.is_empty() {
@@ -316,6 +327,41 @@ impl Store for FileStore {
 
     fn copy_to(&self, #[allow(unused)] store: &dyn Store) {
         // NO-OP
+    }
+
+    fn search_by_wildcard_limited(
+        &self,
+        pattern: &str,
+        limit: usize,
+    ) -> (usize, Vec<(IpAddr, String)>) {
+        self.cache.search_by_wildcard_limited(pattern, limit)
+    }
+
+    fn del_by_wildcard(&self, pattern: &str) -> usize {
+        let pattern = pattern.trim();
+        let items = self.cache.take_by_wildcard(pattern);
+
+        if items.is_empty() {
+            return 0;
+        }
+
+        let count = items.len();
+        let mut deletes = Vec::with_capacity(count);
+
+        for (ip, host) in items {
+            let host_key = Self::make_host_key(&host, ip.is_ipv6());
+            deletes.push((ip.to_string(), Some(host_key)));
+        }
+
+        if let Some(tx) = &self.tx {
+            if let Err(e) = tx.send(FakeIpCommand::DeleteBatch { items: deletes }) {
+                warn!("failed to send fakeip delete batch to background worker: {}", e);
+            }
+        } else {
+            self.file.apply_fake_ip_batch(&[], &deletes);
+        }
+
+        count
     }
 
     fn initial_offset_v4(&self, _min: u32, _max: u32) -> u32 {
