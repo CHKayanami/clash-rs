@@ -143,7 +143,7 @@ impl RuleType {
             }),
             "DOMAIN-REGEX" => Ok(RuleType::DomainRegex {
                 regex: regex::Regex::new(payload)
-                    .map_err(|e| Error::InvalidConfig(e.to_string()))?,
+                    .map_err(|e| Error::InvalidConfig(format!("invalid DOMAIN-REGEX '{payload}': {e}")))?,
                 target: target.to_string(),
             }),
             "DOMAIN-SUFFIX" => Ok(RuleType::DomainSuffix {
@@ -164,12 +164,16 @@ impl RuleType {
                 no_resolve,
             }),
             "IP-CIDR" | "IP-CIDR6" => Ok(RuleType::IpCidr {
-                ipnet: payload.parse()?,
+                ipnet: payload.parse().map_err(|e| Error::InvalidConfig(format!(
+                    "invalid {proto_upper} '{payload}': {e}"
+                )))?,
                 target: target.to_string(),
                 no_resolve,
             }),
             "SRC-IP-CIDR" => Ok(RuleType::SrcCidr {
-                ipnet: payload.parse()?,
+                ipnet: payload.parse().map_err(|e| Error::InvalidConfig(format!(
+                    "invalid SRC-IP-CIDR '{payload}': {e}"
+                )))?,
                 target: target.to_string(),
                 no_resolve,
             }),

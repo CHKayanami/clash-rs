@@ -743,8 +743,12 @@ impl TryFrom<PathBuf> for Config {
     type Error = Error;
 
     fn try_from(value: PathBuf) -> Result<Self, Self::Error> {
-        let content = std::fs::read_to_string(value)?;
-        let config = content.parse::<Config>()?;
+        let content = std::fs::read_to_string(&value).map_err(|e| {
+            Error::InvalidConfig(format!("could not read config file '{}': {e}", value.display()))
+        })?;
+        let config = content.parse::<Config>().map_err(|e| {
+            Error::InvalidConfig(format!("config file '{}': {e}", value.display()))
+        })?;
         Ok(config)
     }
 }

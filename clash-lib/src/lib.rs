@@ -109,7 +109,10 @@ impl Config {
             Config::Def(c) => c.try_into(),
             Config::Internal(c) => Ok(c),
             Config::File(file) => {
-                TryInto::<def::Config>::try_into(PathBuf::from(file))?.try_into()
+                let config = TryInto::<def::Config>::try_into(PathBuf::from(&file))?;
+                config.try_into().map_err(|e| {
+                    Error::InvalidConfig(format!("config file '{file}': {e}"))
+                })
             }
             Config::Str(s) => s.parse::<def::Config>()?.try_into(),
         }
@@ -121,14 +124,26 @@ impl Config {
     ///
     /// Enable this via the `--strict-config` CLI flag.
     pub fn try_parse_strict(self) -> Result<InternalConfig> {
-        let yaml = match self {
-            Config::File(file) => std::fs::read_to_string(file)?,
-            Config::Str(s) => s,
+        let (yaml, source) = match self {
+            Config::File(file) => (
+                std::fs::read_to_string(&file).map_err(|e| {
+                    Error::InvalidConfig(format!("could not read config file '{file}': {e}"))
+                })?,
+                Some(file),
+            ),
+            Config::Str(s) => (s, None),
             // Def/Internal are already structured Rust values — no YAML to
             // check for unknown fields.
             other => return other.try_parse(),
         };
-        def::check_unknown_fields(&yaml)?.try_into()
+        let config = def::check_unknown_fields(&yaml).map_err(|e| match source.as_deref() {
+            Some(file) => Error::InvalidConfig(format!("config file '{file}': {e}")),
+            None => e,
+        })?;
+        config.try_into().map_err(|e| match source {
+            Some(file) => Error::InvalidConfig(format!("config file '{file}': {e}")),
+            None => e,
+        })
     }
 }
 

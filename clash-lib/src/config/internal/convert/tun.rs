@@ -36,17 +36,23 @@ pub fn convert(
 
             let routes = raw_routes
                 .into_iter()
-                .map(|x| x.parse())
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|x| Error::InvalidConfig(format!("parse tun routes: {x}")))?;
+                .map(|route| {
+                    route.parse().map_err(|e| {
+                        Error::InvalidConfig(format!("invalid tun.routes entry '{route}': {e}"))
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
 
             let route_exclude_address = raw_exclude_routes
                 .into_iter()
-                .map(|x| x.parse())
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|x| {
-                    Error::InvalidConfig(format!("parse tun route-exclude-address: {x}"))
-                })?;
+                .map(|route| {
+                    route.parse().map_err(|e| {
+                        Error::InvalidConfig(format!(
+                            "invalid tun.route-exclude-address entry '{route}': {e}"
+                        ))
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
 
             Ok(config::TunConfig {
                 enable: t.enable,
@@ -57,14 +63,16 @@ pub fn convert(
                 routes,
                 route_exclude_address,
                 auto_detect_interface: t.auto_detect_interface.unwrap_or(false),
-                gateway: t.gateway.parse().map_err(|x| {
-                    Error::InvalidConfig(format!("parse tun gateway: {x}"))
+                gateway: t.gateway.parse().map_err(|e| {
+                    Error::InvalidConfig(format!("invalid tun.gateway '{}': {e}", t.gateway))
                 })?,
                 gateway_v6: t
                     .gateway_v6
-                    .map(|x| {
-                        x.parse().map_err(|x| {
-                            Error::InvalidConfig(format!("parse tun gateway_v6: {x}"))
+                    .map(|gateway| {
+                        gateway.parse().map_err(|e| {
+                            Error::InvalidConfig(format!(
+                                "invalid tun.gateway-v6 '{gateway}': {e}"
+                            ))
                         })
                     })
                     .transpose()?,
@@ -99,7 +107,13 @@ pub fn convert(
                         } else {
                             let rules = list
                                 .into_iter()
-                                .map(|s| s.parse())
+                                .map(|rule| {
+                                    rule.parse().map_err(|e| {
+                                        Error::InvalidConfig(format!(
+                                            "invalid tun.dns-hijack entry '{rule}': {e}"
+                                        ))
+                                    })
+                                })
                                 .collect::<Result<Vec<config::DnsHijackRule>, _>>()?;
                             config::DnsHijack::Rules(rules)
                         }
@@ -150,5 +164,27 @@ mod tests {
         let cfg = convert(Some(def_tun)).unwrap();
         assert!(!cfg.enable_tcp);
     }
-}
 
+    #[test]
+    fn invalid_tun_values_identify_field_and_value() {
+        for (yaml, field, value) in [
+            ("enable: true\nroutes: [bad]\n", "tun.routes", "bad"),
+            (
+                "enable: true\nroute-exclude-address: [bad]\n",
+                "tun.route-exclude-address",
+                "bad",
+            ),
+            ("enable: true\ngateway: bad\n", "tun.gateway", "bad"),
+            ("enable: true\ngateway-v6: bad\n", "tun.gateway-v6", "bad"),
+            (
+                "enable: true\ndns-hijack: [bad]\n",
+                "tun.dns-hijack",
+                "bad",
+            ),
+        ] {
+            let def_tun: def::TunConfig = yaml_serde::from_str(yaml).unwrap();
+            let error = convert(Some(def_tun)).err().unwrap().to_string();
+            assert!(error.contains(field) && error.contains(value), "{error}");
+        }
+    }
+}

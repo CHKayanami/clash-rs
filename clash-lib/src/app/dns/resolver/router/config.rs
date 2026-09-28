@@ -3,7 +3,6 @@ use std::net::IpAddr;
 use std::str::FromStr;
 
 use ipnet::IpNet;
-use tracing::warn;
 
 use crate::Error;
 use crate::app::dns::config::{Config as LegacyDnsConfig, NameServer};
@@ -130,19 +129,19 @@ impl RouterConfig {
             let mut ips = Vec::new();
             match value {
                 Dns2StringOrList::Single(s) => {
-                    if let Ok(ip) = s.parse::<IpAddr>() {
-                        ips.push(ip);
-                    } else {
-                        warn!("invalid IP address in dns2.hosts: {s}");
-                    }
+                    ips.push(s.parse::<IpAddr>().map_err(|e| {
+                        Error::InvalidConfig(format!(
+                            "invalid dns2.hosts['{domain}'] address '{s}': {e}"
+                        ))
+                    })?);
                 }
                 Dns2StringOrList::List(l) => {
                     for s in l {
-                        if let Ok(ip) = s.parse::<IpAddr>() {
-                            ips.push(ip);
-                        } else {
-                            warn!("invalid IP address in dns2.hosts: {s}");
-                        }
+                        ips.push(s.parse::<IpAddr>().map_err(|e| {
+                            Error::InvalidConfig(format!(
+                                "invalid dns2.hosts['{domain}'] address '{s}': {e}"
+                            ))
+                        })?);
                     }
                 }
             }
@@ -178,14 +177,18 @@ impl RouterConfig {
                 Vec::new()
             };
 
-            let inet4_range = u
-                .inet4_range
-                .parse::<ipnet::Ipv4Net>()
-                .unwrap_or_else(|_| "198.18.0.1/16".parse().unwrap());
-            let inet6_range = u
-                .inet6_range
-                .parse::<ipnet::Ipv6Net>()
-                .unwrap_or_else(|_| "fc00::/18".parse().unwrap());
+            let inet4_range = u.inet4_range.parse::<ipnet::Ipv4Net>().map_err(|e| {
+                Error::InvalidConfig(format!(
+                    "invalid dns2.upstreams['{}'].inet4-range '{}': {e}",
+                    u.tag, u.inet4_range
+                ))
+            })?;
+            let inet6_range = u.inet6_range.parse::<ipnet::Ipv6Net>().map_err(|e| {
+                Error::InvalidConfig(format!(
+                    "invalid dns2.upstreams['{}'].inet6-range '{}': {e}",
+                    u.tag, u.inet6_range
+                ))
+            })?;
 
             upstreams.push(UpstreamConfig {
                 tag: u.tag.clone(),
@@ -202,7 +205,7 @@ impl RouterConfig {
         let mut request_rules = Vec::new();
         let mut request_fallback = RequestAction::Reject(RejectCode::Nodata);
 
-        for r in &def.routing.request {
+        for (index, r) in def.routing.request.iter().enumerate() {
             if let Some(ref fb) = r.fallback {
                 request_fallback = RequestAction::Route(fb.clone());
                 continue;
@@ -210,9 +213,10 @@ impl RouterConfig {
 
             let mut qtypes = HashSet::new();
             for qt_str in &r.query_type {
-                if let Ok(qt) = QType::from_str(qt_str) {
-                    qtypes.insert(qt);
-                }
+                let qt = QType::from_str(qt_str).map_err(|e| Error::InvalidConfig(format!(
+                    "invalid dns2.routing.request[{index}].query-type '{qt_str}': {e}"
+                )))?;
+                qtypes.insert(qt);
             }
 
             let mut sips = Vec::new();
@@ -221,6 +225,10 @@ impl RouterConfig {
                     sips.push(net);
                 } else if let Ok(ip) = sip_str.parse::<IpAddr>() {
                     sips.push(IpNet::from(ip));
+                } else {
+                    return Err(Error::InvalidConfig(format!(
+                        "invalid dns2.routing.request[{index}].source-ip-cidr '{sip_str}'"
+                    )));
                 }
             }
 
@@ -261,7 +269,7 @@ impl RouterConfig {
         let mut response_rules = Vec::new();
         let mut response_fallback = ResponseAction::Accept;
 
-        for r in &def.routing.response {
+        for (index, r) in def.routing.response.iter().enumerate() {
             if let Some(ref fb) = r.fallback {
                 response_fallback = match fb.to_ascii_lowercase().as_str() {
                     "reject" => ResponseAction::Reject,
@@ -272,9 +280,10 @@ impl RouterConfig {
 
             let mut qtypes = HashSet::new();
             for qt_str in &r.query_type {
-                if let Ok(qt) = QType::from_str(qt_str) {
-                    qtypes.insert(qt);
-                }
+                let qt = QType::from_str(qt_str).map_err(|e| Error::InvalidConfig(format!(
+                    "invalid dns2.routing.response[{index}].query-type '{qt_str}': {e}"
+                )))?;
+                qtypes.insert(qt);
             }
 
             let mut cidrs = Vec::new();
@@ -283,6 +292,10 @@ impl RouterConfig {
                     cidrs.push(net);
                 } else if let Ok(ip) = ip_str.parse::<IpAddr>() {
                     cidrs.push(IpNet::from(ip));
+                } else {
+                    return Err(Error::InvalidConfig(format!(
+                        "invalid dns2.routing.response[{index}].ip-cidr '{ip_str}'"
+                    )));
                 }
             }
 
@@ -337,5 +350,23 @@ impl RouterConfig {
             },
             cache_capacity: def.cache_capacity.unwrap_or(4096).max(1),
         })
+    }
+}
+
+#[cfg(test)]
+mod config_error_tests {
+    use super::*;
+
+    #[test]
+    fn invalid_dns2_upstream_range_identifies_tag_and_value() {
+        let mut def = DefDns2Config::default();
+        def.upstreams.push(crate::config::def::Dns2UpstreamDef {
+            tag: "primary".into(),
+            inet4_range: "bad".into(),
+            ..Default::default()
+        });
+        let error = RouterConfig::from_def(&def, true).err().unwrap().to_string();
+        assert!(error.contains("dns2.upstreams['primary'].inet4-range"));
+        assert!(error.contains("bad"));
     }
 }

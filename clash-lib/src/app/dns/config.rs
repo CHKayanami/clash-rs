@@ -158,10 +158,9 @@ impl Config {
                 }
             }
 
-            let url = Url::parse(&server).map_err(|_x| {
+            let url = Url::parse(&server).map_err(|e| {
                 Error::InvalidConfig(format!(
-                    "invalid dns server: {}",
-                    server.as_str()
+                    "invalid DNS nameserver[{i}] '{server}': {e}"
                 ))
             })?;
 
@@ -273,7 +272,9 @@ impl Config {
         let mut policy = HashMap::new();
 
         for (domain, server_val) in policy_map {
-            let nameservers = Config::parse_nameserver(server_val.as_slice())?;
+            let nameservers = Config::parse_nameserver(server_val.as_slice()).map_err(|e| {
+                Error::InvalidConfig(format!("dns.nameserver-policy['{domain}']: {e}"))
+            })?;
 
             for sub_domain in domain.split(',') {
                 let sub_domain = sub_domain.trim();
@@ -300,9 +301,9 @@ impl Config {
         let mut output = vec![];
 
         for ip in ipcidr.iter() {
-            let net: ipnet::IpNet = ip
-                .parse()
-                .map_err(|x: AddrParseError| Error::InvalidConfig(x.to_string()))?;
+            let net: ipnet::IpNet = ip.parse().map_err(|e: AddrParseError| {
+                Error::InvalidConfig(format!("invalid dns.fallback-filter.ipcidr entry '{ip}': {e}"))
+            })?;
             output.push(net);
         }
 
@@ -319,7 +320,9 @@ impl Config {
         );
 
         for (host, ip_str) in hosts_mapping.iter() {
-            let ip = ip_str.parse::<IpAddr>()?;
+            let ip = ip_str.parse::<IpAddr>().map_err(|e| {
+                Error::InvalidConfig(format!("invalid hosts.{host} address '{ip_str}': {e}"))
+            })?;
             tree.insert(host.as_str(), Arc::new(ip));
         }
 
@@ -401,8 +404,12 @@ impl TryFrom<&crate::config::def::Config> for Config {
             )));
         }
 
-        let nameservers = Config::parse_nameserver(&dc.nameserver)?;
-        let fallback = Config::parse_nameserver(&dc.fallback)?;
+        let nameservers = Config::parse_nameserver(&dc.nameserver).map_err(|e| {
+            Error::InvalidConfig(format!("dns.nameserver: {e}"))
+        })?;
+        let fallback = Config::parse_nameserver(&dc.fallback).map_err(|e| {
+            Error::InvalidConfig(format!("dns.fallback: {e}"))
+        })?;
         let nameserver_policy =
             Config::parse_nameserver_policy(&dc.nameserver_policy)?;
 
@@ -419,12 +426,14 @@ impl TryFrom<&crate::config::def::Config> for Config {
             dc.default_nameserver.clone()
         };
 
-        let default_nameserver = Config::parse_nameserver(&default_nameserver_raw)?;
+        let default_nameserver = Config::parse_nameserver(&default_nameserver_raw).map_err(|e| {
+            Error::InvalidConfig(format!("dns.default-nameserver: {e}"))
+        })?;
 
         for ns in &default_nameserver {
             if let url::Host::Domain(_) = ns.host {
-                return Err(Error::InvalidConfig(String::from(
-                    "default dns must be ip address",
+                return Err(Error::InvalidConfig(format!(
+                    "dns.default-nameserver must use an IP address: {ns}"
                 )));
             }
         }
@@ -433,7 +442,9 @@ impl TryFrom<&crate::config::def::Config> for Config {
         // `default-nameserver` at client-construction time, mirroring how
         // `nameserver` resolves its own DoH/DoT hosts.
         let proxy_server_nameserver = if !dc.proxy_server_nameserver.is_empty() {
-            let ns = Config::parse_nameserver(&dc.proxy_server_nameserver)?;
+            let ns = Config::parse_nameserver(&dc.proxy_server_nameserver).map_err(|e| {
+                Error::InvalidConfig(format!("dns.proxy-server-nameserver: {e}"))
+            })?;
             if ns.is_empty() {
                 return Err(Error::InvalidConfig(String::from(
                     "proxy-server-nameserver has no usable entries (all skipped)",
@@ -543,12 +554,12 @@ impl TryFrom<&crate::config::def::Config> for Config {
             enhance_mode: dc.enhanced_mode.clone(),
             default_nameserver,
             proxy_server_nameserver,
-            fake_ip_range: dc.fake_ip_range.parse::<ipnet::Ipv4Net>().map_err(
-                |_| Error::InvalidConfig(String::from("invalid fake ipv4 range")),
-            )?,
-            fake_ip_range6: dc.fake_ip_range6.parse::<ipnet::Ipv6Net>().map_err(
-                |_| Error::InvalidConfig(String::from("invalid fake ipv6 range")),
-            )?,
+            fake_ip_range: dc.fake_ip_range.parse::<ipnet::Ipv4Net>().map_err(|e| {
+                Error::InvalidConfig(format!("invalid dns.fake-ip-range '{}': {e}", dc.fake_ip_range))
+            })?,
+            fake_ip_range6: dc.fake_ip_range6.parse::<ipnet::Ipv6Net>().map_err(|e| {
+                Error::InvalidConfig(format!("invalid dns.fake-ip-range6 '{}': {e}", dc.fake_ip_range6))
+            })?,
             fake_ip_filter: dc.fake_ip_filter.clone(),
             fake_ip_filter_mode: dc.fake_ip_filter_mode,
             fake_ip_ttl: dc.fake_ip_ttl,
@@ -580,7 +591,7 @@ impl TryFrom<&crate::config::def::Config> for Config {
                 for entry in &dc.qtype_filter {
                     let qtype = entry.parse::<QType>().map_err(|e| {
                         Error::InvalidConfig(format!(
-                            "invalid `qtype-filter` entry: {e}"
+                            "invalid dns.qtype-filter entry '{entry}': {e}"
                         ))
                     })?;
                     set.insert(qtype);

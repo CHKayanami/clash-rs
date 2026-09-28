@@ -119,9 +119,11 @@ pub(super) fn convert(mut c: def::Config) -> Result<config::Config, Error> {
             .take()
             .unwrap_or_default()
             .into_iter()
-            .map(|x| {
-                x.parse::<RuleType>()
-                    .map_err(|x| Error::InvalidConfig(x.to_string()))
+            .enumerate()
+            .map(|(index, rule)| {
+                rule.parse::<RuleType>().map_err(|e| {
+                    Error::InvalidConfig(format!("invalid rules[{index}] '{rule}': {e}"))
+                })
             })
             .collect::<Result<Vec<_>, _>>()?,
         rule_providers: rule_provider::convert(c.rule_provider.take()),
@@ -204,7 +206,7 @@ impl TryFrom<HashMap<String, Value>> for OutboundGroupProtocol {
             .get("name")
             .and_then(|x| x.as_str())
             .ok_or(Error::InvalidConfig(
-                "missing field `name` in outbound proxy grouop".to_owned(),
+                "missing field `name` in outbound proxy group".to_owned(),
             ))?
             .to_owned();
         OutboundGroupProtocol::deserialize(MapDeserializer::new(mapping.into_iter()))
