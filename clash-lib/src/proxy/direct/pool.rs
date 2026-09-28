@@ -10,6 +10,7 @@ use bytes::Bytes;
 use futures::{Sink, Stream, ready};
 use parking_lot::RwLock;
 use std::{
+    cell::RefCell,
     collections::{HashMap, HashSet},
     io,
     net::{IpAddr, SocketAddr, SocketAddrV6},
@@ -51,7 +52,13 @@ pub(crate) struct DirectSocketKey {
 }
 
 const MAX_CONSECUTIVE_RECV_ERRORS: usize = 10;
+const MAX_BATCH_RECV_PACKETS: usize = 32;
 const MAX_LOGICAL_MAPPINGS: usize = 128;
+
+thread_local! {
+    // A receive buffer per worker avoids keeping 64 KiB alive for every pooled socket.
+    static UDP_RECV_BUF: RefCell<Vec<u8>> = RefCell::new(vec![0; 65535]);
+}
 
 #[derive(Default)]
 pub(crate) struct SocketRoutingTable {
@@ -99,34 +106,6 @@ impl SocketRoutingTable {
         true
     }
 
-    /// Try to register a session on this socket and atomically bind a collection of destinations.
-    /// Returns false if the socket is closed or if any destination is already bound to another session.
-    fn try_register_many<'a>(
-        &mut self,
-        session_id: SessionId,
-        tx: Sender<UdpPacket>,
-        _initial_dst: Option<SocketAddr>,
-        all_dsts: impl IntoIterator<Item = &'a SocketAddr>,
-    ) -> bool {
-        if self.is_closed {
-            return false;
-        }
-        let dst_vec: Vec<SocketAddr> = all_dsts.into_iter().copied().collect();
-        for dst in &dst_vec {
-            if let Some(&owner) = self.dest_to_session.get(dst) {
-                if owner != session_id {
-                    return false;
-                }
-            }
-        }
-        for dst in dst_vec {
-            self.dest_to_session.insert(dst, session_id);
-        }
-        self.sessions.insert(session_id, tx);
-        self.last_active_session = Some(session_id);
-        true
-    }
-
     /// Try to bind a destination for an existing session (e.g. after domain resolution).
     /// Returns:
     /// - `Ok(())` if successfully bound (or already bound to this session).
@@ -167,11 +146,12 @@ impl SocketRoutingTable {
             .or_else(|| self.sessions.values().next().cloned())
     }
 
-    fn on_transmit(&mut self, session_id: SessionId, _dst: SocketAddr) {
+    fn on_transmit(&mut self, session_id: SessionId) -> bool {
         if self.is_closed {
-            return;
+            return false;
         }
         self.last_active_session = Some(session_id);
+        true
     }
 
     fn unregister_session(
@@ -240,47 +220,61 @@ impl DirectDatagramPool {
         let key_clone = key.clone();
 
         let recv_task = tokio::spawn(async move {
-            let mut buf = vec![0u8; 65535];
             let mut consecutive_recv_errors = 0;
-            loop {
-                match socket_recv.recv_from(&mut buf).await {
-                    Ok((len, peer_addr)) => {
-                        consecutive_recv_errors = 0;
-                        let peer = canonicalize_src(peer_addr);
-                        let packet_data = Bytes::copy_from_slice(&buf[..len]);
+            'receive: loop {
+                let mut readiness_error = socket_recv.readable().await.err();
+                for _ in 0..MAX_BATCH_RECV_PACKETS {
+                    let received = if let Some(e) = readiness_error.take() {
+                        Err(e)
+                    } else {
+                        UDP_RECV_BUF.with_borrow_mut(|buf| {
+                            socket_recv.try_recv_from(buf).map(|(len, peer)| {
+                                (Bytes::copy_from_slice(&buf[..len]), peer)
+                            })
+                        })
+                    };
+                    match received {
+                        Ok((packet_data, peer_addr)) => {
+                            consecutive_recv_errors = 0;
+                            let peer = canonicalize_src(peer_addr);
 
-                        let target_tx = routing_recv.read().route(peer);
+                            let target_tx = routing_recv.read().route(peer);
 
-                        if let Some(tx) = target_tx {
-                            let packet = UdpPacket {
-                                data: packet_data,
-                                src_addr: SocksAddr::Ip(peer),
-                                dst_addr: SocksAddr::any_ipv4(),
-                                inbound_user: None,
-                            };
-                            if let Err(TrySendError::Full(_)) = tx.try_send(packet) {
-                                tracing::trace!(
-                                    "Direct pooled UDP downstream buffer full, packet dropped"
+                            if let Some(tx) = target_tx {
+                                let packet = UdpPacket {
+                                    data: packet_data,
+                                    src_addr: SocksAddr::Ip(peer),
+                                    dst_addr: SocksAddr::any_ipv4(),
+                                    inbound_user: None,
+                                };
+                                if let Err(TrySendError::Full(_)) = tx.try_send(packet) {
+                                    tracing::trace!(
+                                        "Direct pooled UDP downstream buffer full, packet dropped"
+                                    );
+                                }
+                            }
+                        }
+                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue 'receive,
+                        Err(e) => {
+                            consecutive_recv_errors += 1;
+                            if consecutive_recv_errors >= MAX_CONSECUTIVE_RECV_ERRORS {
+                                tracing::warn!(
+                                    "Direct pooled UDP socket reached error limit ({MAX_CONSECUTIVE_RECV_ERRORS}), closing: {e}"
                                 );
+                                routing_recv.write().close();
+                                if let Some(pool) = pool_weak.and_then(|w| w.upgrade()) {
+                                    pool.cleanup_closed(&key_clone);
+                                }
+                                break 'receive;
                             }
+                            tracing::trace!("Direct pooled UDP transient recv error: {e}");
+                            tokio::task::yield_now().await;
+                            continue 'receive;
                         }
-                    }
-                    Err(e) => {
-                        consecutive_recv_errors += 1;
-                        if consecutive_recv_errors >= MAX_CONSECUTIVE_RECV_ERRORS {
-                            tracing::warn!(
-                                "Direct pooled UDP socket reached error limit ({MAX_CONSECUTIVE_RECV_ERRORS}), closing: {e}"
-                            );
-                            routing_recv.write().close();
-                            if let Some(pool) = pool_weak.and_then(|w| w.upgrade()) {
-                                pool.cleanup_closed(&key_clone);
-                            }
-                            break;
-                        }
-                        tracing::trace!("Direct pooled UDP transient recv error: {e}");
-                        tokio::task::yield_now().await;
                     }
                 }
+                // Bound a burst so other sockets and sessions get a turn.
+                tokio::task::yield_now().await;
             }
         });
 
@@ -295,11 +289,17 @@ impl DirectDatagramPool {
 
     pub fn connect(
         self: &Arc<Self>,
-        key: DirectSocketKey,
+        mut key: DirectSocketKey,
         iface: Option<&OutboundInterface>,
         destination: SocksAddr,
         resolver: ThreadSafeDNSResolver,
     ) -> io::Result<PooledDirectDatagram> {
+        let base_key = key.clone();
+        let initial_loopback = destination.ip().is_some_and(|ip| ip.is_loopback());
+        if initial_loopback {
+            key.iface_name = None;
+        }
+        let initial_iface = if initial_loopback { None } else { iface };
         let canon_dst = match destination {
             SocksAddr::Ip(addr) => Some(canonicalize_src(addr)),
             SocksAddr::Domain(..) => None,
@@ -328,7 +328,7 @@ impl DirectDatagramPool {
             None => {
                 // 2. Slow-path: Create socket OUTSIDE global write lock
                 let pool_weak = Arc::downgrade(self);
-                let new_entry = Arc::new(Self::create_entry(&key, iface, Some(pool_weak))?);
+                let new_entry = Arc::new(Self::create_entry(&key, initial_iface, Some(pool_weak))?);
                 let mut entries_guard = self.entries.write();
                 let list = entries_guard.entry(key.clone()).or_default();
                 list.retain(|e| !e.routing.read().is_closed());
@@ -365,10 +365,13 @@ impl DirectDatagramPool {
             session_id,
             entry,
             pool: self.clone(),
+            base_key,
             resolver,
             iface: iface.cloned(),
             tx,
             registered_dsts,
+            retained_entries: Vec::new(),
+            last_dst: None,
             rx,
             pkt: None,
             flushed: true,
@@ -378,25 +381,17 @@ impl DirectDatagramPool {
         })
     }
 
-    /// Re-home a session to a different socket if its newly-resolved destination
-    /// collides with an existing session on the current socket.
-    fn rehome(
+    /// Attach a session to another socket. Existing sockets stay registered so
+    /// replies to requests already sent from their ports can still arrive.
+    fn attach(
         self: &Arc<Self>,
         key: &DirectSocketKey,
         current_entry: &Arc<DirectSocketEntry>,
         session_id: SessionId,
         tx: Sender<UdpPacket>,
         dst: SocketAddr,
-        registered_dsts: &HashSet<SocketAddr>,
         iface: Option<&OutboundInterface>,
     ) -> io::Result<Arc<DirectSocketEntry>> {
-        // Phase 1: Try to acquire or allocate a new socket FIRST.
-        // If allocation fails (e.g. EMFILE/bind error), return Err immediately
-        // without touching current_entry so the session retains its existing receiver!
-        let all_dsts: Vec<SocketAddr> = std::iter::once(dst)
-            .chain(registered_dsts.iter().copied())
-            .collect();
-
         let mut chosen_entry = None;
         {
             let entries_guard = self.entries.read();
@@ -406,7 +401,7 @@ impl DirectDatagramPool {
                         continue;
                     }
                     let mut routing = candidate.routing.write();
-                    if routing.try_register_many(session_id, tx.clone(), Some(dst), all_dsts.iter()) {
+                    if routing.try_register(session_id, tx.clone(), Some(dst)) {
                         chosen_entry = Some(candidate.clone());
                         break;
                     }
@@ -428,7 +423,7 @@ impl DirectDatagramPool {
                         continue;
                     }
                     let mut routing = candidate.routing.write();
-                    if routing.try_register_many(session_id, tx.clone(), Some(dst), all_dsts.iter()) {
+                    if routing.try_register(session_id, tx.clone(), Some(dst)) {
                         fresh_entry.recv_task.abort();
                         registered = true;
                         chosen_entry = Some(candidate.clone());
@@ -439,7 +434,7 @@ impl DirectDatagramPool {
                     fresh_entry
                         .routing
                         .write()
-                        .try_register_many(session_id, tx, Some(dst), all_dsts.iter());
+                        .try_register(session_id, tx, Some(dst));
                     list.push(fresh_entry.clone());
                     fresh_entry
                 } else {
@@ -447,14 +442,6 @@ impl DirectDatagramPool {
                 }
             }
         };
-
-        // Phase 2: Now that new_entry is guaranteed to be ready and registered,
-        // cleanly unregister from current_entry.
-        current_entry
-            .routing
-            .write()
-            .unregister_session(session_id, registered_dsts);
-        self.release(key, current_entry);
 
         Ok(new_entry)
     }
@@ -496,10 +483,13 @@ pub struct PooledDirectDatagram {
     session_id: SessionId,
     entry: Arc<DirectSocketEntry>,
     pool: Arc<DirectDatagramPool>,
+    base_key: DirectSocketKey,
     resolver: ThreadSafeDNSResolver,
     iface: Option<OutboundInterface>,
     tx: Sender<UdpPacket>,
     registered_dsts: HashSet<SocketAddr>,
+    retained_entries: Vec<(Arc<DirectSocketEntry>, HashSet<SocketAddr>)>,
+    last_dst: Option<SocketAddr>,
     rx: Receiver<UdpPacket>,
     pkt: Option<UdpPacket>,
     flushed: bool,
@@ -519,6 +509,10 @@ impl Drop for PooledDirectDatagram {
             .unregister_session(self.session_id, &self.registered_dsts);
 
         self.pool.release(&self.entry.key, &self.entry);
+        for (entry, destinations) in self.retained_entries.drain(..) {
+            entry.routing.write().unregister_session(self.session_id, &destinations);
+            self.pool.release(&entry.key, &entry);
+        }
     }
 }
 
@@ -576,6 +570,7 @@ impl Sink<UdpPacket> for PooledDirectDatagram {
             session_id,
             ref mut entry,
             ref pool,
+            ref base_key,
             ref tx,
             ref iface,
             ref mut pkt,
@@ -584,6 +579,8 @@ impl Sink<UdpPacket> for PooledDirectDatagram {
             ref mut resolved_dst,
             ref mut ip_to_logical,
             ref mut registered_dsts,
+            ref mut retained_entries,
+            ref mut last_dst,
             ref mut flushed,
             ..
         } = *self;
@@ -651,24 +648,55 @@ impl Sink<UdpPacket> for PooledDirectDatagram {
         };
 
         let canon_dst = canonicalize_src(dst);
-        // Bind destination on current socket. If another session on this socket
-        // already bound this destination, dynamically re-home to another socket!
-        let bind_result = entry.routing.write().bind_destination(session_id, canon_dst);
-        if bind_result.is_err() {
-            let new_entry = pool.rehome(
-                &entry.key,
-                entry,
-                session_id,
-                tx.clone(),
-                canon_dst,
-                registered_dsts,
-                iface.as_ref(),
-            )?;
-            *entry = new_entry;
+        let loopback = canon_dst.ip().is_loopback();
+        let desired_iface_name = if loopback { None } else { base_key.iface_name.as_deref() };
+        let desired_iface = if loopback { None } else { iface.as_ref() };
+
+        let active_matches = if entry.key.iface_name.as_deref() == desired_iface_name {
+            let mut routing = entry.routing.write();
+            if *last_dst == Some(canon_dst) {
+                routing.on_transmit(session_id)
+            } else {
+                routing.bind_destination(session_id, canon_dst).is_ok()
+            }
         } else {
-            entry.routing.write().on_transmit(session_id, canon_dst);
+            false
+        };
+        if !active_matches {
+            let retained_match = retained_entries.iter().position(|(candidate, _)| {
+                candidate.key.iface_name.as_deref() == desired_iface_name
+                    && candidate.routing.write().bind_destination(session_id, canon_dst).is_ok()
+            });
+            if let Some(index) = retained_match {
+                std::mem::swap(entry, &mut retained_entries[index].0);
+                std::mem::swap(registered_dsts, &mut retained_entries[index].1);
+            } else {
+                let mut desired_key = base_key.clone();
+                if loopback {
+                    desired_key.iface_name = None;
+                }
+                let new_entry = pool.attach(
+                    &desired_key,
+                    entry,
+                    session_id,
+                    tx.clone(),
+                    canon_dst,
+                    desired_iface,
+                )?;
+                let previous = std::mem::replace(entry, new_entry);
+                let previous_dsts = std::mem::take(registered_dsts);
+                if previous_dsts.is_empty() {
+                    previous.routing.write().unregister_session(session_id, &previous_dsts);
+                    pool.release(&previous.key, &previous);
+                } else {
+                    retained_entries.push((previous, previous_dsts));
+                }
+            }
         }
-        registered_dsts.insert(canon_dst);
+        if !active_matches || *last_dst != Some(canon_dst) {
+            registered_dsts.insert(canon_dst);
+        }
+        *last_dst = Some(canon_dst);
 
         let send_dst = match (entry.local_is_ipv6, dst) {
             (true, SocketAddr::V4(v4)) => {
@@ -704,37 +732,109 @@ impl Sink<UdpPacket> for PooledDirectDatagram {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::dns::MockClashResolver;
+    use futures::{SinkExt, StreamExt};
+    use std::time::Duration;
 
-    #[test]
-    fn test_socket_routing_try_register_many_atomic() {
-        let mut routing = SocketRoutingTable::default();
-        let (tx1, _rx1) = channel(1);
-        let (tx2, _rx2) = channel(1);
-
-        let dst1: SocketAddr = "1.1.1.1:53".parse().unwrap();
-        let dst2: SocketAddr = "8.8.8.8:53".parse().unwrap();
-        let dst3: SocketAddr = "9.9.9.9:53".parse().unwrap();
-
-        // Register session 1 with dst1
-        assert!(routing.try_register(1, tx1, Some(dst1)));
-
-        // Session 2 attempts to register with dst2 and dst1 (dst1 collides with session 1)
-        let all_dsts = vec![dst2, dst1];
-        assert!(!routing.try_register_many(2, tx2.clone(), Some(dst2), all_dsts.iter()));
-
-        // Verification: dst2 must NOT be bound to session 2 because registration failed atomically
-        assert!(!routing.dest_to_session.contains_key(&dst2));
-        assert!(!routing.sessions.contains_key(&2));
-
-        // Now session 2 attempts to register with dst2 and dst3 (no collision)
-        let all_dsts_ok = vec![dst2, dst3];
-        assert!(routing.try_register_many(2, tx2, Some(dst2), all_dsts_ok.iter()));
-        assert_eq!(routing.dest_to_session.get(&dst2), Some(&2));
-        assert_eq!(routing.dest_to_session.get(&dst3), Some(&2));
+    fn resolver() -> ThreadSafeDNSResolver {
+        Arc::new(MockClashResolver::new())
     }
 
     #[tokio::test]
-    async fn test_rehome_skips_candidate_with_conflicting_old_destination() {
+    async fn test_burst_replies_cross_batch_boundary() {
+        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let dst = peer.local_addr().unwrap();
+        let pool = Arc::new(DirectDatagramPool::new());
+        let key = DirectSocketKey {
+            source: "127.0.0.1:43102".parse().unwrap(),
+            iface_name: None,
+            so_mark: None,
+        };
+        let mut datagram = pool.connect(key, None, SocksAddr::Ip(dst), resolver()).unwrap();
+        datagram.send(UdpPacket::new(
+            Bytes::from_static(b"probe"),
+            SocksAddr::any_ipv4(),
+            SocksAddr::Ip(dst),
+        )).await.unwrap();
+        let mut buf = [0u8; 32];
+        let (_, return_addr) = peer.recv_from(&mut buf).await.unwrap();
+
+        for n in 0..(MAX_BATCH_RECV_PACKETS + 16) {
+            peer.send_to(&[n as u8], return_addr).await.unwrap();
+        }
+        let mut received = vec![false; MAX_BATCH_RECV_PACKETS + 16];
+        for _ in 0..received.len() {
+            let packet = tokio::time::timeout(Duration::from_secs(2), datagram.next()).await.unwrap().unwrap();
+            received[packet.data[0] as usize] = true;
+        }
+        assert!(received.into_iter().all(|seen| seen));
+    }
+
+    #[tokio::test]
+    async fn test_delayed_reply_survives_socket_change() {
+        let old_peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let new_peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let old_dst = old_peer.local_addr().unwrap();
+        let new_dst = new_peer.local_addr().unwrap();
+        let pool = Arc::new(DirectDatagramPool::new());
+        let key = DirectSocketKey {
+            source: "127.0.0.1:43100".parse().unwrap(),
+            iface_name: None,
+            so_mark: None,
+        };
+        let mut changing = pool.connect(key.clone(), None, SocksAddr::Ip(old_dst), resolver()).unwrap();
+        let mut other = pool.connect(key, None, SocksAddr::Ip(new_dst), resolver()).unwrap();
+
+        changing.send(UdpPacket::new(Bytes::from_static(b"old"), SocksAddr::any_ipv4(), SocksAddr::Ip(old_dst))).await.unwrap();
+        let mut buf = [0u8; 32];
+        let (_, old_return_addr) = old_peer.recv_from(&mut buf).await.unwrap();
+
+        other.send(UdpPacket::new(Bytes::from_static(b"other"), SocksAddr::any_ipv4(), SocksAddr::Ip(new_dst))).await.unwrap();
+        let (_, shared_addr) = new_peer.recv_from(&mut buf).await.unwrap();
+        assert_eq!(old_return_addr, shared_addr);
+
+        changing.send(UdpPacket::new(Bytes::from_static(b"new"), SocksAddr::any_ipv4(), SocksAddr::Ip(new_dst))).await.unwrap();
+        let (_, changed_addr) = new_peer.recv_from(&mut buf).await.unwrap();
+        assert_ne!(changed_addr, old_return_addr);
+
+        old_peer.send_to(b"delayed", old_return_addr).await.unwrap();
+        let reply = tokio::time::timeout(Duration::from_secs(2), changing.next()).await.unwrap().unwrap();
+        assert_eq!(reply.data.as_ref(), b"delayed");
+    }
+
+    #[tokio::test]
+    async fn test_domain_resolving_to_loopback_uses_unbound_socket() {
+        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let dst = peer.local_addr().unwrap();
+        let pool = Arc::new(DirectDatagramPool::new());
+        let mut dns = MockClashResolver::new();
+        dns.expect_resolve().returning(|_, _| Ok(Some(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST))));
+        dns.expect_resolve_v4().returning(|_, _| Ok(Some(std::net::Ipv4Addr::LOCALHOST)));
+        let mut datagram = pool.connect(
+            DirectSocketKey {
+                source: "127.0.0.1:43101".parse().unwrap(),
+                iface_name: Some("physical-interface".into()),
+                so_mark: None,
+            },
+            None,
+            SocksAddr::Domain("localhost".into(), dst.port()),
+            Arc::new(dns),
+        ).unwrap();
+        assert!(datagram.entry.key.iface_name.is_some());
+
+        datagram.send(UdpPacket::new(
+            Bytes::from_static(b"loopback"),
+            SocksAddr::any_ipv4(),
+            SocksAddr::Domain("localhost".into(), dst.port()),
+        )).await.unwrap();
+        assert_eq!(datagram.entry.key.iface_name, None);
+        let mut buf = [0u8; 32];
+        let (len, _) = tokio::time::timeout(Duration::from_secs(2), peer.recv_from(&mut buf)).await.unwrap().unwrap();
+        assert_eq!(&buf[..len], b"loopback");
+    }
+
+    #[tokio::test]
+    async fn test_attach_keeps_old_destination_on_original_socket() {
         let pool = Arc::new(DirectDatagramPool::new());
         let key = DirectSocketKey {
             source: "127.0.0.1:0".parse().unwrap(),
@@ -751,32 +851,27 @@ mod tests {
         // Add entry1 to pool
         pool.entries.write().insert(key.clone(), vec![entry1.clone()]);
 
-        // Now session 20 is on another socket (entry0), and has previously registered old_dst
+        // Session 20 is on another socket with an outstanding request to old_dst.
         let entry0 = Arc::new(DirectDatagramPool::create_entry(&key, None, None).unwrap());
         let (tx20, _rx20) = channel(1);
         let new_dst: SocketAddr = "2.2.2.2:53".parse().unwrap();
-        let mut registered_dsts = HashSet::new();
-        registered_dsts.insert(old_dst);
+        entry0.routing.write().try_register(20, tx20.clone(), Some(old_dst));
+        pool.entries.write().get_mut(&key).unwrap().push(entry0.clone());
 
-        // When session 20 tries to rehome to new_dst, entry1 cannot be chosen
-        // because old_dst collides with session 10 on entry1!
-        let rehomed = pool
-            .rehome(
+        let attached = pool
+            .attach(
                 &key,
                 &entry0,
                 20,
                 tx20,
                 new_dst,
-                &registered_dsts,
                 None,
             )
-            .expect("rehome should succeed by allocating a fresh socket");
+            .expect("attach should succeed");
 
-        // The chosen entry MUST NOT be entry1
-        assert!(!Arc::ptr_eq(&rehomed, &entry1));
-        // On rehomed socket, both new_dst and old_dst must belong to session 20
-        assert_eq!(rehomed.routing.read().dest_to_session.get(&new_dst), Some(&20));
-        assert_eq!(rehomed.routing.read().dest_to_session.get(&old_dst), Some(&20));
+        assert!(!Arc::ptr_eq(&attached, &entry0));
+        assert_eq!(attached.routing.read().dest_to_session.get(&new_dst), Some(&20));
+        assert_eq!(entry0.routing.read().dest_to_session.get(&old_dst), Some(&20));
     }
 
     #[tokio::test]
@@ -832,5 +927,3 @@ mod tests {
         assert_eq!(dns_counter.load(Ordering::SeqCst), 0);
     }
 }
-
-

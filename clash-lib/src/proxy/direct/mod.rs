@@ -8,9 +8,8 @@ use crate::{
     app::dns::ThreadSafeDNSResolver,
     proxy::{
         AnyOutboundDatagram, AnyStream, OutboundHandler,
-        direct::datagram::OutboundDatagramImpl,
         direct::pool::{DirectDatagramPool, DirectSocketKey},
-        utils::{dial_tcp_with_happy_eyeballs, new_dual_stack_udp_socket},
+        utils::dial_tcp_with_happy_eyeballs,
     },
     session::Session,
 };
@@ -91,33 +90,25 @@ impl OutboundHandler for Handler {
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
     ) -> std::io::Result<AnyOutboundDatagram> {
-        let iface = if sess.destination.ip().is_some_and(|ip| ip.is_loopback()) {
-            None
-        } else {
-            sess.iface.as_ref()
-        };
         sess.push_chain(self.name());
-
-        if sess.source.port() == 0 {
-            // Unspecified source fallback (e.g. some isolated tests)
-            let udp = new_dual_stack_udp_socket(
-                iface,
-                #[cfg(target_os = "linux")]
-                sess.so_mark,
-            )?;
-            return Ok(Box::new(OutboundDatagramImpl::new(udp, resolver)));
-        }
 
         let key = DirectSocketKey {
             source: sess.source,
-            iface_name: iface.map(|i| i.name.clone()),
+            iface_name: sess.iface.as_ref().map(|i| i.name.clone()),
             #[cfg(target_os = "linux")]
             so_mark: sess.so_mark,
             #[cfg(not(target_os = "linux"))]
             so_mark: None,
         };
 
-        let datagram = self.pool.connect(key, iface, sess.destination.clone(), resolver)?;
+        // An unspecified source has no stable client identity. Give it a private
+        // pool so unrelated sessions cannot share a socket or receive each other's replies.
+        let pool = if sess.source.port() == 0 {
+            Arc::new(DirectDatagramPool::new())
+        } else {
+            self.pool.clone()
+        };
+        let datagram = pool.connect(key, sess.iface.as_ref(), sess.destination.clone(), resolver)?;
         Ok(Box::new(datagram))
     }
 
