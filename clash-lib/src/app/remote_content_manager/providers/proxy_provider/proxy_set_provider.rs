@@ -33,7 +33,7 @@ use async_trait::async_trait;
 use erased_serde::Serialize as ESerialize;
 use futures::future::BoxFuture;
 use serde::{Deserialize, Serialize};
-use serde_yaml::Value;
+use yaml_serde::Value;
 use std::{collections::HashMap, sync::Arc, time::Duration};
 use tracing::{debug, warn};
 
@@ -101,7 +101,7 @@ impl ProxySetProvider {
         let parser: ProxyParser = Box::new(
             move |input: &[u8]| -> anyhow::Result<Vec<AnyOutboundHandler>> {
                 let mut val: Value =
-                    serde_yaml::from_slice(input).map_err(|x| {
+                    yaml_serde::from_slice(input).map_err(|x| {
                         Error::InvalidConfig(format!(
                             "proxy provider parse error {n}: {x}"
                         ))
@@ -112,7 +112,7 @@ impl ProxySetProvider {
                     ))
                 })?;
                 let scheme: ProviderScheme =
-                    serde_yaml::from_value(val).map_err(|x| {
+                    yaml_serde::from_value(val).map_err(|x| {
                         Error::InvalidConfig(format!(
                             "proxy provider parse error {n}: {x}"
                         ))

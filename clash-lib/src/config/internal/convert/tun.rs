@@ -121,7 +121,7 @@ mod tests {
         let yaml = r#"
         enable: true
         "#;
-        let def_tun: def::TunConfig = serde_yaml::from_str(yaml).unwrap();
+        let def_tun: def::TunConfig = yaml_serde::from_str(yaml).unwrap();
         assert_eq!(def_tun.enable_tcp, None);
         let cfg = convert(Some(def_tun)).unwrap();
         assert!(cfg.enable_tcp);
@@ -133,7 +133,7 @@ mod tests {
         enable: true
         enable-tcp: false
         "#;
-        let def_tun: def::TunConfig = serde_yaml::from_str(yaml).unwrap();
+        let def_tun: def::TunConfig = yaml_serde::from_str(yaml).unwrap();
         assert_eq!(def_tun.enable_tcp, Some(false));
         let cfg = convert(Some(def_tun)).unwrap();
         assert!(!cfg.enable_tcp);
@@ -145,7 +145,7 @@ mod tests {
         enable: true
         tcp: false
         "#;
-        let def_tun: def::TunConfig = serde_yaml::from_str(yaml).unwrap();
+        let def_tun: def::TunConfig = yaml_serde::from_str(yaml).unwrap();
         assert_eq!(def_tun.enable_tcp, Some(false));
         let cfg = convert(Some(def_tun)).unwrap();
         assert!(!cfg.enable_tcp);

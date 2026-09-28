@@ -519,7 +519,7 @@ tun:
 ebpf:
   enable: true
 "#;
-        let def_cfg: def::Config = serde_yaml::from_str(yaml).unwrap();
+        let def_cfg: def::Config = yaml_serde::from_str(yaml).unwrap();
         let res: Result<super::Config, _> = def_cfg.try_into();
         match res {
             Err(e) => {
@@ -535,7 +535,7 @@ tun:
 ebpf:
   enable: false
 "#;
-        let def_cfg: def::Config = serde_yaml::from_str(tun_only_yaml).unwrap();
+        let def_cfg: def::Config = yaml_serde::from_str(tun_only_yaml).unwrap();
         let res: Result<super::Config, _> = def_cfg.try_into();
         assert!(res.is_ok());
 
@@ -545,7 +545,7 @@ tun:
 ebpf:
   enable: true
 "#;
-        let def_cfg: def::Config = serde_yaml::from_str(ebpf_only_yaml).unwrap();
+        let def_cfg: def::Config = yaml_serde::from_str(ebpf_only_yaml).unwrap();
         let res: Result<super::Config, _> = def_cfg.try_into();
         assert!(res.is_ok());
     }
@@ -560,7 +560,7 @@ ebpf:
       - "00:11:22:33:44:55"
       - "not-a-mac"
 "#;
-        let def_cfg: def::Config = serde_yaml::from_str(invalid_mac_yaml).unwrap();
+        let def_cfg: def::Config = yaml_serde::from_str(invalid_mac_yaml).unwrap();
         let res: Result<super::Config, _> = def_cfg.try_into();
         match res {
             Err(e) => {
@@ -578,7 +578,7 @@ ebpf:
     proxy-src-macs:
       - "not-a-mac"
 "#;
-        let def_cfg: def::Config = serde_yaml::from_str(disabled_ebpf_invalid_mac_yaml).unwrap();
+        let def_cfg: def::Config = yaml_serde::from_str(disabled_ebpf_invalid_mac_yaml).unwrap();
         let res: Result<super::Config, _> = def_cfg.try_into();
         assert!(res.is_ok(), "disabled eBPF should not reject configuration due to MAC error");
 
@@ -595,7 +595,7 @@ ebpf:
 {macs}
 "#
         );
-        let def_cfg: def::Config = serde_yaml::from_str(&too_many_yaml).unwrap();
+        let def_cfg: def::Config = yaml_serde::from_str(&too_many_yaml).unwrap();
         let res: Result<super::Config, _> = def_cfg.try_into();
         match res {
             Err(e) => {

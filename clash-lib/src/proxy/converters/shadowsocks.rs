@@ -1,4 +1,5 @@
 use std::{collections::HashMap, sync::Arc};
+use yaml_serde::Value;
 
 use crate::{
     Error,
@@ -15,7 +16,7 @@ use crate::{
 };
 
 impl TryFrom<OutboundShadowsocks> for Handler {
-    type Error = crate::Error;
+    type Error = Error;
 
     fn try_from(value: OutboundShadowsocks) -> Result<Self, Self::Error> {
         (&value).try_into()
@@ -107,18 +108,18 @@ pub fn build_handler(
 }
 
 impl TryFrom<&OutboundShadowsocks> for Handler {
-    type Error = crate::Error;
+    type Error = Error;
 
     fn try_from(s: &OutboundShadowsocks) -> Result<Self, Self::Error> {
         build_handler(s, None)
     }
 }
 
-impl TryFrom<HashMap<String, serde_yaml::Value>> for SimpleOBFSOption {
-    type Error = crate::Error;
+impl TryFrom<HashMap<String, Value>> for SimpleOBFSOption {
+    type Error = Error;
 
     fn try_from(
-        value: HashMap<String, serde_yaml::Value>,
+        value: HashMap<String, Value>,
     ) -> Result<Self, Self::Error> {
         let host = value
             .get("host")
@@ -143,11 +144,11 @@ impl TryFrom<HashMap<String, serde_yaml::Value>> for SimpleOBFSOption {
     }
 }
 
-impl TryFrom<HashMap<String, serde_yaml::Value>> for V2RayOBFSOption {
-    type Error = crate::Error;
+impl TryFrom<HashMap<String, Value>> for V2RayOBFSOption {
+    type Error = Error;
 
     fn try_from(
-        value: HashMap<String, serde_yaml::Value>,
+        value: HashMap<String, Value>,
     ) -> Result<Self, Self::Error> {
         let host = value
             .get("host")
@@ -202,11 +203,11 @@ impl TryFrom<HashMap<String, serde_yaml::Value>> for V2RayOBFSOption {
     }
 }
 
-impl TryFrom<HashMap<String, serde_yaml::Value>> for Shadowtls {
-    type Error = crate::Error;
+impl TryFrom<HashMap<String, Value>> for Shadowtls {
+    type Error = Error;
 
     fn try_from(
-        value: HashMap<String, serde_yaml::Value>,
+        value: HashMap<String, Value>,
     ) -> Result<Self, Self::Error> {
         let host = value
             .get("host")

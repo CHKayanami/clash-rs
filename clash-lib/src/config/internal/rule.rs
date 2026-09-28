@@ -1,4 +1,4 @@
-use crate::{Error, print_and_exit};
+use crate::Error;
 use std::{fmt::Display, str::FromStr};
 
 #[derive(Clone)]
@@ -175,15 +175,19 @@ impl RuleType {
             }),
             "SRC-PORT" => Ok(RuleType::SRCPort {
                 target: target.to_string(),
-                port: payload.parse().unwrap_or_else(|_| {
-                    print_and_exit!("invalid port: {}", payload)
-                }),
+                port: payload.parse().map_err(|e| {
+                    Error::InvalidConfig(format!(
+                        "invalid SRC-PORT rule port '{payload}': {e}"
+                    ))
+                })?,
             }),
             "DST-PORT" => Ok(RuleType::DSTPort {
                 target: target.to_string(),
-                port: payload.parse().unwrap_or_else(|_| {
-                    print_and_exit!("invalid port: {}", payload)
-                }),
+                port: payload.parse().map_err(|e| {
+                    Error::InvalidConfig(format!(
+                        "invalid DST-PORT rule port '{payload}': {e}"
+                    ))
+                })?,
             }),
             "PROCESS-NAME" => Ok(RuleType::ProcessName {
                 process_name: payload.to_string(),
@@ -336,6 +340,15 @@ impl FromStr for RuleType {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn invalid_port_rule_returns_error() {
+        for rule in ["SRC-PORT,not-a-port,DIRECT", "DST-PORT,70000,DIRECT"] {
+            let err = rule.parse::<RuleType>().err().unwrap().to_string();
+            assert!(err.contains("invalid"), "{err}");
+            assert!(err.contains("PORT"), "{err}");
+        }
+    }
 
     #[test]
     fn test_domain_regex_with_parentheses() {

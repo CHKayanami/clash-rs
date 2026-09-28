@@ -7,7 +7,7 @@ use crate::{
 };
 use educe::Educe;
 use serde::{Deserialize, Deserializer, Serialize};
-use serde_yaml::Value;
+use yaml_serde::Value;
 use std::{collections::HashMap, fmt::Display, path::PathBuf, str::FromStr};
 
 const DEFAULT_ROUTE_TABLE: u32 = 2468;
@@ -753,42 +753,45 @@ impl FromStr for Config {
     type Err = Error;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let mut val: Value = serde_yaml::from_str(s).map_err(|e| {
-            Error::InvalidConfig(format!(
-                "could not parse config content {s}: {e}"
-            ))
-        })?;
-
-        val.apply_merge().map_err(|e| {
-            Error::InvalidConfig(format!(
-                "failed to process anchors in config content {s}: {e}"
-            ))
-        })?;
-
-        serde_yaml::from_value(val).map_err(|e| {
-            Error::InvalidConfig(format!("could not parse config content: {e}"))
-        })
+        deserialize_config(parse_config_value(s)?)
     }
 }
 
+fn parse_config_value(s: &str) -> Result<Value, Error> {
+    let mut val: Value = yaml_serde::from_str(s).map_err(|e| {
+        Error::InvalidConfig(format!("could not parse config YAML: {e}"))
+    })?;
+    val.apply_merge().map_err(|e| {
+        Error::InvalidConfig(format!("failed to process config YAML anchors: {e}"))
+    })?;
+    Ok(val)
+}
+
+fn deserialize_config(val: Value) -> Result<Config, Error> {
+    serde_path_to_error::deserialize::<_, Config>(val).map_err(|e| {
+        let path = e.path().to_string();
+        if path == "." {
+            Error::InvalidConfig(format!("could not parse config: {}", e.inner()))
+        } else {
+            Error::InvalidConfig(format!(
+                "could not parse config field {path}: {}",
+                e.inner()
+            ))
+        }
+    })
+}
+
 /// Parse a YAML config source, validating that it contains no unknown
-/// top-level or `dns`-section fields. Returns the deserialized [`Config`] so
-/// the caller can convert it without a second parse pass.
+/// top-level or `dns`-section fields. Returns the deserialized [`Config`].
 ///
 /// Inner structs (proxies, rules, listeners, ...) still carry
 /// `#[serde(deny_unknown_fields)]`, so typos inside them remain hard errors
 /// regardless of strict mode. This check exists to surface unknowns at the
 /// only two layers that intentionally accept extras by default: the top-level
 /// [`Config`] and its [`DNS`] sub-section.
-pub(crate) fn check_unknown_fields(s: &str) -> crate::Result<Config> {
-    let mut val: Value = serde_yaml::from_str(s).map_err(|e| {
-        Error::InvalidConfig(format!("couldn't parse config content: {e}"))
-    })?;
-    val.apply_merge().map_err(|e| {
-        Error::InvalidConfig(format!(
-            "failed to process anchors in config content: {e}"
-        ))
-    })?;
+pub(crate) fn check_unknown_fields(s: &str) -> Result<Config, Error> {
+    let val = parse_config_value(s)?;
+    deserialize_config(val.clone())?;
 
     let mut unknown: Vec<String> = Vec::new();
     let cfg = serde_ignored::deserialize::<_, _, Config>(val, |path| {
@@ -1443,6 +1446,23 @@ dns:
         );
     }
 
+    #[test]
+    fn syntax_error_does_not_include_config_contents() {
+        let cfg = "secret: private-token\ndns: [unclosed";
+        let err = cfg.parse::<Config>().err().unwrap().to_string();
+        assert!(err.contains("line 2"), "{err}");
+        assert!(!err.contains("private-token"), "{err}");
+    }
+
+    #[test]
+    fn field_type_error_identifies_nested_path() {
+        let cfg = "dns:\n  enable: wrong\n";
+        let err = cfg.parse::<Config>().err().unwrap().to_string();
+        assert!(err.contains("dns.enable"), "{err}");
+        let strict_err = super::check_unknown_fields(cfg).err().unwrap().to_string();
+        assert!(strict_err.contains("dns.enable"), "{strict_err}");
+    }
+
     /// Verify multi-protocol DNS listen config parses correctly.
     #[test]
     fn parse_dns_multiple_listen() {
@@ -1953,7 +1973,7 @@ rules:
   "###;
 
         let des: Config =
-            serde_yaml::from_str(example_cfg).expect("should parse yaml");
+            yaml_serde::from_str(example_cfg).expect("should parse yaml");
         assert_eq!(des.port.expect("invalid port"), Port(7890));
         assert_eq!(des.dns.fallback_filter.geo_ip_code, String::from("CN"));
 

@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use serde::{Deserialize, de::value::MapDeserializer};
-use serde_yaml::Value;
+use yaml_serde::Value;
 use tracing::warn;
 
 use crate::{
@@ -30,14 +30,14 @@ use super::{
 };
 
 impl TryFrom<def::Config> for config::Config {
-    type Error = crate::Error;
+    type Error = Error;
 
     fn try_from(value: def::Config) -> Result<Self, Self::Error> {
         convert(value)
     }
 }
 
-pub(super) fn convert(mut c: def::Config) -> Result<config::Config, crate::Error> {
+pub(super) fn convert(mut c: def::Config) -> Result<config::Config, Error> {
     let mut proxy_names =
         vec![String::from(PROXY_DIRECT), String::from(PROXY_REJECT)];
 
@@ -113,7 +113,7 @@ pub(super) fn convert(mut c: def::Config) -> Result<config::Config, crate::Error
             store_selected: c.profile.store_selected,
             store_smart_stats: c.profile.store_smart_stats,
         },
-        sniffer: sniffer::convert(c.sniffer.take()),
+        sniffer: sniffer::convert(c.sniffer.take())?,
         rules: c
             .rule
             .take()
@@ -224,7 +224,7 @@ mod tests {
           enable: true
           so-mark: 200
         "#;
-        let def_cfg: def::Config = serde_yaml::from_str(yaml).unwrap();
+        let def_cfg: def::Config = yaml_serde::from_str(yaml).unwrap();
         let cfg = convert(def_cfg).unwrap();
         assert_eq!(cfg.tun.so_mark, Some(100));
     }
@@ -237,7 +237,7 @@ mod tests {
           enable: true
           routing-mark: 300
         "#;
-        let def_cfg: def::Config = serde_yaml::from_str(yaml).unwrap();
+        let def_cfg: def::Config = yaml_serde::from_str(yaml).unwrap();
         let cfg = convert(def_cfg).unwrap();
         assert_eq!(cfg.ebpf.as_ref().unwrap().routing_mark, Some(100));
     }

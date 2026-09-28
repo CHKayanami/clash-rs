@@ -1566,12 +1566,12 @@ dependencies = [
  "nix 0.29.0",
  "rtnetlink 0.21.0",
  "serde",
- "serde_yaml",
  "socket2 0.6.4",
  "thiserror 2.0.18",
  "tokio",
  "tokio-test",
  "tracing",
+ "yaml_serde",
 ]
 
 [[package]]
@@ -1689,7 +1689,7 @@ dependencies = [
  "serde",
  "serde_ignored",
  "serde_json",
- "serde_yaml",
+ "serde_path_to_error",
  "serial_test",
  "sha1 0.11.0",
  "sha2 0.11.0",
@@ -1734,6 +1734,7 @@ dependencies = [
  "webpki-root-certs",
  "webpki-roots 1.0.7",
  "windows 0.62.2",
+ "yaml_serde",
  "zip",
  "zstd",
 ]
@@ -4722,6 +4723,12 @@ dependencies = [
  "pkg-config",
  "vcpkg",
 ]
+
+[[package]]
+name = "libyaml-rs"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2e126dda6f34391ab7b444f9922055facc83c07a910da3eb16f1e4d9c45dc777"
 
 [[package]]
 name = "linux-raw-sys"
@@ -12715,6 +12722,19 @@ dependencies = [
  "arraydeque",
  "encoding_rs",
  "hashlink",
+]
+
+[[package]]
+name = "yaml_serde"
+version = "0.10.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "33b729a08a9a6be689bbad3e2bf8015926db54b6622cc89c3a5f7dc174b9e918"
+dependencies = [
+ "indexmap 2.14.0",
+ "itoa",
+ "libyaml-rs",
+ "ryu",
+ "serde",
 ]
 
 [[package]]

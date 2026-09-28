@@ -6,7 +6,7 @@ use crate::{
 };
 use futures::future::BoxFuture;
 use serde::{Deserialize, Serialize};
-use serde_yaml::Value;
+use yaml_serde::Value;
 use std::{sync::Arc, time::Duration};
 
 /// The YAML structure expected at the provider URL / file.
@@ -48,7 +48,7 @@ impl InboundSetProvider {
         let n = name.clone();
         let parser: InboundParser = Box::new(move |input: &[u8]| {
             let mut val: Value =
-                serde_yaml::from_slice(input).map_err(|e| {
+                yaml_serde::from_slice(input).map_err(|e| {
                     anyhow::anyhow!("inbound provider {n} parse error: {e}")
                 })?;
             val.apply_merge().map_err(|e| {
@@ -57,7 +57,7 @@ impl InboundSetProvider {
                 )
             })?;
             let scheme: ProviderScheme =
-                serde_yaml::from_value(val).map_err(|e| {
+                yaml_serde::from_value(val).map_err(|e| {
                     anyhow::anyhow!("inbound provider {n} parse error: {e}")
                 })?;
             let opts = scheme.listeners.unwrap_or_default();

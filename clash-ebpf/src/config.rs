@@ -283,7 +283,7 @@ bypass-fwmarks:
   - 0x100
   - 512
 "#;
-        let cfg: EbpfConfig = serde_yaml::from_str(yaml).unwrap();
+        let cfg: EbpfConfig = yaml_serde::from_str(yaml).unwrap();
         assert!(cfg.enable);
         assert_eq!(cfg.bypass_dscps, vec![4, 46]);
         assert_eq!(cfg.bypass_fwmarks, vec![256, 512]);
@@ -295,7 +295,7 @@ bypass-dscps:
 bypass-mark:
   - 1000
 "#;
-        let cfg2: EbpfConfig = serde_yaml::from_str(yaml_alias).unwrap();
+        let cfg2: EbpfConfig = yaml_serde::from_str(yaml_alias).unwrap();
         assert_eq!(cfg2.bypass_dscps, vec![8]);
         assert_eq!(cfg2.bypass_fwmarks, vec![1000]);
     }
@@ -329,7 +329,7 @@ lan:
     - "00:11:22:33:44:55"
     - "aa:bb:cc:dd:ee:ff"
 "#;
-        let cfg: EbpfConfig = serde_yaml::from_str(yaml).unwrap();
+        let cfg: EbpfConfig = yaml_serde::from_str(yaml).unwrap();
         assert_eq!(
             cfg.lan.proxy_src_macs,
             vec!["00:11:22:33:44:55", "aa:bb:cc:dd:ee:ff"]
@@ -341,7 +341,7 @@ lan:
   proxy-macs:
     - "11-22-33-44-55-66"
 "#;
-        let cfg2: EbpfConfig = serde_yaml::from_str(yaml_alias).unwrap();
+        let cfg2: EbpfConfig = yaml_serde::from_str(yaml_alias).unwrap();
         assert_eq!(cfg2.lan.proxy_src_macs, vec!["11-22-33-44-55-66"]);
     }
 

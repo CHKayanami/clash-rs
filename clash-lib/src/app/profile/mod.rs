@@ -268,7 +268,7 @@ fn open_or_init_db(path: &str) -> Result<Database, redb::DatabaseError> {
                 // Check if it's a legacy YAML cache file
                 if let Ok(content) = fs::read_to_string(path) {
                     if let Ok(legacy_map) =
-                        serde_yaml::from_str::<serde_json::Value>(&content)
+                        yaml_serde::from_str::<serde_json::Value>(&content)
                     {
                         info!(
                             "migrating legacy yaml cache file at {} to redb...",

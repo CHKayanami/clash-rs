@@ -374,7 +374,7 @@ optimistic-cache-ttl: 300
 stale-cache-retention: 7200
 cache-capacity: 8192
 "#;
-    let def: DefDns2Config = serde_yaml::from_str(yaml_str).expect("deserialize Dns2Config");
+    let def: DefDns2Config = yaml_serde::from_str(yaml_str).expect("deserialize Dns2Config");
     assert_eq!(def.optimistic_cache_ttl, 300);
     assert_eq!(def.stale_cache_retention, 7200);
     assert_eq!(def.cache_capacity, Some(8192));

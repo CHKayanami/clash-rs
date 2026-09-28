@@ -1178,7 +1178,7 @@ filter: "HK.*"
 empty-fallback: "REJECT"
 include-all: true
 "#;
-        let group: OutboundGroupProtocol = serde_yaml::from_str(yaml).unwrap();
+        let group: OutboundGroupProtocol = yaml_serde::from_str(yaml).unwrap();
         assert_eq!(group.filter(), Some("HK.*"));
         assert_eq!(group.empty_fallback(), Some("REJECT"));
 
@@ -1222,7 +1222,7 @@ filter: "^(?=.*(?i)(港|hk|HK|Hong|HKG))(?!.*(排除1|排除2|5x)).*$"
 empty-fallback: "REJECT"
 include-all: true
 "#;
-        let group: OutboundGroupProtocol = serde_yaml::from_str(yaml).unwrap();
+        let group: OutboundGroupProtocol = yaml_serde::from_str(yaml).unwrap();
 
         let hk_node: AnyOutboundHandler = Arc::new(direct::Handler::new("香港 01 节点"));
         let hk_excluded: AnyOutboundHandler = Arc::new(direct::Handler::new("香港 02 排除1"));
@@ -1267,7 +1267,7 @@ filter: "SG.*"
 empty-fallback: "REJECT"
 include-all: true
 "#;
-        let group: OutboundGroupProtocol = serde_yaml::from_str(yaml).unwrap();
+        let group: OutboundGroupProtocol = yaml_serde::from_str(yaml).unwrap();
 
         let us_node: AnyOutboundHandler = Arc::new(direct::Handler::new("US 01"));
         let reject_node: AnyOutboundHandler = Arc::new(reject::Handler::new(PROXY_REJECT));
@@ -1306,7 +1306,7 @@ filter: "SG.*"
 empty-fallback: "NOT_FOUND_NODE"
 include-all: true
 "#;
-        let group: OutboundGroupProtocol = serde_yaml::from_str(yaml).unwrap();
+        let group: OutboundGroupProtocol = yaml_serde::from_str(yaml).unwrap();
 
         let us_node: AnyOutboundHandler = Arc::new(direct::Handler::new("US 01"));
         let mut handlers = HashMap::new();

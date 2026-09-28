@@ -688,7 +688,7 @@ mod tests {
         "#;
 
         let ss_config: crate::config::internal::proxy::OutboundShadowsocks =
-            serde_yaml::from_str(yaml).expect("failed to parse ss uot yaml");
+            yaml_serde::from_str(yaml).expect("failed to parse ss uot yaml");
         assert!(ss_config.udp_over_tcp);
 
         let handler = Handler::try_from(ss_config).expect("failed to convert handler");

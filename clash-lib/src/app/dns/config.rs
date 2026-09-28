@@ -736,7 +736,7 @@ dns:
     - txt
     - SVCB
 "#;
-        let def_cfg: DefConfig = serde_yaml::from_str(yaml).unwrap();
+        let def_cfg: DefConfig = yaml_serde::from_str(yaml).unwrap();
         let cfg: Config = def_cfg.try_into().unwrap();
 
         assert!(cfg.qtype_filter.contains(&QType::HTTPS));

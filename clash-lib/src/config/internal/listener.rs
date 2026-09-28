@@ -3,7 +3,7 @@ use crate::{
     config::utils::deserialize_map_string_or_seq,
 };
 use serde::{Deserialize, Serialize};
-use serde_yaml::Value;
+use yaml_serde::Value;
 use std::collections::HashMap;
 
 use super::config::BindAddress;

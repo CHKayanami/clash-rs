@@ -4,7 +4,7 @@ use crate::{
     config::utils::{self, deserialize_opt_bandwidth_mbps},
 };
 use serde::{Deserialize, de::value::MapDeserializer};
-use serde_yaml::Value;
+use yaml_serde::{Error as YamlError, Value};
 #[cfg(feature = "shadowquic")]
 use shadowquic::config::CongestionControl as SQCongestionControl;
 use std::{
@@ -35,15 +35,13 @@ impl OutboundProxy {
 
 pub fn map_serde_error(
     name: String,
-) -> impl FnOnce(serde_yaml::Error) -> crate::Error {
+) -> impl FnOnce(YamlError) -> Error {
     move |x| {
         if let Some(loc) = x.location() {
             Error::InvalidConfig(format!(
-                "invalid config for {} at line {}, column {} while parsing {}",
-                name,
+                "error while parsing {name} at line {}, column {}: {x}",
                 loc.line(),
-                loc.column(),
-                name
+                loc.column()
             ))
         } else {
             Error::InvalidConfig(format!("error while parsing {name}: {x}"))
@@ -249,7 +247,7 @@ pub struct OutboundShadowsocks {
     #[serde(default = "default_bool_true")]
     pub udp: bool,
     pub plugin: Option<String>,
-    pub plugin_opts: Option<HashMap<String, serde_yaml::Value>>,
+    pub plugin_opts: Option<HashMap<String, Value>>,
     #[serde(default, alias = "uot", alias = "udp-over-tcp")]
     pub udp_over_tcp: bool,
     #[serde(default, alias = "multiplex")]
@@ -939,7 +937,7 @@ impl TryFrom<HashMap<String, Value>> for OutboundProxyProviderDef {
 #[cfg(all(test, feature = "tailscale"))]
 mod tailscale_tests {
     use super::{OutboundProxyProtocol, OutboundTailscale};
-    use serde_yaml::Value;
+    use yaml_serde::Value;
     use std::collections::HashMap;
 
     #[test]
@@ -1005,7 +1003,7 @@ mod tests {
             ip: 10.0.0.2/32
         "#;
 
-        let config: OutboundWireguard = serde_yaml::from_str(yaml_new)
+        let config: OutboundWireguard = yaml_serde::from_str(yaml_new)
             .expect("should parse with pre-shared-key");
         assert!(config.pre_shared_key.is_some());
         assert_eq!(
@@ -1028,7 +1026,7 @@ mod tests {
             ip: 10.0.0.2/32
         "#;
 
-        let config: OutboundWireguard = serde_yaml::from_str(yaml_legacy)
+        let config: OutboundWireguard = yaml_serde::from_str(yaml_legacy)
             .expect("should parse with preshared-key (legacy)");
         assert!(config.pre_shared_key.is_some());
         assert_eq!(
@@ -1050,7 +1048,7 @@ mod tests {
             ip: 10.0.0.2/32
         "#;
 
-        let config: OutboundWireguard = serde_yaml::from_str(yaml_no_psk)
+        let config: OutboundWireguard = yaml_serde::from_str(yaml_no_psk)
             .expect("should parse without pre-shared-key");
         assert!(config.pre_shared_key.is_none());
     }
@@ -1077,7 +1075,7 @@ mod anytls_tests {
         "#;
 
         let config: OutboundProxyProtocol =
-            serde_yaml::from_str(yaml).expect("should parse anytls");
+            yaml_serde::from_str(yaml).expect("should parse anytls");
 
         let Anytls(config) = config else {
             panic!("expected anytls config");
@@ -1111,7 +1109,7 @@ mod proxy_group_tests {
         "#;
 
         let group: OutboundGroupProtocol =
-            serde_yaml::from_str(yaml).expect("should parse url-test with include-all");
+            yaml_serde::from_str(yaml).expect("should parse url-test with include-all");
 
         assert_eq!(group.name(), "Auto Group");
         assert_eq!(group.include_all(), Some(true));
@@ -1131,7 +1129,7 @@ mod proxy_group_tests {
             down: "50 MB/s"
         "#;
 
-        let proto: OutboundProxyProtocol = serde_yaml::from_str(yaml).unwrap();
+        let proto: OutboundProxyProtocol = yaml_serde::from_str(yaml).unwrap();
         if let OutboundProxyProtocol::Hysteria2(h2) = proto {
             assert_eq!(h2.up, Some(1000));
             assert_eq!(h2.down, Some(400));
@@ -1157,7 +1155,7 @@ mod proxy_group_tests {
               max-connections: "4"
         "#;
 
-        let proto: OutboundProxyProtocol = serde_yaml::from_str(yaml).unwrap();
+        let proto: OutboundProxyProtocol = yaml_serde::from_str(yaml).unwrap();
         if let OutboundProxyProtocol::Trojan(trojan) = proto {
             let smux = trojan.smux.unwrap();
             assert!(smux.enable);
@@ -1180,7 +1178,7 @@ mod proxy_group_tests {
               min-streams: null
         "#;
 
-        let proto_null: OutboundProxyProtocol = serde_yaml::from_str(yaml_null).unwrap();
+        let proto_null: OutboundProxyProtocol = yaml_serde::from_str(yaml_null).unwrap();
         if let OutboundProxyProtocol::Trojan(trojan) = proto_null {
             let smux = trojan.smux.unwrap();
             assert!(smux.enable);

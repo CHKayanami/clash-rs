@@ -1,11 +1,10 @@
-use serde::Deserialize;
-
-use std::{fmt::Display, str::FromStr};
+use serde::{Deserialize, Deserializer, de::Error as DeError};
+use std::{collections::HashMap, fmt::Display, str::FromStr};
 
 pub fn deserialize_u64<'de, T, D>(deserializer: D) -> Result<T, D::Error>
 where
-    D: serde::Deserializer<'de>,
-    T: FromStr + serde::Deserialize<'de>,
+    D: Deserializer<'de>,
+    T: FromStr + Deserialize<'de>,
     <T as FromStr>::Err: Display,
 {
     #[derive(Deserialize)]
@@ -16,7 +15,7 @@ where
     }
 
     match StringOrNum::<T>::deserialize(deserializer)? {
-        StringOrNum::String(s) => s.parse().map_err(serde::de::Error::custom),
+        StringOrNum::String(s) => s.parse().map_err(DeError::custom),
         StringOrNum::Num(n) => Ok(n),
     }
 }
@@ -43,9 +42,9 @@ where
 
 pub fn deserialize_map_string_or_seq<'de, D>(
     deserializer: D,
-) -> Result<Option<std::collections::HashMap<String, Vec<String>>>, D::Error>
+) -> Result<Option<HashMap<String, Vec<String>>>, D::Error>
 where
-    D: serde::Deserializer<'de>,
+    D: Deserializer<'de>,
 {
     #[derive(Deserialize)]
     #[serde(untagged)]
@@ -55,7 +54,7 @@ where
     }
 
     let map =
-        Option::<std::collections::HashMap<String, StringOrSeq>>::deserialize(
+        Option::<HashMap<String, StringOrSeq>>::deserialize(
             deserializer,
         )?;
     Ok(map.map(|m| {
@@ -73,7 +72,7 @@ where
 
 pub fn deserialize_usize<'de, D>(deserializer: D) -> Result<usize, D::Error>
 where
-    D: serde::Deserializer<'de>,
+    D: Deserializer<'de>,
 {
     #[derive(Deserialize)]
     #[serde(untagged)]
@@ -89,7 +88,7 @@ where
             if s.is_empty() {
                 Ok(0)
             } else {
-                s.parse().map_err(serde::de::Error::custom)
+                s.parse().map_err(DeError::custom)
             }
         }
         Some(StringOrNum::Num(n)) => Ok(n),
@@ -138,7 +137,7 @@ pub fn deserialize_opt_bandwidth_mbps<'de, D>(
     deserializer: D,
 ) -> Result<Option<u64>, D::Error>
 where
-    D: serde::Deserializer<'de>,
+    D: Deserializer<'de>,
 {
     #[derive(Deserialize)]
     #[serde(untagged)]
@@ -154,7 +153,7 @@ where
         Some(BandwidthVal::Num(n)) => Ok(Some(n)),
         Some(BandwidthVal::Float(f)) => Ok(Some(f.max(0.0).round() as u64)),
         Some(BandwidthVal::Str(s)) => {
-            parse_bandwidth_to_mbps(&s).map(Some).map_err(serde::de::Error::custom)
+            parse_bandwidth_to_mbps(&s).map(Some).map_err(DeError::custom)
         }
     }
 }
@@ -182,19 +181,19 @@ mod tests {
             val: usize,
         }
 
-        let from_str: TestMux = serde_yaml::from_str("val: '8'").unwrap();
+        let from_str: TestMux = yaml_serde::from_str("val: '8'").unwrap();
         assert_eq!(from_str.val, 8);
 
-        let from_num: TestMux = serde_yaml::from_str("val: 8").unwrap();
+        let from_num: TestMux = yaml_serde::from_str("val: 8").unwrap();
         assert_eq!(from_num.val, 8);
 
-        let from_null: TestMux = serde_yaml::from_str("val: ~").unwrap();
+        let from_null: TestMux = yaml_serde::from_str("val: ~").unwrap();
         assert_eq!(from_null.val, 0);
 
-        let from_null_word: TestMux = serde_yaml::from_str("val: null").unwrap();
+        let from_null_word: TestMux = yaml_serde::from_str("val: null").unwrap();
         assert_eq!(from_null_word.val, 0);
 
-        let from_empty_str: TestMux = serde_yaml::from_str("val: ''").unwrap();
+        let from_empty_str: TestMux = yaml_serde::from_str("val: ''").unwrap();
         assert_eq!(from_empty_str.val, 0);
     }
 }

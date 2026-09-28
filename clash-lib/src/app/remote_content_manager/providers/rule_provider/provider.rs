@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use erased_serde::Serialize as ESerialize;
 use futures::future::BoxFuture;
 use serde::{Deserialize, Serialize};
-use serde_yaml::Value;
+use yaml_serde::Value;
 use tracing::{debug, trace};
 
 use super::cidr_trie::CidrTrie;
@@ -217,7 +217,7 @@ impl RuleProviderImpl {
             Box::new(move |input: &[u8]| -> anyhow::Result<RuleContent> {
                 match current_format {
                     RuleSetFormat::Yaml => {
-                        let mut val: Value = serde_yaml::from_slice(input)
+                        let mut val: Value = yaml_serde::from_slice(input)
                             .map_err(|x| {
                                 Error::InvalidConfig(format!(
                                     "rule provider parse error (yaml) {n_parser}: {x}"
@@ -228,7 +228,7 @@ impl RuleProviderImpl {
                                 "rule provider anchor merge error (yaml) {n_parser}: {x}"
                             ))
                         })?;
-                        let scheme: ProviderScheme = serde_yaml::from_value(val)
+                        let scheme: ProviderScheme = yaml_serde::from_value(val)
                             .map_err(|x| {
                                 Error::InvalidConfig(format!(
                                     "rule provider parse error (yaml) {n_parser}: {x}"
