@@ -11,25 +11,34 @@ impl std::str::FromStr for KeyBytes {
 
         match s.len() {
             64 => {
-                // Try to parse as hex
-                for i in 0..32 {
-                    internal[i] = u8::from_str_radix(&s[i * 2..=i * 2 + 1], 16)
-                        .map_err(|_| "Illegal character in key")?;
-                }
+                let decoded_key =
+                    hex::decode(s).map_err(|_| "Illegal character in key")?;
+                internal.copy_from_slice(&decoded_key);
             }
             43 | 44 => {
                 // Try to parse as base64
-                if let Ok(decoded_key) = STANDARD.decode(s) {
-                    if decoded_key.len() == internal.len() {
-                        internal[..].copy_from_slice(&decoded_key);
-                    } else {
-                        return Err("Illegal character in key");
-                    }
+                let decoded_key =
+                    STANDARD.decode(s).map_err(|_| "Illegal character in key")?;
+                if decoded_key.len() == internal.len() {
+                    internal[..].copy_from_slice(&decoded_key);
+                } else {
+                    return Err("Illegal character in key");
                 }
             }
             _ => return Err("Illegal key size"),
         }
 
         Ok(KeyBytes(internal))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::KeyBytes;
+
+    #[test]
+    fn invalid_key_is_rejected() {
+        assert!("?".repeat(44).parse::<KeyBytes>().is_err());
+        assert!("é".repeat(32).parse::<KeyBytes>().is_err());
     }
 }

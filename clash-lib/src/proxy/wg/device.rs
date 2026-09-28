@@ -1,12 +1,14 @@
 use std::{
     collections::{HashMap, VecDeque},
+    future::Future,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    pin::Pin,
     sync::Arc,
     time::Duration,
 };
 
 use bytes::{Bytes, BytesMut};
-use futures::{SinkExt, StreamExt};
+use futures::{SinkExt, StreamExt, stream::FuturesUnordered};
 
 use rand::seq::IndexedRandom;
 use smoltcp::{
@@ -161,11 +163,8 @@ impl DeviceManager {
 
             let msg = crate::app::dns::query::build_dns_query_wire(&name, qtype);
 
-            let pkt = UdpPacket::new(
-                msg.into(),
-                SocksAddr::any_ipv4(),
-                server.into(),
-            );
+            let pkt =
+                UdpPacket::new(msg.into(), SocksAddr::any_ipv4(), server.into());
 
             socket.feed(pkt).await.ok()?;
             socket.flush().await.ok()?;
@@ -181,15 +180,10 @@ impl DeviceManager {
                     }
                 };
 
-            let ips = crate::app::dns::wire::extract_ips_from_dns_response(&pkt.data);
-            for ip in ips {
-                if is_v6 && ip.is_ipv6() {
-                    return Some(ip);
-                } else if !is_v6 && ip.is_ipv4() {
-                    return Some(ip);
-                }
-            }
-            None
+            let ips =
+                crate::app::dns::wire::extract_ips_from_dns_response(&pkt.data);
+            ips.into_iter()
+                .find(|&ip| (is_v6 && ip.is_ipv6()) || (!is_v6 && ip.is_ipv4()))
         }
 
         let socket = self.new_udp_socket().await;
@@ -218,6 +212,14 @@ impl DeviceManager {
     }
 
     pub async fn poll_sockets(&self, mut device: VirtualIpDevice) {
+        type DnsQueryFuture<'a> = Pin<
+            Box<
+                dyn Future<Output = (SocketHandle, UdpPacket, Option<IpAddr>)>
+                    + Send
+                    + 'a,
+            >,
+        >;
+
         let mut config = Config::new(smoltcp::wire::HardwareAddress::Ip);
         config.random_seed = rand::random();
 
@@ -236,6 +238,8 @@ impl DeviceManager {
             HashMap::new();
         let mut udp_queue: HashMap<SocketHandle, VecDeque<(UdpPacket, bool)>> =
             HashMap::new();
+        let mut dns_queries: FuturesUnordered<DnsQueryFuture<'_>> =
+            FuturesUnordered::new();
         let mut next_poll = None;
 
         loop {
@@ -341,6 +345,17 @@ impl DeviceManager {
                                 queue.push_back((data, active));
                                 next_poll = None;
                             }
+                        }
+                    }
+                }
+
+                Some((handle, mut pkt, ip)) = dns_queries.next(), if !dns_queries.is_empty() => {
+                    if let Some(ip) = ip {
+                        let port = pkt.dst_addr.port();
+                        pkt.dst_addr = SocksAddr::Ip(SocketAddr::new(ip, port));
+                        if let Some(queue) = udp_queue.get_mut(&handle) {
+                            queue.push_front((pkt, true));
+                            next_poll = None;
                         }
                     }
                 }
@@ -453,37 +468,39 @@ impl DeviceManager {
                                                         if let Ok(ip) = domain.parse::<IpAddr>() {
                                                             ip
                                                         } else {
-                                                            let dns_server = self.dns_servers.choose(&mut rand::rng());
-                                                            if let Some(dns_server) = dns_server {
-                                                                let ip = self.look_up_dns(domain, *dns_server).await;
+                                                            let domain = domain.to_owned();
+                                                            let dns_server = self.dns_servers.choose(&mut rand::rng()).copied();
+                                                            let socket_handle = *handle;
+                                                            dns_queries.push(Box::pin(async move {
+                                                                let ip = if let Some(server) = dns_server {
+                                                                    self.look_up_dns(&domain, server).await
+                                                                } else {
+                                                                    self.resolver.resolve(&domain, false).await.ok().flatten()
+                                                                };
                                                                 if let Some(ip) = ip {
-                                                                    debug!("host {} resolved to {} on wg stack", domain, ip);
-                                                                    ip
+                                                                    debug!("host {} resolved to {}", domain, ip);
                                                                 } else {
                                                                     warn!("failed to resolve domain on wireguard: {}", domain);
-                                                                    continue;
                                                                 }
-                                                            } else {
-                                                                match self.resolver.resolve(domain, false).await {
-                                                                    Ok(Some(ip)) => {
-                                                                        debug!("host {} resolved to {} on local", domain, ip);
-                                                                        ip
-                                                                    }
-                                                                    _ => {
-                                                                        warn!("failed to resolve domain on wireguard: {}", domain);
-                                                                        continue;
-                                                                    }
-                                                                }
-                                                            }
+                                                                (socket_handle, pkt, ip)
+                                                            }));
+                                                            continue;
                                                         }
                                                     }
                                                 };
 
+                                                let local_addr: IpAddr = match ip {
+                                                    IpAddr::V4(_) => self.addr.into(),
+                                                    IpAddr::V6(_) => {
+                                                        let Some(addr_v6) = self.addr_v6 else {
+                                                            warn!("cannot send IPv6 packet without a WireGuard IPv6 address");
+                                                            continue;
+                                                        };
+                                                        addr_v6.into()
+                                                    }
+                                                };
+
                                                 if !socket.is_open() {
-                                                    let local_addr: IpAddr = match ip {
-                                                        IpAddr::V4(_) => self.addr.into(),
-                                                        IpAddr::V6(_) => self.addr_v6.unwrap().into(),
-                                                    };
                                                     socket
                                                         .bind(
                                                             (local_addr, self.get_ephemeral_udp_port().await),
@@ -534,13 +551,14 @@ impl DeviceManager {
 
                                 }
                             }
-                            SenderType::Udp(_) => {
+                            SenderType::Udp(sender) => {
                                 let socket = sockets.get::<udp::Socket>(*handle);
-                                if socket.is_open() {
+                                if !sender.is_closed() {
                                     true
                                 } else {
-                                    let port = socket.endpoint().port;
-                                    udp_port_to_release.push(port);
+                                    if socket.endpoint().port != 0 {
+                                        udp_port_to_release.push(socket.endpoint().port);
+                                    }
 
                                     trace!("socket {} closed, shutting down connection and releasing resources", handle);
                                     sockets.remove(*handle);

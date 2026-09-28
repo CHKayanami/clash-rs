@@ -1,5 +1,5 @@
-use std::sync::Arc;
 use ipnet::IpNet;
+use std::sync::Arc;
 
 use crate::{
     Error,
@@ -23,7 +23,21 @@ pub fn build_handler(
     s: &OutboundWireguard,
     connector: Option<Arc<dyn RemoteConnector>>,
 ) -> Result<Handler, crate::Error> {
-        let h = Handler::new(HandlerOptions {
+    for (name, key) in [
+        ("private-key", &s.private_key),
+        ("public-key", &s.public_key),
+    ] {
+        key.parse::<crate::proxy::wg::KeyBytes>().map_err(|e| {
+            Error::InvalidConfig(format!("invalid WireGuard {name}: {e}"))
+        })?;
+    }
+    if let Some(key) = &s.pre_shared_key {
+        key.parse::<crate::proxy::wg::KeyBytes>().map_err(|e| {
+            Error::InvalidConfig(format!("invalid WireGuard pre-shared-key: {e}"))
+        })?;
+    }
+    let h = Handler::new(
+        HandlerOptions {
             name: s.common_opts.name.to_owned(),
             common_opts: HandlerCommonOptions {
                 connector: s.common_opts.connect_via.clone(),

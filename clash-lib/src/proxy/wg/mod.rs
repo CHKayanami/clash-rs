@@ -1,4 +1,4 @@
-use self::{keys::KeyBytes, wireguard::Config};
+use self::wireguard::Config;
 use super::{
     AnyOutboundDatagram, AnyStream, ConnectorType, DialWithConnector,
     HandlerCommonOptions, OutboundHandler, OutboundType, PlainProxyAPIResponse,
@@ -27,6 +27,7 @@ use tokio::sync::OnceCell;
 mod device;
 mod events;
 mod keys;
+pub(crate) use keys::KeyBytes;
 mod ports;
 mod stack;
 mod wireguard;
@@ -137,21 +138,26 @@ impl Handler {
                             .opts
                             .private_key
                             .parse::<KeyBytes>()
-                            .unwrap()
+                            .map_err(|e| Error::InvalidConfig(format!("invalid WireGuard private key: {e}")))?
                             .0
                             .into(),
                         endpoint_public_key: self
                             .opts
                             .public_key
                             .parse::<KeyBytes>()
-                            .unwrap()
+                            .map_err(|e| Error::InvalidConfig(format!("invalid WireGuard public key: {e}")))?
                             .0
                             .into(),
                         pre_shared_key: self
                             .opts
                             .pre_shared_key
                             .as_ref()
-                            .map(|s| s.parse::<KeyBytes>().unwrap().0.into()),
+                            .map(|s| {
+                                s.parse::<KeyBytes>()
+                                    .map(|key| key.0.into())
+                                    .map_err(|e| Error::InvalidConfig(format!("invalid WireGuard pre-shared key: {e}")))
+                            })
+                            .transpose()?,
                         remote_endpoint: (server_ip, self.opts.port).into(),
                         source_peer_ip: self.opts.ip,
                         source_peer_ipv6: self.opts.ipv6,
@@ -199,10 +205,13 @@ impl Handler {
                                 server
                                     .iter()
                                     .map(|s| {
-                                        (s.parse::<IpAddr>().unwrap(), 53).into()
+                                        s.parse::<IpAddr>()
+                                            .map(|ip| (ip, 53).into())
+                                            .map_err(|e| Error::InvalidConfig(format!("invalid WireGuard DNS server {s}: {e}")))
                                     })
-                                    .collect::<Vec<_>>()
+                                    .collect::<Result<Vec<_>, _>>()
                             })
+                            .transpose()?
                             .unwrap_or_default()
                     } else {
                         vec![]
@@ -283,6 +292,12 @@ impl OutboundHandler for Handler {
         };
 
         let remote = (ip, sess.destination.port()).into();
+        if ip.is_ipv6() && self.opts.ipv6.is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::AddrNotAvailable,
+                "WireGuard IPv6 address is required for an IPv6 destination",
+            ));
+        }
 
         let socket = inner.device_manager.new_tcp_socket(remote).await;
         sess.push_chain(self.name());
