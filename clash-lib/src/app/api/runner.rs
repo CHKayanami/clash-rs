@@ -244,7 +244,7 @@ impl AsyncService for ApiRunner {
             };
             if dir.exists() {
                 info!("Serving dashboard from: {:?}", dir);
-                router = router.nest_service("/ui", ServeDir::new(dir));
+                router = router.nest_service("/ui/", ServeDir::new(dir));
             } else {
                 warn!("Dashboard dir {:?} does not exist, skipping", dir);
             }
