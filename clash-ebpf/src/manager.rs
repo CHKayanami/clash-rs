@@ -2,6 +2,9 @@ use crate::config::EbpfConfig;
 use crate::listener::{EbpfListener, ListenerError};
 use crate::netns::{DaeNs, NetNsError};
 use network_interface::NetworkInterfaceConfig;
+use std::fs::{File, OpenOptions};
+use std::io::Write;
+use std::os::fd::AsRawFd;
 use std::sync::Arc;
 use thiserror::Error;
 use tracing::info;
@@ -15,6 +18,43 @@ const DAENS_HOST_IPV6: &str = "fd00::1";
 const DAENS_PEER_IPV6: &str = "fd00::2";
 
 const TPROXY_MARK: u32 = 0x1dae;
+const INSTANCE_LOCK_PATH: &str = "/run/clash-rs-ebpf.lock";
+
+fn lock_instance() -> Result<File, EbpfError> {
+    let mut file = OpenOptions::new().read(true).write(true).create(true).open(INSTANCE_LOCK_PATH)?;
+    // The lock stays open for the entire lifetime of the datapath, including startup.
+    let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if result != 0 {
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::WouldBlock {
+            return Err(EbpfError::Bpf("another clash-rs eBPF instance is running".to_string()));
+        }
+        return Err(error.into());
+    }
+    file.set_len(0)?;
+    writeln!(file, "{}", std::process::id())?;
+    Ok(file)
+}
+
+fn link_already_removed(error: &std::io::Error) -> bool {
+    matches!(error.raw_os_error(), Some(libc::ENODEV | libc::ENOENT))
+}
+
+fn cleanup_stale_links(nl: &mut crate::netlink::NlSock) -> std::io::Result<()> {
+    for name in ["dae0", "dae0peer"] {
+        let ifindex = match crate::netlink::ifindex_of(name) {
+            Ok(ifindex) => ifindex,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        match nl.del_link(ifindex) {
+            Ok(()) => info!("Removed stale clash-rs eBPF interface {name}"),
+            Err(error) if link_already_removed(&error) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
 
 #[derive(Error, Debug)]
 pub enum EbpfError {
@@ -33,6 +73,7 @@ struct EbpfRunningState {
     _listener: Arc<EbpfListener>,
     bpf_manager: crate::bpf::BpfProgramManager,
     _host_link: OwnedHostLink,
+    _instance_lock: File,
 }
 
 struct OwnedHostLink {
@@ -44,8 +85,10 @@ impl Drop for OwnedHostLink {
         use crate::netlink::{self, NlSock};
         if netlink::ifindex_of("dae0").ok() == Some(self.ifindex) {
             if let Ok(mut nl) = NlSock::new() {
-                if let Err(error) = nl.del_link(self.ifindex) {
-                    tracing::warn!("Failed to remove owned dae0 interface: {error}");
+                match nl.del_link(self.ifindex) {
+                    Ok(()) => {}
+                    Err(error) if link_already_removed(&error) => {}
+                    Err(error) => tracing::warn!("Failed to remove owned dae0 interface: {error}"),
                 }
             }
         }
@@ -87,10 +130,12 @@ impl EbpfManager {
         use std::net::{Ipv4Addr, Ipv6Addr};
 
         info!("Starting clash-ebpf datapath and isolation netns...");
+        let instance_lock = lock_instance()?;
+        let mut host_nl = NlSock::new()?;
+        cleanup_stale_links(&mut host_nl)?;
         let ns = Arc::new(DaeNs::new()?);
 
         // Create host <-> daens link pair (L2 netkit if supported, fallback to veth)
-        let mut host_nl = NlSock::new()?;
         let link_kind = host_nl.add_link_pair("dae0", "dae0peer")?;
         info!("Created dae0/dae0peer link pair (kind: {:?})", link_kind);
         let dae0_idx = match host_nl.get_link("dae0") {
@@ -395,6 +440,7 @@ impl EbpfManager {
             _listener: listener.clone(),
             bpf_manager,
             _host_link: host_link,
+            _instance_lock: instance_lock,
         });
 
         info!(
