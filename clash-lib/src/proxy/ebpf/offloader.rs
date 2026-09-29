@@ -35,6 +35,12 @@ const DEFAULT_MAX_V4_IPS: usize = 16384;
 const DEFAULT_MAX_V6_IPS: usize = 16384;
 // Domains commonly own multiple IPs; keep a separate bound on owner metadata.
 const DEFAULT_MAX_OWNERS: usize = 8192;
+// Reserve one tenth of each capacity to avoid evicting on every new observation.
+const EVICTION_RESERVE_DIVISOR: usize = 10;
+
+fn eviction_batch(max_ips: usize) -> usize {
+    (max_ips / EVICTION_RESERVE_DIVISOR).max(1)
+}
 
 /// DNS observations replace the addresses of the observed family. An unobserved
 /// family keeps its last state. No DNS TTL is used to change kernel bypass state.
@@ -47,6 +53,9 @@ pub struct OffloadDesiredState {
     ip_action_counts: HashMap<IpAddr, IpActionCounts>,
     tracked_v4: usize,
     tracked_v6: usize,
+    // Trigger proactive reclaim only when free capacity crosses below the threshold.
+    reclaim_armed_v4: bool,
+    reclaim_armed_v6: bool,
     desired: HashSet<IpAddr>,
     applied: HashSet<IpAddr>,
     dirty_ips: HashSet<IpAddr>,
@@ -75,6 +84,8 @@ impl OffloadDesiredState {
             ip_action_counts: HashMap::new(),
             tracked_v4: 0,
             tracked_v6: 0,
+            reclaim_armed_v4: true,
+            reclaim_armed_v6: true,
             desired: HashSet::new(),
             applied: HashSet::new(),
             dirty_ips: HashSet::new(),
@@ -270,95 +281,122 @@ impl OffloadDesiredState {
             return false;
         }
 
-        if self.tracked_v4 <= self.max_v4_ips && self.tracked_v6 <= self.max_v6_ips {
-            if let Some(oldest) = self
+        let excess_owners = self.owners.len().saturating_sub(self.max_owners);
+        let target_owners = if excess_owners > 0 {
+            excess_owners.max(eviction_batch(self.max_owners))
+        } else {
+            0
+        };
+        let excess_v4 = self.tracked_v4.saturating_sub(self.max_v4_ips);
+        let excess_v6 = self.tracked_v6.saturating_sub(self.max_v6_ips);
+        if excess_v4 == 0 && excess_v6 == 0 {
+            let mut candidates: Vec<_> = self
                 .owners
                 .iter()
                 .filter(|(domain, _)| *domain != observed)
-                .min_by_key(|(_, owner)| owner.last_seen)
-                .map(|(domain, _)| Arc::clone(domain))
-            {
-                self.remove_owner(&oldest, affected);
-                return true;
+                .map(|(domain, owner)| (owner.last_seen, domain))
+                .collect();
+            if candidates.len() < target_owners {
+                self.remove_owner(observed, affected);
+                return false;
             }
+            candidates
+                .select_nth_unstable_by_key(target_owners - 1, |(seen, _)| *seen);
+            let evictions: Vec<_> = candidates[..target_owners]
+                .iter()
+                .map(|(_, domain)| Arc::clone(domain))
+                .collect();
+            for domain in evictions {
+                self.remove_owner(&domain, affected);
+            }
+            return true;
+        }
+        let batch_v4 = eviction_batch(self.max_v4_ips);
+        let batch_v6 = eviction_batch(self.max_v6_ips);
+        let target_v4 = if excess_v4 > 0 {
+            excess_v4.max(batch_v4)
+        } else {
+            0
+        };
+        let target_v6 = if excess_v6 > 0 {
+            excess_v6.max(batch_v6)
+        } else {
+            0
+        };
+        let Some(evictions) =
+            self.plan_evictions(Some(observed), target_owners, target_v4, target_v6)
+        else {
             self.remove_owner(observed, affected);
             return false;
+        };
+        for domain in evictions {
+            self.remove_owner(&domain, affected);
         }
+        true
+    }
 
-        let excess_v4 = self.tracked_v4.saturating_sub(self.max_v4_ips);
-        let excess_v6 = self.tracked_v6.saturating_sub(self.max_v6_ips);
+    fn plan_evictions(
+        &self,
+        protected: Option<&DomainKey>,
+        target_owners: usize,
+        target_v4: usize,
+        target_v6: usize,
+    ) -> Option<Vec<DomainKey>> {
+        let fits = |owners: usize, v4: usize, v6: usize| {
+            owners <= self.max_owners
+                && v4 <= self.max_v4_ips
+                && v6 <= self.max_v6_ips
+        };
         let mut candidates: Vec<_> = self
             .owners
             .iter()
-            .filter(|(domain, _)| *domain != observed)
-            .map(|(domain, owner)| {
-                let v4_gain = owner
-                    .v4_ips
-                    .iter()
-                    .filter(|ip| {
-                        self.ip_action_counts
-                            .get(ip)
-                            .is_some_and(|counts| counts.direct + counts.proxy == 1)
-                    })
-                    .count();
-                let v6_gain = owner
-                    .v6_ips
-                    .iter()
-                    .filter(|ip| {
-                        self.ip_action_counts
-                            .get(ip)
-                            .is_some_and(|counts| counts.direct + counts.proxy == 1)
-                    })
-                    .count();
-                (
-                    Arc::clone(domain),
-                    owner,
-                    v4_gain.min(excess_v4) + v6_gain.min(excess_v6),
-                )
+            .filter(|(domain, _)| {
+                protected.is_none_or(|protected| *domain != protected)
             })
             .collect();
-        candidates.sort_unstable_by_key(|(_, owner, gain)| {
-            (std::cmp::Reverse(*gain), owner.last_seen)
-        });
+        candidates.sort_unstable_by_key(|(_, owner)| owner.last_seen);
 
         let mut remaining_owners = self.owners.len();
         let mut remaining_v4 = self.tracked_v4;
         let mut remaining_v6 = self.tracked_v6;
         let mut remaining_counts = HashMap::<IpAddr, usize>::new();
         let mut evictions = Vec::new();
-        while !fits(remaining_owners, remaining_v4, remaining_v6) {
+        loop {
             let mut deferred = Vec::new();
             let mut progressed = false;
-            for (domain, owner, gain) in candidates.drain(..) {
-                if fits(remaining_owners, remaining_v4, remaining_v6) {
+            for (domain, owner) in candidates.drain(..) {
+                let need_owner = evictions.len() < target_owners;
+                let need_v4 =
+                    self.tracked_v4.saturating_sub(remaining_v4) < target_v4;
+                let need_v6 =
+                    self.tracked_v6.saturating_sub(remaining_v6) < target_v6;
+                if fits(remaining_owners, remaining_v4, remaining_v6)
+                    && !need_owner
+                    && !need_v4
+                    && !need_v6
+                {
                     break;
                 }
-                let excess_v4 = remaining_v4.saturating_sub(self.max_v4_ips);
-                let excess_v6 = remaining_v6.saturating_sub(self.max_v6_ips);
-                let mut freed_v4 = 0;
-                let mut freed_v6 = 0;
-                for ip in owner.v4_ips.iter().chain(&owner.v6_ips) {
-                    let remaining =
-                        remaining_counts.get(ip).copied().unwrap_or_else(|| {
-                            self.ip_action_counts
-                                .get(ip)
-                                .map(|counts| {
-                                    usize::from(counts.direct)
-                                        + usize::from(counts.proxy)
-                                })
-                                .unwrap_or(0)
-                        });
-                    if remaining == 1 {
-                        if ip.is_ipv4() {
-                            freed_v4 += 1;
-                        } else {
-                            freed_v6 += 1;
-                        }
-                    }
-                }
-                let useful = freed_v4.min(excess_v4) + freed_v6.min(excess_v6);
-                if useful == 0 && remaining_owners <= self.max_owners {
-                    deferred.push((domain, owner, gain));
+                let frees_needed_ip = !need_owner
+                    && owner.v4_ips.iter().chain(&owner.v6_ips).any(|ip| {
+                        ((ip.is_ipv4() && need_v4) || (ip.is_ipv6() && need_v6))
+                            && remaining_counts.get(ip).copied().unwrap_or_else(
+                                || {
+                                    self.ip_action_counts
+                                        .get(ip)
+                                        .map(|counts| {
+                                            usize::from(counts.direct)
+                                                + usize::from(counts.proxy)
+                                        })
+                                        .unwrap_or(0)
+                                },
+                            ) == 1
+                    });
+                if !frees_needed_ip
+                    && !need_owner
+                    && remaining_owners <= self.max_owners
+                {
+                    deferred.push((domain, owner));
                     continue;
                 }
                 for ip in owner.v4_ips.iter().chain(&owner.v6_ips) {
@@ -384,7 +422,7 @@ impl OffloadDesiredState {
                     }
                 }
                 remaining_owners = remaining_owners.saturating_sub(1);
-                evictions.push(domain);
+                evictions.push(Arc::clone(domain));
                 progressed = true;
             }
             if !progressed {
@@ -393,14 +431,63 @@ impl OffloadDesiredState {
             candidates = deferred;
         }
 
-        if !fits(remaining_owners, remaining_v4, remaining_v6) {
-            self.remove_owner(observed, affected);
-            return false;
+        if fits(remaining_owners, remaining_v4, remaining_v6) {
+            Some(evictions)
+        } else {
+            None
         }
+    }
+
+    /// Reclaim room after a successful kernel flush, outside DNS observation processing.
+    fn reclaim_headroom(&mut self) {
+        let batch_v4 = eviction_batch(self.max_v4_ips);
+        let batch_v6 = eviction_batch(self.max_v6_ips);
+        let free_v4 = self.max_v4_ips.saturating_sub(self.tracked_v4);
+        let free_v6 = self.max_v6_ips.saturating_sub(self.tracked_v6);
+        if free_v4 >= batch_v4 {
+            self.reclaim_armed_v4 = true;
+        }
+        if free_v6 >= batch_v6 {
+            self.reclaim_armed_v6 = true;
+        }
+        let target_v4 = if free_v4 < batch_v4 && self.reclaim_armed_v4 {
+            self.reclaim_armed_v4 = false;
+            batch_v4
+        } else {
+            0
+        };
+        let target_v6 = if free_v6 < batch_v6 && self.reclaim_armed_v6 {
+            self.reclaim_armed_v6 = false;
+            batch_v6
+        } else {
+            0
+        };
+        if target_v4 == 0 && target_v6 == 0 {
+            return;
+        }
+
+        // Keep the most recently observed domain so cleanup cannot undo its fresh update.
+        let protected = self
+            .owners
+            .iter()
+            .max_by_key(|(_, owner)| owner.last_seen)
+            .map(|(domain, _)| Arc::clone(domain));
+        let Some(evictions) =
+            self.plan_evictions(protected.as_ref(), 0, target_v4, target_v6)
+        else {
+            return;
+        };
+        let mut affected = HashSet::new();
         for domain in evictions {
-            self.remove_owner(&domain, affected);
+            self.remove_owner(&domain, &mut affected);
         }
-        true
+        self.recompute_ips(affected);
+        if self.max_v4_ips.saturating_sub(self.tracked_v4) >= batch_v4 {
+            self.reclaim_armed_v4 = true;
+        }
+        if self.max_v6_ips.saturating_sub(self.tracked_v6) >= batch_v6 {
+            self.reclaim_armed_v6 = true;
+        }
     }
 
     fn recompute_ips(&mut self, ips: HashSet<IpAddr>) {
@@ -490,16 +577,16 @@ impl DirectOffloader {
                                     flush_succeeded = true;
                                     if !add_v4.is_empty() || !add_v6.is_empty() {
                                         tracing::info!(
-                                            "[eBPF DirectOffloader] Dynamic bypass added: IPv4={:?}, IPv6={:?}",
-                                            add_v4,
-                                            add_v6
+                                            "[eBPF DirectOffloader] Dynamic bypass added: IPv4={}, IPv6={}",
+                                            add_v4.len(),
+                                            add_v6.len()
                                         );
                                     }
                                     if !del_v4.is_empty() || !del_v6.is_empty() {
                                         tracing::info!(
-                                            "[eBPF DirectOffloader] Dynamic bypass removed: IPv4={:?}, IPv6={:?}",
-                                            del_v4,
-                                            del_v6
+                                            "[eBPF DirectOffloader] Dynamic bypass removed: IPv4={}, IPv6={}",
+                                            del_v4.len(),
+                                            del_v6.len()
                                         );
                                     }
                                     for ip in add_v4
@@ -531,6 +618,13 @@ impl DirectOffloader {
                         state.dirty_ips.clear();
                         retry_at = None;
                         retry_delay = INITIAL_RETRY_DELAY;
+                        if has_updates {
+                            state.reclaim_headroom();
+                            if !state.dirty_ips.is_empty() {
+                                // Flush cleanup immediately, even if no more DNS events arrive.
+                                continue;
+                            }
+                        }
                     } else {
                         retry_at = Some(Instant::now() + retry_delay);
                         retry_delay = (retry_delay * 2).min(MAX_RETRY_DELAY);
@@ -727,7 +821,7 @@ mod tests {
     }
 
     #[test]
-    fn shared_ip_capacity_evicts_only_an_owner_that_releases_space() {
+    fn shared_ip_capacity_skips_oldest_owner_when_it_cannot_release_ip() {
         let mut state = OffloadDesiredState::with_capacity(2, 2, 3);
         let shared: IpAddr = "1.1.1.1".parse().unwrap();
         let old_unique: IpAddr = "2.2.2.2".parse().unwrap();
@@ -850,6 +944,164 @@ mod tests {
     }
 
     #[test]
+    fn ip_capacity_evicts_oldest_before_newer_larger_owner() {
+        let mut state = OffloadDesiredState::with_capacity(4, 4, 5);
+        let old: IpAddr = "1.1.1.1".parse().unwrap();
+        let newer: [IpAddr; 2] =
+            ["2.2.2.1", "2.2.2.2"].map(|ip| ip.parse().unwrap());
+        let filler: IpAddr = "3.3.3.3".parse().unwrap();
+        let incoming: [IpAddr; 2] =
+            ["4.4.4.1", "4.4.4.2"].map(|ip| ip.parse().unwrap());
+        observe(&mut state, "old.com", &[old], RoutingAction::Direct);
+        observe(&mut state, "newer.com", &newer, RoutingAction::Direct);
+        observe(&mut state, "filler.com", &[filler], RoutingAction::Direct);
+
+        observe(&mut state, "incoming.com", &incoming, RoutingAction::Direct);
+        assert!(!state.owners.contains_key("old.com"));
+        assert!(!state.owners.contains_key("newer.com"));
+        assert!(state.owners.contains_key("filler.com"));
+        assert!(state.owners.contains_key("incoming.com"));
+    }
+
+    #[test]
+    fn ip_capacity_scales_batch_for_small_maps() {
+        let mut state = OffloadDesiredState::with_capacity(1024, 1, 1025);
+        for i in 0..1024u32 {
+            let ip = IpAddr::V4(std::net::Ipv4Addr::from(0x0a00_0000 + i));
+            observe(
+                &mut state,
+                &format!("d{i}.com"),
+                &[ip],
+                RoutingAction::Direct,
+            );
+        }
+        let incoming = IpAddr::V4(std::net::Ipv4Addr::from(0x0b00_0000));
+        observe(
+            &mut state,
+            "incoming.com",
+            &[incoming],
+            RoutingAction::Direct,
+        );
+
+        let scaled_batch = eviction_batch(1024);
+        assert_eq!(state.tracked_v4, 1025 - scaled_batch);
+        assert_eq!(state.owners.len(), 1025 - scaled_batch);
+        assert!(!state.owners.contains_key("d0.com"));
+        assert!(!state.owners.contains_key("d101.com"));
+        assert!(state.owners.contains_key("d102.com"));
+        assert!(state.owners.contains_key("incoming.com"));
+    }
+
+    #[test]
+    fn default_ip_capacity_evicts_ten_percent_as_a_batch() {
+        let mut state = OffloadDesiredState::with_capacity(DEFAULT_MAX_V4_IPS, 1, 3);
+        let batch = eviction_batch(DEFAULT_MAX_V4_IPS);
+        assert_eq!(batch, 1638);
+        let old: Vec<_> = (0..batch as u32)
+            .map(|i| IpAddr::V4(std::net::Ipv4Addr::from(0x0a00_0000 + i)))
+            .collect();
+        let recent: Vec<_> = (batch as u32..DEFAULT_MAX_V4_IPS as u32)
+            .map(|i| IpAddr::V4(std::net::Ipv4Addr::from(0x0a00_0000 + i)))
+            .collect();
+        observe(&mut state, "old.com", &old, RoutingAction::Direct);
+        observe(&mut state, "recent.com", &recent, RoutingAction::Direct);
+        let incoming = IpAddr::V4(std::net::Ipv4Addr::from(0x0b00_0000));
+
+        observe(
+            &mut state,
+            "incoming.com",
+            &[incoming],
+            RoutingAction::Direct,
+        );
+        assert!(!state.owners.contains_key("old.com"));
+        assert!(state.owners.contains_key("recent.com"));
+        assert!(state.owners.contains_key("incoming.com"));
+        assert_eq!(state.tracked_v4, DEFAULT_MAX_V4_IPS + 1 - batch);
+    }
+
+    #[test]
+    fn successful_flush_reclaims_headroom_before_ip_capacity_is_full() {
+        let mut state = OffloadDesiredState::with_capacity(64, 64, 64);
+        for i in 0..58u32 {
+            let ip = IpAddr::V4(std::net::Ipv4Addr::from(0x0a00_0000 + i));
+            observe(
+                &mut state,
+                &format!("d{i}.com"),
+                &[ip],
+                RoutingAction::Direct,
+            );
+        }
+        state.dirty_ips.clear();
+        state.reclaim_headroom();
+        assert_eq!(state.tracked_v4, 58);
+        assert!(state.dirty_ips.is_empty());
+
+        let next = IpAddr::V4(std::net::Ipv4Addr::from(0x0a00_003a));
+        observe(&mut state, "d58.com", &[next], RoutingAction::Direct);
+        state.dirty_ips.clear();
+        state.reclaim_headroom();
+        assert_eq!(state.tracked_v4, 53);
+        assert_eq!(state.dirty_ips.len(), 6);
+        assert!(!state.owners.contains_key("d0.com"));
+        assert!(!state.owners.contains_key("d5.com"));
+        assert!(state.owners.contains_key("d6.com"));
+        assert!(state.owners.contains_key("d58.com"));
+    }
+
+    #[test]
+    fn default_capacity_reclaims_when_fewer_than_ten_percent_slots_remain() {
+        let mut state = OffloadDesiredState::with_capacity(DEFAULT_MAX_V4_IPS, 1, 3);
+        let batch = eviction_batch(DEFAULT_MAX_V4_IPS);
+        let old: Vec<_> = (0..batch as u32)
+            .map(|i| IpAddr::V4(std::net::Ipv4Addr::from(0x0a00_0000 + i)))
+            .collect();
+        let recent: Vec<_> = (batch as u32..(DEFAULT_MAX_V4_IPS - batch + 1) as u32)
+            .map(|i| IpAddr::V4(std::net::Ipv4Addr::from(0x0a00_0000 + i)))
+            .collect();
+        observe(&mut state, "old.com", &old, RoutingAction::Direct);
+        observe(&mut state, "recent.com", &recent, RoutingAction::Direct);
+        assert_eq!(state.tracked_v4, DEFAULT_MAX_V4_IPS - batch + 1);
+        state.dirty_ips.clear();
+
+        state.reclaim_headroom();
+        assert!(!state.owners.contains_key("old.com"));
+        assert!(state.owners.contains_key("recent.com"));
+        assert_eq!(state.tracked_v4, DEFAULT_MAX_V4_IPS - 2 * batch + 1);
+        assert_eq!(state.dirty_ips.len(), batch);
+    }
+
+    #[test]
+    fn incomplete_headroom_reclaim_does_not_repeat_until_capacity_recovers() {
+        let mut state = OffloadDesiredState::with_capacity(64, 64, 3);
+        let old: IpAddr = "1.1.1.1".parse().unwrap();
+        let recent: Vec<_> = (0..61u32)
+            .map(|i| IpAddr::V4(std::net::Ipv4Addr::from(0x0b00_0000 + i)))
+            .collect();
+        observe(&mut state, "old.com", &[old], RoutingAction::Direct);
+        observe(&mut state, "recent.com", &recent, RoutingAction::Direct);
+        state.dirty_ips.clear();
+
+        state.reclaim_headroom();
+        assert_eq!(state.tracked_v4, 61);
+        assert!(!state.reclaim_armed_v4);
+        assert_eq!(state.dirty_ips, HashSet::from([old]));
+
+        state.dirty_ips.clear();
+        state.reclaim_headroom();
+        assert_eq!(state.tracked_v4, 61);
+        assert!(state.dirty_ips.is_empty());
+
+        observe(
+            &mut state,
+            "recent.com",
+            &recent[..58],
+            RoutingAction::Direct,
+        );
+        state.reclaim_headroom();
+        assert!(state.reclaim_armed_v4);
+    }
+
+    #[test]
     fn large_domain_replaces_shared_and_unique_small_domains() {
         let mut state = OffloadDesiredState::with_capacity(3, 3, 4);
         let shared: IpAddr = "1.1.1.1".parse().unwrap();
@@ -874,7 +1126,7 @@ mod tests {
     }
 
     #[test]
-    fn default_owner_limit_is_8192_distinct_domains() {
+    fn default_owner_limit_evicts_ten_percent_as_a_batch() {
         let mut state = OffloadDesiredState::new();
         for i in 0..8193u32 {
             let ip = IpAddr::V4(std::net::Ipv4Addr::from(0x0a00_0000 + i));
@@ -885,14 +1137,44 @@ mod tests {
                 RoutingAction::Direct,
             );
         }
-        assert_eq!(state.owners.len(), 8192);
-        assert_eq!(state.desired.len(), 8192);
+        let owner_batch = eviction_batch(DEFAULT_MAX_OWNERS);
+        assert_eq!(owner_batch, 819);
+        assert_eq!(state.owners.len(), 8193 - owner_batch);
+        assert_eq!(state.desired.len(), 8193 - owner_batch);
         assert!(!state.owners.contains_key("d0.com"));
+        assert!(!state.owners.contains_key("d818.com"));
+        assert!(state.owners.contains_key("d819.com"));
         assert!(state.owners.contains_key("d8192.com"));
     }
 
     #[test]
-    fn owner_only_limit_evicts_oldest_without_scanning_ip_ownership() {
+    fn simultaneous_owner_and_ip_overflow_evicts_ten_percent() {
+        let mut state = OffloadDesiredState::with_capacity(100, 1, 100);
+        for i in 0..100u32 {
+            let ip = IpAddr::V4(std::net::Ipv4Addr::from(0x0a00_0000 + i));
+            observe(
+                &mut state,
+                &format!("d{i}.com"),
+                &[ip],
+                RoutingAction::Direct,
+            );
+        }
+        let incoming = IpAddr::V4(std::net::Ipv4Addr::from(0x0b00_0000));
+        observe(
+            &mut state,
+            "incoming.com",
+            &[incoming],
+            RoutingAction::Direct,
+        );
+        assert_eq!(state.owners.len(), 91);
+        assert_eq!(state.tracked_v4, 91);
+        assert!(!state.owners.contains_key("d9.com"));
+        assert!(state.owners.contains_key("d10.com"));
+        assert!(state.owners.contains_key("incoming.com"));
+    }
+
+    #[test]
+    fn owner_only_limit_evicts_oldest_when_capacity_is_small() {
         let mut state = OffloadDesiredState::with_capacity(10, 10, 2);
         let ip: IpAddr = "1.1.1.1".parse().unwrap();
         observe(&mut state, "a.com", &[ip], RoutingAction::Direct);
