@@ -538,6 +538,9 @@ impl ClashResolver for EnhancedResolver {
         host: &str,
         enhanced: bool,
     ) -> anyhow::Result<Option<net::IpAddr>> {
+        if host.is_empty() {
+            return Ok(None);
+        }
         debug!(domain = %host, enhanced, "DNS resolve requested");
         if self.is_blacklisted(host) {
             debug!("dns resolve domain in blacklist: {}", host);
@@ -581,6 +584,10 @@ impl ClashResolver for EnhancedResolver {
         host: &str,
         enhanced: bool,
     ) -> anyhow::Result<Option<net::Ipv4Addr>> {
+        if host.is_empty() {
+            return Ok(None);
+        }
+
         if self.is_blacklisted(host) {
             debug!("dns resolve_v4 domain in blacklist: {}", host);
             return Ok(None);
@@ -637,6 +644,10 @@ impl ClashResolver for EnhancedResolver {
         host: &str,
         enhanced: bool,
     ) -> anyhow::Result<Option<net::Ipv6Addr>> {
+        if host.is_empty() {
+            return Ok(None);
+        }
+
         if self.is_blacklisted(host) {
             debug!("dns resolve_v6 domain in blacklist: {}", host);
             return Ok(None);
@@ -724,6 +735,13 @@ impl ClashResolver for EnhancedResolver {
             return Ok(build_dns_nodata(raw_query));
         }
 
+        // Empty domain / DNS root ('.') has no A or AAAA records.
+        // Return NODATA immediately without allocating Fake-IP or querying upstream.
+        if host.is_empty() && (qtype == QType::A || qtype == QType::AAAA) {
+            debug!(domain = %host, ?qtype, "DNS root/empty domain A/AAAA query, returning NODATA");
+            return Ok(build_dns_nodata(raw_query));
+        }
+
         // 1. Hosts match (takes precedence over Fake-IP when record type matches)
         if let Some(hosts) = &self.hosts {
             if let Some(host_ip) = hosts.search(host).and_then(|h| h.get_data()) {
@@ -744,7 +762,7 @@ impl ClashResolver for EnhancedResolver {
 
         // 2. Fake-IP match
         if let Some(fake_dns) = &self.fake_dns {
-            if !fake_dns.should_skip(host) {
+            if matches!(qtype, QType::A | QType::AAAA) && !fake_dns.should_skip(host) {
                 if qtype == QType::A {
                     let fake_ip = fake_dns.lookup(host);
                     debug!(domain = %host, ?fake_ip, "DNS exchange assigned Fake-IP (A)");

@@ -317,6 +317,9 @@ impl ClashResolver for RouterResolver {
         host: &str,
         enhanced: bool,
     ) -> anyhow::Result<Option<net::IpAddr>> {
+        if host.is_empty() {
+            return Ok(None);
+        }
         if let Some(v4) = self.resolve_v4(host, enhanced).await? {
             return Ok(Some(net::IpAddr::V4(v4)));
         }
@@ -333,6 +336,9 @@ impl ClashResolver for RouterResolver {
         host: &str,
         _enhanced: bool,
     ) -> anyhow::Result<Option<net::Ipv4Addr>> {
+        if host.is_empty() {
+            return Ok(None);
+        }
         if let Some(ip) = parse_ip_literal(host) {
             if let net::IpAddr::V4(v4) = ip {
                 return Ok(Some(v4));
@@ -358,6 +364,9 @@ impl ClashResolver for RouterResolver {
         host: &str,
         _enhanced: bool,
     ) -> anyhow::Result<Option<net::Ipv6Addr>> {
+        if host.is_empty() {
+            return Ok(None);
+        }
         if !self.ipv6() {
             return Ok(None);
         }
@@ -396,6 +405,19 @@ impl ClashResolver for RouterResolver {
         let qtype = query.qtype().unwrap_or(QType::A);
 
         debug!(domain = qname, ?qtype, "DNS query received");
+
+        // AAAA asked for while IPv6 is globally disabled: answer NODATA (NoError + zero answers)
+        if qtype == QType::AAAA && !self.ipv6() {
+            debug!(domain = qname, "AAAA query while IPv6 disabled, returning NODATA");
+            return Ok(build_dns_nodata(message));
+        }
+
+        // Empty domain / DNS root ('.') has no A or AAAA records.
+        // Return NODATA immediately without allocating Fake-IP or querying upstream.
+        if qname.is_empty() && (qtype == QType::A || qtype == QType::AAAA) {
+            debug!(domain = qname, ?qtype, "DNS root/empty domain A/AAAA query, returning NODATA");
+            return Ok(build_dns_nodata(message));
+        }
 
         // 1. 优先匹配 Hosts 静态映射（最快路径：纯内存直出，零网络与零开销）
         if self.cfg.use_hosts {

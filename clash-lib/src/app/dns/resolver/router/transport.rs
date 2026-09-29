@@ -571,6 +571,9 @@ impl DnsTransport for FakeIpTransport {
         query: &QueryContext,
     ) -> anyhow::Result<ExchangeResult> {
         let domain = query.qdomain().unwrap_or_default();
+        if domain.is_empty() {
+            return Ok(ExchangeResult::cached(build_dns_nodata(raw_query)));
+        }
         let qtype = query.qtype().unwrap_or(QType::A);
         let wire = match qtype {
             QType::A => {
@@ -597,6 +600,9 @@ impl DnsTransport for FakeIpTransport {
         host: &str,
         ipv6: bool,
     ) -> anyhow::Result<Vec<IpAddr>> {
+        if host.is_empty() {
+            return Ok(vec![]);
+        }
         if ipv6 {
             Ok(vec![self.fake_dns.lookupv6(host)])
         } else {

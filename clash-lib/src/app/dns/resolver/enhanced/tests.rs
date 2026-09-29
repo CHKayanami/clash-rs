@@ -259,7 +259,7 @@ async fn test_fake_ip_exchange() {
             policy: None,
             proxy_upstreams: None,
             proxy_server_domains: None,
-            fake_dns: Some(fake_dns),
+            fake_dns: Some(Arc::clone(&fake_dns)),
             fake_ip_ttl: 1,
             reverse_lookup_cache: None,
             black_domain_filter: None,
@@ -280,6 +280,16 @@ async fn test_fake_ip_exchange() {
     let ips = crate::app::dns::wire::extract_ips_from_dns_response(&resp);
     assert_eq!(ips.len(), 1);
     assert!(resolver.is_fake_ip(ips[0]));
+    let mappings_before_root = fake_dns.search_cache("*").len();
+    assert_eq!(mappings_before_root, 1);
+
+    // Root/empty domain must not allocate Fake-IP and must return NODATA directly
+    let root_name = DnsName::from_domain(".").unwrap();
+    let root_query_wire = build_dns_query_wire_with_id(0x3344, &root_name, QType::A);
+    let root_resp = resolver.exchange(&root_query_wire).await.expect("root query should return NODATA response");
+    let root_ips = crate::app::dns::wire::extract_ips_from_dns_response(&root_resp);
+    assert_eq!(root_ips.len(), 0);
+    assert_eq!(fake_dns.search_cache("*").len(), mappings_before_root);
 }
 
 #[tokio::test]

@@ -357,6 +357,14 @@ async fn test_fakeip_transport_ttl() {
     let records = extract_ips_with_ttl(&resp.wire);
     assert_eq!(records.len(), 1);
     assert_eq!(records[0].1, custom_ttl);
+
+    // Root/empty domain should return NODATA and not allocate fake-ip
+    let root_name = DnsName::from_domain(".").unwrap();
+    let root_query = build_dns_query_wire(&root_name, QType::A);
+    let root_ctx = QueryContext::parse(&root_query).unwrap();
+    let root_resp = transport.exchange(&root_query, &root_ctx).await.unwrap();
+    let root_records = extract_ips_with_ttl(&root_resp.wire);
+    assert_eq!(root_records.len(), 0);
 }
 
 #[test]
