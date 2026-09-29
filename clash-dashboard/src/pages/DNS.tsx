@@ -17,6 +17,7 @@ import {
   AlertCircle,
   Server,
 } from 'lucide-react';
+import { ConfirmDialog } from '../components/ui/confirm-dialog';
 
 const DNS_TYPES = ['A', 'AAAA', 'CNAME', 'MX', 'TXT', 'NS', 'SOA'];
 
@@ -96,17 +97,18 @@ export function DNS() {
   // DNS Cache Management state
   const [upstreams, setUpstreams] = useState<DnsUpstreamInfo[]>([]);
   const [selectedUpstream, setSelectedUpstream] = useState<string>('');
-  const [wildcard, setWildcard] = useState('*');
+  const [wildcard, setWildcard] = useState('');
   const [cacheResult, setCacheResult] = useState<DnsCacheUpstreamStat | null>(null);
   const [cacheLoading, setCacheLoading] = useState(false);
   const [cacheError, setCacheError] = useState<string | null>(null);
   const [cacheSuccessMsg, setCacheSuccessMsg] = useState<string | null>(null);
   const [isDeleting, setIsDeleting] = useState(false);
-
-  // Fetch available upstreams on mount
-  useEffect(() => {
-    void fetchUpstreams();
-  }, []);
+  const [deleteConfirmTarget, setDeleteConfirmTarget] = useState<{
+    upstream: string;
+    pattern: string;
+    isSpecificDomain: boolean;
+    count?: number;
+  } | null>(null);
 
   async function fetchUpstreams() {
     try {
@@ -119,6 +121,11 @@ export function DNS() {
       console.error('Failed to load DNS upstreams', e);
     }
   }
+
+  // Fetch available upstreams on mount
+  useEffect(() => {
+    void fetchUpstreams();
+  }, []);
 
   // Lookup handler
   async function handleQuery() {
@@ -146,12 +153,16 @@ export function DNS() {
       setCacheError('查询条件必须指定上游');
       return;
     }
+    if (!p) {
+      setCacheError('请输入域名通配符进行查询');
+      return;
+    }
 
     setCacheLoading(true);
     setCacheError(null);
     setCacheSuccessMsg(null);
     try {
-      const res = await getDnsCache(targetUpstream, p || '*');
+      const res = await getDnsCache(targetUpstream, p);
       setCacheResult(res.upstream);
     } catch (e) {
       setCacheError(e instanceof Error ? e.message : '查询 DNS 缓存失败');
@@ -160,29 +171,34 @@ export function DNS() {
     }
   }
 
-  // Cache Delete handler
-  async function handleDeleteCache(specificDomain?: string) {
+  // Cache Delete handlers
+  function requestDeleteCache(specificDomain?: string) {
     if (!selectedUpstream) {
       setCacheError('必须指定上游才能删除缓存');
       return;
     }
     const p = specificDomain || wildcard.trim() || '*';
-    const confirmText = specificDomain
-      ? `确定要删除上游 "${selectedUpstream}" 中域名为 "${specificDomain}" 的缓存记录吗？`
-      : `确定要删除上游 "${selectedUpstream}" 中匹配通配符 "${p}" 的所有缓存记录吗？`;
+    setDeleteConfirmTarget({
+      upstream: selectedUpstream,
+      pattern: p,
+      isSpecificDomain: Boolean(specificDomain),
+      count: specificDomain ? 1 : cacheResult?.count,
+    });
+  }
 
-    if (!window.confirm(confirmText)) {
-      return;
-    }
+  async function handleConfirmDeleteCache() {
+    if (!deleteConfirmTarget) return;
+    const { upstream, pattern } = deleteConfirmTarget;
 
     setIsDeleting(true);
     setCacheError(null);
     setCacheSuccessMsg(null);
     try {
-      const res = await deleteDnsCache(selectedUpstream, p);
-      setCacheSuccessMsg(`成功从上游 "${selectedUpstream}" 中删除 ${res.deleted} 条缓存记录`);
+      const res = await deleteDnsCache(upstream, pattern);
+      setCacheSuccessMsg(`成功从上游 "${upstream}" 中删除 ${res.deleted} 条缓存记录`);
+      setDeleteConfirmTarget(null);
       // Refresh cache
-      const updated = await getDnsCache(selectedUpstream, wildcard.trim() || '*');
+      const updated = await getDnsCache(upstream, wildcard.trim() || '*');
       setCacheResult(updated.upstream);
     } catch (e) {
       setCacheError(e instanceof Error ? e.message : '删除 DNS 缓存失败');
@@ -216,7 +232,7 @@ export function DNS() {
 
           {cacheResult && cacheResult.count > 0 && (
             <button
-              onClick={() => void handleDeleteCache()}
+              onClick={() => requestDeleteCache()}
               disabled={isDeleting || cacheLoading}
               className="flex items-center gap-1.5 px-3.5 py-2 rounded-xl text-[13px] font-medium transition-all shadow-sm hover:brightness-105 active:scale-[0.98] disabled:opacity-50 self-start sm:self-auto cursor-pointer"
               style={{
@@ -252,7 +268,9 @@ export function DNS() {
                       type="button"
                       onClick={() => {
                         setSelectedUpstream(u.tag);
-                        void handleCacheQuery(undefined, u.tag);
+                        setCacheResult(null);
+                        setCacheError(null);
+                        setCacheSuccessMsg(null);
                       }}
                       className="flex items-center gap-2 px-3 py-1.5 rounded-xl text-[13px] font-mono transition-all border cursor-pointer"
                       style={{
@@ -296,7 +314,9 @@ export function DNS() {
                 onKeyDown={(e) => {
                   if (e.key === 'Enter') {
                     e.preventDefault();
-                    void handleCacheQuery();
+                    if (wildcard.trim() && selectedUpstream && !cacheLoading) {
+                      void handleCacheQuery();
+                    }
                   }
                 }}
                 className="w-full pl-10 pr-4 py-2.5 rounded-xl text-[14px] focus:outline-none transition-shadow"
@@ -309,8 +329,8 @@ export function DNS() {
             </div>
             <button
               onClick={() => void handleCacheQuery()}
-              disabled={cacheLoading || !selectedUpstream}
-              className="flex items-center justify-center gap-1.5 px-5 py-2.5 rounded-xl text-[14px] font-medium transition-all shadow-sm hover:brightness-105 active:scale-[0.98] disabled:opacity-50 cursor-pointer"
+              disabled={cacheLoading || !selectedUpstream || !wildcard.trim()}
+              className="flex items-center justify-center gap-1.5 px-5 py-2.5 rounded-xl text-[14px] font-medium transition-all shadow-sm hover:brightness-105 active:scale-[0.98] disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer"
               style={{ background: '#0071e3', color: 'white' }}
             >
               {cacheLoading ? (
@@ -486,7 +506,7 @@ export function DNS() {
                           </span>
                         )}
                         <button
-                          onClick={() => void handleDeleteCache(item.domain)}
+                          onClick={() => requestDeleteCache(item.domain)}
                           disabled={isDeleting}
                           className="p-1 rounded text-[#ff3b30] hover:bg-[rgba(255,59,48,0.1)] transition-colors cursor-pointer disabled:opacity-50"
                           title={`删除 ${item.domain} 的缓存`}
@@ -720,6 +740,80 @@ export function DNS() {
           </div>
         )}
       </section>
+
+      {/* ─── Cache Delete Confirmation Modal ─────────────────────────────── */}
+      <ConfirmDialog
+        open={Boolean(deleteConfirmTarget)}
+        onClose={() => !isDeleting && setDeleteConfirmTarget(null)}
+        onConfirm={() => void handleConfirmDeleteCache()}
+        title={
+          deleteConfirmTarget?.isSpecificDomain
+            ? '确认删除域名缓存'
+            : '确认清理匹配缓存'
+        }
+        description="此操作将从目标 DNS 上游缓存中移除该条目或匹配规则下的解析记录，此操作无法恢复。"
+        confirmText="确认删除"
+        cancelText="取消"
+        variant="destructive"
+        icon="none"
+        isLoading={isDeleting}
+      >
+        {deleteConfirmTarget && (
+          <div
+            className="p-3.5 rounded-xl border text-[13px] space-y-2.5"
+            style={{
+              background: 'var(--color-fill-subtle)',
+              borderColor: 'var(--color-border)',
+            }}
+          >
+            <div className="flex items-center justify-between gap-4">
+              <span className="shrink-0" style={{ color: 'var(--color-text-secondary)' }}>
+                目标上游
+              </span>
+              <span
+                className="font-mono font-medium text-[12px] px-2 py-0.5 rounded-md truncate max-w-[220px]"
+                style={{
+                  background: 'var(--color-fill-medium)',
+                  color: 'var(--color-text-primary)',
+                }}
+                title={deleteConfirmTarget.upstream}
+              >
+                {deleteConfirmTarget.upstream}
+              </span>
+            </div>
+
+            <div className="flex items-center justify-between gap-4">
+              <span className="shrink-0" style={{ color: 'var(--color-text-secondary)' }}>
+                {deleteConfirmTarget.isSpecificDomain ? '域名' : '匹配通配符'}
+              </span>
+              <span
+                className="font-mono font-semibold text-[12px] px-2 py-0.5 rounded-md truncate max-w-[220px]"
+                style={{
+                  background: deleteConfirmTarget.isSpecificDomain
+                    ? 'rgba(0,113,227,0.1)'
+                    : 'rgba(255,149,0,0.1)',
+                  color: deleteConfirmTarget.isSpecificDomain ? '#0071e3' : '#ff9500',
+                }}
+                title={deleteConfirmTarget.pattern}
+              >
+                {deleteConfirmTarget.pattern}
+              </span>
+            </div>
+
+            {deleteConfirmTarget.count !== undefined && !deleteConfirmTarget.isSpecificDomain && (
+              <div
+                className="flex items-center justify-between pt-2 border-t"
+                style={{ borderColor: 'var(--color-separator)' }}
+              >
+                <span style={{ color: 'var(--color-text-secondary)' }}>当前匹配总数</span>
+                <span className="font-semibold text-[#ff3b30] text-[12px]">
+                  共 {deleteConfirmTarget.count} 条记录
+                </span>
+              </div>
+            )}
+          </div>
+        )}
+      </ConfirmDialog>
     </div>
   );
 }
