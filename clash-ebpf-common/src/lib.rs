@@ -10,6 +10,10 @@ pub use event::{DaeEvent, DaeEventType, PIDName};
 
 pub const DAE_TPROXY_MARK: u32 = 0x1dae;
 pub const DAE_BYPASS_MARK: u32 = 0x2dae;
+pub const STATIC_BYPASS_SRC_MAX_ENTRIES: u32 = 1024;
+pub const STATIC_BYPASS_SRC_PORT_MAX_ENTRIES: u32 = 256;
+pub const STATIC_BYPASS_DST_MAX_ENTRIES: u32 = 4096;
+pub const STATIC_BYPASS_DST_PORT_MAX_ENTRIES: u32 = 256;
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -94,4 +98,3 @@ unsafe impl aya::Pod for RedirectEntry {}
 
 #[cfg(all(feature = "user", target_os = "linux"))]
 unsafe impl aya::Pod for DirectTrackEntry {}
-

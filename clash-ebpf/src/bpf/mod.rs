@@ -15,8 +15,9 @@ use aya::programs::{
     CgroupAttachMode, CgroupSock, CgroupSockAddr, SchedClassifier, TcAttachType,
 };
 use aya::{Ebpf, EbpfLoader};
+use std::collections::HashSet;
 use std::fs::File;
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::os::fd::{AsFd, AsRawFd, RawFd};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -26,6 +27,84 @@ const BPF_MAP_UPDATE_ELEM: libc::c_long = 2;
 const BPF_MAP_DELETE_ELEM: libc::c_long = 3;
 const BPF_MAP_UPDATE_BATCH: libc::c_long = 26;
 const BPF_MAP_DELETE_BATCH: libc::c_long = 27;
+
+fn parse_static_bypass_nets(
+    entries: &[String],
+    label: &str,
+    limit: usize,
+) -> Result<(Vec<ipnet::Ipv4Net>, Vec<ipnet::Ipv6Net>), String> {
+    let mut v4 = Vec::new();
+    let mut v6 = Vec::new();
+    for entry in entries {
+        if let Ok(net) = ipnet::IpNet::from_str(entry) {
+            match net {
+                ipnet::IpNet::V4(net) => v4.push(net),
+                ipnet::IpNet::V6(net) => v6.push(net),
+            }
+        } else if let Ok(ip) = IpAddr::from_str(entry) {
+            match ip {
+                IpAddr::V4(ip) => {
+                    v4.push(ipnet::Ipv4Net::new(ip, 32).map_err(|e| {
+                        format!("invalid static {label} bypass IP {ip}: {e}")
+                    })?)
+                }
+                IpAddr::V6(ip) => {
+                    v6.push(ipnet::Ipv6Net::new(ip, 128).map_err(|e| {
+                        format!("invalid static {label} bypass IP {ip}: {e}")
+                    })?)
+                }
+            }
+        } else {
+            return Err(format!("invalid static {label} bypass IP/CIDR: {entry}"));
+        }
+    }
+
+    let mut v4 = ipnet::Ipv4Net::aggregate(&v4);
+    let mut v6 = ipnet::Ipv6Net::aggregate(&v6);
+    if v4.len() > limit {
+        warn!(
+            "Static {label} bypass IPv4 CIDRs exceed eBPF map capacity: {} aggregated, retaining first {limit}, dropping {}",
+            v4.len(),
+            v4.len() - limit
+        );
+        v4.truncate(limit);
+    }
+    if v6.len() > limit {
+        warn!(
+            "Static {label} bypass IPv6 CIDRs exceed eBPF map capacity: {} aggregated, retaining first {limit}, dropping {}",
+            v6.len(),
+            v6.len() - limit
+        );
+        v6.truncate(limit);
+    }
+    Ok((v4, v6))
+}
+
+fn select_static_bypass_ports(
+    configured: &[u16],
+    tproxy_port: u16,
+    label: &str,
+    limit: usize,
+) -> Vec<u16> {
+    let mut seen = HashSet::new();
+    let mut selected = Vec::with_capacity(limit.min(configured.len() + 1));
+    let mut distinct = 0usize;
+    for port in std::iter::once(tproxy_port).chain(configured.iter().copied()) {
+        if seen.insert(port) {
+            distinct += 1;
+            if selected.len() < limit {
+                selected.push(port);
+            }
+        }
+    }
+    if distinct > limit {
+        warn!(
+            "Static {label} bypass ports exceed eBPF map capacity: {distinct} distinct, retaining first {limit}, dropping {}",
+            distinct - limit
+        );
+    }
+    selected
+}
 
 #[repr(C)]
 struct BpfElemAttr {
@@ -338,113 +417,146 @@ impl BpfProgramManager {
         );
 
         // 2. Populate BYPASS_SRC_PORTS map (e.g., local server ports)
-        if let Some(map) = bpf.map_mut("BYPASS_SRC_PORTS") {
-            if let Ok(mut port_map) = HashMap::<_, u16, u8>::try_from(map) {
-                let _ = port_map.insert(param.tproxy_port as u16, 1, 0);
-                for &port in bypass_src_ports {
-                    let _ = port_map.insert(port, 1, 0);
-                }
-                debug!(
-                    "Configured {} source bypass ports in BPF map",
-                    bypass_src_ports.len() + 1
-                );
-            }
+        let source_bypass_ports = select_static_bypass_ports(
+            bypass_src_ports,
+            param.tproxy_port as u16,
+            "source",
+            clash_ebpf_common::STATIC_BYPASS_SRC_PORT_MAX_ENTRIES as usize,
+        );
+        let map = bpf.map_mut("BYPASS_SRC_PORTS").ok_or_else(|| {
+            "required map 'BYPASS_SRC_PORTS' not found".to_string()
+        })?;
+        let mut port_map = HashMap::<_, u16, u8>::try_from(map).map_err(|e| {
+            format!("map 'BYPASS_SRC_PORTS' has incompatible type: {e}")
+        })?;
+        for port in &source_bypass_ports {
+            port_map.insert(*port, 1, 0).map_err(|e| {
+                format!("failed to insert static source bypass port {port}: {e}")
+            })?;
         }
+        debug!(
+            "Configured {} source bypass ports in BPF map",
+            source_bypass_ports.len()
+        );
 
         // 3. Populate BYPASS_DST_PORTS map (e.g., direct destination service ports)
-        if let Some(map) = bpf.map_mut("BYPASS_DST_PORTS") {
-            if let Ok(mut port_map) = HashMap::<_, u16, u8>::try_from(map) {
-                let _ = port_map.insert(param.tproxy_port as u16, 1, 0);
-                for &port in bypass_dst_ports {
-                    let _ = port_map.insert(port, 1, 0);
-                }
-                debug!(
-                    "Configured {} dest bypass ports in BPF map",
-                    bypass_dst_ports.len() + 1
-                );
-            }
+        let dest_bypass_ports = select_static_bypass_ports(
+            bypass_dst_ports,
+            param.tproxy_port as u16,
+            "destination",
+            clash_ebpf_common::STATIC_BYPASS_DST_PORT_MAX_ENTRIES as usize,
+        );
+        let map = bpf.map_mut("BYPASS_DST_PORTS").ok_or_else(|| {
+            "required map 'BYPASS_DST_PORTS' not found".to_string()
+        })?;
+        let mut port_map = HashMap::<_, u16, u8>::try_from(map).map_err(|e| {
+            format!("map 'BYPASS_DST_PORTS' has incompatible type: {e}")
+        })?;
+        for port in &dest_bypass_ports {
+            port_map.insert(*port, 1, 0).map_err(|e| {
+                format!(
+                    "failed to insert static destination bypass port {port}: {e}"
+                )
+            })?;
         }
+        debug!(
+            "Configured {} dest bypass ports in BPF map",
+            dest_bypass_ports.len()
+        );
 
         // 4. Populate BYPASS_SRC_IPS and BYPASS_SRC_IP6S maps
-        if let Some(map) = bpf.map_mut("BYPASS_SRC_IPS") {
-            if let Ok(mut ip_trie) = LpmTrie::<_, u32, u8>::try_from(map) {
-                for ip_str in bypass_src_ips {
-                    if let Ok(net) = ipnet::Ipv4Net::from_str(ip_str) {
-                        let ip_u32 = u32::from_ne_bytes(net.network().octets());
-                        let key = Key::new(net.prefix_len() as u32, ip_u32);
-                        let _ = ip_trie.insert(&key, 1, 0);
-                    } else if let Ok(ip) = Ipv4Addr::from_str(ip_str) {
-                        let ip_u32 = u32::from_ne_bytes(ip.octets());
-                        let key = Key::new(32, ip_u32);
-                        let _ = ip_trie.insert(&key, 1, 0);
-                    }
-                }
-                debug!(
-                    "Configured {} source bypass IPv4 IP/CIDRs in BPF Trie map",
-                    bypass_src_ips.len()
+        let (bypass_src_v4, bypass_src_v6) = parse_static_bypass_nets(
+            bypass_src_ips,
+            "source",
+            clash_ebpf_common::STATIC_BYPASS_SRC_MAX_ENTRIES as usize,
+        )?;
+        {
+            let map = bpf.map_mut("BYPASS_SRC_IPS").ok_or_else(|| {
+                "required map 'BYPASS_SRC_IPS' not found".to_string()
+            })?;
+            let mut ip_trie = LpmTrie::<_, u32, u8>::try_from(map).map_err(|e| {
+                format!("map 'BYPASS_SRC_IPS' has incompatible type: {e}")
+            })?;
+            for net in &bypass_src_v4 {
+                let key = Key::new(
+                    net.prefix_len() as u32,
+                    u32::from_ne_bytes(net.network().octets()),
                 );
+                ip_trie.insert(&key, 1, 0).map_err(|e| {
+                    format!("failed to insert static source IPv4 bypass {net}: {e}")
+                })?;
             }
+            debug!(
+                "Configured {} source bypass IPv4 IP/CIDRs in BPF Trie map",
+                bypass_src_v4.len()
+            );
         }
-        if let Some(map) = bpf.map_mut("BYPASS_SRC_IP6S") {
-            if let Ok(mut ip_trie) = LpmTrie::<_, [u8; 16], u8>::try_from(map) {
-                for ip_str in bypass_src_ips {
-                    if let Ok(net) = ipnet::Ipv6Net::from_str(ip_str) {
-                        let key = Key::new(
-                            net.prefix_len() as u32,
-                            net.network().octets(),
-                        );
-                        let _ = ip_trie.insert(&key, 1, 0);
-                    } else if let Ok(ip) = Ipv6Addr::from_str(ip_str) {
-                        let key = Key::new(128, ip.octets());
-                        let _ = ip_trie.insert(&key, 1, 0);
-                    }
-                }
-                debug!(
-                    "Configured {} source bypass IPv6 IP/CIDRs in BPF Trie map",
-                    bypass_src_ips.len()
-                );
+        {
+            let map = bpf.map_mut("BYPASS_SRC_IP6S").ok_or_else(|| {
+                "required map 'BYPASS_SRC_IP6S' not found".to_string()
+            })?;
+            let mut ip_trie =
+                LpmTrie::<_, [u8; 16], u8>::try_from(map).map_err(|e| {
+                    format!("map 'BYPASS_SRC_IP6S' has incompatible type: {e}")
+                })?;
+            for net in &bypass_src_v6 {
+                let key = Key::new(net.prefix_len() as u32, net.network().octets());
+                ip_trie.insert(&key, 1, 0).map_err(|e| {
+                    format!("failed to insert static source IPv6 bypass {net}: {e}")
+                })?;
             }
+            debug!(
+                "Configured {} source bypass IPv6 IP/CIDRs in BPF Trie map",
+                bypass_src_v6.len()
+            );
         }
 
         // 5. Populate BYPASS_DST_IPS and BYPASS_DST_IP6S maps
-        if let Some(map) = bpf.map_mut("BYPASS_DST_IPS") {
-            if let Ok(mut ip_trie) = LpmTrie::<_, u32, u8>::try_from(map) {
-                for ip_str in bypass_dst_ips {
-                    if let Ok(net) = ipnet::Ipv4Net::from_str(ip_str) {
-                        let ip_u32 = u32::from_ne_bytes(net.network().octets());
-                        let key = Key::new(net.prefix_len() as u32, ip_u32);
-                        let _ = ip_trie.insert(&key, 1, 0);
-                    } else if let Ok(ip) = Ipv4Addr::from_str(ip_str) {
-                        let ip_u32 = u32::from_ne_bytes(ip.octets());
-                        let key = Key::new(32, ip_u32);
-                        let _ = ip_trie.insert(&key, 1, 0);
-                    }
-                }
-                debug!(
-                    "Configured {} dest bypass IPv4 IP/CIDRs in BPF Trie map",
-                    bypass_dst_ips.len()
+        let (bypass_dst_v4, bypass_dst_v6) = parse_static_bypass_nets(
+            bypass_dst_ips,
+            "destination",
+            clash_ebpf_common::STATIC_BYPASS_DST_MAX_ENTRIES as usize,
+        )?;
+        {
+            let map = bpf.map_mut("BYPASS_DST_IPS").ok_or_else(|| {
+                "required map 'BYPASS_DST_IPS' not found".to_string()
+            })?;
+            let mut ip_trie = LpmTrie::<_, u32, u8>::try_from(map).map_err(|e| {
+                format!("map 'BYPASS_DST_IPS' has incompatible type: {e}")
+            })?;
+            for net in &bypass_dst_v4 {
+                let key = Key::new(
+                    net.prefix_len() as u32,
+                    u32::from_ne_bytes(net.network().octets()),
                 );
+                ip_trie.insert(&key, 1, 0).map_err(|e| {
+                    format!("failed to insert static IPv4 bypass {net}: {e}")
+                })?;
             }
+            debug!(
+                "Configured {} dest bypass IPv4 IP/CIDRs in BPF Trie map",
+                bypass_dst_v4.len()
+            );
         }
-        if let Some(map) = bpf.map_mut("BYPASS_DST_IP6S") {
-            if let Ok(mut ip_trie) = LpmTrie::<_, [u8; 16], u8>::try_from(map) {
-                for ip_str in bypass_dst_ips {
-                    if let Ok(net) = ipnet::Ipv6Net::from_str(ip_str) {
-                        let key = Key::new(
-                            net.prefix_len() as u32,
-                            net.network().octets(),
-                        );
-                        let _ = ip_trie.insert(&key, 1, 0);
-                    } else if let Ok(ip) = Ipv6Addr::from_str(ip_str) {
-                        let key = Key::new(128, ip.octets());
-                        let _ = ip_trie.insert(&key, 1, 0);
-                    }
-                }
-                debug!(
-                    "Configured {} dest bypass IPv6 IP/CIDRs in BPF Trie map",
-                    bypass_dst_ips.len()
-                );
+
+        {
+            let map = bpf.map_mut("BYPASS_DST_IP6S").ok_or_else(|| {
+                "required map 'BYPASS_DST_IP6S' not found".to_string()
+            })?;
+            let mut ip_trie =
+                LpmTrie::<_, [u8; 16], u8>::try_from(map).map_err(|e| {
+                    format!("map 'BYPASS_DST_IP6S' has incompatible type: {e}")
+                })?;
+            for net in &bypass_dst_v6 {
+                let key = Key::new(net.prefix_len() as u32, net.network().octets());
+                ip_trie.insert(&key, 1, 0).map_err(|e| {
+                    format!("failed to insert static IPv6 bypass {net}: {e}")
+                })?;
             }
+            debug!(
+                "Configured {} dest bypass IPv6 IP/CIDRs in BPF Trie map",
+                bypass_dst_v6.len()
+            );
         }
 
         // 6. Populate PROXY_SRC_PORTS map
@@ -736,6 +848,36 @@ impl BpfProgramManager {
             })?;
             let raw_fd = map_raw_fd(map);
 
+            if !remove_v4.is_empty() {
+                let mut handled = false;
+                if !self.cap_batch_delete.is_unsupported() {
+                    let mut keys = Vec::with_capacity(remove_v4.len());
+                    for ip in remove_v4 {
+                        keys.push(u32::from_ne_bytes(ip.octets()));
+                    }
+                    handled =
+                        bpf_delete_batch_raw(&self.cap_batch_delete, raw_fd, &keys)?;
+                    if handled {
+                        debug!(
+                            "Batch removed {} dynamic bypass IPv4s via BPF_MAP_DELETE_BATCH",
+                            remove_v4.len()
+                        );
+                    }
+                }
+                if !handled {
+                    for ip in remove_v4 {
+                        let k = u32::from_ne_bytes(ip.octets());
+                        if let Err(e) = bpf_delete_elem_raw(raw_fd, &k)
+                            && e != libc::ENOENT as i64
+                        {
+                            return Err(format!(
+                                "failed to remove dynamic bypass IPv4 {ip}: errno={e}"
+                            ));
+                        }
+                    }
+                }
+            }
+
             if !add_v4.is_empty() {
                 let mut handled = false;
                 if !self.cap_batch_update.is_unsupported() {
@@ -772,36 +914,6 @@ impl BpfProgramManager {
                     }
                 }
             }
-
-            if !remove_v4.is_empty() {
-                let mut handled = false;
-                if !self.cap_batch_delete.is_unsupported() {
-                    let mut keys = Vec::with_capacity(remove_v4.len());
-                    for ip in remove_v4 {
-                        keys.push(u32::from_ne_bytes(ip.octets()));
-                    }
-                    handled =
-                        bpf_delete_batch_raw(&self.cap_batch_delete, raw_fd, &keys)?;
-                    if handled {
-                        debug!(
-                            "Batch removed {} dynamic bypass IPv4s via BPF_MAP_DELETE_BATCH",
-                            remove_v4.len()
-                        );
-                    }
-                }
-                if !handled {
-                    for ip in remove_v4 {
-                        let k = u32::from_ne_bytes(ip.octets());
-                        if let Err(e) = bpf_delete_elem_raw(raw_fd, &k)
-                            && e != libc::ENOENT as i64
-                        {
-                            return Err(format!(
-                                "failed to remove dynamic bypass IPv4 {ip}: errno={e}"
-                            ));
-                        }
-                    }
-                }
-            }
         }
 
         // 2. IPv6 Dynamic Bypass
@@ -810,6 +922,38 @@ impl BpfProgramManager {
                 "map 'DYNAMIC_BYPASS_DST_IP6S' not found".to_string()
             })?;
             let raw_fd = map_raw_fd(map);
+
+            if !remove_v6.is_empty() {
+                let mut handled = false;
+                if !self.cap_batch_delete.is_unsupported() {
+                    let keys: &[[u8; 16]] = unsafe {
+                        std::slice::from_raw_parts(
+                            remove_v6.as_ptr() as *const [u8; 16],
+                            remove_v6.len(),
+                        )
+                    };
+                    handled =
+                        bpf_delete_batch_raw(&self.cap_batch_delete, raw_fd, keys)?;
+                    if handled {
+                        debug!(
+                            "Batch removed {} dynamic bypass IPv6s via BPF_MAP_DELETE_BATCH",
+                            remove_v6.len()
+                        );
+                    }
+                }
+                if !handled {
+                    for ip in remove_v6 {
+                        let k = ip.octets();
+                        if let Err(e) = bpf_delete_elem_raw(raw_fd, &k)
+                            && e != libc::ENOENT as i64
+                        {
+                            return Err(format!(
+                                "failed to remove dynamic bypass IPv6 {ip}: errno={e}"
+                            ));
+                        }
+                    }
+                }
+            }
 
             if !add_v6.is_empty() {
                 let mut handled = false;
@@ -844,38 +988,6 @@ impl BpfProgramManager {
                         if let Err(e) = bpf_update_elem_raw(raw_fd, &k, &1u8) {
                             return Err(format!(
                                 "failed to insert dynamic bypass IPv6 {ip}: errno={e}"
-                            ));
-                        }
-                    }
-                }
-            }
-
-            if !remove_v6.is_empty() {
-                let mut handled = false;
-                if !self.cap_batch_delete.is_unsupported() {
-                    let keys: &[[u8; 16]] = unsafe {
-                        std::slice::from_raw_parts(
-                            remove_v6.as_ptr() as *const [u8; 16],
-                            remove_v6.len(),
-                        )
-                    };
-                    handled =
-                        bpf_delete_batch_raw(&self.cap_batch_delete, raw_fd, keys)?;
-                    if handled {
-                        debug!(
-                            "Batch removed {} dynamic bypass IPv6s via BPF_MAP_DELETE_BATCH",
-                            remove_v6.len()
-                        );
-                    }
-                }
-                if !handled {
-                    for ip in remove_v6 {
-                        let k = ip.octets();
-                        if let Err(e) = bpf_delete_elem_raw(raw_fd, &k)
-                            && e != libc::ENOENT as i64
-                        {
-                            return Err(format!(
-                                "failed to remove dynamic bypass IPv6 {ip}: errno={e}"
                             ));
                         }
                     }
@@ -1403,6 +1515,83 @@ async fn consume_dae_events(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn static_bypass_dst_entries_are_counted_per_family_after_aggregation() {
+        let entries = vec![
+            "1.1.1.1".to_string(),
+            "1.1.1.1/32".to_string(),
+            "2001:db8::/64".to_string(),
+        ];
+        let (v4, v6) = parse_static_bypass_nets(
+            &entries,
+            "destination",
+            clash_ebpf_common::STATIC_BYPASS_DST_MAX_ENTRIES as usize,
+        )
+        .unwrap();
+        assert_eq!(v4.len(), 1);
+        assert_eq!(v6.len(), 1);
+    }
+
+    #[test]
+    fn static_bypass_dst_over_capacity_is_truncated() {
+        let entries: Vec<_> = (0..=clash_ebpf_common::STATIC_BYPASS_DST_MAX_ENTRIES)
+            .map(|i| format!("{}/32", Ipv4Addr::from(0x0a00_0000 + i * 2)))
+            .collect();
+        let (v4, v6) = parse_static_bypass_nets(
+            &entries,
+            "destination",
+            clash_ebpf_common::STATIC_BYPASS_DST_MAX_ENTRIES as usize,
+        )
+        .unwrap();
+        assert_eq!(
+            v4.len(),
+            clash_ebpf_common::STATIC_BYPASS_DST_MAX_ENTRIES as usize
+        );
+        assert!(v6.is_empty());
+    }
+
+    #[test]
+    fn static_bypass_src_over_capacity_is_truncated() {
+        let entries: Vec<_> = (0..=clash_ebpf_common::STATIC_BYPASS_SRC_MAX_ENTRIES)
+            .map(|i| format!("{}/32", Ipv4Addr::from(0x0a00_0000 + i * 2)))
+            .collect();
+        let (v4, v6) = parse_static_bypass_nets(
+            &entries,
+            "source",
+            clash_ebpf_common::STATIC_BYPASS_SRC_MAX_ENTRIES as usize,
+        )
+        .unwrap();
+        assert_eq!(
+            v4.len(),
+            clash_ebpf_common::STATIC_BYPASS_SRC_MAX_ENTRIES as usize
+        );
+        assert!(v6.is_empty());
+    }
+
+    #[test]
+    fn static_bypass_ports_keep_tproxy_port_when_truncated() {
+        let ports = select_static_bypass_ports(
+            &[80, 80, 443, 8080],
+            12345,
+            "destination",
+            3,
+        );
+        assert_eq!(ports, vec![12345, 80, 443]);
+    }
+
+    #[test]
+    fn static_bypass_truncates_each_address_family_independently() {
+        let entries = vec![
+            "1.1.1.1".to_string(),
+            "2.2.2.2".to_string(),
+            "2001:db8::1".to_string(),
+            "2001:db8:1::1".to_string(),
+        ];
+        let (v4, v6) = parse_static_bypass_nets(&entries, "destination", 1).unwrap();
+        assert_eq!(v4.len(), 1);
+        assert_eq!(v6.len(), 1);
+    }
 
     #[test]
     fn empty_object_is_a_startup_error() {

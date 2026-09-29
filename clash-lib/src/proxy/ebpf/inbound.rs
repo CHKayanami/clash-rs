@@ -149,7 +149,7 @@ impl EbpfInbound {
             let offloader = self.create_offloader(&runtime.manager);
             let hook_offloader = offloader.clone();
             let router = self.dispatcher.router().clone();
-            let hook: DnsResolutionHook = Arc::new(move |domain: &str, ips: &[IpAddr], ttl: Duration| {
+            let hook: DnsResolutionHook = Arc::new(move |domain: &str, ips: &[IpAddr], _ttl: Duration| {
                 let offloader = hook_offloader.clone();
                 let router = router.clone();
                 let domain: Arc<str> = Arc::from(domain);
@@ -161,7 +161,7 @@ impl EbpfInbound {
                     } else {
                         RoutingAction::Proxy
                     };
-                    offloader.observe(domain, ips, action, ttl).await;
+                    offloader.observe(domain, ips, action).await;
                 });
             });
             self.dns_resolver.register_resolution_hook(hook.clone());

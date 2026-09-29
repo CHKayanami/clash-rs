@@ -407,7 +407,7 @@ fn handle_lan_ipv4(
             return TC_ACT_OK;
         }
 
-        // 动态下发直连判定 (受 DNS TTL 影响，命中则建立 DIRECT_TRACK 连接追踪)
+        // 动态下发直连判定 (直连状态变化时更新，命中则建立 DIRECT_TRACK 连接追踪)
         if is_dynamic_dst_ip4_bypassed(ip_be) {
             register_direct_track(&tuple);
             return TC_ACT_OK;
@@ -524,7 +524,7 @@ fn handle_lan_ipv6(
             return TC_ACT_OK;
         }
 
-        // 动态下发直连判定 (受 DNS TTL 影响，命中则建立 DIRECT_TRACK 连接追踪)
+        // 动态下发直连判定 (直连状态变化时更新，命中则建立 DIRECT_TRACK 连接追踪)
         if is_dynamic_dst_ip6_bypassed(dst_ip) {
             register_direct_track(&tuple);
             return TC_ACT_OK;
@@ -712,7 +712,7 @@ fn handle_wan_ipv4(
             return TC_ACT_OK;
         }
 
-        // 动态下发直连判定 (受 DNS TTL 影响，命中则建立 DIRECT_TRACK 连接追踪)
+        // 动态下发直连判定 (直连状态变化时更新，命中则建立 DIRECT_TRACK 连接追踪)
         if is_dynamic_dst_ip4_bypassed(ip_be) {
             register_direct_track(&tuple);
             return TC_ACT_OK;
@@ -816,7 +816,7 @@ fn handle_wan_ipv6(
             return TC_ACT_OK;
         }
 
-        // 动态下发直连判定 (受 DNS TTL 影响，命中则建立 DIRECT_TRACK 连接追踪)
+        // 动态下发直连判定 (直连状态变化时更新，命中则建立 DIRECT_TRACK 连接追踪)
         if is_dynamic_dst_ip6_bypassed(dst_ip) {
             register_direct_track(&tuple);
             return TC_ACT_OK;
