@@ -84,7 +84,7 @@ impl OutboundHandler for Handler {
         .await?;
 
         sess.push_chain(self.name());
-        Ok(Box::new(stream))
+        Ok(stream)
     }
 
     async fn connect_datagram(
@@ -116,7 +116,7 @@ impl OutboundHandler for Handler {
             sess.destination.clone(),
             resolver,
         )?;
-        Ok(Box::new(datagram))
+        Ok(AnyOutboundDatagram::Direct(Box::new(datagram)))
     }
 
     async fn support_connector(&self) -> ConnectorType {
@@ -178,6 +178,7 @@ impl PlainProxyAPIResponse for Handler {
 
 #[cfg(test)]
 mod tests {
+    use crate::{app::dispatcher::TrafficTracker, common::io::copy_bidirectional};
     use super::*;
     use crate::{
         app::dns::MockClashResolver,
@@ -190,7 +191,7 @@ mod tests {
         sync::Arc,
         time::Duration,
     };
-    use tokio::net::UdpSocket;
+    use tokio::net::{TcpListener, UdpSocket};
 
     async fn spawn_udp_echo(bind: &str) -> SocketAddr {
         let sock = UdpSocket::bind(bind).await.unwrap();
@@ -212,10 +213,64 @@ mod tests {
         Arc::new(MockClashResolver::new())
     }
 
-    /// Full round-trip through Handler::connect_datagram →
-    /// new_dual_stack_udp_socket → IPv4 echo server.  This exercises the
-    /// real socket-creation path (the source of the Windows WSAEINVAL
-    /// regression in #1399).
+    #[tokio::test]
+    async fn test_tcp_transport_copy_preserves_half_close() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for boxed in [false, true] {
+            let listener =
+                TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let sess = Session {
+                destination: listener.local_addr().unwrap().into(),
+                ..Default::default()
+            };
+            let handler = Handler::new("DIRECT");
+            let transport = if boxed {
+                AnyStream::new(
+                    handler
+                        .connect_stream(&sess, make_resolver())
+                        .await
+                        .unwrap(),
+                )
+            } else {
+                let transport = handler
+                    .connect_stream(&sess, make_resolver())
+                    .await
+                    .unwrap();
+                assert!(matches!(transport, AnyStream::Tcp(_)));
+                transport
+            };
+            let peer = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                socket.read_to_end(&mut request).await.unwrap();
+                assert_eq!(request, b"request");
+                socket.write_all(b"reply").await.unwrap();
+                socket.shutdown().await.unwrap();
+            });
+            let (mut client, inbound) = tokio::io::duplex(64);
+            let relay = tokio::spawn(copy_bidirectional(
+                AnyStream::new(inbound),
+                transport,
+                1024,
+                Duration::from_secs(2),
+                Duration::from_secs(2),
+                TrafficTracker::noop(),
+            ));
+            let roundtrip = async {
+                client.write_all(b"request").await.unwrap();
+                client.shutdown().await.unwrap();
+                let mut response = Vec::new();
+                client.read_to_end(&mut response).await.unwrap();
+                assert_eq!(response, b"reply");
+                assert_eq!(relay.await.unwrap().unwrap(), (7, 5));
+                peer.await.unwrap();
+            };
+            tokio::time::timeout(Duration::from_secs(5), roundtrip)
+                .await
+                .unwrap();
+        }
+    }
+    /// IPv4 echo over the concrete pooled transport, including dual-stack socket creation.
     #[tokio::test]
     async fn test_connect_datagram_ipv4_roundtrip() {
         let echo = spawn_udp_echo("127.0.0.1:0").await;
@@ -227,10 +282,13 @@ mod tests {
             ..Default::default()
         };
 
-        let mut d = handler
+        let transport = handler
             .connect_datagram(&sess, make_resolver())
             .await
             .expect("connect_datagram failed");
+        let AnyOutboundDatagram::Direct(mut d) = transport else {
+            panic!("Direct UDP must retain its concrete transport");
+        };
 
         d.send(UdpPacket {
             data: bytes::Bytes::from_static(b"hello-v4"),

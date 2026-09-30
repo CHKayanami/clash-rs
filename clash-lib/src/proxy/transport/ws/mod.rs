@@ -77,7 +77,7 @@ impl Transport for Client {
                 self.early_data_header_name.clone(),
                 self.max_early_data,
             );
-            Ok(Box::new(early_data_conn))
+            Ok(AnyStream::new(early_data_conn))
         } else {
             let (stream, resp) =
                 client_async_with_config(req, stream, self.ws_config)
@@ -90,7 +90,7 @@ impl Transport for Client {
                     "invalid response",
                 ));
             }
-            Ok(Box::new(WebsocketConn::from_websocket(stream)))
+            Ok(AnyStream::new(WebsocketConn::from_websocket(stream)))
         }
     }
 }

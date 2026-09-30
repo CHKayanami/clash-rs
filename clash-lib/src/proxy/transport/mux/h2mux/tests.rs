@@ -119,7 +119,7 @@ async fn test_h2mux_session_echo_and_concurrency() {
         ..Default::default()
     };
 
-    let session = H2MuxSession::new(Box::new(client_io) as AnyStream, opt)
+    let session = H2MuxSession::new(AnyStream::new(client_io), opt)
         .await
         .unwrap();
 
@@ -203,7 +203,7 @@ async fn test_h2mux_pool_dispatch() {
                 });
             }
         });
-        Ok(Box::new(client_io) as AnyStream)
+        Ok(AnyStream::new(client_io))
     };
 
     let dst = SocksAddr::Ip("1.2.3.4:9000".parse().unwrap());
@@ -248,7 +248,7 @@ async fn test_h2mux_pool_does_not_dial_past_connection_limit() {
                         .unwrap();
                 }
             });
-            Ok(Box::new(client_io) as AnyStream)
+            Ok(AnyStream::new(client_io))
         }
     };
     let dst = SocksAddr::Ip("1.2.3.4:80".parse().unwrap());
@@ -274,7 +274,7 @@ async fn test_h2mux_pool_reuses_session_during_slow_dial() {
                     .unwrap();
             }
         });
-        Box::new(client_io)
+        AnyStream::new(client_io)
     }
 
     let pool = H2MuxPool::new(MuxOption {

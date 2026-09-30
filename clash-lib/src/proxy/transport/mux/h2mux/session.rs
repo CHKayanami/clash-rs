@@ -131,6 +131,6 @@ impl H2MuxSession {
         let stream =
             H2MuxStream::new(resp, send_stream, request_bytes, Some(closer));
 
-        Ok(Box::new(stream))
+        Ok(AnyStream::new(stream))
     }
 }

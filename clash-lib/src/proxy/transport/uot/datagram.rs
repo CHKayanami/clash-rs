@@ -256,8 +256,10 @@ mod tests {
     async fn test_read_normal_packet() {
         let (mut client_side, server_side) = duplex(4096);
         let target_addr = make_target_addr();
-        let mut datagram =
-            OutboundDatagramUotV2::new(Box::new(server_side), target_addr.clone());
+        let mut datagram = OutboundDatagramUotV2::new(
+            AnyStream::new(server_side),
+            target_addr.clone(),
+        );
 
         client_side.write_all(&encode_wire(b"hello")).await.unwrap();
         drop(client_side);
@@ -276,7 +278,7 @@ mod tests {
         let (mut client_side, server_side) = duplex(4096);
         let target_addr = make_target_addr();
         let mut datagram =
-            OutboundDatagramUotV2::new(Box::new(server_side), target_addr);
+            OutboundDatagramUotV2::new(AnyStream::new(server_side), target_addr);
 
         client_side.write_all(&[0x00, 0x00]).await.unwrap();
         drop(client_side);
@@ -293,7 +295,7 @@ mod tests {
         let (mut client_side, server_side) = duplex(4096);
         let target_addr = make_target_addr();
         let mut datagram =
-            OutboundDatagramUotV2::new(Box::new(server_side), target_addr);
+            OutboundDatagramUotV2::new(AnyStream::new(server_side), target_addr);
 
         let mut wire = encode_wire(b"first");
         wire.extend(encode_wire(b"second"));
@@ -316,8 +318,10 @@ mod tests {
     #[tokio::test]
     async fn test_read_eof_returns_none() {
         let (client_side, server_side) = duplex(4096);
-        let mut datagram =
-            OutboundDatagramUotV2::new(Box::new(server_side), make_target_addr());
+        let mut datagram = OutboundDatagramUotV2::new(
+            AnyStream::new(server_side),
+            make_target_addr(),
+        );
 
         drop(client_side);
         assert!(datagram.next().await.is_none());
@@ -329,8 +333,10 @@ mod tests {
     async fn test_write_normal_packet() {
         let (mut client_side, server_side) = duplex(4096);
         let target_addr = make_target_addr();
-        let mut datagram =
-            OutboundDatagramUotV2::new(Box::new(server_side), target_addr.clone());
+        let mut datagram = OutboundDatagramUotV2::new(
+            AnyStream::new(server_side),
+            target_addr.clone(),
+        );
 
         datagram.send(make_packet(b"hello".to_vec())).await.unwrap();
 
@@ -346,7 +352,7 @@ mod tests {
         let (mut client_side, server_side) = duplex(4096);
         let target_addr = make_target_addr();
         let mut datagram =
-            OutboundDatagramUotV2::new(Box::new(server_side), target_addr);
+            OutboundDatagramUotV2::new(AnyStream::new(server_side), target_addr);
 
         datagram.send(make_packet(vec![])).await.unwrap();
 
@@ -360,7 +366,7 @@ mod tests {
         let (_client_side, server_side) = duplex(4096);
         let target_addr = make_target_addr();
         let mut datagram =
-            OutboundDatagramUotV2::new(Box::new(server_side), target_addr);
+            OutboundDatagramUotV2::new(AnyStream::new(server_side), target_addr);
 
         let oversized = vec![0u8; MAX_PACKET_LENGTH + 1];
         let result = datagram.send(make_packet(oversized)).await;
@@ -375,7 +381,7 @@ mod tests {
         let (mut client_side, server_side) = duplex(4096);
         let target_addr = make_target_addr();
         let mut datagram =
-            OutboundDatagramUotV2::new(Box::new(server_side), target_addr);
+            OutboundDatagramUotV2::new(AnyStream::new(server_side), target_addr);
 
         let payload = b"round-trip-uot";
         datagram.send(make_packet(payload.to_vec())).await.unwrap();

@@ -360,6 +360,6 @@ impl TLSObfs {
 
 impl From<TLSObfs> for AnyStream {
     fn from(obfs: TLSObfs) -> Self {
-        Box::new(obfs)
+        AnyStream::new(obfs)
     }
 }

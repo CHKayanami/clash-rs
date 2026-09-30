@@ -138,7 +138,7 @@ pub async fn new_tcp_stream(
         )
         .await
         {
-            Ok(Ok(tfo_stream)) => Ok(Box::new(tfo_stream)),
+            Ok(Ok(tfo_stream)) => Ok(AnyStream::new(tfo_stream)),
             Ok(Err(e)) => Err(e),
             Err(_) => Err(io::Error::new(
                 io::ErrorKind::TimedOut,
@@ -153,7 +153,7 @@ pub async fn new_tcp_stream(
 
         match timeout(Duration::from_secs(10), tokio_socket.connect(endpoint)).await
         {
-            Ok(Ok(tcp_stream)) => Ok(Box::new(tcp_stream)),
+            Ok(Ok(tcp_stream)) => Ok(AnyStream::Tcp(tcp_stream)),
             Ok(Err(e)) => Err(e),
             Err(_) => Err(io::Error::new(
                 io::ErrorKind::TimedOut,
@@ -668,7 +668,10 @@ mod tests {
         .await;
 
         let elapsed = start.elapsed();
-        assert!(stream.is_ok(), "Should successfully connect via IPv4");
+        assert!(
+            matches!(stream, Ok(AnyStream::Tcp(_))),
+            "IPv4 fallback must retain a concrete TCP stream"
+        );
         // Happy Eyeballs should connect within ~500ms instead of 10s timeout
         assert!(
             elapsed < Duration::from_secs(2),

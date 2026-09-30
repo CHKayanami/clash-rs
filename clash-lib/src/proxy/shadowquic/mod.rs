@@ -161,7 +161,7 @@ impl OutboundHandler for Handler {
             io::Error::other(format!("can't open shadowquic stream due to:{x}"))
         })?;
         sess.push_chain(self.name());
-        Ok(Box::new(conn))
+        Ok(AnyStream::new(conn))
     }
 
     /// connect to remote target via UDP
@@ -193,7 +193,7 @@ impl OutboundHandler for Handler {
             src_addr: sess.source.into(),
         };
         sess.push_chain(self.name());
-        Ok(Box::new(chain))
+        Ok(AnyOutboundDatagram::new(chain))
     }
 
     /// relay related

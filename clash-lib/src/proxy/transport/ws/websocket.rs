@@ -142,7 +142,7 @@ mod tests {
         let (client, server) = duplex(256);
         let mut sender =
             WebSocketStream::from_raw_socket(server, Role::Server, None).await;
-        let stream: AnyStream = Box::new(client);
+        let stream: AnyStream = AnyStream::new(client);
         let mut receiver = WebsocketConn::from_websocket(
             WebSocketStream::from_raw_socket(stream, Role::Client, None).await,
         );

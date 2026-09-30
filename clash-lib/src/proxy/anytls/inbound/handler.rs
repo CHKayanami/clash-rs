@@ -414,7 +414,7 @@ async fn handle_udp_session(
         inbound_user
     );
 
-    let inner: AnyStream = Box::new(app_stream);
+    let inner: AnyStream = AnyStream::new(app_stream);
     let datagram = InboundDatagramAnytls::new(inner, real_dest.clone());
 
     let sess = Session {
@@ -576,7 +576,9 @@ async fn handle_tcp_relay(
         ..Default::default()
     };
 
-    dispatcher.dispatch_stream(sess, Box::new(app_stream)).await;
+    dispatcher
+        .dispatch_stream(sess, AnyStream::new(app_stream))
+        .await;
 }
 
 #[cfg(test)]

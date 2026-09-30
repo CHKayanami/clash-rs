@@ -1,3 +1,4 @@
+use crate::proxy::AnyStream;
 mod auth;
 mod connector;
 mod proxy;
@@ -81,7 +82,7 @@ impl InboundHandlerTrait for HttpInbound {
             let fw_mark = self.fw_mark;
             tokio::spawn(async move {
                 proxy::handle(
-                    TokioIo::new(Box::new(socket)),
+                    TokioIo::new(AnyStream::Tcp(socket)),
                     src_addr,
                     dispatcher,
                     author,

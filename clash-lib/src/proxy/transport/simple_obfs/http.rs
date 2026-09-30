@@ -254,6 +254,6 @@ impl HTTPObfs {
 
 impl From<HTTPObfs> for AnyStream {
     fn from(obfs: HTTPObfs) -> Self {
-        Box::new(obfs)
+        AnyStream::new(obfs)
     }
 }

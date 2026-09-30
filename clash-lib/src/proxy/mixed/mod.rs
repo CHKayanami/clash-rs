@@ -1,3 +1,4 @@
+use crate::proxy::AnyStream;
 use crate::{
     Dispatcher,
     common::auth::ThreadSafeAuthenticator,
@@ -134,7 +135,7 @@ impl InboundHandlerTrait for MixedInbound {
 
                     _ => {
                         http::handle_http(
-                            TokioIo::new(Box::new(socket) as _),
+                            TokioIo::new(AnyStream::Tcp(socket)),
                             src_addr,
                             dispatcher,
                             authenticator,

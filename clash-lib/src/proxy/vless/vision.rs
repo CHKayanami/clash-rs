@@ -723,7 +723,7 @@ mod tests {
     fn make_vision_pair() -> (VisionStream, DuplexStream) {
         let (client, server) = duplex(65536);
         (
-            VisionStream::new(Box::new(client), TEST_UUID_STR, None).unwrap(),
+            VisionStream::new(AnyStream::new(client), TEST_UUID_STR, None).unwrap(),
             server,
         )
     }
@@ -744,7 +744,8 @@ mod tests {
             write_flag: Arc::clone(&write_flag),
         };
         (
-            VisionStream::new(Box::new(client), TEST_UUID_STR, Some(opts)).unwrap(),
+            VisionStream::new(AnyStream::new(client), TEST_UUID_STR, Some(opts))
+                .unwrap(),
             server,
             read_flag,
             write_flag,
@@ -1247,7 +1248,8 @@ mod tests {
             shutdown_called: shutdown_called.clone(),
         };
 
-        let mut vs = VisionStream::new(Box::new(mock), TEST_UUID_STR, None).unwrap();
+        let mut vs =
+            VisionStream::new(AnyStream::new(mock), TEST_UUID_STR, None).unwrap();
 
         // 1. Initial write of 50 bytes of app data
         let payload = vec![0x42; 50];

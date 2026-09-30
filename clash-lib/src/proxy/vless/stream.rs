@@ -338,7 +338,7 @@ mod tests {
 
     fn dummy_stream() -> AnyStream {
         let (client, _server) = tokio::io::duplex(1024);
-        Box::new(client)
+        AnyStream::new(client)
     }
 
     fn tcp_dest() -> SocksAddr {
@@ -477,7 +477,7 @@ mod tests {
 
         let (client_raw, mut server_raw) = tokio::io::duplex(1024);
         let mut client = VlessStream::new(
-            Box::new(client_raw),
+            AnyStream::new(client_raw),
             "5415d8e0-df92-3655-afa4-b79de66413f5",
             &tcp_dest(),
             VLESS_COMMAND_TCP,
@@ -528,7 +528,7 @@ mod tests {
 
         let (client_raw, mut server_raw) = tokio::io::duplex(1024);
         let mut client = VlessStream::new(
-            Box::new(client_raw),
+            AnyStream::new(client_raw),
             "5415d8e0-df92-3655-afa4-b79de66413f5",
             &tcp_dest(),
             VLESS_COMMAND_TCP,
@@ -572,7 +572,7 @@ mod tests {
         };
 
         let mut client = VlessStream::new(
-            Box::new(mock),
+            AnyStream::new(mock),
             "5415d8e0-df92-3655-afa4-b79de66413f5",
             &tcp_dest(),
             VLESS_COMMAND_TCP,
@@ -619,7 +619,7 @@ mod tests {
 
         let (client_raw, mut server_raw) = tokio::io::duplex(1024);
         let mut client = VlessStream::new(
-            Box::new(client_raw),
+            AnyStream::new(client_raw),
             "5415d8e0-df92-3655-afa4-b79de66413f5",
             &tcp_dest(),
             VLESS_COMMAND_TCP,
@@ -660,7 +660,7 @@ mod tests {
         };
 
         let mut client = VlessStream::new(
-            Box::new(mock),
+            AnyStream::new(mock),
             "5415d8e0-df92-3655-afa4-b79de66413f5",
             &tcp_dest(),
             VLESS_COMMAND_TCP,

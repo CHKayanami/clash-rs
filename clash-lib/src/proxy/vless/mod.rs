@@ -109,13 +109,13 @@ impl Handler {
             VlessStream::new(s, &self.opts.uuid, &sess.destination, command, flow)?;
 
         if flow == Some("xtls-rprx-vision") {
-            Ok(Box::new(VisionStream::new(
-                Box::new(vless_stream),
+            Ok(AnyStream::new(VisionStream::new(
+                AnyStream::new(vless_stream),
                 &self.opts.uuid,
                 vision_opts,
             )?))
         } else {
-            Ok(Box::new(vless_stream))
+            Ok(AnyStream::new(vless_stream))
         }
     }
 }
@@ -262,7 +262,7 @@ impl OutboundHandler for Handler {
             .await?;
 
         sess.push_chain(self.name());
-        Ok(Box::new(child_dgram))
+        Ok(AnyOutboundDatagram::new(child_dgram))
     }
 
     fn try_as_plain_handler(&self) -> Option<&dyn PlainProxyAPIResponse> {

@@ -301,7 +301,7 @@ impl OutboundHandler for Handler {
 
         let socket = inner.device_manager.new_tcp_socket(remote).await;
         sess.push_chain(self.name());
-        Ok(Box::new(socket))
+        Ok(AnyStream::new(socket))
     }
 
     /// connect to remote target via UDP
@@ -317,7 +317,7 @@ impl OutboundHandler for Handler {
 
         let socket = inner.device_manager.new_udp_socket().await;
         sess.push_chain(self.name());
-        Ok(Box::new(socket))
+        Ok(AnyOutboundDatagram::new(socket))
     }
 
     async fn support_connector(&self) -> ConnectorType {

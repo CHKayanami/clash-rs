@@ -103,7 +103,7 @@ impl Transport for Client {
             });
         }
 
-        Ok(Box::new(GrpcStream::new(
+        Ok(AnyStream::new(GrpcStream::new(
             init_ready,
             recv_stream,
             send_stream,
@@ -344,7 +344,10 @@ mod tests {
         });
 
         let client = Client::new("example.com".into(), "/service".parse().unwrap());
-        let mut stream = client.proxy_stream(Box::new(client_io)).await.unwrap();
+        let mut stream = client
+            .proxy_stream(AnyStream::new(client_io))
+            .await
+            .unwrap();
         let mut received = [0; 130];
         tokio::time::timeout(
             std::time::Duration::from_secs(2),

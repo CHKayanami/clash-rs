@@ -12,7 +12,7 @@ use tokio::io::AsyncReadExt;
 use tracing::{debug, trace};
 
 use crate::common::io::SlideBuffer;
-use crate::proxy::ClientStream;
+use crate::proxy::AnyStream;
 use crate::session::{Session, SocksAddr};
 
 pub use stream::PrefixedStream;
@@ -283,12 +283,12 @@ impl Sniffer {
     }
 
     /// Sniff a TCP client stream.
-    /// Returns: `(Option<sniffed_domain>, Box<dyn ClientStream>, override_destination)`
+    /// Returns: `(Option<sniffed_domain>, AnyStream, override_destination)`
     pub async fn sniff_stream(
         &self,
         sess: &Session,
-        mut stream: Box<dyn ClientStream>,
-    ) -> (Option<String>, Box<dyn ClientStream>, bool) {
+        mut stream: AnyStream,
+    ) -> (Option<String>, AnyStream, bool) {
         if !self.config.enable {
             return (None, stream, false);
         }
@@ -383,8 +383,7 @@ impl Sniffer {
                         .as_ref()
                         .and_then(|c| c.override_destination)
                         .unwrap_or(self.config.override_destination);
-                    let wrapped =
-                        Box::new(PrefixedStream::new(buf, stream));
+                    let wrapped = AnyStream::new(PrefixedStream::new(buf, stream));
                     return (Some(domain), wrapped, override_dest);
                 }
             }
@@ -404,8 +403,7 @@ impl Sniffer {
                         .as_ref()
                         .and_then(|c| c.override_destination)
                         .unwrap_or(self.config.override_destination);
-                    let wrapped =
-                        Box::new(PrefixedStream::new(buf, stream));
+                    let wrapped = AnyStream::new(PrefixedStream::new(buf, stream));
                     return (Some(domain), wrapped, override_dest);
                 }
             }
@@ -416,7 +414,7 @@ impl Sniffer {
             self.tcp_neg_cache.note_failure(addr, now);
         }
 
-        let wrapped = Box::new(PrefixedStream::new(buf, stream));
+        let wrapped = AnyStream::new(PrefixedStream::new(buf, stream));
         (None, wrapped, false)
     }
 

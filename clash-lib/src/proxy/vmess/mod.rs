@@ -232,7 +232,7 @@ impl OutboundHandler for Handler {
         let d = OutboundDatagramVmess::new(stream, sess.destination.clone());
 
         sess.push_chain(self.name());
-        Ok(Box::new(d))
+        Ok(AnyOutboundDatagram::new(d))
     }
 
     fn try_as_plain_handler(&self) -> Option<&dyn PlainProxyAPIResponse> {

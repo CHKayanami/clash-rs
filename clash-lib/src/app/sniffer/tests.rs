@@ -1,3 +1,4 @@
+use crate::proxy::AnyStream;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use super::*;
@@ -122,7 +123,7 @@ async fn test_sniffer_stream_tls() {
     };
 
     let (domain, mut stream, override_dest) =
-        sniffer.sniff_stream(&sess, Box::new(client)).await;
+        sniffer.sniff_stream(&sess, AnyStream::new(client)).await;
     assert_eq!(domain, Some("crates.io".to_string()));
     assert!(!override_dest);
 
@@ -161,7 +162,7 @@ async fn test_sniffer_stream_http_with_override() {
     };
 
     let (domain, _stream, override_dest) =
-        sniffer.sniff_stream(&sess, Box::new(client)).await;
+        sniffer.sniff_stream(&sess, AnyStream::new(client)).await;
     assert_eq!(domain, Some("mydomain.test".to_string()));
     assert!(override_dest);
 }
@@ -191,7 +192,8 @@ async fn test_sniffer_skip_domain() {
         ..Default::default()
     };
 
-    let (domain, _stream, _) = sniffer.sniff_stream(&sess, Box::new(client)).await;
+    let (domain, _stream, _) =
+        sniffer.sniff_stream(&sess, AnyStream::new(client)).await;
     assert_eq!(domain, None);
 }
 
@@ -251,7 +253,8 @@ async fn test_sniffer_parse_pure_ip_disabled() {
         ..Default::default()
     };
 
-    let (domain, _stream, _) = sniffer.sniff_stream(&sess, Box::new(client)).await;
+    let (domain, _stream, _) =
+        sniffer.sniff_stream(&sess, AnyStream::new(client)).await;
     assert_eq!(domain, None);
 }
 
@@ -285,7 +288,7 @@ async fn test_sniffer_stream_tls_fragmented() {
     };
 
     let (domain, mut stream, _) =
-        sniffer.sniff_stream(&sess, Box::new(client)).await;
+        sniffer.sniff_stream(&sess, AnyStream::new(client)).await;
     assert_eq!(domain, Some("fragmented.rust-lang.org".to_string()));
 
     let mut all_bytes = Vec::new();
@@ -324,7 +327,7 @@ async fn test_sniffer_stream_tls_multi_record() {
     };
 
     let (domain, mut stream, _) =
-        sniffer.sniff_stream(&sess, Box::new(client)).await;
+        sniffer.sniff_stream(&sess, AnyStream::new(client)).await;
     assert_eq!(domain, Some("multi-record.rust-lang.org".to_string()));
 
     let mut all_bytes = Vec::new();
@@ -366,7 +369,7 @@ async fn test_sniffer_stream_tls_handshake_header_split() {
         };
 
         let (domain, mut stream, _) =
-            sniffer.sniff_stream(&sess, Box::new(client)).await;
+            sniffer.sniff_stream(&sess, AnyStream::new(client)).await;
         assert_eq!(domain, Some(domain_name));
 
         let mut all_bytes = Vec::new();
@@ -403,7 +406,7 @@ async fn test_sniffer_stream_http_fragmented() {
     };
 
     let (domain, mut stream, _) =
-        sniffer.sniff_stream(&sess, Box::new(client)).await;
+        sniffer.sniff_stream(&sess, AnyStream::new(client)).await;
     assert_eq!(domain, Some("fragmented-http.org".to_string()));
 
     let mut all_bytes = Vec::new();
@@ -434,7 +437,8 @@ async fn test_sniffer_tcp_negative_cache() {
         tokio::spawn(async move {
             server.write_all(b"SSH-2.0-OpenSSH_8.9\r\n").await.unwrap();
         });
-        let (domain, _, _) = sniffer.sniff_stream(&sess, Box::new(client)).await;
+        let (domain, _, _) =
+            sniffer.sniff_stream(&sess, AnyStream::new(client)).await;
         assert_eq!(domain, None);
     }
 
@@ -461,7 +465,7 @@ async fn test_sniffer_tcp_negative_cache() {
     config_with_force.force_domains = vec!["recovered.org".to_string()];
     let sniffer_force = Sniffer::new(config_with_force);
     let (domain, _, _) = sniffer_force
-        .sniff_stream(&force_sess, Box::new(client))
+        .sniff_stream(&force_sess, AnyStream::new(client))
         .await;
     assert_eq!(domain, Some("recovered.org".to_string()));
 }

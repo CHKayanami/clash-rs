@@ -189,6 +189,7 @@ impl SessionPool {
 
 #[cfg(test)]
 mod tests {
+    use crate::proxy::AnyStream;
     use super::*;
     use crate::proxy::anytls::padding::PaddingFactory;
     use crate::session::SocksAddr;
@@ -246,7 +247,7 @@ mod tests {
         let (c1, s1) = duplex(4096);
         spawn_mock_server(s1);
         let sess1 =
-            AnyTlsClientSession::new(Box::new(c1), "secret", padding.clone())
+            AnyTlsClientSession::new(AnyStream::new(c1), "secret", padding.clone())
                 .await
                 .unwrap();
         pool.add_session(Arc::clone(&sess1)).await;
@@ -262,7 +263,7 @@ mod tests {
 
         let (c2, s2) = duplex(4096);
         spawn_mock_server(s2);
-        let sess2 = AnyTlsClientSession::new(Box::new(c2), "secret", padding)
+        let sess2 = AnyTlsClientSession::new(AnyStream::new(c2), "secret", padding)
             .await
             .unwrap();
         pool.add_session(Arc::clone(&sess2)).await;
@@ -284,7 +285,7 @@ mod tests {
         let padding = PaddingFactory::default_factory();
 
         let (c1, _s1) = duplex(4096);
-        let sess1 = AnyTlsClientSession::new(Box::new(c1), "secret", padding)
+        let sess1 = AnyTlsClientSession::new(AnyStream::new(c1), "secret", padding)
             .await
             .unwrap();
         pool.add_session(Arc::clone(&sess1)).await;

@@ -85,7 +85,7 @@ impl OutboundHandler for Handler {
             .await
             .map_err(|x| new_io_error(x.to_string()))?;
         sess.push_chain(self.name());
-        Ok(Box::new(StreamWrapper::new(s)))
+        Ok(AnyStream::new(StreamWrapper::new(s)))
     }
 
     async fn connect_datagram(

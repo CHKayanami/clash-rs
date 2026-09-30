@@ -105,7 +105,7 @@ impl Handler {
             (sess.destination.host(), sess.destination.port()),
         );
 
-        Ok(Box::new(ShadowSocksStream(stream)))
+        Ok(AnyStream::new(ShadowSocksStream(stream)))
     }
 
     fn server_config(&self) -> Result<&ServerConfig, io::Error> {
@@ -161,7 +161,7 @@ impl Handler {
             );
         let d = OutboundDatagramShadowsocks::new(socket, server_addr);
         sess.push_chain(self.name());
-        Ok(Box::new(d))
+        Ok(AnyOutboundDatagram::new(d))
     }
 }
 
@@ -319,7 +319,7 @@ impl OutboundHandler for Handler {
                 sess.destination.clone(),
             );
             sess.push_chain(self.name());
-            return Ok(Box::new(datagram));
+            return Ok(AnyOutboundDatagram::new(datagram));
         }
 
         let cfg = self.server_config()?;
@@ -364,7 +364,7 @@ impl OutboundHandler for Handler {
         );
         let d = OutboundDatagramShadowsocks::new(socket, server_addr);
         sess.push_chain(self.name());
-        Ok(Box::new(d))
+        Ok(AnyOutboundDatagram::new(d))
     }
 
     fn try_as_plain_handler(&self) -> Option<&dyn PlainProxyAPIResponse> {

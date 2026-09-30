@@ -1,3 +1,4 @@
+use crate::proxy::AnyStream;
 use std::{net::SocketAddr, sync::Arc};
 
 use tracing::debug;
@@ -12,7 +13,7 @@ use crate::{
     session::{Network, Session, Type},
 };
 
-pub(crate) async fn handle_inbound_stream<S: ProxyStream + 'static>(
+pub(crate) async fn handle_inbound_stream<S: ProxyStream + Sync + 'static>(
     stream: S,
     source: SocketAddr,
     destination: SocketAddr,
@@ -53,7 +54,9 @@ pub(crate) async fn handle_inbound_stream<S: ProxyStream + 'static>(
     };
 
     debug!("new tun TCP session assigned: {}", sess);
-    dispatcher.dispatch_stream(sess, Box::new(stream)).await;
+    dispatcher
+        .dispatch_stream(sess, AnyStream::new(stream))
+        .await;
 }
 
 pub(crate) async fn handle_inbound_netstack_stream(

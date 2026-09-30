@@ -177,7 +177,7 @@ impl Client {
         let verified_stream =
             VerifiedStream::new(stream, hmac_client, hmac_server, Some(hmac_nop));
 
-        Ok(Box::new(verified_stream))
+        Ok(AnyStream::new(verified_stream))
     }
 }
 

@@ -101,7 +101,7 @@ impl RemoteConnector for DirectConnector {
         .await
         .map(|x| OutboundDatagramImpl::new(x, resolver))?;
 
-        Ok(Box::new(dgram))
+        Ok(AnyOutboundDatagram::Udp(Box::new(dgram)))
     }
 }
 

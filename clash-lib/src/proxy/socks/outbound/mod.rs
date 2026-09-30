@@ -240,7 +240,7 @@ impl OutboundHandler for Handler {
         let d = self.inner_connect_datagram(s, sess, resolver).await?;
 
         sess.push_chain(self.name());
-        Ok(Box::new(d))
+        Ok(AnyOutboundDatagram::new(d))
     }
 
     fn try_as_plain_handler(&self) -> Option<&dyn PlainProxyAPIResponse> {

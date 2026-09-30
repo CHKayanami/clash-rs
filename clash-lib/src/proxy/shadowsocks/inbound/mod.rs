@@ -1,3 +1,4 @@
+use crate::proxy::AnyStream;
 mod datagram;
 
 use crate::{
@@ -227,7 +228,7 @@ impl InboundHandlerTrait for ShadowsocksInbound {
                             ..Default::default()
                         };
 
-                        dispatcher.dispatch_stream(sess, Box::new(socket)).await;
+                        dispatcher.dispatch_stream(sess, AnyStream::new(socket)).await;
                     });
                 }
 

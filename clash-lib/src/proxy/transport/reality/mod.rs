@@ -101,7 +101,7 @@ impl Transport for Client {
         }
 
         let tls = reality_connect(stream, &self.config, self.chrome).await?;
-        Ok(Box::new(tls) as AnyStream)
+        Ok(AnyStream::new(tls))
     }
 
     async fn proxy_stream_spliced(
@@ -127,6 +127,6 @@ impl Transport for Client {
             read_flag,
             write_flag,
         };
-        Ok((Box::new(splicable) as AnyStream, Some(opts)))
+        Ok((AnyStream::new(splicable), Some(opts)))
     }
 }

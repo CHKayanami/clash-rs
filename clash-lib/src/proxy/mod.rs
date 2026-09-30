@@ -103,7 +103,8 @@ pub trait ProxyStream: AsyncRead + AsyncWrite + Send + Unpin {
         None
     }
 }
-pub type AnyStream = Box<dyn ProxyStream + Sync>;
+mod io_types;
+pub use io_types::{AnyOutboundDatagram, AnyStream};
 
 impl ProxyStream for tokio::net::TcpStream {
     #[cfg(all(target_os = "linux", feature = "zero_copy"))]
@@ -148,9 +149,6 @@ impl<S: AsyncRead + AsyncWrite + Send + Sync + Unpin> ProxyStream
 {
 }
 
-pub trait ClientStream: ProxyStream {}
-impl<T: ProxyStream> ClientStream for T {}
-
 pub trait InboundDatagram<Item>:
     Stream<Item = Item> + Sink<Item, Error = io::Error> + Send + Sync + Unpin + Debug
 {
@@ -171,9 +169,6 @@ impl<T, U> OutboundDatagram<U> for T where
     T: Stream<Item = U> + Sink<U, Error = io::Error> + Send + Sync + Unpin + 'static
 {
 }
-
-pub type AnyOutboundDatagram =
-    Box<dyn OutboundDatagram<UdpPacket, Item = UdpPacket, Error = io::Error>>;
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutboundType {

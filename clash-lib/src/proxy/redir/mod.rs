@@ -1,3 +1,4 @@
+use crate::proxy::AnyStream;
 use super::inbound::InboundHandlerTrait;
 use crate::{
     app::dispatcher::Dispatcher,
@@ -117,7 +118,9 @@ impl InboundHandlerTrait for RedirInbound {
 
             let dispatcher = self.dispatcher.clone();
             tokio::spawn(async move {
-                dispatcher.dispatch_stream(sess, Box::new(socket)).await;
+                dispatcher
+                    .dispatch_stream(sess, AnyStream::Tcp(socket))
+                    .await;
             });
         }
     }

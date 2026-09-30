@@ -262,7 +262,7 @@ mod tests {
         let expected = frame(&addr, b"hello world");
         let (client, mut server) = duplex(3);
         let mut datagram =
-            OutboundDatagramTrojan::new(Box::new(client), addr.clone());
+            OutboundDatagramTrojan::new(AnyStream::new(client), addr.clone());
         Pin::new(&mut datagram)
             .start_send(packet(addr, b"hello world"))
             .unwrap();
@@ -285,7 +285,8 @@ mod tests {
         let first = frame(&addr, b"hello");
         let second = frame(&addr, b"next");
         let (mut server, client) = duplex(128);
-        let mut datagram = OutboundDatagramTrojan::new(Box::new(client), remote);
+        let mut datagram =
+            OutboundDatagramTrojan::new(AnyStream::new(client), remote);
 
         server.write_all(&first[..3]).await.unwrap();
         assert!(matches!(poll!(datagram.next()), Poll::Pending));

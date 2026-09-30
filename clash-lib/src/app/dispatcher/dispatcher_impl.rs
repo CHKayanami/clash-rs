@@ -8,7 +8,10 @@ use crate::{
         def::RunMode,
         internal::proxy::{PROXY_DIRECT, PROXY_GLOBAL},
     },
-    proxy::{AnyInboundDatagram, ClientStream, OutboundType, datagram::UdpPacket},
+    proxy::{
+        AnyInboundDatagram, AnyOutboundDatagram, AnyStream, OutboundDatagram, OutboundType,
+        datagram::UdpPacket,
+    },
     session::{Session, SocksAddr},
 };
 use futures::{SinkExt, StreamExt};
@@ -242,11 +245,7 @@ impl Dispatcher {
     }
 
     #[instrument(skip(self, sess, lhs), fields(trace_id = sess.id))]
-    pub async fn dispatch_stream(
-        &self,
-        mut sess: Session,
-        mut lhs: Box<dyn ClientStream>,
-    ) {
+    pub async fn dispatch_stream(&self, mut sess: Session, mut lhs: AnyStream) {
         let orig_dest = sess.destination.clone();
         sess.orig_destination = Some(orig_dest.clone());
 
@@ -1092,12 +1091,53 @@ async fn establish_outbound_session(
     debug!("{} outbound datagram connected", sess);
 
     let tracker_info = Arc::new(TrackerInfo::new(&sess, rule));
+    let established = match outbound_datagram {
+        AnyOutboundDatagram::Direct(datagram) => spawn_udp_relay(
+            datagram,
+            sess,
+            orig_inbound_dst,
+            ctx,
+            established_tx,
+            tracker_info,
+            (is_fake_ip, is_direct),
+        ),
+        AnyOutboundDatagram::Udp(datagram) => spawn_udp_relay(
+            datagram,
+            sess,
+            orig_inbound_dst,
+            ctx,
+            established_tx,
+            tracker_info,
+            (is_fake_ip, is_direct),
+        ),
+        AnyOutboundDatagram::Dynamic(datagram) => spawn_udp_relay(
+            datagram,
+            sess,
+            orig_inbound_dst,
+            ctx,
+            established_tx,
+            tracker_info,
+            (is_fake_ip, is_direct),
+        ),
+    };
+    Some(established)
+}
+
+/// Monomorphize the packet loop after selecting the transport once per session.
+fn spawn_udp_relay<D: OutboundDatagram<UdpPacket>>(
+    outbound_datagram: D,
+    sess: Session,
+    orig_inbound_dst: SocksAddr,
+    ctx: &UdpDispatchContext,
+    established_tx: tokio::sync::mpsc::Sender<EstablishOutcome>,
+    tracker_info: Arc<TrackerInfo>,
+    (is_fake_ip, is_direct): (bool, bool),
+) -> EstablishedSession {
     let (close_tx, close_rx) = tokio::sync::oneshot::channel();
     ctx.manager.track(sess.id, tracker_info.clone(), close_tx);
     let track_guard = TrackGuard::new(sess.id, ctx.manager.clone());
 
-    let (mut remote_w, mut remote_r) = outbound_datagram.split();
-    let (remote_sender, mut remote_forwarder) =
+    let (remote_sender, remote_forwarder) =
         tokio::sync::mpsc::channel::<UdpPacket>(UDP_CHANNEL_CAPACITY);
 
     let relay_dest = sess.destination.clone();
@@ -1118,70 +1158,55 @@ async fn establish_outbound_session(
             return;
         }
 
-        // local -> remote
-        let tracker_out = tracker.clone();
-        let outgoing = async move {
-            while let Some(mut packet) = remote_forwarder.recv().await {
-                let len = packet.data.len();
-                // Most packets already carry the routed destination. Only
-                // replace it when routing changed the original address.
-                if packet.dst_addr != relay_dest {
-                    packet.dst_addr = relay_dest.clone();
+        let mut forward_reply = |mut packet: UdpPacket| {
+            tracker.push_download(packet.data.len());
+
+            // Only allow preserving unmapped peer source addresses (for Full-Cone NAT P2P hole punching)
+            // when using Direct outbound and the destination is not Fake-IP.
+            // In all other cases (e.g. Fake-IP sessions, or proxy outbounds like Shadowsocks returning
+            // physical server IPs), the packet's source address must always be restored to orig_inbound_dst.
+            let should_rewrite_source = is_fake_ip
+                || !is_direct
+                || packet.src_addr == orig_inbound_dst_for_relay
+                || packet.src_addr == relay_sess.destination;
+            if should_rewrite_source {
+                packet.src_addr = orig_inbound_dst_for_relay.clone();
+            }
+
+            packet.dst_addr = relay_sess.source.into();
+            debug!("UDP NAT for packet: {:?}, session: {}", packet, relay_sess);
+            let msg = DownstreamPacket {
+                packet,
+                session_key: relay_session_key_for_incoming.clone(),
+            };
+            match remote_receiver_w_clone.try_send(msg) {
+                Ok(_) => {}
+                Err(TrySendError::Full(_)) => {
+                    debug!(
+                        "[UDP NAT] Backpressure: remote_receiver channel is full for sess: {}",
+                        relay_sess
+                    );
                 }
-                if let Err(err) = remote_w.send(packet).await {
-                    warn!("failed to send packet to remote: {err:?}");
-                } else {
-                    tracker_out.push_upload(len);
+                Err(TrySendError::Closed(_)) => {
+                    debug!(
+                        "[UDP NAT] reply channel closed, ending session: {}",
+                        relay_sess
+                    );
+                    return false;
                 }
             }
+            true
         };
 
-        // remote -> local
-        let tracker_in = tracker;
-        let incoming = async move {
-            while let Some(mut packet) = remote_r.next().await {
-                tracker_in.push_download(packet.data.len());
-
-                // Only allow preserving unmapped peer source addresses (for Full-Cone NAT P2P hole punching)
-                // when using Direct outbound and the destination is not Fake-IP.
-                // In all other cases (e.g. Fake-IP sessions, or proxy outbounds like Shadowsocks returning
-                // physical server IPs), the packet's source address must always be restored to orig_inbound_dst.
-                let should_rewrite_source = is_fake_ip
-                    || !is_direct
-                    || packet.src_addr == orig_inbound_dst_for_relay
-                    || packet.src_addr == relay_sess.destination;
-                if should_rewrite_source {
-                    packet.src_addr = orig_inbound_dst_for_relay.clone();
-                }
-
-                packet.dst_addr = relay_sess.source.into();
-                debug!("UDP NAT for packet: {:?}, session: {}", packet, relay_sess);
-                let msg = DownstreamPacket {
-                    packet,
-                    session_key: relay_session_key_for_incoming.clone(),
-                };
-                match remote_receiver_w_clone.try_send(msg) {
-                    Ok(_) => {}
-                    Err(TrySendError::Full(_)) => {
-                        debug!(
-                            "[UDP NAT] Backpressure: remote_receiver channel is full for sess: {}",
-                            relay_sess
-                        );
-                    }
-                    Err(TrySendError::Closed(_)) => {
-                        debug!(
-                            "[UDP NAT] reply channel closed, ending session: {}",
-                            relay_sess
-                        );
-                        break;
-                    }
-                }
-            }
-        };
-
+        let relay = relay_datagram(
+            outbound_datagram,
+            remote_forwarder,
+            &relay_dest,
+            |len| tracker.push_upload(len),
+            &mut forward_reply,
+        );
         tokio::select! {
-            _ = outgoing => {}
-            _ = incoming => {}
+            _ = relay => {}
             _ = close_rx => {}
         }
 
@@ -1193,14 +1218,137 @@ async fn establish_outbound_session(
             .await;
     });
 
-    Some(EstablishedSession {
+    EstablishedSession {
         session_key: (sess.source, orig_inbound_dst),
         sess_id: sess.id,
         dest: sess.destination,
         sender: remote_sender,
         relay_handle,
         relay_start,
-    })
+    }
+}
+
+/// Drive both directions without splitting the transport. Retain each send
+/// across Pending, including DNS/socket backpressure, while continuing reads.
+async fn relay_datagram<D, W, R>(
+    mut datagram: D,
+    mut outgoing: tokio::sync::mpsc::Receiver<UdpPacket>,
+    destination: &SocksAddr,
+    mut on_sent: W,
+    mut on_received: R,
+) where
+    D: OutboundDatagram<UdpPacket>,
+    W: FnMut(usize),
+    R: FnMut(UdpPacket) -> bool,
+{
+    use std::{pin::Pin, task::Poll};
+
+    enum Event {
+        Sent(std::io::Result<usize>),
+        Received(UdpPacket),
+        Closed,
+    }
+
+    fn poll_send<D: OutboundDatagram<UdpPacket>>(
+        datagram: &mut D,
+        outgoing: &mut tokio::sync::mpsc::Receiver<UdpPacket>,
+        destination: &SocksAddr,
+        queued: &mut Option<UdpPacket>,
+        flushing: &mut Option<usize>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<Event> {
+        if flushing.is_none() && queued.is_none() {
+            match outgoing.poll_recv(cx) {
+                Poll::Ready(Some(mut packet)) => {
+                    if packet.dst_addr != *destination {
+                        packet.dst_addr = destination.clone();
+                    }
+                    *queued = Some(packet);
+                }
+                Poll::Ready(None) => return Poll::Ready(Event::Closed),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+        if let Some(packet) = queued.as_ref() {
+            match Pin::new(&mut *datagram).poll_ready(cx) {
+                Poll::Ready(Ok(())) => {}
+                Poll::Ready(Err(err)) => {
+                    *queued = None;
+                    return Poll::Ready(Event::Sent(Err(err)));
+                }
+                Poll::Pending => return Poll::Pending,
+            }
+            let len = packet.data.len();
+            let packet = queued.take().unwrap();
+            if let Err(err) = Pin::new(&mut *datagram).start_send(packet) {
+                return Poll::Ready(Event::Sent(Err(err)));
+            }
+            *flushing = Some(len);
+        }
+        match Pin::new(datagram).poll_flush(cx) {
+            Poll::Ready(result) => {
+                let len = flushing.take().unwrap();
+                Poll::Ready(Event::Sent(result.map(|()| len)))
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    let mut queued = None::<UdpPacket>;
+    let mut flushing = None::<usize>;
+    let mut read_first = true;
+    loop {
+        let event = futures::future::poll_fn(|cx| {
+            // Alternate priority so either continuously ready direction cannot
+            // starve the other. A Pending send never prevents polling reads.
+            if !read_first {
+                if let Poll::Ready(event) = poll_send(
+                    &mut datagram,
+                    &mut outgoing,
+                    destination,
+                    &mut queued,
+                    &mut flushing,
+                    cx,
+                ) {
+                    return Poll::Ready(event);
+                }
+            }
+            match Pin::new(&mut datagram).poll_next(cx) {
+                Poll::Ready(Some(packet)) => {
+                    return Poll::Ready(Event::Received(packet));
+                }
+                Poll::Ready(None) => return Poll::Ready(Event::Closed),
+                Poll::Pending => {}
+            }
+            if read_first {
+                poll_send(
+                    &mut datagram,
+                    &mut outgoing,
+                    destination,
+                    &mut queued,
+                    &mut flushing,
+                    cx,
+                )
+            } else {
+                Poll::Pending
+            }
+        })
+        .await;
+        match event {
+            Event::Sent(Ok(len)) => on_sent(len),
+            Event::Sent(Err(err)) => {
+                warn!("failed to send packet to remote: {err:?}")
+            }
+            Event::Received(packet) => {
+                if !on_received(packet) {
+                    break;
+                }
+            }
+            Event::Closed => break,
+        }
+        read_first = !read_first;
+        tokio::task::consume_budget().await;
+    }
 }
 
 fn decode_mode(raw: u8) -> RunMode {
@@ -1299,7 +1447,168 @@ fn reverse_lookup(
 
 #[cfg(test)]
 mod tests {
+    use futures::{Sink, Stream};
+    use std::{io, task::{Context, Poll}};
     use super::*;
+
+    /// Flush remains pending until the test releases a token, independently of reads.
+    struct BackpressuredDatagram {
+        replies: tokio::sync::mpsc::Receiver<UdpPacket>,
+        permits: tokio::sync::mpsc::Receiver<()>,
+        sent: tokio::sync::mpsc::Sender<UdpPacket>,
+        staged: Option<UdpPacket>,
+        started: tokio::sync::mpsc::Sender<()>,
+        fail_first: bool,
+    }
+
+    impl Stream for BackpressuredDatagram {
+        type Item = UdpPacket;
+        fn poll_next(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<Option<UdpPacket>> {
+            self.replies.poll_recv(cx)
+        }
+    }
+
+    impl Sink<UdpPacket> for BackpressuredDatagram {
+        type Error = io::Error;
+        fn poll_ready(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            assert!(
+                self.staged.is_none(),
+                "send restarted before flush completed"
+            );
+            Poll::Ready(Ok(()))
+        }
+        fn start_send(
+            mut self: Pin<&mut Self>,
+            packet: UdpPacket,
+        ) -> Result<(), Self::Error> {
+            assert!(self.staged.replace(packet).is_none());
+            self.started.try_send(()).unwrap();
+            Ok(())
+        }
+        fn poll_flush(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            if self.staged.is_none() {
+                return Poll::Ready(Ok(()));
+            }
+            futures::ready!(self.permits.poll_recv(cx))
+                .expect("permit channel closed");
+            let packet = self.staged.take().unwrap();
+            if self.fail_first {
+                self.fail_first = false;
+                return Poll::Ready(Err(io::Error::other(
+                    "test send failure",
+                )));
+            }
+            self.sent.try_send(packet).unwrap();
+            Poll::Ready(Ok(()))
+        }
+        fn poll_close(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            self.poll_flush(cx)
+        }
+    }
+
+    #[tokio::test]
+    async fn unsplit_relay_reads_during_backpressure_and_retains_sends() {
+        check_unsplit_backpressure(false).await;
+    }
+
+    #[tokio::test]
+    async fn unsplit_relay_continues_after_send_error() {
+        check_unsplit_backpressure(true).await;
+    }
+
+    async fn check_unsplit_backpressure(fail_first: bool) {
+        let (outgoing_tx, outgoing_rx) = tokio::sync::mpsc::channel(4);
+        let (reply_tx, reply_rx) = tokio::sync::mpsc::channel(4);
+        let (permit_tx, permit_rx) = tokio::sync::mpsc::channel(4);
+        let (sent_tx, mut sent_rx) = tokio::sync::mpsc::channel(4);
+        let (received_tx, mut received_rx) = tokio::sync::mpsc::channel(4);
+        let (count_tx, mut count_rx) = tokio::sync::mpsc::channel(4);
+        let (started_tx, mut started_rx) = tokio::sync::mpsc::channel(4);
+        let destination: SocksAddr =
+            "127.0.0.1:12345".parse::<SocketAddr>().unwrap().into();
+        let expected_destination = destination.clone();
+        for data in [b"first".as_slice(), b"second".as_slice()] {
+            outgoing_tx
+                .send(UdpPacket {
+                    data: bytes::Bytes::copy_from_slice(data),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+        }
+        drop(outgoing_tx);
+        let relay = tokio::spawn(async move {
+            relay_datagram(
+                AnyOutboundDatagram::new(BackpressuredDatagram {
+                    replies: reply_rx,
+                    permits: permit_rx,
+                    sent: sent_tx,
+                    staged: None,
+                    started: started_tx,
+                    fail_first,
+                }),
+                outgoing_rx,
+                &destination,
+                |len| count_tx.try_send(len).unwrap(),
+                |packet| {
+                    received_tx.try_send(packet).unwrap();
+                    true
+                },
+            )
+            .await;
+        });
+        tokio::time::timeout(Duration::from_secs(2), started_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        // No flush tokens: replies must still progress, and upload accounting
+        // must wait for actual completion rather than start_send.
+        reply_tx
+            .send(UdpPacket {
+                data: bytes::Bytes::from_static(b"reply"),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let reply = tokio::time::timeout(Duration::from_secs(2), received_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(reply.data.as_ref(), b"reply");
+        assert!(count_rx.try_recv().is_err());
+        assert!(!relay.is_finished());
+        permit_tx.send(()).await.unwrap();
+        permit_tx.send(()).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), relay)
+            .await
+            .unwrap()
+            .unwrap();
+        let first = sent_rx.recv().await.unwrap();
+        assert_eq!(first.dst_addr, expected_destination);
+        if fail_first {
+            assert_eq!(first.data.as_ref(), b"second");
+            assert_eq!(count_rx.recv().await, Some(6));
+        } else {
+            assert_eq!(first.data.as_ref(), b"first");
+            assert_eq!(sent_rx.recv().await.unwrap().data.as_ref(), b"second");
+            assert_eq!(count_rx.recv().await, Some(5));
+            assert_eq!(count_rx.recv().await, Some(6));
+        }
+        assert!(sent_rx.recv().await.is_none());
+        assert!(count_rx.recv().await.is_none());
+    }
     use crate::app::dispatcher::StatisticsManager;
     use crate::app::dns::MockClashResolver;
     use crate::app::outbound::manager::OutboundManager;

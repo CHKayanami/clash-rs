@@ -752,7 +752,7 @@ mod unit_tests {
         working.expect_name().return_const("slower-but-working".to_owned());
         working.expect_connect_stream().returning(|_, _| {
             let (stream, _peer) = tokio::io::duplex(64);
-            Ok(Box::new(stream))
+            Ok(AnyStream::new(stream))
         });
 
         let proxies: Arc<Vec<AnyOutboundHandler>> = Arc::new(vec![

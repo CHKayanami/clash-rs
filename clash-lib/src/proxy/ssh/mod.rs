@@ -210,7 +210,7 @@ impl OutboundHandler for Handler {
             )
             .await
             .map_err(io::Error::other)?;
-        let s = Box::new(ChannelStreamWrapper {
+        let s = AnyStream::new(ChannelStreamWrapper {
             inner: channel.into_stream(),
         });
         sess.push_chain(self.name());

@@ -171,7 +171,7 @@ impl Transport for Client {
 
                         Ok(x)
                     })?;
-                Ok(Box::new(c) as _)
+                Ok(AnyStream::new(c))
             }
             ConnectorBackend::Boring(connector) => {
                 let s = connector.connect(&self.sni, stream).await.and_then(|x| {
@@ -187,7 +187,7 @@ impl Transport for Client {
 
                     Ok(x)
                 })?;
-                Ok(Box::new(s) as _)
+                Ok(AnyStream::new(s))
             }
         }
     }
@@ -246,7 +246,7 @@ mod tests {
 
         let client: Client = opts.try_into().unwrap();
         let tcp = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
-        let mut stream = client.proxy_stream(Box::new(tcp)).await.unwrap();
+        let mut stream = client.proxy_stream(AnyStream::Tcp(tcp)).await.unwrap();
 
         stream.write_all(b"ping from chrome").await.unwrap();
         stream.shutdown().await.unwrap();

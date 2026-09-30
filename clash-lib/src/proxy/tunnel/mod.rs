@@ -1,3 +1,4 @@
+use crate::proxy::AnyStream;
 use crate::{
     app::dispatcher::Dispatcher,
     common::errors::new_io_error,
@@ -105,7 +106,9 @@ impl InboundHandlerTrait for TunnelInbound {
             };
 
             tokio::spawn(async move {
-                dispatcher.dispatch_stream(sess, Box::new(socket)).await;
+                dispatcher
+                    .dispatch_stream(sess, AnyStream::Tcp(socket))
+                    .await;
             });
         }
     }

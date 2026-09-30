@@ -19,7 +19,7 @@ pub use clash_common::SlideBuffer;
 
 use crate::{
     app::dispatcher::TrafficTracker,
-    proxy::{AnyStream, ClientStream},
+    proxy::{AnyStream, ProxyStream},
 };
 
 #[derive(Debug)]
@@ -441,9 +441,71 @@ where
     }
 }
 
+/// Select the copy loop once, keeping plain TCP statically dispatched.
 pub async fn copy_bidirectional(
-    mut a: Box<dyn ClientStream>,
-    mut b: AnyStream,
+    a: AnyStream,
+    b: AnyStream,
+    size: usize,
+    upload_timeout: Duration,
+    download_timeout: Duration,
+    tracker: TrafficTracker,
+) -> Result<(u64, u64), CopyBidirectionalError> {
+    match a {
+        AnyStream::Tcp(stream) => {
+            copy_to_outbound(
+                stream,
+                b,
+                size,
+                upload_timeout,
+                download_timeout,
+                tracker,
+            )
+            .await
+        }
+        AnyStream::Dynamic(stream) => {
+            copy_to_outbound(
+                stream,
+                b,
+                size,
+                upload_timeout,
+                download_timeout,
+                tracker,
+            )
+            .await
+        }
+    }
+}
+
+async fn copy_to_outbound<A: ProxyStream>(
+    a: A,
+    b: AnyStream,
+    size: usize,
+    upload_timeout: Duration,
+    download_timeout: Duration,
+    tracker: TrafficTracker,
+) -> Result<(u64, u64), CopyBidirectionalError> {
+    match b {
+        AnyStream::Tcp(stream) => {
+            copy_stream(a, stream, size, upload_timeout, download_timeout, tracker)
+                .await
+        }
+        AnyStream::Dynamic(stream) => {
+            copy_stream(
+                a,
+                stream,
+                size,
+                upload_timeout,
+                download_timeout,
+                tracker,
+            )
+            .await
+        }
+    }
+}
+
+async fn copy_stream<A: ProxyStream, B: ProxyStream>(
+    mut a: A,
+    mut b: B,
     size: usize,
     a_to_b_timeout_duration: Duration,
     b_to_a_timeout_duration: Duration,

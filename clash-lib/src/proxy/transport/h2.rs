@@ -82,7 +82,7 @@ impl Transport for Client {
 
         let recv_stream = resp.await.map_err(map_io_error)?.into_body();
 
-        Ok(Box::new(Http2Stream::new(recv_stream, send_stream)))
+        Ok(AnyStream::new(Http2Stream::new(recv_stream, send_stream)))
     }
 }
 

@@ -102,7 +102,7 @@ impl WebsocketEarlyDataConn {
                 ));
             }
             let rv = Box::new(WebsocketConn::from_websocket(stream));
-            Ok(rv)
+            Ok(AnyStream::from_boxed(rv))
         }
 
         Box::pin(run(stream, req, config))

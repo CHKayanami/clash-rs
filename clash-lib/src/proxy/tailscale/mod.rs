@@ -277,7 +277,7 @@ impl OutboundHandler for Handler {
             })?;
 
         sess.push_chain(self.name());
-        Ok(Box::new(s))
+        Ok(AnyStream::new(s))
     }
 
     async fn connect_datagram(
@@ -333,7 +333,7 @@ impl OutboundHandler for Handler {
 
         let d = TailscaleDatagramOutbound::new(udp, resolver, port_reservation);
         sess.push_chain(self.name());
-        Ok(Box::new(d))
+        Ok(AnyOutboundDatagram::new(d))
     }
 
     async fn support_connector(&self) -> ConnectorType {

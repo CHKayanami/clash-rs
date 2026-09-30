@@ -592,7 +592,8 @@ mod tests {
         let target1: SocksAddr = "1.1.1.1:53".parse().unwrap();
         let target2: SocksAddr = "8.8.8.8:53".parse().unwrap();
 
-        let client_holder = Arc::new(tokio::sync::Mutex::new(Some(Box::new(client_stream) as AnyStream)));
+        let client_holder =
+            Arc::new(tokio::sync::Mutex::new(Some(AnyStream::new(client_stream))));
         let client_holder_clone = client_holder.clone();
 
         // 1. Open child 1
@@ -698,7 +699,8 @@ mod tests {
         let pool = XudpPool::new(1, 1);
 
         let target: SocksAddr = "1.1.1.1:53".parse().unwrap();
-        let client_holder = Arc::new(tokio::sync::Mutex::new(Some(Box::new(client_stream) as AnyStream)));
+        let client_holder =
+            Arc::new(tokio::sync::Mutex::new(Some(AnyStream::new(client_stream))));
 
         // 1. Open child 1 (takes the only slot on the only carrier)
         let _dgram1 = pool
@@ -749,7 +751,7 @@ mod tests {
                         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                         let (client, server) = duplex(64 * 1024);
                         servers.lock().await.push(server);
-                        Ok(Box::new(client) as AnyStream)
+                        Ok(AnyStream::new(client))
                     }
                 })
                 .await
@@ -780,7 +782,7 @@ mod tests {
     async fn test_xudp_carrier_stream_limit_race() {
         let (client, _server) = duplex(64 * 1024);
         // max 2 streams
-        let carrier = XudpCarrier::new(Box::new(client), 1, 2);
+        let carrier = XudpCarrier::new(AnyStream::new(client), 1, 2);
         let target: SocksAddr = "1.1.1.1:53".parse().unwrap();
 
         let mut handles = Vec::new();
@@ -829,7 +831,7 @@ mod tests {
                         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                         let (client, server) = duplex(64 * 1024);
                         servers_clone.lock().unwrap().push(server);
-                        Ok(Box::new(client) as AnyStream)
+                        Ok(AnyStream::new(client))
                     }
                 })
                 .await
@@ -857,7 +859,7 @@ mod tests {
     #[tokio::test]
     async fn test_xudp_poll_close_and_drop_send_end_frame_under_pressure() {
         let (client_stream, mut server_stream) = duplex(64 * 1024);
-        let carrier = XudpCarrier::new(Box::new(client_stream), 1, 10);
+        let carrier = XudpCarrier::new(AnyStream::new(client_stream), 1, 10);
         let target: SocksAddr = "1.1.1.1:53".parse().unwrap();
 
         // 1. Test poll_close sends End frame
@@ -914,7 +916,7 @@ mod tests {
     #[tokio::test]
     async fn test_xudp_drop_with_pending_data_sends_both_data_and_end_frame() {
         let (client_stream, mut server_stream) = duplex(64 * 1024);
-        let carrier = XudpCarrier::new(Box::new(client_stream), 1, 10);
+        let carrier = XudpCarrier::new(AnyStream::new(client_stream), 1, 10);
         let target: SocksAddr = "1.1.1.1:53".parse().unwrap();
 
         let mut dgram = carrier.open_child(target.clone()).unwrap();
@@ -967,7 +969,7 @@ mod tests {
     #[tokio::test]
     async fn test_xudp_send_after_close_rejected() {
         let (client_stream, _server_stream) = duplex(64 * 1024);
-        let carrier = XudpCarrier::new(Box::new(client_stream), 1, 10);
+        let carrier = XudpCarrier::new(AnyStream::new(client_stream), 1, 10);
         let target: SocksAddr = "1.1.1.1:53".parse().unwrap();
 
         let mut dgram = carrier.open_child(target.clone()).unwrap();

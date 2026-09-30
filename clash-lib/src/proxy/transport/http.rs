@@ -347,7 +347,7 @@ impl HttpStream {
 
 impl From<HttpStream> for AnyStream {
     fn from(s: HttpStream) -> Self {
-        Box::new(s)
+        AnyStream::new(s)
     }
 }
 
@@ -371,7 +371,10 @@ mod tests {
             headers,
         );
 
-        let mut stream = client.proxy_stream(Box::new(client_io)).await.unwrap();
+        let mut stream = client
+            .proxy_stream(AnyStream::new(client_io))
+            .await
+            .unwrap();
 
         let write_task = tokio::spawn(async move {
             stream.write_all(b"hello payload").await.unwrap();
@@ -411,7 +414,10 @@ mod tests {
             vec![],
             HashMap::new(),
         );
-        let mut stream = client.proxy_stream(Box::new(client_io)).await.unwrap();
+        let mut stream = client
+            .proxy_stream(AnyStream::new(client_io))
+            .await
+            .unwrap();
         server_io
             .write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n")
             .await
@@ -431,7 +437,10 @@ mod tests {
             vec![],
             HashMap::new(),
         );
-        let mut stream = client.proxy_stream(Box::new(client_io)).await.unwrap();
+        let mut stream = client
+            .proxy_stream(AnyStream::new(client_io))
+            .await
+            .unwrap();
         let writer = tokio::spawn(async move {
             server_io
                 .write_all(b"HTTP/1.1 200 OK\r\nX-Fill: ")
@@ -457,7 +466,10 @@ mod tests {
             vec![],
             HashMap::new(),
         );
-        let mut stream = client.proxy_stream(Box::new(client_io)).await.unwrap();
+        let mut stream = client
+            .proxy_stream(AnyStream::new(client_io))
+            .await
+            .unwrap();
         server_io
             .write_all(b"HTTP/1.1 200 OK\r\n\r\n")
             .await

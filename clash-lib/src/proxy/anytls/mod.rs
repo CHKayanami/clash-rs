@@ -187,7 +187,7 @@ impl Handler {
         )
         .await?;
         let stream = session.open_stream(destination).await?;
-        Ok(Box::new(stream))
+        Ok(AnyStream::new(stream))
     }
 }
 
@@ -272,7 +272,7 @@ impl OutboundHandler for Handler {
             .await?;
 
         sess.push_chain(self.name());
-        Ok(Box::new(stream))
+        Ok(AnyStream::new(stream))
     }
 
     async fn connect_datagram_with_connector(
@@ -296,10 +296,12 @@ impl OutboundHandler for Handler {
         stream.write_all(&request).await?;
         stream.flush().await?;
 
-        let datagram =
-            OutboundDatagramUotV2::new(Box::new(stream), sess.destination.clone());
+        let datagram = OutboundDatagramUotV2::new(
+            AnyStream::new(stream),
+            sess.destination.clone(),
+        );
         sess.push_chain(self.name());
-        Ok(Box::new(datagram))
+        Ok(AnyOutboundDatagram::new(datagram))
     }
 
     fn try_as_plain_handler(&self) -> Option<&dyn PlainProxyAPIResponse> {
@@ -495,7 +497,7 @@ mod tests {
 
         let dst_clone = dst.clone();
         let task = tokio::spawn(async move {
-            h.open_anytls_stream(Box::new(client), &dst_clone)
+            h.open_anytls_stream(AnyStream::new(client), &dst_clone)
                 .await
                 .unwrap()
         });
@@ -559,7 +561,9 @@ mod tests {
         let (client, mut server) = duplex(65536);
 
         let task = tokio::spawn(async move {
-            h.open_anytls_stream(Box::new(client), &dst).await.unwrap()
+            h.open_anytls_stream(AnyStream::new(client), &dst)
+                .await
+                .unwrap()
         });
 
         // Drain initial handshake bytes
@@ -607,7 +611,9 @@ mod tests {
         let (client, mut server) = duplex(131072);
 
         let task = tokio::spawn(async move {
-            h.open_anytls_stream(Box::new(client), &dst).await.unwrap()
+            h.open_anytls_stream(AnyStream::new(client), &dst)
+                .await
+                .unwrap()
         });
 
         // Drain initial handshake bytes
@@ -661,7 +667,9 @@ mod tests {
         let (client, mut server) = duplex(65536);
 
         let task = tokio::spawn(async move {
-            h.open_anytls_stream(Box::new(client), &dst).await.unwrap()
+            h.open_anytls_stream(AnyStream::new(client), &dst)
+                .await
+                .unwrap()
         });
 
         // 接收初始握手
@@ -729,7 +737,7 @@ mod tests {
     async fn test_drop_stream_releases_session_capacity() {
         let (client, mut server) = duplex(65536);
         let session = session::AnyTlsClientSession::new(
-            Box::new(client),
+            AnyStream::new(client),
             "secret",
             PaddingFactory::default_factory(),
         )
@@ -791,7 +799,7 @@ mod tests {
     async fn test_v2_synack_error_propagated_to_caller() {
         let (client, mut server) = duplex(65536);
         let session = session::AnyTlsClientSession::new(
-            Box::new(client),
+            AnyStream::new(client),
             "secret",
             PaddingFactory::default_factory(),
         )
@@ -878,7 +886,7 @@ mod tests {
     async fn test_open_stream_cancellation_releases_record_and_capacity() {
         let (client, mut server) = duplex(65536);
         let session = session::AnyTlsClientSession::new(
-            Box::new(client),
+            AnyStream::new(client),
             "secret",
             PaddingFactory::default_factory(),
         )
@@ -944,7 +952,7 @@ mod tests {
     async fn test_concurrent_first_streams_do_not_duplicate_settings() {
         let (client, mut server) = duplex(65536);
         let session = session::AnyTlsClientSession::new(
-            Box::new(client),
+            AnyStream::new(client),
             "secret",
             PaddingFactory::default_factory(),
         )
@@ -1000,7 +1008,7 @@ mod tests {
     async fn test_try_reserve_stream_concurrent_never_exceeds_max() {
         let (client, _server) = duplex(65536);
         let session = session::AnyTlsClientSession::new(
-            Box::new(client),
+            AnyStream::new(client),
             "secret",
             PaddingFactory::default_factory(),
         )
@@ -1044,7 +1052,7 @@ mod tests {
     async fn test_first_stream_v2_synack_error_propagated_to_caller() {
         let (client, mut server) = duplex(65536);
         let session = session::AnyTlsClientSession::new(
-            Box::new(client),
+            AnyStream::new(client),
             "secret",
             PaddingFactory::default_factory(),
         )
@@ -1126,7 +1134,7 @@ mod tests {
     async fn test_v1_server_first_stream_does_not_timeout() {
         let (client, mut server) = duplex(65536);
         let session = session::AnyTlsClientSession::new(
-            Box::new(client),
+            AnyStream::new(client),
             "secret",
             PaddingFactory::default_factory(),
         )
@@ -1175,7 +1183,7 @@ mod tests {
     async fn test_session_closed_drains_queued_eof_without_error() {
         let (client, mut server) = duplex(65536);
         let session = session::AnyTlsClientSession::new(
-            Box::new(client),
+            AnyStream::new(client),
             "secret",
             PaddingFactory::default_factory(),
         )
@@ -1271,7 +1279,7 @@ mod tests {
         });
 
         let sess1 = session::AnyTlsClientSession::new(
-            Box::new(c1),
+            AnyStream::new(c1),
             "secret",
             PaddingFactory::default_factory(),
         )
@@ -1297,7 +1305,7 @@ mod tests {
     async fn test_write_does_not_drain_incoming_channel_backpressure() {
         let (client, mut server) = duplex(65536);
         let session = session::AnyTlsClientSession::new(
-            Box::new(client),
+            AnyStream::new(client),
             "secret",
             PaddingFactory::default_factory(),
         )
@@ -1364,7 +1372,7 @@ mod tests {
     async fn test_read_drains_buffer_before_reporting_broken_pipe() {
         let (client, mut server) = duplex(65536);
         let session = session::AnyTlsClientSession::new(
-            Box::new(client),
+            AnyStream::new(client),
             "secret",
             PaddingFactory::default_factory(),
         )
@@ -1429,7 +1437,7 @@ mod tests {
     async fn test_remote_fin_stops_local_writes_with_broken_pipe() {
         let (client, mut server) = duplex(65536);
         let session = session::AnyTlsClientSession::new(
-            Box::new(client),
+            AnyStream::new(client),
             "secret",
             PaddingFactory::default_factory(),
         )
@@ -1494,7 +1502,7 @@ mod tests {
 
         let (client, mut server) = duplex(65536);
         let session = session::AnyTlsClientSession::new(
-            Box::new(client),
+            AnyStream::new(client),
             "secret",
             PaddingFactory::default_factory(),
         )
@@ -1561,7 +1569,7 @@ mod tests {
         let h1 = Arc::clone(&h);
         let dst1 = Arc::clone(&dst);
         let task1 = tokio::spawn(async move {
-            h1.open_anytls_stream(Box::new(client1), &dst1)
+            h1.open_anytls_stream(AnyStream::new(client1), &dst1)
                 .await
                 .unwrap()
         });
@@ -1626,7 +1634,7 @@ mod tests {
         let h2 = Arc::clone(&h);
         let dst2 = Arc::clone(&dst);
         let task2 = tokio::spawn(async move {
-            h2.open_anytls_stream(Box::new(client2), &dst2)
+            h2.open_anytls_stream(AnyStream::new(client2), &dst2)
                 .await
                 .unwrap()
         });

@@ -1,3 +1,4 @@
+use crate::proxy::AnyStream;
 use super::{
     datagram::{ChannelDatagram, UdpPacket},
     inbound::InboundHandlerTrait,
@@ -141,7 +142,9 @@ impl InboundHandlerTrait for TproxyInbound {
 
             let dispatcher = self.dispatcher.clone();
             tokio::spawn(async move {
-                dispatcher.dispatch_stream(sess, Box::new(socket)).await;
+                dispatcher
+                    .dispatch_stream(sess, AnyStream::Tcp(socket))
+                    .await;
             });
         }
     }

@@ -72,6 +72,6 @@ impl Builder {
         )
         .await?;
 
-        Ok(Box::new(stream))
+        Ok(AnyStream::new(stream))
     }
 }

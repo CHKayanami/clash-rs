@@ -1,3 +1,4 @@
+use crate::proxy::AnyStream;
 use crate::{
     Dispatcher,
     common::{auth::ThreadSafeAuthenticator, errors::new_io_error},
@@ -158,7 +159,7 @@ pub async fn handle_tcp(
             sess.destination = dst;
 
             dispatcher
-                .dispatch_stream(sess.to_owned(), Box::new(s))
+                .dispatch_stream(sess.to_owned(), AnyStream::Tcp(s))
                 .await;
 
             Ok(())

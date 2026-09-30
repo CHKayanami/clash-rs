@@ -548,7 +548,7 @@ impl OutboundHandler for Handler {
             match authed_conn.connect_tcp(sess).await {
                 Ok(hy_stream) => {
                     sess.push_chain(self.name());
-                    return Ok(Box::new(hy_stream));
+                    return Ok(AnyStream::new(hy_stream));
                 }
                 Err(e) => {
                     // 如果错误是业务层的 ConnectionRefused（即服务端正常回应拒绝，如目标域名不存在、端口拒绝），
@@ -584,7 +584,7 @@ impl OutboundHandler for Handler {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let hy_datagram = authed_conn.connect_udp(sess, next_session_id).await;
         sess.push_chain(self.name());
-        Ok(Box::new(hy_datagram))
+        Ok(AnyOutboundDatagram::new(hy_datagram))
     }
 
     fn try_as_plain_handler(&self) -> Option<&dyn PlainProxyAPIResponse> {

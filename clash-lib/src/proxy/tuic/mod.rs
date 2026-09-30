@@ -345,7 +345,7 @@ impl Handler {
         let dest = sess.destination.clone().into_tuic();
         let tuic_tcp = conn.connect_tcp(dest).await?;
         sess.push_chain(self.name());
-        Ok(Box::new(tuic_tcp))
+        Ok(AnyStream::new(tuic_tcp))
     }
 
     async fn do_connect_datagram(
@@ -357,7 +357,7 @@ impl Handler {
         let assos_id = self.next_assoc_id.fetch_add(1, Ordering::SeqCst);
         let quic_udp = TuicDatagramOutbound::new(assos_id, conn, sess.source.into());
         sess.push_chain(self.name());
-        Ok(Box::new(quic_udp))
+        Ok(AnyOutboundDatagram::new(quic_udp))
     }
 }
 
