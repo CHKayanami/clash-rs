@@ -15,7 +15,7 @@ use tokio::io::{AsyncRead, AsyncWrite, Interest};
 use enum_dispatch::enum_dispatch;
 use tokio::net::{TcpStream, UnixStream};
 
-use super::{CopyBidirectionalError, TrafficTracker};
+use super::{CopyBidirectionalError, SlideBuffer, TrafficTracker};
 
 #[enum_dispatch]
 pub trait TrackCopy: Send + Sync {
@@ -191,6 +191,7 @@ struct CopyBuffer<R, W> {
     cap: usize,
     amt: u64,
     buf: Pipe,
+    prefix: Option<SlideBuffer>,
     _marker_r: PhantomData<R>,
     _marker_w: PhantomData<W>,
 }
@@ -208,6 +209,7 @@ where
             cap: 0,
             amt: 0,
             buf,
+            prefix: None,
             _marker_r: PhantomData,
             _marker_w: PhantomData,
         }
@@ -330,6 +332,23 @@ where
         w: &mut W,
         last_active: &mut tokio::time::Instant,
     ) -> Poll<Result<u64>> {
+        while let Some(prefix) = self.prefix.as_mut() {
+            let size = ready!(Pin::new(&mut *w).poll_write(cx, prefix.as_slice()))?;
+            if size == 0 {
+                return Poll::Ready(Err(Error::new(
+                    ErrorKind::WriteZero,
+                    "write zero byte while forwarding prefix",
+                )
+                .into()));
+            }
+            prefix.consume(size);
+            self.amt += size as u64;
+            self.need_flush = true;
+            *last_active = tokio::time::Instant::now();
+            if prefix.is_empty() {
+                self.prefix = None;
+            }
+        }
         loop {
             // If our buffer is empty, then we need to read some data to
             // continue.
@@ -415,7 +434,10 @@ pub trait Stream: AsyncRead + AsyncWrite + AsRawFd {
 /// This function returns a future that will read from both streams,
 /// writing any data read to the opposing stream.
 /// This happens in both directions concurrently.
-pub async fn zero_copy_bidirectional<A, B>(
+/// After one direction finishes, the remaining direction's timeout is reset
+/// whenever it successfully writes data. Reads alone do not extend the timeout.
+#[cfg(test)]
+pub(super) async fn zero_copy_bidirectional<A, B>(
     a: &mut A,
     b: &mut B,
     read_tracker: CopyTracker,
@@ -427,12 +449,44 @@ where
     A: Stream + Unpin,
     B: Stream + Unpin,
 {
+    zero_copy_bidirectional_with_prefix(
+        a,
+        b,
+        None,
+        None,
+        read_tracker,
+        write_tracker,
+        a_to_b_timeout_duration,
+        b_to_a_timeout_duration,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn zero_copy_bidirectional_with_prefix<A, B>(
+    a: &mut A,
+    b: &mut B,
+    a_prefix: Option<SlideBuffer>,
+    b_prefix: Option<SlideBuffer>,
+    read_tracker: CopyTracker,
+    write_tracker: CopyTracker,
+    a_to_b_timeout_duration: Duration,
+    b_to_a_timeout_duration: Duration,
+) -> Result<(u64, u64)>
+where
+    A: Stream + Unpin,
+    B: Stream + Unpin,
+{
     let idle_timeout_duration = Duration::from_secs(180);
+    let mut a_to_b = CopyBuffer::new(Pipe::new()?);
+    let mut b_to_a = CopyBuffer::new(Pipe::new()?);
+    a_to_b.prefix = a_prefix.filter(|prefix| !prefix.is_empty());
+    b_to_a.prefix = b_prefix.filter(|prefix| !prefix.is_empty());
     CopyBidirectional::new(
         a,
         b,
-        CopyBuffer::new(Pipe::new()?),
-        CopyBuffer::new(Pipe::new()?),
+        a_to_b,
+        b_to_a,
         a_to_b_timeout_duration,
         b_to_a_timeout_duration,
         idle_timeout_duration,
@@ -570,6 +624,15 @@ where
                 TransferState::Running(buf) => {
                     let prev_amt = buf.amount_transferred();
                     let res = buf.poll_copy(cx, *a, *b, last_active);
+                    // Only successful writes extend the remaining direction's
+                    // timeout after the opposite direction has half-closed.
+                    if buf.amount_transferred() > prev_amt
+                        && let Some(delay) = a_to_b_delay.as_mut()
+                    {
+                        delay.as_mut().reset(
+                            tokio::time::Instant::now() + *a_to_b_timeout_duration,
+                        );
+                    }
                     let delta = buf.amount_transferred() - prev_amt;
                     if delta > 0 {
                         write_tracker.track(delta as _);
@@ -623,6 +686,15 @@ where
                 TransferState::Running(buf) => {
                     let prev_amt = buf.amount_transferred();
                     let res = buf.poll_copy(cx, *b, *a, last_active);
+                    // Only successful writes extend the remaining direction's
+                    // timeout after the opposite direction has half-closed.
+                    if buf.amount_transferred() > prev_amt
+                        && let Some(delay) = b_to_a_delay.as_mut()
+                    {
+                        delay.as_mut().reset(
+                            tokio::time::Instant::now() + *b_to_a_timeout_duration,
+                        );
+                    }
                     let delta = buf.amount_transferred() - prev_amt;
                     if delta > 0 {
                         read_tracker.track(delta as _);

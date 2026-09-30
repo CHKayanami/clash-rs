@@ -3,6 +3,8 @@ use std::sync::Arc;
 
 pub(crate) mod datagram;
 pub(crate) mod pool;
+mod recv;
+mod resolve;
 
 use crate::{
     app::dns::ThreadSafeDNSResolver,
@@ -108,7 +110,12 @@ impl OutboundHandler for Handler {
         } else {
             self.pool.clone()
         };
-        let datagram = pool.connect(key, sess.iface.as_ref(), sess.destination.clone(), resolver)?;
+        let datagram = pool.connect(
+            key,
+            sess.iface.as_ref(),
+            sess.destination.clone(),
+            resolver,
+        )?;
         Ok(Box::new(datagram))
     }
 
@@ -344,8 +351,10 @@ mod tests {
     #[tokio::test]
     async fn test_connect_datagram_pooled_multi_session() {
         let recorded_peers = Arc::new(parking_lot::Mutex::new(Vec::new()));
-        let echo_a = spawn_recording_udp_echo("127.0.0.1:0", recorded_peers.clone()).await;
-        let echo_b = spawn_recording_udp_echo("127.0.0.1:0", recorded_peers.clone()).await;
+        let echo_a =
+            spawn_recording_udp_echo("127.0.0.1:0", recorded_peers.clone()).await;
+        let echo_b =
+            spawn_recording_udp_echo("127.0.0.1:0", recorded_peers.clone()).await;
 
         let handler = Handler::new("DIRECT");
         let client_src: SocketAddr = "127.0.0.1:45678".parse().unwrap();
@@ -498,7 +507,8 @@ mod tests {
     #[tokio::test]
     async fn test_connect_datagram_pooled_unsolicited_inbound_accepted() {
         let recorded_peers = Arc::new(parking_lot::Mutex::new(Vec::new()));
-        let echo = spawn_recording_udp_echo("127.0.0.1:0", recorded_peers.clone()).await;
+        let echo =
+            spawn_recording_udp_echo("127.0.0.1:0", recorded_peers.clone()).await;
 
         let handler = Handler::new("DIRECT");
         let client_src: SocketAddr = "127.0.0.1:45680".parse().unwrap();
@@ -640,8 +650,10 @@ mod tests {
     #[tokio::test]
     async fn test_connect_datagram_pooled_unsolicited_full_cone_multiple_sessions() {
         let recorded_peers = Arc::new(parking_lot::Mutex::new(Vec::new()));
-        let echo_1 = spawn_recording_udp_echo("127.0.0.1:0", recorded_peers.clone()).await;
-        let echo_2 = spawn_recording_udp_echo("127.0.0.1:0", recorded_peers.clone()).await;
+        let echo_1 =
+            spawn_recording_udp_echo("127.0.0.1:0", recorded_peers.clone()).await;
+        let echo_2 =
+            spawn_recording_udp_echo("127.0.0.1:0", recorded_peers.clone()).await;
 
         let handler = Handler::new("DIRECT");
         let client_src: SocketAddr = "127.0.0.1:45682".parse().unwrap();
@@ -661,24 +673,40 @@ mod tests {
             ..Default::default()
         };
 
-        let mut d1 = handler.connect_datagram(&sess_1, make_resolver()).await.unwrap();
-        let mut d2 = handler.connect_datagram(&sess_2, make_resolver()).await.unwrap();
+        let mut d1 = handler
+            .connect_datagram(&sess_1, make_resolver())
+            .await
+            .unwrap();
+        let mut d2 = handler
+            .connect_datagram(&sess_2, make_resolver())
+            .await
+            .unwrap();
 
         // Send to establish socket and register destinations
         d1.send(UdpPacket {
             data: bytes::Bytes::from_static(b"ping-1"),
             dst_addr: SocksAddr::Ip(echo_1),
             ..Default::default()
-        }).await.unwrap();
+        })
+        .await
+        .unwrap();
 
         d2.send(UdpPacket {
             data: bytes::Bytes::from_static(b"ping-2"),
             dst_addr: SocksAddr::Ip(echo_2),
             ..Default::default()
-        }).await.unwrap();
+        })
+        .await
+        .unwrap();
 
-        let _ = tokio::time::timeout(Duration::from_secs(2), d1.next()).await.unwrap().unwrap();
-        let _ = tokio::time::timeout(Duration::from_secs(2), d2.next()).await.unwrap().unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(2), d1.next())
+            .await
+            .unwrap()
+            .unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(2), d2.next())
+            .await
+            .unwrap()
+            .unwrap();
 
         let outbound_port = {
             let peers = recorded_peers.lock();
@@ -688,11 +716,16 @@ mod tests {
         // Third party sends unsolicited P2P hole-punching packet to the shared socket
         let third_party = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let third_party_addr = third_party.local_addr().unwrap();
-        third_party.send_to(b"p2p-punch", outbound_port).await.unwrap();
+        third_party
+            .send_to(b"p2p-punch", outbound_port)
+            .await
+            .unwrap();
 
         // Under Full-Cone NAT semantics, the active session receives the hole punch packet
         let r = tokio::time::timeout(Duration::from_secs(2), d2.next()).await;
-        let pkt = r.expect("timed out waiting for P2P punch packet").expect("stream ended");
+        let pkt = r
+            .expect("timed out waiting for P2P punch packet")
+            .expect("stream ended");
 
         assert_eq!(pkt.data.as_ref(), b"p2p-punch");
         // Verify source address is NOT rewritten to echo_2's address; it must stay as the third party's true IP!
@@ -730,36 +763,57 @@ mod tests {
         mock_resolver
             .expect_resolve_v4()
             .returning(|_, _| Ok(Some(std::net::Ipv4Addr::LOCALHOST)));
-        mock_resolver
-            .expect_resolve()
-            .returning(|_, _| Ok(Some(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST))));
+        mock_resolver.expect_resolve().returning(|_, _| {
+            Ok(Some(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)))
+        });
         let resolver: ThreadSafeDNSResolver = Arc::new(mock_resolver);
 
-        let mut d_ip = handler.connect_datagram(&sess_ip, resolver.clone()).await.unwrap();
-        let mut d_domain = handler.connect_datagram(&sess_domain, resolver).await.unwrap();
+        let mut d_ip = handler
+            .connect_datagram(&sess_ip, resolver.clone())
+            .await
+            .unwrap();
+        let mut d_domain = handler
+            .connect_datagram(&sess_domain, resolver)
+            .await
+            .unwrap();
 
         // Send from d_ip
         d_ip.send(UdpPacket {
             data: bytes::Bytes::from_static(b"from-ip-session"),
             dst_addr: SocksAddr::Ip(echo),
             ..Default::default()
-        }).await.unwrap();
+        })
+        .await
+        .unwrap();
 
         // Send from d_domain (triggers lazy DNS resolution -> collides with d_ip -> re-homes to new socket)
-        d_domain.send(UdpPacket {
-            data: bytes::Bytes::from_static(b"from-domain-session"),
-            dst_addr: SocksAddr::Domain("localhost".into(), echo.port()),
-            ..Default::default()
-        }).await.unwrap();
+        d_domain
+            .send(UdpPacket {
+                data: bytes::Bytes::from_static(b"from-domain-session"),
+                dst_addr: SocksAddr::Domain("localhost".into(), echo.port()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
 
         // Both sessions must receive their own responses correctly!
-        let pkt_domain = tokio::time::timeout(Duration::from_secs(2), d_domain.next()).await.unwrap().unwrap();
-        let pkt_ip = tokio::time::timeout(Duration::from_secs(2), d_ip.next()).await.unwrap().unwrap();
+        let pkt_domain =
+            tokio::time::timeout(Duration::from_secs(2), d_domain.next())
+                .await
+                .unwrap()
+                .unwrap();
+        let pkt_ip = tokio::time::timeout(Duration::from_secs(2), d_ip.next())
+            .await
+            .unwrap()
+            .unwrap();
 
         assert_eq!(pkt_ip.data.as_ref(), b"from-ip-session");
         assert_eq!(pkt_domain.data.as_ref(), b"from-domain-session");
         // Verify logical address restoration on rehomed domain session
-        assert_eq!(pkt_domain.src_addr, SocksAddr::Domain("localhost".into(), echo.port()));
+        assert_eq!(
+            pkt_domain.src_addr,
+            SocksAddr::Domain("localhost".into(), echo.port())
+        );
     }
 
     #[tokio::test]
@@ -776,9 +830,9 @@ mod tests {
         mock_resolver
             .expect_resolve_v4()
             .returning(|_, _| Ok(Some(std::net::Ipv4Addr::LOCALHOST)));
-        mock_resolver
-            .expect_resolve()
-            .returning(|_, _| Ok(Some(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST))));
+        mock_resolver.expect_resolve().returning(|_, _| {
+            Ok(Some(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)))
+        });
         let resolver: ThreadSafeDNSResolver = Arc::new(mock_resolver);
 
         let domain_name = "my-service.local";
@@ -797,7 +851,9 @@ mod tests {
             data: bytes::Bytes::from_static(b"packet-1"),
             dst_addr: SocksAddr::Domain(domain_name.into(), echo_addr.port()),
             ..Default::default()
-        }).await.unwrap();
+        })
+        .await
+        .unwrap();
 
         let mut buf = [0u8; 1024];
         let (n, direct_addr) = echo_socket.recv_from(&mut buf).await.unwrap();
@@ -807,32 +863,52 @@ mod tests {
         echo_socket.send_to(b"reply-1", direct_addr).await.unwrap();
 
         // Direct datagram receives reply
-        let reply1 = tokio::time::timeout(Duration::from_secs(2), d.next()).await.unwrap().unwrap();
+        let reply1 = tokio::time::timeout(Duration::from_secs(2), d.next())
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(reply1.data.as_ref(), b"reply-1");
         // Verify logical address restoration: source is restored to Domain!
-        assert_eq!(reply1.src_addr, SocksAddr::Domain(domain_name.into(), echo_addr.port()));
+        assert_eq!(
+            reply1.src_addr,
+            SocksAddr::Domain(domain_name.into(), echo_addr.port())
+        );
 
         // 2. Send second packet to test persistence across flushes
         d.send(UdpPacket {
             data: bytes::Bytes::from_static(b"packet-2"),
             dst_addr: SocksAddr::Domain(domain_name.into(), echo_addr.port()),
             ..Default::default()
-        }).await.unwrap();
+        })
+        .await
+        .unwrap();
 
         let (n2, _) = echo_socket.recv_from(&mut buf).await.unwrap();
         assert_eq!(&buf[..n2], b"packet-2");
 
         echo_socket.send_to(b"reply-2", direct_addr).await.unwrap();
 
-        let reply2 = tokio::time::timeout(Duration::from_secs(2), d.next()).await.unwrap().unwrap();
+        let reply2 = tokio::time::timeout(Duration::from_secs(2), d.next())
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(reply2.data.as_ref(), b"reply-2");
         // Source must STILL be restored to Domain on consecutive packets!
-        assert_eq!(reply2.src_addr, SocksAddr::Domain(domain_name.into(), echo_addr.port()));
+        assert_eq!(
+            reply2.src_addr,
+            SocksAddr::Domain(domain_name.into(), echo_addr.port())
+        );
 
         // 3. Unsolicited peer packet sent to the same direct socket
-        peer_socket.send_to(b"peer-hole-punch", direct_addr).await.unwrap();
+        peer_socket
+            .send_to(b"peer-hole-punch", direct_addr)
+            .await
+            .unwrap();
 
-        let peer_pkt = tokio::time::timeout(Duration::from_secs(2), d.next()).await.unwrap().unwrap();
+        let peer_pkt = tokio::time::timeout(Duration::from_secs(2), d.next())
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(peer_pkt.data.as_ref(), b"peer-hole-punch");
         // Must NOT be rewritten to domain: retain genuine peer IP!
         assert_eq!(peer_pkt.src_addr, SocksAddr::Ip(peer_addr));

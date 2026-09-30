@@ -7,13 +7,16 @@ use crate::common::io::SlideBuffer;
 use crate::proxy::ProxyStream;
 
 pub struct PrefixedStream<S> {
-    prefix: SlideBuffer,
+    prefix: Option<SlideBuffer>,
     inner: S,
 }
 
 impl<S> PrefixedStream<S> {
     pub fn new(prefix: SlideBuffer, inner: S) -> Self {
-        Self { prefix, inner }
+        Self {
+            prefix: (!prefix.is_empty()).then_some(prefix),
+            inner,
+        }
     }
 
     pub fn into_inner(self) -> S {
@@ -27,10 +30,13 @@ impl<S: AsyncRead + Unpin> AsyncRead for PrefixedStream<S> {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        if !self.prefix.is_empty() {
-            let to_read = std::cmp::min(self.prefix.len(), buf.remaining());
-            buf.put_slice(&self.prefix.as_slice()[..to_read]);
-            self.prefix.consume(to_read);
+        if let Some(prefix) = self.prefix.as_mut() {
+            let to_read = std::cmp::min(prefix.len(), buf.remaining());
+            buf.put_slice(&prefix.as_slice()[..to_read]);
+            prefix.consume(to_read);
+            if prefix.is_empty() {
+                self.prefix = None;
+            }
             return Poll::Ready(Ok(()));
         }
         Pin::new(&mut self.inner).poll_read(cx, buf)
@@ -64,10 +70,27 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for PrefixedStream<S> {
 impl<S: ProxyStream> ProxyStream for PrefixedStream<S> {
     #[cfg(all(target_os = "linux", feature = "zero_copy"))]
     fn underlying_socket(&mut self) -> Option<&mut tokio::net::TcpStream> {
-        if self.prefix.is_empty() {
+        if self.prefix.is_none() {
             self.inner.underlying_socket()
         } else {
             None
+        }
+    }
+
+    #[cfg(all(target_os = "linux", feature = "zero_copy"))]
+    fn zero_copy_socket(&mut self) -> Option<&mut tokio::net::TcpStream> {
+        self.inner.zero_copy_socket()
+    }
+
+    #[cfg(all(target_os = "linux", feature = "zero_copy"))]
+    fn take_read_prefix(&mut self) -> Option<SlideBuffer> {
+        let prefix = self.prefix.take();
+        match (prefix, self.inner.take_read_prefix()) {
+            (Some(mut outer), Some(inner)) => {
+                outer.extend_from_slice(inner.as_slice());
+                Some(outer)
+            }
+            (outer, inner) => outer.or(inner),
         }
     }
 }
@@ -91,5 +114,9 @@ mod tests {
         let mut buf = vec![0u8; 11];
         prefixed.read_exact(&mut buf).await.unwrap();
         assert_eq!(&buf, b"hello world");
+        assert!(
+            prefixed.prefix.is_none(),
+            "drained prefix storage must be released"
+        );
     }
 }

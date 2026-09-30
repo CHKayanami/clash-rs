@@ -2,18 +2,16 @@ use crate::{
     app::dns::ThreadSafeDNSResolver, common::errors::new_io_error,
     proxy::datagram::UdpPacket, session::SocksAddr,
 };
-use bytes::BytesMut;
 use futures::{Sink, Stream, ready};
 use std::{
-    cell::RefCell,
     collections::{HashMap, VecDeque},
     io,
-    net::{IpAddr, SocketAddr},
+    net::SocketAddr,
     pin::Pin,
     task::{Context, Poll},
     time::{Duration, Instant},
 };
-use tokio::{io::ReadBuf, net::UdpSocket, task::JoinHandle};
+use tokio::net::UdpSocket;
 
 const UDP_DOMAIN_MAP_TTL: Duration = Duration::from_secs(60);
 
@@ -31,20 +29,6 @@ const UDP_DOMAIN_MAP_SWEEP_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Maximum number of datagrams to batch drain on a single ready notification.
 const MAX_BATCH_RECV_PACKETS: usize = 16;
-
-const UDP_RECV_CHUNK_SIZE: usize = 256 * 1024;
-const MAX_UDP_DATAGRAM_SIZE: usize = 65535;
-
-thread_local! {
-    static UDP_CHUNK_BUF: RefCell<BytesMut> = RefCell::new(BytesMut::new());
-}
-
-#[inline]
-fn ensure_chunk_capacity(chunk_buf: &mut BytesMut) {
-    if chunk_buf.capacity() < MAX_UDP_DATAGRAM_SIZE {
-        chunk_buf.reserve(UDP_RECV_CHUNK_SIZE);
-    }
-}
 
 #[inline]
 fn canonicalize_src(src: SocketAddr) -> SocketAddr {
@@ -75,12 +59,9 @@ pub struct OutboundDatagramImpl {
     // IP; used in poll_next to translate src_addr back to dst_addr.
     ip_to_logical: HashMap<SocketAddr, (SocksAddr, Instant)>,
     last_sweep: Instant,
-    /// In-flight DNS resolution task for the current queued packet.
-    /// Using a JoinHandle (Send + Sync) rather than a raw BoxFuture so that
-    /// OutboundDatagramImpl satisfies the Sync bound required by
-    /// ChainedDatagram. The task is spawned once and awaited across polls —
-    /// no query restarts.
-    pending_dns: Option<JoinHandle<io::Result<SocketAddr>>>,
+    /// In-flight query polled in the forwarding task; retained across polls
+    /// without spawning a task or restarting the lookup.
+    pending_dns: Option<super::resolve::PendingResolution>,
     /// Resolved IP for the current queued packet; reused across poll_send_to
     /// retries so we never re-poll an already-completed DNS task.
     resolved_dst: Option<SocketAddr>,
@@ -129,9 +110,7 @@ impl Sink<UdpPacket> for OutboundDatagramImpl {
 
     fn start_send(self: Pin<&mut Self>, item: UdpPacket) -> Result<(), Self::Error> {
         let pin = self.get_mut();
-        if let Some(handle) = pin.pending_dns.take() {
-            handle.abort();
-        }
+        pin.pending_dns = None;
         pin.pkt = Some(item);
         pin.flushed = false;
         pin.resolved_dst = None;
@@ -175,48 +154,14 @@ impl Sink<UdpPacket> for OutboundDatagramImpl {
                     addr
                 } else {
                     let is_ipv6 = local_is_ipv6;
-                    let handle = pending_dns.get_or_insert_with(|| {
-                        let resolver = resolver.clone();
-                        let domain = domain.clone();
-                        let port = *port;
-                        tokio::spawn(async move {
-                            let ip = if is_ipv6 {
-                                resolver.resolve(&domain, false).await.map_err(
-                                    |_| io::Error::other("resolve domain failed"),
-                                )?
-                            } else {
-                                resolver
-                                    .resolve_v4(&domain, false)
-                                    .await
-                                    .map_err(|_| {
-                                        io::Error::other("resolve domain failed")
-                                    })?
-                                    .map(IpAddr::V4)
-                            };
-                            match ip {
-                                Some(ip) => Ok(SocketAddr::from((ip, port))),
-                                None => Err(io::Error::other(format!(
-                                    "resolve domain failed: {domain}"
-                                 ))),
-                            }
-                        })
-                    });
-                    let join_result = ready!(Pin::new(handle).poll(cx));
-                    // Always clear the handle once it has completed (regardless of
-                    // success or failure). If we skip this on the error path the
-                    // handle stays in `pending_dns` and the next call to
-                    // `poll_flush` will try to poll an already-completed
-                    // `JoinHandle`, which panics with "JoinHandle polled after
-                    // completion".
-                    *pending_dns = None;
-                    let addr = match join_result {
-                        Ok(result) => result?,
-                        Err(e) => {
-                            return Poll::Ready(Err(io::Error::other(format!(
-                                "DNS task panicked: {e}"
-                            ))));
-                        }
-                    };
+                    let addr = ready!(super::resolve::poll_resolve_destination(
+                        cx,
+                        pending_dns,
+                        resolver,
+                        domain,
+                        *port,
+                        is_ipv6,
+                    ))?;
                     *resolved_dst = Some(addr);
                     addr
                 }
@@ -249,8 +194,9 @@ impl Sink<UdpPacket> for OutboundDatagramImpl {
             if ip_to_logical.len() > UDP_DOMAIN_MAP_SWEEP_THRESHOLD
                 && now.duration_since(*last_sweep) >= UDP_DOMAIN_MAP_SWEEP_INTERVAL
             {
-                ip_to_logical
-                    .retain(|_, (_, ts)| now.duration_since(*ts) < UDP_DOMAIN_MAP_TTL);
+                ip_to_logical.retain(|_, (_, ts)| {
+                    now.duration_since(*ts) < UDP_DOMAIN_MAP_TTL
+                });
                 *last_sweep = now;
             }
             ip_to_logical.insert(dst, (p.dst_addr.clone(), now));
@@ -300,94 +246,46 @@ impl Stream for OutboundDatagramImpl {
             return Poll::Ready(Some(packet));
         }
 
-        UDP_CHUNK_BUF.with_borrow_mut(|chunk_buf| {
-            ensure_chunk_capacity(chunk_buf);
-
-            loop {
-                let unfilled = chunk_buf.spare_capacity_mut();
-                let mut buf = ReadBuf::uninit(unfilled);
-                match ready!(inner.poll_recv_from(cx, &mut buf)) {
-                    Ok(src) => {
-                        *consecutive_recv_errors = 0;
-                        let filled_len = buf.filled().len();
-                        unsafe {
-                            let new_len = chunk_buf.len() + filled_len;
-                            chunk_buf.set_len(new_len);
-                        }
-                        let data = chunk_buf.split_to(filled_len).freeze();
+        loop {
+            let result = ready!(inner.poll_recv_ready(cx)).and_then(|()| {
+                super::recv::recv_batch(
+                    inner,
+                    MAX_BATCH_RECV_PACKETS,
+                    |data, src| {
                         let src = canonicalize_src(src);
                         let src_addr = ip_to_logical
                             .get(&src)
                             .map(|(logical, _)| logical.clone())
                             .unwrap_or_else(|| src.into());
-                        let first_packet = UdpPacket {
-                            data,
+                        recv_queue.push_back(UdpPacket {
+                            data: bytes::Bytes::copy_from_slice(data),
                             src_addr,
-                            // Overwritten by the dispatcher with the originating
-                            // client address on the reply path.
                             dst_addr: SocksAddr::any_ipv4(),
                             ..Default::default()
-                        };
-
-                        // 2. Batch Drain: opportunistically drain more packets from socket
-                        while recv_queue.len() < MAX_BATCH_RECV_PACKETS - 1 {
-                            ensure_chunk_capacity(chunk_buf);
-                            let spare = chunk_buf.spare_capacity_mut();
-                            let spare_slice = unsafe {
-                                std::slice::from_raw_parts_mut(
-                                    spare.as_mut_ptr() as *mut u8,
-                                    spare.len(),
-                                )
-                            };
-                            match inner.try_recv_from(spare_slice) {
-                                Ok((n, next_src)) => {
-                                    unsafe {
-                                        let new_len = chunk_buf.len() + n;
-                                        chunk_buf.set_len(new_len);
-                                    }
-                                    let next_data = chunk_buf.split_to(n).freeze();
-                                    let next_src = canonicalize_src(next_src);
-                                    let next_src_addr = ip_to_logical
-                                        .get(&next_src)
-                                        .map(|(logical, _)| logical.clone())
-                                        .unwrap_or_else(|| next_src.into());
-
-                                    recv_queue.push_back(UdpPacket {
-                                        data: next_data,
-                                        src_addr: next_src_addr,
-                                        dst_addr: SocksAddr::any_ipv4(),
-                                        ..Default::default()
-                                    });
-                                }
-                                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                                    break;
-                                }
-                                Err(e) => {
-                                    tracing::trace!("Direct UDP transient batch recv error: {e}");
-                                    break;
-                                }
-                            }
-                        }
-
-                        return Poll::Ready(Some(first_packet));
-                    }
-                    // A UDP socket reports plenty of transient failures — an inbound
-                    // ICMP port-unreachable for an earlier packet surfaces here as
-                    // ECONNREFUSED. Ending the stream on the first one tore down the
-                    // whole association, and this is the DIRECT path.
-                    Err(e) => {
-                        *consecutive_recv_errors += 1;
-                        if *consecutive_recv_errors >= MAX_CONSECUTIVE_RECV_ERRORS {
-                            tracing::warn!(
-                                "Direct UDP socket reached error limit ({MAX_CONSECUTIVE_RECV_ERRORS}), closing: {e}"
-                            );
-                            return Poll::Ready(None);
-                        }
-                        tracing::trace!("Direct UDP transient recv error: {e}");
+                        });
+                    },
+                )
+            });
+            match result {
+                Ok(_) => {
+                    *consecutive_recv_errors = 0;
+                    if let Some(packet) = recv_queue.pop_front() {
+                        return Poll::Ready(Some(packet));
                     }
                 }
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => continue,
+                Err(err) => {
+                    *consecutive_recv_errors += 1;
+                    if *consecutive_recv_errors >= MAX_CONSECUTIVE_RECV_ERRORS {
+                        tracing::warn!(
+                            "Direct UDP socket reached error limit ({MAX_CONSECUTIVE_RECV_ERRORS}), closing: {err}"
+                        );
+                        return Poll::Ready(None);
+                    }
+                    tracing::trace!("Direct UDP transient recv error: {err}");
+                }
             }
-        })
+        }
     }
 }
 
@@ -498,7 +396,7 @@ mod tests {
 
     /// When DNS resolution fails, `poll_flush` must return an error and clear
     /// `pending_dns` so that a subsequent `send` can start a fresh DNS query
-    /// without panicking with "JoinHandle polled after completion".
+    /// without polling a completed query again.
     #[tokio::test]
     async fn test_dns_failure_does_not_panic_on_retry() {
         let mut resolver = MockClashResolver::new();
@@ -601,7 +499,8 @@ mod tests {
         let echo_port = spawn_echo_server().await;
         let mut datagram = make_datagram().await;
 
-        let ip_dst = SocksAddr::Ip(SocketAddr::from((Ipv4Addr::LOCALHOST, echo_port)));
+        let ip_dst =
+            SocksAddr::Ip(SocketAddr::from((Ipv4Addr::LOCALHOST, echo_port)));
         datagram
             .send(UdpPacket {
                 data: bytes::Bytes::from_static(b"pure-ip"),
@@ -661,4 +560,3 @@ mod tests {
         }
     }
 }
-

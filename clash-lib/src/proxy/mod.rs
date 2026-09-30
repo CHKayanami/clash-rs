@@ -1,7 +1,5 @@
 use crate::{
-    app::dns::ThreadSafeDNSResolver,
-    proxy::datagram::UdpPacket,
-    session::Session,
+    app::dns::ThreadSafeDNSResolver, proxy::datagram::UdpPacket, session::Session,
 };
 use async_trait::async_trait;
 use erased_serde::Serialize as ErasedSerialize;
@@ -23,12 +21,12 @@ use self::utils::RemoteConnector;
 pub mod direct;
 pub mod reject;
 
+#[cfg(all(target_os = "linux", feature = "ebpf"))]
+pub mod ebpf;
 pub mod http;
 pub mod mixed;
 #[cfg(all(target_os = "linux", feature = "tproxy"))]
 pub mod tproxy;
-#[cfg(all(target_os = "linux", feature = "ebpf"))]
-pub mod ebpf;
 
 #[cfg(all(target_os = "linux", feature = "redir"))]
 pub mod redir;
@@ -93,6 +91,17 @@ pub trait ProxyStream: AsyncRead + AsyncWrite + Send + Unpin {
     fn underlying_socket(&mut self) -> Option<&mut tokio::net::TcpStream> {
         None
     }
+
+    /// Raw TCP eligible for splice after `take_read_prefix()` is forwarded.
+    #[cfg(all(target_os = "linux", feature = "zero_copy"))]
+    fn zero_copy_socket(&mut self) -> Option<&mut tokio::net::TcpStream> {
+        self.underlying_socket()
+    }
+
+    #[cfg(all(target_os = "linux", feature = "zero_copy"))]
+    fn take_read_prefix(&mut self) -> Option<crate::common::io::SlideBuffer> {
+        None
+    }
 }
 pub type AnyStream = Box<dyn ProxyStream + Sync>;
 
@@ -113,6 +122,16 @@ impl<T: ProxyStream + ?Sized> ProxyStream for Box<T> {
     #[cfg(all(target_os = "linux", feature = "zero_copy"))]
     fn underlying_socket(&mut self) -> Option<&mut tokio::net::TcpStream> {
         (**self).underlying_socket()
+    }
+
+    #[cfg(all(target_os = "linux", feature = "zero_copy"))]
+    fn zero_copy_socket(&mut self) -> Option<&mut tokio::net::TcpStream> {
+        (**self).zero_copy_socket()
+    }
+
+    #[cfg(all(target_os = "linux", feature = "zero_copy"))]
+    fn take_read_prefix(&mut self) -> Option<crate::common::io::SlideBuffer> {
+        (**self).take_read_prefix()
     }
 }
 

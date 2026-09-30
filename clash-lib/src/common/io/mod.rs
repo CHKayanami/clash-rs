@@ -13,9 +13,7 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 #[cfg(all(target_os = "linux", feature = "zero_copy"))]
 mod splice;
 #[cfg(all(target_os = "linux", feature = "zero_copy"))]
-pub use splice::{
-    CopyTracker, DownloadTracker, UploadTracker, zero_copy_bidirectional,
-};
+pub use splice::{CopyTracker, DownloadTracker, UploadTracker};
 
 pub use clash_common::SlideBuffer;
 
@@ -295,16 +293,27 @@ where
         loop {
             match a_to_b {
                 TransferState::Running(buf) => {
-                    let mut on_upload = |written: usize| {
-                        tracker.push_upload(written);
-                    };
+                    let prev_amt = buf.amount_transferred();
                     let res = buf.poll_copy(
                         cx,
                         a.as_mut(),
                         b.as_mut(),
                         Some(last_active),
-                        Some(&mut on_upload),
+                        None,
                     );
+                    let written = buf.amount_transferred() - prev_amt;
+                    if written > 0 {
+                        tracker.push_upload(written as usize);
+                    }
+                    // Only successful writes extend the remaining direction's
+                    // timeout after the opposite direction has half-closed.
+                    if buf.amount_transferred() > prev_amt
+                        && let Some(delay) = a_to_b_delay.as_mut()
+                    {
+                        delay.as_mut().reset(
+                            tokio::time::Instant::now() + *a_to_b_timeout_duration,
+                        );
+                    }
                     match res {
                         Poll::Ready(Ok(count)) => {
                             *a_to_b = TransferState::ShuttingDown(count);
@@ -354,16 +363,27 @@ where
 
             match b_to_a {
                 TransferState::Running(buf) => {
-                    let mut on_download = |written: usize| {
-                        tracker.push_download(written);
-                    };
+                    let prev_amt = buf.amount_transferred();
                     let res = buf.poll_copy(
                         cx,
                         b.as_mut(),
                         a.as_mut(),
                         Some(last_active),
-                        Some(&mut on_download),
+                        None,
                     );
+                    let written = buf.amount_transferred() - prev_amt;
+                    if written > 0 {
+                        tracker.push_download(written as usize);
+                    }
+                    // Only successful writes extend the remaining direction's
+                    // timeout after the opposite direction has half-closed.
+                    if buf.amount_transferred() > prev_amt
+                        && let Some(delay) = b_to_a_delay.as_mut()
+                    {
+                        delay.as_mut().reset(
+                            tokio::time::Instant::now() + *b_to_a_timeout_duration,
+                        );
+                    }
                     match res {
                         Poll::Ready(Ok(count)) => {
                             *b_to_a = TransferState::ShuttingDown(count);
@@ -434,36 +454,37 @@ pub async fn copy_bidirectional(
     // zero copy is only available on linux
     #[cfg(all(target_os = "linux", feature = "zero_copy"))]
     let res = {
-        let a_raw = a.underlying_socket();
-        let b_raw = b.underlying_socket();
-        match (a_raw, b_raw) {
-            // zero copy is only available when both streams are raw TcpStream
-            (Some(a_stream), Some(b_stream)) => {
-                tracing::trace!("using zero copy for bidirectional copy");
-                let w_tracker =
-                    CopyTracker::from(UploadTracker::new(tracker.clone()));
-                let r_tracker = CopyTracker::from(DownloadTracker::new(tracker));
-                zero_copy_bidirectional(
-                    a_stream,
-                    b_stream,
-                    r_tracker,
-                    w_tracker,
-                    a_to_b_timeout_duration,
-                    b_to_a_timeout_duration,
-                )
-                .await
-            }
-            _ => {
-                copy_buf_bidirectional_with_timeout(
-                    &mut a,
-                    &mut b,
-                    size,
-                    a_to_b_timeout_duration,
-                    b_to_a_timeout_duration,
-                    tracker,
-                )
-                .await
-            }
+        if a.zero_copy_socket().is_some() && b.zero_copy_socket().is_some() {
+            // Drain prefixes inside the bidirectional copier, so replies can
+            // progress even when forwarding the request is backpressured.
+            let a_prefix = a.take_read_prefix();
+            let b_prefix = b.take_read_prefix();
+            let a_stream = a.zero_copy_socket().unwrap();
+            let b_stream = b.zero_copy_socket().unwrap();
+            tracing::trace!("using zero copy for bidirectional copy");
+            let w_tracker = CopyTracker::from(UploadTracker::new(tracker.clone()));
+            let r_tracker = CopyTracker::from(DownloadTracker::new(tracker));
+            splice::zero_copy_bidirectional_with_prefix(
+                a_stream,
+                b_stream,
+                a_prefix,
+                b_prefix,
+                r_tracker,
+                w_tracker,
+                a_to_b_timeout_duration,
+                b_to_a_timeout_duration,
+            )
+            .await
+        } else {
+            copy_buf_bidirectional_with_timeout(
+                &mut a,
+                &mut b,
+                size,
+                a_to_b_timeout_duration,
+                b_to_a_timeout_duration,
+                tracker,
+            )
+            .await
         }
     };
     #[cfg(not(all(target_os = "linux", feature = "zero_copy")))]
@@ -485,6 +506,9 @@ pub async fn copy_bidirectional(
     res
 }
 
+/// Copies both directions, shutting down the opposing writer on EOF.
+/// After one direction finishes, the remaining direction's timeout is reset
+/// whenever it successfully writes data. Reads alone do not extend the timeout.
 pub async fn copy_buf_bidirectional_with_timeout<A, B>(
     a: &mut A,
     b: &mut B,
@@ -610,6 +634,9 @@ impl<T: ReadExactSlideBase> ReadExactSlideExt for T {
         }
     }
 }
+
+#[cfg(test)]
+mod half_close_tests;
 
 #[cfg(test)]
 mod tests {

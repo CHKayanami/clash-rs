@@ -12,8 +12,7 @@ use crate::{
         dispatcher::Dispatcher,
         dns::ThreadSafeDNSResolver,
         net::{
-            get_outbound_interface,
-            update_default_outbound_interface_if_changed,
+            get_outbound_interface, update_default_outbound_interface_if_changed,
         },
     },
     config::config::TunConfig,
@@ -573,15 +572,18 @@ impl AsyncService for TunRunner {
                 }
 
                 let read_cap = if gso_enabled { 65535 } else { stack_mtu.max(2048) };
+                // The device API requires initialized storage. Reuse one
+                // receive buffer, then retain only the received packet's bytes
+                // downstream (small packets must not pin a 64 KiB GSO buffer).
+                let mut read_buf = vec![0u8; read_cap];
                 loop {
-                    let mut buf = BytesMut::zeroed(read_cap);
-                    match tun.recv(&mut buf[..]).await {
+                    match tun.recv(&mut read_buf).await {
                         Ok(0) => {
                             info!("tun reader reached EOF");
                             break;
                         }
                         Ok(n) => {
-                            buf.truncate(n);
+                            let buf = BytesMut::from(&read_buf[..n]);
                             if gso_enabled && buf.len() > stack_mtu {
                                 let pkt = buf.freeze();
                                 for single_pkt in
