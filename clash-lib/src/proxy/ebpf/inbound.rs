@@ -11,6 +11,7 @@ use crate::app::dns::{DnsResolutionHook, ThreadSafeDNSResolver};
 use crate::app::net::get_default_outbound_interface_cloned;
 use crate::app::remote_content_manager::providers::rule_provider::CidrTrie;
 use crate::config::def::EbpfConfig;
+use crate::proxy::AnyStream;
 use crate::proxy::datagram::{ChannelDatagram, UdpPacket};
 use crate::proxy::inbound::InboundHandlerTrait;
 
@@ -238,7 +239,9 @@ impl InboundHandlerTrait for EbpfInbound {
 
                     let dispatcher = self.dispatcher.clone();
                     connections.spawn(async move {
-                        dispatcher.dispatch_stream(session, Box::new(stream)).await;
+                        dispatcher
+                            .dispatch_stream(session, AnyStream::Tcp(stream))
+                            .await;
                     });
                 }
                 Err(err) => {

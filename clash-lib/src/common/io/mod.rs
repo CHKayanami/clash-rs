@@ -19,7 +19,7 @@ pub use clash_common::SlideBuffer;
 
 use crate::{
     app::dispatcher::TrafficTracker,
-    proxy::{AnyStream, ProxyStream},
+    proxy::{AnyStream, ProxyStream, dispatch_stream},
 };
 
 #[derive(Debug)]
@@ -441,7 +441,8 @@ where
     }
 }
 
-/// Select the copy loop once, keeping plain TCP statically dispatched.
+/// Select the outbound copy loop once. Specialize plain TCP inputs while
+/// keeping other inputs as enums to avoid a specialization for every pair.
 pub async fn copy_bidirectional(
     a: AnyStream,
     b: AnyStream,
@@ -462,7 +463,7 @@ pub async fn copy_bidirectional(
             )
             .await
         }
-        AnyStream::Dynamic(stream) => {
+        stream => {
             copy_to_outbound(
                 stream,
                 b,
@@ -484,23 +485,10 @@ async fn copy_to_outbound<A: ProxyStream>(
     download_timeout: Duration,
     tracker: TrafficTracker,
 ) -> Result<(u64, u64), CopyBidirectionalError> {
-    match b {
-        AnyStream::Tcp(stream) => {
-            copy_stream(a, stream, size, upload_timeout, download_timeout, tracker)
-                .await
-        }
-        AnyStream::Dynamic(stream) => {
-            copy_stream(
-                a,
-                stream,
-                size,
-                upload_timeout,
-                download_timeout,
-                tracker,
-            )
+    dispatch_stream!(b, |stream| {
+        copy_stream(a, stream, size, upload_timeout, download_timeout, tracker)
             .await
-        }
-    }
+    })
 }
 
 async fn copy_stream<A: ProxyStream, B: ProxyStream>(

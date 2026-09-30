@@ -1,6 +1,6 @@
 mod datagram;
 
-use datagram::TailscaleDatagramOutbound;
+pub(crate) use datagram::TailscaleDatagramOutbound;
 
 use std::{
     collections::{HashMap, HashSet},

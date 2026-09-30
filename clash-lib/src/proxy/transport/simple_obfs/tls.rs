@@ -357,9 +357,3 @@ impl TLSObfs {
         }
     }
 }
-
-impl From<TLSObfs> for AnyStream {
-    fn from(obfs: TLSObfs) -> Self {
-        AnyStream::new(obfs)
-    }
-}

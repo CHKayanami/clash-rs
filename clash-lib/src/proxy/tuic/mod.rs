@@ -362,7 +362,7 @@ impl Handler {
 }
 
 #[derive(Debug)]
-struct TuicDatagramOutbound {
+pub struct TuicDatagramOutbound {
     send_tx: tokio_util::sync::PollSender<UdpPacket>,
     recv_rx: tokio::sync::mpsc::Receiver<UdpPacket>,
 }

@@ -10,7 +10,7 @@ use crate::{
     session::Session,
 };
 
-use self::stream::StreamWrapper;
+pub(crate) use self::stream::StreamWrapper;
 
 use super::{
     ConnectorType, DialWithConnector, OutboundHandler, OutboundType,

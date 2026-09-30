@@ -572,7 +572,7 @@ mod tests {
         };
 
         let mut client = VlessStream::new(
-            AnyStream::new(mock),
+            AnyStream::dynamic(mock),
             "5415d8e0-df92-3655-afa4-b79de66413f5",
             &tcp_dest(),
             VLESS_COMMAND_TCP,
@@ -660,7 +660,7 @@ mod tests {
         };
 
         let mut client = VlessStream::new(
-            AnyStream::new(mock),
+            AnyStream::dynamic(mock),
             "5415d8e0-df92-3655-afa4-b79de66413f5",
             &tcp_dest(),
             VLESS_COMMAND_TCP,

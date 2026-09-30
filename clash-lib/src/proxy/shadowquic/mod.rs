@@ -3,7 +3,7 @@ use std::{collections::HashMap, fmt::Debug, io, net::SocketAddr, str::FromStr};
 
 use async_trait::async_trait;
 
-use compat::UdpSessionWrapper;
+pub(crate) use compat::UdpSessionWrapper;
 use shadowquic::{
     config,
     msgs::socks5::SocksAddr as SQAddr,

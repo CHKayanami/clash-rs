@@ -1,3 +1,4 @@
+pub(crate) use stack::{tcp::SocketPair, udp::UdpPair};
 use self::wireguard::Config;
 use super::{
     AnyOutboundDatagram, AnyStream, ConnectorType, DialWithConnector,

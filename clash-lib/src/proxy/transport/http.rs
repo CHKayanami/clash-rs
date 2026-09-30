@@ -345,12 +345,6 @@ impl HttpStream {
     }
 }
 
-impl From<HttpStream> for AnyStream {
-    fn from(s: HttpStream) -> Self {
-        AnyStream::new(s)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

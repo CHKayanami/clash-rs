@@ -1,3 +1,4 @@
+pub(crate) use vmess_impl::VmessStream;
 use super::{
     AnyOutboundDatagram, AnyStream, ConnectorType, DialWithConnector,
     HandlerCommonOptions, OutboundHandler, OutboundType, PlainProxyAPIResponse,
@@ -13,7 +14,7 @@ use async_trait::async_trait;
 use erased_serde::Serialize as ErasedSerialize;
 use std::{collections::HashMap, io, sync::Arc};
 use tracing::debug;
-use vmess_impl::OutboundDatagramVmess;
+pub(crate) use vmess_impl::OutboundDatagramVmess;
 
 mod vmess_impl;
 

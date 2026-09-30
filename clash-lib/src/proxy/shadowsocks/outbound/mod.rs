@@ -1,10 +1,7 @@
+pub(crate) use datagram::{OutboundDatagramShadowsocks, ShadowsocksUdpIo};
+pub(crate) use stream::ShadowSocksStream;
 mod datagram;
 mod stream;
-
-use self::{
-    datagram::{OutboundDatagramShadowsocks, ShadowsocksUdpIo},
-    stream::ShadowSocksStream,
-};
 
 use crate::{
     app::dns::ThreadSafeDNSResolver,

@@ -14,7 +14,7 @@ use crate::{
     session::Session,
 };
 use async_trait::async_trait;
-use datagram::Socks5Datagram;
+pub(crate) use datagram::Socks5Datagram;
 use erased_serde::Serialize as ErasedSerialize;
 use std::{collections::HashMap, fmt::Debug, sync::Arc};
 use tracing::{debug, trace};

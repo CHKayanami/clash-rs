@@ -1,3 +1,5 @@
+pub(crate) use http::HTTPObfs;
+pub(crate) use tls::TLSObfs;
 mod http;
 mod tls;
 

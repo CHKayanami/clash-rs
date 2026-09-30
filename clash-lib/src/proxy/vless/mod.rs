@@ -1,7 +1,6 @@
-use self::{
-    stream::{VLESS_COMMAND_MUX, VLESS_COMMAND_TCP, VLESS_COMMAND_UDP, VlessStream},
-    vision::VisionStream,
-};
+pub(crate) use stream::VlessStream;
+pub(crate) use vision::VisionStream;
+use self::stream::{VLESS_COMMAND_MUX, VLESS_COMMAND_TCP, VLESS_COMMAND_UDP};
 use super::{
     AnyOutboundDatagram, AnyStream, ConnectorType, DialWithConnector,
     HandlerCommonOptions, OutboundHandler, OutboundType, PlainProxyAPIResponse,

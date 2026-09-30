@@ -1127,7 +1127,7 @@ mod tests {
             .expect_name()
             .return_const(PROXY_DIRECT.to_owned());
         mock_handler.expect_connect_stream().returning(|_, _| {
-            Ok(AnyStream::new(
+            Ok(AnyStream::dynamic(
                 tokio_test::io::Builder::new()
                     .wait(Duration::from_secs(10))
                     .build(),

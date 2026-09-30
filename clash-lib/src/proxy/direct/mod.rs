@@ -225,7 +225,7 @@ mod tests {
             };
             let handler = Handler::new("DIRECT");
             let transport = if boxed {
-                AnyStream::new(
+                AnyStream::dynamic(
                     handler
                         .connect_stream(&sess, make_resolver())
                         .await

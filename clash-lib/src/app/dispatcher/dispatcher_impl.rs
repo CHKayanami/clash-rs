@@ -1,3 +1,4 @@
+use crate::proxy::dispatch_datagram;
 use crate::{
     app::{
         dns::ClashResolver, outbound::manager::ThreadSafeOutboundManager,
@@ -1091,8 +1092,8 @@ async fn establish_outbound_session(
     debug!("{} outbound datagram connected", sess);
 
     let tracker_info = Arc::new(TrackerInfo::new(&sess, rule));
-    let established = match outbound_datagram {
-        AnyOutboundDatagram::Direct(datagram) => spawn_udp_relay(
+    let established = dispatch_datagram!(outbound_datagram, |datagram| {
+        spawn_udp_relay(
             datagram,
             sess,
             orig_inbound_dst,
@@ -1100,26 +1101,8 @@ async fn establish_outbound_session(
             established_tx,
             tracker_info,
             (is_fake_ip, is_direct),
-        ),
-        AnyOutboundDatagram::Udp(datagram) => spawn_udp_relay(
-            datagram,
-            sess,
-            orig_inbound_dst,
-            ctx,
-            established_tx,
-            tracker_info,
-            (is_fake_ip, is_direct),
-        ),
-        AnyOutboundDatagram::Dynamic(datagram) => spawn_udp_relay(
-            datagram,
-            sess,
-            orig_inbound_dst,
-            ctx,
-            established_tx,
-            tracker_info,
-            (is_fake_ip, is_direct),
-        ),
-    };
+        )
+    });
     Some(established)
 }
 
@@ -1551,7 +1534,7 @@ mod tests {
         drop(outgoing_tx);
         let relay = tokio::spawn(async move {
             relay_datagram(
-                AnyOutboundDatagram::new(BackpressuredDatagram {
+                AnyOutboundDatagram::dynamic(BackpressuredDatagram {
                     replies: reply_rx,
                     permits: permit_rx,
                     sent: sent_tx,

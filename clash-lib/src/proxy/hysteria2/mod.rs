@@ -1,3 +1,4 @@
+pub(crate) use datagram::HysteriaDatagramOutbound;
 mod codec;
 mod congestion;
 mod datagram;
@@ -10,7 +11,7 @@ use quinn_proto::congestion::{BbrConfig, ControllerFactory};
 use self::{
     codec::Hy2TcpCodec,
     congestion::BrutalConfig,
-    datagram::{HysteriaDatagramOutbound, UdpSession},
+    datagram::UdpSession,
     h3::{
         H3_STREAM_QPACK_DECODER, H3_STREAM_QPACK_ENCODER, auth_request_frame, client_preface,
         read_h3_response_headers,

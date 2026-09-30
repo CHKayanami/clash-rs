@@ -1,3 +1,11 @@
+#[cfg(feature = "shadowsocks")]
+pub(crate) use simple_obfs::{HTTPObfs, TLSObfs};
+pub(crate) use grpc::GrpcStream;
+pub(crate) use h2::Http2Stream;
+pub(crate) use http::HttpStream;
+pub(crate) use ws::{WebsocketConn, WebsocketEarlyDataConn};
+#[cfg(feature = "shadowsocks")]
+pub(crate) use shadow_tls::VerifiedStream;
 mod grpc;
 mod h2;
 mod http;

@@ -101,8 +101,8 @@ impl WebsocketEarlyDataConn {
                     "msg: websocket early data handshake failed",
                 ));
             }
-            let rv = Box::new(WebsocketConn::from_websocket(stream));
-            Ok(AnyStream::from_boxed(rv))
+            let rv = WebsocketConn::from_websocket(stream);
+            Ok(AnyStream::new(rv))
         }
 
         Box::pin(run(stream, req, config))

@@ -40,7 +40,7 @@ pub struct TailscaleDatagramOutbound {
 }
 
 impl TailscaleDatagramOutbound {
-    pub fn new(
+    pub(super) fn new(
         socket: ::tailscale::netstack::UdpSocket,
         resolver: ThreadSafeDNSResolver,
         port_reservation: UdpPortReservation,

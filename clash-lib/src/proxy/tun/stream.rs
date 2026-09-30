@@ -13,7 +13,7 @@ use crate::{
     session::{Network, Session, Type},
 };
 
-pub(crate) async fn handle_inbound_stream<S: ProxyStream + Sync + 'static>(
+pub(crate) async fn handle_inbound_stream<S: ProxyStream + Sync + Into<AnyStream> + 'static>(
     stream: S,
     source: SocketAddr,
     destination: SocketAddr,

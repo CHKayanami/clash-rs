@@ -1,3 +1,4 @@
+pub(crate) use stream::VmessStream;
 mod cipher;
 mod client;
 mod header;

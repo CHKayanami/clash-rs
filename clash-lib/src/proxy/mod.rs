@@ -104,6 +104,7 @@ pub trait ProxyStream: AsyncRead + AsyncWrite + Send + Unpin {
     }
 }
 mod io_types;
+pub(crate) use io_types::{dispatch_datagram, dispatch_stream};
 pub use io_types::{AnyOutboundDatagram, AnyStream};
 
 impl ProxyStream for tokio::net::TcpStream {

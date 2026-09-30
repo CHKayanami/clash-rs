@@ -13,7 +13,7 @@ use crate::{
     session::SocksAddr,
 };
 
-pub(crate) struct Socks5Datagram {
+pub struct Socks5Datagram {
     // hold the socket to keep it alive and drop it when this is dropped
     _socket: AnyStream,
     remote: SocketAddr,

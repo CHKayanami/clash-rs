@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use rand::{RngExt, distr::Distribution};
 use std::{io, sync::Arc};
-use stream::VerifiedStream;
+pub(crate) use stream::VerifiedStream;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use utils::{
     Hmac, feed_rustls_client_connection, modify_client_hello, parse_server_hello,

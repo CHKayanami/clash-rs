@@ -1249,7 +1249,7 @@ mod tests {
         };
 
         let mut vs =
-            VisionStream::new(AnyStream::new(mock), TEST_UUID_STR, None).unwrap();
+            VisionStream::new(AnyStream::dynamic(mock), TEST_UUID_STR, None).unwrap();
 
         // 1. Initial write of 50 bytes of app data
         let payload = vec![0x42; 50];

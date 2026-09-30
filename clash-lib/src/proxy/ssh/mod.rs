@@ -29,7 +29,7 @@ use crate::{
 };
 
 /// Wrapper for `ChannelStream` for `Debug` trait
-struct ChannelStreamWrapper {
+pub struct ChannelStreamWrapper {
     inner: ChannelStream<Msg>,
 }
 

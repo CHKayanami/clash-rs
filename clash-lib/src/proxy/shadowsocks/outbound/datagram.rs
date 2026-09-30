@@ -276,7 +276,7 @@ where
 const NOTHING_QUEUED: usize = usize::MAX;
 
 /// Shadowsocks UDP I/O that ProxySocket required
-pub(crate) struct ShadowsocksUdpIo {
+pub struct ShadowsocksUdpIo {
     w: Mutex<SplitSink<AnyOutboundDatagram, UdpPacket>>,
     r: Mutex<SplitStream<AnyOutboundDatagram>>,
     /// Length of the datagram handed to the sink but not yet flushed, or

@@ -1,3 +1,4 @@
+pub(crate) use datagram::OutboundDatagramTrojan;
 use erased_serde::Serialize as ErasedSerialize;
 use std::{collections::HashMap, io, sync::Arc};
 

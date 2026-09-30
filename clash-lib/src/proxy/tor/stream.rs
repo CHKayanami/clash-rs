@@ -11,7 +11,7 @@ use tokio::{
 };
 
 #[derive(Debug)]
-pub(super) struct StreamWrapper(Arc<Mutex<DataStream>>);
+pub struct StreamWrapper(Arc<Mutex<DataStream>>);
 
 impl StreamWrapper {
     pub(super) fn new(stream: DataStream) -> Self {
