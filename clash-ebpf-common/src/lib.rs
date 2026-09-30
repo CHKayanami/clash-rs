@@ -69,11 +69,13 @@ impl RedirectTuple {
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct RedirectEntry {
+    pub last_seen_ns: u64,
     pub ifindex: u32,
     pub from_wan: u8,
     pub _pad0: [u8; 3],
     pub smac: [u8; 6],
     pub dmac: [u8; 6],
+    pub _pad1: [u8; 4],
 }
 
 pub const DIRECT_TRACK_STATE_ACTIVE: u8 = 0;

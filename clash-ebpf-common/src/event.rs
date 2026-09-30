@@ -1,10 +1,8 @@
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 #[repr(C)]
 pub struct PIDName {
-    pub last_seen_ns: u64,
     pub pid: u32,
     pub pname: [u8; 16],
-    pub _pad: [u8; 4],
 }
 
 #[repr(u32)]

@@ -10,10 +10,19 @@ fn main() {
     println!("cargo:rerun-if-changed={}", ebpf_crate.join("Cargo.toml").display());
     println!("cargo:rerun-if-changed={}", manifest_dir.join("../clash-ebpf-common").display());
 
+    let profile = if std::env::var("PROFILE").as_deref() == Ok("debug") {
+        "debug"
+    } else {
+        "release"
+    };
+    let artifact = format!("target/bpfel-unknown-none/{profile}/clash-ebpf-bpf");
     let candidates = [
-        ebpf_crate.join("target/bpfel-unknown-none/release/clash-ebpf-bpf"),
-        manifest_dir.join("../target/bpfel-unknown-none/release/clash-ebpf-bpf"),
+        ebpf_crate.join(&artifact),
+        manifest_dir.join("..").join(&artifact),
     ];
+    for candidate in &candidates {
+        println!("cargo:rerun-if-changed={}", candidate.display());
+    }
 
     let found = candidates.iter().find(|p| p.exists() && p.metadata().map(|m| m.len()).unwrap_or(0) > 0);
 

@@ -1556,6 +1556,7 @@ dependencies = [
  "arc-swap",
  "async-trait",
  "aya",
+ "aya-obj",
  "bytes",
  "clash-ebpf-common",
  "futures",

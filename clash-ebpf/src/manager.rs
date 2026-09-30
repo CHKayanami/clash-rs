@@ -418,18 +418,12 @@ impl EbpfManager {
             &self.config.bypass_dscps,
             &self.config.bypass_fwmarks,
             Some(&ns),
-        ) {
-            bpf_manager.unload(Some(&ns));
-            return Err(EbpfError::Bpf(e));
-        }
-
-        // Publish listener socket fds into LISTEN_SOCKET_MAP for bpf_sk_assign.
-        // This must happen after both listener binding and BPF loading.
-        if let Err(e) = bpf_manager.publish_listener_sockets(
-            listener.tcp_v4_raw_fd(),
-            listener.tcp_v6_raw_fd(),
-            listener.udp_v4_raw_fd(),
-            listener.udp_v6_raw_fd(),
+            (
+                listener.tcp_v4_raw_fd(),
+                listener.tcp_v6_raw_fd(),
+                listener.udp_v4_raw_fd(),
+                listener.udp_v6_raw_fd(),
+            ),
         ) {
             bpf_manager.unload(Some(&ns));
             return Err(EbpfError::Bpf(e));

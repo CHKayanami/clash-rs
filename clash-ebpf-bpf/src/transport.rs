@@ -1,6 +1,7 @@
 use crate::maps::{PARSE_CTX_MAP, PARSED_PKT_MAP};
 use aya_ebpf::programs::TcContext;
 use aya_ebpf_bindings::helpers::bpf_skb_load_bytes;
+use clash_ebpf_bpf::policy::ipv4_is_fragment;
 use clash_ebpf_common::{In6Addr, ParseTransportCtx, Tuples};
 use core::{ffi::c_long, mem, ptr};
 use network_types::{
@@ -260,7 +261,7 @@ impl ParseTransportExt for ParseTransportCtx {
                     mem::size_of::<EthHdr>(),
                 )
             };
-            self.ethh.ether_type = (ctx.skb.protocol() as u16).to_be();
+            self.ethh.ether_type = ctx.skb.protocol() as u16;
         }
 
         self.ihl = 0;
@@ -315,8 +316,7 @@ impl ParseTransportExt for ParseTransportCtx {
             // Keep every fragment on the normal kernel path. Redirecting only the
             // first fragment would split one datagram across two network namespaces,
             // so neither side could reassemble it. DF is not a fragmentation bit.
-            let frag = u16::from_be(self.iph.frag_offset());
-            if frag & 0x3FFF != 0 {
+            if ipv4_is_fragment(&self.iph) {
                 return Err(PARSE_FRAGMENT as c_long);
             }
 
@@ -524,7 +524,7 @@ impl ParseTransportExt for ParseTransportCtx {
             self.ethh.src_addr.copy_from_slice(&eth.src_addr);
             offset += mem::size_of::<EthHdr>() as u32;
         } else {
-            self.ethh.ether_type = (ctx.skb.protocol() as u16).to_be();
+            self.ethh.ether_type = ctx.skb.protocol() as u16;
         }
 
         if self.ethh.ether_type == ETH_P_IP.to_be() {
@@ -543,8 +543,7 @@ impl ParseTransportExt for ParseTransportCtx {
             self.ihl = iph.ihl();
             self.l4proto = iph.proto;
 
-            let frag = u16::from_be(iph.frag_offset());
-            if frag & 0x3FFF != 0 {
+            if ipv4_is_fragment(iph) {
                 return Err(PARSE_FRAGMENT as c_long);
             }
 

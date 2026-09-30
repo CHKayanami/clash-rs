@@ -23,6 +23,18 @@ use std::str::FromStr;
 use std::sync::atomic::{AtomicU8, Ordering};
 use tracing::{debug, error, info, warn};
 
+/// Keep inactive process tracking maps minimal; their BPF references still
+/// require a real map, so zero capacity is not valid for a hash map.
+fn load_object(obj_bytes: &[u8], proxy_local: bool) -> Result<Ebpf, String> {
+    let mut loader = EbpfLoader::new();
+    if !proxy_local {
+        loader.map_max_entries("COOKIE_PID_MAP", 1);
+    }
+    loader
+        .load(obj_bytes)
+        .map_err(|e| format!("Failed to load eBPF object: {e}"))
+}
+
 const BPF_MAP_UPDATE_ELEM: libc::c_long = 2;
 const BPF_MAP_DELETE_ELEM: libc::c_long = 3;
 const BPF_MAP_UPDATE_BATCH: libc::c_long = 26;
@@ -385,6 +397,7 @@ impl BpfProgramManager {
         bypass_dscps: &[u8],
         bypass_fwmarks: &[u32],
         netns: Option<&crate::netns::DaeNs>,
+        listener_fds: (i32, Option<i32>, i32, Option<i32>),
     ) -> Result<(), String> {
         if obj_bytes.is_empty() {
             return Err(
@@ -397,10 +410,7 @@ impl BpfProgramManager {
             "Loading embedded eBPF programs ({} bytes)...",
             obj_bytes.len()
         );
-        let mut loader = EbpfLoader::new();
-        let mut bpf = loader
-            .load(obj_bytes)
-            .map_err(|e| format!("Failed to load eBPF object: {e}"))?;
+        let mut bpf = load_object(obj_bytes, param.proxy_local != 0)?;
 
         // 1. Initialize parameter map
         let map = bpf
@@ -759,6 +769,26 @@ impl BpfProgramManager {
             self.attach_cgroup()?;
         }
 
+        // Populate sockets and prepare the complete receive/reply path before
+        // enabling any LAN/WAN hook that can redirect live traffic.
+        self.publish_listener_sockets(
+            listener_fds.0,
+            listener_fds.1,
+            listener_fds.2,
+            listener_fds.3,
+        )?;
+
+        // 16. Attach TC Ingress on dae0 for reply short-circuit and MAC restoration (in host netns)
+        self.attach_tc_interface("dae0", true, "dae0_ingress", false)?;
+
+        // 17. Attach sk_lookup and TC Ingress on dae0peer inside daens
+        let ns = netns.ok_or_else(|| "daens namespace is required".to_string())?;
+        self.attach_sk_lookup(ns)?;
+        ns.with_daens(|| {
+            self.attach_tc_interface("dae0peer", true, "dae0peer_ingress", true)
+        })
+        .map_err(|e| format!("failed to enter daens for TC attachment: {e}"))??;
+
         // 14. Attach TC Ingress on configured/detected LAN interfaces (局域网入站拦截)
         let detected_lan_fallback;
         let effective_lan = if lan_interfaces.is_empty()
@@ -812,17 +842,6 @@ impl BpfProgramManager {
             self.attach_tc_interface(wan, false, prog_name, false)?;
             info!("Attached TC egress ({}) on {}", prog_name, wan);
         }
-
-        // 16. Attach TC Ingress on dae0 for reply short-circuit and MAC restoration (in host netns)
-        self.attach_tc_interface("dae0", true, "dae0_ingress", false)?;
-
-        // 17. Attach sk_lookup and TC Ingress on dae0peer inside daens
-        let ns = netns.ok_or_else(|| "daens namespace is required".to_string())?;
-        self.attach_sk_lookup(ns)?;
-        ns.with_daens(|| {
-            self.attach_tc_interface("dae0peer", true, "dae0peer_ingress", true)
-        })
-        .map_err(|e| format!("failed to enter daens for TC attachment: {e}"))??;
 
         info!("eBPF programs and TC/cgroup hooks successfully attached");
         Ok(())
@@ -1594,6 +1613,29 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires root and freshly built eBPF bytecode"]
+    fn process_tracking_capacity_follows_local_proxy_setting() {
+        for (proxy_local, expected) in [(false, 1), (true, 65536)] {
+            let mut bpf = load_object(EMBEDDED_BPF_OBJECT, proxy_local).unwrap();
+            let aya::maps::Map::HashMap(map) = bpf.map("COOKIE_PID_MAP").unwrap() else {
+                panic!("COOKIE_PID_MAP must be a hash map");
+            };
+            assert_eq!(map.info().unwrap().max_entries(), expected);
+            // Even the minimal map must remain compatible with every program.
+            for (name, program) in bpf.programs_mut() {
+                let result = match program {
+                    aya::programs::Program::SchedClassifier(p) => p.load(),
+                    aya::programs::Program::SkLookup(p) => p.load(),
+                    aya::programs::Program::CgroupSock(p) => p.load(),
+                    aya::programs::Program::CgroupSockAddr(p) => p.load(),
+                    _ => panic!("unexpected program {name}"),
+                };
+                result.unwrap_or_else(|error| panic!("load {name}: {error}"));
+            }
+        }
+    }
+
+    #[test]
     fn empty_object_is_a_startup_error() {
         let mut manager = BpfProgramManager::new();
         let empty_strings = Vec::<String>::new();
@@ -1621,6 +1663,7 @@ mod tests {
                 &empty_u8,
                 &empty_u32,
                 None,
+                (-1, None, -1, None),
             )
             .expect_err("an empty object must not produce a successful datapath");
 

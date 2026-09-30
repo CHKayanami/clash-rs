@@ -10,17 +10,21 @@ mod maps;
 mod transport;
 
 use aya_ebpf::bindings::{__sk_buff, TC_ACT_OK, bpf_sk_lookup};
+use aya_ebpf::btf_maps::lpm_trie::Key;
 use aya_ebpf::helpers::{bpf_get_current_pid_tgid, bpf_redirect};
 use aya_ebpf::macros::{cgroup_sock, cgroup_sock_addr};
-use aya_ebpf::maps::lpm_trie::Key;
 use aya_ebpf::programs::{SkLookupContext, SockAddrContext, SockContext, TcContext};
 use aya_ebpf_bindings::helpers::{
-    bpf_get_current_comm, bpf_get_socket_cookie, bpf_ktime_get_ns,
-    bpf_skb_change_head, bpf_skb_store_bytes,
+    bpf_get_current_comm, bpf_get_socket_cookie, bpf_ktime_get_ns, bpf_sk_fullsock,
+    bpf_sk_storage_get, bpf_skb_change_head, bpf_skb_store_bytes,
+};
+use clash_ebpf_bpf::policy::{
+    REDIRECT_REFRESH_NS, RedirectTrackingAction, UDP_CONN_TIMEOUT_NS,
+    redirect_entry_needs_update, redirect_tracking_action,
 };
 use clash_ebpf_common::{
-    DAE_BYPASS_MARK, DAE_TPROXY_MARK, DIRECT_TRACK_STATE_ACTIVE, DaeEvent,
-    DaeEventType, DaeParam, DirectTrackEntry, PIDName, RedirectEntry, RedirectTuple,
+    DAE_BYPASS_MARK, DAE_TPROXY_MARK, DIRECT_TRACK_STATE_ACTIVE, DaeEventType,
+    DaeParam, DirectTrackEntry, PIDName, RedirectEntry, RedirectTuple,
 };
 use core::mem;
 use maps::*;
@@ -34,8 +38,7 @@ const SK_DROP: u32 = 0;
 const SK_PASS: u32 = 1;
 
 // ── Conntrack timeout constants ──
-const UDP_CONN_TIMEOUT_NS: u64 = 120_000_000_000; // 120 seconds
-const CONN_TRACK_UPDATE_INTERVAL_NS: u64 = 1_000_000_000; // 1 second
+const CONN_TRACK_UPDATE_INTERVAL_NS: u64 = REDIRECT_REFRESH_NS;
 
 // ── SOCKMAP key constants ──
 const SK_TCP4: u32 = 0;
@@ -83,13 +86,12 @@ pub fn send_dae_event(
     if let Some(d) = dip {
         e.dip.copy_from_slice(d);
     }
-    let _ = EVENT_RINGBUF.output::<DaeEvent>(e, 0);
+    let _ = EVENT_RINGBUF.output(e, 0);
 }
 
 #[inline(always)]
 fn get_pid_pname(pid_pname: &mut PIDName) -> i32 {
     let pid_tgid = bpf_get_current_pid_tgid();
-    pid_pname.last_seen_ns = unsafe { bpf_ktime_get_ns() };
     pid_pname.pid = (pid_tgid >> 32) as u32;
 
     let ret = unsafe {
@@ -109,15 +111,12 @@ fn update_map_elem_by_cookie(cookie: u64) -> i32 {
     if cookie == 0 {
         return 0;
     }
-    let now = unsafe { bpf_ktime_get_ns() };
-    if let Some(ptr) = COOKIE_PID_MAP.get_ptr_mut(&cookie) {
-        let entry = unsafe { &mut *ptr };
-        entry.last_seen_ns = now;
-        return 0;
-    }
     let mut val: PIDName = unsafe { mem::zeroed() };
     let _ = get_pid_pname(&mut val);
-    let _ = COOKIE_PID_MAP.insert(&cookie, &val, 0);
+    if unsafe { COOKIE_PID_MAP.get(&cookie) } != Some(&val) {
+        // Keep whole-value replacement atomic when shared sockets change owner.
+        let _ = COOKIE_PID_MAP.insert(&cookie, &val, 0);
+    }
     0
 }
 
@@ -219,30 +218,19 @@ fn check_direct_track(
         return false;
     }
     if let Some(entry) = unsafe { DIRECT_TRACK.get(tuple) } {
-        let last_seen_ns = entry.last_seen_ns;
-        let now = unsafe { bpf_ktime_get_ns() };
-
-        if is_udp {
-            if now.wrapping_sub(last_seen_ns) > UDP_CONN_TIMEOUT_NS {
-                let _ = DIRECT_TRACK.remove(tuple);
-                return false;
-            }
-            if now.wrapping_sub(last_seen_ns) > CONN_TRACK_UPDATE_INTERVAL_NS {
-                let updated = DirectTrackEntry {
-                    last_seen_ns: now,
-                    state: DIRECT_TRACK_STATE_ACTIVE,
-                    _pad: [0; 7],
-                };
-                let _ = DIRECT_TRACK.insert(tuple, &updated, 0);
-            }
-            return true;
-        }
-
         if is_tcp {
             if is_fin_rst {
                 let _ = DIRECT_TRACK.remove(tuple);
-            } else if now.wrapping_sub(last_seen_ns) > CONN_TRACK_UPDATE_INTERVAL_NS
-            {
+            }
+            return true;
+        }
+        if is_udp {
+            let now = unsafe { bpf_ktime_get_ns() };
+            if now.wrapping_sub(entry.last_seen_ns) > UDP_CONN_TIMEOUT_NS {
+                let _ = DIRECT_TRACK.remove(tuple);
+                return false;
+            }
+            if now.wrapping_sub(entry.last_seen_ns) > CONN_TRACK_UPDATE_INTERVAL_NS {
                 let updated = DirectTrackEntry {
                     last_seen_ns: now,
                     state: DIRECT_TRACK_STATE_ACTIVE,
@@ -265,6 +253,48 @@ fn register_direct_track(tuple: &RedirectTuple) {
         _pad: [0; 7],
     };
     let _ = DIRECT_TRACK.insert(tuple, &direct_entry, 0);
+}
+
+/// A new TCP SYN starts a fresh decision for a reused tuple. UDP redirect
+/// entries expire like direct entries so they do not pin later datagrams forever.
+#[inline(always)]
+fn check_redirect_track(
+    tuple: &RedirectTuple,
+    is_udp: bool,
+    is_pure_syn: bool,
+) -> (Option<&'static RedirectEntry>, u64) {
+    if is_pure_syn {
+        let _ = DIRECT_TRACK.remove(tuple);
+        let _ = REDIRECT_TRACK.remove(tuple);
+        return (None, 0);
+    }
+    let entry = unsafe { REDIRECT_TRACK.get(tuple) };
+    let now = if is_udp {
+        unsafe { bpf_ktime_get_ns() }
+    } else {
+        0
+    };
+    if redirect_tracking_action(entry, is_udp, false, now)
+        == RedirectTrackingAction::Expired
+    {
+        let _ = REDIRECT_TRACK.remove(tuple);
+        return (None, now);
+    }
+    (entry, now)
+}
+
+#[inline(always)]
+fn publish_redirect_track(
+    tuple: &RedirectTuple,
+    old: Option<&RedirectEntry>,
+    mut entry: RedirectEntry,
+    is_udp: bool,
+    now: u64,
+) {
+    if redirect_entry_needs_update(old, &entry, is_udp, now) {
+        entry.last_seen_ns = if is_udp { now } else { 0 };
+        let _ = REDIRECT_TRACK.insert(tuple, &entry, 0);
+    }
 }
 
 // ── Redirect helper: sets cb[] and performs bpf_redirect ──
@@ -372,6 +402,9 @@ fn handle_lan_ipv4(
         _pad: [0; 2],
     };
 
+    let (tracked, track_now) = check_redirect_track(&tuple, is_udp, is_pure_syn);
+    let is_redirected = tracked.is_some();
+
     // 1. 源 IP / 源端口 静态 Bypass 与白名单判定
     if is_src_ip4_bypassed(src_ip_be) {
         return TC_ACT_OK;
@@ -403,12 +436,14 @@ fn handle_lan_ipv4(
         }
 
         // 动态直连流表 Fast-Path 查询 (针对非纯 SYN 报文)
-        if check_direct_track(&tuple, is_tcp, is_udp, is_fin_rst, is_pure_syn) {
+        if !is_redirected
+            && check_direct_track(&tuple, is_tcp, is_udp, is_fin_rst, is_pure_syn)
+        {
             return TC_ACT_OK;
         }
 
         // 动态下发直连判定 (直连状态变化时更新，命中则建立 DIRECT_TRACK 连接追踪)
-        if is_dynamic_dst_ip4_bypassed(ip_be) {
+        if !is_redirected && is_dynamic_dst_ip4_bypassed(ip_be) {
             register_direct_track(&tuple);
             return TC_ACT_OK;
         }
@@ -431,15 +466,17 @@ fn handle_lan_ipv4(
         ([0u8; 6], [0u8; 6])
     };
     let entry = RedirectEntry {
+        last_seen_ns: 0,
         ifindex,
         from_wan: 0,
         _pad0: [0; 3],
         smac,
         dmac,
+        _pad1: [0; 4],
     };
     unsafe {
-        let is_new_flow = REDIRECT_TRACK.get(&tuple).is_none();
-        let _ = REDIRECT_TRACK.insert(&tuple, &entry, 0);
+        let is_new_flow = tracked.is_none();
+        publish_redirect_track(&tuple, tracked, entry, is_udp, track_now);
         let l4proto = if pkt.l4proto == IPPROTO_TCP {
             pkt.listener_l4proto
         } else {
@@ -494,6 +531,9 @@ fn handle_lan_ipv6(
         _pad: [0; 2],
     };
 
+    let (tracked, track_now) = check_redirect_track(&tuple, is_udp, is_pure_syn);
+    let is_redirected = tracked.is_some();
+
     // 1. 源 IP / 源端口 静态 Bypass 与白名单判定
     if is_src_ip6_bypassed(src_ip) {
         return TC_ACT_OK;
@@ -520,12 +560,14 @@ fn handle_lan_ipv6(
         }
 
         // 动态直连流表 Fast-Path 查询 (针对非纯 SYN 报文)
-        if check_direct_track(&tuple, is_tcp, is_udp, is_fin_rst, is_pure_syn) {
+        if !is_redirected
+            && check_direct_track(&tuple, is_tcp, is_udp, is_fin_rst, is_pure_syn)
+        {
             return TC_ACT_OK;
         }
 
         // 动态下发直连判定 (直连状态变化时更新，命中则建立 DIRECT_TRACK 连接追踪)
-        if is_dynamic_dst_ip6_bypassed(dst_ip) {
+        if !is_redirected && is_dynamic_dst_ip6_bypassed(dst_ip) {
             register_direct_track(&tuple);
             return TC_ACT_OK;
         }
@@ -548,15 +590,17 @@ fn handle_lan_ipv6(
         ([0u8; 6], [0u8; 6])
     };
     let entry = RedirectEntry {
+        last_seen_ns: 0,
         ifindex,
         from_wan: 0,
         _pad0: [0; 3],
         smac,
         dmac,
+        _pad1: [0; 4],
     };
     unsafe {
-        let is_new_flow = REDIRECT_TRACK.get(&tuple).is_none();
-        let _ = REDIRECT_TRACK.insert(&tuple, &entry, 0);
+        let is_new_flow = tracked.is_none();
+        publish_redirect_track(&tuple, tracked, entry, is_udp, track_now);
         let l4proto = if pkt.l4proto == IPPROTO_TCP {
             pkt.listener_l4proto
         } else {
@@ -661,6 +705,7 @@ fn handle_wan_ipv4(
     link_h_len: usize,
     pkt: &ParsedPacket,
     pid_pname: Option<&PIDName>,
+    socket_was_proxied: bool,
 ) -> i32 {
     let src_port = pkt.tuples.five.src_port;
     let dst_port = pkt.tuples.five.dst_port;
@@ -693,6 +738,9 @@ fn handle_wan_ipv4(
         _pad: [0; 2],
     };
 
+    let (tracked, track_now) = check_redirect_track(&tuple, is_udp, is_pure_syn);
+    let is_redirected = tracked.is_some() || socket_was_proxied;
+
     // 1. 常规业务流量目标过滤 (DNS 53 强制劫持到代理)
     if dst_port != 53 {
         // 本机直连流量放行
@@ -708,12 +756,14 @@ fn handle_wan_ipv4(
         }
 
         // 动态直连流表 Fast-Path 查询 (针对非纯 SYN 报文)
-        if check_direct_track(&tuple, is_tcp, is_udp, is_fin_rst, is_pure_syn) {
+        if !is_redirected
+            && check_direct_track(&tuple, is_tcp, is_udp, is_fin_rst, is_pure_syn)
+        {
             return TC_ACT_OK;
         }
 
         // 动态下发直连判定 (直连状态变化时更新，命中则建立 DIRECT_TRACK 连接追踪)
-        if is_dynamic_dst_ip4_bypassed(ip_be) {
+        if !is_redirected && is_dynamic_dst_ip4_bypassed(ip_be) {
             register_direct_track(&tuple);
             return TC_ACT_OK;
         }
@@ -736,15 +786,17 @@ fn handle_wan_ipv4(
         ([0u8; 6], [0u8; 6])
     };
     let entry = RedirectEntry {
+        last_seen_ns: 0,
         ifindex,
         from_wan: 1,
         _pad0: [0; 3],
         smac,
         dmac,
+        _pad1: [0; 4],
     };
     unsafe {
-        let is_new_flow = REDIRECT_TRACK.get(&tuple).is_none();
-        let _ = REDIRECT_TRACK.insert(&tuple, &entry, 0);
+        let is_new_flow = tracked.is_none();
+        publish_redirect_track(&tuple, tracked, entry, is_udp, track_now);
         let l4proto = if pkt.l4proto == IPPROTO_TCP {
             pkt.listener_l4proto
         } else {
@@ -780,6 +832,7 @@ fn handle_wan_ipv6(
     link_h_len: usize,
     pkt: &ParsedPacket,
     pid_pname: Option<&PIDName>,
+    socket_was_proxied: bool,
 ) -> i32 {
     let src_port = pkt.tuples.five.src_port;
     let dst_port = pkt.tuples.five.dst_port;
@@ -802,6 +855,9 @@ fn handle_wan_ipv6(
         _pad: [0; 2],
     };
 
+    let (tracked, track_now) = check_redirect_track(&tuple, is_udp, is_pure_syn);
+    let is_redirected = tracked.is_some() || socket_was_proxied;
+
     // 1. 常规业务流量目标过滤 (DNS 53 强制劫持到代理)
     if dst_port != 53 {
         // 静态目标 IP / 目标端口 Bypass 判定 (无需入表)
@@ -812,12 +868,14 @@ fn handle_wan_ipv6(
         }
 
         // 动态直连流表 Fast-Path 查询 (针对非纯 SYN 报文)
-        if check_direct_track(&tuple, is_tcp, is_udp, is_fin_rst, is_pure_syn) {
+        if !is_redirected
+            && check_direct_track(&tuple, is_tcp, is_udp, is_fin_rst, is_pure_syn)
+        {
             return TC_ACT_OK;
         }
 
         // 动态下发直连判定 (直连状态变化时更新，命中则建立 DIRECT_TRACK 连接追踪)
-        if is_dynamic_dst_ip6_bypassed(dst_ip) {
+        if !is_redirected && is_dynamic_dst_ip6_bypassed(dst_ip) {
             register_direct_track(&tuple);
             return TC_ACT_OK;
         }
@@ -840,15 +898,17 @@ fn handle_wan_ipv6(
         ([0u8; 6], [0u8; 6])
     };
     let entry = RedirectEntry {
+        last_seen_ns: 0,
         ifindex,
         from_wan: 1,
         _pad0: [0; 3],
         smac,
         dmac,
+        _pad1: [0; 4],
     };
     unsafe {
-        let is_new_flow = REDIRECT_TRACK.get(&tuple).is_none();
-        let _ = REDIRECT_TRACK.insert(&tuple, &entry, 0);
+        let is_new_flow = tracked.is_none();
+        publish_redirect_track(&tuple, tracked, entry, is_udp, track_now);
         let l4proto = if pkt.l4proto == IPPROTO_TCP {
             pkt.listener_l4proto
         } else {
@@ -972,10 +1032,55 @@ fn handle_wan_egress_impl(tc_ctx: &TcContext, link_h_len: usize) -> i32 {
         return TC_ACT_OK;
     }
 
+    // Only connect hooks grant active-open identity; no flow-LRU dependency.
+    if pkt.l4proto == IPPROTO_TCP {
+        let sk = unsafe { (*ctx).__bindgen_anon_2.sk };
+        if sk.is_null() {
+            return TC_ACT_OK;
+        }
+        let full = unsafe { bpf_sk_fullsock(sk) };
+        if full.is_null() {
+            return TC_ACT_OK;
+        }
+        let policy = unsafe {
+            bpf_sk_storage_get(
+                core::ptr::addr_of!(TCP_SOCKET_POLICY).cast_mut().cast(),
+                full.cast(),
+                core::ptr::null_mut(),
+                0,
+            )
+        }
+        .cast::<u32>();
+        if policy.is_null() {
+            return TC_ACT_OK;
+        }
+        let decision = unsafe { *policy };
+        if decision == 3 {
+            return TC_ACT_OK;
+        }
+        let verdict =
+            dispatch_wan(ctx, param, link_h_len, pkt, &(pid_pname, decision == 2));
+        unsafe {
+            *policy = if verdict == TC_ACT_OK { 3 } else { 2 };
+        }
+        return verdict;
+    }
+    dispatch_wan(ctx, param, link_h_len, pkt, &(pid_pname, false))
+}
+
+#[inline(always)]
+fn dispatch_wan(
+    ctx: *mut __sk_buff,
+    param: &DaeParam,
+    link_h_len: usize,
+    pkt: &ParsedPacket,
+    process: &(Option<&PIDName>, bool),
+) -> i32 {
+    let (pid_pname, socket_was_proxied) = *process;
     if pkt.ethh.ether_type == ETH_P_IP.to_be() {
-        handle_wan_ipv4(ctx, param, link_h_len, pkt, pid_pname)
+        handle_wan_ipv4(ctx, param, link_h_len, pkt, pid_pname, socket_was_proxied)
     } else if pkt.ethh.ether_type == ETH_P_IPV6.to_be() {
-        handle_wan_ipv6(ctx, param, link_h_len, pkt, pid_pname)
+        handle_wan_ipv6(ctx, param, link_h_len, pkt, pid_pname, socket_was_proxied)
     } else {
         TC_ACT_OK
     }
@@ -1202,6 +1307,14 @@ pub fn tproxy_wan_cg_sock_release(ctx: SockContext) -> i32 {
 
 #[cgroup_sock_addr(connect4)]
 pub fn tproxy_wan_cg_connect4(ctx: SockAddrContext) -> i32 {
+    if unsafe { (*ctx.sock_addr).protocol } == IPPROTO_TCP as u32 {
+        let mut active = 1u32;
+        // Preserve a decision if connect is called again on the same socket.
+        let _ = unsafe {
+            TCP_SOCKET_POLICY.get_or_insert_ptr_mut(&ctx, Some(&mut active))
+        };
+    }
+
     let cookie = unsafe { bpf_get_socket_cookie(ctx.sock_addr as *mut _) };
     update_map_elem_by_cookie(cookie);
     1
@@ -1209,6 +1322,14 @@ pub fn tproxy_wan_cg_connect4(ctx: SockAddrContext) -> i32 {
 
 #[cgroup_sock_addr(connect6)]
 pub fn tproxy_wan_cg_connect6(ctx: SockAddrContext) -> i32 {
+    if unsafe { (*ctx.sock_addr).protocol } == IPPROTO_TCP as u32 {
+        let mut active = 1u32;
+        // Preserve a decision if connect is called again on the same socket.
+        let _ = unsafe {
+            TCP_SOCKET_POLICY.get_or_insert_ptr_mut(&ctx, Some(&mut active))
+        };
+    }
+
     let cookie = unsafe { bpf_get_socket_cookie(ctx.sock_addr as *mut _) };
     update_map_elem_by_cookie(cookie);
     1
