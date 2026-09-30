@@ -1,4 +1,5 @@
 use std::{
+    collections::VecDeque,
     io,
     pin::Pin,
     sync::{
@@ -8,8 +9,10 @@ use std::{
     task::{Context, Poll},
 };
 
-use bytes::{Buf, BufMut, BytesMut};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
+use futures::ready;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio_util::io::poll_read_buf;
 
 use crate::proxy::{AnyStream, transport::VisionOptions};
 use rand::RngExt;
@@ -339,7 +342,7 @@ pub struct VisionStream {
     /// Whether the server's 16-byte UUID prefix has been consumed.
     server_uuid_consumed: bool,
     /// Fully decoded payload bytes ready to be returned to the caller.
-    decoded: BytesMut,
+    decoded: VecDeque<Bytes>,
     /// Raw bytes from `inner` that have not yet been Vision-decoded.
     raw: BytesMut,
     /// Current Vision read state (framed / end / direct-splice).
@@ -387,7 +390,7 @@ impl VisionStream {
             write_buf_consumed: 0,
             write_buf_app_data: false,
             server_uuid_consumed: false,
-            decoded: BytesMut::new(),
+            decoded: VecDeque::new(),
             raw: BytesMut::new(),
             read_state: ReadState::Framed,
             filter: VisionFilter::new(),
@@ -464,12 +467,18 @@ impl AsyncRead for VisionStream {
     ) -> Poll<io::Result<()>> {
         let this = self.get_mut(); // safe: VisionStream is Unpin
 
+        if buf.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
         loop {
             // 1. Return already-decoded data.
-            if !this.decoded.is_empty() {
-                let amt = this.decoded.len().min(buf.remaining());
-                buf.put_slice(&this.decoded[..amt]);
-                this.decoded.advance(amt);
+            if let Some(data) = this.decoded.front_mut() {
+                let amt = data.len().min(buf.remaining());
+                buf.put_slice(&data[..amt]);
+                data.advance(amt);
+                if data.is_empty() {
+                    this.decoded.pop_front();
+                }
                 return Poll::Ready(Ok(()));
             }
 
@@ -499,18 +508,14 @@ impl AsyncRead for VisionStream {
             }
 
             // 4. Need more raw bytes from inner stream.
-            let mut tmp = [0u8; 8192];
-            let mut read_buf = ReadBuf::new(&mut tmp);
-
-            match Pin::new(&mut this.inner).poll_read(cx, &mut read_buf) {
+            this.raw.reserve(8192);
+            match poll_read_buf(Pin::new(&mut this.inner), cx, &mut this.raw) {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Ready(Ok(())) => {
-                    let read_bytes = read_buf.filled();
-                    if read_bytes.is_empty() {
+                Poll::Ready(Ok(read_bytes)) => {
+                    if read_bytes == 0 {
                         return Poll::Ready(Ok(()));
                     }
-                    this.raw.extend_from_slice(read_bytes);
                 }
             }
         }
@@ -522,7 +527,7 @@ impl AsyncRead for VisionStream {
 /// Returns `true` if any content bytes were produced or `read_state` changed.
 fn decode_vision_frames(
     raw: &mut BytesMut,
-    decoded: &mut BytesMut,
+    decoded: &mut VecDeque<Bytes>,
     read_state: &mut ReadState,
     server_uuid_consumed: &mut bool,
     filter: &mut VisionFilter,
@@ -556,21 +561,25 @@ fn decode_vision_frames(
         if *read_state == ReadState::Framed {
             filter.filter_server_record(frame_content);
         }
-        decoded.extend_from_slice(frame_content);
-        raw.advance(content_len);
+        let content = raw.split_to(content_len).freeze();
+        if !content.is_empty() {
+            decoded.push_back(content);
+        }
         raw.advance(padding_len);
 
         // CMD_PADDING_END (0x01): Vision framing done, stay in TLS.
         // CMD_PADDING_DIRECT (0x02): Vision framing done, enter XTLS-splice.
         if command == CMD_PADDING_END {
             *read_state = ReadState::End;
-            decoded.extend_from_slice(raw);
-            raw.clear();
+            if !raw.is_empty() {
+                decoded.push_back(raw.split().freeze());
+            }
             break;
         } else if command == CMD_PADDING_DIRECT {
             *read_state = ReadState::Direct;
-            decoded.extend_from_slice(raw);
-            raw.clear();
+            if !raw.is_empty() {
+                decoded.push_back(raw.split().freeze());
+            }
             break;
         }
     }
@@ -689,7 +698,7 @@ impl AsyncWrite for VisionStream {
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<io::Result<()>> {
-        futures::ready!(self.as_mut().poll_flush(cx))?;
+        ready!(self.as_mut().poll_flush(cx))?;
         Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
     }
 }
@@ -697,7 +706,13 @@ impl AsyncWrite for VisionStream {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use futures::task::noop_waker;
+    use std::sync::Mutex;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt, DuplexStream, duplex},
+        spawn,
+        task::yield_now,
+    };
 
     const TEST_UUID_STR: &str = "5415d8e0-df92-3655-afa4-b79de66413f5";
     const TEST_UUID: [u8; 16] = [
@@ -705,8 +720,8 @@ mod tests {
         0xe6, 0x64, 0x13, 0xf5,
     ];
 
-    fn make_vision_pair() -> (VisionStream, tokio::io::DuplexStream) {
-        let (client, server) = tokio::io::duplex(65536);
+    fn make_vision_pair() -> (VisionStream, DuplexStream) {
+        let (client, server) = duplex(65536);
         (
             VisionStream::new(Box::new(client), TEST_UUID_STR, None).unwrap(),
             server,
@@ -714,14 +729,14 @@ mod tests {
     }
 
     fn make_vision_pair_with_splice_flags()
-    -> (VisionStream, tokio::io::DuplexStream, Arc<AtomicBool>) {
+    -> (VisionStream, DuplexStream, Arc<AtomicBool>) {
         let (vs, server, read_flag, _) = make_vision_pair_with_both_splice_flags();
         (vs, server, read_flag)
     }
 
     fn make_vision_pair_with_both_splice_flags()
-    -> (VisionStream, tokio::io::DuplexStream, Arc<AtomicBool>, Arc<AtomicBool>) {
-        let (client, server) = tokio::io::duplex(65536);
+    -> (VisionStream, DuplexStream, Arc<AtomicBool>, Arc<AtomicBool>) {
+        let (client, server) = duplex(65536);
         let read_flag = Arc::new(AtomicBool::new(false));
         let write_flag = Arc::new(AtomicBool::new(false));
         let opts = VisionOptions {
@@ -734,6 +749,37 @@ mod tests {
             read_flag,
             write_flag,
         )
+    }
+
+    #[tokio::test]
+    async fn fragmented_large_frames_survive_small_reads_and_direct_transition() {
+        let (mut stream, mut server) = make_vision_pair();
+        let payload: Vec<u8> = (0..60000).map(|i| (i % 251) as u8).collect();
+        let mut wire =
+            server_first_frame(&TEST_UUID, CMD_PADDING_CONTINUE, &payload, 31);
+        wire.extend(server_frame(CMD_PADDING_CONTINUE, b""));
+        wire.extend(server_frame(CMD_PADDING_DIRECT, b"last"));
+        wire.extend_from_slice(b"raw-tail");
+        let writer = spawn(async move {
+            for part in wire.chunks(173) {
+                server.write_all(part).await.unwrap();
+                yield_now().await;
+            }
+        });
+        assert_eq!(stream.read(&mut []).await.unwrap(), 0);
+        let mut received = Vec::new();
+        let mut chunk = [0; 113];
+        loop {
+            let n = stream.read(&mut chunk).await.unwrap();
+            if n == 0 {
+                break;
+            }
+            received.extend_from_slice(&chunk[..n]);
+        }
+        let mut expected = payload;
+        expected.extend_from_slice(b"lastraw-tail");
+        assert_eq!(received, expected);
+        writer.await.unwrap();
     }
 
     // -----------------------------------------------------------------------
@@ -1138,7 +1184,7 @@ mod tests {
         use std::sync::atomic::AtomicUsize;
 
         struct ChunkedWriter {
-            written: Arc<std::sync::Mutex<Vec<u8>>>,
+            written: Arc<Mutex<Vec<u8>>>,
             write_count: Arc<AtomicUsize>,
             shutdown_called: Arc<AtomicBool>,
         }
@@ -1175,17 +1221,23 @@ mod tests {
                 }
             }
 
-            fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            fn poll_flush(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+            ) -> Poll<io::Result<()>> {
                 Poll::Ready(Ok(()))
             }
 
-            fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            fn poll_shutdown(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+            ) -> Poll<io::Result<()>> {
                 self.shutdown_called.store(true, Ordering::SeqCst);
                 Poll::Ready(Ok(()))
             }
         }
 
-        let written = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let written = Arc::new(Mutex::new(Vec::new()));
         let write_count = Arc::new(AtomicUsize::new(0));
         let shutdown_called = Arc::new(AtomicBool::new(false));
 
@@ -1199,7 +1251,7 @@ mod tests {
 
         // 1. Initial write of 50 bytes of app data
         let payload = vec![0x42; 50];
-        let waker = futures::task::noop_waker();
+        let waker = noop_waker();
         let mut cx = Context::from_waker(&waker);
 
         let res = Pin::new(&mut vs).poll_write(&mut cx, &payload);

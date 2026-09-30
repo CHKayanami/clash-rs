@@ -6,11 +6,10 @@ use std::{
 
 use futures::{Sink, SinkExt, Stream, StreamExt};
 use tokio::net::UdpSocket;
-use tokio_util::udp::UdpFramed;
 use tracing::{error, trace};
 
 use crate::{
-    proxy::{AnyStream, datagram::UdpPacket, socks::inbound::Socks5UDPCodec},
+    proxy::{AnyStream, datagram::UdpPacket, socks::inbound::Socks5UdpFramed},
     session::SocksAddr,
 };
 
@@ -18,7 +17,7 @@ pub(crate) struct Socks5Datagram {
     // hold the socket to keep it alive and drop it when this is dropped
     _socket: AnyStream,
     remote: SocketAddr,
-    inner: UdpFramed<Socks5UDPCodec>,
+    inner: Socks5UdpFramed,
 }
 
 impl Socks5Datagram {
@@ -27,7 +26,7 @@ impl Socks5Datagram {
         remote: SocketAddr,
         udp_socket: UdpSocket,
     ) -> Self {
-        let framed = UdpFramed::new(udp_socket, Socks5UDPCodec);
+        let framed = Socks5UdpFramed::new(udp_socket);
 
         Self {
             _socket: socket,

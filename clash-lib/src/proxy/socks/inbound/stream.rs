@@ -4,7 +4,7 @@ use crate::{
     proxy::{
         socks::{
             SOCKS5_VERSION,
-            inbound::{Socks5UDPCodec, datagram::InboundUdp},
+            inbound::datagram::{InboundUdp, Socks5UdpFramed},
             socks5::{auth_methods, response_code, socks_command},
         },
         utils::new_udp_socket,
@@ -19,7 +19,6 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
 };
-use tokio_util::udp::UdpFramed;
 use tracing::{instrument, trace, warn};
 
 /// A client that connects but never completes the SOCKS handshake would
@@ -190,7 +189,7 @@ pub async fn handle_tcp(
 
             let (close_handle, close_listener) = tokio::sync::oneshot::channel();
 
-            let framed = UdpFramed::new(udp_inbound, Socks5UDPCodec);
+            let framed = Socks5UdpFramed::new(udp_inbound);
             // Pin the association to the client that requested it. The relay
             // socket is reachable by anything that can route to this host, so
             // without this it is an open UDP relay.
