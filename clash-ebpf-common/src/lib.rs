@@ -40,7 +40,9 @@ pub struct DaeParam {
     pub _pad1: [u8; 2],
 }
 
-#[repr(C)]
+// Keep address copies aligned for BPF code generation. The key remains 40
+// bytes with the same field offsets; only its alignment changes.
+#[repr(C, align(8))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct RedirectTuple {
     pub src_ip: [u8; 16],

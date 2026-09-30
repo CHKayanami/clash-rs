@@ -14,9 +14,6 @@ use network_types::{
 
 pub const PARSE_FRAGMENT: i32 = 2;
 
-/// Fast-path pull size. 256 bytes covers Ethernet (14) + IPv6 (40) +
-/// extension headers (up to ~120) + large TCP options (up to 40).
-pub const HEADER_PULL_SIZE: u32 = 256;
 pub const ETH_HLEN: u32 = 14;
 pub const ETH_P_IP: u16 = 0x0800;
 pub const ETH_P_IPV6: u16 = 0x86DD;
@@ -79,7 +76,7 @@ pub struct ParsedPacket {
 /// Malformed packet: invalid header, bad length, too many extension headers.
 pub const ERR_MALFORMED: c_long = -14;
 
-/// Fast path could not pull enough data; fall back to slow path.
+/// Required header is not linear; fall back to skb_load_bytes.
 pub const ERR_FALLBACK: c_long = -1;
 
 /// Non-initial IP fragment that lacks L4 header; pass through for kernel reassembly.
@@ -222,11 +219,8 @@ pub fn udp_has_quic_long_header(
 }
 
 pub trait ParseTransportExt {
-    fn parse_fast(&mut self, ctx: &TcContext, link_h_len: u32)
-    -> Result<(), c_long>;
     fn parse_slow(&mut self, ctx: &TcContext, link_h_len: u32)
     -> Result<(), c_long>;
-    fn parse(&mut self, ctx: &TcContext, link_h_len: u32) -> Result<(), c_long>;
     fn fill_tuples(&self, tuples: &mut Tuples);
 }
 
@@ -267,34 +261,6 @@ impl ParseTransportExt for ParseTransportCtx {
         self.ihl = 0;
         self.l4proto = 0;
         self.listener_l4proto = 0;
-        unsafe {
-            ptr::write_bytes(
-                &mut self.iph as *mut _ as *mut u8,
-                0,
-                mem::size_of::<Ipv4Hdr>(),
-            );
-            ptr::write_bytes(
-                &mut self.ipv6h as *mut _ as *mut u8,
-                0,
-                mem::size_of::<Ipv6Hdr>(),
-            );
-            ptr::write_bytes(
-                &mut self.icmp6h as *mut _ as *mut u8,
-                0,
-                mem::size_of::<Icmpv6Hdr>(),
-            );
-            ptr::write_bytes(
-                &mut self.tcph as *mut _ as *mut u8,
-                0,
-                mem::size_of::<TcpHdr>(),
-            );
-            ptr::write_bytes(
-                &mut self.udph as *mut _ as *mut u8,
-                0,
-                mem::size_of::<UdpHdr>(),
-            );
-        }
-
         if self.ethh.ether_type == ETH_P_IP.to_be() {
             let r = unsafe {
                 bpf_skb_load_bytes(
@@ -492,15 +458,40 @@ impl ParseTransportExt for ParseTransportCtx {
     }
 
     #[inline(always)]
+    fn fill_tuples(&self, tuples: &mut Tuples) {
+        tuples.five.l4proto = self.l4proto;
+
+        if self.ethh.ether_type == ETH_P_IP.to_be() {
+            tuples.five.src_ip = In6Addr::from_ipv4_bytes(self.iph.src_addr);
+            tuples.five.dst_ip = In6Addr::from_ipv4_bytes(self.iph.dst_addr);
+            tuples.dscp = self.iph.dscp();
+        } else {
+            tuples.five.src_ip = In6Addr::from_ipv6_addr(self.ipv6h.src_addr());
+            tuples.five.dst_ip = In6Addr::from_ipv6_addr(self.ipv6h.dst_addr());
+            tuples.dscp = self.ipv6h.dscp();
+        }
+
+        match self.l4proto {
+            IPPROTO_TCP => {
+                tuples.five.src_port = u16::from_be_bytes(self.tcph.source);
+                tuples.five.dst_port = u16::from_be_bytes(self.tcph.dest);
+            }
+            IPPROTO_UDP => {
+                tuples.five.src_port = u16::from_be_bytes(self.udph.src);
+                tuples.five.dst_port = u16::from_be_bytes(self.udph.dst);
+            }
+            _ => {}
+        }
+    }
+}
+
+impl ParsedPacket {
+    #[inline(always)]
     fn parse_fast(
         &mut self,
         ctx: &TcContext,
         link_h_len: u32,
     ) -> Result<(), c_long> {
-        if ctx.pull_data(HEADER_PULL_SIZE).is_err() {
-            return Err(ERR_FALLBACK);
-        }
-
         let data = ctx.data() as *const u8;
         let data_end = ctx.data_end() as *const u8;
         let mut offset = 0u32;
@@ -509,7 +500,7 @@ impl ParseTransportExt for ParseTransportCtx {
             ptr::write_bytes(
                 self as *mut _ as *mut u8,
                 0,
-                mem::size_of::<ParseTransportCtx>(),
+                mem::size_of::<ParsedPacket>(),
             );
         }
 
@@ -539,8 +530,9 @@ impl ParseTransportExt for ParseTransportCtx {
                 return Err(ERR_MALFORMED);
             }
 
-            self.iph = unsafe { ptr::read(iph_ptr) };
-            self.ihl = iph.ihl();
+            self.tuples.five.src_ip = In6Addr::from_ipv4_bytes(iph.src_addr);
+            self.tuples.five.dst_ip = In6Addr::from_ipv4_bytes(iph.dst_addr);
+            self.tuples.dscp = iph.dscp();
             self.l4proto = iph.proto;
 
             if ipv4_is_fragment(iph) {
@@ -559,6 +551,9 @@ impl ParseTransportExt for ParseTransportCtx {
                     }
                     let tcph = unsafe { &*tcph_ptr };
                     self.tcph = unsafe { ptr::read(tcph_ptr) };
+                    self.tuples.five.src_port = u16::from_be_bytes(tcph.source);
+                    self.tuples.five.dst_port = u16::from_be_bytes(tcph.dest);
+                    self.tuples.five.l4proto = IPPROTO_TCP;
                     self.listener_l4proto = tcp_listener_l4proto(tcph);
                     return Ok(());
                 }
@@ -569,7 +564,11 @@ impl ParseTransportExt for ParseTransportCtx {
                     {
                         return Err(ERR_FALLBACK);
                     }
+                    let udph = unsafe { &*udph_ptr };
                     self.udph = unsafe { ptr::read(udph_ptr) };
+                    self.tuples.five.src_port = u16::from_be_bytes(udph.src);
+                    self.tuples.five.dst_port = u16::from_be_bytes(udph.dst);
+                    self.tuples.five.l4proto = IPPROTO_UDP;
                     self.listener_l4proto = IPPROTO_UDP;
                     return Ok(());
                 }
@@ -586,9 +585,10 @@ impl ParseTransportExt for ParseTransportCtx {
             }
             let ipv6h = unsafe { &*ipv6h_ptr };
 
-            self.ipv6h = unsafe { ptr::read(ipv6h_ptr) };
+            self.tuples.five.src_ip = In6Addr::from_ipv6_addr(ipv6h.src_addr());
+            self.tuples.five.dst_ip = In6Addr::from_ipv6_addr(ipv6h.dst_addr());
+            self.tuples.dscp = ipv6h.dscp();
             self.l4proto = ipv6h.next_hdr;
-            self.ihl = (mem::size_of::<Ipv6Hdr>() / 4) as u8;
             offset += mem::size_of::<Ipv6Hdr>() as u32;
 
             let mut nexthdr = ipv6h.next_hdr;
@@ -645,6 +645,9 @@ impl ParseTransportExt for ParseTransportCtx {
                     }
                     let tcph = unsafe { &*tcph_ptr };
                     self.tcph = unsafe { ptr::read(tcph_ptr) };
+                    self.tuples.five.src_port = u16::from_be_bytes(tcph.source);
+                    self.tuples.five.dst_port = u16::from_be_bytes(tcph.dest);
+                    self.tuples.five.l4proto = IPPROTO_TCP;
                     self.listener_l4proto = tcp_listener_l4proto(tcph);
                     return Ok(());
                 }
@@ -657,102 +660,54 @@ impl ParseTransportExt for ParseTransportCtx {
                     {
                         return Err(ERR_FALLBACK);
                     }
+                    let udph = unsafe { &*udph_ptr };
                     self.udph = unsafe { ptr::read(udph_ptr) };
+                    self.tuples.five.src_port = u16::from_be_bytes(udph.src);
+                    self.tuples.five.dst_port = u16::from_be_bytes(udph.dst);
+                    self.tuples.five.l4proto = IPPROTO_UDP;
                     self.listener_l4proto = IPPROTO_UDP;
                     return Ok(());
                 }
-                IPPROTO_ICMPV6 => {
-                    let icmp6h_ptr =
-                        unsafe { data.add(offset as usize) as *const Icmpv6Hdr };
-                    if unsafe {
-                        data.add(offset as usize + mem::size_of::<Icmpv6Hdr>())
-                    } > data_end
-                    {
-                        return Err(ERR_FALLBACK);
-                    }
-                    self.icmp6h = unsafe { ptr::read(icmp6h_ptr) };
-                    return Ok(());
-                }
+                IPPROTO_ICMPV6 => return Err(PASS_UNSUPPORTED),
                 _ => return Err(PASS_UNSUPPORTED),
             }
         }
 
         Err(PASS_UNSUPPORTED)
     }
-
-    #[inline(always)]
-    fn parse(&mut self, ctx: &TcContext, link_h_len: u32) -> Result<(), c_long> {
-        match self.parse_fast(ctx, link_h_len) {
-            Err(ERR_FALLBACK) => self.parse_slow(ctx, link_h_len),
-            other => other,
-        }
-    }
-
-    #[inline(always)]
-    fn fill_tuples(&self, tuples: &mut Tuples) {
-        unsafe {
-            ptr::write_bytes(
-                tuples as *mut _ as *mut u8,
-                0,
-                mem::size_of::<Tuples>(),
-            )
-        };
-        tuples.five.l4proto = self.l4proto;
-
-        if self.iph.version() == 4 {
-            tuples.five.src_ip = In6Addr::from_ipv4_bytes(self.iph.src_addr);
-            tuples.five.dst_ip = In6Addr::from_ipv4_bytes(self.iph.dst_addr);
-            tuples.dscp = self.iph.dscp();
-        } else {
-            tuples.five.src_ip = In6Addr::from_ipv6_addr(self.ipv6h.src_addr());
-            tuples.five.dst_ip = In6Addr::from_ipv6_addr(self.ipv6h.dst_addr());
-            tuples.dscp = self.ipv6h.dscp();
-        }
-
-        match self.l4proto {
-            IPPROTO_TCP => {
-                tuples.five.src_port = u16::from_be_bytes(self.tcph.source);
-                tuples.five.dst_port = u16::from_be_bytes(self.tcph.dest);
-            }
-            IPPROTO_UDP => {
-                tuples.five.src_port = u16::from_be_bytes(self.udph.src);
-                tuples.five.dst_port = u16::from_be_bytes(self.udph.dst);
-            }
-            _ => {}
-        }
-    }
 }
 
-/// Parse the packet into `PARSED_PKT_MAP` via the scratch-map-based fast/slow path.
+/// Parse linear headers directly into the output; use scratch only for nonlinear data.
 #[inline(always)]
 pub fn parse_packet<'a>(
     ctx: &TcContext,
     link_h_len: u32,
 ) -> Result<&'a ParsedPacket, c_long> {
-    let scratch_key: u32 = 0;
-    let tctx = match PARSE_CTX_MAP.get_ptr_mut(scratch_key) {
-        Some(ptr) => unsafe { &mut *ptr },
-        None => return Err(ERR_MALFORMED),
-    };
-
-    if let Err(e) = tctx.parse(ctx, link_h_len) {
-        return Err(e);
+    let pkt_ptr = PARSED_PKT_MAP.get_ptr_mut(0).ok_or(ERR_MALFORMED)?;
+    let out = unsafe { &mut *pkt_ptr };
+    match out.parse_fast(ctx, link_h_len) {
+        Ok(()) => return Ok(out),
+        Err(ERR_FALLBACK) => {}
+        Err(e) => return Err(e),
     }
 
+    // skb_load_bytes handles nonlinear headers without making the skb writable.
+    let scratch = PARSE_CTX_MAP.get_ptr_mut(0).ok_or(ERR_MALFORMED)?;
+    let tctx = unsafe { &mut *scratch };
+    tctx.parse_slow(ctx, link_h_len)?;
     if tctx.l4proto == IPPROTO_ICMPV6 {
         return Err(PASS_UNSUPPORTED);
     }
 
-    let pkt_ptr = match PARSED_PKT_MAP.get_ptr_mut(0) {
-        Some(ptr) => ptr,
-        None => return Err(ERR_MALFORMED),
+    unsafe {
+        ptr::write_bytes(pkt_ptr.cast::<u8>(), 0, mem::size_of::<ParsedPacket>())
     };
-
-    let out = unsafe { &mut *pkt_ptr };
-    *out = unsafe { mem::zeroed() };
     out.ethh = tctx.ethh;
-    out.tcph = tctx.tcph;
-    out.udph = tctx.udph;
+    match tctx.l4proto {
+        IPPROTO_TCP => out.tcph = tctx.tcph,
+        IPPROTO_UDP => out.udph = tctx.udph,
+        _ => return Err(PASS_UNSUPPORTED),
+    }
     out.l4proto = tctx.l4proto;
     out.listener_l4proto = tctx.listener_l4proto;
     tctx.fill_tuples(&mut out.tuples);

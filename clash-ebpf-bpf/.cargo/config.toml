@@ -7,7 +7,8 @@ rustflags = [
   "-C",
   "link-arg=--emit=obj",
   "-C",
-  "link-arg=--llvm-args=-bpf-stack-size=4096",
+  # Match the kernel per-frame limit instead of hiding compiler stack overflow.
+  "link-arg=--llvm-args=-bpf-stack-size=512",
   "-C",
   "link-arg=--btf",
 ]

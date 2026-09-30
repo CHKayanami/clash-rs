@@ -97,7 +97,7 @@ pub static DIRECT_TRACK: LruHashMap<RedirectTuple, DirectTrackEntry, 65536> =
 #[btf_map]
 pub static LISTEN_SOCKET_MAP: SockMap<4> = SockMap::new();
 
-/// PerCpuArray for packet transport parsing scratch memory (zero-allocation fast path).
+/// PerCpuArray for nonlinear packet parsing scratch memory (slow path only).
 #[btf_map]
 pub static PARSE_CTX_MAP: PerCpuArray<ParseTransportCtx, 1> = PerCpuArray::new();
 
@@ -129,10 +129,6 @@ pub static BYPASS_FWMARKS: HashMap<u32, u8, 256> = HashMap::new();
 /// RingBuffer for sending events and alerts from eBPF to userspace.
 #[btf_map]
 pub static EVENT_RINGBUF: RingBuf<DaeEvent, 262144> = RingBuf::new();
-
-/// PerCpuArray for event scratch memory (zero stack allocation).
-#[btf_map]
-pub static EVENT_SCRATCH_MAP: PerCpuArray<DaeEvent, 1> = PerCpuArray::new();
 
 /// PerCpuArray for parsed packet scratch memory (zero stack allocation).
 #[btf_map]

@@ -5,7 +5,7 @@
 use aya::programs::Program;
 use aya_obj::{Map, Object, generated::bpf_map_type::*};
 use clash_ebpf_common::{
-    DaeEvent, DaeParam, DirectTrackEntry, PIDName, ParseTransportCtx, RedirectEntry,
+    DaeParam, DirectTrackEntry, PIDName, ParseTransportCtx, RedirectEntry,
     RedirectTuple, STATIC_BYPASS_DST_MAX_ENTRIES,
     STATIC_BYPASS_DST_PORT_MAX_ENTRIES, STATIC_BYPASS_SRC_MAX_ENTRIES,
     STATIC_BYPASS_SRC_PORT_MAX_ENTRIES,
@@ -131,13 +131,6 @@ fn btf_map_definitions_match_userspace_abi() {
         ("BYPASS_DSCPS", BPF_MAP_TYPE_HASH, 64, 1, Some(1)),
         ("BYPASS_FWMARKS", BPF_MAP_TYPE_HASH, 256, 4, Some(1)),
         ("EVENT_RINGBUF", BPF_MAP_TYPE_RINGBUF, 262144, 0, Some(0)),
-        (
-            "EVENT_SCRATCH_MAP",
-            BPF_MAP_TYPE_PERCPU_ARRAY,
-            1,
-            4,
-            Some(size_of::<DaeEvent>()),
-        ),
         ("PARSED_PKT_MAP", BPF_MAP_TYPE_PERCPU_ARRAY, 1, 4, None),
     ];
     assert_eq!(
@@ -325,7 +318,8 @@ fn cgroup_socket_identity_and_active_open_are_preserved() {
         unsafe { libc::prctl(libc::PR_SET_NAME, c"ebpf-refresh".as_ptr()) },
         0
     );
-    udp.send_to(b"refresh", listener.local_addr().unwrap()).unwrap();
+    udp.send_to(b"refresh", listener.local_addr().unwrap())
+        .unwrap();
     let refreshed = identities.get(&cookie, 0).unwrap();
     assert_eq!(refreshed.pid, before.pid);
     assert_eq!(&refreshed.pname[..12], b"ebpf-refresh");

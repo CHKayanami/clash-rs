@@ -65,11 +65,19 @@ pub fn send_dae_event(
     sport: u16,
     dport: u16,
 ) {
-    let Some(ptr) = EVENT_SCRATCH_MAP.get_ptr_mut(0) else {
+    let Some(mut event) = EVENT_RINGBUF.reserve(0) else {
         return;
     };
+    let ptr = event.as_mut_ptr();
+    // Initialize every byte, including padding, before constructing a reference.
+    unsafe {
+        core::ptr::write_bytes(
+            ptr.cast::<u8>(),
+            0,
+            mem::size_of::<clash_ebpf_common::DaeEvent>(),
+        )
+    };
     let e = unsafe { &mut *ptr };
-    *e = unsafe { mem::zeroed() };
     e.timestamp = unsafe { bpf_ktime_get_ns() };
     e.type_ = type_;
     e.pid = pid;
@@ -86,7 +94,7 @@ pub fn send_dae_event(
     if let Some(d) = dip {
         e.dip.copy_from_slice(d);
     }
-    let _ = EVENT_RINGBUF.output(e, 0);
+    event.submit(0);
 }
 
 #[inline(always)]
@@ -178,31 +186,31 @@ fn is_dynamic_dst_ip4_bypassed(ip_be: [u8; 4]) -> bool {
 }
 
 #[inline(always)]
-fn is_src_ip6_bypassed(ip: [u8; 16]) -> bool {
-    let key = Key::new(128, ip);
+fn is_src_ip6_bypassed(ip: &[u8; 16]) -> bool {
+    let key = Key::new(128, *ip);
     BYPASS_SRC_IP6S.get(&key).is_some()
 }
 
 #[inline(always)]
-fn is_dst_ip6_bypassed(ip: [u8; 16]) -> bool {
-    let key = Key::new(128, ip);
+fn is_dst_ip6_bypassed(ip: &[u8; 16]) -> bool {
+    let key = Key::new(128, *ip);
     BYPASS_DST_IP6S.get(&key).is_some()
 }
 
 #[inline(always)]
-fn is_dynamic_dst_ip6_bypassed(ip: [u8; 16]) -> bool {
-    unsafe { DYNAMIC_BYPASS_DST_IP6S.get(&ip).is_some() }
+fn is_dynamic_dst_ip6_bypassed(ip: &[u8; 16]) -> bool {
+    unsafe { DYNAMIC_BYPASS_DST_IP6S.get(ip).is_some() }
 }
 
 #[inline(always)]
-fn is_src_ip6_proxied(ip: [u8; 16]) -> bool {
-    let key = Key::new(128, ip);
+fn is_src_ip6_proxied(ip: &[u8; 16]) -> bool {
+    let key = Key::new(128, *ip);
     PROXY_SRC_IP6S.get(&key).is_some()
 }
 
 #[inline(always)]
-fn is_dst_ip6_proxied(ip: [u8; 16]) -> bool {
-    let key = Key::new(128, ip);
+fn is_dst_ip6_proxied(ip: &[u8; 16]) -> bool {
+    let key = Key::new(128, *ip);
     PROXY_DST_IP6S.get(&key).is_some()
 }
 
@@ -295,6 +303,64 @@ fn publish_redirect_track(
         entry.last_seen_ns = if is_udp { now } else { 0 };
         let _ = REDIRECT_TRACK.insert(tuple, &entry, 0);
     }
+}
+
+/// Copy addresses as four aligned words in a separate subprogram. Keeping
+/// this out of the WAN control flow avoids spilling individual IPv6 bytes.
+#[inline(never)]
+fn packet_redirect_tuple(
+    pkt: &ParsedPacket,
+    ip_version: u8,
+    tuple: &mut RedirectTuple,
+) {
+    write_redirect_tuple(pkt, ip_version, tuple, false);
+}
+
+#[inline(never)]
+fn packet_reverse_redirect_tuple(
+    pkt: &ParsedPacket,
+    ip_version: u8,
+    tuple: &mut RedirectTuple,
+) {
+    write_redirect_tuple(pkt, ip_version, tuple, true);
+}
+
+#[inline(always)]
+fn write_redirect_tuple(
+    pkt: &ParsedPacket,
+    ip_version: u8,
+    tuple: &mut RedirectTuple,
+    reverse: bool,
+) {
+    let (src_ip, dst_ip, src_port, dst_port) = if reverse {
+        (
+            &pkt.tuples.five.dst_ip,
+            &pkt.tuples.five.src_ip,
+            pkt.tuples.five.dst_port,
+            pkt.tuples.five.src_port,
+        )
+    } else {
+        (
+            &pkt.tuples.five.src_ip,
+            &pkt.tuples.five.dst_ip,
+            pkt.tuples.five.src_port,
+            pkt.tuples.five.dst_port,
+        )
+    };
+    unsafe {
+        let src = tuple.src_ip.as_mut_ptr().cast::<u64>();
+        let dst = tuple.dst_ip.as_mut_ptr().cast::<u64>();
+        // RedirectTuple is 8-byte aligned; addresses start at offsets 0/16.
+        core::ptr::write(src, src_ip.u6_addr64[0]);
+        core::ptr::write(src.add(1), src_ip.u6_addr64[1]);
+        core::ptr::write(dst, dst_ip.u6_addr64[0]);
+        core::ptr::write(dst.add(1), dst_ip.u6_addr64[1]);
+    }
+    tuple.src_port = src_port;
+    tuple.dst_port = dst_port;
+    tuple.proto = pkt.l4proto;
+    tuple.ip_version = ip_version;
+    tuple._pad = [0; 2];
 }
 
 // ── Redirect helper: sets cb[] and performs bpf_redirect ──
@@ -392,15 +458,8 @@ fn handle_lan_ipv4(
         pkt.tuples.five.src_ip[15],
     ];
 
-    let tuple = RedirectTuple {
-        src_ip: *pkt.tuples.five.src_ip.as_bytes(),
-        dst_ip: *pkt.tuples.five.dst_ip.as_bytes(),
-        src_port,
-        dst_port,
-        proto: pkt.l4proto,
-        ip_version: 4,
-        _pad: [0; 2],
-    };
+    let mut tuple = RedirectTuple::default();
+    packet_redirect_tuple(pkt, 4, &mut tuple);
 
     let (tracked, track_now) = check_redirect_track(&tuple, is_udp, is_pure_syn);
     let is_redirected = tracked.is_some();
@@ -518,27 +577,20 @@ fn handle_lan_ipv6(
     let is_pure_syn = is_tcp && (pkt.tcph.syn() != 0 && pkt.tcph.ack() == 0);
     let is_fin_rst = is_tcp && (pkt.tcph.fin() != 0 || pkt.tcph.rst() != 0);
 
-    let dst_ip = *pkt.tuples.five.dst_ip.as_bytes();
-    let src_ip = *pkt.tuples.five.src_ip.as_bytes();
-
-    let tuple = RedirectTuple {
-        src_ip,
-        dst_ip,
-        src_port,
-        dst_port,
-        proto: pkt.l4proto,
-        ip_version: 6,
-        _pad: [0; 2],
-    };
+    let dst_ip = pkt.tuples.five.dst_ip.as_bytes();
+    let mut tuple = RedirectTuple::default();
+    packet_redirect_tuple(pkt, 6, &mut tuple);
 
     let (tracked, track_now) = check_redirect_track(&tuple, is_udp, is_pure_syn);
     let is_redirected = tracked.is_some();
 
     // 1. 源 IP / 源端口 静态 Bypass 与白名单判定
-    if is_src_ip6_bypassed(src_ip) {
+    if is_src_ip6_bypassed(pkt.tuples.five.src_ip.as_bytes()) {
         return TC_ACT_OK;
     }
-    if param.has_proxy_src_ips != 0 && !is_src_ip6_proxied(src_ip) {
+    if param.has_proxy_src_ips != 0
+        && !is_src_ip6_proxied(pkt.tuples.five.src_ip.as_bytes())
+    {
         return TC_ACT_OK;
     }
     if is_src_port_bypassed(src_port) {
@@ -608,30 +660,14 @@ fn handle_lan_ipv6(
         };
 
         if is_new_flow {
-            let mut sip_u32 = [0u32; 4];
-            let mut dip_u32 = [0u32; 4];
-            for i in 0..4 {
-                sip_u32[i] = u32::from_ne_bytes([
-                    src_ip[i * 4],
-                    src_ip[i * 4 + 1],
-                    src_ip[i * 4 + 2],
-                    src_ip[i * 4 + 3],
-                ]);
-                dip_u32[i] = u32::from_ne_bytes([
-                    dst_ip[i * 4],
-                    dst_ip[i * 4 + 1],
-                    dst_ip[i * 4 + 2],
-                    dst_ip[i * 4 + 3],
-                ]);
-            }
             send_dae_event(
                 DaeEventType::Redirected as u32,
                 0,
                 None,
                 0,
                 pkt.l4proto,
-                Some(&sip_u32),
-                Some(&dip_u32),
+                Some(&pkt.tuples.five.src_ip.u6_addr32),
+                Some(&pkt.tuples.five.dst_ip.u6_addr32),
                 src_port,
                 dst_port,
             );
@@ -728,15 +764,8 @@ fn handle_wan_ipv4(
         pkt.tuples.five.src_ip[15],
     ];
 
-    let tuple = RedirectTuple {
-        src_ip: *pkt.tuples.five.src_ip.as_bytes(),
-        dst_ip: *pkt.tuples.five.dst_ip.as_bytes(),
-        src_port,
-        dst_port,
-        proto: pkt.l4proto,
-        ip_version: 4,
-        _pad: [0; 2],
-    };
+    let mut tuple = RedirectTuple::default();
+    packet_redirect_tuple(pkt, 4, &mut tuple);
 
     let (tracked, track_now) = check_redirect_track(&tuple, is_udp, is_pure_syn);
     let is_redirected = tracked.is_some() || socket_was_proxied;
@@ -842,18 +871,9 @@ fn handle_wan_ipv6(
     let is_pure_syn = is_tcp && (pkt.tcph.syn() != 0 && pkt.tcph.ack() == 0);
     let is_fin_rst = is_tcp && (pkt.tcph.fin() != 0 || pkt.tcph.rst() != 0);
 
-    let dst_ip = *pkt.tuples.five.dst_ip.as_bytes();
-    let src_ip = *pkt.tuples.five.src_ip.as_bytes();
-
-    let tuple = RedirectTuple {
-        src_ip,
-        dst_ip,
-        src_port,
-        dst_port,
-        proto: pkt.l4proto,
-        ip_version: 6,
-        _pad: [0; 2],
-    };
+    let dst_ip = pkt.tuples.five.dst_ip.as_bytes();
+    let mut tuple = RedirectTuple::default();
+    packet_redirect_tuple(pkt, 6, &mut tuple);
 
     let (tracked, track_now) = check_redirect_track(&tuple, is_udp, is_pure_syn);
     let is_redirected = tracked.is_some() || socket_was_proxied;
@@ -918,30 +938,14 @@ fn handle_wan_ipv6(
         if is_new_flow {
             let pid = pid_pname.map(|p| p.pid).unwrap_or(0);
             let pname = pid_pname.map(|p| &p.pname);
-            let mut sip_u32 = [0u32; 4];
-            let mut dip_u32 = [0u32; 4];
-            for i in 0..4 {
-                sip_u32[i] = u32::from_ne_bytes([
-                    src_ip[i * 4],
-                    src_ip[i * 4 + 1],
-                    src_ip[i * 4 + 2],
-                    src_ip[i * 4 + 3],
-                ]);
-                dip_u32[i] = u32::from_ne_bytes([
-                    dst_ip[i * 4],
-                    dst_ip[i * 4 + 1],
-                    dst_ip[i * 4 + 2],
-                    dst_ip[i * 4 + 3],
-                ]);
-            }
             send_dae_event(
                 DaeEventType::Redirected as u32,
                 pid,
                 pname,
                 1,
                 pkt.l4proto,
-                Some(&sip_u32),
-                Some(&dip_u32),
+                Some(&pkt.tuples.five.src_ip.u6_addr32),
+                Some(&pkt.tuples.five.dst_ip.u6_addr32),
                 src_port,
                 dst_port,
             );
@@ -981,6 +985,27 @@ fn handle_wan_egress_impl(tc_ctx: &TcContext, link_h_len: usize) -> i32 {
     // 已经在 lan_ingress 中完成准入判定，在 WAN 出口必须放行直连，严禁被当作本机流量误劫持。
     if unsafe { (*ctx).ingress_ifindex } != 0 {
         return TC_ACT_OK;
+    }
+
+    let mut tcp_policy = core::ptr::null_mut::<u32>();
+    let sk = unsafe { (*ctx).__bindgen_anon_2.sk };
+    if !sk.is_null() {
+        let full = unsafe { bpf_sk_fullsock(sk) };
+        if !full.is_null() && unsafe { (*full).protocol } == IPPROTO_TCP as u32 {
+            tcp_policy = unsafe {
+                bpf_sk_storage_get(
+                    core::ptr::addr_of!(TCP_SOCKET_POLICY).cast_mut().cast(),
+                    full.cast(),
+                    core::ptr::null_mut(),
+                    0,
+                )
+            }
+            .cast::<u32>();
+            // Missing storage means passive or predating the connect hooks.
+            if tcp_policy.is_null() || unsafe { *tcp_policy } == 3 {
+                return TC_ACT_OK;
+            }
+        }
     }
 
     let cookie = unsafe { bpf_get_socket_cookie(ctx as *mut _) };
@@ -1034,34 +1059,14 @@ fn handle_wan_egress_impl(tc_ctx: &TcContext, link_h_len: usize) -> i32 {
 
     // Only connect hooks grant active-open identity; no flow-LRU dependency.
     if pkt.l4proto == IPPROTO_TCP {
-        let sk = unsafe { (*ctx).__bindgen_anon_2.sk };
-        if sk.is_null() {
+        if tcp_policy.is_null() {
             return TC_ACT_OK;
         }
-        let full = unsafe { bpf_sk_fullsock(sk) };
-        if full.is_null() {
-            return TC_ACT_OK;
-        }
-        let policy = unsafe {
-            bpf_sk_storage_get(
-                core::ptr::addr_of!(TCP_SOCKET_POLICY).cast_mut().cast(),
-                full.cast(),
-                core::ptr::null_mut(),
-                0,
-            )
-        }
-        .cast::<u32>();
-        if policy.is_null() {
-            return TC_ACT_OK;
-        }
-        let decision = unsafe { *policy };
-        if decision == 3 {
-            return TC_ACT_OK;
-        }
+        let decision = unsafe { *tcp_policy };
         let verdict =
             dispatch_wan(ctx, param, link_h_len, pkt, &(pid_pname, decision == 2));
         unsafe {
-            *policy = if verdict == TC_ACT_OK { 3 } else { 2 };
+            *tcp_policy = if verdict == TC_ACT_OK { 3 } else { 2 };
         }
         return verdict;
     }
@@ -1211,33 +1216,15 @@ fn handle_dae0_ingress_impl(tc_ctx: &TcContext) -> i32 {
     let is_ipv4 = pkt.ethh.ether_type == ETH_P_IP.to_be();
     let is_ipv6 = pkt.ethh.ether_type == ETH_P_IPV6.to_be();
 
-    let (src_ip, dst_ip, ip_version) = if is_ipv4 {
-        (
-            *pkt.tuples.five.src_ip.as_bytes(),
-            *pkt.tuples.five.dst_ip.as_bytes(),
-            4,
-        )
+    let ip_version = if is_ipv4 {
+        4
     } else if is_ipv6 {
-        (
-            *pkt.tuples.five.src_ip.as_bytes(),
-            *pkt.tuples.five.dst_ip.as_bytes(),
-            6,
-        )
+        6
     } else {
         return TC_ACT_OK;
     };
-
-    let tuple = RedirectTuple {
-        src_ip,
-        dst_ip,
-        src_port: pkt.tuples.five.src_port,
-        dst_port: pkt.tuples.five.dst_port,
-        proto: pkt.l4proto,
-        ip_version,
-        _pad: [0; 2],
-    };
-
-    let reversed = tuple.reverse();
+    let mut reversed = RedirectTuple::default();
+    packet_reverse_redirect_tuple(pkt, ip_version, &mut reversed);
     if let Some(entry) = unsafe { REDIRECT_TRACK.get(&reversed) } {
         let dmac = entry.smac;
         let smac = entry.dmac;
@@ -1246,20 +1233,11 @@ fn handle_dae0_ingress_impl(tc_ctx: &TcContext) -> i32 {
 
         unsafe {
             if dmac != [0; 6] {
-                let _ = bpf_skb_store_bytes(
-                    ctx,
-                    mem::offset_of!(EthHdr, src_addr) as u32,
-                    smac.as_ptr() as *const _,
-                    6,
-                    0,
-                );
-                let _ = bpf_skb_store_bytes(
-                    ctx,
-                    mem::offset_of!(EthHdr, dst_addr) as u32,
-                    dmac.as_ptr() as *const _,
-                    6,
-                    0,
-                );
+                // Ethernet destination and source addresses occupy the first 12 bytes.
+                let mut macs = [0u8; 12];
+                macs[..6].copy_from_slice(&dmac);
+                macs[6..].copy_from_slice(&smac);
+                let _ = bpf_skb_store_bytes(ctx, 0, macs.as_ptr().cast(), 12, 0);
             }
 
             let flags: u64 = if from_wan != 0 { 1 } else { 0 }; // 1 = BPF_F_INGRESS
