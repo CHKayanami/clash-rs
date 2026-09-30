@@ -2,15 +2,11 @@ use std::{
     io,
     net::SocketAddr,
     pin::Pin,
-    sync::atomic::{AtomicUsize, Ordering},
     task::{Context, Poll},
 };
 
 use bytes::Bytes;
-use futures::{
-    Sink, SinkExt, Stream, StreamExt, ready,
-    stream::{SplitSink, SplitStream},
-};
+use futures::{Sink, SinkExt, Stream, StreamExt, ready};
 use parking_lot::Mutex;
 use shadowsocks::{
     ProxySocket,
@@ -272,26 +268,26 @@ where
     }
 }
 
-/// Sentinel for `queued_len`: nothing is currently held by the sink.
-const NOTHING_QUEUED: usize = usize::MAX;
-
-/// Shadowsocks UDP I/O that ProxySocket required
+/// Shadowsocks UDP I/O that ProxySocket requires. The guard is held only
+/// during each poll, so a pending send leaves receives free to make progress.
 pub struct ShadowsocksUdpIo {
-    w: Mutex<SplitSink<AnyOutboundDatagram, UdpPacket>>,
-    r: Mutex<SplitStream<AnyOutboundDatagram>>,
-    /// Length of the datagram handed to the sink but not yet flushed, or
-    /// [`NOTHING_QUEUED`]. Used to tell a legitimate re-poll of the same packet
-    /// apart from a caller that moved on to a different one.
-    queued_len: AtomicUsize,
+    state: Mutex<UdpIoState>,
+}
+
+struct UdpIoState {
+    inner: AnyOutboundDatagram,
+    /// A caller must retry Pending sends with the same packet. Keep its length
+    /// and destination until flush completes, including zero-length datagrams.
+    queued: Option<(usize, SocketAddr)>,
 }
 
 impl ShadowsocksUdpIo {
     pub fn new(inner: AnyOutboundDatagram) -> Self {
-        let (w, r) = inner.split();
         Self {
-            w: Mutex::new(w),
-            r: Mutex::new(r),
-            queued_len: AtomicUsize::new(NOTHING_QUEUED),
+            state: Mutex::new(UdpIoState {
+                inner,
+                queued: None,
+            }),
         }
     }
 }
@@ -301,47 +297,30 @@ impl DatagramSend for ShadowsocksUdpIo {
         &self,
         cx: &mut Context<'_>,
         buf: &[u8],
-        target: std::net::SocketAddr,
+        target: SocketAddr,
     ) -> Poll<io::Result<usize>> {
-        let mut w = self.w.lock();
-
-        // A `Pending` flush leaves the packet with the sink, and the caller is
-        // expected to re-poll with the same data. If it comes back with a
-        // *different* datagram instead, flush what we already hold rather than
-        // skipping `start_send` and reporting success for a packet we never
-        // queued.
-        let queued = self.queued_len.load(Ordering::Relaxed);
-        if queued != NOTHING_QUEUED && queued != buf.len() {
-            ready!(w.poll_flush_unpin(cx))
-                .map_err(|e| new_io_error(e.to_string()))?;
-            self.queued_len.store(NOTHING_QUEUED, Ordering::Relaxed);
-        }
-
-        if self.queued_len.load(Ordering::Relaxed) == NOTHING_QUEUED {
-            match w.start_send_unpin(UdpPacket {
-                data: bytes::Bytes::copy_from_slice(buf),
-                src_addr: SocksAddr::any_ipv4(),
-                dst_addr: target.into(),
-                inbound_user: None,
-            }) {
-                Ok(_) => {
-                    self.queued_len.store(buf.len(), Ordering::Relaxed);
-                }
-                Err(e) => return Poll::Ready(Err(new_io_error(e.to_string()))),
+        let mut state = self.state.lock();
+        if let Some((len, destination)) = state.queued {
+            let result = ready!(state.inner.poll_flush_unpin(cx));
+            state.queued = None;
+            result?;
+            if len == buf.len() && destination == target {
+                return Poll::Ready(Ok(len));
             }
         }
 
-        match w.poll_flush_unpin(cx) {
-            Poll::Ready(Ok(())) => {
-                self.queued_len.store(NOTHING_QUEUED, Ordering::Relaxed);
-                Poll::Ready(Ok(buf.len()))
-            }
-            Poll::Ready(Err(e)) => {
-                self.queued_len.store(NOTHING_QUEUED, Ordering::Relaxed);
-                Poll::Ready(Err(new_io_error(e.to_string())))
-            }
-            Poll::Pending => Poll::Pending,
-        }
+        ready!(state.inner.poll_ready_unpin(cx))?;
+        state.inner.start_send_unpin(UdpPacket {
+            data: Bytes::copy_from_slice(buf),
+            src_addr: SocksAddr::any_ipv4(),
+            dst_addr: target.into(),
+            inbound_user: None,
+        })?;
+        state.queued = Some((buf.len(), target));
+
+        let result = ready!(state.inner.poll_flush_unpin(cx));
+        state.queued = None;
+        Poll::Ready(result.map(|()| buf.len()))
     }
 }
 
@@ -351,9 +330,9 @@ impl DatagramReceive for ShadowsocksUdpIo {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        let mut r = self.r.lock();
+        let mut state = self.state.lock();
 
-        match r.poll_next_unpin(cx) {
+        match state.inner.poll_next_unpin(cx) {
             Poll::Ready(Some(pkt)) => {
                 // Datagram boundaries are significant: the remainder of an
                 // oversized packet is not a new packet. Carrying it over to the
@@ -389,3 +368,7 @@ impl DatagramReceive for ShadowsocksUdpIo {
         Poll::Ready(Err(new_io_error("not supported for shadowsocks udp io")))
     }
 }
+
+#[cfg(test)]
+#[path = "datagram_tests.rs"]
+mod tests;

@@ -123,8 +123,7 @@ type DynamicStream = dyn ProxyStream + Sync;
 type DynamicDatagram =
     dyn OutboundDatagram<UdpPacket, Item = UdpPacket, Error = io::Error>;
 
-define_transport!($, AnyStream, DynamicStream, [ProxyStream + Sync], dispatch_stream, [Tcp(TcpStream)], [
-    Duplex(DuplexStream),
+define_transport!($, AnyStream, DynamicStream, [ProxyStream + Sync], dispatch_stream, [Tcp(TcpStream), Duplex(DuplexStream)], [
     Tfo(TfoStream),
     Hysteria2(HystStream),
     #[cfg(feature = "tuic")]
@@ -310,6 +309,42 @@ mod tests {
     use super::*;
     use crate::common::io::SlideBuffer;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[test]
+    fn inline_duplex_does_not_grow_transport_layout() {
+        // Before inlining Duplex, TCP and the fat dynamic pointer determined
+        // the layout; every other protocol variant contains one Box pointer.
+        #[allow(dead_code)]
+        enum PreviousLayout {
+            Tcp(TcpStream),
+            Dynamic(Box<dyn ProxyStream + Sync>),
+        }
+        assert_eq!(
+            std::mem::size_of::<AnyStream>(),
+            std::mem::size_of::<PreviousLayout>()
+        );
+    }
+
+    #[tokio::test]
+    async fn prefixed_enum_preserves_vectored_writes() {
+        let (client, mut peer) = tokio::io::duplex(64);
+        let mut prefix = SlideBuffer::new(8);
+        prefix.extend_from_slice(b"prefix");
+        let mut stream =
+            AnyStream::new(PrefixedStream::new(prefix, AnyStream::new(client)));
+        assert!(stream.is_write_vectored());
+        let bufs = [io::IoSlice::new(b"one"), io::IoSlice::new(b"two")];
+        assert_eq!(stream.write_vectored(&bufs).await.unwrap(), 6);
+        stream.shutdown().await.unwrap();
+        let mut received = Vec::new();
+        peer.read_to_end(&mut received).await.unwrap();
+        assert_eq!(received, b"onetwo");
+        peer.write_all(b"body").await.unwrap();
+        peer.shutdown().await.unwrap();
+        received.clear();
+        stream.read_to_end(&mut received).await.unwrap();
+        assert_eq!(received, b"prefixbody");
+    }
 
     #[tokio::test]
     async fn nested_transport_preserves_prefix_and_half_close() {

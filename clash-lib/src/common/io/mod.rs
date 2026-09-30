@@ -167,10 +167,23 @@ impl CopyBuffer {
                     std::cmp::min(self.start_index + self.cache_length, self.size);
 
                 let me = &mut *self;
-                match writer.as_mut().poll_write(
-                    cx,
-                    &me.buf[used_start_index..used_end_index_exclusive],
-                ) {
+                let head_length = me.cache_length
+                    - (used_end_index_exclusive - used_start_index);
+                let result = if head_length > 0 && writer.is_write_vectored() {
+                    let slices = [
+                        io::IoSlice::new(
+                            &me.buf[used_start_index..used_end_index_exclusive],
+                        ),
+                        io::IoSlice::new(&me.buf[..head_length]),
+                    ];
+                    writer.as_mut().poll_write_vectored(cx, &slices)
+                } else {
+                    writer.as_mut().poll_write(
+                        cx,
+                        &me.buf[used_start_index..used_end_index_exclusive],
+                    )
+                };
+                match result {
                     Poll::Ready(Ok(written)) => {
                         if written == 0 {
                             return Poll::Ready(Err(io::Error::new(
@@ -687,6 +700,8 @@ impl<T: ReadExactSlideBase> ReadExactSlideExt for T {
 
 #[cfg(test)]
 mod half_close_tests;
+#[cfg(test)]
+mod vectored_tests;
 
 #[cfg(test)]
 mod tests {
