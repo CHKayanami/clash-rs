@@ -778,7 +778,8 @@ async fn create_components(
     let cache_store = profile::ThreadSafeCacheFile::new(
         &cwd.join("cache.db").to_string_lossy(),
         config.profile.store_selected,
-    );
+    )
+    .map_err(|e| Error::ProfileError(e.to_string()))?;
 
     let system_resolver = Arc::new(
         SystemResolver::new(config.dns.ipv6)

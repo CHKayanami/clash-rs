@@ -63,7 +63,7 @@ pub async fn build_dns_resolver() -> anyhow::Result<Arc<dyn ClashResolver>> {
     let cache_store = profile::ThreadSafeCacheFile::new(
         root.join("cache.db").as_path().to_str().unwrap(),
         config.profile.store_selected,
-    );
+    )?;
 
     let dns_resolver = Arc::new(
         dns::EnhancedResolver::new(

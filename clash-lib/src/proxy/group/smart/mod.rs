@@ -870,7 +870,7 @@ mod tests {
         let cache_store = ThreadSafeCacheFile::new(
             cache_path.to_str().expect("Cache path is not valid UTF-8"),
             false,
-        );
+        )?;
 
         let resolver = SystemResolver::new(false).map_err(|e| {
             anyhow::anyhow!("Failed to create system resolver: {}", e)

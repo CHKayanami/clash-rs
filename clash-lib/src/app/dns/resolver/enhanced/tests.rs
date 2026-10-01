@@ -397,7 +397,7 @@ async fn test_optimistic_cache_ttl_and_never_cache() {
 
     let dir = tempfile::tempdir().unwrap();
     let cache_path = dir.path().join("cache.db");
-    let store = ThreadSafeCacheFile::new(cache_path.to_str().unwrap(), true);
+    let store = ThreadSafeCacheFile::new(cache_path.to_str().unwrap(), true).unwrap();
     let resolver = EnhancedResolver::new(
         cfg,
         store,
@@ -427,7 +427,7 @@ async fn test_reverse_lookup_cache_integration_and_conflict() {
 
     let dir = tempfile::tempdir().unwrap();
     let cache_path = dir.path().join("cache.db");
-    let store = ThreadSafeCacheFile::new(cache_path.to_str().unwrap(), true);
+    let store = ThreadSafeCacheFile::new(cache_path.to_str().unwrap(), true).unwrap();
 
     let cfg = Config {
         enable: true,

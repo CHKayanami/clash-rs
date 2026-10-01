@@ -27,15 +27,19 @@ mod mem_store;
 pub use file_store::FileStore;
 pub use mem_store::InMemStore;
 
+const DEFAULT_CACHE_CAPACITY: usize = 20_000;
+
 #[enum_dispatch]
 pub trait Store: Sync + Send {
     fn get_by_host(&self, host: &str) -> Option<net::IpAddr>;
     fn get_v6_by_host(&self, host: &str) -> Option<net::IpAddr>;
 
-    fn put_by_host(&self, host: &str, ip: net::IpAddr);
     fn get_by_ip(&self, ip: net::IpAddr) -> Option<String>;
     fn put_by_ip(&self, ip: net::IpAddr, host: &str);
+    #[cfg(test)]
     fn del_by_ip(&self, ip: net::IpAddr);
+    /// Evict a batch from the given address family, returning an IP to reuse.
+    fn evict_batch(&self, ip: net::IpAddr) -> Option<net::IpAddr>;
     fn exist(&self, ip: net::IpAddr) -> bool;
     fn copy_to(&self, store: &dyn Store);
     fn search_by_wildcard_limited(
@@ -122,6 +126,18 @@ pub(crate) fn v6_prefix_mask(prefix_len: u8) -> u128 {
     }
 }
 
+/// Split a total mapping budget without expanding it for large address pools.
+pub(crate) fn cache_capacities(
+    total: usize,
+    v4_addresses: u128,
+    v6_addresses: u128,
+) -> (usize, usize) {
+    let total = if total == 0 { 1000 } else { total };
+    let v4 = (total / 2 + total % 2) as u128;
+    let v6 = (total / 2) as u128;
+    (v4.min(v4_addresses) as usize, v6.min(v6_addresses) as usize)
+}
+
 pub type ThreadSafeFakeDns = Arc<FakeDns>;
 
 pub struct FakePoolV4 {
@@ -144,6 +160,9 @@ pub struct FakeDns {
     domain_filter: Option<DomainFilter>,
     filter_mode: FakeIpFilterMode,
     store: FakeStore,
+    // Serialize allocation within each family; clearing locks v4 before v6.
+    v4_allocation: parking_lot::Mutex<()>,
+    v6_allocation: parking_lot::Mutex<()>,
     /// Memoized `should_skip` verdicts. Covers both static `fake-ip-filter`
     /// entries and `rule-set:` matches; cleared wholesale whenever one of the
     /// bound rule-sets reloads (see [`FakeDns::add_rule_set`]).
@@ -166,17 +185,33 @@ impl Opts {
 
 impl FakeDns {
     pub fn new(opt: Opts) -> Result<Self, Error> {
+        let (min, max) = compute_v4_range(&opt.ipnet)?;
+        let (prefix, prefix_len6, min_host, max_host) =
+            compute_v6_range(&opt.ipnet6)?;
+        let (v4_capacity, v6_capacity) = cache_capacities(
+            DEFAULT_CACHE_CAPACITY,
+            u128::from(max) - u128::from(min) + 1,
+            max_host - min_host + 1,
+        );
         let store = match opt.store {
             Some(s) => s,
             None => match opt.cache_file {
-                Some(cache_file) => FakeStore::File(FileStore::new(
-                    cache_file, opt.ipnet, opt.ipnet6,
+                Some(cache_file) => FakeStore::File(
+                    FileStore::new(cache_file, opt.ipnet, opt.ipnet6).map_err(
+                        |e| {
+                            Error::ProfileError(format!(
+                                "restore fake-ip cache: {e:#}"
+                            ))
+                        },
+                    )?,
+                ),
+                None => FakeStore::Memory(InMemStore::with_capacities(
+                    v4_capacity,
+                    v6_capacity,
                 )),
-                None => FakeStore::Memory(InMemStore::new(10000)),
             },
         };
 
-        let (min, max) = compute_v4_range(&opt.ipnet)?;
         let initial_offset_v4 = store.initial_offset_v4(min, max);
         let v4_pool = Some(FakePoolV4 {
             min,
@@ -184,8 +219,6 @@ impl FakeDns {
             offset: AtomicU32::new(initial_offset_v4),
         });
 
-        let (prefix, prefix_len6, min_host, max_host) =
-            compute_v6_range(&opt.ipnet6)?;
         let initial_offset_v6 =
             store.initial_offset_v6(&prefix, prefix_len6, min_host, max_host);
         let v6_pool = Some(FakePoolV6 {
@@ -202,6 +235,8 @@ impl FakeDns {
             domain_filter: opt.domain_filter,
             filter_mode: opt.filter_mode,
             store,
+            v4_allocation: parking_lot::Mutex::new(()),
+            v6_allocation: parking_lot::Mutex::new(()),
             skip_cache: Arc::new(quick_cache::sync::Cache::new(1000)),
         })
     }
@@ -241,7 +276,20 @@ impl FakeDns {
     }
 
     pub fn delete_cache(&self, pattern: &str) -> usize {
-        self.store.del_by_wildcard(pattern.trim())
+        let pattern = pattern.trim();
+        if pattern != "*" {
+            return self.store.del_by_wildcard(pattern);
+        }
+        let _v4 = self.v4_allocation.lock();
+        let _v6 = self.v6_allocation.lock();
+        let deleted = self.store.del_by_wildcard(pattern);
+        if let Some(pool) = &self.v4_pool {
+            pool.offset.store(0, Ordering::Relaxed);
+        }
+        if let Some(pool) = &self.v6_pool {
+            pool.offset.store(0, Ordering::Relaxed);
+        }
+        deleted
     }
 
     pub async fn add_rule_set(
@@ -353,6 +401,10 @@ impl FakeDns {
     }
 
     fn get(&self, host: &str) -> net::IpAddr {
+        let _allocation = self.v4_allocation.lock();
+        if let Some(ip) = self.store.get_by_host(host) {
+            return ip;
+        }
         let mut allocated_v4 = None;
         if let Some(pool) = &self.v4_pool {
             let pool_size = pool.max - pool.min + 1;
@@ -367,8 +419,10 @@ impl FakeDns {
                 let ip = Ipv4Addr::from(pool.min + candidate_offset);
                 let ip_addr = IpAddr::V4(ip);
                 if current_try >= pool_size {
-                    self.store.del_by_ip(ip_addr);
-                    allocated_v4 = Some(ip);
+                    allocated_v4 = Some(match self.store.evict_batch(ip_addr) {
+                        Some(IpAddr::V4(victim)) => victim,
+                        _ => ip,
+                    });
                     break;
                 }
                 if !self.store.exist(ip_addr) {
@@ -392,6 +446,10 @@ impl FakeDns {
     /// 2. 仅分配/查询 IPv6 Fake IP (应对 AAAA 记录)
     /// ----------------------------------------
     pub fn getv6(&self, host: &str) -> IpAddr {
+        let _allocation = self.v6_allocation.lock();
+        if let Some(ip) = self.store.get_v6_by_host(host) {
+            return ip;
+        }
         let pool = self.v6_pool.as_ref().unwrap();
         let pool_size = pool.max_host - pool.min_host + 1;
         let mut current_try = 0;
@@ -411,9 +469,11 @@ impl FakeDns {
             let ip_addr = IpAddr::V6(ip);
 
             if current_try >= pool_size {
-                // 撞圈，淘汰最老的一个
-                self.store.del_by_ip(ip_addr);
-                allocated_ip = Some(ip);
+                // Evict a batch and reuse one of the freed addresses.
+                allocated_ip = Some(match self.store.evict_batch(ip_addr) {
+                    Some(IpAddr::V6(victim)) => victim,
+                    _ => ip,
+                });
                 break;
             }
             if !self.store.exist(ip_addr) {
@@ -459,12 +519,158 @@ mod tests {
 
     use tempfile::tempdir;
 
-    use super::{FakeDns, FileStore, InMemStore, Opts, Store};
+    use super::{
+        FakeDns, FakeStore, FileStore, InMemStore, Opts, Store, cache_capacities,
+    };
     use crate::{
         app::{dns::filters::DomainFilter, profile::ThreadSafeCacheFile},
         common::trie,
         config::def::FakeIpFilterMode,
     };
+
+    #[test]
+    fn concurrent_allocations_preserve_both_family_mappings() {
+        let pool = FakeDns::new(Opts::new(
+            "198.18.0.0/16".parse().unwrap(),
+            "fc00::/64".parse().unwrap(),
+        ))
+        .unwrap();
+        let barrier = std::sync::Barrier::new(16);
+        let results = std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..16)
+                .map(|_| {
+                    scope.spawn(|| {
+                        barrier.wait();
+                        (pool.lookup("same.com"), pool.lookupv6("same.com"))
+                    })
+                })
+                .collect();
+            workers
+                .into_iter()
+                .map(|worker| worker.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        for &(v4, v6) in &results {
+            assert_eq!((v4, v6), results[0]);
+            assert_eq!(pool.reverse_lookup(v4).as_deref(), Some("same.com"));
+            assert_eq!(pool.reverse_lookup(v6).as_deref(), Some("same.com"));
+        }
+        assert_eq!(pool.search_cache_limited("*", 0).0, 2);
+    }
+
+    #[test]
+    fn allocation_rechecks_existing_mappings() {
+        let pool = FakeDns::new(Opts::new(
+            "198.18.0.0/16".parse().unwrap(),
+            "fc00::/64".parse().unwrap(),
+        ))
+        .unwrap();
+        let v4 = pool.lookup("same.com");
+        let v6 = pool.lookupv6("same.com");
+        assert_eq!(pool.get("same.com"), v4);
+        assert_eq!(pool.getv6("same.com"), v6);
+        assert_eq!(pool.lookup("next.com").to_string(), "198.18.0.3");
+        assert_eq!(pool.lookupv6("next.com").to_string(), "fc00::2");
+    }
+
+    #[test]
+    fn clearing_all_cache_rewinds_both_families() {
+        let pool = FakeDns::new(Opts::new(
+            "198.18.0.0/16".parse().unwrap(),
+            "fc00::/64".parse().unwrap(),
+        ))
+        .unwrap();
+        let first_v4 = pool.lookup("first.com");
+        let first_v6 = pool.lookupv6("first.com");
+        pool.lookup("second.com");
+        pool.lookupv6("second.com");
+        assert_eq!(pool.delete_cache(" * "), 4);
+        assert_eq!(pool.search_cache_limited("*", 0).0, 0);
+        assert_eq!(pool.lookup("new.com"), first_v4);
+        assert_eq!(pool.lookupv6("new.com"), first_v6);
+        assert_eq!(pool.reverse_lookup(first_v4).as_deref(), Some("new.com"));
+        assert_eq!(pool.reverse_lookup(first_v6).as_deref(), Some("new.com"));
+    }
+
+    #[test]
+    fn partial_deletion_keeps_allocation_cursors() {
+        let pool = FakeDns::new(Opts::new(
+            "198.18.0.0/16".parse().unwrap(),
+            "fc00::/64".parse().unwrap(),
+        ))
+        .unwrap();
+        pool.lookup("delete.com");
+        pool.lookupv6("delete.com");
+        let kept_v4 = pool.lookup("keep.org");
+        let kept_v6 = pool.lookupv6("keep.org");
+        assert_eq!(pool.delete_cache("*.com"), 2);
+        assert_eq!(pool.delete_cache("missing.com"), 0);
+        assert_eq!(pool.lookup("keep.org"), kept_v4);
+        assert_eq!(pool.lookupv6("keep.org"), kept_v6);
+        assert_eq!(pool.lookup("next.com").to_string(), "198.18.0.4");
+        assert_eq!(pool.lookupv6("next.com").to_string(), "fc00::3");
+    }
+
+    #[test]
+    fn clearing_an_empty_cache_still_rewinds_cursors() {
+        let pool = FakeDns::new(Opts::new(
+            "198.18.0.0/16".parse().unwrap(),
+            "fc00::/64".parse().unwrap(),
+        ))
+        .unwrap();
+        let first_v4 = pool.lookup("delete.com");
+        let first_v6 = pool.lookupv6("delete.com");
+        assert_eq!(pool.delete_cache("delete.com"), 2);
+        assert_eq!(pool.delete_cache("*"), 0);
+        assert_eq!(pool.lookup("new.com"), first_v4);
+        assert_eq!(pool.lookupv6("new.com"), first_v6);
+    }
+
+    #[tokio::test]
+    async fn clear_then_reallocate_preserves_persistence_order() {
+        let dir = tempdir().unwrap();
+        let file = ThreadSafeCacheFile::new(
+            dir.path().join("clear-cursor.db").to_str().unwrap(),
+            true,
+        )
+        .unwrap();
+        let mut options = Opts::new(
+            "198.18.0.0/16".parse().unwrap(),
+            "fc00::/64".parse().unwrap(),
+        );
+        options.cache_file = Some(file.clone());
+        let pool = FakeDns::new(options).unwrap();
+        let v4 = pool.lookup("old.com");
+        let v6 = pool.lookupv6("old.com");
+        assert_eq!(pool.delete_cache("*"), 2);
+        assert_eq!(pool.lookup("new.com"), v4);
+        assert_eq!(pool.lookupv6("new.com"), v6);
+        pool.lookup("flush.org");
+        assert_eq!(pool.delete_cache("flush.org"), 1); // Flush the queued operations.
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if file.get_fake_ip("new.com#v6").as_deref() == Some("fc00::1") {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(file.get_fake_ip("old.com#v4"), None);
+        assert_eq!(file.get_fake_ip("old.com#v6"), None);
+        let (hosts, ips) = file.get_fake_ip_tables().unwrap();
+        assert_eq!(hosts.len(), 2);
+        assert_eq!(ips.len(), 2);
+        assert_eq!(
+            file.get_fake_ip(&v4.to_string()).as_deref(),
+            Some("new.com")
+        );
+        assert_eq!(
+            file.get_fake_ip(&v6.to_string()).as_deref(),
+            Some("new.com")
+        );
+    }
 
     #[tokio::test]
     async fn test_inmem_basic() {
@@ -785,7 +991,7 @@ mod tests {
         let temp_dir = tempdir().unwrap();
         let cache_path = temp_dir.path().join("test_cache.db");
         let cache_store =
-            ThreadSafeCacheFile::new(cache_path.to_str().unwrap(), true);
+            ThreadSafeCacheFile::new(cache_path.to_str().unwrap(), true).unwrap();
 
         let ipnet = "192.168.0.0/29".parse::<ipnet::IpNet>().unwrap();
         let v4 = match ipnet {
@@ -840,13 +1046,68 @@ mod tests {
     }
 
     #[test]
+    fn exhausted_address_pools_also_evict_in_batches() {
+        let pool = FakeDns::new(Opts::new(
+            "198.18.0.0/28".parse().unwrap(),
+            "fc00::/124".parse().unwrap(),
+        ))
+        .unwrap();
+        // Each pool has 14 usable addresses, so overflow evicts ceil(14/10)=2.
+        let first_v4 = pool.lookup("0.com");
+        let first_v6 = pool.lookupv6("0.com");
+        for i in 1..14 {
+            pool.lookup(&format!("{i}.com"));
+            pool.lookupv6(&format!("{i}.com"));
+        }
+        assert_eq!(pool.search_cache_limited("*", 0).0, 28);
+        assert_eq!(pool.lookup("new.com"), first_v4);
+        assert_eq!(pool.lookupv6("new.com"), first_v6);
+        assert_eq!(pool.search_cache_limited("*", 0).0, 26);
+        assert_eq!(pool.store.get_by_host("0.com"), None);
+        assert_eq!(pool.store.get_by_host("1.com"), None);
+        assert_eq!(pool.store.get_v6_by_host("0.com"), None);
+        assert_eq!(pool.store.get_v6_by_host("1.com"), None);
+        assert_eq!(pool.reverse_lookup(first_v4).as_deref(), Some("new.com"));
+        assert_eq!(pool.reverse_lookup(first_v6).as_deref(), Some("new.com"));
+        // The next insertion fills the headroom without another eviction.
+        pool.lookup("next.com");
+        pool.lookupv6("next.com");
+        assert_eq!(pool.search_cache_limited("*", 0).0, 28);
+    }
+
+    #[test]
+    fn cache_budget_is_capped_by_address_pool() {
+        assert_eq!(
+            cache_capacities(super::DEFAULT_CACHE_CAPACITY, 2, u128::MAX),
+            (2, 10_000)
+        );
+        assert_eq!(cache_capacities(5, u128::MAX, u128::MAX), (3, 2));
+        let pool = FakeDns::new(Opts::new(
+            "198.18.0.0/30".parse().unwrap(),
+            "fc00::/126".parse().unwrap(),
+        ))
+        .unwrap();
+        let FakeStore::Memory(store) = &pool.store else {
+            panic!("expected memory store");
+        };
+        for i in 0..10 {
+            pool.lookup(&format!("{i}.com"));
+            pool.lookupv6(&format!("{i}.com"));
+        }
+        let (_, entries) = store.search_by_wildcard_limited("*", usize::MAX);
+        assert_eq!(entries.iter().filter(|(ip, _)| ip.is_ipv4()).count(), 2);
+        assert_eq!(entries.iter().filter(|(ip, _)| ip.is_ipv6()).count(), 2);
+    }
+
+    #[test]
     fn test_file_store_pattern_delete_updates_both_indexes() {
         let temp_dir = tempdir().unwrap();
         let cache_path = temp_dir.path().join("test_pattern_delete.db");
-        let cache_store = ThreadSafeCacheFile::new(cache_path.to_str().unwrap(), true);
+        let cache_store =
+            ThreadSafeCacheFile::new(cache_path.to_str().unwrap(), true).unwrap();
         let v4_net = "198.18.0.0/16".parse().unwrap();
         let v6_net = "fc00::/64".parse().unwrap();
-        let store = FileStore::new(cache_store.clone(), v4_net, v6_net);
+        let store = FileStore::new(cache_store.clone(), v4_net, v6_net).unwrap();
         let v4: net::IpAddr = "198.18.0.2".parse().unwrap();
         let v6: net::IpAddr = "fc00::2".parse().unwrap();
         let other: net::IpAddr = "198.18.0.3".parse().unwrap();
@@ -859,9 +1120,12 @@ mod tests {
         assert_eq!(cache_store.get_fake_ip(&v6.to_string()), None);
         assert_eq!(cache_store.get_fake_ip("example.com#v4"), None);
         assert_eq!(cache_store.get_fake_ip("example.com#v6"), None);
-        assert_eq!(cache_store.get_fake_ip(&other.to_string()).as_deref(), Some("other.org"));
+        assert_eq!(
+            cache_store.get_fake_ip(&other.to_string()).as_deref(),
+            Some("other.org")
+        );
 
-        let reloaded = FileStore::new(cache_store, v4_net, v6_net);
+        let reloaded = FileStore::new(cache_store, v4_net, v6_net).unwrap();
         assert_eq!(reloaded.get_by_ip(v4), None);
         assert_eq!(reloaded.get_by_ip(v6), None);
         assert_eq!(reloaded.get_by_ip(other).as_deref(), Some("other.org"));
@@ -871,10 +1135,11 @@ mod tests {
     async fn test_file_store_pattern_delete_flushes_queued_puts() {
         let temp_dir = tempdir().unwrap();
         let cache_path = temp_dir.path().join("test_queued_pattern_delete.db");
-        let cache_store = ThreadSafeCacheFile::new(cache_path.to_str().unwrap(), true);
+        let cache_store =
+            ThreadSafeCacheFile::new(cache_path.to_str().unwrap(), true).unwrap();
         let v4_net = "198.18.0.0/16".parse().unwrap();
         let v6_net = "fc00::/64".parse().unwrap();
-        let store = FileStore::new(cache_store.clone(), v4_net, v6_net);
+        let store = FileStore::new(cache_store.clone(), v4_net, v6_net).unwrap();
         let deleted_ip: net::IpAddr = "198.18.0.2".parse().unwrap();
         let retained_ip: net::IpAddr = "198.18.0.3".parse().unwrap();
         store.put_by_ip(deleted_ip, "example.com");
@@ -883,7 +1148,8 @@ mod tests {
 
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
             loop {
-                if cache_store.get_fake_ip(&retained_ip.to_string()).as_deref() == Some("other.org")
+                if cache_store.get_fake_ip(&retained_ip.to_string()).as_deref()
+                    == Some("other.org")
                     && cache_store.get_fake_ip(&deleted_ip.to_string()).is_none()
                     && cache_store.get_fake_ip("example.com#v4").is_none()
                 {
@@ -891,7 +1157,9 @@ mod tests {
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
-        }).await.unwrap();
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -899,7 +1167,7 @@ mod tests {
         let temp_dir = tempdir().unwrap();
         let cache_path = temp_dir.path().join("test_cache_legacy.db");
         let cache_store =
-            ThreadSafeCacheFile::new(cache_path.to_str().unwrap(), true);
+            ThreadSafeCacheFile::new(cache_path.to_str().unwrap(), true).unwrap();
 
         // Manually write old format to the cache store (no suffix)
         let host = "old-style.com";
@@ -911,7 +1179,7 @@ mod tests {
         let v4_net = "192.168.0.0/24".parse().unwrap();
         let v6_net = "fdfe:5a70:6451:982b::/64".parse().unwrap();
 
-        let store = FileStore::new(cache_store.clone(), v4_net, v6_net);
+        let store = FileStore::new(cache_store.clone(), v4_net, v6_net).unwrap();
 
         // Test lookup v4 from loaded legacy entry
         let res_v4 = store.get_by_host(host);
@@ -926,7 +1194,7 @@ mod tests {
         let ip_v6_str = "fdfe:5a70:6451:982b::2";
         cache_store.set_host_to_ip(host_v6, ip_v6_str);
 
-        let store_v6 = FileStore::new(cache_store.clone(), v4_net, v6_net);
+        let store_v6 = FileStore::new(cache_store.clone(), v4_net, v6_net).unwrap();
         let res_v6_new = store_v6.get_v6_by_host(host_v6);
         assert_eq!(res_v6_new, Some(ip_v6_str.parse().unwrap()));
         assert_eq!(store_v6.get_by_host(host_v6), None);
@@ -946,7 +1214,8 @@ mod tests {
 
         // 阶段 1：使用首个 FakeDns 实例分配 FakeIP 并持久化
         {
-            let cache_store = ThreadSafeCacheFile::new(cache_path_str, true);
+            let cache_store =
+                ThreadSafeCacheFile::new(cache_path_str, true).unwrap();
             let pool = FakeDns::new(Opts {
                 ipnet: v4_net,
                 ipnet6: v6_net,
@@ -968,7 +1237,8 @@ mod tests {
 
         // 阶段 2：重启并创建全新实例，验证启动时预热加载至内存
         {
-            let cache_store = ThreadSafeCacheFile::new(cache_path_str, true);
+            let cache_store =
+                ThreadSafeCacheFile::new(cache_path_str, true).unwrap();
             let pool = FakeDns::new(Opts {
                 ipnet: v4_net,
                 ipnet6: v6_net,
@@ -1000,7 +1270,8 @@ mod tests {
 
         // 写入旧网段数据
         {
-            let cache_store = ThreadSafeCacheFile::new(cache_path_str, true);
+            let cache_store =
+                ThreadSafeCacheFile::new(cache_path_str, true).unwrap();
             let pool = FakeDns::new(Opts {
                 ipnet: old_v4,
                 ipnet6: old_v6,
@@ -1021,7 +1292,8 @@ mod tests {
         let new_v4: ipnet::Ipv4Net = "198.19.0.0/16".parse().unwrap();
         let new_v6: ipnet::Ipv6Net = "fdfe:9999:6451:982b::/64".parse().unwrap();
         {
-            let cache_store = ThreadSafeCacheFile::new(cache_path_str, true);
+            let cache_store =
+                ThreadSafeCacheFile::new(cache_path_str, true).unwrap();
             let pool = FakeDns::new(Opts {
                 ipnet: new_v4,
                 ipnet6: new_v6,
@@ -1053,7 +1325,8 @@ mod tests {
 
         // 阶段 1：分配 3 个 IP
         {
-            let cache_store = ThreadSafeCacheFile::new(cache_path_str, true);
+            let cache_store =
+                ThreadSafeCacheFile::new(cache_path_str, true).unwrap();
             let pool = FakeDns::new(Opts {
                 ipnet: v4_net,
                 ipnet6: v6_net,
@@ -1073,7 +1346,8 @@ mod tests {
 
         // 阶段 2：重启后，offset 应恢复至 3（紧随 198.18.0.4 之后），分配新域名时直接得到 198.18.0.5
         {
-            let cache_store = ThreadSafeCacheFile::new(cache_path_str, true);
+            let cache_store =
+                ThreadSafeCacheFile::new(cache_path_str, true).unwrap();
             let pool = FakeDns::new(Opts {
                 ipnet: v4_net,
                 ipnet6: v6_net,

@@ -7,7 +7,7 @@ use std::{
 };
 
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 const TABLE_SELECTED: TableDefinition<&str, &str> = TableDefinition::new("selected");
 const TABLE_IP_TO_HOST: TableDefinition<&str, &str> =
@@ -17,6 +17,23 @@ const TABLE_HOST_TO_IP: TableDefinition<&str, &str> =
 const TABLE_SMART_STATS: TableDefinition<&str, &[u8]> =
     TableDefinition::new("smart_stats");
 
+pub enum FakeIpOperation {
+    // Startup reconciliation removes each index independently before repairs.
+    Prune {
+        ips: Vec<String>,
+        host_keys: Vec<String>,
+    },
+    Put {
+        ip: String,
+        host: String,
+        host_key: String,
+    },
+    Delete {
+        ip: String,
+        host_key: Option<String>,
+    },
+}
+
 #[derive(Clone)]
 pub struct ThreadSafeCacheFile {
     db: Arc<Database>,
@@ -24,35 +41,32 @@ pub struct ThreadSafeCacheFile {
 }
 
 impl ThreadSafeCacheFile {
-    pub fn new(path: &str, store_selected: bool) -> Self {
+    pub fn new(path: &str, store_selected: bool) -> anyhow::Result<Self> {
         let db_path = Path::new(path);
         if let Some(parent) = db_path.parent() {
             if !parent.as_os_str().is_empty() {
-                let _ = fs::create_dir_all(parent);
+                fs::create_dir_all(parent)?;
             }
         }
 
         let mut db = match open_or_init_db(path) {
             Ok(db) => db,
-            Err(e) => {
-                error!(
-                    "failed to open cache database at {}: {}, resetting",
-                    path, e
-                );
-                reset_corrupt_db(path);
-                Database::create(path)
-                    .expect("failed to create fresh cache database")
+            Err(redb::DatabaseError::Storage(redb::StorageError::Corrupted(
+                reason,
+            ))) => {
+                warn!("cache database is corrupt: {}", reason);
+                reset_corrupt_db(path)?;
+                Database::create(path)?
             }
+            Err(e) => return Err(e.into()),
         };
 
-        // Ensure default tables exist
-        if let Ok(write_txn) = db.begin_write() {
-            let _ = write_txn.open_table(TABLE_SELECTED);
-            let _ = write_txn.open_table(TABLE_IP_TO_HOST);
-            let _ = write_txn.open_table(TABLE_HOST_TO_IP);
-            let _ = write_txn.open_table(TABLE_SMART_STATS);
-            let _ = write_txn.commit();
-        }
+        let write_txn = db.begin_write()?;
+        write_txn.open_table(TABLE_SELECTED)?;
+        write_txn.open_table(TABLE_IP_TO_HOST)?;
+        write_txn.open_table(TABLE_HOST_TO_IP)?;
+        write_txn.open_table(TABLE_SMART_STATS)?;
+        write_txn.commit()?;
 
         // 启动时整理压缩数据库以回收碎片和空闲空间
         let size_before = fs::metadata(path).map(|m| m.len()).unwrap_or(0);
@@ -72,10 +86,10 @@ impl ThreadSafeCacheFile {
             }
         }
 
-        Self {
+        Ok(Self {
             db: Arc::new(db),
             store_selected,
-        }
+        })
     }
 
     pub fn store_selected(&self) -> bool {
@@ -174,59 +188,62 @@ impl ThreadSafeCacheFile {
 
     pub fn get_fake_ip_tables(
         &self,
-    ) -> (HashMap<String, String>, HashMap<String, String>) {
-        let mut host_to_ip = HashMap::new();
-        let mut ip_to_host = HashMap::new();
-        if let Ok(read_txn) = self.db.begin_read() {
-            if let Ok(table) = read_txn.open_table(TABLE_HOST_TO_IP) {
-                if let Ok(iter) = table.iter() {
-                    for item in iter.flatten() {
-                        host_to_ip.insert(
-                            item.0.value().to_string(),
-                            item.1.value().to_string(),
-                        );
-                    }
-                }
+    ) -> anyhow::Result<(HashMap<String, String>, HashMap<String, String>)> {
+        use anyhow::Context;
+
+        let read_txn = self.db.begin_read().context("read fake-ip snapshot")?;
+        let read_table = |definition: TableDefinition<&str, &str>| -> anyhow::Result<HashMap<String, String>> {
+            let table = read_txn.open_table(definition)?;
+            let mut entries = HashMap::new();
+            for item in table.iter()? {
+                let (key, value) = item?;
+                entries.insert(key.value().to_owned(), value.value().to_owned());
             }
-            if let Ok(table) = read_txn.open_table(TABLE_IP_TO_HOST) {
-                if let Ok(iter) = table.iter() {
-                    for item in iter.flatten() {
-                        ip_to_host.insert(
-                            item.0.value().to_string(),
-                            item.1.value().to_string(),
-                        );
-                    }
-                }
-            }
-        }
-        (host_to_ip, ip_to_host)
+            Ok(entries)
+        };
+        let host_to_ip =
+            read_table(TABLE_HOST_TO_IP).context("read host_to_ip table")?;
+        let ip_to_host =
+            read_table(TABLE_IP_TO_HOST).context("read ip_to_host table")?;
+        Ok((host_to_ip, ip_to_host))
     }
 
     pub fn apply_fake_ip_batch(
         &self,
-        puts: &[(String, String, String)],
-        deletes: &[(String, Option<String>)],
-    ) {
-        if puts.is_empty() && deletes.is_empty() {
-            return;
+        commands: &[FakeIpOperation],
+    ) -> anyhow::Result<()> {
+        if commands.is_empty() {
+            return Ok(());
         }
-        if let Ok(write_txn) = self.db.begin_write() {
-            let t1 = write_txn.open_table(TABLE_IP_TO_HOST).ok();
-            let t2 = write_txn.open_table(TABLE_HOST_TO_IP).ok();
-            if let (Some(mut ip_table), Some(mut host_table)) = (t1, t2) {
-                for (ip, host, host_key) in puts {
-                    let _ = ip_table.insert(ip.as_str(), host.as_str());
-                    let _ = host_table.insert(host_key.as_str(), ip.as_str());
-                }
-                for (ip, host_key) in deletes {
-                    let _ = ip_table.remove(ip.as_str());
-                    if let Some(hk) = host_key {
-                        let _ = host_table.remove(hk.as_str());
+        let write_txn = self.db.begin_write()?;
+        {
+            let mut ip_table = write_txn.open_table(TABLE_IP_TO_HOST)?;
+            let mut host_table = write_txn.open_table(TABLE_HOST_TO_IP)?;
+            for command in commands {
+                match command {
+                    FakeIpOperation::Prune { ips, host_keys } => {
+                        for ip in ips {
+                            ip_table.remove(ip.as_str())?;
+                        }
+                        for key in host_keys {
+                            host_table.remove(key.as_str())?;
+                        }
+                    }
+                    FakeIpOperation::Put { ip, host, host_key } => {
+                        ip_table.insert(ip.as_str(), host.as_str())?;
+                        host_table.insert(host_key.as_str(), ip.as_str())?;
+                    }
+                    FakeIpOperation::Delete { ip, host_key } => {
+                        ip_table.remove(ip.as_str())?;
+                        if let Some(key) = host_key {
+                            host_table.remove(key.as_str())?;
+                        }
                     }
                 }
             }
-            let _ = write_txn.commit();
         }
+        write_txn.commit()?;
+        Ok(())
     }
 
     pub fn set_smart_stats(
@@ -267,17 +284,25 @@ fn open_or_init_db(path: &str) -> Result<Database, redb::DatabaseError> {
             Err(e) => {
                 // Check if it's a legacy YAML cache file
                 if let Ok(content) = fs::read_to_string(path) {
-                    if let Ok(legacy_map) =
-                        yaml_serde::from_str::<serde_json::Value>(&content)
+                    if let Ok(legacy_map) = yaml_serde::from_str::<
+                        HashMap<String, HashMap<String, String>>,
+                    >(&content)
                     {
                         info!(
                             "migrating legacy yaml cache file at {} to redb...",
                             path
                         );
                         let backup_path = format!("{}.legacy-yaml", path);
-                        let _ = fs::rename(path, &backup_path);
+                        fs::rename(path, &backup_path)?;
                         let db = Database::create(path)?;
-                        migrate_legacy_json(&db, &legacy_map);
+                        migrate_legacy_json(
+                            &db,
+                            &serde_json::to_value(&legacy_map)
+                                .expect("string maps are serializable"),
+                        )
+                        .map_err(|e| {
+                            redb::DatabaseError::from(std::io::Error::other(e))
+                        })?;
                         return Ok(db);
                     }
                 }
@@ -289,52 +314,38 @@ fn open_or_init_db(path: &str) -> Result<Database, redb::DatabaseError> {
     }
 }
 
-fn migrate_legacy_json(db: &Database, legacy: &serde_json::Value) {
-    if let Ok(write_txn) = db.begin_write() {
-        if let Some(selected) = legacy.get("selected").and_then(|v| v.as_object()) {
-            if let Ok(mut table) = write_txn.open_table(TABLE_SELECTED) {
-                for (k, v) in selected {
-                    if let Some(val) = v.as_str() {
-                        let _ = table.insert(k.as_str(), val);
-                    }
+fn migrate_legacy_json(
+    db: &Database,
+    legacy: &serde_json::Value,
+) -> Result<(), redb::Error> {
+    let write_txn = db.begin_write()?;
+    for (name, definition) in [
+        ("selected", TABLE_SELECTED),
+        ("ip_to_host", TABLE_IP_TO_HOST),
+        ("host_to_ip", TABLE_HOST_TO_IP),
+    ] {
+        if let Some(values) = legacy.get(name).and_then(|v| v.as_object()) {
+            let mut table = write_txn.open_table(definition)?;
+            for (key, value) in values {
+                if let Some(value) = value.as_str() {
+                    table.insert(key.as_str(), value)?;
                 }
             }
         }
-        if let Some(ip_to_host) =
-            legacy.get("ip_to_host").and_then(|v| v.as_object())
-        {
-            if let Ok(mut table) = write_txn.open_table(TABLE_IP_TO_HOST) {
-                for (k, v) in ip_to_host {
-                    if let Some(val) = v.as_str() {
-                        let _ = table.insert(k.as_str(), val);
-                    }
-                }
-            }
-        }
-        if let Some(host_to_ip) =
-            legacy.get("host_to_ip").and_then(|v| v.as_object())
-        {
-            if let Ok(mut table) = write_txn.open_table(TABLE_HOST_TO_IP) {
-                for (k, v) in host_to_ip {
-                    if let Some(val) = v.as_str() {
-                        let _ = table.insert(k.as_str(), val);
-                    }
-                }
-            }
-        }
-        let _ = write_txn.commit();
-        debug!("legacy cache data imported into redb successfully");
     }
+    write_txn.commit()?;
+    debug!("legacy cache data imported into redb successfully");
+    Ok(())
 }
 
-fn reset_corrupt_db(path: &str) {
+fn reset_corrupt_db(path: &str) -> std::io::Result<()> {
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
     let corrupt_path = format!("{}.corrupt-{}", path, ts);
     warn!("moving corrupt database {} to {}", path, corrupt_path);
-    let _ = fs::rename(path, corrupt_path);
+    fs::rename(path, corrupt_path)
 }
 
 #[cfg(test)]
@@ -343,12 +354,130 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
+    fn fake_ip_snapshot_rejects_missing_tables_without_modification() {
+        for definition in [TABLE_HOST_TO_IP, TABLE_IP_TO_HOST] {
+            let dir = tempdir().unwrap();
+            let cache = ThreadSafeCacheFile::new(
+                dir.path().join("incomplete.db").to_str().unwrap(),
+                true,
+            )
+            .unwrap();
+            cache
+                .apply_fake_ip_batch(&[FakeIpOperation::Put {
+                    ip: "198.18.0.2".into(),
+                    host: "retained.com".into(),
+                    host_key: "retained.com#v4".into(),
+                }])
+                .unwrap();
+            let txn = cache.db.begin_write().unwrap();
+            txn.delete_table(definition).unwrap();
+            txn.commit().unwrap();
+            assert!(cache.get_fake_ip_tables().is_err());
+            // The other half of the snapshot must not be pruned or repaired.
+            let txn = cache.db.begin_read().unwrap();
+            if let Ok(table) = txn.open_table(TABLE_HOST_TO_IP) {
+                assert_eq!(
+                    table.get("retained.com#v4").unwrap().unwrap().value(),
+                    "198.18.0.2"
+                );
+            } else {
+                let table = txn.open_table(TABLE_IP_TO_HOST).unwrap();
+                assert_eq!(
+                    table.get("198.18.0.2").unwrap().unwrap().value(),
+                    "retained.com"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_open_database_twice_preserves_file() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("locked.db");
+        let cache = ThreadSafeCacheFile::new(path.to_str().unwrap(), true).unwrap();
+        cache.set_selected("PROXY", "Node");
+        assert!(ThreadSafeCacheFile::new(path.to_str().unwrap(), true).is_err());
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+        drop(cache);
+        let reopened =
+            ThreadSafeCacheFile::new(path.to_str().unwrap(), true).unwrap();
+        assert_eq!(reopened.get_selected("PROXY").as_deref(), Some("Node"));
+    }
+
+    #[test]
+    fn test_failed_batch_does_not_commit_partial_changes() {
+        let dir = tempdir().unwrap();
+        let cache = ThreadSafeCacheFile::new(
+            dir.path().join("failure.db").to_str().unwrap(),
+            true,
+        )
+        .unwrap();
+        let txn = cache.db.begin_write().unwrap();
+        txn.delete_table(TABLE_HOST_TO_IP).unwrap();
+        txn.open_table(TableDefinition::<&str, u64>::new("host_to_ip"))
+            .unwrap();
+        txn.commit().unwrap();
+        assert!(
+            cache
+                .apply_fake_ip_batch(&[FakeIpOperation::Put {
+                    ip: "198.18.0.1".into(),
+                    host: "example.com".into(),
+                    host_key: "example.com#v4".into(),
+                }])
+                .is_err()
+        );
+        assert_eq!(cache.get_fake_ip("198.18.0.1"), None);
+    }
+
+    #[test]
+    fn test_batch_preserves_ip_reuse_order() {
+        let dir = tempdir().unwrap();
+        let cache = ThreadSafeCacheFile::new(
+            dir.path().join("order.db").to_str().unwrap(),
+            true,
+        )
+        .unwrap();
+        let put = |host: &str| FakeIpOperation::Put {
+            ip: "198.18.0.1".into(),
+            host: host.into(),
+            host_key: format!("{host}#v4"),
+        };
+        cache
+            .apply_fake_ip_batch(&[
+                put("old.com"),
+                FakeIpOperation::Delete {
+                    ip: "198.18.0.1".into(),
+                    host_key: Some("old.com#v4".into()),
+                },
+                put("new.com"),
+            ])
+            .unwrap();
+        assert_eq!(cache.get_fake_ip("198.18.0.1").as_deref(), Some("new.com"));
+        assert_eq!(
+            cache.get_fake_ip("new.com#v4").as_deref(),
+            Some("198.18.0.1")
+        );
+        assert_eq!(cache.get_fake_ip("old.com#v4"), None);
+        cache
+            .apply_fake_ip_batch(&[
+                put("new.com"),
+                FakeIpOperation::Delete {
+                    ip: "198.18.0.1".into(),
+                    host_key: Some("new.com#v4".into()),
+                },
+            ])
+            .unwrap();
+        assert_eq!(cache.get_fake_ip("198.18.0.1"), None);
+        assert_eq!(cache.get_fake_ip("new.com#v4"), None);
+    }
+
+    #[test]
     fn test_selected_crud() {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("test_cache.db");
         let path_str = db_path.to_str().unwrap();
 
-        let cache = ThreadSafeCacheFile::new(path_str, true);
+        let cache = ThreadSafeCacheFile::new(path_str, true).unwrap();
         assert_eq!(cache.get_selected("PROXY"), None);
 
         cache.set_selected("PROXY", "Node-1");
@@ -367,7 +496,7 @@ mod tests {
         let db_path = dir.path().join("test_cache_disabled.db");
         let path_str = db_path.to_str().unwrap();
 
-        let cache = ThreadSafeCacheFile::new(path_str, false);
+        let cache = ThreadSafeCacheFile::new(path_str, false).unwrap();
         cache.set_selected("PROXY", "Node-1");
         assert_eq!(cache.get_selected("PROXY"), None);
         assert!(cache.get_selected_map().is_empty());
@@ -379,7 +508,7 @@ mod tests {
         let db_path = dir.path().join("test_fakeip.db");
         let path_str = db_path.to_str().unwrap();
 
-        let cache = ThreadSafeCacheFile::new(path_str, true);
+        let cache = ThreadSafeCacheFile::new(path_str, true).unwrap();
         cache.set_ip_to_host("198.18.0.1", "google.com");
         cache.set_host_to_ip("google.com#v4", "198.18.0.1");
 
@@ -404,14 +533,14 @@ mod tests {
         let path_str = db_path.to_str().unwrap();
 
         {
-            let cache = ThreadSafeCacheFile::new(path_str, true);
+            let cache = ThreadSafeCacheFile::new(path_str, true).unwrap();
             cache.set_selected("AUTO", "HK-01");
             cache.set_ip_to_host("198.18.0.2", "github.com");
         }
 
         // Reopen database from disk
         {
-            let cache = ThreadSafeCacheFile::new(path_str, true);
+            let cache = ThreadSafeCacheFile::new(path_str, true).unwrap();
             assert_eq!(cache.get_selected("AUTO"), Some("HK-01".to_string()));
             assert_eq!(
                 cache.get_fake_ip("198.18.0.2"),
@@ -436,7 +565,7 @@ host_to_ip:
 "#;
         fs::write(&db_path, yaml_content).unwrap();
 
-        let cache = ThreadSafeCacheFile::new(path_str, true);
+        let cache = ThreadSafeCacheFile::new(path_str, true).unwrap();
         assert_eq!(cache.get_selected("PROXY"), Some("Legacy-Node".to_string()));
         assert_eq!(
             cache.get_fake_ip("198.18.0.99"),
@@ -455,11 +584,17 @@ host_to_ip:
         let path_str = db_path.to_str().unwrap();
 
         {
-            let cache = ThreadSafeCacheFile::new(path_str, true);
+            let cache = ThreadSafeCacheFile::new(path_str, true).unwrap();
             // 写入较多数据制造页面占用
             for i in 0..1000 {
-                cache.set_ip_to_host(&format!("198.18.0.{}", i), &format!("host-{}.com", i));
-                cache.set_host_to_ip(&format!("host-{}.com#v4", i), &format!("198.18.0.{}", i));
+                cache.set_ip_to_host(
+                    &format!("198.18.0.{}", i),
+                    &format!("host-{}.com", i),
+                );
+                cache.set_host_to_ip(
+                    &format!("host-{}.com#v4", i),
+                    &format!("198.18.0.{}", i),
+                );
             }
             // 删除大部分数据制造空闲死页（碎片）
             for i in 100..1000 {
@@ -474,7 +609,7 @@ host_to_ip:
         let size_before = fs::metadata(&db_path).unwrap().len();
 
         // 重新启动打开数据库，触发 startup compaction
-        let cache = ThreadSafeCacheFile::new(path_str, true);
+        let cache = ThreadSafeCacheFile::new(path_str, true).unwrap();
         let size_after = fs::metadata(&db_path).unwrap().len();
 
         // 验证碎片被成功压缩，文件尺寸减小或维持紧凑
