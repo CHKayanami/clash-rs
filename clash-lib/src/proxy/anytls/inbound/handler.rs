@@ -77,11 +77,11 @@ async fn do_handshake(
     raw_stream: tokio::net::TcpStream,
     src_addr: SocketAddr,
     acceptor: TlsAcceptor,
-    user_map: Arc<HashMap<[u8; 32], String>>,
+    user_map: Arc<HashMap<[u8; 32], Arc<str>>>,
     fallback: Option<String>,
 ) -> Option<(
     tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
-    Option<String>,
+    Option<Arc<str>>,
     SocksAddr,
     u32,
 )> {
@@ -238,7 +238,7 @@ pub(super) async fn handle_connection(
     src_addr: SocketAddr,
     acceptor: TlsAcceptor,
     dispatcher: Arc<Dispatcher>,
-    user_map: Arc<HashMap<[u8; 32], String>>,
+    user_map: Arc<HashMap<[u8; 32], Arc<str>>>,
     fw_mark: Option<u32>,
     fallback: Option<String>,
 ) {
@@ -308,7 +308,7 @@ async fn handle_udp_session(
     src_addr: SocketAddr,
     stream_id: u32,
     dispatcher: Arc<Dispatcher>,
-    inbound_user: Option<String>,
+    inbound_user: Option<Arc<str>>,
     fw_mark: Option<u32>,
 ) {
     let (mut remote_read, mut remote_write) = tokio::io::split(tls_stream);
@@ -446,7 +446,7 @@ async fn handle_tcp_relay(
     dest: SocksAddr,
     stream_id: u32,
     dispatcher: Arc<Dispatcher>,
-    inbound_user: Option<String>,
+    inbound_user: Option<Arc<str>>,
     fw_mark: Option<u32>,
 ) {
     let (mut remote_read, mut remote_write) = tokio::io::split(tls_stream);
@@ -761,7 +761,7 @@ mod tests {
             let mut map = std::collections::HashMap::new();
             let hash: [u8; 32] =
                 sha2::Sha256::digest("correct-password".as_bytes()).into();
-            map.insert(hash, "user".to_string());
+            map.insert(hash, Arc::<str>::from("user"));
             handle_fallback_connection(
                 stream,
                 src,
@@ -809,7 +809,7 @@ mod tests {
         raw: tokio::net::TcpStream,
         src: std::net::SocketAddr,
         acceptor: tokio_rustls::TlsAcceptor,
-        user_map: Arc<std::collections::HashMap<[u8; 32], String>>,
+        user_map: Arc<std::collections::HashMap<[u8; 32], Arc<str>>>,
         fallback: Option<String>,
     ) {
         use tokio::io::AsyncReadExt as _;

@@ -258,7 +258,7 @@ impl Stream for OutboundDatagramImpl {
                             .map(|(logical, _)| logical.clone())
                             .unwrap_or_else(|| src.into());
                         recv_queue.push_back(UdpPacket {
-                            data: bytes::Bytes::copy_from_slice(data),
+                            data,
                             src_addr,
                             dst_addr: SocksAddr::any_ipv4(),
                             ..Default::default()

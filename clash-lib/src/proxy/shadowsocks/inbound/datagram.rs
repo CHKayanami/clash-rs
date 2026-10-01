@@ -5,14 +5,14 @@ use crate::{
 };
 use futures::ready;
 use shadowsocks::{
-    ProxySocket,
-    relay::udprelay::options::UdpSocketControlData,
+    ProxySocket, relay::udprelay::options::UdpSocketControlData,
     security::replay::PacketWindow,
 };
 use std::{
     collections::{HashMap, HashSet, hash_map::Entry},
     net::SocketAddr,
     pin::Pin,
+    sync::Arc,
     task::{Context, Poll},
     time::{Duration, Instant},
 };
@@ -49,6 +49,8 @@ pub(crate) struct InboundShadowsocksDatagram {
 /// A client's control block plus the last time we saw traffic from it, so the
 /// map can be bounded — see [`InboundShadowsocksDatagram::evict_stale_clients`].
 struct ClientControl {
+    // Allocated once for this authenticated client session, shared by its packets.
+    inbound_user: Option<Arc<str>>,
     ctrl: UdpSocketControlData,
     logical_addr: SocketAddr,
     client_addr: SocketAddr,
@@ -229,6 +231,10 @@ impl futures::Stream for InboundShadowsocksDatagram {
                             let mut d = UdpSocketControlData::default();
                             d.server_session_id = server_session_id;
                             entry.insert(ClientControl {
+                                inbound_user: ctrl
+                                    .as_ref()
+                                    .and_then(|c| c.user.as_ref())
+                                    .map(|u| Arc::from(u.name())),
                                 ctrl: d,
                                 logical_addr: new_logical_addr,
                                 client_addr: src,
@@ -264,9 +270,7 @@ impl futures::Stream for InboundShadowsocksDatagram {
                                 port,
                             ) => SocksAddr::Domain(domain.into(), port),
                         },
-                        inbound_user: ctrl
-                            .and_then(|c| c.user)
-                            .map(|u| u.name().to_owned()),
+                        inbound_user: entry.inbound_user.clone(),
                     }));
                 }
                 Err(e) => {

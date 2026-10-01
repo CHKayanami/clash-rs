@@ -282,7 +282,7 @@ impl Manager {
         const MAX_CLOSED_FLOWS: usize = 500;
         let mut closed_flows: LruCache<FlowKey, ClosedFlowEntry> =
             LruCache::new(NonZeroUsize::new(MAX_CLOSED_FLOWS).unwrap());
-        let mut user_period_stats: HashMap<String, UserTraffic> = HashMap::new();
+        let mut user_period_stats: HashMap<Arc<str>, UserTraffic> = HashMap::new();
 
         while let Some(cmd) = rx.recv().await {
             match cmd {
@@ -312,7 +312,12 @@ impl Manager {
                 }
                 StatsCommand::DrainUserStats(reply) => {
                     let drained = std::mem::take(&mut user_period_stats);
-                    let _ = reply.send(drained);
+                    let _ = reply.send(
+                        drained
+                            .into_iter()
+                            .map(|(user, traffic)| (user.to_string(), traffic))
+                            .collect(),
+                    );
                 }
                 #[cfg(test)]
                 StatsCommand::InjectClosedUserBytes {
@@ -320,7 +325,7 @@ impl Manager {
                     upload,
                     download,
                 } => {
-                    let entry = user_period_stats.entry(user).or_default();
+                    let entry = user_period_stats.entry(user.into()).or_default();
                     entry.upload += upload;
                     entry.download += download;
                 }
@@ -462,7 +467,11 @@ impl Manager {
                 let upload = info.user_upload.swap(0, Ordering::Relaxed);
                 let download = info.user_download.swap(0, Ordering::Relaxed);
                 if upload > 0 || download > 0 {
-                    let entry = result.entry(user.clone()).or_default();
+                    let entry = if let Some(entry) = result.get_mut(user.as_ref()) {
+                        entry
+                    } else {
+                        result.entry(user.to_string()).or_default()
+                    };
                     entry.upload += upload;
                     entry.download += download;
                 }

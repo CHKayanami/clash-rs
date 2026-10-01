@@ -3,7 +3,6 @@ use crate::{
     proxy::{datagram::UdpPacket, utils::new_dual_stack_udp_socket},
     session::SocksAddr,
 };
-use bytes::Bytes;
 use futures::{Sink, Stream, ready};
 use parking_lot::RwLock;
 use std::{
@@ -231,7 +230,7 @@ impl DirectDatagramPool {
                                 let target_tx = routing_recv.read().route(peer);
                                 if let Some(tx) = target_tx {
                                     let packet = UdpPacket {
-                                        data: Bytes::copy_from_slice(data),
+                                        data,
                                         src_addr: SocksAddr::Ip(peer),
                                         dst_addr: SocksAddr::any_ipv4(),
                                         inbound_user: None,
@@ -749,6 +748,7 @@ impl Sink<UdpPacket> for PooledDirectDatagram {
 mod tests {
     use super::*;
     use crate::app::dns::MockClashResolver;
+    use bytes::Bytes;
     use futures::{SinkExt, StreamExt};
     use std::{net::IpAddr, time::Duration};
 

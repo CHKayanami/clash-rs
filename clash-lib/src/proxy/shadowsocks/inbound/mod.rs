@@ -122,11 +122,11 @@ fn build_user_manager(
 /// every connection.
 fn build_user_index(
     mgr: Option<&ServerUserManager>,
-) -> Arc<HashMap<Vec<u8>, String>> {
+) -> Arc<HashMap<Vec<u8>, Arc<str>>> {
     let mut index = HashMap::new();
     if let Some(mgr) = mgr {
         for u in mgr.users_iter() {
-            index.insert(u.key().to_vec(), u.name().to_owned());
+            index.insert(u.key().to_vec(), Arc::<str>::from(u.name()));
         }
     }
     Arc::new(index)
@@ -499,7 +499,77 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_aead2022_udp_sessions_and_replay_protection() -> anyhow::Result<()> {
+    async fn test_aead2022_udp_packets_share_authenticated_user()
+    -> anyhow::Result<()> {
+        use crate::proxy::shadowsocks::inbound::datagram::InboundShadowsocksDatagram;
+        use futures::{StreamExt, future::poll_fn};
+        use shadowsocks::{
+            config::ServerType,
+            context::Context,
+            relay::udprelay::{
+                options::UdpSocketControlData, proxy_socket::UdpSocketType,
+            },
+        };
+        use tokio::net::UdpSocket;
+
+        let socket = UdpSocket::bind("127.0.0.1:0").await?;
+        let address = socket.local_addr()?;
+        let method = shadowsocks::crypto::CipherKind::AEAD2022_BLAKE3_AES_128_GCM;
+        let server_key = "AAAAAAAAAAAAAAAAAAAAAA==";
+        let user_key = "AQEBAQEBAQEBAQEBAQEBAQ==";
+        let mut config = ServerConfig::new(address, server_key, method)?;
+        let mut users = ServerUserManager::new();
+        users.add_user(ServerUser::with_encoded_key("alice", user_key)?);
+        config.set_user_manager(users);
+        let server = ProxySocket::from_socket(
+            UdpSocketType::Server,
+            Context::new_shared(ServerType::Server),
+            &config,
+            socket.into(),
+        );
+        let mut inbound = InboundShadowsocksDatagram::new(server);
+        let client_config =
+            ServerConfig::new(address, format!("{server_key}:{user_key}"), method)?;
+        let client: ProxySocket<shadowsocks::net::UdpSocket> =
+            ProxySocket::from_socket(
+                UdpSocketType::Client,
+                Context::new_shared(ServerType::Local),
+                &client_config,
+                UdpSocket::bind("127.0.0.1:0").await?.into(),
+            );
+        let target =
+            shadowsocks::relay::Address::SocketAddress("1.1.1.1:53".parse()?);
+        let mut control = UdpSocketControlData::default();
+        control.client_session_id = 101;
+        let mut first_user = None;
+        for packet_id in 0..2 {
+            control.packet_id = packet_id;
+            poll_fn(|cx| {
+                client.poll_send_to_with_ctrl(
+                    address, &target, &control, b"request", cx,
+                )
+            })
+            .await?;
+            let packet = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                inbound.next(),
+            )
+            .await?
+            .unwrap();
+            let user = packet.inbound_user.unwrap();
+            assert_eq!(user.as_ref(), "alice");
+            if let Some(ref first) = first_user {
+                assert!(Arc::ptr_eq(first, &user));
+            } else {
+                first_user = Some(user);
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_aead2022_udp_sessions_and_replay_protection() -> anyhow::Result<()>
+    {
         use crate::proxy::datagram::UdpPacket;
         use crate::proxy::shadowsocks::inbound::datagram::InboundShadowsocksDatagram;
         use futures::{SinkExt, StreamExt, future::poll_fn};

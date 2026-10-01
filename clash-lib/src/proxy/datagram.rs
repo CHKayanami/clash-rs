@@ -1,5 +1,8 @@
 use crate::session::SocksAddr;
-use std::fmt::{Debug, Display, Formatter};
+use std::{
+    fmt::{Debug, Display, Formatter},
+    sync::Arc,
+};
 
 #[derive(Clone)]
 pub struct UdpPacket {
@@ -11,8 +14,8 @@ pub struct UdpPacket {
     pub dst_addr: SocksAddr,
     /// Authenticated user name from SS2022 EIH, propagated to the dispatcher
     /// session for per-user traffic attribution. `None` for all other
-    /// protocols.
-    pub inbound_user: Option<String>,
+    /// protocols. Clones share the authenticated name with the inbound session.
+    pub inbound_user: Option<Arc<str>>,
 }
 
 impl Default for UdpPacket {
@@ -159,5 +162,42 @@ impl Sink<UdpPacket> for ChannelDatagram {
         cx: &mut Context<'_>,
     ) -> Poll<Result<(), Self::Error>> {
         self.poll_flush(cx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn packet_and_session_clones_share_domain_and_user() {
+        let domain: Arc<str> = Arc::from("example.com");
+        let user: Arc<str> = Arc::from("alice");
+        let mut packet = UdpPacket::new(
+            bytes::Bytes::from_static(b"payload"),
+            SocksAddr::any_ipv4(),
+            SocksAddr::Domain(domain.clone(), 443),
+        );
+        packet.inbound_user = Some(user.clone());
+        let cloned = packet.clone();
+        let SocksAddr::Domain(cloned_domain, _) = &cloned.dst_addr else {
+            panic!("expected domain address");
+        };
+        assert!(Arc::ptr_eq(&domain, cloned_domain));
+        assert!(Arc::ptr_eq(&user, cloned.inbound_user.as_ref().unwrap()));
+        let session = crate::session::Session {
+            destination: packet.dst_addr,
+            inbound_user: packet.inbound_user,
+            ..Default::default()
+        };
+        let cloned_session = session.clone();
+        assert!(Arc::ptr_eq(
+            &user,
+            cloned_session.inbound_user.as_ref().unwrap()
+        ));
+        let SocksAddr::Domain(cloned_domain, _) = &cloned_session.destination else {
+            panic!("expected domain address");
+        };
+        assert!(Arc::ptr_eq(&domain, cloned_domain));
     }
 }

@@ -177,7 +177,7 @@ fn make_udp_flow_session(
     orig_inbound_dst: SocksAddr,
     dest: SocksAddr,
     mapped_domain: Option<String>,
-    inbound_user: Option<String>,
+    inbound_user: Option<Arc<str>>,
 ) -> Session {
     let mut sess = sess_base.clone();
     sess.id = crate::session::generate_session_id();

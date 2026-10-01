@@ -490,7 +490,7 @@ pub struct Session {
     /// Authenticated user name from SS2022 EIH (FAC user_id as string).
     /// Set by the Shadowsocks inbound before dispatch; used for per-user
     /// traffic attribution.
-    pub inbound_user: Option<String>,
+    pub inbound_user: Option<Arc<str>>,
     /// Domain name sniffed from TLS SNI / HTTP Host / QUIC SNI
     pub sniffed_domain: Option<String>,
     /// Domain name mapped from DNS reverse lookup or Fake-IP
@@ -725,7 +725,7 @@ fn test_session_serialize() {
     let mut s = Session::default();
     s.resolved_ip = Some(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)));
     s.asn = Some("Cloudflare".to_string());
-    s.inbound_user = Some("alice".to_string());
+    s.inbound_user = Some("alice".into());
     s.sniffed_domain = Some("example.com".to_string());
 
     let val: serde_json::Value = serde_json::to_value(&s).unwrap();

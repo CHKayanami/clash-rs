@@ -11,17 +11,17 @@ use std::{collections::HashMap, sync::Arc};
 pub fn build_user_map(
     users: &[InboundUser],
     fallback_password: &str,
-) -> Arc<HashMap<[u8; 32], String>> {
+) -> Arc<HashMap<[u8; 32], Arc<str>>> {
     let mut map = HashMap::new();
     if users.is_empty() {
         let hash: [u8; 32] = Sha256::digest(fallback_password.as_bytes()).into();
-        map.insert(hash, String::new());
+        map.insert(hash, Arc::<str>::from(""));
     } else {
         for u in users {
             let hash: [u8; 32] = Sha256::digest(u.password.as_bytes()).into();
             match map.entry(hash) {
                 std::collections::hash_map::Entry::Vacant(e) => {
-                    e.insert(u.name.clone());
+                    e.insert(Arc::from(u.name.as_str()));
                 }
                 std::collections::hash_map::Entry::Occupied(e) => {
                     tracing::warn!(
@@ -44,9 +44,9 @@ pub fn build_user_map(
 /// entry is compared, with no break on a hit, so the work done is independent
 /// of both whether and where a match occurred.
 pub fn lookup_user<'a>(
-    map: &'a HashMap<[u8; 32], String>,
+    map: &'a HashMap<[u8; 32], Arc<str>>,
     hash: &[u8; 32],
-) -> Option<&'a String> {
+) -> Option<&'a Arc<str>> {
     let mut found = None;
     for (candidate, name) in map.iter() {
         if crate::common::auth::constant_time_eq(candidate, hash) {
@@ -72,12 +72,22 @@ mod tests {
     }
 
     #[test]
+    fn authenticated_names_share_user_map_storage() {
+        let users = make_users(&[("alice", "password")]);
+        let map = build_user_map(&users, "ignored");
+        let hash: [u8; 32] = Sha256::digest(b"password").into();
+        let first = lookup_user(&map, &hash).unwrap().clone();
+        let second = lookup_user(&map, &hash).unwrap().clone();
+        assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    #[test]
     fn test_build_user_map_empty_uses_fallback() {
         let map = build_user_map(&[], "secret");
         let hash: [u8; 32] = Sha256::digest("secret".as_bytes()).into();
         assert!(map.contains_key(&hash), "fallback hash must be in the map");
         assert_eq!(
-            map.get(&hash).unwrap(),
+            map.get(&hash).unwrap().as_ref(),
             "",
             "fallback user name must be empty"
         );
@@ -88,7 +98,7 @@ mod tests {
         let users = make_users(&[("alice", "pass123")]);
         let map = build_user_map(&users, "ignored");
         let hash: [u8; 32] = Sha256::digest("pass123".as_bytes()).into();
-        assert_eq!(map.get(&hash).map(String::as_str), Some("alice"));
+        assert_eq!(map.get(&hash).map(AsRef::as_ref), Some("alice"));
     }
 
     #[test]
@@ -110,7 +120,7 @@ mod tests {
 
         let hash_a: [u8; 32] = Sha256::digest("pw_a".as_bytes()).into();
         let hash_b: [u8; 32] = Sha256::digest("pw_b".as_bytes()).into();
-        assert_eq!(map.get(&hash_a).map(String::as_str), Some("alice"));
-        assert_eq!(map.get(&hash_b).map(String::as_str), Some("bob"));
+        assert_eq!(map.get(&hash_a).map(AsRef::as_ref), Some("alice"));
+        assert_eq!(map.get(&hash_b).map(AsRef::as_ref), Some("bob"));
     }
 }
