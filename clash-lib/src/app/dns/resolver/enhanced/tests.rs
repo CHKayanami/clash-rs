@@ -316,10 +316,10 @@ async fn test_udp_pool_outbound_resolution() {
         None,
     );
 
-    // When outbound is not found in registry, it falls back to direct
+    // An unknown explicit outbound must not silently bypass the configured route.
     let addr = "1.1.1.1:53".parse().unwrap();
     let res = pool.udp_pool(&entry, addr, None).await;
-    assert!(res.is_ok(), "udp_pool direct fallback should succeed");
+    assert!(res.err().unwrap().to_string().contains("unknown DNS outbound"));
 }
 
 #[tokio::test]

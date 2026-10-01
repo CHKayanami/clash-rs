@@ -4,6 +4,7 @@ mod admission;
 mod entries;
 mod query;
 mod transports;
+mod udp;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -11,8 +12,9 @@ use std::sync::atomic::AtomicUsize;
 use std::time::Duration;
 
 pub use admission::{AdmissionGate, AdmissionPermit, ClosePermit};
-pub use entries::UpstreamEntry;
-pub use transports::{PooledTransport, TransportKey};
+pub use entries::{UpstreamEntry, UpstreamState};
+pub use transports::{PooledTransport, TransportKey, TransportPool};
+pub use udp::UdpUpstream;
 
 use crate::app::dns::ClashResolver;
 use crate::proxy::utils::OutboundHandlerRegistry;
@@ -53,7 +55,11 @@ impl UpstreamPool {
         })
     }
 
-    pub async fn query(&self, upstream_name: &str, raw_query: &[u8]) -> anyhow::Result<Vec<u8>> {
+    pub async fn query(
+        &self,
+        upstream_name: &str,
+        raw_query: &[u8],
+    ) -> anyhow::Result<Vec<u8>> {
         let entry = self
             .entries
             .get(upstream_name)
@@ -78,17 +84,7 @@ impl UpstreamPool {
         if let Some(close_permit) = self.admission.acquire_close().await {
             self.admission.wait_for_idle().await;
             for entry in self.entries.values() {
-                let transports = std::mem::take(&mut *entry.transports.lock());
-                for slot in transports.into_values() {
-                    slot.close(|t| async move { t.close().await }).await;
-                }
-                let udp_pools = {
-                    let mut udp = entry.udp.lock();
-                    std::mem::take(&mut udp.pools)
-                };
-                for (_, (_, pool)) in udp_pools {
-                    pool.close().await;
-                }
+                entry.state.close().await;
             }
             close_permit.complete();
         }

@@ -70,8 +70,8 @@ mod guards {
             {
                 let mut inner = self.slot.inner.lock();
                 inner.state = SlotState::Ready(Arc::clone(&value));
+                self.slot.active.store(Some(Arc::clone(&value)));
             }
-            self.slot.active.store(Some(Arc::clone(&value)));
             self.armed = false;
             self.slot.changed.notify_waiters();
             value
@@ -206,7 +206,10 @@ impl<T> LifecycleSlot<T> {
                         let generation = inner.generation;
                         inner.state = SlotState::Building { generation };
                         self.init_count.fetch_add(1, Ordering::SeqCst);
-                        tracing::debug!(phase = "start", "DNS transport initialization");
+                        tracing::debug!(
+                            phase = "start",
+                            "DNS transport initialization"
+                        );
                         Some(generation)
                     }
                 }
@@ -217,9 +220,9 @@ impl<T> LifecycleSlot<T> {
                 continue;
             };
             let guard = BuildGuard::new(self, generation);
-            let initializer = build
-                .take()
-                .ok_or_else(|| anyhow::anyhow!("initializer was already consumed"))?;
+            let initializer = build.take().ok_or_else(|| {
+                anyhow::anyhow!("initializer was already consumed")
+            })?;
             match initializer().await {
                 Ok(value) => return Ok(guard.publish(value)),
                 Err(error) => {
@@ -231,12 +234,36 @@ impl<T> LifecycleSlot<T> {
         }
     }
 
+    pub async fn close_if<F, Fut>(&self, expected: &Arc<T>, close: F)
+    where
+        F: FnOnce(Arc<T>) -> Fut,
+        Fut: Future<Output = ()>,
+    {
+        let resource = {
+            let mut inner = self.inner.lock();
+            match &inner.state {
+                SlotState::Ready(value) if Arc::ptr_eq(value, expected) => {
+                    let value = Arc::clone(value);
+                    inner.state = SlotState::Closing {
+                        value: Arc::clone(&value),
+                        owner: true,
+                    };
+                    self.active.store(None);
+                    value
+                }
+                _ => return,
+            }
+        };
+        let guard = CloseGuard::new(self);
+        close(resource).await;
+        guard.complete();
+    }
+
     pub async fn close<F, Fut>(&self, close: F)
     where
         F: FnOnce(Arc<T>) -> Fut,
         Fut: Future<Output = ()>,
     {
-        self.active.store(None);
         let mut close = Some(close);
         loop {
             let notified = self.changed.notified();
@@ -251,6 +278,7 @@ impl<T> LifecycleSlot<T> {
                             value: Arc::clone(&value),
                             owner: true,
                         };
+                        self.active.store(None);
                         Some(value)
                     }
                     SlotState::Closing { value, owner } if !*owner => {
@@ -266,9 +294,9 @@ impl<T> LifecycleSlot<T> {
                 continue;
             };
             let guard = CloseGuard::new(self);
-            let close_resource = close
-                .take()
-                .ok_or_else(|| anyhow::anyhow!("close operation was already consumed"));
+            let close_resource = close.take().ok_or_else(|| {
+                anyhow::anyhow!("close operation was already consumed")
+            });
             if let Ok(close_resource) = close_resource {
                 close_resource(resource).await;
             }
@@ -391,5 +419,22 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(*current, "brand_new_session");
+    }
+    #[tokio::test]
+    async fn stale_failure_does_not_close_replacement() {
+        let slot = LifecycleSlot::new();
+        let old = slot.acquire(|| async { Ok(1) }).await.unwrap();
+        slot.close_if(&old, |_| async {}).await;
+        let new = slot.acquire(|| async { Ok(2) }).await.unwrap();
+        slot.close_if(&old, |_| async {
+            panic!("stale failure closed new session")
+        })
+        .await;
+        let current = slot
+            .acquire(|| async { panic!("replacement must survive") })
+            .await
+            .unwrap();
+        assert!(Arc::ptr_eq(&new, &current));
+        assert_eq!(slot.close_count(), 1);
     }
 }

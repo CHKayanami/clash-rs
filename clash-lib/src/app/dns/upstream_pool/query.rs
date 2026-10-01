@@ -6,25 +6,9 @@ use tracing::{debug, trace, warn};
 
 use super::UpstreamPool;
 use super::admission::AdmissionPermit;
-use super::entries::UpstreamEntry;
-use crate::app::dns::endpoint::DnsProtocol;
+use super::entries::{UpstreamEntry, UpstreamState};
+use super::udp::UdpUpstream;
 use crate::app::dns::transport::UdpPool;
-
-fn udp_attempt_addresses(
-    addresses: &[SocketAddr],
-    current: Option<SocketAddr>,
-) -> Option<[SocketAddr; 2]> {
-    let first = current
-        .filter(|address| addresses.contains(address))
-        .or_else(|| addresses.first().copied())?;
-    let retry = addresses
-        .iter()
-        .copied()
-        .find(|address| address.is_ipv4() != first.is_ipv4())
-        .or_else(|| addresses.iter().copied().find(|address| *address != first))
-        .unwrap_or(first);
-    Some([first, retry])
-}
 
 impl UpstreamPool {
     pub async fn udp_pool(
@@ -33,37 +17,79 @@ impl UpstreamPool {
         address: SocketAddr,
         outbound_name: Option<&str>,
     ) -> anyhow::Result<Arc<UdpPool>> {
-        let (outbound_handler, effective_outbound) = if let Some(name) = outbound_name.or(entry.outbound.as_deref()) {
-            (self.outbounds.read().get(name).cloned(), Some(name.to_string()))
-        } else if let Some(ref rd) = self.rule_dispatch {
-            if let Some(handler) = rd.resolve_outbound(&entry.endpoint, crate::session::Network::Udp).await {
-                let name = handler.name().to_string();
-                (Some(handler), Some(name))
-            } else {
-                (None, None)
-            }
-        } else {
-            (None, None)
-        };
-
-        let family = usize::from(address.is_ipv6());
-        let cache_key = (effective_outbound.clone(), family);
-
-        if let Some((cached_address, pool)) = entry.udp.lock().pools.get(&cache_key)
-            && *cached_address == address
-        {
-            return Ok(Arc::clone(pool));
+        let udp = entry.udp_state()?;
+        let outbound = self.resolve_outbound(entry, outbound_name).await?;
+        if udp.fixed_address(&entry.endpoint, &outbound.name) == Some(address) {
+            return udp
+                .acquire_fixed(address, || {
+                    self.build_udp_pool(entry, address, &outbound)
+                })
+                .await;
         }
+        udp.for_address(address, &outbound.name)
+            .acquire(|| self.build_udp_pool(entry, address, &outbound))
+            .await
+    }
 
-        let dial = self.dial_context(entry, outbound_handler);
-        let candidate = if dial.outbound.is_some() {
+    async fn query_fixed_udp(
+        &self,
+        entry: &UpstreamEntry,
+        udp: &UdpUpstream,
+        address: SocketAddr,
+        outbound: &super::transports::ResolvedOutbound,
+        query: &[u8],
+    ) -> anyhow::Result<Vec<u8>> {
+        let mut last_error = None;
+        for _ in 0..2 {
+            let result = async {
+                let pool = udp
+                    .acquire_fixed(address, || {
+                        self.build_udp_pool(entry, address, outbound)
+                    })
+                    .await?;
+                pool.exchange(query).await
+            }
+            .await;
+            match result {
+                Ok(response) => {
+                    debug!(upstream = %entry.name, %address, outbound = ?outbound.name, "fixed UDP DNS query succeeded");
+                    return Ok(response);
+                }
+                Err(error) => {
+                    warn!(upstream = %entry.name, %address, outbound = ?outbound.name, "fixed UDP DNS query failed: {error}");
+                    last_error = Some(error);
+                }
+            }
+        }
+        Err(last_error
+            .unwrap_or_else(|| anyhow::anyhow!("fixed UDP DNS query failed")))
+    }
+
+    async fn build_udp_pool(
+        &self,
+        entry: &UpstreamEntry,
+        address: SocketAddr,
+        outbound: &super::transports::ResolvedOutbound,
+    ) -> anyhow::Result<Arc<UdpPool>> {
+        let effective_outbound = &outbound.name;
+        let dial = self.dial_context(entry, outbound.handler.clone());
+        if dial.outbound.is_some() {
             debug!(
                 upstream = %entry.name,
                 %address,
                 outbound = ?effective_outbound,
                 "creating proxied UDP DNS pool"
             );
-            UdpPool::new_proxied(&dial, address, Arc::clone(&self.active_transport_tasks)).await?
+            tokio::time::timeout(
+                dial.dial_timeout,
+                UdpPool::new_proxied(
+                    &dial,
+                    address,
+                    Arc::clone(&self.active_transport_tasks),
+                ),
+            )
+            .await
+            .map_err(|_| anyhow::anyhow!("proxied UDP DNS dial timed out"))?
         } else {
             trace!(
                 upstream = %entry.name,
@@ -73,36 +99,12 @@ impl UpstreamPool {
             UdpPool::new_direct(
                 address,
                 dial.so_mark,
-                dial.iface.as_ref().map(|i| i.name.as_str()),
+                dial.iface.as_ref(),
                 dial.query_timeout,
                 Arc::clone(&self.active_transport_tasks),
             )
-            .await?
-        };
-
-        let (pool, unused) = {
-            let mut state = entry.udp.lock();
-            if let Some((cached_address, pool)) = state.pools.get(&cache_key)
-                && *cached_address == address
-            {
-                (Arc::clone(pool), Some(candidate))
-            } else {
-                if state
-                    .current
-                    .is_some_and(|current| current.is_ipv6() == address.is_ipv6())
-                {
-                    state.current = None;
-                }
-                let old = state
-                    .pools
-                    .insert(cache_key, (address, Arc::clone(&candidate)));
-                (candidate, old.map(|(_, old_pool)| old_pool))
-            }
-        };
-        if let Some(unused) = unused {
-            unused.close().await;
+            .await
         }
-        Ok(pool)
     }
 
     pub async fn admit_query(&self) -> anyhow::Result<AdmissionPermit<'_>> {
@@ -118,23 +120,36 @@ impl UpstreamPool {
         outbound_name: Option<&str>,
     ) -> anyhow::Result<Vec<u8>> {
         let _permit = self.admit_query().await?;
+        let timeout = self.dns_query_timeout + self.dns_dial_timeout;
+        tokio::time::timeout(
+            timeout,
+            self.query_entry_inner(entry, raw_query, outbound_name),
+        )
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "DNS upstream '{}' query budget exhausted after {timeout:?}",
+                entry.name
+            )
+        })?
+    }
+
+    async fn query_entry_inner(
+        &self,
+        entry: &UpstreamEntry,
+        raw_query: &[u8],
+        outbound_name: Option<&str>,
+    ) -> anyhow::Result<Vec<u8>> {
         let start = Instant::now();
-        let effective_outbound: Option<String> = if let Some(name) = outbound_name.or(entry.outbound.as_deref()) {
-            Some(name.to_string())
-        } else if let Some(ref rd) = self.rule_dispatch {
-            let network = match entry.protocol {
-                DnsProtocol::Udp => crate::session::Network::Udp,
-                _ => crate::session::Network::Tcp,
-            };
-            rd.resolve_outbound(&entry.endpoint, network).await.map(|h| h.name().to_string())
-        } else {
-            None
-        };
+        let outbound = self.resolve_outbound(entry, outbound_name).await?;
+        let effective_outbound = &outbound.name;
 
         let ecs_query = if let Some(ref ecs) = entry.ecs
             && let Some(ipv4) = ecs.ipv4
         {
-            crate::app::dns::ecs::EcsQuery::prepare(raw_query, ipv4).ok().flatten()
+            crate::app::dns::ecs::EcsQuery::prepare(raw_query, ipv4)
+                .ok()
+                .flatten()
         } else {
             None
         };
@@ -157,16 +172,27 @@ impl UpstreamPool {
             "querying DNS upstream"
         );
 
-        let response = if entry.protocol == DnsProtocol::Udp {
+        let udp = match entry.state.as_ref() {
+            UpstreamState::Udp(udp) => Some(udp),
+            UpstreamState::Transport(_) => None,
+        };
+        let fixed_address =
+            udp.and_then(|udp| udp.fixed_address(&entry.endpoint, &outbound.name));
+        let response = if let (Some(udp), Some(address)) = (udp, fixed_address) {
+            self.query_fixed_udp(entry, udp, address, &outbound, outgoing_query)
+                .await?
+        } else if let Some(udp) = udp {
             let addresses = entry.endpoint.resolve_addrs().await?;
-            let current = entry.udp.lock().current;
-            let attempts = udp_attempt_addresses(&addresses, current)
-                .ok_or_else(|| anyhow::anyhow!("UDP DNS resolved to no addresses"))?;
+            let snapshot = udp.snapshot(&addresses, &outbound.name)?;
 
             let mut last_error = None;
             let mut successful_resp = None;
-            for address in attempts {
-                let pool = match self.udp_pool(entry, address, outbound_name).await {
+            for attempt in snapshot.attempts {
+                let address = attempt.address;
+                let pool = match attempt
+                    .acquire(|| self.build_udp_pool(entry, address, &outbound))
+                    .await
+                {
                     Ok(pool) => pool,
                     Err(error) => {
                         warn!(
@@ -191,7 +217,9 @@ impl UpstreamPool {
                             elapsed_ms = elapsed.as_millis(),
                             "DNS upstream query succeeded"
                         );
-                        entry.udp.lock().mark_current(address, effective_outbound.as_deref());
+                        if snapshot.current != Some(address) {
+                            udp.mark_current(address, &outbound.name);
+                        }
                         successful_resp = Some(response);
                         break;
                     }
@@ -209,10 +237,15 @@ impl UpstreamPool {
             }
             match successful_resp {
                 Some(resp) => resp,
-                None => return Err(last_error.unwrap_or_else(|| anyhow::anyhow!("UDP DNS query failed"))),
+                None => {
+                    entry.endpoint.invalidate_addresses();
+                    return Err(last_error.unwrap_or_else(|| {
+                        anyhow::anyhow!("UDP DNS query failed")
+                    }));
+                }
             }
         } else {
-            let transport = self.get_pooled_transport(entry, outbound_name).await?;
+            let transport = self.get_pooled_transport(entry, &outbound).await?;
             match transport.exchange(outgoing_query).await {
                 Ok(response) => {
                     let elapsed = start.elapsed();
@@ -254,5 +287,204 @@ impl UpstreamPool {
         } else {
             Ok(response)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::dns::MockClashResolver;
+    use crate::app::dns::config::{DNSNetMode, NameServer};
+    use crate::app::dns::query::{DnsName, QType, build_dns_query_wire};
+    use std::collections::HashMap;
+    use std::time::Duration;
+    use tokio::net::UdpSocket;
+
+    fn pool() -> Arc<UpstreamPool> {
+        UpstreamPool::new(
+            HashMap::new(),
+            Arc::new(parking_lot::RwLock::new(HashMap::new())),
+            None,
+            None,
+            None,
+            None,
+        )
+    }
+
+    #[tokio::test]
+    async fn fixed_ip_retries_and_reuses_its_dedicated_pool() {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let address = socket.local_addr().unwrap();
+        let ns = NameServer {
+            net: DNSNetMode::Udp,
+            host: url::Host::Ipv4(std::net::Ipv4Addr::LOCALHOST),
+            port: address.port(),
+            path: None,
+            proxy: None,
+            interface: None,
+        };
+        let entry = UpstreamEntry::from_nameserver(&ns, None).unwrap();
+        let mut pool = pool();
+        let inner = Arc::get_mut(&mut pool).unwrap();
+        inner.dns_query_timeout = Duration::from_millis(100);
+        inner.dns_dial_timeout = Duration::from_secs(1);
+        let server = tokio::spawn(async move {
+            let mut buffer = [0; 512];
+            for index in 0..3 {
+                let (len, peer) = socket.recv_from(&mut buffer).await.unwrap();
+                if index != 0 {
+                    buffer[2] |= 0x80;
+                    socket.send_to(&buffer[..len], peer).await.unwrap();
+                }
+            }
+        });
+        let query = build_dns_query_wire(
+            &DnsName::from_domain("fixed.test").unwrap(),
+            QType::A,
+        );
+        tokio::time::timeout(Duration::from_secs(2), async {
+            for _ in 0..2 {
+                assert_eq!(
+                    pool.query_entry(&entry, &query, None).await.unwrap()[..2],
+                    query[..2]
+                );
+            }
+            server.await.unwrap();
+        })
+        .await
+        .unwrap();
+        let fixed = entry
+            .udp_state()
+            .unwrap()
+            .acquire_fixed(address, || async {
+                panic!("query must populate dedicated slot")
+            })
+            .await
+            .unwrap();
+        let public = pool.udp_pool(&entry, address, None).await.unwrap();
+        assert!(Arc::ptr_eq(&fixed, &public));
+        assert_eq!(
+            pool.active_transport_tasks
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        let inner = Arc::get_mut(&mut pool).unwrap();
+        inner.rule_dispatch = Some(crate::app::dns::RuleDispatch::new());
+        let resolved = pool.resolve_outbound(&entry, None).await.unwrap();
+        assert_eq!(
+            entry
+                .udp_state()
+                .unwrap()
+                .fixed_address(&entry.endpoint, &resolved.name),
+            Some(address)
+        );
+        let routed = pool.udp_pool(&entry, address, None).await.unwrap();
+        assert!(Arc::ptr_eq(&fixed, &routed));
+        entry.udp_state().unwrap().close().await;
+        assert!(fixed.is_closed());
+        assert_eq!(
+            pool.active_transport_tasks
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_queries_share_bootstrap_and_udp_pool() {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut bootstrap = MockClashResolver::new();
+        bootstrap
+            .expect_resolve_v4()
+            .times(1)
+            .returning(|_, _| Ok(Some(std::net::Ipv4Addr::LOCALHOST)));
+        bootstrap
+            .expect_resolve_v6()
+            .times(1)
+            .returning(|_, _| Ok(None));
+        let ns = NameServer {
+            net: DNSNetMode::Udp,
+            host: url::Host::Domain("dns.example".into()),
+            port: socket.local_addr().unwrap().port(),
+            path: None,
+            proxy: None,
+            interface: None,
+        };
+        let entry = Arc::new(
+            UpstreamEntry::from_nameserver(&ns, Some(Arc::new(bootstrap))).unwrap(),
+        );
+        let pool = pool();
+        let server = tokio::spawn(async move {
+            let mut buffer = [0; 512];
+            for _ in 0..10 {
+                let (len, peer) = socket.recv_from(&mut buffer).await.unwrap();
+                buffer[2] |= 0x80;
+                socket.send_to(&buffer[..len], peer).await.unwrap();
+            }
+        });
+        let mut queries = tokio::task::JoinSet::new();
+        for _ in 0..10 {
+            let pool = pool.clone();
+            let entry = entry.clone();
+            queries.spawn(async move {
+                let query = build_dns_query_wire(
+                    &DnsName::from_domain("query.test").unwrap(),
+                    QType::A,
+                );
+                pool.query_entry(&entry, &query, None).await.unwrap()
+            });
+        }
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while let Some(result) = queries.join_next().await {
+                assert!(result.unwrap().len() >= 12);
+            }
+            server.await.unwrap();
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            pool.active_transport_tasks
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        entry.udp_state().unwrap().close().await;
+    }
+
+    #[tokio::test]
+    async fn address_refresh_does_not_cancel_old_pool_queries() {
+        let old_server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let new_server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let ns = NameServer {
+            net: DNSNetMode::Udp,
+            host: url::Host::Ipv4(std::net::Ipv4Addr::LOCALHOST),
+            port: old_server.local_addr().unwrap().port(),
+            path: None,
+            proxy: None,
+            interface: None,
+        };
+        let entry = UpstreamEntry::from_nameserver(&ns, None).unwrap();
+        let pool = pool();
+        let old = pool
+            .udp_pool(&entry, old_server.local_addr().unwrap(), None)
+            .await
+            .unwrap();
+        let exchange_pool = old.clone();
+        let exchange = tokio::spawn(async move {
+            let query = build_dns_query_wire(
+                &DnsName::from_domain("refresh.test").unwrap(),
+                QType::A,
+            );
+            exchange_pool.exchange(&query).await
+        });
+        let mut response = [0; 512];
+        let (len, peer) = old_server.recv_from(&mut response).await.unwrap();
+        let new = pool
+            .udp_pool(&entry, new_server.local_addr().unwrap(), None)
+            .await
+            .unwrap();
+        response[2] |= 0x80;
+        old_server.send_to(&response[..len], peer).await.unwrap();
+        assert!(exchange.await.unwrap().is_ok());
+        old.close().await;
+        new.close().await;
     }
 }

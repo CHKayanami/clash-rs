@@ -26,7 +26,10 @@ impl TcpPool {
         Self::new_tracked(dial, Arc::new(AtomicUsize::new(0)))
     }
 
-    pub fn new_tracked(dial: DialContext, active_tasks: Arc<AtomicUsize>) -> Arc<Self> {
+    pub fn new_tracked(
+        dial: DialContext,
+        active_tasks: Arc<AtomicUsize>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             dial,
             session: LifecycleSlot::new(),
@@ -34,26 +37,44 @@ impl TcpPool {
         })
     }
 
-    pub async fn exchange(self: &Arc<Self>, raw_query: &[u8]) -> anyhow::Result<Vec<u8>> {
-        exchange_with_retry(
-            "TCP DNS",
-            || self.exchange_once(raw_query),
-            || async {
-                self.close_session().await;
-            },
+    pub async fn exchange(
+        self: &Arc<Self>,
+        raw_query: &[u8],
+    ) -> anyhow::Result<Vec<u8>> {
+        let timeout = self.dial.query_timeout + self.dial.dial_timeout;
+        tokio::time::timeout(
+            timeout,
+            exchange_with_retry("TCP DNS", || self.exchange_once(raw_query)),
         )
         .await
+        .map_err(|_| {
+            anyhow::anyhow!("TCP DNS query budget exhausted after {timeout:?}")
+        })?
     }
 
     async fn exchange_once(&self, raw_query: &[u8]) -> anyhow::Result<Vec<u8>> {
         let session = self.get_session().await?;
-        session.exchange(raw_query, self.dial.query_timeout).await
+        let result = session.exchange(raw_query, self.dial.query_timeout).await;
+        if result.is_err() && session.is_closed() {
+            self.session
+                .close_if(&session, |session| async move {
+                    session.shutdown(Duration::ZERO).await;
+                })
+                .await;
+            return result
+                .map_err(|error| super::retry::ConnectionFailure(error).into());
+        }
+        result
     }
 
     async fn get_session(&self) -> anyhow::Result<Arc<TcpSession>> {
         let session = self.session.acquire(|| self.dial_session()).await?;
         if session.is_closed() {
-            self.close_session().await;
+            self.session
+                .close_if(&session, |session| async move {
+                    session.shutdown(Duration::ZERO).await;
+                })
+                .await;
             return self.session.acquire(|| self.dial_session()).await;
         }
         Ok(session)

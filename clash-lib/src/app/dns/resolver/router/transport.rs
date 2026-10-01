@@ -1,7 +1,7 @@
+use arc_swap::ArcSwapOption;
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use arc_swap::ArcSwapOption;
 
 use enum_dispatch::enum_dispatch;
 use tracing::debug;
@@ -235,25 +235,46 @@ impl TransportEndpoint for RemoteEndpoint {
             anyhow::bail!("upstream '{}' has no servers configured", self.tag);
         }
 
-        let mut last_err = None;
-        for key in &self.upstream_keys {
-            match self.pool.query(key, raw_query).await {
-                Ok(resp) => return Ok(resp),
-                Err(err) => {
-                    debug!(
-                        upstream = %self.tag,
-                        server = %key,
-                        domain,
-                        "upstream query failed: {err}"
-                    );
-                    last_err = Some(err);
+        let budget = self.pool.dns_query_timeout + self.pool.dns_dial_timeout;
+        let deadline = tokio::time::Instant::now() + budget;
+        tokio::time::timeout_at(deadline, async {
+            let mut last_err = None;
+            for (index, key) in self.upstream_keys.iter().enumerate() {
+                let remaining =
+                    deadline.saturating_duration_since(tokio::time::Instant::now());
+                let servers_left = (self.upstream_keys.len() - index) as u32;
+                let attempt = tokio::time::timeout(
+                    remaining / servers_left,
+                    self.pool.query(key, raw_query),
+                )
+                .await
+                .unwrap_or_else(|_| {
+                    Err(anyhow::anyhow!(
+                        "DNS server '{key}' failover attempt timed out"
+                    ))
+                });
+                match attempt {
+                    Ok(resp) => return Ok(resp),
+                    Err(err) => {
+                        debug!(
+                            upstream = %self.tag,
+                            server = %key,
+                            domain,
+                            "upstream query failed: {err}"
+                        );
+                        last_err = Some(err);
+                    }
                 }
             }
-        }
 
-        Err(last_err.unwrap_or_else(|| {
-            anyhow::anyhow!("all servers in '{}' failed", self.tag)
-        }))
+            Err(last_err.unwrap_or_else(|| {
+                anyhow::anyhow!("all servers in '{}' failed", self.tag)
+            }))
+        })
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!("DNS upstream '{}' failover budget exhausted", self.tag)
+        })?
     }
 }
 

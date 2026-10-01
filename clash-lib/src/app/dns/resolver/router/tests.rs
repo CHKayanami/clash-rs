@@ -788,3 +788,38 @@ async fn test_router_resolver_stale_refresh_notification_with_rule_filter() {
 
     server_task.abort();
 }
+
+#[tokio::test]
+async fn remote_failover_leaves_budget_for_second_server() {
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::net::UdpSocket;
+    use super::transport::{RemoteEndpoint, TransportEndpoint};
+    use crate::app::dns::config::{NameServer, DNSNetMode};
+    use crate::app::dns::upstream_pool::{UpstreamEntry, UpstreamPool};
+
+    let silent = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let healthy = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let mut entries = HashMap::new();
+    for (key, socket) in [("silent", &silent), ("healthy", &healthy)] {
+        let ns = NameServer { net: DNSNetMode::Udp, host: url::Host::Ipv4("127.0.0.1".parse().unwrap()), port: socket.local_addr().unwrap().port(), path: None, proxy: None, interface: None };
+        entries.insert(key.into(), UpstreamEntry::from_nameserver(&ns, None).unwrap());
+    }
+    let mut pool = UpstreamPool::new(entries, Arc::new(parking_lot::RwLock::new(HashMap::new())), None, None, None, None);
+    let inner = Arc::get_mut(&mut pool).unwrap();
+    inner.dns_query_timeout = Duration::from_millis(100);
+    inner.dns_dial_timeout = Duration::from_millis(100);
+    let server = tokio::spawn(async move {
+        let mut buffer = [0; 512];
+        let (len, peer) = healthy.recv_from(&mut buffer).await.unwrap();
+        buffer[2] |= 0x80;
+        healthy.send_to(&buffer[..len], peer).await.unwrap();
+    });
+    let endpoint = RemoteEndpoint::new("test".into(), vec!["silent".into(), "healthy".into()], pool.clone());
+    let query = build_dns_query_wire(&DnsName::from_domain("failover.test").unwrap(), QType::A);
+    let response = tokio::time::timeout(Duration::from_secs(1), endpoint.fetch(&query, "failover.test", QType::A))
+        .await.unwrap().unwrap();
+    assert_eq!(response[..2], query[..2]);
+    server.await.unwrap();
+    pool.close().await;
+}

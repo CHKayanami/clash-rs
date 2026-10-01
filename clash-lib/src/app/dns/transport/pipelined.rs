@@ -34,6 +34,21 @@ pub struct PipelinedSession<W> {
     driver: Mutex<Option<OwnedTask>>,
 }
 
+struct WriteGuard<'a, W> {
+    session: &'a PipelinedSession<W>,
+    complete: bool,
+}
+
+impl<W> Drop for WriteGuard<'_, W> {
+    fn drop(&mut self) {
+        if !self.complete {
+            let mut state = self.session.state.lock();
+            state.closed = true;
+            state.pending.clear();
+        }
+    }
+}
+
 struct PendingGuard<'a, W: AsyncWrite + Send + Unpin + 'static> {
     session: &'a PipelinedSession<W>,
     id: u16,
@@ -63,11 +78,7 @@ impl<W: AsyncWrite + Send + Unpin + 'static> Drop for PendingGuard<'_, W> {
 }
 
 impl<W: AsyncWrite + Send + Unpin + 'static> PipelinedSession<W> {
-    pub fn new<R>(
-        mut reader: R,
-        writer: W,
-        active_tasks: Arc<AtomicUsize>,
-    ) -> Self
+    pub fn new<R>(mut reader: R, writer: W, active_tasks: Arc<AtomicUsize>) -> Self
     where
         R: AsyncRead + Send + Unpin + 'static,
     {
@@ -97,7 +108,11 @@ impl<W: AsyncWrite + Send + Unpin + 'static> PipelinedSession<W> {
         self.state.lock().closed
     }
 
-    pub async fn exchange(&self, query: &[u8], timeout: Duration) -> anyhow::Result<Vec<u8>> {
+    pub async fn exchange(
+        &self,
+        query: &[u8],
+        timeout: Duration,
+    ) -> anyhow::Result<Vec<u8>> {
         if query.len() < 12 {
             anyhow::bail!("DNS query too short");
         }
@@ -133,28 +148,42 @@ impl<W: AsyncWrite + Send + Unpin + 'static> PipelinedSession<W> {
         wire.extend_from_slice(query);
         wire[2..4].copy_from_slice(&id.to_be_bytes());
 
-        let write_res = {
-            let mut writer = self.writer.lock().await;
-            writer.write_all(&wire).await
-        };
+        tokio::time::timeout(timeout, async {
+            let write_res = {
+                let mut writer = self.writer.lock().await;
+                if self.is_closed() {
+                    anyhow::bail!("Pipelined DNS session is closed");
+                }
+                let mut write_guard = WriteGuard {
+                    session: self,
+                    complete: false,
+                };
+                let result = writer.write_all(&wire).await;
+                write_guard.complete = result.is_ok();
+                result
+            };
 
-        if let Err(e) = write_res {
-            self.mark_closed();
-            return Err(anyhow::anyhow!("DNS pipe write error: {e}"));
-        }
+            if let Err(e) = write_res {
+                self.mark_closed();
+                return Err(anyhow::anyhow!("DNS pipe write error: {e}"));
+            }
 
-        match tokio::time::timeout(timeout, receiver).await {
-            Ok(Ok(response)) => {
-                guard.disarm();
-                Ok(response)
+            match receiver.await {
+                Ok(response) => {
+                    guard.disarm();
+                    Ok(response)
+                }
+                Err(_) => {
+                    anyhow::bail!(
+                        "Pipelined DNS session closed while waiting for response"
+                    )
+                }
             }
-            Ok(Err(_)) => {
-                anyhow::bail!("Pipelined DNS session closed while waiting for response")
-            }
-            Err(_) => {
-                anyhow::bail!("Pipelined DNS query timed out after {timeout:?}")
-            }
-        }
+        })
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!("Pipelined DNS query timed out after {timeout:?}")
+        })?
     }
 
     pub async fn shutdown(&self, timeout: Duration) {
@@ -165,7 +194,10 @@ impl<W: AsyncWrite + Send + Unpin + 'static> PipelinedSession<W> {
         }
     }
 
-    async fn read_loop<R: AsyncRead + Send + Unpin>(state: Arc<Mutex<State>>, reader: &mut R) {
+    async fn read_loop<R: AsyncRead + Send + Unpin>(
+        state: Arc<Mutex<State>>,
+        reader: &mut R,
+    ) {
         loop {
             let mut len_buf = [0u8; 2];
             if reader.read_exact(&mut len_buf).await.is_err() {
@@ -248,7 +280,9 @@ impl<W: AsyncWrite + Send + Unpin + 'static> PipelinedSession<W> {
         let word = (id / 64) as usize;
         let bit = id % 64;
         state.retired_ids[word] |= 1 << bit;
-        state.retired.push_back((Instant::now() + ID_QUARANTINE, id));
+        state
+            .retired
+            .push_back((Instant::now() + ID_QUARANTINE, id));
     }
 
     fn allocate_id(state: &State) -> Option<u16> {
@@ -267,7 +301,9 @@ impl<W: AsyncWrite + Send + Unpin + 'static> PipelinedSession<W> {
 
 fn question_end(query: &[u8]) -> anyhow::Result<usize> {
     let mut pos = 12;
-    if !crate::app::dns::wire::skip_dns_name(query, &mut pos) || pos + 4 > query.len() {
+    if !crate::app::dns::wire::skip_dns_name(query, &mut pos)
+        || pos + 4 > query.len()
+    {
         anyhow::bail!("malformed DNS question");
     }
     Ok(pos + 4)
@@ -337,7 +373,8 @@ mod tests {
             handles.push(tokio::spawn(async move {
                 let orig_id = 0x1000 + i;
                 let q = build_test_query(orig_id, &format!("domain{i}.com"));
-                let resp = session.exchange(&q, Duration::from_secs(2)).await.unwrap();
+                let resp =
+                    session.exchange(&q, Duration::from_secs(2)).await.unwrap();
                 assert_eq!(u16::from_be_bytes([resp[0], resp[1]]), orig_id);
             }));
         }
@@ -387,5 +424,86 @@ mod tests {
         // Pending map should be cleaned up by PendingGuard
         assert_eq!(session.state.lock().pending.len(), 0);
         session.shutdown(Duration::from_millis(50)).await;
+    }
+    #[tokio::test]
+    async fn response_timeout_preserves_other_pending_queries() {
+        let (client, mut server) = tokio::io::duplex(4096);
+        let (reader, writer) = tokio::io::split(client);
+        let session = Arc::new(PipelinedSession::new(
+            reader,
+            writer,
+            Arc::new(AtomicUsize::new(0)),
+        ));
+        let slow_query = build_test_query(1, "slow.test");
+        let fast_query = build_test_query(2, "fast.test");
+        let slow_session = session.clone();
+        let slow = tokio::spawn(async move {
+            slow_session
+                .exchange(&slow_query, Duration::from_millis(30))
+                .await
+        });
+        let fast_session = session.clone();
+        let fast = tokio::spawn(async move {
+            fast_session
+                .exchange(&fast_query, Duration::from_secs(1))
+                .await
+        });
+        let mut fast_response = None;
+        for _ in 0..2 {
+            let length = server.read_u16().await.unwrap() as usize;
+            let mut query = vec![0; length];
+            server.read_exact(&mut query).await.unwrap();
+            if query[13..17] == *b"fast" {
+                query[2] |= 0x80;
+                fast_response = Some(query);
+            }
+        }
+        assert!(slow.await.unwrap().is_err());
+        assert!(!session.is_closed());
+        let response = fast_response.unwrap();
+        server.write_u16(response.len() as u16).await.unwrap();
+        server.write_all(&response).await.unwrap();
+        assert_eq!(fast.await.unwrap().unwrap()[..2], [0, 2]);
+        session.shutdown(Duration::ZERO).await;
+    }
+
+    #[tokio::test]
+    async fn blocked_writer_times_out_and_closes_partial_frame() {
+        let (client, _server) = tokio::io::duplex(1);
+        let (reader, writer) = tokio::io::split(client);
+        let session =
+            PipelinedSession::new(reader, writer, Arc::new(AtomicUsize::new(0)));
+        let query = build_test_query(1, "blocked.test");
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            session.exchange(&query, Duration::from_millis(20)),
+        )
+        .await
+        .expect("write must be covered by exchange timeout");
+        assert!(result.is_err());
+        assert!(session.is_closed());
+        assert!(session.state.lock().pending.is_empty());
+        session.shutdown(Duration::ZERO).await;
+    }
+
+    #[tokio::test]
+    async fn cancelling_queued_writer_keeps_session_usable() {
+        let (client, _server) = tokio::io::duplex(4096);
+        let (reader, writer) = tokio::io::split(client);
+        let session =
+            PipelinedSession::new(reader, writer, Arc::new(AtomicUsize::new(0)));
+        let _lock = session.writer.lock().await;
+        assert!(
+            session
+                .exchange(
+                    &build_test_query(1, "queued.test"),
+                    Duration::from_millis(20)
+                )
+                .await
+                .is_err()
+        );
+        assert!(!session.is_closed());
+        assert!(session.state.lock().pending.is_empty());
+        session.shutdown(Duration::ZERO).await;
     }
 }

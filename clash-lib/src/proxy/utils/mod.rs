@@ -2,6 +2,7 @@
 pub mod test_utils;
 
 mod platform;
+pub(crate) use platform::must_bind_socket_on_interface;
 
 pub mod provider_helper;
 mod proxy_connector;

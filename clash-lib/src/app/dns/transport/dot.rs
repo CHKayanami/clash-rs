@@ -19,6 +19,7 @@ type DotSession = PipelinedSession<WriteHalf<DotStream>>;
 /// Pipelined DoT client for one upstream multiplexing concurrent queries over a single TLS session.
 pub struct DotPool {
     dial: DialContext,
+    connector: tokio_rustls::TlsConnector,
     session: LifecycleSlot<DotSession>,
     active_tasks: Arc<AtomicUsize>,
 }
@@ -32,33 +33,59 @@ impl DotPool {
         dial: DialContext,
         active_tasks: Arc<AtomicUsize>,
     ) -> anyhow::Result<Arc<Self>> {
+        let mut config = crate::common::tls::build_tls_client_config(
+            Arc::new(crate::common::tls::DefaultTlsVerifier::new(None, false)),
+            None,
+            None,
+        )?;
+        config.alpn_protocols = vec![b"dot".to_vec()];
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
         Ok(Arc::new(Self {
             dial,
+            connector,
             session: LifecycleSlot::new(),
             active_tasks,
         }))
     }
 
-    pub async fn exchange(self: &Arc<Self>, raw_query: &[u8]) -> anyhow::Result<Vec<u8>> {
-        exchange_with_retry(
-            "DoT",
-            || self.exchange_once(raw_query),
-            || async {
-                self.close_session().await;
-            },
+    pub async fn exchange(
+        self: &Arc<Self>,
+        raw_query: &[u8],
+    ) -> anyhow::Result<Vec<u8>> {
+        let timeout = self.dial.query_timeout + self.dial.dial_timeout;
+        tokio::time::timeout(
+            timeout,
+            exchange_with_retry("DoT", || self.exchange_once(raw_query)),
         )
         .await
+        .map_err(|_| {
+            anyhow::anyhow!("DoT query budget exhausted after {timeout:?}")
+        })?
     }
 
     async fn exchange_once(&self, raw_query: &[u8]) -> anyhow::Result<Vec<u8>> {
         let session = self.get_session().await?;
-        session.exchange(raw_query, self.dial.query_timeout).await
+        let result = session.exchange(raw_query, self.dial.query_timeout).await;
+        if result.is_err() && session.is_closed() {
+            self.session
+                .close_if(&session, |session| async move {
+                    session.shutdown(Duration::ZERO).await;
+                })
+                .await;
+            return result
+                .map_err(|error| super::retry::ConnectionFailure(error).into());
+        }
+        result
     }
 
     async fn get_session(&self) -> anyhow::Result<Arc<DotSession>> {
         let session = self.session.acquire(|| self.dial_session()).await?;
         if session.is_closed() {
-            self.close_session().await;
+            self.session
+                .close_if(&session, |session| async move {
+                    session.shutdown(Duration::ZERO).await;
+                })
+                .await;
             return self.session.acquire(|| self.dial_session()).await;
         }
         Ok(session)
@@ -67,21 +94,18 @@ impl DotPool {
     async fn dial_session(&self) -> anyhow::Result<DotSession> {
         let deadline = tokio::time::Instant::now() + self.dial.dial_timeout;
         let tcp = self.dial.dial_tcp_until(deadline).await?;
-        let server_name = rustls::pki_types::ServerName::try_from(self.dial.endpoint.sni.clone())
-            .map_err(|e| anyhow::anyhow!("invalid SNI {}: {e}", self.dial.endpoint.sni))?;
+        let server_name =
+            rustls::pki_types::ServerName::try_from(self.dial.endpoint.sni.clone())
+                .map_err(|e| {
+                    anyhow::anyhow!("invalid SNI {}: {e}", self.dial.endpoint.sni)
+                })?;
 
-        let client_config = crate::common::tls::build_tls_client_config(
-            Arc::new(crate::common::tls::DefaultTlsVerifier::new(None, false)),
-            None,
-            None,
-        )?;
-        let mut config = client_config;
-        config.alpn_protocols = vec![b"dot".to_vec()];
-        let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
-
-        let tls_stream = tokio::time::timeout_at(deadline, connector.connect(server_name, tcp))
-            .await
-            .map_err(|_| anyhow::anyhow!("DoT TLS handshake timed out"))??;
+        let tls_stream = tokio::time::timeout_at(
+            deadline,
+            self.connector.connect(server_name, tcp),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("DoT TLS handshake timed out"))??;
 
         let (reader, writer) = tokio::io::split(tls_stream);
         Ok(PipelinedSession::new(
