@@ -341,6 +341,56 @@ jobs:
     needs: [prepare-release, build]
     runs-on: ubuntu-latest
     steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Generate changelog
+        env:
+          RELEASE_TAG: ${{ needs.prepare-release.outputs.tag_name }}
+        run: |
+          BASE_REF=HEAD
+          if [[ "${RELEASE_TAG}" != "latest" ]]; then
+            BASE_REF=HEAD^
+          fi
+          PREVIOUS_TAG=$(git describe --tags --abbrev=0 --match 'v*' "${BASE_REF}" 2>/dev/null || true)
+          COMMIT_RANGE=HEAD
+          if [[ -n "${PREVIOUS_TAG}" ]]; then
+            COMMIT_RANGE="${PREVIOUS_TAG}..HEAD"
+          fi
+
+          {
+            echo "## Changelog"
+            echo
+            git log --format='- %s (%h)' "${COMMIT_RANGE}" | awk '
+              BEGIN {
+                types[1] = "feat"; titles[1] = "Features"
+                types[2] = "fix"; titles[2] = "Bug Fixes"
+                types[3] = "perf"; titles[3] = "Performance"
+                types[4] = "refactor"; titles[4] = "Refactoring"
+              }
+              {
+                for (i = 1; i <= 4; i++) {
+                  if ($0 ~ "^- " types[i] "(\\([^)]*\\))?!?: ") {
+                    entries[i] = entries[i] $0 "\n"
+                    count++
+                    break
+                  }
+                }
+              }
+              END {
+                for (i = 1; i <= 4; i++) {
+                  if (entries[i] != "") {
+                    print "### " titles[i] "\n"
+                    printf "%s\n", entries[i]
+                  }
+                }
+                if (!count) print "No feature, fix, performance or refactoring changes in this release."
+              }
+            '
+          } > release-notes.md
+
       - name: Download all artifacts
         uses: actions/download-artifact@v8
         with:
@@ -360,6 +410,6 @@ jobs:
           files: release_assets/*
           draft: false
           prerelease: false
-          generate_release_notes: true
+          body_path: release-notes.md
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
