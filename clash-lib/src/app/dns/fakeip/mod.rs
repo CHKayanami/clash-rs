@@ -1,13 +1,10 @@
 use std::{
     collections::HashMap,
     net::{self, IpAddr, Ipv4Addr, Ipv6Addr},
-    sync::{
-        Arc,
-        atomic::{AtomicU32, Ordering},
-    },
+    sync::Arc,
 };
 
-use portable_atomic::AtomicU128;
+use parking_lot::Mutex;
 use tracing::debug;
 
 use crate::{
@@ -143,7 +140,7 @@ pub type ThreadSafeFakeDns = Arc<FakeDns>;
 pub struct FakePoolV4 {
     pub min: u32,
     pub max: u32,
-    pub offset: AtomicU32,
+    pub offset: Mutex<u32>,
 }
 
 pub struct FakePoolV6 {
@@ -151,7 +148,7 @@ pub struct FakePoolV6 {
     pub prefix_len: u8,
     pub min_host: u128,
     pub max_host: u128,
-    pub offset: AtomicU128,
+    pub offset: Mutex<u128>,
 }
 
 pub struct FakeDns {
@@ -160,9 +157,6 @@ pub struct FakeDns {
     domain_filter: Option<DomainFilter>,
     filter_mode: FakeIpFilterMode,
     store: FakeStore,
-    // Serialize allocation within each family; clearing locks v4 before v6.
-    v4_allocation: parking_lot::Mutex<()>,
-    v6_allocation: parking_lot::Mutex<()>,
     /// Memoized `should_skip` verdicts. Covers both static `fake-ip-filter`
     /// entries and `rule-set:` matches; cleared wholesale whenever one of the
     /// bound rule-sets reloads (see [`FakeDns::add_rule_set`]).
@@ -216,7 +210,7 @@ impl FakeDns {
         let v4_pool = Some(FakePoolV4 {
             min,
             max,
-            offset: AtomicU32::new(initial_offset_v4),
+            offset: Mutex::new(initial_offset_v4),
         });
 
         let initial_offset_v6 =
@@ -226,7 +220,7 @@ impl FakeDns {
             prefix_len: prefix_len6,
             min_host,
             max_host,
-            offset: AtomicU128::new(initial_offset_v6),
+            offset: Mutex::new(initial_offset_v6),
         });
 
         Ok(Self {
@@ -235,8 +229,6 @@ impl FakeDns {
             domain_filter: opt.domain_filter,
             filter_mode: opt.filter_mode,
             store,
-            v4_allocation: parking_lot::Mutex::new(()),
-            v6_allocation: parking_lot::Mutex::new(()),
             skip_cache: Arc::new(quick_cache::sync::Cache::new(1000)),
         })
     }
@@ -280,14 +272,15 @@ impl FakeDns {
         if pattern != "*" {
             return self.store.del_by_wildcard(pattern);
         }
-        let _v4 = self.v4_allocation.lock();
-        let _v6 = self.v6_allocation.lock();
+        // Match allocation lock ordering: IPv4 before IPv6.
+        let mut v4_offset = self.v4_pool.as_ref().map(|pool| pool.offset.lock());
+        let mut v6_offset = self.v6_pool.as_ref().map(|pool| pool.offset.lock());
         let deleted = self.store.del_by_wildcard(pattern);
-        if let Some(pool) = &self.v4_pool {
-            pool.offset.store(0, Ordering::Relaxed);
+        if let Some(offset) = v4_offset.as_deref_mut() {
+            *offset = 0;
         }
-        if let Some(pool) = &self.v6_pool {
-            pool.offset.store(0, Ordering::Relaxed);
+        if let Some(offset) = v6_offset.as_deref_mut() {
+            *offset = 0;
         }
         deleted
     }
@@ -401,66 +394,53 @@ impl FakeDns {
     }
 
     fn get(&self, host: &str) -> net::IpAddr {
-        let _allocation = self.v4_allocation.lock();
+        let pool = self.v4_pool.as_ref().expect("IPv4 subnet not configured");
+        let mut offset = pool.offset.lock();
         if let Some(ip) = self.store.get_by_host(host) {
             return ip;
         }
-        let mut allocated_v4 = None;
-        if let Some(pool) = &self.v4_pool {
-            let pool_size = pool.max - pool.min + 1;
-            let mut current_try = 0;
-            loop {
-                let candidate_offset = pool
-                    .offset
-                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |val| {
-                        Some((val + 1) % pool_size)
-                    })
-                    .unwrap();
-                let ip = Ipv4Addr::from(pool.min + candidate_offset);
-                let ip_addr = IpAddr::V4(ip);
-                if current_try >= pool_size {
-                    allocated_v4 = Some(match self.store.evict_batch(ip_addr) {
-                        Some(IpAddr::V4(victim)) => victim,
-                        _ => ip,
-                    });
-                    break;
-                }
-                if !self.store.exist(ip_addr) {
-                    allocated_v4 = Some(ip);
-                    break;
-                }
-                current_try += 1;
+        let pool_size = pool.max - pool.min + 1;
+        let mut current_try = 0;
+        let allocated_v4;
+        loop {
+            let candidate_offset = *offset;
+            *offset = (candidate_offset + 1) % pool_size;
+            let ip = Ipv4Addr::from(pool.min + candidate_offset);
+            let ip_addr = IpAddr::V4(ip);
+            if current_try >= pool_size {
+                allocated_v4 = match self.store.evict_batch(ip_addr) {
+                    Some(IpAddr::V4(victim)) => victim,
+                    _ => ip,
+                };
+                break;
             }
+            if !self.store.exist(ip_addr) {
+                allocated_v4 = ip;
+                break;
+            }
+            current_try += 1;
         }
 
-        if let Some(v4) = allocated_v4 {
-            let ip = IpAddr::V4(v4);
-            self.store.put_by_ip(ip, host);
-            ip
-        } else {
-            panic!("IPv4 subnet not configured");
-        }
+        let ip = IpAddr::V4(allocated_v4);
+        self.store.put_by_ip(ip, host);
+        ip
     }
 
     /// ----------------------------------------
     /// 2. 仅分配/查询 IPv6 Fake IP (应对 AAAA 记录)
     /// ----------------------------------------
     pub fn getv6(&self, host: &str) -> IpAddr {
-        let _allocation = self.v6_allocation.lock();
+        let pool = self.v6_pool.as_ref().unwrap();
+        let mut offset = pool.offset.lock();
         if let Some(ip) = self.store.get_v6_by_host(host) {
             return ip;
         }
-        let pool = self.v6_pool.as_ref().unwrap();
         let pool_size = pool.max_host - pool.min_host + 1;
         let mut current_try = 0;
         let allocated_ip;
         loop {
-            let candidate_offset = pool
-                .offset
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |val| {
-                    Some((val + 1) % pool_size)
-                })
-                .unwrap();
+            let candidate_offset = *offset;
+            *offset = (candidate_offset + 1) % pool_size;
             let ip = Self::assemble_ipv6(
                 &pool.prefix,
                 pool.prefix_len,

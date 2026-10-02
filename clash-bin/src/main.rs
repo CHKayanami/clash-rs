@@ -35,6 +35,7 @@ extern crate clash_lib as clash;
 
 use clap::Parser;
 use clash::TokioRuntime;
+use sentry::ClientOptions;
 use std::{
     io::Write,
     path::{Path, PathBuf},
@@ -266,10 +267,7 @@ fn main() -> anyhow::Result<()> {
     if cli.help_improve {
         _guard = Some(sentry::init((
             env!("SENTRY_DSN"),
-            sentry::ClientOptions {
-                release: sentry::release_name!(),
-                ..Default::default()
-            },
+            ClientOptions::new().maybe_release(sentry::release_name!()),
         )));
     }
 

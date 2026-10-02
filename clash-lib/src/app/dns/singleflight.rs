@@ -157,7 +157,7 @@ impl Singleflight {
             });
         }
 
-        if self.inner.active_count.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |active| {
+        if self.inner.active_count.try_update(Ordering::Relaxed, Ordering::Relaxed, |active| {
             (active < MAX_ACTIVE_FLIGHTS).then_some(active + 1)
         }).is_err() {
             self.inner

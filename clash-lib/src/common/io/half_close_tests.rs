@@ -230,7 +230,7 @@ async fn zero_copy_half_close_idle_timeout() {
 #[tokio::test]
 async fn zero_copy_forwards_nested_prefixes_and_counts_them() {
     use crate::app::sniffer::PrefixedStream;
-    use crate::proxy::ProxyStream;
+    use crate::proxy::{AnyStream, ProxyStream};
     let (mut client, a) = tcp_pair().await;
     let (b, mut server) = tcp_pair().await;
     let mut inner_prefix = SlideBuffer::new(4096);
@@ -242,8 +242,8 @@ async fn zero_copy_forwards_nested_prefixes_and_counts_them() {
     assert!(a.underlying_socket().is_none());
     assert!(a.zero_copy_socket().is_some());
     let copy = copy_bidirectional(
-        Box::new(a),
-        Box::new(b),
+        AnyStream::Dynamic(Box::new(a)),
+        AnyStream::Tcp(b),
         1024,
         Duration::from_secs(10),
         Duration::from_secs(10),
@@ -274,6 +274,7 @@ async fn zero_copy_forwards_nested_prefixes_and_counts_them() {
 #[tokio::test]
 async fn zero_copy_prefix_backpressure_does_not_block_replies() {
     use crate::app::sniffer::PrefixedStream;
+    use crate::proxy::AnyStream;
     let (mut client, a) = tcp_pair().await;
     let (b, mut server) = tcp_pair().await;
     socket2::SockRef::from(&b)
@@ -283,8 +284,8 @@ async fn zero_copy_prefix_backpressure_does_not_block_replies() {
     let mut prefix = SlideBuffer::new(payload.len());
     prefix.extend_from_slice(&payload);
     let copy = copy_bidirectional(
-        Box::new(PrefixedStream::new(prefix, a)),
-        Box::new(b),
+        AnyStream::Dynamic(Box::new(PrefixedStream::new(prefix, a))),
+        AnyStream::Tcp(b),
         1024,
         Duration::from_secs(10),
         Duration::from_secs(10),

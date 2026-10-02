@@ -238,7 +238,7 @@ impl XudpCarrier {
         }
 
         self.active_streams
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |active| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |active| {
                 if active < self.max_streams {
                     Some(active + 1)
                 } else {

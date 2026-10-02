@@ -75,7 +75,6 @@ jobs:
           docker pull teddysun/xray:26.3.27
           docker pull ghcr.io/sagernet/sing-box:v1.13.8
           docker pull tobyxdd/hysteria:latest
-          docker pull ghcr.io/itsusinn/tuic-server:latest
           docker pull ghcr.io/spongebob888/shadowquic:latest
           docker pull docker.io/linuxserver/openssh-server:latest
           docker pull nicolaka/netshoot:latest

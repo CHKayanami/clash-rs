@@ -196,7 +196,7 @@ impl AnyTlsClientSession {
     }
 
     pub(super) fn decrement_active_streams(&self) {
-        let _ = self.stream_counts.fetch_update(
+        let _ = self.stream_counts.try_update(
             Ordering::AcqRel,
             Ordering::Relaxed,
             |val| {
@@ -223,7 +223,7 @@ impl AnyTlsClientSession {
     /// and updated atomically without race conditions.
     pub fn try_reserve_stream(&self, max_streams: usize) -> bool {
         self.stream_counts
-            .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |val| {
+            .try_update(Ordering::AcqRel, Ordering::Relaxed, |val| {
                 let (active, reserved) = unpack_stream_counts(val);
                 if active + reserved < max_streams {
                     Some(pack_stream_counts(active, reserved + 1))
@@ -236,7 +236,7 @@ impl AnyTlsClientSession {
 
     /// Explicitly reserve a stream slot without limit checking (used when pool is at max capacity)
     pub fn force_reserve_stream(&self) {
-        let _ = self.stream_counts.fetch_update(
+        let _ = self.stream_counts.try_update(
             Ordering::AcqRel,
             Ordering::Relaxed,
             |val| {
@@ -248,7 +248,7 @@ impl AnyTlsClientSession {
 
     /// Release a previously reserved stream slot without registering a stream
     pub fn release_reserved_stream(&self) {
-        let _ = self.stream_counts.fetch_update(
+        let _ = self.stream_counts.try_update(
             Ordering::AcqRel,
             Ordering::Relaxed,
             |val| {
@@ -260,7 +260,7 @@ impl AnyTlsClientSession {
 
     /// Atomically transition one reserved stream slot to an active stream
     pub(super) fn commit_reserved_stream(&self) {
-        let _ = self.stream_counts.fetch_update(
+        let _ = self.stream_counts.try_update(
             Ordering::AcqRel,
             Ordering::Relaxed,
             |val| {

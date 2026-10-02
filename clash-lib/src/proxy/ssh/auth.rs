@@ -19,6 +19,7 @@ enum MethodKindAdapter {
     PublicKey,
     HostBased,
     KeyboardInteractive,
+    GssapiWithMic,
 }
 
 impl From<MethodKind> for MethodKindAdapter {
@@ -28,6 +29,7 @@ impl From<MethodKind> for MethodKindAdapter {
             MethodKind::Password => MethodKindAdapter::Password,
             MethodKind::PublicKey => MethodKindAdapter::PublicKey,
             MethodKind::HostBased => MethodKindAdapter::HostBased,
+            MethodKind::GssapiWithMic => MethodKindAdapter::GssapiWithMic,
             MethodKind::KeyboardInteractive => {
                 MethodKindAdapter::KeyboardInteractive
             }
@@ -42,6 +44,7 @@ impl From<MethodKindAdapter> for MethodKind {
             MethodKindAdapter::Password => MethodKind::Password,
             MethodKindAdapter::PublicKey => MethodKind::PublicKey,
             MethodKindAdapter::HostBased => MethodKind::HostBased,
+            MethodKindAdapter::GssapiWithMic => MethodKind::GssapiWithMic,
             MethodKindAdapter::KeyboardInteractive => {
                 MethodKind::KeyboardInteractive
             }
@@ -96,7 +99,7 @@ pub async fn authenticate(
             .any(|p| p.prompt.contains(VERIFICATION_CODE_PROMPT))
         {
             totp.clone()
-                .map(|t| t.generate_current().unwrap())
+                .map(|t| t.generate_current().to_string())
                 .map(|t| vec![t])
                 .unwrap_or_default()
         } else {

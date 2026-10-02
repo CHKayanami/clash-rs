@@ -57,7 +57,7 @@ tokio = { version = "1", features = [
 
 aes = { version = "0.9", optional = true }
 blake3 = "1"
-shadowsocks-crypto = { version = "0.7.0", default-features = false }
+shadowsocks-crypto = { version = "0.8", default-features = false }
 
 [dev-dependencies]
 env_logger = "0.11"

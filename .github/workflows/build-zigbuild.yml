@@ -1,40 +1,14 @@
-name: Release (cargo-zigbuild)
+name: Build Test (cargo-zigbuild)
 
 on:
-  push:
-    tags:
-      - "v*"
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  prepare-release:
-    name: Prepare Release Tag
-    runs-on: ubuntu-latest
-    outputs:
-      tag_name: ${{ steps.gen_tag.outputs.tag_name }}
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
-
-      - name: Generate Release Tag
-        id: gen_tag
-        run: |
-          if [[ "${{ github.ref }}" == refs/tags/* ]]; then
-            TAG="${GITHUB_REF#refs/tags/}"
-          else
-            TAG="latest"
-          fi
-          echo "tag_name=${TAG}" >> $GITHUB_OUTPUT
-          echo "Release tag: ${TAG}"
-
   build:
     name: Build (${{ matrix.archive-name }})
-    needs: prepare-release
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -303,14 +277,14 @@ jobs:
           # Match Zig's musl time_t ABI in boring's high-level libc API.
           RUST_LIBC_UNSTABLE_MUSL_V1_2_3: ${{ (matrix.target == 'i686-unknown-linux-musl' || matrix.target == 'armv7-unknown-linux-musleabihf') && '1' || '0' }}
         run: |
-          cargo zigbuild --release --target ${{ matrix.target }} -F ${{ matrix.features }} -p clash-rs
+          cargo +stable zigbuild --locked --release --target ${{ matrix.target }} -F ${{ matrix.features }} -p clash-rs
 
       - name: Build with cargo (macOS native)
         if: "!matrix.use-zigbuild"
         env:
           CARGO_PROFILE_RELEASE_OPT_LEVEL: ${{ matrix.opt-level }}
         run: |
-          cargo build --release --target ${{ matrix.target }} -F ${{ matrix.features }} -p clash-rs
+          cargo +stable build --locked --release --target ${{ matrix.target }} -F ${{ matrix.features }} -p clash-rs
 
       - name: Package Binary
         shell: bash
@@ -337,81 +311,4 @@ jobs:
           name: ${{ matrix.archive-name }}
           path: dist/*.${{ matrix.archive-ext }}
           retention-days: 1
-
-  publish-release:
-    name: Create GitHub Release
-    needs: [prepare-release, build]
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
-
-      - name: Generate changelog
-        env:
-          RELEASE_TAG: ${{ needs.prepare-release.outputs.tag_name }}
-        run: |
-          BASE_REF=HEAD
-          if [[ "${RELEASE_TAG}" != "latest" ]]; then
-            BASE_REF=HEAD^
-          fi
-          PREVIOUS_TAG=$(git describe --tags --abbrev=0 --match 'v*' "${BASE_REF}" 2>/dev/null || true)
-          COMMIT_RANGE=HEAD
-          if [[ -n "${PREVIOUS_TAG}" ]]; then
-            COMMIT_RANGE="${PREVIOUS_TAG}..HEAD"
-          fi
-
-          {
-            echo "## Changelog"
-            echo
-            git log --format='- %s (%h)' "${COMMIT_RANGE}" | awk '
-              BEGIN {
-                types[1] = "feat"; titles[1] = "Features"
-                types[2] = "fix"; titles[2] = "Bug Fixes"
-                types[3] = "perf"; titles[3] = "Performance"
-                types[4] = "refactor"; titles[4] = "Refactoring"
-              }
-              {
-                for (i = 1; i <= 4; i++) {
-                  if ($0 ~ "^- " types[i] "(\\([^)]*\\))?!?: ") {
-                    entries[i] = entries[i] $0 "\n"
-                    count++
-                    break
-                  }
-                }
-              }
-              END {
-                for (i = 1; i <= 4; i++) {
-                  if (entries[i] != "") {
-                    print "### " titles[i] "\n"
-                    printf "%s\n", entries[i]
-                  }
-                }
-                if (!count) print "No feature, fix, performance or refactoring changes in this release."
-              }
-            '
-          } > release-notes.md
-
-      - name: Download all artifacts
-        uses: actions/download-artifact@v8
-        with:
-          path: artifacts
-
-      - name: Organize release assets
-        run: |
-          mkdir -p release_assets
-          find artifacts -type f \( -name "*.tar.gz" -o -name "*.zip" \) -exec cp {} release_assets/ \;
-          ls -la release_assets/
-
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v3
-        with:
-          tag_name: ${{ needs.prepare-release.outputs.tag_name }}
-          name: Release ${{ needs.prepare-release.outputs.tag_name }}
-          files: release_assets/*
-          draft: false
-          prerelease: false
-          body_path: release-notes.md
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          if-no-files-found: error

@@ -1,6 +1,6 @@
 use std::sync::Arc;
 use russh::keys::{EcdsaCurve, HashAlg};
-use totp_rs::{Rfc6238, Secret, TOTP};
+use totp_rs::{Builder, Secret, Totp as TotpGenerator};
 
 use crate::{
     config::internal::proxy::{OutboundSsh, Totp},
@@ -60,26 +60,21 @@ pub fn build_handler(
             .filter_map(|s| str_to_algo(s))
             .collect::<Vec<_>>()
     });
-    let totp: Option<Result<TOTP, crate::Error>> =
+    let totp: Option<Result<TotpGenerator, crate::Error>> =
         s.totp_opt.clone().map(|t| match t {
             crate::config::internal::proxy::TotpOption::OtpAuth(secret) => {
-                let rfc6238 = Rfc6238::with_defaults(
-                    Secret::Encoded(secret).to_bytes().map_err(|e| {
+                Builder::new()
+                    .with_secret(Secret::try_from_base32(secret).map_err(|e| {
                         crate::Error::InvalidConfig(format!(
                             "ssh totp, invalid secret {e:?}"
                         ))
-                    })?,
-                )
-                .map_err(|e| {
-                    crate::Error::InvalidConfig(format!(
-                        "ssh totp, invalid totp: {e}"
-                    ))
-                })?;
-                TOTP::from_rfc6238(rfc6238).map_err(|e| {
-                    crate::Error::InvalidConfig(format!(
-                        "ssh totp, invalid totp: {e}"
-                    ))
-                })
+                    })?)
+                    .build()
+                    .map_err(|e| {
+                        crate::Error::InvalidConfig(format!(
+                            "ssh totp, invalid totp: {e}"
+                        ))
+                    })
             }
             crate::config::internal::proxy::TotpOption::Common(Totp {
                 algorithm,
@@ -87,22 +82,26 @@ pub fn build_handler(
                 screw,
                 step,
                 secret,
-            }) => TOTP::new(
-                algorithm,
-                digits,
-                screw,
-                step,
-                Secret::Encoded(secret).to_bytes().map_err(|e| {
+            }) => Builder::new()
+                .with_algorithm(algorithm)
+                .with_digits(u8::try_from(digits).map_err(|_| {
+                    crate::Error::InvalidConfig(format!(
+                        "ssh totp, invalid digits: {digits}"
+                    ))
+                })?)
+                .with_skew(u16::from(screw))
+                .with_step_duration(step)
+                .with_secret(Secret::try_from_base32(secret).map_err(|e| {
                     crate::Error::InvalidConfig(format!(
                         "ssh totp, invalid secret {e:?}"
                     ))
-                })?,
-            )
-            .map_err(|e| {
-                crate::Error::InvalidConfig(format!(
-                    "ssh totp, invalid totp: {e}"
-                ))
-            }),
+                })?)
+                .build()
+                .map_err(|e| {
+                    crate::Error::InvalidConfig(format!(
+                        "ssh totp, invalid totp: {e}"
+                    ))
+                }),
         });
 
     let totp = match totp {

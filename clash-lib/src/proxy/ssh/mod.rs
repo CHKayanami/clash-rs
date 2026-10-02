@@ -15,6 +15,7 @@ use russh::{
     keys::Algorithm,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
+use totp_rs::Totp;
 
 use crate::{
     app::dns::ThreadSafeDNSResolver,
@@ -84,7 +85,7 @@ pub struct HandlerOptions {
     /// try public key first, then password
     pub password: Option<String>,
     /// TOTP secret, support full config and Rfc6238
-    pub totp: Option<totp_rs::TOTP>,
+    pub totp: Option<Totp>,
     /// key content or path
     /// if contains "PRIVATE KEY", it's raw content, otherwise it's a file path
     /// if so, it can start with "~" to represent home directory,
@@ -262,6 +263,70 @@ async fn auth0(
         Err(e) => {
             tracing::error!("ssh auth failed: {:?}", e);
             Err(new_io_error("ssh auth failed"))
+        }
+    }
+}
+
+#[cfg(test)]
+mod totp_tests {
+    use totp_rs::{Algorithm, Secret};
+
+    use super::Handler;
+    use crate::{
+        Error,
+        config::internal::proxy::{OutboundSsh, Totp, TotpOption},
+    };
+
+    // Public test vector from RFC 6238, Appendix B.
+    const SECRET: &[u8] = b"12345678901234567890";
+
+    #[test]
+    fn default_totp_matches_rfc6238() {
+        let config = OutboundSsh {
+            totp_opt: Some(TotpOption::OtpAuth(
+                Secret::from(SECRET).to_base32(),
+            )),
+            ..Default::default()
+        };
+        let handler = Handler::try_from(config).unwrap();
+        let totp = handler.opts.totp.unwrap();
+        assert_eq!(totp.generate(59).to_string(), "287082");
+    }
+
+    #[test]
+    fn configured_totp_preserves_digits_and_step() {
+        let config = OutboundSsh {
+            totp_opt: Some(TotpOption::Common(Totp {
+                algorithm: Algorithm::SHA1,
+                digits: 8,
+                screw: 1,
+                step: 60,
+                secret: Secret::from(SECRET).to_base32(),
+            })),
+            ..Default::default()
+        };
+        let handler = Handler::try_from(config).unwrap();
+        let totp = handler.opts.totp.unwrap();
+        assert_eq!(totp.generate(118).to_string(), "94287082");
+    }
+
+    #[test]
+    fn invalid_totp_config_is_rejected() {
+        for (digits, step) in [(5, 30), (262, 30), (6, 0)] {
+            let config = OutboundSsh {
+                totp_opt: Some(TotpOption::Common(Totp {
+                    algorithm: Algorithm::SHA1,
+                    digits,
+                    screw: 1,
+                    step,
+                    secret: Secret::from(SECRET).to_base32(),
+                })),
+                ..Default::default()
+            };
+            assert!(matches!(
+                Handler::try_from(config),
+                Err(Error::InvalidConfig(_))
+            ));
         }
     }
 }

@@ -25,6 +25,7 @@ impl TryFrom<&OutboundShadowQuic> for Handler {
         Ok(Handler::new(
             s.common_opts.name.clone(),
             HandlerOptions {
+                tag: s.common_opts.name.clone(),
                 addr: SocksAddr::try_from((
                     s.common_opts.server.clone(),
                     s.common_opts.port,
