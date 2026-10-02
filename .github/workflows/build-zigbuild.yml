@@ -275,7 +275,8 @@ jobs:
           CARGO_PROFILE_RELEASE_OPT_LEVEL: ${{ matrix.opt-level }}
           MAKEFLAGS: "CC_MM="
           # Match Zig's musl time_t ABI in boring's high-level libc API.
-          RUST_LIBC_UNSTABLE_MUSL_V1_2_3: ${{ (matrix.target == 'i686-unknown-linux-musl' || matrix.target == 'armv7-unknown-linux-musleabihf') && '1' || '0' }}
+          CARGO_TARGET_I686_UNKNOWN_LINUX_MUSL_RUSTFLAGS: "--cfg tokio_unstable --cfg libc_unstable_musl_v1_2_3"
+          CARGO_TARGET_ARMV7_UNKNOWN_LINUX_MUSLEABIHF_RUSTFLAGS: "--cfg tokio_unstable --cfg libc_unstable_musl_v1_2_3"
         run: |
           cargo +stable zigbuild --locked --release --target ${{ matrix.target }} -F ${{ matrix.features }} -p clash-rs
 
