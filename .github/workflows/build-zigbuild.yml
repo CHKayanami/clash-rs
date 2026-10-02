@@ -109,7 +109,7 @@ jobs:
             archive-name: clash-rs-standard-armv7-unknown-linux-musleabihf
             binary-name: clash-rs
             archive-ext: tar.gz
-            features: standard,jemallocator,ebpf
+            features: standard,jemallocator
             os: ubuntu-latest
             use-zigbuild: true
             opt-level: "s"
@@ -117,7 +117,7 @@ jobs:
             archive-name: clash-rs-minimal-armv7-unknown-linux-musleabihf
             binary-name: clash-rs
             archive-ext: tar.gz
-            features: minimal,jemallocator,ebpf
+            features: minimal,jemallocator
             os: ubuntu-latest
             use-zigbuild: true
             opt-level: "s"
