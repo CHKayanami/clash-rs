@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use std::net::IpAddr;
 use std::sync::Arc;
 
 #[cfg(test)]
@@ -72,6 +73,15 @@ pub trait ClashResolver: Sync + Send {
 
     /// Used for DNS Server / TUN / eBPF: accepts raw wire-format query bytes and returns raw response bytes
     async fn exchange(&self, message: &[u8]) -> anyhow::Result<Vec<u8>>;
+
+    /// DNS listeners supply the peer IP; internal queries may omit it.
+    async fn exchange_from(
+        &self,
+        message: &[u8],
+        _source_ip: Option<IpAddr>,
+    ) -> anyhow::Result<Vec<u8>> {
+        self.exchange(message).await
+    }
 
     /// Only used for look up fake IP
     fn reverse_lookup(&self, ip: std::net::IpAddr) -> Option<String>;

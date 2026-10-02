@@ -4,10 +4,12 @@ use super::{DnsName, EdnsMetadata, QueryError};
 
 const MAX_POINTER_HOPS: usize = 128;
 const STACK_PARSE_LEN: usize = 512;
+// DNS compression pointers contain a 14-bit target offset.
+const MAX_POINTER_TARGETS: usize = 1 << 14;
 
 enum VisitedStorage {
     Stack([u32; STACK_PARSE_LEN]),
-    Heap(Vec<u32>),
+    Heap { marks: Option<Vec<u32>>, len: usize },
 }
 
 impl VisitedStorage {
@@ -15,7 +17,7 @@ impl VisitedStorage {
         if len <= STACK_PARSE_LEN {
             Self::Stack([0; STACK_PARSE_LEN])
         } else {
-            Self::Heap(vec![0; len])
+            Self::Heap { marks: None, len: len.min(MAX_POINTER_TARGETS) }
         }
     }
 
@@ -23,7 +25,10 @@ impl VisitedStorage {
     fn get_mut(&mut self, idx: usize) -> Option<&mut u32> {
         match self {
             Self::Stack(arr) => arr.get_mut(idx),
-            Self::Heap(vec) => vec.get_mut(idx),
+            Self::Heap { marks, len } => {
+                if idx >= *len { return None; }
+                marks.get_or_insert_with(|| vec![0; *len]).get_mut(idx)
+            }
         }
     }
 
@@ -31,7 +36,9 @@ impl VisitedStorage {
     fn fill(&mut self, val: u32) {
         match self {
             Self::Stack(arr) => arr.fill(val),
-            Self::Heap(vec) => vec.fill(val),
+            Self::Heap { marks, .. } => {
+                if let Some(marks) = marks { marks.fill(val); }
+            }
         }
     }
 }
@@ -148,7 +155,10 @@ pub(crate) fn parse_name(
     state: &mut NameParseState,
 ) -> Result<(DnsName, usize), QueryError> {
     let mut wire = Vec::with_capacity(64);
-    let name_end = walk_name(raw, start, state, Some(&mut wire))?;
+    let name_end = walk_name(raw, start, state, |bytes| {
+        wire.extend_from_slice(bytes);
+        Ok(())
+    })?;
     Ok((DnsName(wire.into_boxed_slice()), name_end))
 }
 
@@ -157,16 +167,40 @@ pub(crate) fn skip_name(
     start: usize,
     state: &mut NameParseState,
 ) -> Result<usize, QueryError> {
-    walk_name(raw, start, state, None)
+    walk_name(raw, start, state, |_| Ok(()))
 }
 
-#[inline(always)]
-fn walk_name(
+/// Compare the expanded name without constructing a temporary DnsName.
+/// All pointer, label and expanded-length checks use the common walker.
+pub(crate) fn match_name(
     raw: &[u8],
     start: usize,
     state: &mut NameParseState,
-    mut sink: Option<&mut Vec<u8>>,
+    expected: &DnsName,
 ) -> Result<usize, QueryError> {
+    let expected = expected.as_wire();
+    let mut position = 0;
+    let end = walk_name(raw, start, state, |bytes| {
+        let next = position + bytes.len();
+        if expected.get(position..next) != Some(bytes) {
+            return Err(QueryError::MalformedName);
+        }
+        position = next;
+        Ok(())
+    })?;
+    if position != expected.len() { return Err(QueryError::MalformedName); }
+    Ok(end)
+}
+
+#[inline(always)]
+fn walk_name<F>(
+    raw: &[u8],
+    start: usize,
+    state: &mut NameParseState,
+    mut sink: F,
+) -> Result<usize, QueryError>
+where F: FnMut(&[u8]) -> Result<(), QueryError>,
+{
     state.begin_name();
     let mut cursor = start;
     let mut end = None;
@@ -186,9 +220,7 @@ fn walk_name(
         if octet & 0xc0 != 0 || octet > 63 {
             return Err(QueryError::MalformedName);
         }
-        if let Some(ref mut wire) = sink {
-            wire.push(octet);
-        }
+        sink(&[octet])?;
         total_len += 1;
         if total_len > 255 {
             return Err(QueryError::MalformedName);
@@ -201,12 +233,7 @@ fn walk_name(
             .checked_add(usize::from(octet))
             .filter(|label_end| *label_end <= raw.len())
             .ok_or(QueryError::MalformedName)?;
-        if let Some(ref mut wire) = sink {
-            wire.extend_from_slice(
-                raw.get(cursor..label_end)
-                    .ok_or(QueryError::MalformedName)?,
-            );
-        }
+        sink(&raw[cursor..label_end])?;
         total_len += usize::from(octet);
         if total_len > 255 {
             return Err(QueryError::MalformedName);
@@ -227,4 +254,87 @@ fn read_u32(raw: &[u8], offset: usize) -> Result<u32, QueryError> {
         .get(offset..offset + 4)
         .ok_or(QueryError::TruncatedField)?;
     Ok(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn comparison_matches_decoding_for_plain_and_compressed_names() {
+        let base = DnsName::from_domain("example.test").unwrap();
+        let mut wire = base.as_wire().to_vec();
+        let compressed = wire.len();
+        wire.extend_from_slice(&[0xc0, 0]);
+        let prefixed = wire.len();
+        wire.extend_from_slice(&[3, b'w', b'w', b'w', 0xc0, 0]);
+        let www = DnsName::from_domain("www.example.test").unwrap();
+        for (start, expected) in [(0, &base), (compressed, &base), (prefixed, &www)] {
+            let mut state = NameParseState::new(wire.len());
+            let (decoded, end) = parse_name(&wire, start, &mut state).unwrap();
+            assert_eq!(&decoded, expected);
+            assert_eq!(match_name(&wire, start, &mut state, expected).unwrap(), end);
+            let mismatch = DnsName::from_domain("other.test").unwrap();
+            assert_eq!(match_name(&wire, start, &mut state, &mismatch), Err(QueryError::MalformedName));
+        }
+        for end in 0..base.as_wire().len() {
+            let raw = &base.as_wire()[..end];
+            assert!(match_name(raw, 0, &mut NameParseState::new(raw.len()), &base).is_err());
+        }
+        for mismatch in ["example.test.extra", "example", "Example.test"] {
+            let expected = DnsName::from_domain(mismatch).unwrap();
+            assert!(match_name(&wire, 0, &mut NameParseState::new(wire.len()), &expected).is_err());
+        }
+    }
+
+    #[test]
+    fn comparison_rejects_invalid_pointers_and_overlong_names() {
+        let expected = DnsName::from_domain("x").unwrap();
+        for wire in [vec![0xc0, 0], vec![0xc0, 2, 0], vec![0x40, 0],
+            vec![1, b'x', 0xc0, 0]] {
+            let mut state = NameParseState::new(wire.len());
+            assert!(match_name(&wire, 0, &mut state, &expected).is_err());
+            assert!(skip_name(&wire, 0, &mut state).is_err());
+        }
+        let root = DnsName::from_domain("").unwrap();
+        let mut chain = vec![0];
+        let mut start = 0;
+        for hops in 1..=MAX_POINTER_HOPS + 1 {
+            let target = start;
+            start = chain.len();
+            chain.extend_from_slice(&(0xc000 | target as u16).to_be_bytes());
+            let mut state = NameParseState::new(chain.len());
+            assert_eq!(match_name(&chain, start, &mut state, &root).is_ok(), hops <= MAX_POINTER_HOPS);
+        }
+        for (last_len, valid) in [(61, true), (62, false)] {
+            let domain = ["x".repeat(63), "x".repeat(63), "x".repeat(63), "x".repeat(last_len)].join(".");
+            let expected = DnsName::from_domain(&domain).unwrap();
+            let wire = expected.as_wire();
+            let mut state = NameParseState::new(wire.len());
+            assert_eq!(match_name(wire, 0, &mut state, &expected).is_ok(), valid);
+            assert_eq!(parse_name(wire, 0, &mut state).is_ok(), valid);
+        }
+    }
+
+    #[test]
+    fn large_messages_allocate_pointer_marks_only_when_needed() {
+        let mut wire = vec![0; 65535];
+        let start = wire.len() - 2;
+        let mut state = NameParseState::new(wire.len());
+        assert_eq!(skip_name(&wire, 0, &mut state).unwrap(), 1);
+        assert!(matches!(&state.visited, VisitedStorage::Heap { marks: None, .. }));
+        // Exercise the largest encodable target, including epoch rollover.
+        wire[start..].copy_from_slice(&[0xff, 0xff]);
+        assert_eq!(skip_name(&wire, start, &mut state).unwrap(), wire.len());
+        match &state.visited {
+            VisitedStorage::Heap { marks: Some(marks), .. } => assert_eq!(marks.len(), MAX_POINTER_TARGETS),
+            _ => panic!("compression must allocate pointer marks"),
+        }
+        state.epoch = u32::MAX;
+        assert_eq!(skip_name(&wire, start, &mut state).unwrap(), wire.len());
+        // A maximum-offset target beyond a smaller message remains invalid.
+        let mut shorter = vec![0; 1024];
+        shorter[1022..].copy_from_slice(&[0xff, 0xff]);
+        assert!(skip_name(&shorter, 1022, &mut NameParseState::new(shorter.len())).is_err());
+    }
 }

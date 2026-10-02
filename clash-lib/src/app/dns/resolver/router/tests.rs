@@ -51,7 +51,7 @@ async fn test_cache_delete_prefers_configured_upstream_tag_over_fakeip_alias() {
         None,
         Arc::new(parking_lot::RwLock::new(HashMap::new())),
         None,
-    ).await;
+    ).await.unwrap();
 
     let name = DnsName::from_domain("example.com").unwrap();
     let wire = build_dns_query_wire(&name, QType::A);
@@ -156,15 +156,17 @@ fn test_hosts_snapshot() {
     let resp_a = snapshot
         .make_response(&q_a, "localhost", QType::A, true)
         .expect("make_response A");
-    let ips_a = extract_ips_from_dns_response(&resp_a);
+    let ips_a = extract_ips_from_dns_response(&resp_a.wire);
     assert_eq!(ips_a, vec![IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))]);
+    assert_eq!(resp_a.answer_ips.as_ref(), ips_a.as_slice());
 
     let q_aaaa = build_dns_query_wire(&name, QType::AAAA);
     let resp_aaaa = snapshot
         .make_response(&q_aaaa, "localhost", QType::AAAA, true)
         .expect("make_response AAAA");
-    let ips_aaaa = extract_ips_from_dns_response(&resp_aaaa);
+    let ips_aaaa = extract_ips_from_dns_response(&resp_aaaa.wire);
     assert_eq!(ips_aaaa, vec![IpAddr::V6(Ipv6Addr::LOCALHOST)]);
+    assert_eq!(resp_aaaa.answer_ips.as_ref(), ips_aaaa.as_slice());
 
     // ipv6 为 false 时，AAAA 请求返回 None
     assert!(snapshot
@@ -518,7 +520,7 @@ async fn test_router_resolver_fresh_vs_cache_hit_notification() {
         None,
         Arc::new(parking_lot::RwLock::new(HashMap::new())),
         None,
-    ).await;
+    ).await.unwrap();
 
     let hook_calls = Arc::new(AtomicUsize::new(0));
     let hook_calls_clone = Arc::clone(&hook_calls);
@@ -646,7 +648,7 @@ async fn test_router_resolver_polluted_requery_prevents_dirty_cache_and_hook() {
         None,
         Arc::new(parking_lot::RwLock::new(HashMap::new())),
         None,
-    ).await;
+    ).await.unwrap();
 
     let hooked_ips = Arc::new(parking_lot::Mutex::new(Vec::new()));
     let hooked_ips_clone = Arc::clone(&hooked_ips);
@@ -745,7 +747,7 @@ async fn test_router_resolver_stale_refresh_notification_with_rule_filter() {
         None,
         Arc::new(parking_lot::RwLock::new(HashMap::new())),
         None,
-    ).await;
+    ).await.unwrap();
 
     let hooked_ips = Arc::new(parking_lot::Mutex::new(Vec::new()));
     let hooked_ips_clone = Arc::clone(&hooked_ips);

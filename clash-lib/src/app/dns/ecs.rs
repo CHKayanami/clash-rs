@@ -1,6 +1,6 @@
 use std::ops::Range;
 
-use ipnet::Ipv4Net;
+use ipnet::IpNet;
 use thiserror::Error;
 
 use super::wire::skip_dns_name;
@@ -35,8 +35,10 @@ pub struct EcsQuery {
 
 #[derive(Clone, Copy)]
 struct ExpectedEcs {
+    family: u16,
+    max_prefix: u8,
     source_prefix: u8,
-    address: [u8; 4],
+    address: [u8; 16],
     address_len: usize,
 }
 
@@ -57,9 +59,9 @@ struct OptRecord {
 }
 
 impl EcsQuery {
-    pub fn prepare(raw: &[u8], subnet: Ipv4Net) -> Result<Option<Self>, EcsWireError> {
+    pub fn prepare(raw: &[u8], subnet: impl Into<IpNet>) -> Result<Option<Self>, EcsWireError> {
         let layout = message_layout(raw)?;
-        let (option, expected) = encode_ecs(subnet);
+        let (option, expected) = encode_ecs(subnet.into());
         let original_had_opt = layout.opt.is_some();
         let wire = if let Some(opt) = layout.opt {
             if opt.end != raw.len() {
@@ -168,20 +170,32 @@ impl EcsQuery {
     }
 }
 
-fn encode_ecs(subnet: Ipv4Net) -> (Vec<u8>, ExpectedEcs) {
+fn encode_ecs(subnet: IpNet) -> (Vec<u8>, ExpectedEcs) {
     let source_prefix = subnet.prefix_len();
     let address_len = usize::from(source_prefix).div_ceil(8);
-    let address = subnet.network().octets();
+    let mut address = [0; 16];
+    let (family, max_prefix) = match subnet {
+        IpNet::V4(subnet) => {
+            address[..4].copy_from_slice(&subnet.network().octets());
+            (1_u16, 32)
+        }
+        IpNet::V6(subnet) => {
+            address.copy_from_slice(&subnet.network().octets());
+            (2_u16, 128)
+        }
+    };
     let mut option = Vec::with_capacity(8 + address_len);
     option.extend_from_slice(&ECS_OPTION_CODE.to_be_bytes());
     option.extend_from_slice(&(4_u16 + address_len as u16).to_be_bytes());
-    option.extend_from_slice(&1_u16.to_be_bytes());
+    option.extend_from_slice(&family.to_be_bytes());
     option.push(source_prefix);
     option.push(0);
     option.extend_from_slice(&address[..address_len]);
     (
         option,
         ExpectedEcs {
+            family,
+            max_prefix,
             source_prefix,
             address,
             address_len,
@@ -191,9 +205,9 @@ fn encode_ecs(subnet: Ipv4Net) -> (Vec<u8>, ExpectedEcs) {
 
 fn ecs_matches(value: &[u8], expected: ExpectedEcs) -> bool {
     value.len() == 4 + expected.address_len
-        && value[..2] == 1_u16.to_be_bytes()
+        && value[..2] == expected.family.to_be_bytes()
         && value[2] == expected.source_prefix
-        && value[3] <= 32
+        && value[3] <= expected.max_prefix
         && value[4..] == expected.address[..expected.address_len]
 }
 

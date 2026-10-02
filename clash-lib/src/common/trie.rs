@@ -91,17 +91,19 @@ impl<T> StringTrie<T> {
             return None;
         }
 
-        let parts = parts.unwrap();
-        if parts[0].is_empty() {
+        self.search_parts(&parts.unwrap())
+    }
+
+    /// Search pre-split labels so routing can reuse them across domain rules.
+    pub(crate) fn search_parts(&self, parts: &[&str]) -> Option<&Node<T>> {
+        if parts.is_empty() || parts.iter().any(|part| part.is_empty()) {
             return None;
         }
-
-        if let Some(n) = Self::search_inner(&self.root, &parts)
-            && n.data.is_some()
+        if let Some(node) = Self::search_inner(&self.root, parts)
+            && node.data.is_some()
         {
-            return Some(n);
+            return Some(node);
         }
-
         None
     }
 

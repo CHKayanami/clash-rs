@@ -3,12 +3,14 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use tracing::{debug, trace, warn};
+use ipnet::IpNet;
 
 use super::UpstreamPool;
 use super::admission::AdmissionPermit;
 use super::entries::{UpstreamEntry, UpstreamState};
 use super::udp::UdpUpstream;
 use crate::app::dns::transport::UdpPool;
+use crate::app::dns::ecs::EcsQuery;
 
 impl UpstreamPool {
     pub async fn udp_pool(
@@ -145,11 +147,9 @@ impl UpstreamPool {
         let effective_outbound = &outbound.name;
 
         let ecs_query = if let Some(ref ecs) = entry.ecs
-            && let Some(ipv4) = ecs.ipv4
+            && let Some(subnet) = ecs.ipv4.map(IpNet::V4).or_else(|| ecs.ipv6.map(IpNet::V6))
         {
-            crate::app::dns::ecs::EcsQuery::prepare(raw_query, ipv4)
-                .ok()
-                .flatten()
+            EcsQuery::prepare(raw_query, subnet)?
         } else {
             None
         };

@@ -4,7 +4,7 @@ mod reverse_cache;
 #[cfg(test)]
 mod tests;
 
-pub use cache::{CacheLookup, DnsCache, SERVE_STALE_WIRE_TTL};
+pub use cache::{CacheLookup, DnsCache, DnsCacheEntryDetail, SERVE_STALE_WIRE_TTL};
 pub use policy::NameServerPolicyContainer;
 pub use reverse_cache::ReverseLookupCache;
 
@@ -828,6 +828,7 @@ impl ClashResolver for EnhancedResolver {
         // Singleflight execution
         let flight_key = FlightKey::Query(query.canonical_wire_arc());
         let (raw_resp, template_to_publish) = match self.singleflight.acquire(flight_key) {
+            FlightRole::Failed(error) => anyhow::bail!("{error}"),
             FlightRole::Ready(template) => {
                 let rendered = template.render(&query)?;
                 return Ok(rendered);

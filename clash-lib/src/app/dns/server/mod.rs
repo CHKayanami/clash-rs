@@ -1,3 +1,5 @@
+use std::net::IpAddr;
+
 use async_trait::async_trait;
 use tracing::{error, info, instrument};
 use watfaq_dns::DNSListenAddr;
@@ -16,6 +18,15 @@ struct DnsMessageExchanger {
 impl watfaq_dns::DnsMessageExchanger for DnsMessageExchanger {
     fn ipv6(&self) -> bool {
         self.resolver.ipv6()
+    }
+
+    async fn exchange_from(
+        &self,
+        message: &[u8],
+        source_ip: Option<IpAddr>,
+    ) -> Result<Vec<u8>, watfaq_dns::DNSError> {
+        self.resolver.exchange_from(message, source_ip).await
+            .map_err(|error| watfaq_dns::DNSError::QueryFailed(error.to_string()))
     }
 
     #[instrument(skip(self))]

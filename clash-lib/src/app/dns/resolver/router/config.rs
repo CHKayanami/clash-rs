@@ -5,8 +5,9 @@ use std::str::FromStr;
 use ipnet::IpNet;
 
 use crate::Error;
-use crate::app::dns::config::{Config as LegacyDnsConfig, NameServer};
+use crate::app::dns::config::{Config as LegacyDnsConfig, EdnsClientSubnet, NameServer};
 use crate::app::dns::query::QType;
+use crate::app::dns::fakeip::{compute_v4_range, compute_v6_range};
 use crate::config::def::{DNSListen, Dns2Config as DefDns2Config, Dns2StringOrList};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -39,7 +40,7 @@ pub struct UpstreamConfig {
     pub upstream_type: UpstreamType,
     pub servers: Vec<NameServer>,
     pub proxy: Option<String>,
-    pub client_subnet: Option<crate::app::dns::config::EdnsClientSubnet>,
+    pub client_subnet: Option<EdnsClientSubnet>,
     pub inet4_range: ipnet::Ipv4Net,
     pub inet6_range: ipnet::Ipv6Net,
     pub ttl: Option<u32>,
@@ -123,6 +124,33 @@ impl Default for RouterConfig {
 }
 
 impl RouterConfig {
+    pub fn validate(&self) -> Result<(), Error> {
+        let mut fakeip_tag = None;
+        for upstream in &self.upstreams {
+            if upstream.upstream_type != UpstreamType::FakeIp {
+                continue;
+            }
+            if let Some(first) = fakeip_tag {
+                return Err(Error::InvalidConfig(format!(
+                    "dns2 allows only one fakeip upstream: '{first}' and '{}'",
+                    upstream.tag,
+                )));
+            }
+            fakeip_tag = Some(upstream.tag.as_str());
+            compute_v4_range(&upstream.inet4_range).map_err(|error| {
+                Error::InvalidConfig(format!(
+                    "dns2.upstreams['{}'].inet4-range: {error}", upstream.tag,
+                ))
+            })?;
+            compute_v6_range(&upstream.inet6_range).map_err(|error| {
+                Error::InvalidConfig(format!(
+                    "dns2.upstreams['{}'].inet6-range: {error}", upstream.tag,
+                ))
+            })?;
+        }
+        Ok(())
+    }
+
     pub fn from_def(def: &DefDns2Config, global_ipv6: bool) -> Result<Self, Error> {
         let mut hosts = HashMap::new();
         for (domain, value) in &def.hosts {
@@ -190,12 +218,24 @@ impl RouterConfig {
                 ))
             })?;
 
+            let client_subnet = u.client_subnet.as_deref().map(|value| {
+                let subnet = value.trim().parse::<IpNet>()
+                    .or_else(|_| value.trim().parse::<IpAddr>().map(IpNet::from))
+                    .map_err(|error| Error::InvalidConfig(format!(
+                        "invalid dns2.upstreams['{}'].client-subnet '{value}': {error}", u.tag,
+                    )))?;
+                Ok::<_, Error>(match subnet {
+                    IpNet::V4(ipv4) => EdnsClientSubnet { ipv4: Some(ipv4), ipv6: None },
+                    IpNet::V6(ipv6) => EdnsClientSubnet { ipv4: None, ipv6: Some(ipv6) },
+                })
+            }).transpose()?;
+
             upstreams.push(UpstreamConfig {
                 tag: u.tag.clone(),
                 upstream_type,
                 servers,
                 proxy: u.proxy.clone(),
-                client_subnet: None,
+                client_subnet,
                 inet4_range,
                 inet6_range,
                 ttl: u.ttl,
@@ -328,7 +368,7 @@ impl RouterConfig {
             });
         }
 
-        Ok(Self {
+        let config = Self {
             enable: def.enable,
             listen: def.listen.clone(),
             ipv6: global_ipv6 && def.ipv6,
@@ -343,19 +383,41 @@ impl RouterConfig {
             response_rules,
             response_fallback,
             optimistic_cache_ttl: def.optimistic_cache_ttl,
-            stale_cache_retention: if def.stale_cache_retention == 0 {
-                3600
-            } else {
-                def.stale_cache_retention
-            },
+            stale_cache_retention: def.stale_cache_retention,
             cache_capacity: def.cache_capacity.unwrap_or(4096).max(1),
-        })
+        };
+        config.validate()?;
+        Ok(config)
     }
 }
 
 #[cfg(test)]
 mod config_error_tests {
     use super::*;
+    use crate::config::def::Dns2UpstreamDef;
+
+    #[test]
+    fn client_subnet_parses_both_families_and_rejects_invalid_values() {
+        for value in ["192.0.2.129/25", "2001:db8::1/57", "192.0.2.1", "2001:db8::1"] {
+            let mut def = DefDns2Config::default();
+            def.upstreams.push(Dns2UpstreamDef {
+                tag: "primary".into(), r#type: "remote".into(),
+                client_subnet: Some(value.into()), ..Default::default()
+            });
+            let cfg = RouterConfig::from_def(&def, true).unwrap();
+            let ecs = cfg.upstreams[0].client_subnet.as_ref().unwrap();
+            assert_eq!(ecs.ipv4.is_some(), !value.contains(':'));
+            assert_eq!(ecs.ipv6.is_some(), value.contains(':'));
+        }
+        for value in ["", "bad", "192.0.2.1/33", "2001:db8::1/129"] {
+            let mut def = DefDns2Config::default();
+            def.upstreams.push(Dns2UpstreamDef {
+                tag: "primary".into(), client_subnet: Some(value.into()), ..Default::default()
+            });
+            let error = RouterConfig::from_def(&def, true).err().unwrap().to_string();
+            assert!(error.contains("dns2.upstreams['primary'].client-subnet"));
+        }
+    }
 
     #[test]
     fn invalid_dns2_upstream_range_identifies_tag_and_value() {

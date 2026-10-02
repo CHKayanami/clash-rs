@@ -5,8 +5,8 @@ use thiserror::Error;
 
 mod parser;
 
-pub(crate) use parser::{NameParseState, parse_name, skip_name};
-use parser::{parse_edns, parse_rr, read_u16};
+pub(crate) use parser::{NameParseState, match_name, skip_name};
+use parser::{parse_edns, parse_name, parse_rr, read_u16};
 
 const HEADER_LEN: usize = 12;
 const MIN_QUESTION_WIRE_LEN: usize = 5;

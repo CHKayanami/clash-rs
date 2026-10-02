@@ -42,7 +42,8 @@ pub async fn new(
                     outbounds,
                     collector,
                 )
-                .await,
+                .await
+                .unwrap_or_else(|error| print_and_exit!("failed to initialize dns2: {error}")),
             );
         }
     }

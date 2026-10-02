@@ -9,22 +9,23 @@ use tracing::debug;
 use crate::app::dns::fakeip::FakeDns;
 use crate::app::dns::query::{DnsName, QType, QueryContext, build_dns_query_wire};
 use crate::app::dns::resolver::enhanced::{
-    CacheLookup, DnsCache, ReverseLookupCache, SERVE_STALE_WIRE_TTL,
+    CacheLookup, DnsCache, ReverseLookupCache,
 };
 use crate::app::dns::response::{
-    ResponseTemplate, build_dns_ip_response, build_dns_nodata, build_dns_nxdomain,
+    RenderedResponse, ResponseMetadata, ResponseTemplate, build_dns_ip_response, build_dns_nodata, build_dns_nxdomain,
 };
 use crate::app::dns::singleflight::{
     FlightKey, FlightLeader, FlightRole, Singleflight,
 };
 use crate::app::dns::upstream_pool::UpstreamPool;
-use crate::app::dns::wire::{
-    extract_ips_from_dns_response, extract_min_ttl_from_dns_response,
-    rewrite_dns_response_ttl,
-};
+
 use crate::app::dns::{DnsResolutionHookWrapper, ThreadSafeDnsCollector};
 
 use super::config::UpstreamType;
+
+const STALE_RESPONSE_TTL: u32 = 60;
+const ZERO_NEGATIVE_CACHE_TTL: u32 = 5;
+const MAX_NEGATIVE_CACHE_TTL: u32 = 1800;
 
 #[derive(Clone, Copy, Debug)]
 pub struct DnsCachePolicy {
@@ -51,21 +52,14 @@ impl DnsCachePolicy {
         }
     }
 
-    pub fn calculate_effective_ttl(
-        &self,
-        override_ttl: Option<u32>,
-        raw_resp: &[u8],
-    ) -> u32 {
-        if let Some(ttl) = override_ttl {
-            ttl
-        } else {
-            let min_ttl = extract_min_ttl_from_dns_response(raw_resp).unwrap_or(60);
-            if self.optimistic_cache_ttl > 0 {
-                min_ttl.max(self.optimistic_cache_ttl)
-            } else {
-                min_ttl
-            }
+    fn effective_ttl(&self, override_ttl: Option<u32>, metadata: &ResponseMetadata) -> u32 {
+        let Some(ttl) = metadata.cache_ttl else { return 0; };
+        if override_ttl == Some(0) { return 0; }
+        if metadata.negative {
+            // Briefly retain zero-TTL negatives to absorb repeated queries.
+            return if ttl == 0 { ZERO_NEGATIVE_CACHE_TTL } else { ttl.min(MAX_NEGATIVE_CACHE_TTL) };
         }
+        override_ttl.unwrap_or_else(|| ttl.max(self.optimistic_cache_ttl))
     }
 }
 
@@ -89,12 +83,11 @@ impl DnsResolvedNotifier {
         }
     }
 
-    pub fn on_fresh_response(&self, qname: &str, resp: &[u8], effective_ttl: u32) {
-        let ips = extract_ips_from_dns_response(resp);
+    pub fn on_fresh_response(&self, qname: &str, ips: &[IpAddr], effective_ttl: u32) {
 
         // 1. 保存反向 IP 缓存（供后续连接管理反查域名）
         if effective_ttl > 0 {
-            for ip in &ips {
+            for ip in ips {
                 if !ip.is_unspecified() {
                     self.reverse_lookup_cache.insert(*ip, qname, effective_ttl);
                 }
@@ -102,10 +95,10 @@ impl DnsResolvedNotifier {
         }
 
         // 2. 触发 Resolution Hook (例如 eBPF offload)
-        if let Some(hook) = self.resolution_hook.load().as_ref() {
-            if !ips.is_empty() {
-                (hook.0)(qname, &ips, Duration::from_secs(effective_ttl as u64));
-            }
+        if let Some(hook) = self.resolution_hook.load().as_ref()
+            && !ips.is_empty()
+        {
+            (hook.0)(qname, ips, Duration::from_secs(effective_ttl as u64));
         }
 
         // 3. 记录 DNS 统计
@@ -131,7 +124,7 @@ impl RefreshTicket {
         &self.query
     }
 
-    pub async fn run(self) -> anyhow::Result<Vec<u8>> {
+    pub async fn run(self) -> anyhow::Result<ExchangeResult> {
         self.transport
             .fetch_and_cache(&self.raw_query, &self.query, Some(self.leader))
             .await
@@ -142,31 +135,44 @@ pub struct ExchangeResult {
     pub wire: Vec<u8>,
     pub is_fresh: bool,
     pub refresh_ticket: Option<RefreshTicket>,
+    pub answer_ips: Arc<[IpAddr]>,
+    pub ttl: u32,
 }
 
 impl ExchangeResult {
-    pub fn fresh(wire: Vec<u8>) -> Self {
+    fn fresh(wire: Vec<u8>, answer_ips: Arc<[IpAddr]>, ttl: u32) -> Self {
         Self {
             wire,
             is_fresh: true,
             refresh_ticket: None,
+            answer_ips,
+            ttl,
         }
     }
 
-    pub fn cached(wire: Vec<u8>) -> Self {
-        Self {
-            wire,
-            is_fresh: false,
-            refresh_ticket: None,
-        }
+    fn synthetic(wire: Vec<u8>, answer_ips: Arc<[IpAddr]>, ttl: u32) -> Self {
+        Self { wire, answer_ips, ttl, is_fresh: false, refresh_ticket: None }
     }
 
-    pub fn stale(wire: Vec<u8>, refresh_ticket: Option<RefreshTicket>) -> Self {
-        Self {
-            wire,
-            is_fresh: false,
-            refresh_ticket,
-        }
+    fn coalesced(template: &ResponseTemplate, query: &QueryContext) -> anyhow::Result<Self> {
+        let rendered = template.render_with_ips(query)?;
+        // UDP truncation makes the rendered packet uncacheable even when the
+        // complete published template has a cache TTL.
+        let ttl = if rendered.wire[2] & 2 != 0 { 0 } else { template.cache_ttl().unwrap_or(0) };
+        Ok(Self { wire: rendered.wire, answer_ips: rendered.answer_ips,
+            is_fresh: false, refresh_ticket: None, ttl })
+    }
+
+    fn cached_with_ttl(template: &ResponseTemplate, query: &QueryContext, ttl: u32, refresh_ticket: Option<RefreshTicket>) -> anyhow::Result<Self> {
+        let rendered = template.render_cached(query, ttl)?;
+        Ok(Self { wire: rendered.wire, is_fresh: false, refresh_ticket,
+            answer_ips: rendered.answer_ips, ttl })
+    }
+}
+
+impl From<ExchangeResult> for RenderedResponse {
+    fn from(result: ExchangeResult) -> Self {
+        Self { wire: result.wire, answer_ips: result.answer_ips }
     }
 }
 
@@ -370,38 +376,44 @@ impl CachedTransport {
         raw_query: &[u8],
         query: &QueryContext,
         mut leader: Option<FlightLeader>,
-    ) -> anyhow::Result<Vec<u8>> {
+    ) -> anyhow::Result<ExchangeResult> {
+        let result = self.fetch_response(raw_query, query, leader.as_mut()).await;
+        if let Err(error) = &result
+            && let Some(leader) = leader.as_mut()
+        {
+            leader.publish_error(Arc::from(format!("{error:#}")));
+        }
+        result
+    }
+
+    async fn fetch_response(
+        &self,
+        raw_query: &[u8],
+        query: &QueryContext,
+        leader: Option<&mut FlightLeader>,
+    ) -> anyhow::Result<ExchangeResult> {
         let domain = query.qdomain().unwrap_or_default();
         let qtype = query.qtype().unwrap_or(QType::A);
-        let mut resp = self.endpoint.fetch(raw_query, domain, qtype).await?;
-        let effective_ttl = self
-            .policy
-            .calculate_effective_ttl(self.override_ttl, &resp);
-        let ips = extract_ips_from_dns_response(&resp);
-        let is_acme = query.qtype() == Some(QType::TXT)
-            && domain.starts_with("_acme-challenge.");
-        let is_unspecified =
-            !ips.is_empty() && ips.iter().all(|ip| ip.is_unspecified());
-
-        if let Ok(template) = ResponseTemplate::validate(query, &resp) {
-            let arc_template = Arc::new(template);
-            if let Some(leader) = leader.as_mut() {
-                leader.publish(Arc::clone(&arc_template));
-            }
-            if !is_acme && !is_unspecified && effective_ttl > 0 {
-                self.cache.insert_scoped(
-                    &self.tag,
-                    query,
-                    arc_template,
-                    effective_ttl,
-                    self.policy.stale_cache_retention,
-                );
-            }
+        let mut wire = self.endpoint.fetch(raw_query, domain, qtype).await?;
+        let (template, negative, ttl) = ResponseTemplate::validate_with_ttl(query, &mut wire,
+            |metadata| self.policy.effective_ttl(self.override_ttl, metadata))?;
+        let is_acme = qtype == QType::TXT && domain.starts_with("_acme-challenge.");
+        let answer_ips = template.answer_ips();
+        let is_unspecified = !answer_ips.is_empty()
+            && answer_ips.iter().all(|ip| ip.is_unspecified());
+        let template = Arc::new(template);
+        if !is_acme && !is_unspecified && ttl > 0 {
+            let retention = if negative {
+                Duration::ZERO
+            } else {
+                self.policy.stale_cache_retention
+            };
+            self.cache.insert_scoped(&self.tag, query, Arc::clone(&template), ttl, retention);
         }
-        if self.override_ttl.is_some() || self.policy.optimistic_cache_ttl > 0 {
-            rewrite_dns_response_ttl(resp.as_mut_slice(), effective_ttl);
+        if let Some(leader) = leader {
+            leader.publish(template);
         }
-        Ok(resp)
+        Ok(ExchangeResult::fresh(wire, answer_ips, ttl))
     }
 
     pub fn new_remote(
@@ -470,11 +482,7 @@ impl DnsTransport for CachedTransport {
                     remaining_ttl,
                     "cache hit"
                 );
-                if let Ok(mut rendered) = template.render(query) {
-                    let effective_ttl = self.override_ttl.unwrap_or(remaining_ttl);
-                    rewrite_dns_response_ttl(rendered.as_mut_slice(), effective_ttl);
-                    return Ok(ExchangeResult::cached(rendered));
-                }
+                return ExchangeResult::cached_with_ttl(&template, query, remaining_ttl, None);
             }
             CacheLookup::Stale(template) => {
                 debug!(
@@ -496,48 +504,37 @@ impl DnsTransport for CachedTransport {
                     });
                 }
 
-                if let Ok(mut rendered) = template.render(query) {
-                    let effective_ttl =
-                        self.override_ttl.unwrap_or(SERVE_STALE_WIRE_TTL);
-                    rewrite_dns_response_ttl(rendered.as_mut_slice(), effective_ttl);
-                    return Ok(ExchangeResult::stale(rendered, refresh_ticket));
-                }
+                return ExchangeResult::cached_with_ttl(&template, query, STALE_RESPONSE_TTL, refresh_ticket);
             }
             CacheLookup::Miss => {}
         }
 
         // 2. 并发抑制 (Singleflight)
         let flight_key = FlightKey::Query(query.canonical_wire_arc());
-        match self.singleflight.acquire(flight_key) {
-            FlightRole::Ready(template) => {
-                let mut rendered = template.render(query)?;
-                if let Some(ttl) = self.override_ttl {
-                    rewrite_dns_response_ttl(rendered.as_mut_slice(), ttl);
+        // A cancelled leader permits one coalesced retry. Endpoint failures are
+        // published to all waiters instead of making each waiter query upstream.
+        for _ in 0..2 {
+            match self.singleflight.acquire(flight_key.clone()) {
+                FlightRole::Ready(template) => {
+                    return ExchangeResult::coalesced(&template, query);
                 }
-                Ok(ExchangeResult::cached(rendered))
-            }
-            FlightRole::Waiter(waiter) => {
-                if let Some(template) = waiter.receive().await {
-                    let mut rendered = template.render(query)?;
-                    if let Some(ttl) = self.override_ttl {
-                        rewrite_dns_response_ttl(rendered.as_mut_slice(), ttl);
+                FlightRole::Failed(error) => anyhow::bail!("{error}"),
+                FlightRole::Waiter(waiter) => {
+                    match waiter.receive_result().await {
+                        Some(Ok(template)) => {
+                            return ExchangeResult::coalesced(&template, query);
+                        }
+                        Some(Err(error)) => anyhow::bail!("{error}"),
+                        None => continue,
                     }
-                    Ok(ExchangeResult::cached(rendered))
-                } else {
-                    let resp = self.fetch_and_cache(raw_query, query, None).await?;
-                    Ok(ExchangeResult::fresh(resp))
                 }
-            }
-            FlightRole::Leader(leader) => {
-                let resp =
-                    self.fetch_and_cache(raw_query, query, Some(leader)).await?;
-                Ok(ExchangeResult::fresh(resp))
-            }
-            FlightRole::Rejected => {
-                let resp = self.fetch_and_cache(raw_query, query, None).await?;
-                Ok(ExchangeResult::fresh(resp))
+                FlightRole::Leader(leader) => {
+                    return self.fetch_and_cache(raw_query, query, Some(leader)).await;
+                }
+                FlightRole::Rejected => anyhow::bail!("DNS singleflight capacity exhausted"),
             }
         }
+        anyhow::bail!("DNS singleflight leader repeatedly cancelled")
     }
 
     async fn resolve_ip(
@@ -552,8 +549,7 @@ impl DnsTransport for CachedTransport {
         let query = QueryContext::parse(&query_wire)
             .map_err(|e| anyhow::anyhow!("failed to parse built query: {e}"))?;
         let resp = self.exchange(&query_wire, &query).await?;
-        let ips = extract_ips_from_dns_response(&resp.wire);
-        Ok(ips)
+        Ok(resp.answer_ips.to_vec())
     }
 }
 
@@ -593,27 +589,29 @@ impl DnsTransport for FakeIpTransport {
     ) -> anyhow::Result<ExchangeResult> {
         let domain = query.qdomain().unwrap_or_default();
         if domain.is_empty() {
-            return Ok(ExchangeResult::cached(build_dns_nodata(raw_query)));
+            return Ok(ExchangeResult::synthetic(build_dns_nodata(raw_query), Arc::from([]), 0));
         }
         let qtype = query.qtype().unwrap_or(QType::A);
-        let wire = match qtype {
+        let ip = match qtype {
             QType::A => {
                 let ip = self.fake_dns.lookup(domain);
                 debug!(upstream = %self.tag, domain, ?qtype, fake_ip = %ip, "assigned fake-ip");
-                build_dns_ip_response(raw_query, &[ip], self.ttl).ok_or_else(
-                    || anyhow::anyhow!("failed to construct fakeip A response"),
-                )?
+                Some(ip)
             }
             QType::AAAA => {
                 let ip = self.fake_dns.lookupv6(domain);
                 debug!(upstream = %self.tag, domain, ?qtype, fake_ip = %ip, "assigned fake-ip");
-                build_dns_ip_response(raw_query, &[ip], self.ttl).ok_or_else(
-                    || anyhow::anyhow!("failed to construct fakeip AAAA response"),
-                )?
+                Some(ip)
             }
-            _ => build_dns_nodata(raw_query),
+            _ => None,
         };
-        Ok(ExchangeResult::cached(wire))
+        if let Some(ip) = ip {
+            let wire = build_dns_ip_response(raw_query, &[ip], self.ttl)
+                .ok_or_else(|| anyhow::anyhow!("failed to construct fakeip response"))?;
+            Ok(ExchangeResult::synthetic(wire, Arc::from([ip]), self.ttl))
+        } else {
+            Ok(ExchangeResult::synthetic(build_dns_nodata(raw_query), Arc::from([]), 0))
+        }
     }
 
     async fn resolve_ip(
@@ -638,3 +636,7 @@ pub enum Transport {
     Cached(CachedTransport),
     FakeIp(FakeIpTransport),
 }
+
+#[cfg(test)]
+#[path = "transport_tests.rs"]
+mod tests;

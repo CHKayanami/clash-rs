@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
@@ -6,6 +7,7 @@ use moka::sync::Cache;
 
 use crate::app::dns::query::{QType, QueryContext};
 use crate::app::dns::response::ResponseTemplate;
+use crate::common::utils::wildcard_match;
 
 /// Default wire TTL for serve-stale answers to encourage quick client retry.
 pub const SERVE_STALE_WIRE_TTL: u32 = 30;
@@ -195,7 +197,7 @@ impl DnsCache {
             } else if is_exact {
                 key.domain.eq_ignore_ascii_case(pattern)
             } else {
-                crate::common::utils::wildcard_match(pattern, &key.domain)
+                wildcard_match(pattern, &key.domain)
             };
 
             if matched {
@@ -215,14 +217,39 @@ impl DnsCache {
         (total_count, results)
     }
 
-    /// Search cached entries by wildcard matching on domain name (unlimited).
-    pub fn search_scoped(
+    /// Scan once, retaining a bounded sample and an exact count for each scope.
+    pub fn search_grouped_limited(
         &self,
         pattern: &str,
-        scope_filter: Option<&str>,
+        limit: usize,
         now: Instant,
-    ) -> Vec<DnsCacheEntryDetail> {
-        self.search_scoped_limited(pattern, scope_filter, usize::MAX, now).1
+    ) -> HashMap<Arc<str>, (usize, Vec<DnsCacheEntryDetail>)> {
+        let pattern = pattern.trim();
+        let exact = !pattern.contains('*') && !pattern.contains('?');
+        let mut groups: HashMap<Arc<str>, (usize, Vec<DnsCacheEntryDetail>)> = HashMap::new();
+        for (key, entry) in self.inner.iter() {
+            if !entry.is_fresh(now) && !entry.is_stale_valid(now) { continue; }
+            let matched = if pattern == "*" {
+                true
+            } else if exact {
+                key.domain.eq_ignore_ascii_case(pattern)
+            } else {
+                crate::common::utils::wildcard_match(pattern, &key.domain)
+            };
+            if !matched { continue; }
+            let (count, items) = groups.entry(Arc::clone(&key.scope)).or_default();
+            *count += 1;
+            if items.len() < limit {
+                items.push(DnsCacheEntryDetail {
+                    scope: key.scope.to_string(),
+                    domain: key.domain.to_string(),
+                    qtype: key.qtype.to_string(),
+                    ttl: entry.remaining_ttl_secs(now),
+                    is_stale: !entry.is_fresh(now),
+                });
+            }
+        }
+        groups
     }
 
     /// Invalidate/delete cached entries matching a domain pattern, optionally filtered by scope.

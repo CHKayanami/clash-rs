@@ -6,6 +6,8 @@ pub mod transport;
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod regression_tests;
 
 use std::collections::HashMap;
 use std::net;
@@ -19,19 +21,18 @@ use tracing::{debug, info, warn};
 
 use std::time::Instant;
 
-use crate::app::dns::config::NameServer;
+use crate::Error;
+use crate::app::dns::config::{EdnsClientSubnet, NameServer};
 use crate::app::dns::fakeip::{FakeDns, Opts as FakeDnsOpts};
 use crate::app::dns::query::{DnsName, QType, QueryContext, build_dns_query_wire};
 use crate::app::dns::resolver::enhanced::{
-    BootstrapResolver, DnsCache, ReverseLookupCache,
+    BootstrapResolver, DnsCache, DnsCacheEntryDetail, ReverseLookupCache,
 };
 use crate::app::dns::response::{
-    build_dns_nodata, build_dns_nxdomain, build_dns_refused,
+    RenderedResponse, build_dns_nodata, build_dns_nxdomain, build_dns_refused,
 };
 use crate::app::dns::upstream_pool::{UpstreamEntry, UpstreamPool};
-use crate::app::dns::wire::{
-    extract_ips_from_dns_response, extract_min_ttl_from_dns_response,
-};
+
 use crate::app::dns::{
     ClashResolver, DnsCacheItem, DnsCacheReport, DnsCacheUpstreamStat, DnsResolutionHook,
     DnsResolutionHookWrapper, DnsUpstreamInfo, ResolverKind, ThreadSafeDnsCollector,
@@ -49,7 +50,8 @@ use self::config::{
 use self::hosts::HostsSnapshot;
 use self::routing::DnsRouter;
 use self::transport::{
-    CachedTransport, DnsCachePolicy, DnsResolvedNotifier, DnsTransport, FakeIpTransport, Transport,
+    CachedTransport, DnsCachePolicy, DnsResolvedNotifier, DnsTransport, ExchangeResult,
+    FakeIpTransport, Transport,
 };
 
 pub struct RouterResolver {
@@ -66,6 +68,7 @@ pub struct RouterResolver {
     proxy_server_domains: Option<StringTrie<bool>>,
     proxy_server_transports: Vec<Transport>,
     notifier: DnsResolvedNotifier,
+    real_transport: Option<Transport>,
 }
 
 impl RouterResolver {
@@ -75,22 +78,29 @@ impl RouterResolver {
         store: Option<ThreadSafeCacheFile>,
         outbounds: OutboundHandlerRegistry,
         collector: Option<ThreadSafeDnsCollector>,
-    ) -> Self {
+    ) -> Result<Self, Error> {
+        cfg.validate()?;
         let mut entries = HashMap::new();
 
-        let make_key = |ns: &NameServer, proxy: Option<&str>| -> String {
+        let make_key = |ns: &NameServer, proxy: Option<&str>, ecs: Option<&EdnsClientSubnet>| -> String {
             let effective_proxy = ns.proxy.as_deref().or(proxy);
-            format!("{}#proxy={:?}", ns, effective_proxy)
+            let mut key = format!("{}#proxy={:?}", ns, effective_proxy);
+            if let Some(ecs) = ecs {
+                key.push_str(&format!("#ecs={:?},{:?}", ecs.ipv4, ecs.ipv6));
+            }
+            key
         };
 
         let register_ns = |ns: &NameServer,
                            entries: &mut HashMap<String, UpstreamEntry>,
-                           proxy: Option<&str>|
+                           proxy: Option<&str>,
+                           ecs: Option<&EdnsClientSubnet>|
          -> Option<String> {
-            let key = make_key(ns, proxy);
+            let key = make_key(ns, proxy, ecs);
             if !entries.contains_key(&key) {
                 if let Ok(mut entry) = UpstreamEntry::from_nameserver(ns, None) {
                     let effective_proxy = ns.proxy.as_deref().or(proxy);
+                    entry.ecs = ecs.cloned();
                     if let Some(p) = effective_proxy {
                         entry.outbound = Some(p.to_string());
                     }
@@ -108,7 +118,7 @@ impl RouterResolver {
         let mut default_entries = HashMap::new();
         let mut default_upstreams = Vec::new();
         for ns in &cfg.default_nameserver {
-            if let Some(key) = register_ns(ns, &mut default_entries, None) {
+            if let Some(key) = register_ns(ns, &mut default_entries, None, None) {
                 if !default_upstreams.contains(&key) {
                     default_upstreams.push(key);
                 }
@@ -151,15 +161,8 @@ impl RouterResolver {
         for u in &cfg.upstreams {
             match u.upstream_type {
                 UpstreamType::Remote => {
-                    let mut keys = Vec::new();
                     for ns in &u.servers {
-                        if let Some(key) =
-                            register_ns(ns, &mut entries, u.proxy.as_deref())
-                        {
-                            if !keys.contains(&key) {
-                                keys.push(key);
-                            }
-                        }
+                        let _ = register_ns(ns, &mut entries, u.proxy.as_deref(), u.client_subnet.as_ref());
                     }
                     // RemoteTransport 会在 pool 初始化后绑定
                 }
@@ -183,8 +186,7 @@ impl RouterResolver {
                             filter_mode: FakeIpFilterMode::Blacklist,
                             cache_file: store.clone(),
                             store: None,
-                        })
-                        .expect("failed to initialize fakeip in router resolver"),
+                        })?,
                     );
                     fake_dns = Some(fake.clone());
                     transports.insert(
@@ -195,6 +197,23 @@ impl RouterResolver {
                             u.ttl.unwrap_or(1),
                         )),
                     );
+                }
+            }
+        }
+
+        let mut proxy_keys = Vec::new();
+        for ns in &cfg.proxy_server_nameserver {
+            if let Some(key) = register_ns(ns, &mut entries, None, None) {
+                if !proxy_keys.contains(&key) {
+                    proxy_keys.push(key);
+                }
+            }
+        }
+        let mut real_keys = Vec::new();
+        for ns in &cfg.default_nameserver {
+            if let Some(key) = register_ns(ns, &mut entries, None, None) {
+                if !real_keys.contains(&key) {
+                    real_keys.push(key);
                 }
             }
         }
@@ -213,7 +232,7 @@ impl RouterResolver {
             if u.upstream_type == UpstreamType::Remote {
                 let mut keys = Vec::new();
                 for ns in &u.servers {
-                    let key = make_key(ns, u.proxy.as_deref());
+                    let key = make_key(ns, u.proxy.as_deref(), u.client_subnet.as_ref());
                     if pool.entries.contains_key(&key) && !keys.contains(&key) {
                         keys.push(key);
                     }
@@ -235,13 +254,7 @@ impl RouterResolver {
         // 3. 处理 proxy_server_nameserver
         let mut proxy_server_transports = Vec::new();
         if !cfg.proxy_server_nameserver.is_empty() {
-            let mut keys = Vec::new();
-            for ns in &cfg.proxy_server_nameserver {
-                let key = make_key(ns, None);
-                if pool.entries.contains_key(&key) && !keys.contains(&key) {
-                    keys.push(key);
-                }
-            }
+            let keys = proxy_keys;
             if !keys.is_empty() {
                 proxy_server_transports.push(Transport::Cached(
                     CachedTransport::new_remote(
@@ -273,6 +286,25 @@ impl RouterResolver {
             }
         };
 
+        // Real connection addresses use the first non-Fake-IP upstream,
+        // falling back to bootstrap nameservers when none is configured.
+        let real_transport = cfg.upstreams.iter()
+            .find(|u| u.upstream_type != UpstreamType::FakeIp)
+            .and_then(|u| transports.get(&u.tag))
+            .cloned()
+            .or_else(|| {
+                (!real_keys.is_empty()).then(|| {
+                    Transport::Cached(CachedTransport::new_remote(
+                        "__real_dns".to_string(),
+                        None,
+                        real_keys,
+                        pool.clone(),
+                        cache.clone(),
+                        cache_policy,
+                    ))
+                })
+            });
+
         // 4. 初始化 Hosts 快照与路由引擎
         let hosts = HostsSnapshot::new(&cfg.hosts, &cfg.hosts_files);
 
@@ -281,7 +313,7 @@ impl RouterResolver {
             transports.len()
         );
 
-        Self {
+        Ok(Self {
             ipv6: AtomicBool::new(cfg.ipv6),
             cfg,
             transports,
@@ -294,7 +326,208 @@ impl RouterResolver {
             proxy_server_domains,
             proxy_server_transports,
             notifier,
+            real_transport,
+        })
+    }
+}
+
+impl RouterResolver {
+    fn select_transport(&self, tag: &str, enhanced: bool) -> anyhow::Result<&Transport> {
+        let transport = self.transports.get(tag)
+            .ok_or_else(|| anyhow!("upstream '{tag}' not found"))?;
+        if !enhanced && transport.is_fake_ip() {
+            self.real_transport.as_ref()
+                .ok_or_else(|| anyhow!("no real DNS upstream configured"))
+        } else {
+            Ok(transport)
         }
+    }
+
+    fn schedule_refresh(&self, result: &mut ExchangeResult) {
+        if let Some(ticket) = result.refresh_ticket.take() {
+            let router = Arc::clone(&self.router);
+            let notifier = self.notifier.clone();
+            tokio::spawn(async move {
+                let tag = ticket.tag().to_string();
+                let qname = ticket.query().qdomain().unwrap_or_default().to_string();
+                let qtype = ticket.query().qtype().unwrap_or(QType::A);
+                if let Ok(result) = ticket.run().await {
+                    if router.route_response(&tag, &qname, qtype, &result.answer_ips) == &ResponseAction::Accept {
+                        notifier.on_fresh_response(&qname, &result.answer_ips, result.ttl);
+                    }
+                }
+            });
+        }
+    }
+
+    async fn exchange_query(
+        &self,
+        message: &[u8],
+        source_ip: Option<net::IpAddr>,
+        enhanced: bool,
+    ) -> anyhow::Result<RenderedResponse> {
+        let query = match QueryContext::parse(message) {
+            Ok(q) => q,
+            Err(_) => return Ok(RenderedResponse::empty(build_dns_refused(message))),
+        };
+
+        let qname = query.qdomain().unwrap_or_default();
+        let qtype = query.qtype().unwrap_or(QType::A);
+
+        debug!(domain = qname, ?qtype, "DNS query received");
+
+        // AAAA asked for while IPv6 is globally disabled: answer NODATA (NoError + zero answers)
+        if qtype == QType::AAAA && !self.ipv6() {
+            debug!(domain = qname, "AAAA query while IPv6 disabled, returning NODATA");
+            return Ok(RenderedResponse::empty(build_dns_nodata(message)));
+        }
+
+        // Empty domain / DNS root ('.') has no A or AAAA records.
+        // Return NODATA immediately without allocating Fake-IP or querying upstream.
+        if qname.is_empty() && (qtype == QType::A || qtype == QType::AAAA) {
+            debug!(domain = qname, ?qtype, "DNS root/empty domain A/AAAA query, returning NODATA");
+            return Ok(RenderedResponse::empty(build_dns_nodata(message)));
+        }
+
+        // 1. 优先匹配 Hosts 静态映射（最快路径：纯内存直出，零网络与零开销）
+        if self.cfg.use_hosts {
+            if let Some(resp) =
+                self.hosts.make_response(message, qname, qtype, self.ipv6())
+            {
+                debug!(domain = qname, ?qtype, "matched hosts snapshot");
+                return Ok(resp);
+            }
+        }
+
+        // 2. 检查节点域名直连解析通道 (proxy-server-nameserver)
+        if let (Some(domains), false) = (
+            &self.proxy_server_domains,
+            self.proxy_server_transports.is_empty(),
+        ) {
+            if domains.search(qname).is_some() {
+                debug!(
+                    domain = qname,
+                    ?qtype,
+                    "using proxy-server-nameserver for proxy node domain"
+                );
+                for transport in &self.proxy_server_transports {
+                    if let Ok(mut res) = transport.exchange(message, &query).await {
+                        if let Some(ticket) = res.refresh_ticket.take() {
+                            let notifier = self.notifier.clone();
+                            tokio::spawn(async move {
+                                let qname = ticket.query().qdomain().unwrap_or_default().to_string();
+                                if let Ok(result) = ticket.run().await {
+                                    notifier.on_fresh_response(&qname, &result.answer_ips, result.ttl);
+                                }
+                            });
+                        }
+                        if res.is_fresh {
+                            self.notifier
+                                .on_fresh_response(qname, &res.answer_ips, res.ttl);
+                        }
+                        return Ok(res.into());
+                    }
+                }
+            }
+        }
+
+        // 3. 执行 Request 路由
+        let request_decision = self.router.route_request(qname, qtype, source_ip);
+
+        let initial_tag = match request_decision {
+            RequestAction::Reject(code) => {
+                debug!(domain = qname, ?qtype, ?code, "request rejected by rule");
+                let resp = match code {
+                    RejectCode::Nodata => build_dns_nodata(message),
+                    RejectCode::Nxdomain => build_dns_nxdomain(message),
+                    RejectCode::Refused => build_dns_refused(message),
+                };
+                return Ok(RenderedResponse::empty(resp));
+            }
+            RequestAction::Route(tag) => tag.clone(),
+        };
+
+        let transport = self.select_transport(&initial_tag, enhanced)?;
+        let initial_tag = transport.tag().to_string();
+
+        debug!(
+            domain = qname,
+            ?qtype,
+            upstream = %initial_tag,
+            upstream_type = ?transport.upstream_type(),
+            "dispatching query to upstream"
+        );
+
+        // 4. 执行初次上游查询（若为 RemoteTransport，其内部自治命中 Cache / Singleflight 并发收敛）
+        let mut exchange_res = transport.exchange(message, &query).await?;
+        let current_tag = initial_tag;
+
+        // Fake-IP 上游自动跳过后续缓存刷新与 Response 防污染检查，直接返回
+        if transport.is_fake_ip() {
+            return Ok(exchange_res.into());
+        }
+
+        // 如果底层命中了 Stale 缓存且作为 Leader 获得了刷新凭证，由顶层调度异步刷新！
+        self.schedule_refresh(&mut exchange_res);
+
+        let answer_ips = &exchange_res.answer_ips;
+
+        // 5. 执行 Response 路由检查 (精准 match-response，防污染重查，限制最多重查 1 次)
+        let resp_decision =
+            self.router
+                .route_response(&current_tag, qname, qtype, answer_ips);
+
+        match resp_decision {
+            ResponseAction::Accept => {}
+            ResponseAction::Reject => {
+                debug!(domain = qname, from = %current_tag, ?answer_ips, "response rejected by rule");
+                return Ok(RenderedResponse::empty(build_dns_nodata(message)));
+            }
+            ResponseAction::Requery(next_tag) => {
+                if next_tag != &current_tag {
+                    if let Ok(next_transport) = self.select_transport(next_tag, enhanced) {
+                        if next_transport.tag() != current_tag {
+                            debug!(
+                                domain = qname,
+                                from = %current_tag,
+                                target = %next_tag,
+                                polluted_ips = ?answer_ips,
+                                "re-querying DNS upstream due to response rule"
+                            );
+                            match next_transport.exchange(message, &query).await {
+                                Ok(new_res) => {
+                                    debug!(
+                                        domain = qname,
+                                        target = %next_tag,
+                                        "DNS requery succeeded"
+                                    );
+                                    exchange_res = new_res;
+                                    self.schedule_refresh(&mut exchange_res);
+                                }
+                                Err(err) => {
+                                    warn!(
+                                        domain = qname,
+                                        target = %next_tag,
+                                        "DNS requery failed: {err}"
+                                    );
+                                    return Ok(RenderedResponse::empty(build_dns_nodata(message)));
+                                }
+                            }
+                        }
+                    } else {
+                        warn!(target = %next_tag, "target upstream for requery not found");
+                        return Ok(RenderedResponse::empty(build_dns_nodata(message)));
+                    }
+                }
+            }
+        }
+
+        // 6. 确认为刷新缓存的结果时才下发反向缓存与直连 (Fresh Result)
+        if exchange_res.is_fresh && !exchange_res.answer_ips.is_empty() {
+            self.notifier.on_fresh_response(qname, &exchange_res.answer_ips, exchange_res.ttl);
+        }
+
+        Ok(exchange_res.into())
     }
 }
 
@@ -334,7 +567,7 @@ impl ClashResolver for RouterResolver {
     async fn resolve_v4(
         &self,
         host: &str,
-        _enhanced: bool,
+        enhanced: bool,
     ) -> anyhow::Result<Option<net::Ipv4Addr>> {
         if host.is_empty() {
             return Ok(None);
@@ -349,9 +582,8 @@ impl ClashResolver for RouterResolver {
         let name = DnsName::from_domain(host)
             .ok_or_else(|| anyhow!("invalid domain name: {host}"))?;
         let query = build_dns_query_wire(&name, QType::A);
-        let resp = self.exchange(&query).await?;
-        let ips = extract_ips_from_dns_response(&resp);
-        for ip in ips {
+        let resp = self.exchange_query(&query, None, enhanced).await?;
+        for ip in resp.answer_ips.iter().copied() {
             if let net::IpAddr::V4(v4) = ip {
                 return Ok(Some(v4));
             }
@@ -362,7 +594,7 @@ impl ClashResolver for RouterResolver {
     async fn resolve_v6(
         &self,
         host: &str,
-        _enhanced: bool,
+        enhanced: bool,
     ) -> anyhow::Result<Option<net::Ipv6Addr>> {
         if host.is_empty() {
             return Ok(None);
@@ -381,9 +613,8 @@ impl ClashResolver for RouterResolver {
         let name = DnsName::from_domain(host)
             .ok_or_else(|| anyhow!("invalid domain name: {host}"))?;
         let query = build_dns_query_wire(&name, QType::AAAA);
-        let resp = self.exchange(&query).await?;
-        let ips = extract_ips_from_dns_response(&resp);
-        for ip in ips {
+        let resp = self.exchange_query(&query, None, enhanced).await?;
+        for ip in resp.answer_ips.iter().copied() {
             if let net::IpAddr::V6(v6) = ip {
                 return Ok(Some(v6));
             }
@@ -396,210 +627,15 @@ impl ClashResolver for RouterResolver {
     }
 
     async fn exchange(&self, message: &[u8]) -> anyhow::Result<Vec<u8>> {
-        let query = match QueryContext::parse(message) {
-            Ok(q) => q,
-            Err(_) => return Ok(build_dns_refused(message)),
-        };
+        self.exchange_query(message, None, true).await.map(|response| response.wire)
+    }
 
-        let qname = query.qdomain().unwrap_or_default();
-        let qtype = query.qtype().unwrap_or(QType::A);
-
-        debug!(domain = qname, ?qtype, "DNS query received");
-
-        // AAAA asked for while IPv6 is globally disabled: answer NODATA (NoError + zero answers)
-        if qtype == QType::AAAA && !self.ipv6() {
-            debug!(domain = qname, "AAAA query while IPv6 disabled, returning NODATA");
-            return Ok(build_dns_nodata(message));
-        }
-
-        // Empty domain / DNS root ('.') has no A or AAAA records.
-        // Return NODATA immediately without allocating Fake-IP or querying upstream.
-        if qname.is_empty() && (qtype == QType::A || qtype == QType::AAAA) {
-            debug!(domain = qname, ?qtype, "DNS root/empty domain A/AAAA query, returning NODATA");
-            return Ok(build_dns_nodata(message));
-        }
-
-        // 1. 优先匹配 Hosts 静态映射（最快路径：纯内存直出，零网络与零开销）
-        if self.cfg.use_hosts {
-            if let Some(resp) =
-                self.hosts.make_response(message, qname, qtype, self.ipv6())
-            {
-                debug!(domain = qname, ?qtype, "matched hosts snapshot");
-                return Ok(resp);
-            }
-        }
-
-        // 2. 检查节点域名直连解析通道 (proxy-server-nameserver)
-        if let (Some(domains), false) = (
-            &self.proxy_server_domains,
-            self.proxy_server_transports.is_empty(),
-        ) {
-            if domains.search(qname).is_some() {
-                debug!(
-                    domain = qname,
-                    ?qtype,
-                    "using proxy-server-nameserver for proxy node domain"
-                );
-                for transport in &self.proxy_server_transports {
-                    if let Ok(mut res) = transport.exchange(message, &query).await {
-                        if let Some(ticket) = res.refresh_ticket.take() {
-                            let notifier = self.notifier.clone();
-                            tokio::spawn(async move {
-                                let qname = ticket.query().qdomain().unwrap_or_default().to_string();
-                                if let Ok(fresh_wire) = ticket.run().await {
-                                    let effective_ttl =
-                                        extract_min_ttl_from_dns_response(&fresh_wire).unwrap_or(60);
-                                    notifier.on_fresh_response(&qname, &fresh_wire, effective_ttl);
-                                }
-                            });
-                        }
-                        if res.is_fresh {
-                            let effective_ttl =
-                                extract_min_ttl_from_dns_response(&res.wire).unwrap_or(60);
-                            self.notifier
-                                .on_fresh_response(qname, &res.wire, effective_ttl);
-                        }
-                        return Ok(res.wire);
-                    }
-                }
-            }
-        }
-
-        // 3. 执行 Request 路由
-        let request_decision = self.router.route_request(qname, qtype, None);
-
-        let initial_tag = match request_decision {
-            RequestAction::Reject(code) => {
-                debug!(domain = qname, ?qtype, ?code, "request rejected by rule");
-                let resp = match code {
-                    RejectCode::Nodata => build_dns_nodata(message),
-                    RejectCode::Nxdomain => build_dns_nxdomain(message),
-                    RejectCode::Refused => build_dns_refused(message),
-                };
-                return Ok(resp);
-            }
-            RequestAction::Route(tag) => tag.clone(),
-        };
-
-        let transport = self
-            .transports
-            .get(&initial_tag)
-            .ok_or_else(|| anyhow!("upstream '{}' not found", initial_tag))?;
-
-        debug!(
-            domain = qname,
-            ?qtype,
-            upstream = %initial_tag,
-            upstream_type = ?transport.upstream_type(),
-            "dispatching query to upstream"
-        );
-
-        // 4. 执行初次上游查询（若为 RemoteTransport，其内部自治命中 Cache / Singleflight 并发收敛）
-        let mut exchange_res = transport.exchange(message, &query).await?;
-        let current_tag = initial_tag;
-
-        // Fake-IP 上游自动跳过后续缓存刷新与 Response 防污染检查，直接返回
-        if transport.is_fake_ip() {
-            return Ok(exchange_res.wire);
-        }
-
-        // 如果底层命中了 Stale 缓存且作为 Leader 获得了刷新凭证，由顶层调度异步刷新！
-        if let Some(ticket) = exchange_res.refresh_ticket.take() {
-            let router = Arc::clone(&self.router);
-            let notifier = self.notifier.clone();
-            tokio::spawn(async move {
-                let tag = ticket.tag().to_string();
-                let qname = ticket.query().qdomain().unwrap_or_default().to_string();
-                let qtype = ticket.query().qtype().unwrap_or(QType::A);
-                if let Ok(fresh_wire) = ticket.run().await {
-                    let ips = extract_ips_from_dns_response(&fresh_wire);
-                    if !ips.is_empty() {
-                        let resp_decision = router.route_response(&tag, &qname, qtype, &ips);
-                        match resp_decision {
-                            ResponseAction::Accept => {
-                                let effective_ttl =
-                                    extract_min_ttl_from_dns_response(&fresh_wire).unwrap_or(60);
-                                notifier.on_fresh_response(&qname, &fresh_wire, effective_ttl);
-                            }
-                            ResponseAction::Reject | ResponseAction::Requery(_) => {
-                                debug!(
-                                    domain = %qname,
-                                    from = %tag,
-                                    ?ips,
-                                    "background stale refresh detected polluted/rejected IPs, skipped offload"
-                                );
-                            }
-                        }
-                    }
-                }
-            });
-        }
-
-        // 若为非 IP 类请求（TXT/MX/HTTPS 等）或上游返回 NODATA/NXDOMAIN，无 IP 供防污染校验，直接放行
-        let answer_ips = extract_ips_from_dns_response(&exchange_res.wire);
-        if answer_ips.is_empty() {
-            return Ok(exchange_res.wire);
-        }
-
-        // 5. 执行 Response 路由检查 (精准 match-response，防污染重查，限制最多重查 1 次)
-        let resp_decision =
-            self.router
-                .route_response(&current_tag, qname, qtype, &answer_ips);
-
-        match resp_decision {
-            ResponseAction::Accept => {}
-            ResponseAction::Reject => {
-                debug!(domain = qname, from = %current_tag, ?answer_ips, "response rejected by rule");
-                return Ok(build_dns_nodata(message));
-            }
-            ResponseAction::Requery(next_tag) => {
-                if next_tag != &current_tag {
-                    if let Some(next_transport) = self.transports.get(next_tag) {
-                        debug!(
-                            domain = qname,
-                            from = %current_tag,
-                            target = %next_tag,
-                            polluted_ips = ?answer_ips,
-                            "re-querying DNS upstream due to response rule"
-                        );
-                        match next_transport.exchange(message, &query).await {
-                            Ok(new_res) => {
-                                debug!(
-                                    domain = qname,
-                                    target = %next_tag,
-                                    "DNS requery succeeded"
-                                );
-                                exchange_res = new_res;
-                            }
-                            Err(err) => {
-                                warn!(
-                                    domain = qname,
-                                    target = %next_tag,
-                                    "DNS requery failed: {err}"
-                                );
-                                return Ok(build_dns_nodata(message));
-                            }
-                        }
-                    } else {
-                        warn!(target = %next_tag, "target upstream for requery not found");
-                        return Ok(build_dns_nodata(message));
-                    }
-                }
-            }
-        }
-
-        // 6. 确认为刷新缓存的结果时才下发反向缓存与直连 (Fresh Result)
-        if exchange_res.is_fresh {
-            let final_ips = extract_ips_from_dns_response(&exchange_res.wire);
-            if !final_ips.is_empty() {
-                let effective_ttl =
-                    extract_min_ttl_from_dns_response(&exchange_res.wire).unwrap_or(60);
-                self.notifier
-                    .on_fresh_response(qname, &exchange_res.wire, effective_ttl);
-            }
-        }
-
-        Ok(exchange_res.wire)
+    async fn exchange_from(
+        &self,
+        message: &[u8],
+        source_ip: Option<net::IpAddr>,
+    ) -> anyhow::Result<Vec<u8>> {
+        self.exchange_query(message, source_ip, true).await.map(|response| response.wire)
     }
 
     fn reverse_lookup(&self, ip: net::IpAddr) -> Option<String> {
@@ -789,41 +825,46 @@ impl ClashResolver for RouterResolver {
     }
 
     fn search_cache(&self, pattern: &str) -> DnsCacheReport {
+        const MAX_RETURN_ITEMS: usize = 50;
+        let mut groups = self.cache.search_grouped_limited(pattern, MAX_RETURN_ITEMS, Instant::now());
+        let items = |entries: Vec<DnsCacheEntryDetail>| {
+            entries.into_iter().map(|entry| DnsCacheItem {
+                domain: entry.domain,
+                qtype: entry.qtype,
+                ip: None,
+                ttl: Some(entry.ttl),
+                is_stale: Some(entry.is_stale),
+            }).collect()
+        };
         let mut upstreams = Vec::new();
-        let now = Instant::now();
-        let mut processed_scopes = std::collections::HashSet::new();
-
-        for u in &self.cfg.upstreams {
-            processed_scopes.insert(u.tag.clone());
-            if let Some(stat) = self.search_cache_by_upstream(pattern, &u.tag) {
-                upstreams.push(stat);
+        for upstream in &self.cfg.upstreams {
+            if upstream.upstream_type == UpstreamType::FakeIp {
+                if let Some(stat) = self.search_cache_by_upstream(pattern, &upstream.tag) {
+                    upstreams.push(stat);
+                }
+                continue;
             }
-        }
-
-        let all_cached = self.cache.search_scoped(pattern, None, now);
-        let mut extra_scopes: HashMap<String, Vec<DnsCacheItem>> = HashMap::new();
-        for e in all_cached {
-            if !processed_scopes.contains(&e.scope) && !e.scope.is_empty() {
-                extra_scopes.entry(e.scope.clone()).or_default().push(DnsCacheItem {
-                    domain: e.domain,
-                    qtype: e.qtype,
-                    ip: None,
-                    ttl: Some(e.ttl),
-                    is_stale: Some(e.is_stale),
-                });
-            }
-        }
-        for (scope, items) in extra_scopes {
-            let count = items.len();
+            let (count, entries) = groups.remove(upstream.tag.as_str()).unwrap_or_default();
             upstreams.push(DnsCacheUpstreamStat {
-                name: scope,
+                name: upstream.tag.clone(),
                 count,
-                upstream_type: Some("extra".to_string()),
-                items,
+                upstream_type: Some(match upstream.upstream_type {
+                    UpstreamType::Local => "local",
+                    _ => "remote",
+                }.to_string()),
+                items: items(entries),
             });
         }
-
-        let total = upstreams.iter().map(|u| u.count).sum();
+        for (scope, (count, entries)) in groups {
+            if scope.is_empty() { continue; }
+            upstreams.push(DnsCacheUpstreamStat {
+                name: scope.to_string(),
+                count,
+                upstream_type: Some("extra".to_string()),
+                items: items(entries),
+            });
+        }
+        let total = upstreams.iter().map(|upstream| upstream.count).sum();
         DnsCacheReport { upstreams, total }
     }
 

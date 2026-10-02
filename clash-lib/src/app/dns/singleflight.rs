@@ -46,14 +46,17 @@ struct CounterSet {
     retries: AtomicU64,
 }
 
+type FlightResult = Result<Arc<ResponseTemplate>, Arc<str>>;
+
 struct FlightEntry {
-    waiters: Vec<oneshot::Sender<Arc<ResponseTemplate>>>,
+    waiters: Vec<oneshot::Sender<FlightResult>>,
     state: FlightState,
 }
 
 enum FlightState {
     Running,
     Published(Arc<ResponseTemplate>),
+    Failed(Arc<str>),
 }
 
 #[derive(Default)]
@@ -91,11 +94,12 @@ pub enum FlightRole {
     Leader(FlightLeader),
     Waiter(FlightWaiter),
     Ready(Arc<ResponseTemplate>),
+    Failed(Arc<str>),
     Rejected,
 }
 
 pub struct FlightWaiter {
-    receiver: oneshot::Receiver<Arc<ResponseTemplate>>,
+    receiver: oneshot::Receiver<FlightResult>,
     counters: Arc<CounterSet>,
 }
 
@@ -125,6 +129,9 @@ impl Singleflight {
                 self.inner.counters.waiters.fetch_add(1, Ordering::Relaxed);
                 return FlightRole::Ready(Arc::clone(template));
             }
+            if let FlightState::Failed(error) = &entry.state {
+                return FlightRole::Failed(Arc::clone(error));
+            }
             if entry.waiters.len() >= MAX_WAITERS_PER_FLIGHT {
                 self.inner
                     .counters
@@ -150,7 +157,9 @@ impl Singleflight {
             });
         }
 
-        if self.inner.active_count.load(Ordering::Relaxed) >= MAX_ACTIVE_FLIGHTS {
+        if self.inner.active_count.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |active| {
+            (active < MAX_ACTIVE_FLIGHTS).then_some(active + 1)
+        }).is_err() {
             self.inner
                 .counters
                 .rejections
@@ -171,7 +180,6 @@ impl Singleflight {
                 state: FlightState::Running,
             },
         );
-        self.inner.active_count.fetch_add(1, Ordering::Relaxed);
 
         if is_refresh {
             self.inner.counters.refreshes.fetch_add(1, Ordering::Relaxed);
@@ -209,8 +217,12 @@ impl Singleflight {
 
 impl FlightWaiter {
     pub async fn receive(self) -> Option<Arc<ResponseTemplate>> {
+        self.receive_result().await?.ok()
+    }
+
+    pub async fn receive_result(self) -> Option<FlightResult> {
         match self.receiver.await {
-            Ok(template) => Some(template),
+            Ok(result) => Some(result),
             Err(_) => {
                 self.counters.retries.fetch_add(1, Ordering::Relaxed);
                 tracing::debug!(reason = "leader_unavailable", "DNS singleflight retry");
@@ -230,10 +242,22 @@ impl FlightLeader {
             entry.state = FlightState::Published(Arc::clone(&template));
             let waiters = std::mem::take(&mut entry.waiters);
             for tx in waiters {
-                let _ = tx.send(Arc::clone(&template));
+                let _ = tx.send(Ok(Arc::clone(&template)));
             }
         }
     }
+
+    pub fn publish_error(&mut self, error: Arc<str>) {
+        let Some(key) = self.key.as_ref() else { return; };
+        let mut entries = lock(&self.inner.shards[self.shard_idx].entries);
+        if let Some(entry) = entries.get_mut(key) {
+            entry.state = FlightState::Failed(Arc::clone(&error));
+            for tx in std::mem::take(&mut entry.waiters) {
+                let _ = tx.send(Err(Arc::clone(&error)));
+            }
+        }
+    }
+
 }
 
 impl Drop for FlightLeader {
@@ -272,6 +296,29 @@ mod tests {
             build_dns_ip_response(&query_bytes, &["1.2.3.4".parse().unwrap()], 60).unwrap();
         let template = Arc::new(ResponseTemplate::validate(&query, &resp_bytes).unwrap());
         (query, template)
+    }
+
+    #[tokio::test]
+    async fn failures_are_published_to_waiters_and_late_joiners() {
+        let sf = Singleflight::new();
+        let key = FlightKey::Query(Arc::from(b"failure" as &[u8]));
+        let mut leader = match sf.acquire(key.clone()) {
+            FlightRole::Leader(leader) => leader,
+            _ => panic!("expected leader"),
+        };
+        let waiter = match sf.acquire(key.clone()) {
+            FlightRole::Waiter(waiter) => waiter,
+            _ => panic!("expected waiter"),
+        };
+        leader.publish_error(Arc::from("upstream failed"));
+        assert_eq!(waiter.receive_result().await.unwrap().unwrap_err().as_ref(), "upstream failed");
+        match sf.acquire(key.clone()) {
+            FlightRole::Failed(error) => assert_eq!(error.as_ref(), "upstream failed"),
+            _ => panic!("expected shared error"),
+        }
+        drop(leader);
+        assert_eq!(sf.active_len(), 0);
+        assert!(matches!(sf.acquire(key), FlightRole::Leader(_)));
     }
 
     #[tokio::test]
@@ -441,7 +488,7 @@ mod tests {
                     FlightRole::Waiter(waiter) => {
                         let _ = waiter.receive().await;
                     }
-                    FlightRole::Ready(_) | FlightRole::Rejected => {}
+                    FlightRole::Ready(_) | FlightRole::Failed(_) | FlightRole::Rejected => {}
                 }
             }));
         }

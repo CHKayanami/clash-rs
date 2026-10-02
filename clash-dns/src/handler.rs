@@ -54,7 +54,7 @@ where
                                     let ex = ex.clone();
                                     let socket = Arc::clone(&socket);
                                     inflight.push(async move {
-                                        match ex.exchange(&req).await {
+                                        match ex.exchange_from(&req, Some(src.ip())).await {
                                             Ok(resp) => {
                                                 let _ = socket.send_to(&resp, src).await;
                                             }
@@ -120,7 +120,7 @@ where
                                 if stream.read_exact(&mut req_buf).await.is_err() {
                                     break;
                                 }
-                                match ex.exchange(&req_buf).await {
+                                match ex.exchange_from(&req_buf, Some(peer.ip())).await {
                                     Ok(resp) => {
                                         let resp_len = resp.len() as u16;
                                         out_buf.clear();
@@ -160,15 +160,28 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::IpAddr;
     use std::time::Duration;
+    use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 
     #[derive(Clone)]
-    struct EchoExchanger;
+    struct EchoExchanger {
+        sources: UnboundedSender<Option<IpAddr>>,
+    }
 
     impl DnsMessageExchanger for EchoExchanger {
         fn ipv6(&self) -> bool {
             false
         }
+        async fn exchange_from(
+            &self,
+            message: &[u8],
+            source_ip: Option<IpAddr>,
+        ) -> Result<Vec<u8>, DNSError> {
+            self.sources.send(source_ip).unwrap();
+            self.exchange(message).await
+        }
+
         async fn exchange(&self, message: &[u8]) -> Result<Vec<u8>, DNSError> {
             let mut resp = message.to_vec();
             if resp.len() >= 4 {
@@ -196,7 +209,8 @@ mod tests {
             doh3: None,
         };
 
-        let listener_fut = get_dns_listener(listen, EchoExchanger).await?;
+        let (sources, mut received_sources) = unbounded_channel();
+        let listener_fut = get_dns_listener(listen, EchoExchanger { sources }).await?;
         tokio::spawn(listener_fut);
 
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -230,6 +244,15 @@ mod tests {
         assert_eq!(resp_buf[0], 0x12);
         assert_eq!(resp_buf[1], 0x34);
         assert_eq!(resp_buf[2] & 0x80, 0x80);
+
+        assert_eq!(
+            received_sources.recv().await,
+            Some(Some(client_udp.local_addr()?.ip())),
+        );
+        assert_eq!(
+            received_sources.recv().await,
+            Some(Some(client_tcp.local_addr()?.ip())),
+        );
 
         Ok(())
     }

@@ -10,7 +10,7 @@ use super::config::{
     RequestAction, RequestRule, ResponseAction, ResponseRule, RouterConfig,
 };
 use super::matcher::{
-    DomainMatcher, IpNetMatcher, QTypeMatcher, RuleSetMatcher,
+    DomainMatcher, IpNetMatcher, QTypeMatcher, RuleSetMatcher, normalize_domain,
 };
 
 #[derive(Clone)]
@@ -43,8 +43,8 @@ impl CompiledRequestRule {
         }
     }
 
-    fn matches_domain(&self, domain: &str) -> bool {
-        (self.has_domain && self.domain.matches(domain))
+    fn matches_domain(&self, domain: &str, parts: &[&str]) -> bool {
+        (self.has_domain && self.domain.matches_parts(parts))
             || (self.has_rule_set && self.rule_set.matches_domain(domain))
     }
 
@@ -55,24 +55,21 @@ impl CompiledRequestRule {
         }
     }
 
-    pub fn matches(&self, domain: &str, qtype: QType, source_ip: Option<IpAddr>) -> bool {
+    fn matches_parts(&self, domain: &str, parts: &[&str], qtype: QType, source_ip: Option<IpAddr>) -> bool {
         // 1. 无任何匹配条件的空规则不生效
         if !self.has_domain && !self.has_rule_set && !self.has_query_type && !self.has_source_ip {
             return false;
         }
 
-        // 2. 域名检查：配置了 domain 或 rule-set，但均未命中
-        if (self.has_domain || self.has_rule_set) && !self.matches_domain(domain) {
-            return self.invert;
-        }
-
-        // 3. 查询类型检查：配置了 query-type，但未匹配
+        // Cheap predicates precede domain/provider matching; invert applies to
+        // the conjunction of all conditions regardless of evaluation order.
         if self.has_query_type && !self.query_type.matches(qtype) {
             return self.invert;
         }
-
-        // 4. 客户端源 IP 检查：配置了 source-ip，但未匹配
         if self.has_source_ip && !self.matches_source_ip(source_ip) {
+            return self.invert;
+        }
+        if (self.has_domain || self.has_rule_set) && !self.matches_domain(domain, parts) {
             return self.invert;
         }
 
@@ -121,10 +118,10 @@ impl CompiledResponseRule {
             || (self.has_rule_set && self.rule_set.matches_ip(ip))
     }
 
-    pub fn matches(
+    fn matches_parts(
         &self,
         from_upstream: &str,
-        domain: &str,
+        parts: &[&str],
         qtype: QType,
         answer_ips: &[IpAddr],
     ) -> bool {
@@ -145,13 +142,10 @@ impl CompiledResponseRule {
             }
         }
 
-        // 3. 域名检查
-        if self.has_domain && !self.domain.matches(domain) {
+        if self.has_query_type && !self.query_type.matches(qtype) {
             return self.invert;
         }
-
-        // 4. 查询类型检查
-        if self.has_query_type && !self.query_type.matches(qtype) {
+        if self.has_domain && !self.domain.matches_parts(parts) {
             return self.invert;
         }
 
@@ -179,6 +173,8 @@ pub struct DnsRouter {
     request_fallback: RequestAction,
     response_rules: Vec<CompiledResponseRule>,
     response_fallback: ResponseAction,
+    has_request_domains: bool,
+    has_response_domains: bool,
 }
 
 impl DnsRouter {
@@ -195,6 +191,8 @@ impl DnsRouter {
             request_fallback: cfg.request_fallback.clone(),
             response_rules,
             response_fallback: cfg.response_fallback.clone(),
+            has_request_domains: cfg.request_rules.iter().any(|rule| !rule.domain.is_empty()),
+            has_response_domains: cfg.response_rules.iter().any(|rule| !rule.domain.is_empty()),
         }
     }
 
@@ -213,13 +211,15 @@ impl DnsRouter {
         qtype: QType,
         source_ip: Option<IpAddr>,
     ) -> &RequestAction {
+        let domain = normalize_domain(domain);
+        let parts: Vec<_> = if self.has_request_domains { domain.split('.').collect() } else { Vec::new() };
         for rule in &self.request_rules {
-            if rule.matches(domain, qtype, source_ip) {
-                debug!(domain, ?qtype, action = ?rule.action(), "matched request rule");
+            if rule.matches_parts(&domain, &parts, qtype, source_ip) {
+                debug!(domain = %domain, ?qtype, action = ?rule.action(), "matched request rule");
                 return rule.action();
             }
         }
-        debug!(domain, ?qtype, action = ?self.request_fallback, "using request fallback");
+        debug!(domain = %domain, ?qtype, action = ?self.request_fallback, "using request fallback");
         &self.request_fallback
     }
 
@@ -230,11 +230,13 @@ impl DnsRouter {
         qtype: QType,
         answer_ips: &[IpAddr],
     ) -> &ResponseAction {
+        let domain = normalize_domain(domain);
+        let parts: Vec<_> = if self.has_response_domains { domain.split('.').collect() } else { Vec::new() };
         for rule in &self.response_rules {
-            if rule.matches(from_upstream, domain, qtype, answer_ips) {
+            if rule.matches_parts(from_upstream, &parts, qtype, answer_ips) {
                 debug!(
                     from_upstream,
-                    domain,
+                    domain = %domain,
                     ?qtype,
                     action = ?rule.action(),
                     "matched response rule"
