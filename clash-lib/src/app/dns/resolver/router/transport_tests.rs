@@ -1,3 +1,5 @@
+use bytes::Bytes;
+use crate::app::dns::query::build_dns_query_wire;
 use super::*;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -49,7 +51,7 @@ fn rewrite_ttl(wire: &mut [u8], ttl: u32) {
 
 fn query() -> (Vec<u8>, QueryContext) {
     let wire = build_dns_query_wire(&DnsName::from_domain("negative.test").unwrap(), QType::A);
-    let query = QueryContext::parse(&wire).unwrap();
+    let query = QueryContext::parse(Bytes::copy_from_slice(&wire), IngressProfile::Internal).unwrap();
     (wire, query)
 }
 
@@ -123,13 +125,13 @@ async fn zero_ttl_negative_is_cached_for_five_seconds_without_stale_retention() 
             let (len, peer) = socket.recv_from(&mut buf).await.unwrap();
             socket.send_to(&negative_response(&buf[..len], code, 0, 0), peer).await.unwrap();
         });
-        let (wire, query) = query();
-        let result = transport.exchange(&wire, &query).await.unwrap();
+        let (_, query) = query();
+        let result = transport.exchange(&query).await.unwrap();
         assert_eq!(result.ttl, 5);
         task.await.unwrap();
         // The endpoint no longer responds: repeated queries must use the cache.
         for _ in 0..3 {
-            let cached = transport.exchange(&wire, &query).await.unwrap();
+            let cached = transport.exchange(&query).await.unwrap();
             assert!(!cached.is_fresh);
         }
         let now = Instant::now();
@@ -203,7 +205,7 @@ fn soa_compression_rejects_self_and_out_of_bounds_pointers() {
 fn cached_rewrite_matches_full_rewrite_and_preserves_opt() {
     let (wire, context) = query();
     let ips = ["192.0.2.1".parse().unwrap(), "2001:db8::1".parse().unwrap()];
-    let mut response = build_dns_ip_response(&wire, &ips, 300).unwrap();
+    let mut response = build_dns_ip_response(&QueryContext::parse(Bytes::copy_from_slice(&wire), IngressProfile::Internal).unwrap(), &ips, 300).unwrap();
     let negative = negative_response(&wire, 3, 100, 20);
     response[8..10].copy_from_slice(&1u16.to_be_bytes());
     let authority_start = response.len();
@@ -250,7 +252,7 @@ fn truncated_records_and_invalid_address_lengths_are_rejected() {
     for (qtype, ip, length) in [(QType::A, "192.0.2.1", 4u16),
         (QType::AAAA, "2001:db8::1", 16)] {
         let wire = build_dns_query_wire(&DnsName::from_domain("parse.test").unwrap(), qtype);
-        let response = build_dns_ip_response(&wire, &[ip.parse().unwrap()], 60).unwrap();
+        let response = build_dns_ip_response(&QueryContext::parse(Bytes::copy_from_slice(&wire), IngressProfile::Internal).unwrap(), &[ip.parse().unwrap()], 60).unwrap();
         for end in 0..response.len() {
             assert!(ResponseMetadata::parse(&response[..end]).is_none());
         }
@@ -271,11 +273,11 @@ async fn negative_cache_expires_without_stale_retention_and_ages_soa_ttl() {
         let (len, peer) = socket.recv_from(&mut buf).await.unwrap();
         socket.send_to(&negative_response(&buf[..len], 3, 3600, 7200), peer).await.unwrap();
     });
-    let (wire, query) = query();
-    let result = transport.exchange(&wire, &query).await.unwrap();
+    let (_, query) = query();
+    let result = transport.exchange(&query).await.unwrap();
     assert_eq!(result.ttl, 1800);
     assert_eq!(ResponseMetadata::parse(&result.wire).unwrap().cache_ttl, Some(1800));
-    let cached = transport.exchange(&wire, &query).await.unwrap();
+    let cached = transport.exchange(&query).await.unwrap();
     assert!(!cached.is_fresh);
     let mut position = 12;
     assert!(skip_dns_name(&cached.wire, &mut position));
@@ -301,9 +303,9 @@ async fn server_errors_are_not_cached() {
             socket.send_to(&negative_response(&buf[..len], 2, 100, 20), peer).await.unwrap();
         }
     });
-    let (wire, query) = query();
+    let (_, query) = query();
     for _ in 0..2 {
-        assert!(transport.exchange(&wire, &query).await.unwrap().is_fresh);
+        assert!(transport.exchange(&query).await.unwrap().is_fresh);
         assert!(matches!(transport.cache.lookup_scoped(&transport.tag, &query, Instant::now()), CacheLookup::Miss));
     }
     task.await.unwrap();
@@ -319,8 +321,8 @@ async fn endpoint_failure_is_shared_without_waiter_fanout() {
             socket.recv_from(&mut buf).await.unwrap(); // Deliberately silent.
         }
     });
-    let (wire, query) = query();
-    let results = join_all((0..32).map(|_| transport.exchange(&wire, &query))).await;
+    let (_, query) = query();
+    let results = join_all((0..32).map(|_| transport.exchange(&query))).await;
     assert!(results.iter().all(Result::is_err));
     let counters = transport.singleflight.counters();
     assert_eq!(counters.leaders, 1);
@@ -333,12 +335,12 @@ async fn endpoint_failure_is_shared_without_waiter_fanout() {
 async fn saturation_rejects_without_bypassing_singleflight() {
     let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let transport = remote(&socket, None, DnsCachePolicy::default()).await;
-    let (wire, query) = query();
+    let (_, query) = query();
     let key = FlightKey::Query(query.canonical_wire_arc());
     let leader = transport.singleflight.acquire(key.clone());
     let waiters: Vec<_> = (0..MAX_WAITERS_PER_FLIGHT)
         .map(|_| transport.singleflight.acquire(key.clone())).collect();
-    assert!(transport.exchange(&wire, &query).await.err().unwrap().to_string().contains("capacity"));
+    assert!(transport.exchange(&query).await.err().unwrap().to_string().contains("capacity"));
     assert!(tokio::time::timeout(Duration::from_millis(20), socket.readable()).await.is_err());
     drop(waiters);
     drop(leader);
@@ -348,7 +350,7 @@ async fn saturation_rejects_without_bypassing_singleflight() {
 async fn cancelled_leader_retries_once_through_singleflight() {
     let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let transport = remote(&socket, None, DnsCachePolicy::default()).await;
-    let (wire, query) = query();
+    let (_, query) = query();
     let key = FlightKey::Query(query.canonical_wire_arc());
     let leader = transport.singleflight.acquire(key);
     let entered = Arc::new(Notify::new());
@@ -359,13 +361,13 @@ async fn cancelled_leader_retries_once_through_singleflight() {
             let mut buf = [0; 512];
             let (len, peer) = socket.recv_from(&mut buf).await.unwrap();
             counter.fetch_add(1, Ordering::Relaxed);
-            let response = build_dns_ip_response(&buf[..len], &["192.0.2.1".parse().unwrap()], 60).unwrap();
+            let response = build_dns_ip_response(&QueryContext::parse(Bytes::copy_from_slice(&buf[..len]), IngressProfile::Internal).unwrap(), &["192.0.2.1".parse().unwrap()], 60).unwrap();
             socket.send_to(&response, peer).await.unwrap();
         }
     });
     let exchanges = async {
         entered.notify_one();
-        join_all((0..16).map(|_| transport.exchange(&wire, &query))).await
+        join_all((0..16).map(|_| transport.exchange(&query))).await
     };
     let cancel = async {
         entered.notified().await;
@@ -381,8 +383,7 @@ async fn cancelled_leader_retries_once_through_singleflight() {
 #[test]
 fn unified_validation_preserves_ttl_policy_and_coalesced_results() {
     let (query_wire, context) = query();
-    let positive = build_dns_ip_response(&query_wire,
-        &["192.0.2.1".parse().unwrap(), "2001:db8::1".parse().unwrap()], 300).unwrap();
+    let positive = build_dns_ip_response(&QueryContext::parse(Bytes::copy_from_slice(&query_wire), IngressProfile::Internal).unwrap(), &["192.0.2.1".parse().unwrap(), "2001:db8::1".parse().unwrap()], 300).unwrap();
     let mut cname_negative = negative_response(&query_wire, 0, 100, 20);
     let authority_start = cname_negative.len() - 34;
     cname_negative.splice(authority_start..authority_start,
@@ -413,11 +414,42 @@ fn unified_validation_preserves_ttl_policy_and_coalesced_results() {
             let result = ExchangeResult::coalesced(&template, &context).unwrap();
             assert_eq!(result.ttl, expected_ttl.unwrap_or(0));
             assert!(Arc::ptr_eq(&result.answer_ips, &template.answer_ips()));
-            let udp = QueryContext::parse_with_profile(&query_wire,
-                IngressProfile::Udp { advertised_size: query_wire.len() as u16 }).unwrap();
+            let udp = QueryContext::parse(Bytes::copy_from_slice(&query_wire), IngressProfile::Udp { advertised_size: query_wire.len() as u16 }).unwrap();
             let truncated = ExchangeResult::coalesced(&template, &udp).unwrap();
             assert_eq!(truncated.ttl, 0);
             assert!(truncated.answer_ips.is_empty());
         }
     }
+}
+
+#[tokio::test]
+async fn fresh_udp_response_is_limited_without_truncating_cached_template() {
+    let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let transport = remote(&socket, None, DnsCachePolicy::new(600, 3600)).await;
+    let server = tokio::spawn(async move {
+        let mut buffer = [0; 512];
+        let (len, peer) = socket.recv_from(&mut buffer).await.unwrap();
+        let query = QueryContext::parse(Bytes::copy_from_slice(&buffer[..len]), IngressProfile::Internal).unwrap();
+        let response = build_dns_ip_response(
+            &query, &vec!["192.0.2.1".parse().unwrap(); 80], 60,
+        ).unwrap();
+        socket.send_to(&response, peer).await.unwrap();
+    });
+    let query = QueryContext::new(DnsName::from_domain("large.test").unwrap(), QType::A);
+    let udp = QueryContext::parse(Bytes::copy_from_slice(query.wire()), IngressProfile::Udp { advertised_size: 512 }).unwrap();
+    let fresh = transport.exchange(&udp).await.unwrap();
+    assert!(fresh.is_fresh);
+    assert!(fresh.wire.len() <= 512);
+    assert_ne!(fresh.wire[2] & 2, 0);
+    assert_eq!(fresh.ttl, 0);
+    assert_eq!(fresh.answer_ips.len(), usize::from(u16::from_be_bytes([
+        fresh.wire[6], fresh.wire[7],
+    ])));
+    server.await.unwrap();
+    let tcp = QueryContext::parse(Bytes::copy_from_slice(query.wire()), IngressProfile::Tcp).unwrap();
+    let cached = transport.exchange(&tcp).await.unwrap();
+    assert!(!cached.is_fresh);
+    assert!(cached.wire.len() > 512);
+    assert_eq!(cached.wire[2] & 2, 0);
+    assert_eq!(cached.answer_ips.len(), 80);
 }

@@ -1,3 +1,5 @@
+use bytes::Bytes;
+use crate::app::dns::query::IngressProfile;
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -50,7 +52,7 @@ async fn configured_client_subnet_reaches_upstream_without_crossing_scopes() {
             } else {
                 "192.0.2.1".parse().unwrap()
             };
-            let mut response = build_dns_ip_response(request, &[ip], 60).unwrap();
+            let mut response = build_dns_ip_response(&QueryContext::parse(Bytes::copy_from_slice(request), IngressProfile::Internal).unwrap(), &[ip], 60).unwrap();
             // Echo ECS so the resolver must validate and strip the injected OPT.
             response[10..12].copy_from_slice(&u16::from(!opt.is_empty()).to_be_bytes());
             response.extend_from_slice(opt);
@@ -84,7 +86,7 @@ async fn configured_client_subnet_reaches_upstream_without_crossing_scopes() {
         ("plain.test", QType::A, vec![]),
     ] {
         let query = build_dns_query_wire(&DnsName::from_domain(domain).unwrap(), qtype);
-        let response = resolver.exchange(&query).await.unwrap();
+        let response = resolver.exchange(&QueryContext::parse(Bytes::copy_from_slice(&query), IngressProfile::Internal).unwrap(), None).await.unwrap();
         assert_eq!(&response[10..12], &[0, 0]);
         let opt = tokio::time::timeout(Duration::from_secs(2), requests.recv())
             .await.unwrap().unwrap();
@@ -106,7 +108,7 @@ impl TestServer {
         let task = tokio::spawn(async move {
             let mut buf = [0; 4096];
             while let Ok((len, peer)) = socket.recv_from(&mut buf).await {
-                let query = QueryContext::parse(&buf[..len]).unwrap();
+                let query = QueryContext::parse(Bytes::copy_from_slice(&buf[..len]), IngressProfile::Internal).unwrap();
                 let matching: Vec<_> = ips.iter().copied().filter(|ip| {
                     match query.qtype() {
                         Some(QType::A) => ip.is_ipv4(),
@@ -117,7 +119,7 @@ impl TestServer {
                 let response = if matching.is_empty() {
                     build_dns_nxdomain(&buf[..len])
                 } else {
-                    build_dns_ip_response(&buf[..len], &matching, 60).unwrap()
+                    build_dns_ip_response(&QueryContext::parse(Bytes::copy_from_slice(&buf[..len]), IngressProfile::Internal).unwrap(), &matching, 60).unwrap()
                 };
                 socket.send_to(&response, peer).await.unwrap();
                 let _ = tx.send(());
@@ -202,7 +204,7 @@ async fn real_resolution_bypasses_fakeip_for_both_families() {
         assert_eq!(resolver.resolve("example.test", false).await.unwrap(), Some("192.0.2.1".parse().unwrap()));
         let fake_ip = resolver.resolve("example.test", true).await.unwrap().unwrap();
         assert!(resolver.is_fake_ip(fake_ip));
-        let wire = resolver.exchange(&query(QType::A)).await.unwrap();
+        let wire = resolver.exchange(&QueryContext::parse(Bytes::copy_from_slice(&query(QType::A)), IngressProfile::Internal).unwrap(), None).await.unwrap();
         assert!(resolver.is_fake_ip(extract_ips_from_dns_response(&wire)[0]));
     }
 }
@@ -235,7 +237,7 @@ async fn source_ip_selects_request_rule() {
     let resolver = resolver(cfg).await;
     let query = query(QType::A);
     for (source, code) in [(Some("192.0.2.1".parse().unwrap()), 5), (Some("198.51.100.1".parse().unwrap()), 3), (None, 3)] {
-        let wire = resolver.exchange_from(&query, source).await.unwrap();
+        let wire = resolver.exchange(&QueryContext::parse(Bytes::copy_from_slice(&query), IngressProfile::Internal).unwrap(), source).await.unwrap();
         assert_eq!(wire[3] & 0xf, code);
     }
 }
@@ -258,7 +260,7 @@ async fn responses_without_ips_obey_response_rules_and_fallback() {
                 cfg.response_fallback = ResponseAction::Reject;
             }
             let resolver = resolver(cfg).await;
-            let wire = resolver.exchange(&query(qtype)).await.unwrap();
+            let wire = resolver.exchange(&QueryContext::parse(Bytes::copy_from_slice(&query(qtype)), IngressProfile::Internal).unwrap(), None).await.unwrap();
             assert_eq!(wire[3] & 0xf, 0); // Reject produces NODATA, not upstream NXDOMAIN.
         }
     }
@@ -267,7 +269,7 @@ async fn responses_without_ips_obey_response_rules_and_fallback() {
     cfg.request_fallback = RequestAction::Route("empty".into());
     cfg.response_rules.push(response_rule("empty", ResponseAction::Requery("real".into())));
     let resolver = resolver(cfg).await;
-    assert_eq!(extract_ips_from_dns_response(&resolver.exchange(&query(QType::A)).await.unwrap()), vec!["192.0.2.3".parse::<IpAddr>().unwrap()]);
+    assert_eq!(extract_ips_from_dns_response(&resolver.exchange(&QueryContext::parse(Bytes::copy_from_slice(&query(QType::A)), IngressProfile::Internal).unwrap(), None).await.unwrap()), vec!["192.0.2.3".parse::<IpAddr>().unwrap()]);
 }
 
 #[tokio::test]
@@ -280,18 +282,18 @@ async fn requery_schedules_stale_target_refresh() {
     cfg.response_rules.push(response_rule("initial", ResponseAction::Requery("replacement".into())));
     let resolver = resolver(cfg).await;
     let wire = query(QType::A);
-    let context = QueryContext::parse(&wire).unwrap();
-    let old = build_dns_ip_response(&wire, &["192.0.2.5".parse().unwrap()], 1).unwrap();
+    let context = QueryContext::parse(Bytes::copy_from_slice(&wire), IngressProfile::Internal).unwrap();
+    let old = build_dns_ip_response(&QueryContext::parse(Bytes::copy_from_slice(&wire), IngressProfile::Internal).unwrap(), &["192.0.2.5".parse().unwrap()], 1).unwrap();
     resolver.cache.insert_scoped(&Arc::from("replacement"), &context,
         Arc::new(ResponseTemplate::validate(&context, &old).unwrap()), 1, Duration::from_secs(60));
     tokio::time::sleep(Duration::from_millis(1100)).await;
-    let response = resolver.exchange(&wire).await.unwrap();
+    let response = resolver.exchange(&QueryContext::parse(Bytes::copy_from_slice(&wire), IngressProfile::Internal).unwrap(), None).await.unwrap();
     assert_eq!(extract_ips_from_dns_response(&response), vec!["192.0.2.5".parse::<IpAddr>().unwrap()]);
     replacement.received().await;
     // Wait for response processing, then confirm subsequent requery uses refreshed data.
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
-            let response = resolver.exchange(&wire).await.unwrap();
+            let response = resolver.exchange(&QueryContext::parse(Bytes::copy_from_slice(&wire), IngressProfile::Internal).unwrap(), None).await.unwrap();
             if extract_ips_from_dns_response(&response) == vec!["192.0.2.4".parse::<IpAddr>().unwrap()] { break; }
             tokio::task::yield_now().await;
         }
@@ -375,12 +377,12 @@ async fn stale_response_ttl_is_sixty_even_with_override() {
         cfg.upstreams.push(real);
         let resolver = resolver(cfg).await;
         let wire = query(QType::A);
-        let context = QueryContext::parse(&wire).unwrap();
-        let old = build_dns_ip_response(&wire, &["192.0.2.11".parse().unwrap()], 1).unwrap();
+        let context = QueryContext::parse(Bytes::copy_from_slice(&wire), IngressProfile::Internal).unwrap();
+        let old = build_dns_ip_response(&QueryContext::parse(Bytes::copy_from_slice(&wire), IngressProfile::Internal).unwrap(), &["192.0.2.11".parse().unwrap()], 1).unwrap();
         resolver.cache.insert_scoped(&Arc::from("real"), &context,
             Arc::new(ResponseTemplate::validate(&context, &old).unwrap()), 1, Duration::from_secs(60));
         tokio::time::sleep(Duration::from_millis(1100)).await;
-        let result = resolver.transports["real"].exchange(&wire, &context).await.unwrap();
+        let result = resolver.transports["real"].exchange(&context).await.unwrap();
         assert!(!result.is_fresh && result.refresh_ticket.is_some());
         assert_eq!(extract_min_ttl_from_dns_response(&result.wire), Some(60));
     }
@@ -397,11 +399,11 @@ async fn fresh_cache_hit_uses_remaining_ttl_even_with_override() {
     cfg.upstreams.push(real);
     let resolver = resolver(cfg).await;
     let wire = query(QType::A);
-    let context = QueryContext::parse(&wire).unwrap();
-    let old = build_dns_ip_response(&wire, &["192.0.2.11".parse().unwrap()], 60).unwrap();
+    let context = QueryContext::parse(Bytes::copy_from_slice(&wire), IngressProfile::Internal).unwrap();
+    let old = build_dns_ip_response(&QueryContext::parse(Bytes::copy_from_slice(&wire), IngressProfile::Internal).unwrap(), &["192.0.2.11".parse().unwrap()], 60).unwrap();
     resolver.cache.insert_scoped(&Arc::from("real"), &context,
         Arc::new(ResponseTemplate::validate(&context, &old).unwrap()), 60, Duration::from_secs(60));
-    let result = resolver.transports["real"].exchange(&wire, &context).await.unwrap();
+    let result = resolver.transports["real"].exchange(&context).await.unwrap();
     assert!(!result.is_fresh);
     assert!(extract_min_ttl_from_dns_response(&result.wire).unwrap() <= 60);
 }
@@ -416,8 +418,8 @@ async fn grouped_cache_report_keeps_counts_and_caps_every_scope() {
             let wire = build_dns_query_wire(
                 &DnsName::from_domain(&format!("{index}.example.test")).unwrap(), QType::A,
             );
-            let context = QueryContext::parse(&wire).unwrap();
-            let response = build_dns_ip_response(&wire, &["192.0.2.1".parse().unwrap()], 60).unwrap();
+            let context = QueryContext::parse(Bytes::copy_from_slice(&wire), IngressProfile::Internal).unwrap();
+            let response = build_dns_ip_response(&QueryContext::parse(Bytes::copy_from_slice(&wire), IngressProfile::Internal).unwrap(), &["192.0.2.1".parse().unwrap()], 60).unwrap();
             resolver.cache.insert_scoped(&Arc::from(scope), &context,
                 Arc::new(ResponseTemplate::validate(&context, &response).unwrap()), 60, Duration::ZERO);
         }
@@ -445,9 +447,9 @@ async fn internal_queries_reuse_cached_addresses_for_both_families() {
     let resolver = resolver(cfg).await;
     for qtype in [QType::A, QType::AAAA] {
         let wire = query(qtype);
-        let fresh = resolver.exchange_query(&wire, None, true).await.unwrap();
+        let fresh = resolver.exchange_query(&QueryContext::parse(Bytes::copy_from_slice(&wire), IngressProfile::Internal).unwrap(), None, true).await.unwrap();
         server.received().await;
-        let cached = resolver.exchange_query(&wire, None, true).await.unwrap();
+        let cached = resolver.exchange_query(&QueryContext::parse(Bytes::copy_from_slice(&wire), IngressProfile::Internal).unwrap(), None, true).await.unwrap();
         assert!(Arc::ptr_eq(&fresh.answer_ips, &cached.answer_ips));
         assert_eq!(cached.answer_ips.as_ref(), extract_ips_from_dns_response(&cached.wire));
     }

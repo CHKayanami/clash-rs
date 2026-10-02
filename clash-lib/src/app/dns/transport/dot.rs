@@ -1,5 +1,7 @@
 //! DNS over TLS (RFC 7858) with RFC 7766 query pipelining multiplexing.
 
+use crate::app::dns::query::QueryContext;
+
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::time::Duration;
@@ -50,12 +52,12 @@ impl DotPool {
 
     pub async fn exchange(
         self: &Arc<Self>,
-        raw_query: &[u8],
+        query: &QueryContext,
     ) -> anyhow::Result<Vec<u8>> {
         let timeout = self.dial.query_timeout + self.dial.dial_timeout;
         tokio::time::timeout(
             timeout,
-            exchange_with_retry("DoT", || self.exchange_once(raw_query)),
+            exchange_with_retry("DoT", || self.exchange_once(query)),
         )
         .await
         .map_err(|_| {
@@ -63,9 +65,9 @@ impl DotPool {
         })?
     }
 
-    async fn exchange_once(&self, raw_query: &[u8]) -> anyhow::Result<Vec<u8>> {
+    async fn exchange_once(&self, query: &QueryContext) -> anyhow::Result<Vec<u8>> {
         let session = self.get_session().await?;
-        let result = session.exchange(raw_query, self.dial.query_timeout).await;
+        let result = session.exchange(query, self.dial.query_timeout).await;
         if result.is_err() && session.is_closed() {
             self.session
                 .close_if(&session, |session| async move {

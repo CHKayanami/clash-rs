@@ -1,5 +1,8 @@
 //! RFC 7766 TCP/TLS DNS query pipelining session multiplexer.
 
+use bytes::Bytes;
+use crate::app::dns::query::QueryContext;
+
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
@@ -16,7 +19,7 @@ const ID_QUARANTINE: Duration = Duration::from_secs(3);
 const ID_BITMAP_WORDS: usize = (u16::MAX as usize + 1) / u64::BITS as usize;
 
 struct Pending {
-    question: Vec<u8>,
+    question: Bytes,
     original_id: [u8; 2],
     reply: oneshot::Sender<Vec<u8>>,
 }
@@ -110,16 +113,13 @@ impl<W: AsyncWrite + Send + Unpin + 'static> PipelinedSession<W> {
 
     pub async fn exchange(
         &self,
-        query: &[u8],
+        context: &QueryContext,
         timeout: Duration,
     ) -> anyhow::Result<Vec<u8>> {
-        if query.len() < 12 {
-            anyhow::bail!("DNS query too short");
-        }
+        let query = context.wire();
         let (receiver, id) = {
-            let question_end = question_end(query)?;
-            let question = query[12..question_end].to_vec();
-            let original_id = [query[0], query[1]];
+            let question = context.shared_question_wire();
+            let original_id = context.txid().get().to_be_bytes();
             let (reply, receiver) = oneshot::channel();
             let mut state = self.state.lock();
             if state.closed {
@@ -311,6 +311,8 @@ fn question_end(query: &[u8]) -> anyhow::Result<usize> {
 
 #[cfg(test)]
 mod tests {
+    use bytes::Bytes;
+    use crate::app::dns::query::{IngressProfile, QueryContext};
     use std::sync::Arc;
     use std::sync::atomic::AtomicUsize;
     use std::time::Duration;
@@ -374,7 +376,7 @@ mod tests {
                 let orig_id = 0x1000 + i;
                 let q = build_test_query(orig_id, &format!("domain{i}.com"));
                 let resp =
-                    session.exchange(&q, Duration::from_secs(2)).await.unwrap();
+                    session.exchange(&QueryContext::parse(Bytes::copy_from_slice(&q), IngressProfile::Internal).unwrap(), Duration::from_secs(2)).await.unwrap();
                 assert_eq!(u16::from_be_bytes([resp[0], resp[1]]), orig_id);
             }));
         }
@@ -398,7 +400,7 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(50)).await;
         let q = build_test_query(0x1234, "example.com");
-        let res = session.exchange(&q, Duration::from_millis(100)).await;
+        let res = session.exchange(&QueryContext::parse(Bytes::copy_from_slice(&q), IngressProfile::Internal).unwrap(), Duration::from_millis(100)).await;
         assert!(res.is_err());
     }
 
@@ -413,7 +415,8 @@ mod tests {
 
         // Start exchange and cancel it after short duration (simulating outer select!/timeout drop)
         {
-            let fut = session.exchange(&q, Duration::from_secs(5));
+            let context = QueryContext::parse(Bytes::copy_from_slice(&q), IngressProfile::Internal).unwrap();
+            let fut = session.exchange(&context, Duration::from_secs(5));
             tokio::pin!(fut);
             tokio::select! {
                 _ = &mut fut => {}
@@ -439,13 +442,13 @@ mod tests {
         let slow_session = session.clone();
         let slow = tokio::spawn(async move {
             slow_session
-                .exchange(&slow_query, Duration::from_millis(30))
+                .exchange(&QueryContext::parse(Bytes::copy_from_slice(&slow_query), IngressProfile::Internal).unwrap(), Duration::from_millis(30))
                 .await
         });
         let fast_session = session.clone();
         let fast = tokio::spawn(async move {
             fast_session
-                .exchange(&fast_query, Duration::from_secs(1))
+                .exchange(&QueryContext::parse(Bytes::copy_from_slice(&fast_query), IngressProfile::Internal).unwrap(), Duration::from_secs(1))
                 .await
         });
         let mut fast_response = None;
@@ -476,7 +479,7 @@ mod tests {
         let query = build_test_query(1, "blocked.test");
         let result = tokio::time::timeout(
             Duration::from_secs(1),
-            session.exchange(&query, Duration::from_millis(20)),
+            session.exchange(&QueryContext::parse(Bytes::copy_from_slice(&query), IngressProfile::Internal).unwrap(), Duration::from_millis(20)),
         )
         .await
         .expect("write must be covered by exchange timeout");
@@ -495,10 +498,7 @@ mod tests {
         let _lock = session.writer.lock().await;
         assert!(
             session
-                .exchange(
-                    &build_test_query(1, "queued.test"),
-                    Duration::from_millis(20)
-                )
+                .exchange(&QueryContext::parse(Bytes::copy_from_slice(&build_test_query(1, "queued.test")), IngressProfile::Internal).unwrap(), Duration::from_millis(20))
                 .await
                 .is_err()
         );

@@ -12,7 +12,7 @@ use serde_json::{Map, Value};
 
 use crate::app::api::AppState;
 use crate::app::dns::{DnsCacheUpstreamStat, ThreadSafeDNSResolver};
-use crate::app::dns::query::{DnsName, QType};
+use crate::app::dns::query::{DnsName, QType, QueryContext};
 use crate::app::dns::wire::parse_dns_response_records;
 
 #[derive(Clone)]
@@ -62,19 +62,8 @@ async fn query_dns(
         _ => QType::A,
     };
 
-    let mut msg = vec![
-        0x00, 0x00, // ID
-        0x01, 0x00, // Flags: RD=1
-        0x00, 0x01, // QDCOUNT=1
-        0x00, 0x00, // ANCOUNT=0
-        0x00, 0x00, // NSCOUNT=0
-        0x00, 0x00, // ARCOUNT=0
-    ];
-    msg.extend_from_slice(name.as_wire());
-    msg.extend_from_slice(&qtype.get().to_be_bytes());
-    msg.extend_from_slice(&1u16.to_be_bytes()); // CLASS IN
-
-    match state.resolver.exchange(&msg).await {
+    let query = QueryContext::new(name, qtype);
+    match state.resolver.exchange(&query, None).await {
         Ok(response) => {
             let mut resp = Map::new();
             let rcode = if response.len() >= 4 {

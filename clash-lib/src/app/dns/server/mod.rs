@@ -1,8 +1,10 @@
 use std::net::IpAddr;
+use bytes::Bytes;
 
 use async_trait::async_trait;
-use tracing::{error, info, instrument};
-use watfaq_dns::DNSListenAddr;
+use tracing::{error, info};
+use watfaq_dns::{DNSListenAddr, DnsIngress};
+use super::query::IngressProfile;
 
 use super::ThreadSafeDNSResolver;
 use crate::runner::{AsyncService, ServiceContext};
@@ -20,21 +22,17 @@ impl watfaq_dns::DnsMessageExchanger for DnsMessageExchanger {
         self.resolver.ipv6()
     }
 
-    async fn exchange_from(
-        &self,
-        message: &[u8],
-        source_ip: Option<IpAddr>,
-    ) -> Result<Vec<u8>, watfaq_dns::DNSError> {
-        self.resolver.exchange_from(message, source_ip).await
-            .map_err(|error| watfaq_dns::DNSError::QueryFailed(error.to_string()))
-    }
-
-    #[instrument(skip(self))]
     async fn exchange(
         &self,
-        message: &[u8],
+        message: Bytes,
+        source_ip: Option<IpAddr>,
+        ingress: DnsIngress,
     ) -> Result<Vec<u8>, watfaq_dns::DNSError> {
-        exchange_with_resolver(&self.resolver, message, true).await
+        let profile = match ingress {
+            DnsIngress::Udp => IngressProfile::Udp { advertised_size: 512 },
+            DnsIngress::Tcp => IngressProfile::Tcp,
+        };
+        exchange_with_resolver(&self.resolver, message, profile, source_ip).await
     }
 }
 

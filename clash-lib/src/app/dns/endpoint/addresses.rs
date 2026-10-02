@@ -1,5 +1,8 @@
 //! Bootstrap resolution shared by endpoint clones and all DNS transports.
 
+#[cfg(test)]
+use crate::app::dns::query::QueryContext;
+
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -120,7 +123,7 @@ mod tests {
         async fn resolve(&self, _: &str, _: bool) -> anyhow::Result<Option<IpAddr>> {
             unreachable!()
         }
-        async fn exchange(&self, _: &[u8]) -> anyhow::Result<Vec<u8>> {
+        async fn exchange(&self, _: &QueryContext, _: Option<IpAddr>) -> anyhow::Result<Vec<u8>> {
             unreachable!()
         }
         fn cached_for(&self, _: IpAddr) -> Option<String> {

@@ -1,3 +1,5 @@
+#[cfg(test)]
+use crate::app::dns::query::IngressProfile;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
@@ -284,6 +286,7 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 
 #[cfg(test)]
 mod tests {
+    use bytes::Bytes;
     use super::*;
     use crate::app::dns::query::{DnsName, QType, QueryContext, build_dns_query_wire_with_id};
     use crate::app::dns::response::build_dns_ip_response;
@@ -291,9 +294,9 @@ mod tests {
     fn make_test_template() -> (QueryContext, Arc<ResponseTemplate>) {
         let name = DnsName::from_domain("example.com").unwrap();
         let query_bytes = build_dns_query_wire_with_id(0x1234, &name, QType::A);
-        let query = QueryContext::parse(&query_bytes).unwrap();
+        let query = QueryContext::parse(Bytes::copy_from_slice(&query_bytes), IngressProfile::Internal).unwrap();
         let resp_bytes =
-            build_dns_ip_response(&query_bytes, &["1.2.3.4".parse().unwrap()], 60).unwrap();
+            build_dns_ip_response(&query, &["1.2.3.4".parse().unwrap()], 60).unwrap();
         let template = Arc::new(ResponseTemplate::validate(&query, &resp_bytes).unwrap());
         (query, template)
     }

@@ -1,3 +1,4 @@
+use crate::app::dns::query::QueryContext;
 use async_trait::async_trait;
 use std::io;
 use std::sync::Arc;
@@ -47,7 +48,7 @@ impl ClashResolver for NoopResolver {
     }
 
     /// Used for DNS Server
-    async fn exchange(&self, _message: &[u8]) -> anyhow::Result<Vec<u8>> {
+    async fn exchange(&self, _query: &QueryContext, _source_ip: Option<std::net::IpAddr>) -> anyhow::Result<Vec<u8>> {
         Err(anyhow::anyhow!("unsupported"))
     }
     /// Only used for look up fake IP

@@ -1,5 +1,8 @@
 //! Bounded connected DNS-over-UDP exchange pool with lock-free fixed slot array routing.
 
+use bytes::Bytes;
+use crate::app::dns::query::QueryContext;
+
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
@@ -23,7 +26,7 @@ const ID_QUARANTINE: Duration = Duration::from_secs(3);
 // use another salt. Millisecond deadlines keep the per-slot history compact.
 
 struct SlotData {
-    question: Vec<u8>,
+    question: Bytes,
     original_id: [u8; 2],
     reply: Option<oneshot::Sender<Vec<u8>>>,
     retired_until: [u64; 64],
@@ -32,7 +35,7 @@ struct SlotData {
 impl Default for SlotData {
     fn default() -> Self {
         Self {
-            question: Vec::new(),
+            question: Bytes::new(),
             original_id: [0; 2],
             reply: None,
             retired_until: [0; 64],
@@ -239,6 +242,7 @@ impl UdpPool {
         for slot in self.slots.iter() {
             let mut data = slot.data.lock();
             data.reply = None;
+            data.question = Bytes::new();
             slot.in_use.store(false, Ordering::Release);
         }
     }
@@ -251,16 +255,14 @@ impl UdpPool {
         }
     }
 
-    pub async fn exchange(&self, query: &[u8]) -> anyhow::Result<Vec<u8>> {
-        if query.len() < 12 {
-            anyhow::bail!("malformed DNS query");
-        }
+    pub async fn exchange(&self, context: &QueryContext) -> anyhow::Result<Vec<u8>> {
+        let query = context.wire();
         if self.is_closed() {
             anyhow::bail!("UDP DNS exchange pool is closed");
         }
 
-        let original_id = [query[0], query[1]];
-        let question = query[12..Self::question_end(query)?].to_vec();
+        let original_id = context.txid().get().to_be_bytes();
+        let question = context.shared_question_wire();
         let (reply, receiver) = oneshot::channel();
 
         let id = self.allocate_slot(question, original_id, reply)?;
@@ -312,7 +314,7 @@ impl UdpPool {
 
     fn allocate_slot(
         &self,
-        question: Vec<u8>,
+        question: Bytes,
         original_id: [u8; 2],
         reply: oneshot::Sender<Vec<u8>>,
     ) -> anyhow::Result<u16> {
@@ -423,9 +425,10 @@ impl UdpPool {
                 return;
             }
             let matches = Self::question_end(buffer)
-                .is_ok_and(|end| data.question == buffer[12..end]);
+                .is_ok_and(|end| data.question.as_ref() == &buffer[12..end]);
             if matches {
                 let reply = data.reply.take();
+                data.question = Bytes::new();
                 let original_id = data.original_id;
                 data.retired_until[expected_salt as usize] =
                     (self.epoch.elapsed() + ID_QUARANTINE).as_millis() as u64;
@@ -451,6 +454,7 @@ impl UdpPool {
         let mut data = slot.data.lock();
         if (slot.salt.load(Ordering::Relaxed) & 0x3F) == expected_salt {
             data.reply = None;
+            data.question = Bytes::new();
             data.retired_until[expected_salt as usize] =
                 (self.epoch.elapsed() + ID_QUARANTINE).as_millis() as u64;
             slot.in_use.store(false, Ordering::Release);
@@ -470,6 +474,8 @@ impl UdpPool {
 
 #[cfg(test)]
 mod tests {
+    use bytes::Bytes;
+    use crate::app::dns::query::{IngressProfile, QueryContext};
     use std::net::SocketAddr;
     use std::sync::Arc;
     use std::sync::atomic::AtomicUsize;
@@ -527,7 +533,7 @@ mod tests {
             proxied_fixture(Duration::from_secs(10));
         let query_pool = pool.clone();
         let query = tokio::spawn(async move {
-            query_pool.exchange(&build_test_query(7, "eof.test")).await
+            query_pool.exchange(&QueryContext::parse(Bytes::copy_from_slice(&build_test_query(7, "eof.test")), IngressProfile::Internal).unwrap()).await
         });
         outgoing.recv().await.unwrap();
         drop(incoming);
@@ -550,7 +556,7 @@ mod tests {
         drop(outgoing);
         tokio::time::timeout(Duration::from_secs(1), async {
             assert!(
-                pool.exchange(&build_test_query(7, "send.test"))
+                pool.exchange(&QueryContext::parse(Bytes::copy_from_slice(&build_test_query(7, "send.test")), IngressProfile::Internal).unwrap())
                     .await
                     .is_err()
             );
@@ -569,7 +575,7 @@ mod tests {
         let (pool, incoming, mut outgoing, _active) =
             proxied_fixture(Duration::from_millis(100));
         assert!(
-            pool.exchange(&build_test_query(7, "timeout.test"))
+            pool.exchange(&QueryContext::parse(Bytes::copy_from_slice(&build_test_query(7, "timeout.test")), IngressProfile::Internal).unwrap())
                 .await
                 .is_err()
         );
@@ -578,7 +584,7 @@ mod tests {
         let query_pool = pool.clone();
         let query = tokio::spawn(async move {
             query_pool
-                .exchange(&build_test_query(8, "healthy.test"))
+                .exchange(&QueryContext::parse(Bytes::copy_from_slice(&build_test_query(8, "healthy.test")), IngressProfile::Internal).unwrap())
                 .await
         });
         let packet = outgoing.recv().await.unwrap();
@@ -638,7 +644,7 @@ mod tests {
             handles.push(tokio::spawn(async move {
                 let orig_id = 0x2000 + i;
                 let q = build_test_query(orig_id, &format!("domain{i}.test"));
-                let resp = pool.exchange(&q).await.unwrap();
+                let resp = pool.exchange(&QueryContext::parse(Bytes::copy_from_slice(&q), IngressProfile::Internal).unwrap()).await.unwrap();
                 assert_eq!(u16::from_be_bytes([resp[0], resp[1]]), orig_id);
             }));
         }
@@ -666,7 +672,7 @@ mod tests {
         .unwrap();
 
         let query = build_test_query(1, "example.com");
-        let question = query[12..UdpPool::question_end(&query).unwrap()].to_vec();
+        let question = Bytes::copy_from_slice(&query[12..UdpPool::question_end(&query).unwrap()]);
 
         // Repeatedly allocate the SAME slot (slot 0) over 130 times (more than 64 salt cycles)
         // by locking the slot data and clearing retired_until.
@@ -725,13 +731,14 @@ mod tests {
         let query = build_test_query(1, "timeout.com");
 
         // Timeout should unregister slot cleanly
-        let res = pool.exchange(&query).await;
+        let res = pool.exchange(&QueryContext::parse(Bytes::copy_from_slice(&query), IngressProfile::Internal).unwrap()).await;
         assert!(res.is_err());
 
         // Cancellation by dropping future before completion
         let query2 = build_test_query(2, "cancelled.com");
         {
-            let exchange_fut = pool.exchange(&query2);
+            let context = QueryContext::parse(Bytes::copy_from_slice(&query2), IngressProfile::Internal).unwrap();
+            let exchange_fut = pool.exchange(&context);
             tokio::pin!(exchange_fut);
             tokio::select! {
                 _ = &mut exchange_fut => {}
@@ -765,7 +772,7 @@ mod tests {
         .await
         .unwrap();
         let query = build_test_query(7, "reuse.test");
-        let question = query[12..UdpPool::question_end(&query).unwrap()].to_vec();
+        let question = Bytes::copy_from_slice(&query[12..UdpPool::question_end(&query).unwrap()]);
         let mut old: Option<u16> = None;
         // More completed queries than slots, without waiting for quarantine expiry.
         for _ in 0..(super::SLOT_COUNT * 2) {

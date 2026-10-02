@@ -23,6 +23,7 @@ pub mod upstream_pool;
 pub mod wire;
 
 use crate::app::router::Router;
+use query::QueryContext;
 pub use collector::{DnsCollector, ThreadSafeDnsCollector};
 pub use config::{Config, EdnsClientSubnet};
 
@@ -71,17 +72,12 @@ pub trait ClashResolver: Sync + Send {
 
     fn cached_for(&self, ip: std::net::IpAddr) -> Option<String>;
 
-    /// Used for DNS Server / TUN / eBPF: accepts raw wire-format query bytes and returns raw response bytes
-    async fn exchange(&self, message: &[u8]) -> anyhow::Result<Vec<u8>>;
-
-    /// DNS listeners supply the peer IP; internal queries may omit it.
-    async fn exchange_from(
+    /// Ingress adapters parse the query once and supply the peer IP when available.
+    async fn exchange(
         &self,
-        message: &[u8],
-        _source_ip: Option<IpAddr>,
-    ) -> anyhow::Result<Vec<u8>> {
-        self.exchange(message).await
-    }
+        query: &QueryContext,
+        source_ip: Option<IpAddr>,
+    ) -> anyhow::Result<Vec<u8>>;
 
     /// Only used for look up fake IP
     fn reverse_lookup(&self, ip: std::net::IpAddr) -> Option<String>;

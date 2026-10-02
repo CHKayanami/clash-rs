@@ -206,7 +206,7 @@ impl ResponseTemplate {
             IngressProfile::Udp { advertised_size } => {
                 self.render_udp(caller, usize::from(advertised_size))
             }
-            IngressProfile::Tcp | IngressProfile::Api | IngressProfile::Internal => {
+            IngressProfile::Tcp | IngressProfile::Internal => {
                 self.render_full(caller)
             }
         }
@@ -499,27 +499,10 @@ pub fn build_dns_refused(query: &[u8]) -> Vec<u8> {
 }
 
 /// Build a synthetic DNS answer for given IP addresses (e.g. for Fake-IP, Hosts).
-pub fn build_dns_ip_response(query: &[u8], ips: &[IpAddr], ttl: u32) -> Option<Vec<u8>> {
-    if query.len() < HEADER_LEN {
-        return None;
-    }
-    let mut response = Vec::with_capacity(query.len() + ips.len() * 20);
-    // Find the end of the question section
-    let qdcount = u16::from_be_bytes([query[4], query[5]]) as usize;
-    if qdcount == 0 {
-        return None;
-    }
-    let mut pos = HEADER_LEN;
-    for _ in 0..qdcount {
-        if !crate::app::dns::wire::skip_dns_name(query, &mut pos) {
-            return None;
-        }
-        pos += 4; // QTYPE + QCLASS
-        if pos > query.len() {
-            return None;
-        }
-    }
-    let question_end = pos;
+pub fn build_dns_ip_response(context: &QueryContext, ips: &[IpAddr], ttl: u32) -> Option<Vec<u8>> {
+    let query = context.wire();
+    let question_end = HEADER_LEN + context.question_wire()?.len();
+    let mut response = Vec::with_capacity(question_end + ips.len() * 28);
 
     // Header & Question
     response.extend_from_slice(&query[..question_end]);

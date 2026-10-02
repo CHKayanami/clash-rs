@@ -1,6 +1,8 @@
 use std::ops::Range;
 
+use bytes::Bytes;
 use ipnet::IpNet;
+use super::query::QueryContext;
 use thiserror::Error;
 
 use super::wire::skip_dns_name;
@@ -28,7 +30,7 @@ pub enum EcsWireError {
 }
 
 pub struct EcsQuery {
-    wire: Vec<u8>,
+    query: QueryContext,
     original_had_opt: bool,
     expected: ExpectedEcs,
 }
@@ -59,7 +61,8 @@ struct OptRecord {
 }
 
 impl EcsQuery {
-    pub fn prepare(raw: &[u8], subnet: impl Into<IpNet>) -> Result<Option<Self>, EcsWireError> {
+    pub fn prepare(query: &QueryContext, subnet: impl Into<IpNet>) -> Result<Option<Self>, EcsWireError> {
+        let raw = query.wire();
         let layout = message_layout(raw)?;
         let (option, expected) = encode_ecs(subnet.into());
         let original_had_opt = layout.opt.is_some();
@@ -118,14 +121,14 @@ impl EcsQuery {
             wire
         };
         Ok(Some(Self {
-            wire,
+            query: query.with_additional_wire(Bytes::from(wire)),
             original_had_opt,
             expected,
         }))
     }
 
-    pub fn wire(&self) -> &[u8] {
-        &self.wire
+    pub fn query(&self) -> &QueryContext {
+        &self.query
     }
 
     pub fn restore_response(self, mut response: Vec<u8>) -> Result<Vec<u8>, EcsWireError> {

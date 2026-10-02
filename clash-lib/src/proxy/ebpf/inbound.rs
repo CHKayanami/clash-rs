@@ -1,3 +1,4 @@
+use crate::app::dns::query::IngressProfile;
 use async_trait::async_trait;
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
@@ -393,11 +394,15 @@ async fn udp_listener_loop(
                 for (payload, src, dst) in batch.drain(..) {
                     // 1. Intercept UDP port 53 (DNS)
                     if dst.port() == 53 {
-                        let req_bytes = payload.to_vec();
+                        let req_bytes = payload;
                         let resolver = resolver.clone();
                         let listener_for_dns = listener_for_dns.clone();
                         dns_tasks.spawn(async move {
-                            match crate::app::dns::exchange_with_resolver(&resolver, &req_bytes, true)
+                            match crate::app::dns::exchange_with_resolver(
+                                &resolver, req_bytes,
+                                IngressProfile::Udp { advertised_size: 512 },
+                                Some(src.ip()),
+                            )
                                 .await
                             {
                                 Ok(resp_bytes) => {

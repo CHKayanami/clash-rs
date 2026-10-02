@@ -24,7 +24,7 @@ use std::time::Instant;
 use crate::Error;
 use crate::app::dns::config::{EdnsClientSubnet, NameServer};
 use crate::app::dns::fakeip::{FakeDns, Opts as FakeDnsOpts};
-use crate::app::dns::query::{DnsName, QType, QueryContext, build_dns_query_wire};
+use crate::app::dns::query::{DnsName, QType, QueryContext};
 use crate::app::dns::resolver::enhanced::{
     BootstrapResolver, DnsCache, DnsCacheEntryDetail, ReverseLookupCache,
 };
@@ -362,14 +362,11 @@ impl RouterResolver {
 
     async fn exchange_query(
         &self,
-        message: &[u8],
+        query: &QueryContext,
         source_ip: Option<net::IpAddr>,
         enhanced: bool,
     ) -> anyhow::Result<RenderedResponse> {
-        let query = match QueryContext::parse(message) {
-            Ok(q) => q,
-            Err(_) => return Ok(RenderedResponse::empty(build_dns_refused(message))),
-        };
+        let message = query.wire();
 
         let qname = query.qdomain().unwrap_or_default();
         let qtype = query.qtype().unwrap_or(QType::A);
@@ -392,7 +389,7 @@ impl RouterResolver {
         // 1. 优先匹配 Hosts 静态映射（最快路径：纯内存直出，零网络与零开销）
         if self.cfg.use_hosts {
             if let Some(resp) =
-                self.hosts.make_response(message, qname, qtype, self.ipv6())
+                self.hosts.make_response(query, self.ipv6())
             {
                 debug!(domain = qname, ?qtype, "matched hosts snapshot");
                 return Ok(resp);
@@ -411,7 +408,7 @@ impl RouterResolver {
                     "using proxy-server-nameserver for proxy node domain"
                 );
                 for transport in &self.proxy_server_transports {
-                    if let Ok(mut res) = transport.exchange(message, &query).await {
+                    if let Ok(mut res) = transport.exchange(query).await {
                         if let Some(ticket) = res.refresh_ticket.take() {
                             let notifier = self.notifier.clone();
                             tokio::spawn(async move {
@@ -459,7 +456,7 @@ impl RouterResolver {
         );
 
         // 4. 执行初次上游查询（若为 RemoteTransport，其内部自治命中 Cache / Singleflight 并发收敛）
-        let mut exchange_res = transport.exchange(message, &query).await?;
+        let mut exchange_res = transport.exchange(query).await?;
         let current_tag = initial_tag;
 
         // Fake-IP 上游自动跳过后续缓存刷新与 Response 防污染检查，直接返回
@@ -494,7 +491,7 @@ impl RouterResolver {
                                 polluted_ips = ?answer_ips,
                                 "re-querying DNS upstream due to response rule"
                             );
-                            match next_transport.exchange(message, &query).await {
+                            match next_transport.exchange(query).await {
                                 Ok(new_res) => {
                                     debug!(
                                         domain = qname,
@@ -581,7 +578,7 @@ impl ClashResolver for RouterResolver {
 
         let name = DnsName::from_domain(host)
             .ok_or_else(|| anyhow!("invalid domain name: {host}"))?;
-        let query = build_dns_query_wire(&name, QType::A);
+        let query = QueryContext::new(name, QType::A);
         let resp = self.exchange_query(&query, None, enhanced).await?;
         for ip in resp.answer_ips.iter().copied() {
             if let net::IpAddr::V4(v4) = ip {
@@ -612,7 +609,7 @@ impl ClashResolver for RouterResolver {
 
         let name = DnsName::from_domain(host)
             .ok_or_else(|| anyhow!("invalid domain name: {host}"))?;
-        let query = build_dns_query_wire(&name, QType::AAAA);
+        let query = QueryContext::new(name, QType::AAAA);
         let resp = self.exchange_query(&query, None, enhanced).await?;
         for ip in resp.answer_ips.iter().copied() {
             if let net::IpAddr::V6(v6) = ip {
@@ -626,16 +623,12 @@ impl ClashResolver for RouterResolver {
         self.reverse_lookup_cache.lookup(&ip)
     }
 
-    async fn exchange(&self, message: &[u8]) -> anyhow::Result<Vec<u8>> {
-        self.exchange_query(message, None, true).await.map(|response| response.wire)
-    }
-
-    async fn exchange_from(
+    async fn exchange(
         &self,
-        message: &[u8],
+        query: &QueryContext,
         source_ip: Option<net::IpAddr>,
     ) -> anyhow::Result<Vec<u8>> {
-        self.exchange_query(message, source_ip, true).await.map(|response| response.wire)
+        self.exchange_query(query, source_ip, true).await.map(|response| response.wire)
     }
 
     fn reverse_lookup(&self, ip: net::IpAddr) -> Option<String> {

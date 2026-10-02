@@ -1,5 +1,6 @@
 //! DNS over HTTP/3 (DoH3).
 
+use crate::app::dns::query::QueryContext;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::time::Duration;
@@ -102,12 +103,12 @@ impl Doh3Client {
 
     pub async fn exchange(
         self: &Arc<Self>,
-        raw_query: &[u8],
+        query: &QueryContext,
     ) -> anyhow::Result<Vec<u8>> {
         let timeout = self.query_timeout + self.dial_timeout;
         tokio::time::timeout(
             timeout,
-            exchange_with_retry("DoH3", || self.exchange_once(raw_query)),
+            exchange_with_retry("DoH3", || self.exchange_once(query)),
         )
         .await
         .map_err(|_| {
@@ -115,7 +116,7 @@ impl Doh3Client {
         })?
     }
 
-    async fn exchange_once(&self, raw_query: &[u8]) -> anyhow::Result<Vec<u8>> {
+    async fn exchange_once(&self, query: &QueryContext) -> anyhow::Result<Vec<u8>> {
         let session = self.get_session().await?;
         let mut sender = session
             .sender
@@ -125,15 +126,8 @@ impl Doh3Client {
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("DoH3 sender closed"))?;
         let result = tokio::time::timeout(self.query_timeout, async {
-            let orig_id = if raw_query.len() >= 2 {
-                u16::from_be_bytes([raw_query[0], raw_query[1]])
-            } else {
-                0
-            };
-            let mut wire = raw_query.to_vec();
-            if wire.len() >= 2 {
-                wire[0..2].copy_from_slice(&[0, 0]);
-            }
+            let orig_id = query.txid().get();
+            let wire = query.canonical_wire_arc();
 
             let req = build_doh_request(&self.endpoint, None, "DoH3")?;
 
@@ -143,7 +137,7 @@ impl Doh3Client {
                 .map_err(|e| anyhow::anyhow!("DoH3 send_request: {e}"))?;
 
             stream
-                .send_data(Bytes::from(wire))
+                .send_data(Bytes::from_owner(wire))
                 .await
                 .map_err(|e| anyhow::anyhow!("DoH3 send_data: {e}"))?;
 
@@ -258,6 +252,8 @@ impl Doh3Client {
 
 #[cfg(test)]
 mod tests {
+    use bytes::Bytes;
+    use crate::app::dns::query::{IngressProfile, QueryContext};
     use super::super::quic_test_support::{self, SocksProxy};
     use super::*;
     use crate::app::dns::endpoint::DnsProtocol;
@@ -326,7 +322,7 @@ mod tests {
                 &DnsName::from_domain("proxy.test").unwrap(),
                 QType::A,
             );
-            let response = client.exchange(&query).await.unwrap();
+            let response = client.exchange(&QueryContext::parse(Bytes::copy_from_slice(&query), IngressProfile::Internal).unwrap()).await.unwrap();
             assert_eq!(response[..2], id.to_be_bytes());
         }
         assert_eq!(proxy.associations.load(Ordering::SeqCst), 1);

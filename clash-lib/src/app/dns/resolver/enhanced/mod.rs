@@ -23,7 +23,7 @@ use tracing::{debug, instrument, trace};
 use crate::app::dns::config::{Config, NameServer};
 use crate::app::dns::fakeip::{self, ThreadSafeFakeDns};
 use crate::app::dns::filters::{BlackDomainFilter, DomainFilter, FallbackFilter, PendingMmdb};
-use crate::app::dns::query::{DnsName, QType, QueryContext, build_dns_query_wire};
+use crate::app::dns::query::{DnsName, QType, QueryContext};
 use crate::app::dns::response::{
     ResponseTemplate, build_dns_ip_response, build_dns_nodata, build_dns_nxdomain,
 };
@@ -321,14 +321,14 @@ impl EnhancedResolver {
             .copied()
     }
 
-    async fn batch_exchange(&self, upstreams: &[String], raw_query: &[u8]) -> anyhow::Result<Vec<u8>> {
+    async fn batch_exchange(&self, upstreams: &[String], query: &QueryContext) -> anyhow::Result<Vec<u8>> {
         if upstreams.is_empty() {
             anyhow::bail!("no upstreams configured");
         }
 
         let queries = upstreams
             .iter()
-            .map(|name| Box::pin(self.pool.query(name, raw_query)));
+            .map(|name| Box::pin(self.pool.query(name, query, None)));
         let (resp, _) = futures::future::select_ok(queries).await?;
         Ok(resp)
     }
@@ -336,10 +336,9 @@ impl EnhancedResolver {
     async fn fallback_exchange(
         &self,
         query: &QueryContext,
-        raw_query: &[u8],
     ) -> anyhow::Result<Vec<u8>> {
         let Some(ref fallback_upstreams) = self.fallback_upstreams else {
-            return self.batch_exchange(&self.main_upstreams, raw_query).await;
+            return self.batch_exchange(&self.main_upstreams, query).await;
         };
 
         let qname = query.qdomain().unwrap_or_default();
@@ -353,13 +352,13 @@ impl EnhancedResolver {
                     domain = %qname,
                     "DNS domain matched fallback-filter, querying fallback upstreams directly"
                 );
-                return self.batch_exchange(fallback_upstreams, raw_query).await;
+                return self.batch_exchange(fallback_upstreams, query).await;
             }
         }
 
         // 2. Concurrently query both main and fallback upstreams
-        let main_fut = self.batch_exchange(&self.main_upstreams, raw_query);
-        let fallback_fut = self.batch_exchange(fallback_upstreams, raw_query);
+        let main_fut = self.batch_exchange(&self.main_upstreams, query);
+        let fallback_fut = self.batch_exchange(fallback_upstreams, query);
 
         tokio::pin!(main_fut);
         tokio::pin!(fallback_fut);
@@ -424,8 +423,8 @@ impl EnhancedResolver {
         let name = DnsName::from_domain(host)
             .ok_or_else(|| anyhow!("invalid domain name: {host}"))?;
 
-        let query = build_dns_query_wire(&name, qtype);
-        let response = self.exchange(&query).await?;
+        let query = QueryContext::new(name, qtype);
+        let response = self.exchange(&query, None).await?;
         let ips = extract_ips_from_dns_response(&response);
         if ips.is_empty() {
             return Err(anyhow!("no record for hostname: {}", host));
@@ -433,7 +432,7 @@ impl EnhancedResolver {
         Ok(ips)
     }
 
-    async fn exchange_no_cache(&self, query: &QueryContext, raw_query: &[u8]) -> anyhow::Result<Vec<u8>> {
+    async fn exchange_no_cache(&self, query: &QueryContext) -> anyhow::Result<Vec<u8>> {
         let qname = query.qdomain().unwrap_or_default();
 
         if let (Some(proxy_upstreams), Some(proxy_domains)) =
@@ -444,18 +443,18 @@ impl EnhancedResolver {
                 domain = %qname,
                 "using proxy-server-nameserver for proxy server domain"
             );
-            return self.batch_exchange(proxy_upstreams, raw_query).await;
+            return self.batch_exchange(proxy_upstreams, query).await;
         }
 
         if let Some(policy) = &self.policy {
             if let Some(upstreams) = policy.match_policy(qname) {
                 debug!(domain = %qname, ?upstreams, "DNS matched nameserver policy");
-                return self.batch_exchange(upstreams, raw_query).await;
+                return self.batch_exchange(upstreams, query).await;
             }
         }
 
         trace!(domain = %qname, "DNS proceeding to main/fallback upstreams");
-        self.fallback_exchange(query, raw_query).await
+        self.fallback_exchange(query).await
     }
 
     async fn process_fresh_response(
@@ -710,10 +709,8 @@ impl ClashResolver for EnhancedResolver {
     }
 
     #[instrument(skip_all, level = "trace")]
-    async fn exchange(&self, raw_query: &[u8]) -> anyhow::Result<Vec<u8>> {
-        let query = QueryContext::parse(raw_query)
-            .map_err(|e| anyhow!("invalid DNS query: {e:?}"))?;
-
+    async fn exchange(&self, query: &QueryContext, _source_ip: Option<net::IpAddr>) -> anyhow::Result<Vec<u8>> {
+        let raw_query = query.wire();
         let host = query.qdomain().unwrap_or_default();
 
         let qtype = query.qtype().unwrap_or(QType::A);
@@ -751,7 +748,7 @@ impl ClashResolver for EnhancedResolver {
                 };
                 if matches {
                     debug!(domain = %host, ip = ?host_ip, "DNS exchange matched hosts");
-                    if let Some(resp) = build_dns_ip_response(raw_query, &[*host_ip], 60) {
+                    if let Some(resp) = build_dns_ip_response(query, &[*host_ip], 60) {
                         return Ok(resp);
                     }
                 }
@@ -766,13 +763,13 @@ impl ClashResolver for EnhancedResolver {
                 if qtype == QType::A {
                     let fake_ip = fake_dns.lookup(host);
                     debug!(domain = %host, ?fake_ip, "DNS exchange assigned Fake-IP (A)");
-                    if let Some(resp) = build_dns_ip_response(raw_query, &[fake_ip], self.fake_ip_ttl) {
+                    if let Some(resp) = build_dns_ip_response(query, &[fake_ip], self.fake_ip_ttl) {
                         return Ok(resp);
                     }
                 } else if qtype == QType::AAAA && self.ipv6() {
                     let fake_ip = fake_dns.lookupv6(host);
                     debug!(domain = %host, ?fake_ip, "DNS exchange assigned Fake-IP (AAAA)");
-                    if let Some(resp) = build_dns_ip_response(raw_query, &[fake_ip], self.fake_ip_ttl) {
+                    if let Some(resp) = build_dns_ip_response(query, &[fake_ip], self.fake_ip_ttl) {
                         return Ok(resp);
                     }
                 }
@@ -797,7 +794,7 @@ impl ClashResolver for EnhancedResolver {
                         let this = self.clone();
 
                         tokio::spawn(async move {
-                            if let Ok(fresh_resp) = this.exchange_no_cache(&query_clone, &raw_key).await {
+                            if let Ok(fresh_resp) = this.exchange_no_cache(&query_clone).await {
                                 let fresh_template = ResponseTemplate::validate(&query_clone, &fresh_resp)
                                     .ok()
                                     .map(Arc::new);
@@ -839,11 +836,11 @@ impl ClashResolver for EnhancedResolver {
                     return Ok(rendered);
                 }
                 // Retry as leader if waiter didn't get response
-                let resp = self.exchange_no_cache(&query, raw_query).await?;
+                let resp = self.exchange_no_cache(query).await?;
                 (resp, None)
             }
             FlightRole::Leader(mut leader) => {
-                let resp = self.exchange_no_cache(&query, raw_query).await?;
+                let resp = self.exchange_no_cache(query).await?;
                 if let Ok(template) = ResponseTemplate::validate(&query, &resp) {
                     let arc_template = Arc::new(template);
                     leader.publish(Arc::clone(&arc_template));
@@ -853,7 +850,7 @@ impl ClashResolver for EnhancedResolver {
                 }
             }
             FlightRole::Rejected => {
-                let resp = self.exchange_no_cache(&query, raw_query).await?;
+                let resp = self.exchange_no_cache(query).await?;
                 (resp, None)
             }
         };
@@ -1073,11 +1070,11 @@ impl ClashResolver for BootstrapResolver {
         }
         let name = DnsName::from_domain(host)
             .ok_or_else(|| anyhow!("invalid domain name: {host}"))?;
-        let query = build_dns_query_wire(&name, QType::A);
+        let query = QueryContext::new(name, QType::A);
         let queries = self
             .upstreams
             .iter()
-            .map(|ns| Box::pin(self.pool.query(ns, &query)));
+            .map(|ns| Box::pin(self.pool.query(ns, &query, None)));
         let (resp, _) = futures::future::select_ok(queries).await?;
         let ips = extract_ips_from_dns_response(&resp);
         for ip in ips {
@@ -1101,11 +1098,11 @@ impl ClashResolver for BootstrapResolver {
         }
         let name = DnsName::from_domain(host)
             .ok_or_else(|| anyhow!("invalid domain name: {host}"))?;
-        let query = build_dns_query_wire(&name, QType::AAAA);
+        let query = QueryContext::new(name, QType::AAAA);
         let queries = self
             .upstreams
             .iter()
-            .map(|ns| Box::pin(self.pool.query(ns, &query)));
+            .map(|ns| Box::pin(self.pool.query(ns, &query, None)));
         let (resp, _) = futures::future::select_ok(queries).await?;
         let ips = extract_ips_from_dns_response(&resp);
         for ip in ips {
@@ -1120,11 +1117,11 @@ impl ClashResolver for BootstrapResolver {
         None
     }
 
-    async fn exchange(&self, message: &[u8]) -> anyhow::Result<Vec<u8>> {
+    async fn exchange(&self, query: &QueryContext, _source_ip: Option<net::IpAddr>) -> anyhow::Result<Vec<u8>> {
         let queries = self
             .upstreams
             .iter()
-            .map(|ns| Box::pin(self.pool.query(ns, message)));
+            .map(|ns| Box::pin(self.pool.query(ns, query, None)));
         let (resp, _) = futures::future::select_ok(queries).await?;
         Ok(resp)
     }

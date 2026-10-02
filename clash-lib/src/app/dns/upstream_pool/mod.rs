@@ -17,6 +17,7 @@ pub use transports::{PooledTransport, TransportKey, TransportPool};
 pub use udp::UdpUpstream;
 
 use crate::app::dns::ClashResolver;
+use crate::app::dns::query::QueryContext;
 use crate::proxy::utils::OutboundHandlerRegistry;
 
 pub struct UpstreamPool {
@@ -58,26 +59,14 @@ impl UpstreamPool {
     pub async fn query(
         &self,
         upstream_name: &str,
-        raw_query: &[u8],
-    ) -> anyhow::Result<Vec<u8>> {
-        let entry = self
-            .entries
-            .get(upstream_name)
-            .ok_or_else(|| anyhow::anyhow!("unknown upstream '{upstream_name}'"))?;
-        self.query_entry(entry, raw_query, None).await
-    }
-
-    pub async fn query_with_outbound(
-        &self,
-        upstream_name: &str,
-        raw_query: &[u8],
+        query: &QueryContext,
         outbound: Option<&str>,
     ) -> anyhow::Result<Vec<u8>> {
         let entry = self
             .entries
             .get(upstream_name)
             .ok_or_else(|| anyhow::anyhow!("unknown upstream '{upstream_name}'"))?;
-        self.query_entry(entry, raw_query, outbound).await
+        self.query_entry(entry, query, outbound).await
     }
 
     pub async fn close(&self) {

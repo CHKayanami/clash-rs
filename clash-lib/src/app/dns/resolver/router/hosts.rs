@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use tracing::{debug, warn};
 
-use crate::app::dns::query::QType;
+use crate::app::dns::query::{QType, QueryContext};
 use crate::app::dns::response::{RenderedResponse, build_dns_ip_response};
 use crate::common::trie::StringTrie;
 
@@ -82,13 +82,12 @@ impl HostsSnapshot {
 
     pub(super) fn make_response(
         &self,
-        raw_query: &[u8],
-        domain: &str,
-        qtype: QType,
+        query: &QueryContext,
         ipv6: bool,
     ) -> Option<RenderedResponse> {
-        let domain_normalized = domain.trim().trim_end_matches('.').to_ascii_lowercase();
-        let ips = self.trie.search(&domain_normalized)?.get_data()?;
+        let domain = query.qdomain()?;
+        let qtype = query.qtype()?;
+        let ips = self.trie.search(domain)?.get_data()?;
 
         let matching_ips: Vec<IpAddr> = match qtype {
             QType::A => ips.iter().copied().filter(|ip| ip.is_ipv4()).collect(),
@@ -100,7 +99,7 @@ impl HostsSnapshot {
             return None;
         }
 
-        let wire = build_dns_ip_response(raw_query, &matching_ips, HOSTS_TTL)?;
+        let wire = build_dns_ip_response(query, &matching_ips, HOSTS_TTL)?;
         Some(RenderedResponse { wire, answer_ips: matching_ips.into() })
     }
 }

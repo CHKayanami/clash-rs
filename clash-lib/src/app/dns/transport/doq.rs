@@ -1,5 +1,6 @@
 //! DNS over QUIC (RFC 9250).
 
+use crate::app::dns::query::QueryContext;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::time::Duration;
@@ -73,12 +74,12 @@ impl DoqClient {
 
     pub async fn exchange(
         self: &Arc<Self>,
-        raw_query: &[u8],
+        query: &QueryContext,
     ) -> anyhow::Result<Vec<u8>> {
         let timeout = self.query_timeout + self.dial_timeout;
         tokio::time::timeout(
             timeout,
-            exchange_with_retry("DoQ", || self.exchange_once(raw_query)),
+            exchange_with_retry("DoQ", || self.exchange_once(query)),
         )
         .await
         .map_err(|_| {
@@ -86,7 +87,7 @@ impl DoqClient {
         })?
     }
 
-    async fn exchange_once(&self, raw_query: &[u8]) -> anyhow::Result<Vec<u8>> {
+    async fn exchange_once(&self, query: &QueryContext) -> anyhow::Result<Vec<u8>> {
         let conn = self.get_conn().await?;
         let result = tokio::time::timeout(self.query_timeout, async {
             let (mut send, mut recv) = conn
@@ -94,15 +95,8 @@ impl DoqClient {
                 .await
                 .map_err(|e| anyhow::anyhow!("DoQ open_bi: {e}"))?;
 
-            let orig_id = if raw_query.len() >= 2 {
-                u16::from_be_bytes([raw_query[0], raw_query[1]])
-            } else {
-                0
-            };
-            let mut wire = raw_query.to_vec();
-            if wire.len() >= 2 {
-                wire[0..2].copy_from_slice(&[0, 0]);
-            }
+            let orig_id = query.txid().get();
+            let wire = query.canonical_wire_arc();
             crate::app::dns::framing::write_length_prefixed(&mut send, &wire)
                 .await?;
             send.finish()
@@ -174,6 +168,8 @@ impl DoqClient {
 
 #[cfg(test)]
 mod tests {
+    use bytes::Bytes;
+    use crate::app::dns::query::{IngressProfile, QueryContext};
     use super::super::quic_test_support::{self, SocksProxy};
     use super::*;
     use crate::app::dns::endpoint::DnsProtocol;
@@ -220,7 +216,7 @@ mod tests {
                 &DnsName::from_domain("proxy.test").unwrap(),
                 QType::A,
             );
-            let response = client.exchange(&query).await.unwrap();
+            let response = client.exchange(&QueryContext::parse(Bytes::copy_from_slice(&query), IngressProfile::Internal).unwrap()).await.unwrap();
             assert_eq!(response[..2], id.to_be_bytes());
         }
         assert_eq!(proxy.associations.load(Ordering::SeqCst), 1);

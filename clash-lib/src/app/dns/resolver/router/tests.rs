@@ -1,3 +1,5 @@
+use bytes::Bytes;
+use crate::app::dns::query::IngressProfile;
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::str::FromStr;
@@ -55,8 +57,8 @@ async fn test_cache_delete_prefers_configured_upstream_tag_over_fakeip_alias() {
 
     let name = DnsName::from_domain("example.com").unwrap();
     let wire = build_dns_query_wire(&name, QType::A);
-    let query = QueryContext::parse(&wire).unwrap();
-    let response = build_dns_ip_response(&wire, &["1.2.3.4".parse().unwrap()], 60).unwrap();
+    let query = QueryContext::parse(Bytes::copy_from_slice(&wire), IngressProfile::Internal).unwrap();
+    let response = build_dns_ip_response(&QueryContext::parse(Bytes::copy_from_slice(&wire), IngressProfile::Internal).unwrap(), &["1.2.3.4".parse().unwrap()], 60).unwrap();
     let template = Arc::new(ResponseTemplate::validate(&query, &response).unwrap());
     resolver.cache.insert_scoped(
         &Arc::from("fakeip"),
@@ -152,17 +154,17 @@ fn test_hosts_snapshot() {
 
     // 测试 make_response
     let name = DnsName::from_domain("localhost").unwrap();
-    let q_a = build_dns_query_wire(&name, QType::A);
+    let q_a = QueryContext::new(name.clone(), QType::A);
     let resp_a = snapshot
-        .make_response(&q_a, "localhost", QType::A, true)
+        .make_response(&q_a, true)
         .expect("make_response A");
     let ips_a = extract_ips_from_dns_response(&resp_a.wire);
     assert_eq!(ips_a, vec![IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))]);
     assert_eq!(resp_a.answer_ips.as_ref(), ips_a.as_slice());
 
-    let q_aaaa = build_dns_query_wire(&name, QType::AAAA);
+    let q_aaaa = QueryContext::new(name.clone(), QType::AAAA);
     let resp_aaaa = snapshot
-        .make_response(&q_aaaa, "localhost", QType::AAAA, true)
+        .make_response(&q_aaaa, true)
         .expect("make_response AAAA");
     let ips_aaaa = extract_ips_from_dns_response(&resp_aaaa.wire);
     assert_eq!(ips_aaaa, vec![IpAddr::V6(Ipv6Addr::LOCALHOST)]);
@@ -170,12 +172,12 @@ fn test_hosts_snapshot() {
 
     // ipv6 为 false 时，AAAA 请求返回 None
     assert!(snapshot
-        .make_response(&q_aaaa, "localhost", QType::AAAA, false)
+        .make_response(&q_aaaa, false)
         .is_none());
 
     // 非 A/AAAA 请求返回 None
     assert!(snapshot
-        .make_response(&q_a, "localhost", QType::TXT, true)
+        .make_response(&QueryContext::new(name, QType::TXT), true)
         .is_none());
 
     let _ = std::fs::remove_file(tmp_hosts_file);
@@ -353,9 +355,9 @@ async fn test_fakeip_transport_ttl() {
 
     let name = DnsName::from_domain("google.com").unwrap();
     let raw_query = build_dns_query_wire(&name, QType::A);
-    let query_ctx = QueryContext::parse(&raw_query).unwrap();
+    let query_ctx = QueryContext::parse(Bytes::copy_from_slice(&raw_query), IngressProfile::Internal).unwrap();
 
-    let resp = transport.exchange(&raw_query, &query_ctx).await.unwrap();
+    let resp = transport.exchange(&query_ctx).await.unwrap();
     let records = extract_ips_with_ttl(&resp.wire);
     assert_eq!(records.len(), 1);
     assert_eq!(records[0].1, custom_ttl);
@@ -363,8 +365,8 @@ async fn test_fakeip_transport_ttl() {
     // Root/empty domain should return NODATA and not allocate fake-ip
     let root_name = DnsName::from_domain(".").unwrap();
     let root_query = build_dns_query_wire(&root_name, QType::A);
-    let root_ctx = QueryContext::parse(&root_query).unwrap();
-    let root_resp = transport.exchange(&root_query, &root_ctx).await.unwrap();
+    let root_ctx = QueryContext::parse(Bytes::copy_from_slice(&root_query), IngressProfile::Internal).unwrap();
+    let root_resp = transport.exchange(&root_ctx).await.unwrap();
     let root_records = extract_ips_with_ttl(&root_resp.wire);
     assert_eq!(root_records.len(), 0);
 }
@@ -425,7 +427,7 @@ fn test_dns2_cache_policy_effective_ttl() {
     let query_wire = build_dns_query_wire(&qname, QType::A);
 
     // 构造一个原始 TTL 为 60 的响应
-    let resp = build_dns_ip_response(&query_wire, &[IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))], 60).unwrap();
+    let resp = build_dns_ip_response(&QueryContext::parse(Bytes::copy_from_slice(&query_wire), IngressProfile::Internal).unwrap(), &[IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))], 60).unwrap();
 
     // 1. 无 optimistic TTL 时保持原上游 TTL
     assert_eq!(policy_default.calculate_effective_ttl(None, &resp), 60);
@@ -481,7 +483,7 @@ async fn test_router_resolver_fresh_vs_cache_hit_notification() {
         let mut buf = vec![0u8; 512];
         while let Ok((len, src)) = server_sock.recv_from(&mut buf).await {
             let req = &buf[..len];
-            let resp = build_dns_ip_response(req, &["93.184.216.34".parse().unwrap()], 60).unwrap();
+            let resp = build_dns_ip_response(&QueryContext::parse(Bytes::copy_from_slice(req), IngressProfile::Internal).unwrap(), &["93.184.216.34".parse().unwrap()], 60).unwrap();
             let _ = server_sock.send_to(&resp, src).await;
         }
     });
@@ -532,13 +534,13 @@ async fn test_router_resolver_fresh_vs_cache_hit_notification() {
     let query_wire = build_dns_query_wire(&name, QType::A);
 
     // 1. 第一次请求：Cache Miss，产生真实网络查询并写入缓存 -> is_fresh = true，触发 1 次 hook
-    let resp1 = resolver.exchange(&query_wire).await.unwrap();
+    let resp1 = resolver.exchange(&QueryContext::parse(Bytes::copy_from_slice(&query_wire), IngressProfile::Internal).unwrap(), None).await.unwrap();
     assert_eq!(extract_ips_from_dns_response(&resp1), vec!["93.184.216.34".parse::<IpAddr>().unwrap()]);
     assert_eq!(hook_calls.load(Ordering::SeqCst), 1);
     assert_eq!(resolver.cached_for("93.184.216.34".parse::<IpAddr>().unwrap()), Some("example.com".to_string()));
 
     // 2. 第二次请求：Cache Hit -> is_fresh = false，直接从缓存出，绝不重复触发 hook！
-    let resp2 = resolver.exchange(&query_wire).await.unwrap();
+    let resp2 = resolver.exchange(&QueryContext::parse(Bytes::copy_from_slice(&query_wire), IngressProfile::Internal).unwrap(), None).await.unwrap();
     assert_eq!(extract_ips_from_dns_response(&resp2), vec!["93.184.216.34".parse::<IpAddr>().unwrap()]);
     assert_eq!(hook_calls.load(Ordering::SeqCst), 1); // 仍然是 1，未重复触发！
 
@@ -563,7 +565,7 @@ async fn test_router_resolver_polluted_requery_prevents_dirty_cache_and_hook() {
         let mut buf = vec![0u8; 512];
         while let Ok((len, src)) = local_sock.recv_from(&mut buf).await {
             let req = &buf[..len];
-            let resp = build_dns_ip_response(req, &["198.18.0.1".parse().unwrap()], 60).unwrap();
+            let resp = build_dns_ip_response(&QueryContext::parse(Bytes::copy_from_slice(req), IngressProfile::Internal).unwrap(), &["198.18.0.1".parse().unwrap()], 60).unwrap();
             let _ = local_sock.send_to(&resp, src).await;
         }
     });
@@ -575,7 +577,7 @@ async fn test_router_resolver_polluted_requery_prevents_dirty_cache_and_hook() {
         let mut buf = vec![0u8; 512];
         while let Ok((len, src)) = remote_sock.recv_from(&mut buf).await {
             let req = &buf[..len];
-            let resp = build_dns_ip_response(req, &["93.184.216.34".parse().unwrap()], 60).unwrap();
+            let resp = build_dns_ip_response(&QueryContext::parse(Bytes::copy_from_slice(req), IngressProfile::Internal).unwrap(), &["93.184.216.34".parse().unwrap()], 60).unwrap();
             let _ = remote_sock.send_to(&resp, src).await;
         }
     });
@@ -659,7 +661,7 @@ async fn test_router_resolver_polluted_requery_prevents_dirty_cache_and_hook() {
     let name = DnsName::from_domain("polluted-domain.com").unwrap();
     let query_wire = build_dns_query_wire(&name, QType::A);
 
-    let resp = resolver.exchange(&query_wire).await.unwrap();
+    let resp = resolver.exchange(&QueryContext::parse(Bytes::copy_from_slice(&query_wire), IngressProfile::Internal).unwrap(), None).await.unwrap();
     let final_ips = extract_ips_from_dns_response(&resp);
 
     // 最终返回的一定是 remote 的真实 IP
@@ -706,7 +708,7 @@ async fn test_router_resolver_stale_refresh_notification_with_rule_filter() {
                 "1.1.1.2".parse::<IpAddr>().unwrap()
             };
             let req = &buf[..len];
-            if let Some(resp) = build_dns_ip_response(req, &[ip_to_return], 1) {
+            if let Some(resp) = build_dns_ip_response(&QueryContext::parse(Bytes::copy_from_slice(req), IngressProfile::Internal).unwrap(), &[ip_to_return], 1) {
                 let _ = socket.send_to(&resp, peer).await;
             }
         }
@@ -759,7 +761,7 @@ async fn test_router_resolver_stale_refresh_notification_with_rule_filter() {
     let query_wire = build_dns_query_wire(&name, QType::A);
 
     // 1. 第一次查询：命中网络，拿到 1.1.1.1
-    let resp1 = resolver.exchange(&query_wire).await.unwrap();
+    let resp1 = resolver.exchange(&QueryContext::parse(Bytes::copy_from_slice(&query_wire), IngressProfile::Internal).unwrap(), None).await.unwrap();
     assert_eq!(extract_ips_from_dns_response(&resp1), vec!["1.1.1.1".parse::<IpAddr>().unwrap()]);
     assert_eq!(*hooked_ips.lock(), vec!["1.1.1.1".parse::<IpAddr>().unwrap()]);
     assert_eq!(resolver.cached_for("1.1.1.1".parse::<IpAddr>().unwrap()), Some("stale-domain.com".to_string()));
@@ -768,7 +770,7 @@ async fn test_router_resolver_stale_refresh_notification_with_rule_filter() {
     tokio::time::sleep(tokio::time::Duration::from_millis(1100)).await;
 
     // 3. 第二次查询：前台极速命中 Stale 缓存，返回 1.1.1.1，同时后台发起异步刷新
-    let resp2 = resolver.exchange(&query_wire).await.unwrap();
+    let resp2 = resolver.exchange(&QueryContext::parse(Bytes::copy_from_slice(&query_wire), IngressProfile::Internal).unwrap(), None).await.unwrap();
     assert_eq!(extract_ips_from_dns_response(&resp2), vec!["1.1.1.1".parse::<IpAddr>().unwrap()]);
 
     // 4. 等待后台刷新任务完成
@@ -819,7 +821,8 @@ async fn remote_failover_leaves_budget_for_second_server() {
     });
     let endpoint = RemoteEndpoint::new("test".into(), vec!["silent".into(), "healthy".into()], pool.clone());
     let query = build_dns_query_wire(&DnsName::from_domain("failover.test").unwrap(), QType::A);
-    let response = tokio::time::timeout(Duration::from_secs(1), endpoint.fetch(&query, "failover.test", QType::A))
+    let context = QueryContext::parse(Bytes::copy_from_slice(&query), IngressProfile::Internal).unwrap();
+    let response = tokio::time::timeout(Duration::from_secs(1), endpoint.fetch(&context))
         .await.unwrap().unwrap();
     assert_eq!(response[..2], query[..2]);
     server.await.unwrap();

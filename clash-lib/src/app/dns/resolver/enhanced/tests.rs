@@ -1,3 +1,6 @@
+use bytes::Bytes;
+use crate::app::dns::query::QueryContext;
+use crate::app::dns::query::IngressProfile;
 use std::collections::HashSet;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
@@ -101,7 +104,7 @@ async fn test_dns_resolution_hook_triggered() {
 
     // Build mock response and test hook
     if let Some(hook) = resolver.inner.resolution_hook.load().as_ref() {
-        let resp = build_dns_ip_response(&query_wire, &["93.184.216.34".parse().unwrap()], 120).unwrap();
+        let resp = build_dns_ip_response(&QueryContext::parse(Bytes::copy_from_slice(&query_wire), IngressProfile::Internal).unwrap(), &["93.184.216.34".parse().unwrap()], 120).unwrap();
         let ips = crate::app::dns::wire::extract_ips_from_dns_response(&resp);
         (hook.0)("hook-test.com", &ips, Duration::from_secs(120));
     }
@@ -149,7 +152,7 @@ async fn test_dns_resolution_hook_end_to_end_on_exchange() {
         let mut buf = vec![0u8; 512];
         if let Ok((len, src)) = server_sock.recv_from(&mut buf).await {
             let req = &buf[..len];
-            let resp = build_dns_ip_response(req, &["93.184.216.34".parse().unwrap()], 120).unwrap();
+            let resp = build_dns_ip_response(&QueryContext::parse(Bytes::copy_from_slice(req), IngressProfile::Internal).unwrap(), &["93.184.216.34".parse().unwrap()], 120).unwrap();
             let _ = server_sock.send_to(&resp, src).await;
         }
     });
@@ -214,7 +217,7 @@ async fn test_dns_resolution_hook_end_to_end_on_exchange() {
     let name = DnsName::from_domain("hook-e2e.com").unwrap();
     let query_wire = build_dns_query_wire_with_id(0x5678, &name, QType::A);
 
-    let resp = resolver.exchange(&query_wire).await.expect("query exchange should succeed");
+    let resp = resolver.exchange(&QueryContext::parse(Bytes::copy_from_slice(&query_wire), IngressProfile::Internal).unwrap(), None).await.expect("query exchange should succeed");
     let ips = crate::app::dns::wire::extract_ips_from_dns_response(&resp);
     assert_eq!(ips, vec!["93.184.216.34".parse::<std::net::IpAddr>().unwrap()]);
 
@@ -276,7 +279,7 @@ async fn test_fake_ip_exchange() {
     let name = DnsName::from_domain("example.com").unwrap();
     let query_wire = build_dns_query_wire_with_id(0x1122, &name, QType::A);
 
-    let resp = resolver.exchange(&query_wire).await.expect("fake ip exchange should succeed");
+    let resp = resolver.exchange(&QueryContext::parse(Bytes::copy_from_slice(&query_wire), IngressProfile::Internal).unwrap(), None).await.expect("fake ip exchange should succeed");
     let ips = crate::app::dns::wire::extract_ips_from_dns_response(&resp);
     assert_eq!(ips.len(), 1);
     assert!(resolver.is_fake_ip(ips[0]));
@@ -286,7 +289,7 @@ async fn test_fake_ip_exchange() {
     // Root/empty domain must not allocate Fake-IP and must return NODATA directly
     let root_name = DnsName::from_domain(".").unwrap();
     let root_query_wire = build_dns_query_wire_with_id(0x3344, &root_name, QType::A);
-    let root_resp = resolver.exchange(&root_query_wire).await.expect("root query should return NODATA response");
+    let root_resp = resolver.exchange(&QueryContext::parse(Bytes::copy_from_slice(&root_query_wire), IngressProfile::Internal).unwrap(), None).await.expect("root query should return NODATA response");
     let root_ips = crate::app::dns::wire::extract_ips_from_dns_response(&root_resp);
     assert_eq!(root_ips.len(), 0);
     assert_eq!(fake_dns.search_cache("*").len(), mappings_before_root);
@@ -453,8 +456,8 @@ async fn test_reverse_lookup_cache_integration_and_conflict() {
     let ip: std::net::IpAddr = "1.2.3.4".parse().unwrap();
     let name_a = DnsName::from_domain("domain-a.com").unwrap();
     let query_wire_a = build_dns_query_wire_with_id(0x1234, &name_a, QType::A);
-    let resp_a = build_dns_ip_response(&query_wire_a, &[ip], 120).unwrap();
-    let query_a = QueryContext::parse(&query_wire_a).unwrap();
+    let resp_a = build_dns_ip_response(&QueryContext::parse(Bytes::copy_from_slice(&query_wire_a), IngressProfile::Internal).unwrap(), &[ip], 120).unwrap();
+    let query_a = QueryContext::parse(Bytes::copy_from_slice(&query_wire_a), IngressProfile::Internal).unwrap();
 
     resolver.process_fresh_response(&query_a, "domain-a.com", &resp_a, None).await;
 
@@ -464,8 +467,8 @@ async fn test_reverse_lookup_cache_integration_and_conflict() {
     // 2. Now process another real DNS response for domain-b.com -> 1.2.3.4 (same IP, different domain)
     let name_b = DnsName::from_domain("domain-b.com").unwrap();
     let query_wire_b = build_dns_query_wire_with_id(0x5678, &name_b, QType::A);
-    let resp_b = build_dns_ip_response(&query_wire_b, &[ip], 120).unwrap();
-    let query_b = QueryContext::parse(&query_wire_b).unwrap();
+    let resp_b = build_dns_ip_response(&QueryContext::parse(Bytes::copy_from_slice(&query_wire_b), IngressProfile::Internal).unwrap(), &[ip], 120).unwrap();
+    let query_b = QueryContext::parse(Bytes::copy_from_slice(&query_wire_b), IngressProfile::Internal).unwrap();
 
     resolver.process_fresh_response(&query_b, "domain-b.com", &resp_b, None).await;
 
@@ -475,8 +478,8 @@ async fn test_reverse_lookup_cache_integration_and_conflict() {
     let other_ip: std::net::IpAddr = "5.6.7.8".parse().unwrap();
     let name_c = DnsName::from_domain("domain-c.com").unwrap();
     let query_wire_c = build_dns_query_wire_with_id(0x9abc, &name_c, QType::A);
-    let resp_c = build_dns_ip_response(&query_wire_c, &[other_ip], 120).unwrap();
-    let query_c = QueryContext::parse(&query_wire_c).unwrap();
+    let resp_c = build_dns_ip_response(&QueryContext::parse(Bytes::copy_from_slice(&query_wire_c), IngressProfile::Internal).unwrap(), &[other_ip], 120).unwrap();
+    let query_c = QueryContext::parse(Bytes::copy_from_slice(&query_wire_c), IngressProfile::Internal).unwrap();
     let template_c = Arc::new(crate::app::dns::response::ResponseTemplate::validate(&query_c, &resp_c).unwrap());
     resolver.process_fresh_response(&query_c, "domain-c.com", &resp_c, Some(template_c)).await;
     assert_eq!(resolver.reverse_lookup(other_ip).as_deref(), Some("domain-c.com"));
@@ -529,7 +532,7 @@ async fn test_qtype_filter_exchange() {
 
     // 1. Query HTTPS (Type 65) -> filtered -> returns NODATA
     let https_query = build_dns_query_wire_with_id(0x1001, &name, QType::HTTPS);
-    let resp = resolver.exchange(&https_query).await.expect("exchange should succeed");
+    let resp = resolver.exchange(&QueryContext::parse(Bytes::copy_from_slice(&https_query), IngressProfile::Internal).unwrap(), None).await.expect("exchange should succeed");
     // Verify response header: QR=1, RCODE=0 (NoError), ANCOUNT=0
     assert!(resp.len() >= 12);
     let flags = u16::from_be_bytes([resp[2], resp[3]]);
@@ -540,7 +543,7 @@ async fn test_qtype_filter_exchange() {
 
     // 2. Query TXT (Type 16) -> filtered -> returns NODATA
     let txt_query = build_dns_query_wire_with_id(0x1002, &name, QType::TXT);
-    let resp = resolver.exchange(&txt_query).await.expect("exchange should succeed");
+    let resp = resolver.exchange(&QueryContext::parse(Bytes::copy_from_slice(&txt_query), IngressProfile::Internal).unwrap(), None).await.expect("exchange should succeed");
     let flags = u16::from_be_bytes([resp[2], resp[3]]);
     let rcode = flags & 0x000F;
     let ancount = u16::from_be_bytes([resp[6], resp[7]]);

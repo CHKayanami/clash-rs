@@ -1,3 +1,4 @@
+use crate::app::dns::query::QueryContext;
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
@@ -98,13 +99,13 @@ impl PooledTransport {
         }
     }
 
-    pub async fn exchange(&self, raw_query: &[u8]) -> anyhow::Result<Vec<u8>> {
+    pub async fn exchange(&self, query: &QueryContext) -> anyhow::Result<Vec<u8>> {
         match self {
-            Self::Tcp(transport) => transport.exchange(raw_query).await,
-            Self::Dot(transport) => transport.exchange(raw_query).await,
-            Self::Doh(transport) => transport.exchange(raw_query).await,
-            Self::Doq(transport) => transport.exchange(raw_query).await,
-            Self::Doh3(transport) => transport.exchange(raw_query).await,
+            Self::Tcp(transport) => transport.exchange(query).await,
+            Self::Dot(transport) => transport.exchange(query).await,
+            Self::Doh(transport) => transport.exchange(query).await,
+            Self::Doq(transport) => transport.exchange(query).await,
+            Self::Doh3(transport) => transport.exchange(query).await,
         }
     }
 }
@@ -220,6 +221,8 @@ impl UpstreamPool {
 
 #[cfg(test)]
 mod tests {
+    use bytes::Bytes;
+    use crate::app::dns::query::{IngressProfile, QueryContext};
     use super::*;
     use crate::app::dns::config::{DNSNetMode, NameServer};
     use crate::app::dns::query::{DnsName, QType, build_dns_query_wire};
@@ -293,7 +296,7 @@ mod tests {
                     let query = query.clone();
                     queries.spawn(async move {
                         let response = pool
-                            .query_with_outbound("test", &query, outbound)
+                            .query("test", &QueryContext::parse(Bytes::copy_from_slice(&query), IngressProfile::Internal).unwrap(), outbound)
                             .await
                             .unwrap();
                         assert_eq!(response[..2], query[..2]);

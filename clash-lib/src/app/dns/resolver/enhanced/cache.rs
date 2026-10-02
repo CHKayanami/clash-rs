@@ -1,3 +1,5 @@
+#[cfg(test)]
+use crate::app::dns::query::IngressProfile;
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
@@ -298,6 +300,7 @@ pub struct DnsCacheEntryDetail {
 
 #[cfg(test)]
 mod tests {
+    use bytes::Bytes;
     use super::*;
     use crate::app::dns::query::{build_dns_query_wire_with_id, DnsName, QType};
     use crate::app::dns::response::build_dns_ip_response;
@@ -307,9 +310,9 @@ mod tests {
         let cache = DnsCache::new(100);
         let name = DnsName::from_domain("example.com").unwrap();
         let query_bytes = build_dns_query_wire_with_id(0x1234, &name, QType::A);
-        let query = QueryContext::parse(&query_bytes).unwrap();
+        let query = QueryContext::parse(Bytes::copy_from_slice(&query_bytes), IngressProfile::Internal).unwrap();
 
-        let resp_bytes = build_dns_ip_response(&query_bytes, &["1.2.3.4".parse().unwrap()], 10).unwrap();
+        let resp_bytes = build_dns_ip_response(&QueryContext::parse(Bytes::copy_from_slice(&query_bytes), IngressProfile::Internal).unwrap(), &["1.2.3.4".parse().unwrap()], 10).unwrap();
         let template = Arc::new(ResponseTemplate::validate(&query, &resp_bytes).unwrap());
 
         // Cache miss initially
@@ -351,12 +354,12 @@ mod tests {
         let cache = DnsCache::new(100);
         let name = DnsName::from_domain("example.com").unwrap();
         let query_bytes = build_dns_query_wire_with_id(0x1234, &name, QType::A);
-        let query = QueryContext::parse(&query_bytes).unwrap();
+        let query = QueryContext::parse(Bytes::copy_from_slice(&query_bytes), IngressProfile::Internal).unwrap();
 
-        let resp_remote = build_dns_ip_response(&query_bytes, &["1.1.1.1".parse().unwrap()], 10).unwrap();
+        let resp_remote = build_dns_ip_response(&QueryContext::parse(Bytes::copy_from_slice(&query_bytes), IngressProfile::Internal).unwrap(), &["1.1.1.1".parse().unwrap()], 10).unwrap();
         let tmpl_remote = Arc::new(ResponseTemplate::validate(&query, &resp_remote).unwrap());
 
-        let resp_local = build_dns_ip_response(&query_bytes, &["127.0.0.1".parse().unwrap()], 10).unwrap();
+        let resp_local = build_dns_ip_response(&QueryContext::parse(Bytes::copy_from_slice(&query_bytes), IngressProfile::Internal).unwrap(), &["127.0.0.1".parse().unwrap()], 10).unwrap();
         let tmpl_local = Arc::new(ResponseTemplate::validate(&query, &resp_local).unwrap());
 
         let remote_scope: Arc<str> = Arc::from("remote");
@@ -396,9 +399,9 @@ mod tests {
         let cache = DnsCache::new(100);
         let name_upper = DnsName::from_domain("ExAmPlE.CoM").unwrap();
         let query_upper_wire = build_dns_query_wire_with_id(0x1111, &name_upper, QType::A);
-        let query_upper = QueryContext::parse(&query_upper_wire).unwrap();
+        let query_upper = QueryContext::parse(Bytes::copy_from_slice(&query_upper_wire), IngressProfile::Internal).unwrap();
 
-        let resp = build_dns_ip_response(&query_upper_wire, &["8.8.8.8".parse().unwrap()], 60).unwrap();
+        let resp = build_dns_ip_response(&QueryContext::parse(Bytes::copy_from_slice(&query_upper_wire), IngressProfile::Internal).unwrap(), &["8.8.8.8".parse().unwrap()], 60).unwrap();
         let template = Arc::new(ResponseTemplate::validate(&query_upper, &resp).unwrap());
 
         let scope: Arc<str> = Arc::from("upstream1");
@@ -407,7 +410,7 @@ mod tests {
         // 客户端发来全小写的同域名查询
         let name_lower = DnsName::from_domain("example.com").unwrap();
         let query_lower_wire = build_dns_query_wire_with_id(0x2222, &name_lower, QType::A);
-        let query_lower = QueryContext::parse(&query_lower_wire).unwrap();
+        let query_lower = QueryContext::parse(Bytes::copy_from_slice(&query_lower_wire), IngressProfile::Internal).unwrap();
 
         let now = Instant::now();
         match cache.lookup_scoped(&scope, &query_lower, now) {

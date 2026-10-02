@@ -7,7 +7,7 @@ use enum_dispatch::enum_dispatch;
 use tracing::debug;
 
 use crate::app::dns::fakeip::FakeDns;
-use crate::app::dns::query::{DnsName, QType, QueryContext, build_dns_query_wire};
+use crate::app::dns::query::{DnsName, IngressProfile, QType, QueryContext};
 use crate::app::dns::resolver::enhanced::{
     CacheLookup, DnsCache, ReverseLookupCache,
 };
@@ -111,7 +111,6 @@ impl DnsResolvedNotifier {
 pub struct RefreshTicket {
     transport: CachedTransport,
     leader: FlightLeader,
-    raw_query: Vec<u8>,
     query: QueryContext,
 }
 
@@ -126,7 +125,7 @@ impl RefreshTicket {
 
     pub async fn run(self) -> anyhow::Result<ExchangeResult> {
         self.transport
-            .fetch_and_cache(&self.raw_query, &self.query, Some(self.leader))
+            .fetch_and_cache(&self.query, Some(self.leader))
             .await
     }
 }
@@ -188,7 +187,6 @@ pub trait DnsTransport: Send + Sync {
 
     async fn exchange(
         &self,
-        raw_query: &[u8],
         query: &QueryContext,
     ) -> anyhow::Result<ExchangeResult>;
     async fn resolve_ip(
@@ -203,9 +201,7 @@ pub trait DnsTransport: Send + Sync {
 pub trait TransportEndpoint: Send + Sync + 'static {
     async fn fetch(
         &self,
-        raw_query: &[u8],
-        domain: &str,
-        qtype: QType,
+        query: &QueryContext,
     ) -> anyhow::Result<Vec<u8>>;
 }
 
@@ -233,10 +229,10 @@ impl RemoteEndpoint {
 impl TransportEndpoint for RemoteEndpoint {
     async fn fetch(
         &self,
-        raw_query: &[u8],
-        domain: &str,
-        _qtype: QType,
+        query: &QueryContext,
     ) -> anyhow::Result<Vec<u8>> {
+        let domain = query.qdomain().unwrap_or_default();
+        let qtype = query.qtype().unwrap_or(QType::A);
         if self.upstream_keys.is_empty() {
             anyhow::bail!("upstream '{}' has no servers configured", self.tag);
         }
@@ -251,7 +247,7 @@ impl TransportEndpoint for RemoteEndpoint {
                 let servers_left = (self.upstream_keys.len() - index) as u32;
                 let attempt = tokio::time::timeout(
                     remaining / servers_left,
-                    self.pool.query(key, raw_query),
+                    self.pool.query(key, query, None),
                 )
                 .await
                 .unwrap_or_else(|_| {
@@ -266,6 +262,7 @@ impl TransportEndpoint for RemoteEndpoint {
                             upstream = %self.tag,
                             server = %key,
                             domain,
+                            qtype = %qtype,
                             "upstream query failed: {err}"
                         );
                         last_err = Some(err);
@@ -298,10 +295,11 @@ impl LocalEndpoint {
 impl TransportEndpoint for LocalEndpoint {
     async fn fetch(
         &self,
-        raw_query: &[u8],
-        domain: &str,
-        qtype: QType,
+        query: &QueryContext,
     ) -> anyhow::Result<Vec<u8>> {
+        let domain = query.qdomain().unwrap_or_default();
+        let raw_query = query.wire();
+        let qtype = query.qtype().unwrap_or(QType::A);
         if qtype != QType::A && qtype != QType::AAAA {
             return Ok(build_dns_nodata(raw_query));
         }
@@ -325,7 +323,7 @@ impl TransportEndpoint for LocalEndpoint {
 
         if matching.is_empty() {
             Ok(build_dns_nodata(raw_query))
-        } else if let Some(resp) = build_dns_ip_response(raw_query, &matching, 60) {
+        } else if let Some(resp) = build_dns_ip_response(query, &matching, 60) {
             Ok(resp)
         } else {
             Ok(build_dns_nodata(raw_query))
@@ -373,11 +371,10 @@ impl CachedTransport {
 
     pub async fn fetch_and_cache(
         &self,
-        raw_query: &[u8],
         query: &QueryContext,
         mut leader: Option<FlightLeader>,
     ) -> anyhow::Result<ExchangeResult> {
-        let result = self.fetch_response(raw_query, query, leader.as_mut()).await;
+        let result = self.fetch_response(query, leader.as_mut()).await;
         if let Err(error) = &result
             && let Some(leader) = leader.as_mut()
         {
@@ -388,13 +385,12 @@ impl CachedTransport {
 
     async fn fetch_response(
         &self,
-        raw_query: &[u8],
         query: &QueryContext,
         leader: Option<&mut FlightLeader>,
     ) -> anyhow::Result<ExchangeResult> {
         let domain = query.qdomain().unwrap_or_default();
         let qtype = query.qtype().unwrap_or(QType::A);
-        let mut wire = self.endpoint.fetch(raw_query, domain, qtype).await?;
+        let mut wire = self.endpoint.fetch(query).await?;
         let (template, negative, ttl) = ResponseTemplate::validate_with_ttl(query, &mut wire,
             |metadata| self.policy.effective_ttl(self.override_ttl, metadata))?;
         let is_acme = qtype == QType::TXT && domain.starts_with("_acme-challenge.");
@@ -410,6 +406,15 @@ impl CachedTransport {
             };
             self.cache.insert_scoped(&self.tag, query, Arc::clone(&template), ttl, retention);
         }
+        let (wire, answer_ips, ttl) = match query.ingress() {
+            IngressProfile::Udp { advertised_size }
+                if wire.len() > usize::from(advertised_size) =>
+            {
+                let rendered = template.render_with_ips(query)?;
+                (rendered.wire, rendered.answer_ips, 0)
+            }
+            _ => (wire, answer_ips, ttl),
+        };
         if let Some(leader) = leader {
             leader.publish(template);
         }
@@ -465,7 +470,6 @@ impl DnsTransport for CachedTransport {
 
     async fn exchange(
         &self,
-        raw_query: &[u8],
         query: &QueryContext,
     ) -> anyhow::Result<ExchangeResult> {
         let domain = query.qdomain().unwrap_or_default();
@@ -499,7 +503,6 @@ impl DnsTransport for CachedTransport {
                     refresh_ticket = Some(RefreshTicket {
                         transport: self.clone(),
                         leader,
-                        raw_query: raw_query.to_vec(),
                         query: query.clone(),
                     });
                 }
@@ -529,7 +532,7 @@ impl DnsTransport for CachedTransport {
                     }
                 }
                 FlightRole::Leader(leader) => {
-                    return self.fetch_and_cache(raw_query, query, Some(leader)).await;
+                    return self.fetch_and_cache(query, Some(leader)).await;
                 }
                 FlightRole::Rejected => anyhow::bail!("DNS singleflight capacity exhausted"),
             }
@@ -545,10 +548,8 @@ impl DnsTransport for CachedTransport {
         let qtype = if ipv6 { QType::AAAA } else { QType::A };
         let name = DnsName::from_domain(host)
             .ok_or_else(|| anyhow::anyhow!("invalid domain: {host}"))?;
-        let query_wire = build_dns_query_wire(&name, qtype);
-        let query = QueryContext::parse(&query_wire)
-            .map_err(|e| anyhow::anyhow!("failed to parse built query: {e}"))?;
-        let resp = self.exchange(&query_wire, &query).await?;
+        let query = QueryContext::new(name, qtype);
+        let resp = self.exchange(&query).await?;
         Ok(resp.answer_ips.to_vec())
     }
 }
@@ -584,9 +585,9 @@ impl DnsTransport for FakeIpTransport {
 
     async fn exchange(
         &self,
-        raw_query: &[u8],
         query: &QueryContext,
     ) -> anyhow::Result<ExchangeResult> {
+        let raw_query = query.wire();
         let domain = query.qdomain().unwrap_or_default();
         if domain.is_empty() {
             return Ok(ExchangeResult::synthetic(build_dns_nodata(raw_query), Arc::from([]), 0));
@@ -606,7 +607,7 @@ impl DnsTransport for FakeIpTransport {
             _ => None,
         };
         if let Some(ip) = ip {
-            let wire = build_dns_ip_response(raw_query, &[ip], self.ttl)
+            let wire = build_dns_ip_response(query, &[ip], self.ttl)
                 .ok_or_else(|| anyhow::anyhow!("failed to construct fakeip response"))?;
             Ok(ExchangeResult::synthetic(wire, Arc::from([ip]), self.ttl))
         } else {

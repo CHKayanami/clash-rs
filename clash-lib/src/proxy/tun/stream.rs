@@ -1,3 +1,5 @@
+use crate::app::dns::query::IngressProfile;
+use bytes::Bytes;
 use crate::proxy::AnyStream;
 use std::{net::SocketAddr, sync::Arc};
 
@@ -114,7 +116,9 @@ async fn handle_tcp_dns_hijack<S: ProxyStream + 'static>(
             break;
         }
 
-        match exchange_with_resolver(&resolver, &msg_buf, true).await {
+        match exchange_with_resolver(
+            &resolver, Bytes::from(msg_buf), IngressProfile::Tcp, Some(local.ip()),
+        ).await {
             Ok(resp_bytes) => {
                 let resp_len = (resp_bytes.len() as u16).to_be_bytes();
                 if let Err(e) = stream.write_all(&resp_len).await {

@@ -1,3 +1,4 @@
+use crate::app::dns::query::QueryContext;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
@@ -92,7 +93,8 @@ impl ClashResolver for SystemResolver {
 
     async fn exchange(
         &self,
-        _: &[u8],
+        _: &QueryContext,
+        _: Option<std::net::IpAddr>,
     ) -> anyhow::Result<Vec<u8>> {
         Err(anyhow::anyhow!(
             "system resolver does not support advanced dns features, please enable \

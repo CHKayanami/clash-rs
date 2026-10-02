@@ -1,11 +1,12 @@
 use futures::stream::{FuturesUnordered, StreamExt};
 use std::sync::Arc;
+use bytes::Bytes;
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, UdpSocket};
 use tracing::{debug, error, info};
 
-use crate::{DNSListenAddr, DnsMessageExchanger};
+use crate::{DNSListenAddr, DnsIngress, DnsMessageExchanger};
 
 #[derive(Error, Debug)]
 pub enum DNSError {
@@ -54,7 +55,7 @@ where
                                     let ex = ex.clone();
                                     let socket = Arc::clone(&socket);
                                     inflight.push(async move {
-                                        match ex.exchange_from(&req, Some(src.ip())).await {
+                                        match ex.exchange(req, Some(src.ip()), DnsIngress::Udp).await {
                                             Ok(resp) => {
                                                 let _ = socket.send_to(&resp, src).await;
                                             }
@@ -120,7 +121,7 @@ where
                                 if stream.read_exact(&mut req_buf).await.is_err() {
                                     break;
                                 }
-                                match ex.exchange_from(&req_buf, Some(peer.ip())).await {
+                                match ex.exchange(Bytes::from(std::mem::take(&mut req_buf)), Some(peer.ip()), DnsIngress::Tcp).await {
                                     Ok(resp) => {
                                         let resp_len = resp.len() as u16;
                                         out_buf.clear();
@@ -166,23 +167,15 @@ mod tests {
 
     #[derive(Clone)]
     struct EchoExchanger {
-        sources: UnboundedSender<Option<IpAddr>>,
+        sources: UnboundedSender<(Option<IpAddr>, DnsIngress)>,
     }
 
     impl DnsMessageExchanger for EchoExchanger {
         fn ipv6(&self) -> bool {
             false
         }
-        async fn exchange_from(
-            &self,
-            message: &[u8],
-            source_ip: Option<IpAddr>,
-        ) -> Result<Vec<u8>, DNSError> {
-            self.sources.send(source_ip).unwrap();
-            self.exchange(message).await
-        }
-
-        async fn exchange(&self, message: &[u8]) -> Result<Vec<u8>, DNSError> {
+        async fn exchange(&self, message: Bytes, source_ip: Option<IpAddr>, ingress: DnsIngress) -> Result<Vec<u8>, DNSError> {
+            self.sources.send((source_ip, ingress)).unwrap();
             let mut resp = message.to_vec();
             if resp.len() >= 4 {
                 resp[2] |= 0x80; // Set QR flag to indicate response
@@ -247,11 +240,11 @@ mod tests {
 
         assert_eq!(
             received_sources.recv().await,
-            Some(Some(client_udp.local_addr()?.ip())),
+            Some((Some(client_udp.local_addr()?.ip()), DnsIngress::Udp)),
         );
         assert_eq!(
             received_sources.recv().await,
-            Some(Some(client_tcp.local_addr()?.ip())),
+            Some((Some(client_tcp.local_addr()?.ip()), DnsIngress::Tcp)),
         );
 
         Ok(())

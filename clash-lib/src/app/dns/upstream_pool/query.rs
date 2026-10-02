@@ -9,8 +9,10 @@ use super::UpstreamPool;
 use super::admission::AdmissionPermit;
 use super::entries::{UpstreamEntry, UpstreamState};
 use super::udp::UdpUpstream;
+use super::transports::ResolvedOutbound;
 use crate::app::dns::transport::UdpPool;
 use crate::app::dns::ecs::EcsQuery;
+use crate::app::dns::query::QueryContext;
 
 impl UpstreamPool {
     pub async fn udp_pool(
@@ -38,11 +40,13 @@ impl UpstreamPool {
         entry: &UpstreamEntry,
         udp: &UdpUpstream,
         address: SocketAddr,
-        outbound: &super::transports::ResolvedOutbound,
-        query: &[u8],
+        outbound: &ResolvedOutbound,
+        query: &QueryContext,
     ) -> anyhow::Result<Vec<u8>> {
         let mut last_error = None;
-        for _ in 0..2 {
+        let domain = query.qdomain().unwrap_or("<unknown>");
+        let qtype = query.logged_qtype();
+        for attempt in 1..=2 {
             let result = async {
                 let pool = udp
                     .acquire_fixed(address, || {
@@ -54,11 +58,27 @@ impl UpstreamPool {
             .await;
             match result {
                 Ok(response) => {
-                    debug!(upstream = %entry.name, %address, outbound = ?outbound.name, "fixed UDP DNS query succeeded");
+                    debug!(
+                        upstream = %entry.name,
+                        %address,
+                        outbound = ?outbound.name,
+                        %domain,
+                        %qtype,
+                        attempt,
+                        "fixed UDP DNS query succeeded"
+                    );
                     return Ok(response);
                 }
                 Err(error) => {
-                    warn!(upstream = %entry.name, %address, outbound = ?outbound.name, "fixed UDP DNS query failed: {error}");
+                    warn!(
+                        upstream = %entry.name,
+                        %address,
+                        outbound = ?outbound.name,
+                        %domain,
+                        %qtype,
+                        attempt,
+                        "fixed UDP DNS query failed: {error}"
+                    );
                     last_error = Some(error);
                 }
             }
@@ -71,7 +91,7 @@ impl UpstreamPool {
         &self,
         entry: &UpstreamEntry,
         address: SocketAddr,
-        outbound: &super::transports::ResolvedOutbound,
+        outbound: &ResolvedOutbound,
     ) -> anyhow::Result<Arc<UdpPool>> {
         let effective_outbound = &outbound.name;
         let dial = self.dial_context(entry, outbound.handler.clone());
@@ -118,14 +138,14 @@ impl UpstreamPool {
     pub async fn query_entry(
         &self,
         entry: &UpstreamEntry,
-        raw_query: &[u8],
+        query: &QueryContext,
         outbound_name: Option<&str>,
     ) -> anyhow::Result<Vec<u8>> {
         let _permit = self.admit_query().await?;
         let timeout = self.dns_query_timeout + self.dns_dial_timeout;
         tokio::time::timeout(
             timeout,
-            self.query_entry_inner(entry, raw_query, outbound_name),
+            self.query_entry_inner(entry, query, outbound_name),
         )
         .await
         .map_err(|_| {
@@ -139,7 +159,7 @@ impl UpstreamPool {
     async fn query_entry_inner(
         &self,
         entry: &UpstreamEntry,
-        raw_query: &[u8],
+        query: &QueryContext,
         outbound_name: Option<&str>,
     ) -> anyhow::Result<Vec<u8>> {
         let start = Instant::now();
@@ -149,25 +169,26 @@ impl UpstreamPool {
         let ecs_query = if let Some(ref ecs) = entry.ecs
             && let Some(subnet) = ecs.ipv4.map(IpNet::V4).or_else(|| ecs.ipv6.map(IpNet::V6))
         {
-            EcsQuery::prepare(raw_query, subnet)?
+            EcsQuery::prepare(query, subnet)?
         } else {
             None
         };
 
         let outgoing_query = if let Some(ref eq) = ecs_query {
-            eq.wire()
+            eq.query()
         } else {
-            raw_query
+            query
         };
 
-        let domain = crate::app::dns::wire::extract_domain_from_dns_query(raw_query);
-        let domain_str = domain.as_deref().unwrap_or("<unknown>");
+        let domain_str = query.qdomain().unwrap_or("<unknown>");
+        let qtype = query.logged_qtype();
 
         debug!(
             upstream = %entry.name,
             protocol = ?entry.protocol,
             outbound = ?effective_outbound,
             domain = %domain_str,
+            qtype = %qtype,
             ecs = ecs_query.is_some(),
             "querying DNS upstream"
         );
@@ -179,15 +200,21 @@ impl UpstreamPool {
         let fixed_address =
             udp.and_then(|udp| udp.fixed_address(&entry.endpoint, &outbound.name));
         let response = if let (Some(udp), Some(address)) = (udp, fixed_address) {
-            self.query_fixed_udp(entry, udp, address, &outbound, outgoing_query)
-                .await?
+            self.query_fixed_udp(
+                entry,
+                udp,
+                address,
+                &outbound,
+                outgoing_query,
+            )
+            .await?
         } else if let Some(udp) = udp {
             let addresses = entry.endpoint.resolve_addrs().await?;
             let snapshot = udp.snapshot(&addresses, &outbound.name)?;
 
             let mut last_error = None;
             let mut successful_resp = None;
-            for attempt in snapshot.attempts {
+            for (index, attempt) in snapshot.attempts.into_iter().enumerate() {
                 let address = attempt.address;
                 let pool = match attempt
                     .acquire(|| self.build_udp_pool(entry, address, &outbound))
@@ -200,6 +227,8 @@ impl UpstreamPool {
                             %address,
                             outbound = ?effective_outbound,
                             domain = %domain_str,
+                            qtype = %qtype,
+                            attempt = index + 1,
                             "failed to initialize UDP pool: {error}"
                         );
                         last_error = Some(error);
@@ -214,6 +243,8 @@ impl UpstreamPool {
                             %address,
                             outbound = ?effective_outbound,
                             domain = %domain_str,
+                            qtype = %qtype,
+                            attempt = index + 1,
                             elapsed_ms = elapsed.as_millis(),
                             "DNS upstream query succeeded"
                         );
@@ -229,6 +260,8 @@ impl UpstreamPool {
                             %address,
                             outbound = ?effective_outbound,
                             domain = %domain_str,
+                            qtype = %qtype,
+                            attempt = index + 1,
                             "UDP DNS query to upstream address failed: {error}"
                         );
                         last_error = Some(error);
@@ -254,6 +287,7 @@ impl UpstreamPool {
                         protocol = ?entry.protocol,
                         outbound = ?effective_outbound,
                         domain = %domain_str,
+                        qtype = %qtype,
                         elapsed_ms = elapsed.as_millis(),
                         "DNS upstream query succeeded"
                     );
@@ -265,6 +299,7 @@ impl UpstreamPool {
                         protocol = ?entry.protocol,
                         outbound = ?effective_outbound,
                         domain = %domain_str,
+                        qtype = %qtype,
                         "DNS upstream query failed: {error}"
                     );
                     return Err(error);
@@ -279,6 +314,7 @@ impl UpstreamPool {
                     warn!(
                         upstream = %entry.name,
                         domain = %domain_str,
+                        qtype = %qtype,
                         "failed to restore ECS response: {error}"
                     );
                     Err(anyhow::anyhow!("failed to restore ECS response: {error}"))
@@ -292,6 +328,8 @@ impl UpstreamPool {
 
 #[cfg(test)]
 mod tests {
+    use bytes::Bytes;
+    use crate::app::dns::query::{IngressProfile, QueryContext};
     use super::*;
     use crate::app::dns::MockClashResolver;
     use crate::app::dns::config::{DNSNetMode, NameServer};
@@ -345,7 +383,7 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(2), async {
             for _ in 0..2 {
                 assert_eq!(
-                    pool.query_entry(&entry, &query, None).await.unwrap()[..2],
+                    pool.query_entry(&entry, &QueryContext::parse(Bytes::copy_from_slice(&query), IngressProfile::Internal).unwrap(), None).await.unwrap()[..2],
                     query[..2]
                 );
             }
@@ -430,7 +468,7 @@ mod tests {
                     &DnsName::from_domain("query.test").unwrap(),
                     QType::A,
                 );
-                pool.query_entry(&entry, &query, None).await.unwrap()
+                pool.query_entry(&entry, &QueryContext::parse(Bytes::copy_from_slice(&query), IngressProfile::Internal).unwrap(), None).await.unwrap()
             });
         }
         tokio::time::timeout(Duration::from_secs(1), async {
@@ -473,7 +511,7 @@ mod tests {
                 &DnsName::from_domain("refresh.test").unwrap(),
                 QType::A,
             );
-            exchange_pool.exchange(&query).await
+            exchange_pool.exchange(&QueryContext::parse(Bytes::copy_from_slice(&query), IngressProfile::Internal).unwrap()).await
         });
         let mut response = [0; 512];
         let (len, peer) = old_server.recv_from(&mut response).await.unwrap();

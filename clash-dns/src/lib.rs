@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+use bytes::Bytes;
 use serde::Deserialize;
 use std::{
     future::Future,
@@ -52,21 +53,20 @@ pub struct DNSListenAddr {
     pub doh3: Option<DoH3Config>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DnsIngress {
+    Udp,
+    Tcp,
+}
+
 #[cfg_attr(test, mockall::automock)]
 pub trait DnsMessageExchanger: Send + Sync + 'static {
     fn ipv6(&self) -> bool;
-    /// Source-aware exchange; existing exchangers can ignore the peer IP.
-    fn exchange_from(
-        &self,
-        message: &[u8],
-        _source_ip: Option<IpAddr>,
-    ) -> impl Future<Output = Result<Vec<u8>, DNSError>> + Send {
-        self.exchange(message)
-    }
-
     fn exchange(
         &self,
-        message: &[u8],
+        message: Bytes,
+        source_ip: Option<IpAddr>,
+        ingress: DnsIngress,
     ) -> impl Future<Output = Result<Vec<u8>, DNSError>> + Send;
 }
 

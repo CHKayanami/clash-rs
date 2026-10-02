@@ -1,180 +1,22 @@
-use std::net::{IpAddr, SocketAddr};
-use std::sync::Arc;
+use std::fmt::{self, Display};
+use std::sync::{Arc, OnceLock};
+
+use bytes::Bytes;
 
 use thiserror::Error;
 
 mod parser;
 
 pub(crate) use parser::{NameParseState, match_name, skip_name};
-use parser::{parse_edns, parse_name, parse_rr, read_u16};
+use parser::{DomainBuilder, parse_edns, parse_name, parse_rr};
 
 const HEADER_LEN: usize = 12;
 const MIN_QUESTION_WIRE_LEN: usize = 5;
 const OPT_TYPE: u16 = 41;
-const ALLOWED_QUERY_FLAGS: u16 = 0x0130;
-
-/// Unforgeable evidence that an ingress adapter validated the exact query.
-#[derive(Clone, Copy, Debug)]
-pub struct ValidatedDnsQuery(IngressProfile);
-
-impl ValidatedDnsQuery {
-    pub const fn ingress(self) -> IngressProfile {
-        self.0
-    }
-}
-
-const STACK_BOUNDARY_LEN: usize = 512;
-
-/// Validate exactly one complete, forwarder-consumable DNS query.
-pub fn validate_exact_dns_query(data: &[u8]) -> Option<ValidatedDnsQuery> {
-    if data.len() < HEADER_LEN || data[2] & 0x80 != 0 {
-        return None;
-    }
-
-    let qdcount = usize::from(u16::from_be_bytes([data[4], data[5]]));
-    if qdcount != 1 {
-        return None;
-    }
-    let counts = [
-        usize::from(u16::from_be_bytes([data[6], data[7]])),
-        usize::from(u16::from_be_bytes([data[8], data[9]])),
-        usize::from(u16::from_be_bytes([data[10], data[11]])),
-    ];
-    let mut pos = HEADER_LEN;
-    let mut stack_boundaries = [false; STACK_BOUNDARY_LEN];
-    let mut heap_boundaries;
-    let label_boundaries: &mut [bool] = if data.len() <= STACK_BOUNDARY_LEN {
-        &mut stack_boundaries[..data.len()]
-    } else {
-        heap_boundaries = vec![false; data.len()];
-        &mut heap_boundaries[..]
-    };
-
-    if !skip_strict_dns_name(data, &mut pos, label_boundaries)
-        || pos.checked_add(4).is_none_or(|end| end > data.len())
-    {
-        return None;
-    }
-    pos += 4; // QTYPE + QCLASS
-
-    for count in counts {
-        for _ in 0..count {
-            if !skip_strict_dns_name(data, &mut pos, label_boundaries)
-                || pos.checked_add(10).is_none_or(|end| end > data.len())
-            {
-                return None;
-            }
-            let rdlength =
-                usize::from(u16::from_be_bytes([data[pos + 8], data[pos + 9]]));
-            pos += 10; // TYPE + CLASS + TTL + RDLENGTH
-            let rdata_end = pos.checked_add(rdlength)?;
-            if rdata_end > data.len() {
-                return None;
-            }
-            pos = rdata_end;
-        }
-    }
-
-    if pos != data.len() {
-        return None;
-    }
-
-    let query = QueryContext::parse(data).ok()?;
-    query.qdomain()?;
-    let advertised_size = query
-        .edns()
-        .map(|edns| edns.advertised_size())
-        .unwrap_or(512);
-    Some(ValidatedDnsQuery(IngressProfile::Udp { advertised_size }))
-}
-
-pub fn is_exact_dns_query(data: &[u8]) -> bool {
-    validate_exact_dns_query(data).is_some()
-}
-
-/// Bounds-safe name walk that enforces the RFC expanded-name limit and
-/// restricts compression pointers to previously observed label boundaries.
-fn skip_strict_dns_name(
-    data: &[u8],
-    pos: &mut usize,
-    label_boundaries: &mut [bool],
-) -> bool {
-    let mut cursor = *pos;
-    let mut expanded = 0usize;
-    let mut jumped = false;
-    let mut depth = 0usize;
-
-    loop {
-        if depth > 128 || cursor >= data.len() || cursor >= label_boundaries.len() {
-            return false;
-        }
-
-        if jumped {
-            if !label_boundaries[cursor] {
-                return false;
-            }
-        } else {
-            label_boundaries[cursor] = true;
-        }
-
-        let label_len = data[cursor];
-        if label_len == 0 {
-            if expanded.checked_add(1).is_none_or(|value| value > 255) {
-                return false;
-            }
-            if !jumped {
-                *pos = cursor + 1;
-            }
-            return true;
-        }
-
-        if label_len & 0xc0 == 0xc0 {
-            let Some(&next) = data.get(cursor + 1) else {
-                return false;
-            };
-            let target = (usize::from(label_len & 0x3f) << 8) | usize::from(next);
-            if target >= cursor
-                || target >= label_boundaries.len()
-                || !label_boundaries[target]
-            {
-                return false;
-            }
-            if !jumped {
-                *pos = cursor + 2;
-            }
-            jumped = true;
-            cursor = target;
-            depth += 1;
-            continue;
-        }
-
-        if label_len > 63 {
-            return false;
-        }
-
-        let label_octets = 1 + usize::from(label_len);
-        expanded = match expanded.checked_add(label_octets) {
-            Some(value) if value <= 255 => value,
-            _ => return false,
-        };
-        let Some(next_pos) = cursor.checked_add(label_octets) else {
-            return false;
-        };
-        if next_pos > data.len() {
-            return false;
-        }
-        cursor = next_pos;
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TxId(u16);
 
 impl TxId {
-    pub const fn new(id: u16) -> Self {
-        Self(id)
-    }
-
     pub const fn get(self) -> u16 {
         self.0
     }
@@ -196,10 +38,6 @@ impl QType {
     pub const SVCB: Self = Self(64);
     pub const HTTPS: Self = Self(65);
     pub const ANY: Self = Self(255);
-
-    pub const fn new(qtype: u16) -> Self {
-        Self(qtype)
-    }
 
     pub const fn get(self) -> u16 {
         self.0
@@ -266,65 +104,51 @@ pub struct QClass(u16);
 impl QClass {
     pub const IN: Self = Self(1);
 
-    pub const fn new(class: u16) -> Self {
-        Self(class)
-    }
-
     pub const fn get(self) -> u16 {
         self.0
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct DnsName(Box<[u8]>);
+pub struct DnsName(Bytes);
 
 impl DnsName {
-    pub fn new(wire: Box<[u8]>) -> Self {
-        Self(wire)
-    }
-
     pub fn from_domain(domain: &str) -> Option<Self> {
         let domain = domain.trim_end_matches('.');
-        let mut wire = Vec::new();
+        let mut wire = Vec::with_capacity(domain.len().min(253) + 2);
         if domain.is_empty() {
             wire.push(0);
-            return Some(Self(wire.into_boxed_slice()));
+            return Some(Self(Bytes::from(wire)));
         }
         for label in domain.split('.') {
-            if label.is_empty() || label.len() > 63 {
+            if label.is_empty() || label.len() > 63
+                || wire.len() + label.len() + 2 > 255
+            {
                 return None;
             }
             wire.push(label.len() as u8);
             wire.extend_from_slice(label.as_bytes());
         }
         wire.push(0);
-        Some(Self(wire.into_boxed_slice()))
+        Some(Self(Bytes::from(wire)))
     }
 
     pub fn as_wire(&self) -> &[u8] {
         &self.0
     }
 
-    /// Decode the canonical wire name as a lowercase dotted UTF-8 domain.
-    pub fn to_domain_name(&self) -> Option<String> {
-        let mut domain = String::with_capacity(self.0.len());
-        let mut cursor = 0usize;
+    fn domain(&self) -> Option<Arc<str>> {
+        let mut domain = DomainBuilder::new();
+        let mut cursor = 0;
         loop {
             let length = usize::from(*self.0.get(cursor)?);
             cursor += 1;
             if length == 0 {
-                if domain.is_empty() || cursor != self.0.len() {
-                    return None;
-                }
-                domain.make_ascii_lowercase();
-                return Some(domain);
+                if cursor != self.0.len() { return None; }
+                return domain.finish();
             }
             let end = cursor.checked_add(length)?;
-            let label = std::str::from_utf8(self.0.get(cursor..end)?).ok()?;
-            if !domain.is_empty() {
-                domain.push('.');
-            }
-            domain.push_str(label);
+            domain.push_label(self.0.get(cursor..end)?);
             cursor = end;
         }
     }
@@ -357,117 +181,61 @@ pub fn build_dns_query_wire_with_id(
     buf
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum IngressProfile {
     Udp {
         advertised_size: u16,
     },
     Tcp,
-    Api,
-    #[default]
     Internal,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
-pub struct DnsRequestMeta {
-    source_ip: Option<IpAddr>,
-    original_dst: Option<SocketAddr>,
-}
-
-impl DnsRequestMeta {
-    pub const EMPTY: Self = Self {
-        source_ip: None,
-        original_dst: None,
-    };
-
-    pub fn new(source_ip: Option<IpAddr>, original_dst: Option<SocketAddr>) -> Self {
-        let source_ip = source_ip.map(|source| match source {
-            IpAddr::V6(address) => address
-                .to_ipv4_mapped()
-                .map_or(IpAddr::V6(address), IpAddr::V4),
-            source => source,
-        });
-        Self {
-            source_ip,
-            original_dst,
-        }
-    }
-
-    pub const fn source_ip(self) -> Option<IpAddr> {
-        self.source_ip
-    }
-
-    pub const fn original_dst(self) -> Option<SocketAddr> {
-        self.original_dst
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct QuestionOffsets {
+struct QuestionOffsets {
     start: u32,
     end: u32,
 }
 
 impl QuestionOffsets {
-    pub const fn start(self) -> usize {
+    const fn start(self) -> usize {
         self.start as usize
     }
 
-    pub const fn end(self) -> usize {
+    const fn end(self) -> usize {
         self.end as usize
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct EdnsMetadata {
-    advertised_size: u16,
-    extended_rcode: u8,
-    version: u8,
-    dnssec_ok: bool,
-    option_codes: Vec<u16>,
-    flags: u16,
+struct Question {
+    name: DnsName,
+    qtype: QType,
+    qclass: QClass,
+    offsets: QuestionOffsets,
 }
 
-impl EdnsMetadata {
-    pub const fn advertised_size(&self) -> u16 {
-        self.advertised_size
-    }
-
-    pub const fn version(&self) -> u8 {
-        self.version
-    }
-
-    pub const fn extended_rcode(&self) -> u8 {
-        self.extended_rcode
-    }
-
-    pub const fn dnssec_ok(&self) -> bool {
-        self.dnssec_ok
-    }
-
-    pub fn option_codes(&self) -> &[u16] {
-        &self.option_codes
-    }
+#[derive(Debug)]
+struct QueryPacket {
+    wire: Bytes,
+    canonical_wire: OnceLock<Arc<[u8]>>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Question {
-    pub name: DnsName,
-    pub qtype: QType,
-    pub qclass: QClass,
-    pub offsets: QuestionOffsets,
-}
-
-#[derive(Debug, Clone)]
-pub struct QueryContext {
+#[derive(Debug)]
+struct QueryData {
     txid: TxId,
     flags: u16,
     questions: Vec<Question>,
     cached_domain: Option<Arc<str>>,
-    edns: Option<EdnsMetadata>,
+    packet: QueryPacket,
+}
+
+#[derive(Debug, Clone)]
+pub struct QueryContext {
+    data: Arc<QueryData>,
+    // ECS keeps the parsed questions shared, but owns its modified packet and
+    // canonical key. Ordinary queries need only the single QueryData allocation.
+    packet_override: Option<Arc<QueryPacket>>,
     ingress: IngressProfile,
-    canonical_wire: Arc<[u8]>,
-    cacheable: bool,
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -485,35 +253,33 @@ pub enum QueryError {
 }
 
 impl QueryContext {
-    pub fn parse(raw: &[u8]) -> Result<Self, QueryError> {
-        Self::parse_with_profile(raw, IngressProfile::default())
-    }
-
-    pub fn parse_with_profile(
-        raw: &[u8],
-        ingress: IngressProfile,
-    ) -> Result<Self, QueryError> {
+    pub fn parse(wire: Bytes, mut ingress: IngressProfile) -> Result<Self, QueryError> {
+        let raw = wire.as_ref();
         if raw.len() < HEADER_LEN {
             return Err(QueryError::HeaderTruncated);
         }
-        let txid = TxId(read_u16(raw, 0)?);
-        let flags = read_u16(raw, 2)?;
-        let qdcount = read_u16(raw, 4)?;
-        let ancount = read_u16(raw, 6)?;
-        let nscount = read_u16(raw, 8)?;
-        let arcount = read_u16(raw, 10)?;
+        let txid = TxId(u16::from_be_bytes([raw[0], raw[1]]));
+        let flags = u16::from_be_bytes([raw[2], raw[3]]);
+        let qdcount = u16::from_be_bytes([raw[4], raw[5]]);
+        let ancount = u16::from_be_bytes([raw[6], raw[7]]);
+        let nscount = u16::from_be_bytes([raw[8], raw[9]]);
+        let arcount = u16::from_be_bytes([raw[10], raw[11]]);
         let mut cursor = HEADER_LEN;
         if usize::from(qdcount) > (raw.len() - HEADER_LEN) / MIN_QUESTION_WIRE_LEN {
             return Err(QueryError::TruncatedField);
         }
         let mut name_state = NameParseState::new(raw.len());
-        let mut questions = Vec::new();
-        for _ in 0..qdcount {
+        let mut questions = Vec::with_capacity(usize::from(qdcount));
+        let mut cached_domain = None;
+        for index in 0..qdcount {
             let start = cursor;
-            let (name, end) = parse_name(raw, cursor, &mut name_state)?;
+            let (name, end, domain) = parse_name(&wire, cursor, &mut name_state, index == 0)?;
+            if index == 0 { cached_domain = domain; }
             cursor = end;
-            let qtype = QType(read_u16(raw, cursor)?);
-            let qclass = QClass(read_u16(raw, cursor + 2)?);
+            let fields = raw.get(cursor..cursor + 4)
+                .ok_or(QueryError::TruncatedField)?;
+            let qtype = QType(u16::from_be_bytes([fields[0], fields[1]]));
+            let qclass = QClass(u16::from_be_bytes([fields[2], fields[3]]));
             cursor += 4;
             questions.push(Question {
                 name,
@@ -533,125 +299,151 @@ impl QueryContext {
         for _ in 0..nscount {
             cursor = parse_rr(raw, cursor, &mut name_state)?.end;
         }
-        let mut edns = None;
-        let mut opt_count = 0u16;
+        let mut advertised_size = None;
         for _ in 0..arcount {
             let rr = parse_rr(raw, cursor, &mut name_state)?;
             cursor = rr.end;
             if rr.rtype == OPT_TYPE {
-                opt_count = opt_count.saturating_add(1);
-                let metadata = parse_edns(raw, &rr)?;
-                if edns.is_none() {
-                    edns = Some(metadata);
-                }
+                let size = parse_edns(raw, &rr)?;
+                advertised_size.get_or_insert(size);
             }
         }
         if cursor != raw.len() {
             return Err(QueryError::TrailingBytes);
         }
-        let mut canonical_wire = raw.to_vec();
-        if let Some(id) = canonical_wire.get_mut(0..2) {
-            id.copy_from_slice(&[0, 0]);
+        if let IngressProfile::Udp { advertised_size: default_size } = ingress {
+            ingress = IngressProfile::Udp {
+                advertised_size: advertised_size
+                    .map(|size| size.max(512)).unwrap_or(default_size),
+            };
         }
-        let cacheable = flags & !ALLOWED_QUERY_FLAGS == 0
-            && qdcount == 1
-            && ancount == 0
-            && nscount == 0
-            && arcount == opt_count
-            && opt_count <= 1
-            && edns.as_ref().is_none_or(|value| {
-                value.version == 0
-                    && value.option_codes.is_empty()
-                    && value.extended_rcode == 0
-                    && value.flags & !0x8000 == 0
-            });
-        let cached_domain = questions
-            .first()
-            .and_then(|q| q.name.to_domain_name().map(Arc::from));
         Ok(Self {
-            txid,
-            flags,
-            questions,
-            cached_domain,
-            edns,
+            data: Arc::new(QueryData {
+                txid,
+                flags,
+                questions,
+                cached_domain,
+                packet: QueryPacket { wire, canonical_wire: OnceLock::new() },
+            }),
+            packet_override: None,
             ingress,
-            canonical_wire: canonical_wire.into(),
-            cacheable,
         })
     }
 
-    pub const fn txid(&self) -> TxId {
-        self.txid
+    pub fn new(name: DnsName, qtype: QType) -> Self {
+        let txid = TxId(rand::random());
+        let wire = build_dns_query_wire_with_id(txid.get(), &name, qtype);
+        let end = wire.len() as u32;
+        let cached_domain = name.domain();
+        Self {
+            data: Arc::new(QueryData {
+                txid,
+                flags: 0x0100,
+                questions: vec![Question {
+                    name, qtype, qclass: QClass::IN,
+                    offsets: QuestionOffsets { start: 12, end },
+                }],
+                cached_domain,
+                packet: QueryPacket {
+                    wire: Bytes::from(wire), canonical_wire: OnceLock::new(),
+                },
+            }),
+            packet_override: None,
+            ingress: IngressProfile::Internal,
+        }
     }
 
-    pub fn qname(&self) -> Option<&DnsName> {
-        self.questions.first().map(|question| &question.name)
+    /// ECS rewrites only Additional records and ARCOUNT; all question offsets,
+    /// flags and TxID remain valid. The original context keeps its cache key.
+    pub(crate) fn with_additional_wire(&self, wire: Bytes) -> Self {
+        debug_assert_eq!(&wire[..10], &self.wire()[..10]);
+        if let Some(question) = self.question_wire() {
+            debug_assert_eq!(&wire[12..12 + question.len()], question);
+        }
+        let mut query = self.clone();
+        query.packet_override = Some(Arc::new(QueryPacket {
+            wire, canonical_wire: OnceLock::new(),
+        }));
+        query
+    }
+
+    fn packet(&self) -> &QueryPacket {
+        self.packet_override.as_deref().unwrap_or(&self.data.packet)
+    }
+
+    pub fn wire(&self) -> &[u8] {
+        &self.packet().wire
+    }
+
+    pub(crate) fn shared_question_wire(&self) -> Bytes {
+        self.question_offsets()
+            .map(|offsets| self.packet().wire.slice(offsets.start()..offsets.end()))
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn logged_qtype(&self) -> impl Display {
+        LoggedQType(self.qtype())
+    }
+
+    pub fn txid(&self) -> TxId {
+        self.data.txid
     }
 
     pub fn qdomain(&self) -> Option<&str> {
-        self.cached_domain.as_deref()
+        self.data.cached_domain.as_deref()
     }
 
     pub fn qdomain_arc(&self) -> Option<Arc<str>> {
-        self.cached_domain.clone()
+        self.data.cached_domain.clone()
     }
 
     pub fn qtype(&self) -> Option<QType> {
-        self.questions.first().map(|question| question.qtype)
+        self.data.questions.first().map(|question| question.qtype)
     }
 
-    pub fn qclass(&self) -> Option<QClass> {
-        self.questions.first().map(|question| question.qclass)
-    }
-
-    pub fn question_offsets(&self) -> Option<QuestionOffsets> {
-        self.questions.first().map(|question| question.offsets)
-    }
-
-    pub fn all_question_offsets(
-        &self,
-    ) -> impl ExactSizeIterator<Item = QuestionOffsets> + '_ {
-        self.questions.iter().map(|question| question.offsets)
+    fn question_offsets(&self) -> Option<QuestionOffsets> {
+        self.data.questions.first().map(|question| question.offsets)
     }
 
     pub fn question_wire(&self) -> Option<&[u8]> {
-        let offsets = self.question_offsets()?;
-        self.canonical_wire.get(offsets.start()..offsets.end())
-    }
-
-    pub const fn edns(&self) -> Option<&EdnsMetadata> {
-        self.edns.as_ref()
+        let start = self.data.questions.first()?.offsets.start();
+        let end = self.data.questions.last()?.offsets.end();
+        self.wire().get(start..end)
     }
 
     pub const fn ingress(&self) -> IngressProfile {
         self.ingress
     }
 
-    pub fn canonical_wire(&self) -> &[u8] {
-        &self.canonical_wire
-    }
     pub(crate) fn canonical_wire_arc(&self) -> Arc<[u8]> {
-        Arc::clone(&self.canonical_wire)
+        Arc::clone(self.packet().canonical_wire.get_or_init(|| {
+            let mut wire = self.wire().to_vec();
+            wire[..2].fill(0);
+            wire.into()
+        }))
     }
 
-    pub const fn is_cacheable(&self) -> bool {
-        self.cacheable
-    }
-
-    pub const fn is_coalescable(&self) -> bool {
-        self.cacheable
-    }
-
-    pub const fn flags(&self) -> u16 {
-        self.flags
+    pub fn flags(&self) -> u16 {
+        self.data.flags
     }
 
     pub fn questions(
         &self,
     ) -> impl ExactSizeIterator<Item = (&DnsName, QType, QClass)> {
-        self.questions
+        self.data.questions
             .iter()
             .map(|question| (&question.name, question.qtype, question.qclass))
+    }
+}
+
+struct LoggedQType(Option<QType>);
+
+impl Display for LoggedQType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.0 {
+            Some(qtype) => Display::fmt(&qtype, f),
+            None => f.write_str("<unknown>"),
+        }
     }
 }
 
@@ -682,9 +474,74 @@ mod tests {
         // Display
         assert_eq!(QType::A.to_string(), "A");
         assert_eq!(QType::HTTPS.to_string(), "HTTPS");
-        assert_eq!(QType::new(999).to_string(), "TYPE999");
+        assert_eq!(QType(999).to_string(), "TYPE999");
 
         // Invalid
         assert!("invalid_qtype".parse::<QType>().is_err());
     }
+
+    #[test]
+    fn built_context_matches_parsed_context_and_preserves_key() {
+        for (domain, qtype) in [("Mixed.Example", QType::AAAA), ("MiXeD.é.Example", QType::TXT), (".", QType::A)] {
+            let query = QueryContext::new(DnsName::from_domain(domain).unwrap(), qtype);
+            let wire = Bytes::copy_from_slice(query.wire());
+            let wire_start = wire.as_ptr();
+            let parsed = QueryContext::parse(wire, IngressProfile::Internal).unwrap();
+            assert_eq!(parsed.wire().as_ptr(), wire_start);
+            assert_eq!(query.txid(), parsed.txid());
+            assert_eq!(query.flags(), parsed.flags());
+            assert_eq!(query.data.questions, parsed.data.questions);
+            assert_eq!(query.qdomain(), parsed.qdomain());
+            assert!(query.packet().canonical_wire.get().is_none());
+            let key = query.canonical_wire_arc();
+            assert_eq!(&key[..2], &[0, 0]);
+            assert_eq!(&key[2..], &query.wire()[2..]);
+            assert_eq!(key, parsed.canonical_wire_arc());
+            let cloned = query.clone();
+            assert!(Arc::ptr_eq(&query.data, &cloned.data));
+            assert!(Arc::ptr_eq(&key, &cloned.canonical_wire_arc()));
+            assert_eq!(query.wire().as_ptr(), cloned.wire().as_ptr());
+            assert_eq!(query.shared_question_wire().as_ptr(), query.wire()[12..].as_ptr());
+        }
+    }
+
+    #[test]
+    fn udp_profile_uses_edns_size_and_tcp_keeps_full_response_profile() {
+        let query = QueryContext::new(DnsName::from_domain("size.test").unwrap(), QType::A);
+        let mut wire = query.wire().to_vec();
+        wire[10..12].copy_from_slice(&1_u16.to_be_bytes());
+        wire.extend_from_slice(&[0, 0, 41, 4, 208, 0, 0, 0, 0, 0, 0]);
+        let udp = QueryContext::parse(Bytes::copy_from_slice(&wire), IngressProfile::Udp { advertised_size: 512 }).unwrap();
+        assert_eq!(udp.ingress(), IngressProfile::Udp { advertised_size: 1232 });
+        let tcp = QueryContext::parse(Bytes::copy_from_slice(&wire), IngressProfile::Tcp).unwrap();
+        assert_eq!(tcp.ingress(), IngressProfile::Tcp);
+        let last = wire.len() - 1;
+        wire[last] = 1;
+        assert_eq!(QueryContext::parse(Bytes::copy_from_slice(&wire), IngressProfile::Tcp).unwrap_err(), QueryError::TruncatedField);
+    }
+
+    #[test]
+    fn additional_packets_share_metadata_but_keep_independent_keys() {
+        let query = QueryContext::new(DnsName::from_domain("ecs.test").unwrap(), QType::A);
+        let original_key = query.canonical_wire_arc();
+        let mut wire = query.wire().to_vec();
+        wire[10..12].copy_from_slice(&1_u16.to_be_bytes());
+        wire.extend_from_slice(&[0, 0, 41, 4, 208, 0, 0, 0, 0, 0, 0]);
+        let derived = query.with_additional_wire(Bytes::from(wire));
+        assert!(Arc::ptr_eq(&query.data, &derived.data));
+        assert_eq!(query.qdomain(), derived.qdomain());
+        assert_eq!(query.question_wire(), derived.question_wire());
+        assert!(Arc::ptr_eq(&original_key, &query.canonical_wire_arc()));
+        let derived_key = derived.canonical_wire_arc();
+        assert_ne!(original_key, derived_key);
+        assert_eq!(&derived_key[2..], &derived.wire()[2..]);
+        assert!(Arc::ptr_eq(&derived_key, &derived.clone().canonical_wire_arc()));
+    }
+
+    #[test]
+    fn generated_names_respect_dns_wire_length_limit() {
+        let label = "a".repeat(63);
+        assert!(DnsName::from_domain(&format!("{label}.{label}.{label}.{label}")).is_none());
+    }
+
 }

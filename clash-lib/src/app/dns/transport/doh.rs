@@ -1,5 +1,6 @@
 //! DNS over HTTPS (RFC 8484) over HTTP/2.
 
+use crate::app::dns::query::QueryContext;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
@@ -57,12 +58,12 @@ impl DohClient {
 
     pub async fn exchange(
         self: &Arc<Self>,
-        raw_query: &[u8],
+        query: &QueryContext,
     ) -> anyhow::Result<Vec<u8>> {
         let timeout = self.dial.query_timeout + self.dial.dial_timeout;
         tokio::time::timeout(
             timeout,
-            exchange_with_retry("DoH", || self.exchange_once(raw_query)),
+            exchange_with_retry("DoH", || self.exchange_once(query)),
         )
         .await
         .map_err(|_| {
@@ -70,7 +71,7 @@ impl DohClient {
         })?
     }
 
-    async fn exchange_once(&self, raw_query: &[u8]) -> anyhow::Result<Vec<u8>> {
+    async fn exchange_once(&self, query: &QueryContext) -> anyhow::Result<Vec<u8>> {
         let session = self.get_session().await?;
         let sender = session
             .sender
@@ -83,15 +84,8 @@ impl DohClient {
                 anyhow::Error::new(e).context("DoH H2 sender ready error")
             })?;
 
-            let orig_id = if raw_query.len() >= 2 {
-                u16::from_be_bytes([raw_query[0], raw_query[1]])
-            } else {
-                0
-            };
-            let mut wire = raw_query.to_vec();
-            if wire.len() >= 2 {
-                wire[0..2].copy_from_slice(&[0, 0]); // Zero ID for wire cacheability
-            }
+            let orig_id = query.txid().get();
+            let wire = query.canonical_wire_arc();
 
             let req =
                 build_doh_request(&self.dial.endpoint, Some(wire.len()), "DoH")?;
@@ -101,7 +95,7 @@ impl DohClient {
                 .map_err(|e| anyhow::Error::new(e).context("DoH send_request"))?;
 
             send_stream
-                .send_data(Bytes::from(wire), true)
+                .send_data(Bytes::from_owner(wire), true)
                 .map_err(|e| anyhow::Error::new(e).context("DoH send_data"))?;
 
             let response = response_fut
@@ -222,6 +216,8 @@ impl DohClient {
 
 #[cfg(test)]
 mod tests {
+    use bytes::Bytes;
+    use crate::app::dns::query::{IngressProfile, QueryContext};
     use super::*;
     use crate::app::dns::endpoint::{DnsEndpoint, DnsProtocol, DnsStrategy};
 
@@ -293,10 +289,10 @@ mod tests {
             .unwrap();
         let mut query = vec![0; 12];
         query[..2].copy_from_slice(&[0x12, 0x34]);
-        let error = client.exchange(&query).await.unwrap_err();
+        let error = client.exchange(&QueryContext::parse(Bytes::copy_from_slice(&query), IngressProfile::Internal).unwrap()).await.unwrap_err();
         assert!(error.to_string().contains("500"));
         assert_eq!(client.session.close_count(), 0);
-        assert_eq!(client.exchange(&query).await.unwrap()[..2], [0x12, 0x34]);
+        assert_eq!(client.exchange(&QueryContext::parse(Bytes::copy_from_slice(&query), IngressProfile::Internal).unwrap()).await.unwrap()[..2], [0x12, 0x34]);
         assert_eq!(client.session.init_count(), 1);
         client.close().await;
         assert_eq!(server.await.unwrap(), 2);

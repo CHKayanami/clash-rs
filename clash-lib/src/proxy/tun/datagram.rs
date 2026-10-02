@@ -1,3 +1,4 @@
+use crate::app::dns::query::IngressProfile;
 use crate::{
     app::{
         dispatcher::Dispatcher,
@@ -137,7 +138,11 @@ pub(crate) async fn handle_inbound_datagram(
                     let mut ls_dns = ls_dns.clone();
                     let resolver = resolver_dns.clone();
                     tokio::spawn(async move {
-                        match exchange_with_resolver(&resolver, &pkt.data, true).await {
+                        match exchange_with_resolver(
+                            &resolver, pkt.data.clone(),
+                            IngressProfile::Udp { advertised_size: 512 },
+                            Some(local_addr.ip()),
+                        ).await {
                             Ok(resp) => {
                                 let _ = ls_dns
                                     .send((resp, remote_addr, local_addr).into())
