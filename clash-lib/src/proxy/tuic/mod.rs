@@ -73,6 +73,7 @@ pub struct HandlerOptions {
     pub send_window: u64,
     pub receive_window: VarInt,
     pub skip_cert_verify: bool,
+    pub fingerprint: Option<String>,
 
     #[allow(dead_code)]
     pub common_opts: HandlerCommonOptions,
@@ -202,7 +203,7 @@ impl Handler {
         sess: &Session,
     ) -> Result<TuicEndpoint> {
         let verifier =
-            Arc::new(DefaultTlsVerifier::new(None, opts.skip_cert_verify));
+            Arc::new(DefaultTlsVerifier::new(opts.fingerprint.clone(), opts.skip_cert_verify));
         let mut crypto = build_tls_client_config(
             verifier,
             opts.tls_cert.as_deref(),

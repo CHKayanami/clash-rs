@@ -1,37 +1,29 @@
 use bytes::{BufMut, Bytes, BytesMut};
-use futures::ready;
+use futures::{Future, ready};
 use h2::{RecvStream, SendStream, client::ResponseFuture};
+use http::StatusCode;
 use std::{
     fmt::Debug,
     io,
     pin::Pin,
-    sync::Arc,
     task::{Context, Poll},
 };
-use tokio::{
-    io::{AsyncRead, AsyncWrite, ReadBuf},
-    sync::oneshot,
-};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
-use super::protocol::{STATUS_ERROR, STATUS_SUCCESS};
-use crate::proxy::ProxyStream;
-
-pub trait StreamCloser: Send + Sync {
-    fn on_close(&self);
-}
+use super::{protocol::parse_stream_response, session::StreamLease};
+use crate::proxy::{ProxyStream, transport::h2::shutdown_h2_send};
 
 pub struct H2MuxStream {
     recv: Option<RecvStream>,
-    recv_pending: Option<oneshot::Receiver<io::Result<RecvStream>>>,
+    recv_pending: Option<ResponseFuture>,
     send: SendStream<Bytes>,
     recv_buf: Bytes,
-    closer: Option<Arc<dyn StreamCloser>>,
+    _lease: Option<StreamLease>,
     /// Pending initial request bytes to prepend on first write
     request_bytes: Option<Bytes>,
-    /// Pending write data from partial send (combined_buffer, user_data_len, bytes_sent)
-    pending_write: Option<(Bytes, usize, usize)>,
     /// Whether we have verified the initial status response
     response_read: bool,
+    write_closed: bool,
 }
 
 impl ProxyStream for H2MuxStream {}
@@ -50,43 +42,17 @@ impl H2MuxStream {
         response_future: ResponseFuture,
         send: SendStream<Bytes>,
         request_bytes: Bytes,
-        closer: Option<Arc<dyn StreamCloser>>,
+        _lease: Option<StreamLease>,
     ) -> Self {
-        let (tx, rx) = oneshot::channel();
-
-        tokio::spawn(async move {
-            match response_future.await {
-                Ok(response) => {
-                    if response.status().is_success() {
-                        let _ = tx.send(Ok(response.into_body()));
-                    } else {
-                        let _ = tx.send(Err(io::Error::new(
-                            io::ErrorKind::ConnectionRefused,
-                            format!(
-                                "h2mux server returned status: {}",
-                                response.status()
-                            ),
-                        )));
-                    }
-                }
-                Err(e) => {
-                    let _ = tx.send(Err(io::Error::new(
-                        io::ErrorKind::ConnectionReset,
-                        format!("h2mux response error: {e}"),
-                    )));
-                }
-            }
-        });
-
         Self {
             recv: None,
-            recv_pending: Some(rx),
+            recv_pending: Some(response_future),
             send,
             recv_buf: Bytes::new(),
-            closer,
+            _lease,
             request_bytes: Some(request_bytes),
-            pending_write: None,
             response_read: false,
+            write_closed: false,
         }
     }
 
@@ -95,113 +61,66 @@ impl H2MuxStream {
             return Poll::Ready(Ok(()));
         }
 
-        if let Some(rx) = self.recv_pending.as_mut() {
-            match Pin::new(rx).poll(cx) {
-                Poll::Ready(Ok(Ok(recv))) => {
-                    self.recv = Some(recv);
-                    self.recv_pending = None;
-                    Poll::Ready(Ok(()))
-                }
-                Poll::Ready(Ok(Err(e))) => {
-                    self.recv_pending = None;
-                    Poll::Ready(Err(e))
-                }
-                Poll::Ready(Err(_)) => {
-                    self.recv_pending = None;
-                    Poll::Ready(Err(io::Error::new(
-                        io::ErrorKind::BrokenPipe,
-                        "h2mux response channel closed",
-                    )))
-                }
-                Poll::Pending => Poll::Pending,
+        let Some(response) = self.recv_pending.as_mut() else {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe, "h2mux response is unavailable",
+            )));
+        };
+        let response = ready!(Pin::new(response).poll(cx));
+        self.recv_pending = None;
+        let response = response.map_err(|e| {
+            io::Error::new(io::ErrorKind::ConnectionReset, e)
+        })?;
+        if response.status() != StatusCode::OK {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::ConnectionRefused,
+                format!("h2mux server returned status: {}", response.status()),
+            )));
+        }
+        self.recv = Some(response.into_body());
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_request_prefix(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        while let Some(prefix) = self.request_bytes.as_ref() {
+            if prefix.is_empty() {
+                self.request_bytes = None;
+                break;
             }
-        } else {
-            Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "no receiver available",
-            )))
+            let capacity = ready!(self.poll_send_capacity(cx, prefix.len()))?;
+            let prefix = self.request_bytes.as_mut().expect("prefix is present");
+            let n = prefix.len().min(capacity);
+            let data = prefix.split_to(n);
+            self.send.send_data(data, false)
+                .map_err(|e| io::Error::new(io::ErrorKind::BrokenPipe, e))?;
+        }
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_send_capacity(&mut self, cx: &mut Context<'_>, len: usize) -> Poll<io::Result<usize>> {
+        self.send.reserve_capacity(len);
+        let capacity = self.send.capacity();
+        if capacity > 0 {
+            return Poll::Ready(Ok(capacity));
+        }
+        match ready!(self.send.poll_capacity(cx)) {
+            Some(Ok(capacity)) => Poll::Ready(Ok(capacity)),
+            Some(Err(e)) => Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, e))),
+            None => Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, "H2 stream closed"))),
         }
     }
 
     fn read_status_response(&mut self) -> io::Result<()> {
-        if self.recv_buf.is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "need more data for status",
-            ));
+        let Some((size, error)) = parse_stream_response(&self.recv_buf)? else {
+            return Err(io::ErrorKind::WouldBlock.into());
+        };
+        if let Some(message) = error {
+            return Err(io::Error::new(io::ErrorKind::ConnectionRefused,
+                format!("h2mux stream rejected: {message}")));
         }
-
-        let status = self.recv_buf[0];
-        match status {
-            STATUS_SUCCESS => {
-                self.recv_buf = self.recv_buf.slice(1..);
-                self.response_read = true;
-                Ok(())
-            }
-            STATUS_ERROR => {
-                let msg = self.read_error_message()?;
-                Err(io::Error::new(
-                    io::ErrorKind::ConnectionRefused,
-                    format!("h2mux stream rejected: {msg}"),
-                ))
-            }
-            _ => {
-                self.recv_buf = self.recv_buf.slice(1..);
-                Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("invalid status byte: {status}"),
-                ))
-            }
-        }
-    }
-
-    fn read_error_message(&mut self) -> io::Result<String> {
-        if self.recv_buf.len() < 2 {
-            return Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "need more data for error message",
-            ));
-        }
-
-        let mut pos = 1;
-        let mut len: usize = 0;
-        let mut shift = 0;
-
-        loop {
-            if pos >= self.recv_buf.len() {
-                return Err(io::Error::new(
-                    io::ErrorKind::WouldBlock,
-                    "need more data for varint",
-                ));
-            }
-            let byte = self.recv_buf[pos];
-            pos += 1;
-            len |= ((byte & 0x7F) as usize) << shift;
-            if byte & 0x80 == 0 {
-                break;
-            }
-            shift += 7;
-            if shift >= 64 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "varint too large",
-                ));
-            }
-        }
-
-        let total_len = pos + len;
-        if self.recv_buf.len() < total_len {
-            return Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "need more data for error message body",
-            ));
-        }
-
-        let msg_bytes = &self.recv_buf[pos..total_len];
-        let msg = String::from_utf8_lossy(msg_bytes).to_string();
-        self.recv_buf = self.recv_buf.slice(total_len..);
+        self.recv_buf = self.recv_buf.slice(size..);
         self.response_read = true;
-        Ok(msg)
+        Ok(())
     }
 
     fn poll_h2_stream(
@@ -209,15 +128,10 @@ impl H2MuxStream {
         cx: &mut Context<'_>,
     ) -> Poll<io::Result<Option<Bytes>>> {
         let recv = self.recv.as_mut().expect("recv should be resolved");
-        match Pin::new(recv).poll_data(cx) {
+        match Pin::new(&mut *recv).poll_data(cx) {
             Poll::Ready(Some(Ok(data))) => {
-                let len = data.len();
-                let _ = self
-                    .recv
-                    .as_mut()
-                    .unwrap()
-                    .flow_control()
-                    .release_capacity(len);
+                recv.flow_control().release_capacity(data.len())
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
                 Poll::Ready(Ok(Some(data)))
             }
             Poll::Ready(Some(Err(e))) => {
@@ -229,20 +143,18 @@ impl H2MuxStream {
     }
 }
 
-impl Drop for H2MuxStream {
-    fn drop(&mut self) {
-        if let Some(closer) = self.closer.take() {
-            closer.on_close();
-        }
-    }
-}
-
 impl AsyncRead for H2MuxStream {
     fn poll_read(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
+        if buf.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
+        if !self.write_closed {
+            ready!(self.poll_request_prefix(cx))?;
+        }
         if self.recv.is_none() {
             ready!(self.poll_resolve_recv(cx))?;
         }
@@ -262,12 +174,16 @@ impl AsyncRead for H2MuxStream {
                         if data.is_empty() {
                             continue;
                         }
-                        let mut new_buf = BytesMut::with_capacity(
-                            self.recv_buf.len() + data.len(),
-                        );
-                        new_buf.put_slice(&self.recv_buf);
-                        new_buf.put_slice(&data);
-                        self.recv_buf = new_buf.freeze();
+                        if self.recv_buf.is_empty() {
+                            self.recv_buf = data;
+                        } else {
+                            let mut new_buf = BytesMut::with_capacity(
+                                self.recv_buf.len() + data.len(),
+                            );
+                            new_buf.put_slice(&self.recv_buf);
+                            new_buf.put_slice(&data);
+                            self.recv_buf = new_buf.freeze();
+                        }
 
                         match self.read_status_response() {
                             Ok(()) => break,
@@ -296,18 +212,23 @@ impl AsyncRead for H2MuxStream {
             return Poll::Ready(Ok(()));
         }
 
-        match self.poll_h2_stream(cx) {
-            Poll::Ready(Ok(Some(data))) => {
-                let to_copy = data.len().min(buf.remaining());
-                buf.put_slice(&data[..to_copy]);
-                if to_copy < data.len() {
-                    self.recv_buf = data.slice(to_copy..);
+        loop {
+            match self.poll_h2_stream(cx) {
+                Poll::Ready(Ok(Some(data))) => {
+                    if data.is_empty() {
+                        continue;
+                    }
+                    let to_copy = data.len().min(buf.remaining());
+                    buf.put_slice(&data[..to_copy]);
+                    if to_copy < data.len() {
+                        self.recv_buf = data.slice(to_copy..);
+                    }
+                    return Poll::Ready(Ok(()));
                 }
-                Poll::Ready(Ok(()))
+                Poll::Ready(Ok(None)) => return Poll::Ready(Ok(())),
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => return Poll::Pending,
             }
-            Poll::Ready(Ok(None)) => Poll::Ready(Ok(())), // EOF
-            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
-            Poll::Pending => Poll::Pending,
         }
     }
 }
@@ -318,133 +239,41 @@ impl AsyncWrite for H2MuxStream {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        if let Some((pending_data, user_len, sent)) = self.pending_write.take() {
-            let remaining = &pending_data[sent..];
-            let current_capacity = self.send.capacity();
-            if current_capacity < remaining.len() {
-                self.send.reserve_capacity(remaining.len());
-            }
-
-            match self.send.poll_capacity(cx) {
-                Poll::Ready(Some(Ok(capacity))) => {
-                    let to_send = remaining.len().min(capacity);
-                    self.send
-                        .send_data(pending_data.slice(sent..sent + to_send), false)
-                        .map_err(|e| io::Error::new(io::ErrorKind::BrokenPipe, e))?;
-
-                    let new_sent = sent + to_send;
-                    if new_sent < pending_data.len() {
-                        self.pending_write =
-                            Some((pending_data, user_len, new_sent));
-                        return Poll::Pending;
-                    }
-                    return Poll::Ready(Ok(user_len));
-                }
-                Poll::Ready(Some(Err(e))) => {
-                    return Poll::Ready(Err(io::Error::new(
-                        io::ErrorKind::BrokenPipe,
-                        e,
-                    )));
-                }
-                Poll::Ready(None) => {
-                    return Poll::Ready(Err(io::Error::new(
-                        io::ErrorKind::BrokenPipe,
-                        "H2 stream closed",
-                    )));
-                }
-                Poll::Pending => {
-                    self.pending_write = Some((pending_data, user_len, sent));
-                    return Poll::Pending;
-                }
-            }
+        if self.write_closed {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe, "H2 stream write side is closed",
+            )));
         }
-
-        if let Some(request_bytes) = self.request_bytes.take() {
-            let request_len = request_bytes.len();
-            let mut combined = BytesMut::with_capacity(request_len + buf.len());
-            combined.put_slice(&request_bytes);
-            combined.put_slice(buf);
-            let combined = combined.freeze();
-
-            let current_capacity = self.send.capacity();
-            if current_capacity < combined.len() {
-                self.send.reserve_capacity(combined.len());
-            }
-
-            return match self.send.poll_capacity(cx) {
-                Poll::Ready(Some(Ok(capacity))) => {
-                    let to_send = combined.len().min(capacity);
-                    self.send
-                        .send_data(combined.slice(..to_send), false)
-                        .map_err(|e| io::Error::new(io::ErrorKind::BrokenPipe, e))?;
-
-                    if to_send < combined.len() {
-                        let user_written =
-                            to_send.saturating_sub(request_len).min(buf.len());
-                        self.pending_write = Some((combined, user_written, to_send));
-                        Poll::Pending
-                    } else {
-                        Poll::Ready(Ok(buf.len()))
-                    }
-                }
-                Poll::Ready(Some(Err(e))) => {
-                    Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, e)))
-                }
-                Poll::Ready(None) => Poll::Ready(Err(io::Error::new(
-                    io::ErrorKind::BrokenPipe,
-                    "H2 stream closed",
-                ))),
-                Poll::Pending => {
-                    self.request_bytes = Some(request_bytes);
-                    Poll::Pending
-                }
-            };
+        if buf.is_empty() {
+            return Poll::Ready(Ok(0));
         }
-
-        let current_capacity = self.send.capacity();
-        if current_capacity < buf.len() {
-            self.send.reserve_capacity(buf.len());
-        }
-
-        match self.send.poll_capacity(cx) {
-            Poll::Ready(Some(Ok(capacity))) => {
-                let to_send = buf.len().min(capacity);
-                self.send
-                    .send_data(Bytes::copy_from_slice(&buf[..to_send]), false)
-                    .map_err(|e| io::Error::new(io::ErrorKind::BrokenPipe, e))?;
-                Poll::Ready(Ok(to_send))
-            }
-            Poll::Ready(Some(Err(e))) => {
-                Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, e)))
-            }
-            Poll::Ready(None) => Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "H2 stream closed",
-            ))),
-            Poll::Pending => Poll::Pending,
-        }
+        ready!(self.poll_request_prefix(cx))?;
+        let capacity = ready!(self.poll_send_capacity(cx, buf.len()))?;
+        let n = buf.len().min(capacity);
+        self.send.send_data(Bytes::copy_from_slice(&buf[..n]), false)
+            .map_err(|e| io::Error::new(io::ErrorKind::BrokenPipe, e))?;
+        Poll::Ready(Ok(n))
     }
 
     fn poll_flush(
-        self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
     ) -> Poll<io::Result<()>> {
-        Poll::Ready(Ok(()))
+        self.poll_request_prefix(cx)
     }
 
     fn poll_shutdown(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<io::Result<()>> {
-        self.send.reserve_capacity(0);
-        Poll::Ready(match ready!(self.send.poll_capacity(cx)) {
-            Some(Ok(_)) | None => {
-                self.send.send_data(Bytes::new(), true).map_or_else(
-                    |e| Err(io::Error::new(io::ErrorKind::BrokenPipe, e)),
-                    |_| Ok(()),
-                )
-            }
-            Some(Err(e)) => Err(io::Error::new(io::ErrorKind::BrokenPipe, e)),
-        })
+        if !self.write_closed {
+            ready!(self.poll_request_prefix(cx))?;
+        }
+        let this = self.get_mut();
+        shutdown_h2_send(&mut this.send, &mut this.write_closed, cx)
     }
 }
+
+#[cfg(test)]
+#[path = "stream_tests.rs"]
+mod tests;

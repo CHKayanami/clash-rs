@@ -24,7 +24,9 @@ pub mod xudp;
 #[cfg(test)]
 mod interop_tests;
 
-use crate::proxy::transport::mux::{H2MuxPool, MuxOption};
+use crate::proxy::transport::mux::{
+    H2MuxPool, MuxOption, h2mux::protocol::carrier_session,
+};
 
 pub struct HandlerOptions {
     pub name: String,
@@ -59,6 +61,17 @@ impl std::fmt::Debug for Handler {
 impl_default_connector!(Handler);
 
 impl Handler {
+    async fn dial_mux_carrier(
+        &self,
+        sess: &Session,
+        resolver: ThreadSafeDNSResolver,
+        connector: &dyn RemoteConnector,
+    ) -> io::Result<AnyStream> {
+        let carrier_sess = carrier_session(sess);
+        self.dial_proxy_stream(&carrier_sess, VLESS_COMMAND_TCP, resolver, connector)
+            .await
+    }
+
     pub fn new(
         opts: HandlerOptions,
         connector: Option<Arc<dyn RemoteConnector>>,
@@ -184,6 +197,7 @@ impl OutboundHandler for Handler {
 
     async fn support_udp(&self) -> bool {
         self.opts.udp
+            || self.mux_pool.as_ref().is_some_and(|pool| pool.supports_udp())
     }
 
     async fn connect_stream(
@@ -235,18 +249,7 @@ impl OutboundHandler for Handler {
         connector: &dyn RemoteConnector,
     ) -> io::Result<AnyStream> {
         if let Some(mux) = &self.mux_pool {
-            let dialer = || async {
-                let carrier_sess = Session {
-                    destination: crate::session::SocksAddr::Domain(
-                        crate::proxy::transport::mux::h2mux::protocol::MUX_DESTINATION_HOST
-                            .into(),
-                        crate::proxy::transport::mux::h2mux::protocol::MUX_DESTINATION_PORT,
-                    ),
-                    ..sess.clone()
-                };
-                self.dial_proxy_stream(&carrier_sess, VLESS_COMMAND_TCP, resolver.clone(), connector)
-                    .await
-            };
+            let dialer = || self.dial_mux_carrier(sess, resolver.clone(), connector);
             let s = mux.open_stream(&sess.destination, false, dialer).await?;
             sess.push_chain(self.name());
             return Ok(s);
@@ -263,6 +266,13 @@ impl OutboundHandler for Handler {
         resolver: ThreadSafeDNSResolver,
         connector: &dyn RemoteConnector,
     ) -> io::Result<AnyOutboundDatagram> {
+        if let Some(mux) = self.mux_pool.as_ref().filter(|pool| pool.supports_udp()) {
+            let dialer = || self.dial_mux_carrier(sess, resolver.clone(), connector);
+            let datagram = mux.open_datagram(&sess.destination, dialer).await?;
+            sess.push_chain(self.name());
+            return Ok(AnyOutboundDatagram::new(datagram));
+        }
+
         let dial_carrier = || self.dial_proxy_stream(sess, VLESS_COMMAND_MUX, resolver.clone(), connector);
 
         let child_dgram = self

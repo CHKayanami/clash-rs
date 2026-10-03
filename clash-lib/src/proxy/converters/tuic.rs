@@ -65,6 +65,7 @@ impl TryFrom<&OutboundTuic> for Handler {
                 .unwrap_or(VarInt::MAX),
             ip: s.ip.clone(),
             skip_cert_verify: s.skip_cert_verify.unwrap_or(false),
+            fingerprint: s.fingerprint.clone(),
             sni: s.sni.clone(),
             gc_interval: Duration::from_millis(s.gc_interval.unwrap_or(3000)),
             gc_lifetime: Duration::from_millis(s.gc_lifetime.unwrap_or(15000)),

@@ -6,7 +6,7 @@ use std::{
     fmt::{Debug, Display, Formatter},
     io,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
-    str::FromStr,
+    str::{FromStr, from_utf8},
     sync::Arc,
 };
 use tokio::io::{AsyncRead, AsyncReadExt};
@@ -385,14 +385,14 @@ impl TryFrom<&[u8]> for SocksAddr {
             }
 
             SocksAddrType::DOMAIN => {
-                if buf.is_empty() {
+                if buf.len() < 2 {
                     return Err(insuff_bytes());
                 }
                 let domain_len = buf[1] as usize;
-                if buf.len() < 1 + domain_len + 2 {
+                if buf.len() < 2 + domain_len + 2 {
                     return Err(insuff_bytes());
                 }
-                let domain = String::from_utf8((buf[2..domain_len + 2]).to_vec())
+                let domain = from_utf8(&buf[2..domain_len + 2])
                     .map_err(|e| io::Error::other(format!("invalid domain: {e}")))?;
                 let mut port_bytes = [0u8; 2];
                 (port_bytes).copy_from_slice(&buf[domain_len + 2..domain_len + 4]);
@@ -403,6 +403,17 @@ impl TryFrom<&[u8]> for SocksAddr {
             _ => Err(io::Error::other("invalid ATYP")),
         }
     }
+}
+
+#[test]
+fn test_socks_addr_domain_wire_bounds() {
+    let wire = [3, 3, b'd', b'n', b's', 0, 53];
+    for len in 0..wire.len() {
+        assert!(SocksAddr::try_from(&wire[..len]).is_err());
+    }
+    assert_eq!(SocksAddr::try_from(&wire[..]).unwrap(),
+        SocksAddr::Domain("dns".into(), 53));
+    assert!(SocksAddr::try_from(&[3, 1, 0xff, 0, 53][..]).is_err());
 }
 
 impl TryFrom<SocksAddr> for SocketAddr {

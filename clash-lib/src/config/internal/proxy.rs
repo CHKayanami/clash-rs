@@ -537,6 +537,7 @@ pub struct OutboundTuic {
     pub max_udp_relay_packet_size: Option<u64>,
     pub fast_open: Option<bool>,
     pub skip_cert_verify: Option<bool>,
+    pub fingerprint: Option<String>,
     pub max_open_stream: Option<u64>,
     pub sni: Option<String>,
     /// millis

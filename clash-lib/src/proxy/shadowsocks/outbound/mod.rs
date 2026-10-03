@@ -25,7 +25,9 @@ use std::{collections::HashMap, fmt::Debug, io, sync::Arc};
 use tokio::io::AsyncWriteExt;
 use tracing::debug;
 
-use crate::proxy::transport::mux::{H2MuxPool, MuxOption};
+use crate::proxy::transport::mux::{
+    H2MuxPool, MuxOption, h2mux::protocol::carrier_session,
+};
 
 pub struct HandlerOptions {
     pub name: String,
@@ -66,6 +68,28 @@ impl Debug for Handler {
 }
 
 impl Handler {
+    async fn dial_mux_carrier(
+        &self,
+        sess: &Session,
+        resolver: ThreadSafeDNSResolver,
+        connector: &dyn RemoteConnector,
+    ) -> io::Result<AnyStream> {
+        let stream = connector
+            .connect_stream(
+                resolver.clone(),
+                self.opts.server.as_str(),
+                self.opts.port,
+                self.opts.common_opts.tfo,
+                sess.iface.as_ref(),
+                #[cfg(target_os = "linux")]
+                sess.so_mark,
+            )
+            .await?;
+        let carrier_sess = carrier_session(sess);
+        self.proxy_stream(stream, &carrier_sess, resolver)
+            .await
+    }
+
     pub fn new(opts: HandlerOptions, connector: Option<Arc<dyn RemoteConnector>>) -> Self {
         let mux_pool = opts
             .smux
@@ -178,6 +202,7 @@ impl OutboundHandler for Handler {
 
     async fn support_udp(&self) -> bool {
         self.opts.udp || self.opts.uot
+            || self.mux_pool.as_ref().is_some_and(|pool| pool.supports_udp())
     }
 
     async fn connect_stream(
@@ -208,7 +233,9 @@ impl OutboundHandler for Handler {
             debug!("{:?} is connecting via {:?}", self, dialer);
             self.connect_datagram_with_connector(sess, resolver, dialer.as_ref())
                 .await
-        } else if self.opts.uot {
+        } else if self.opts.uot
+            || self.mux_pool.as_ref().is_some_and(|pool| pool.supports_udp())
+        {
             self.connect_datagram_with_connector(
                 sess,
                 resolver,
@@ -231,29 +258,7 @@ impl OutboundHandler for Handler {
         connector: &dyn RemoteConnector,
     ) -> io::Result<AnyStream> {
         if let Some(mux) = &self.mux_pool {
-            let dialer = || async {
-                let stream = connector
-                    .connect_stream(
-                        resolver.clone(),
-                        self.opts.server.as_str(),
-                        self.opts.port,
-                        self.opts.common_opts.tfo,
-                        sess.iface.as_ref(),
-                        #[cfg(target_os = "linux")]
-                        sess.so_mark,
-                    )
-                    .await?;
-                let carrier_sess = Session {
-                    destination: SocksAddr::Domain(
-                        crate::proxy::transport::mux::h2mux::protocol::MUX_DESTINATION_HOST
-                            .into(),
-                        crate::proxy::transport::mux::h2mux::protocol::MUX_DESTINATION_PORT,
-                    ),
-                    ..sess.clone()
-                };
-                self.proxy_stream(stream, &carrier_sess, resolver.clone())
-                    .await
-            };
+            let dialer = || self.dial_mux_carrier(sess, resolver.clone(), connector);
             let s = mux.open_stream(&sess.destination, false, dialer).await?;
             sess.push_chain(self.name());
             return Ok(s);
@@ -282,6 +287,13 @@ impl OutboundHandler for Handler {
         resolver: ThreadSafeDNSResolver,
         connector: &dyn RemoteConnector,
     ) -> io::Result<AnyOutboundDatagram> {
+        if let Some(mux) = self.mux_pool.as_ref().filter(|pool| pool.supports_udp()) {
+            let dialer = || self.dial_mux_carrier(sess, resolver.clone(), connector);
+            let datagram = mux.open_datagram(&sess.destination, dialer).await?;
+            sess.push_chain(self.name());
+            return Ok(AnyOutboundDatagram::new(datagram));
+        }
+
         if self.opts.uot {
             let uot_dest = SocksAddr::try_from((
                 crate::proxy::transport::uot::UDP_OVER_TCP_V2_MAGIC_HOST.to_owned(),

@@ -177,6 +177,20 @@ pub struct ParsedPacket {
     pub payload: Bytes,
 }
 
+/// Heartbeats use QUIC datagrams regardless of the UDP relay mode.
+/// `None` means a valid heartbeat; packet frames retain their full validation.
+pub fn decode_relay_datagram(buf: Bytes) -> Result<Option<ParsedPacket>, ProtoError> {
+    let mut prefix = buf.as_ref();
+    let header = Header::decode(&mut prefix)?;
+    if header.command == CmdType::Heartbeat {
+        if !prefix.is_empty() {
+            return Err(ProtoError::InvalidPayloadSize);
+        }
+        return Ok(None);
+    }
+    decode_packet_frame(buf).map(Some)
+}
+
 pub fn decode_packet_frame(mut buf: Bytes) -> Result<ParsedPacket, ProtoError> {
     let header = Header::decode(&mut buf)?;
     if header.command != CmdType::Packet {
@@ -215,6 +229,30 @@ mod tests {
     use super::*;
     use crate::session::SocksAddr;
     use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+
+    #[test]
+    fn test_relay_datagram_accepts_heartbeat_and_packet() {
+        // Independent TUIC v5 heartbeat wire fixture.
+        assert!(decode_relay_datagram(Bytes::from_static(&[5, 4])).unwrap().is_none());
+        let addr = Address::IPv4(Ipv4Addr::LOCALHOST, 53);
+        let packet = encode_single_packet(1, 2, &addr, b"reply").unwrap();
+        let parsed = decode_relay_datagram(packet).unwrap().unwrap();
+        assert_eq!(parsed.assoc_id, 1);
+        assert_eq!(parsed.addr, addr);
+        assert_eq!(parsed.payload.as_ref(), b"reply");
+    }
+
+    #[test]
+    fn test_relay_datagram_rejects_invalid_control_frames() {
+        for wire in [&[5][..], &[4, 4], &[5, 255], &[5, 1], &[5, 4, 0]] {
+            assert!(decode_relay_datagram(Bytes::copy_from_slice(wire)).is_err());
+        }
+        let addr = Address::IPv4(Ipv4Addr::LOCALHOST, 53);
+        let mut packet = encode_single_packet(1, 2, &addr, b"reply").unwrap().to_vec();
+        packet.pop();
+        assert!(matches!(decode_relay_datagram(Bytes::from(packet)),
+            Err(ProtoError::InvalidPayloadSize)));
+    }
 
     #[test]
     fn test_header_codec() {

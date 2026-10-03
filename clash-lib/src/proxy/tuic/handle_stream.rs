@@ -1,4 +1,4 @@
-use super::types::TuicConnection;
+use super::{proto::decode_relay_datagram, types::TuicConnection};
 use crate::proxy::tuic::types::UdpRelayMode;
 use bytes::Bytes;
 use std::sync::Arc;
@@ -63,13 +63,15 @@ impl TuicConnection {
     pub async fn handle_datagram(&self, dg: Bytes) {
         tracing::debug!("[relay] incoming datagram");
 
-        if self.udp_relay_mode != UdpRelayMode::Native {
-            tracing::warn!("[relay] received datagram in non-native relay mode");
-            return;
-        }
-
-        match super::proto::decode_packet_frame(dg) {
-            Ok(parsed) => {
+        match decode_relay_datagram(dg) {
+            Ok(None) => {
+                tracing::debug!("[relay] incoming heartbeat");
+            }
+            Ok(Some(parsed)) => {
+                if self.udp_relay_mode != UdpRelayMode::Native {
+                    tracing::warn!("[relay] received packet datagram in non-native relay mode");
+                    return;
+                }
                 self.dispatch_packet(parsed, "native").await;
             }
             Err(err) => {

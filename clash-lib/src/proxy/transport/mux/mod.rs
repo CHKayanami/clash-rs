@@ -34,6 +34,9 @@ pub struct MuxOption {
     pub padding: bool,
     #[serde(default)]
     pub statistic: bool,
+    /// Keep UDP on the outbound's original transport instead of sing-mux.
+    #[serde(default)]
+    pub only_tcp: bool,
 }
 
 impl MuxOption {

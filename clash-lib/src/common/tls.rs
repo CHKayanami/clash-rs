@@ -7,6 +7,8 @@ use rustls::{
 };
 use tracing::warn;
 
+use super::utils::{encode_hex, sha256};
+
 use std::{io, sync::{Arc, LazyLock}};
 
 pub(crate) fn validate_alpn(protocols: &[String]) -> io::Result<usize> {
@@ -170,6 +172,22 @@ pub fn build_tls_client_config(
     }
 }
 
+/// Parse a SHA-256 fingerprint value (hex, optionally colon-separated) into 32 bytes.
+pub(crate) fn parse_fingerprint_sha256(s: &str) -> Option<[u8; 32]> {
+    let hex: String = s
+        .chars()
+        .filter(|c| *c != ':' && !c.is_whitespace())
+        .collect();
+    if hex.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, b) in out.iter_mut().enumerate() {
+        *b = u8::from_str_radix(hex.get(i * 2..i * 2 + 2)?, 16).ok()?;
+    }
+    Some(out)
+}
+
 #[derive(Debug)]
 pub struct DefaultTlsVerifier {
     fingerprint: Option<String>,
@@ -189,6 +207,39 @@ impl DefaultTlsVerifier {
     }
 }
 
+#[cfg(test)]
+mod fingerprint_tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn certificate_pin_accepts_equivalent_hex_formats() {
+        crate::tests::initialize();
+        let cert = CertificateDer::from(b"test certificate".to_vec());
+        let hash = encode_hex(&sha256(cert.as_ref()));
+        let colon_hash = hash.as_bytes().chunks(2)
+            .map(|pair| String::from_utf8(pair.to_vec()).unwrap().to_uppercase())
+            .collect::<Vec<_>>().join(":");
+        let name = ServerName::try_from("example.com").unwrap();
+        for fingerprint in [hash, colon_hash] {
+            let verifier = DefaultTlsVerifier::new(Some(fingerprint), false);
+            assert!(verifier.verify_server_cert(
+                &cert, &[], &name, &[], UnixTime::since_unix_epoch(Duration::ZERO),
+            ).is_ok());
+        }
+        for fingerprint in ["00".repeat(32), "invalid".to_owned()] {
+            let verifier = DefaultTlsVerifier::new(Some(fingerprint), true);
+            assert!(verifier.verify_server_cert(
+                &cert, &[], &name, &[], UnixTime::since_unix_epoch(Duration::ZERO),
+            ).is_err());
+        }
+        let verifier = DefaultTlsVerifier::new(None, false);
+        assert!(verifier.verify_server_cert(
+            &cert, &[], &name, &[], UnixTime::since_unix_epoch(Duration::ZERO),
+        ).is_err());
+    }
+}
+
 impl ServerCertVerifier for DefaultTlsVerifier {
     fn verify_server_cert(
         &self,
@@ -199,13 +250,20 @@ impl ServerCertVerifier for DefaultTlsVerifier {
         now: rustls::pki_types::UnixTime,
     ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
         if let Some(ref fingerprint) = self.fingerprint {
-            let cert_hex =
-                super::utils::encode_hex(&super::utils::sha256(end_entity.as_ref()));
-            if !fingerprint.eq_ignore_ascii_case(&cert_hex) {
+            let expected = parse_fingerprint_sha256(fingerprint).ok_or_else(|| {
+                rustls::Error::General("invalid certificate fingerprint (expected SHA-256 hex)".into())
+            })?;
+            let cert_hash = sha256(end_entity.as_ref());
+            if expected.as_slice() != cert_hash.as_slice() {
+                let cert_hex = encode_hex(&cert_hash);
                 return Err(rustls::Error::General(format!(
-                    "cert hash mismatch: found: {cert_hex}\nexcept: {fingerprint}"
+                    "cert hash mismatch: found: {cert_hex}\nexpected: {fingerprint}"
                 )));
             }
+            // An explicit certificate pin is the trust anchor, including for
+            // self-signed certificates. TLS handshake signatures are still
+            // verified by verify_tls12_signature / verify_tls13_signature.
+            return Ok(rustls::client::danger::ServerCertVerified::assertion());
         }
 
         if self.skip {

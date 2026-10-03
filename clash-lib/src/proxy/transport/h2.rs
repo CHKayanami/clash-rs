@@ -90,6 +90,7 @@ pub struct Http2Stream {
     recv: RecvStream,
     send: SendStream<Bytes>,
     buffer: Bytes,
+    write_closed: bool,
 }
 
 impl crate::proxy::ProxyStream for Http2Stream {}
@@ -110,6 +111,7 @@ impl Http2Stream {
             recv,
             send,
             buffer: Bytes::new(),
+            write_closed: false,
         }
     }
 }
@@ -161,6 +163,11 @@ impl AsyncWrite for Http2Stream {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<Result<usize, io::Error>> {
+        if self.write_closed {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe, "H2 stream write side is closed",
+            )));
+        }
         self.send.reserve_capacity(buf.len());
         Poll::Ready(match ready!(self.send.poll_capacity(cx)) {
             Some(Ok(to_write)) => self
@@ -182,19 +189,41 @@ impl AsyncWrite for Http2Stream {
     }
 
     fn poll_shutdown(
-        mut self: Pin<&mut Self>,
+        self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Result<(), io::Error>> {
-        self.send.reserve_capacity(0);
-        Poll::Ready(ready!(self.send.poll_capacity(cx)).map_or(
-            Err(io::Error::new(io::ErrorKind::BrokenPipe, "broken pipe")),
-            |_| {
-                self.send.send_data(Bytes::new(), true).map_or_else(
-                    |e| Err(io::Error::new(io::ErrorKind::BrokenPipe, e)),
-                    |_| Ok(()),
-                )
-            },
-        ))
+        let this = self.get_mut();
+        shutdown_h2_send(&mut this.send, &mut this.write_closed, cx)
+    }
+}
+
+pub(crate) fn shutdown_h2_send(
+    send: &mut SendStream<Bytes>,
+    write_closed: &mut bool,
+    cx: &mut Context<'_>,
+) -> Poll<io::Result<()>> {
+    if *write_closed {
+        return Poll::Ready(Ok(()));
+    }
+    send.reserve_capacity(0);
+    match send.poll_capacity(cx) {
+        Poll::Ready(None) => {
+            *write_closed = true;
+            Poll::Ready(Ok(()))
+        }
+        Poll::Ready(Some(Err(e))) => {
+            Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, e)))
+        }
+        // An empty END_STREAM frame needs no flow-control capacity.
+        Poll::Ready(Some(Ok(_))) | Poll::Pending => {
+            match send.send_data(Bytes::new(), true) {
+                Ok(()) => {
+                    *write_closed = true;
+                    Poll::Ready(Ok(()))
+                }
+                Err(e) => Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, e))),
+            }
+        }
     }
 }
 

@@ -1,16 +1,71 @@
 use bytes::Bytes;
+use h2::{client::handshake as client_handshake, server::Builder as ServerBuilder};
 use http::Response;
+use std::{io::ErrorKind, time::Duration};
 use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::time::timeout;
 
-use super::{pool::H2MuxPool, protocol::*, session::H2MuxSession};
+use super::{
+    padding::PaddingStream, pool::H2MuxPool, protocol::*,
+    session::H2MuxSession, stream::H2MuxStream,
+};
 use crate::{
     proxy::{AnyStream, transport::mux::MuxOption},
     session::SocksAddr,
 };
+
+#[tokio::test]
+async fn test_h2mux_shutdown_without_capacity_is_idempotent() {
+    check_shutdown(false).await;
+}
+
+#[tokio::test]
+async fn test_h2mux_shutdown_after_send_side_closed() {
+    check_shutdown(true).await;
+}
+
+async fn check_shutdown(end_stream: bool) {
+    let (client, peer) = tokio::io::duplex(4096);
+    let server = tokio::spawn(async move {
+        let mut builder = ServerBuilder::new();
+        builder.initial_window_size(0);
+        let mut conn = builder.handshake::<_, Bytes>(peer).await.unwrap();
+        let (req, mut respond) = conn.accept().await.unwrap().unwrap();
+        let task = tokio::spawn(async move {
+            let response = Response::builder().status(200).body(()).unwrap();
+            let mut send = respond.send_response(response, false).unwrap();
+            send.send_data(Bytes::from_static(&[STATUS_SUCCESS, b'x']), false).unwrap();
+            let mut recv = req.into_body();
+            while let Some(data) = recv.data().await {
+                assert!(data.unwrap().is_empty());
+            }
+            send.send_data(Bytes::from_static(b"y"), true).unwrap();
+        });
+        while conn.accept().await.is_some() {}
+        task.await.unwrap();
+    });
+    let (mut sender, conn) = client_handshake(client).await.unwrap();
+    let driver = tokio::spawn(conn);
+    let (response, send) = sender.send_request(build_h2_connect_request().unwrap(), end_stream).unwrap();
+    let mut stream = H2MuxStream::new(response, send, Bytes::new(), None);
+    let mut data = [0; 1];
+    stream.read_exact(&mut data).await.unwrap();
+    assert_eq!(data, [b'x']);
+    timeout(Duration::from_secs(1), stream.shutdown())
+        .await.unwrap().unwrap();
+    stream.shutdown().await.unwrap();
+    assert_eq!(stream.write_all(b"closed").await.unwrap_err().kind(), ErrorKind::BrokenPipe);
+    stream.read_exact(&mut data).await.unwrap();
+    assert_eq!(data, [b'y']);
+    assert_eq!(stream.read(&mut data).await.unwrap(), 0);
+    drop((stream, sender));
+    driver.abort();
+    server.await.unwrap();
+}
 
 #[test]
 fn test_mux_option_validation() {
@@ -53,6 +108,15 @@ fn test_stream_request_encoding() {
 
 #[tokio::test]
 async fn test_h2mux_session_echo_and_concurrency() {
+    session_echo_and_concurrency(false).await;
+}
+
+#[tokio::test]
+async fn test_h2mux_padded_session_echo_and_concurrency() {
+    session_echo_and_concurrency(true).await;
+}
+
+async fn session_echo_and_concurrency(padding_enabled: bool) {
     let (client_io, mut server_io) = tokio::io::duplex(1024 * 1024);
 
     // Spawn mock sing-box H2Mux server
@@ -68,6 +132,12 @@ async fn test_h2mux_session_echo_and_concurrency() {
                 let mut pad = vec![0u8; pad_len as usize];
                 server_io.read_exact(&mut pad).await.unwrap();
             }
+        }
+
+        let mut server_io = AnyStream::new(server_io);
+        if padding_enabled {
+            assert_eq!(version, VERSION_1);
+            server_io = AnyStream::new(PaddingStream::new(server_io));
         }
 
         // 2. HTTP/2 handshake
@@ -115,7 +185,7 @@ async fn test_h2mux_session_echo_and_concurrency() {
         max_connections: 2,
         min_streams: 2,
         max_streams: 10,
-        padding: false,
+        padding: padding_enabled,
         ..Default::default()
     };
 

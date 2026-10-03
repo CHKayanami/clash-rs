@@ -8,7 +8,7 @@ use std::io;
 use std::sync::LazyLock;
 
 use anyhow::Context as _;
-use super::encode_alpn;
+use super::{encode_alpn, parse_fingerprint_sha256};
 use boring::error::ErrorStack;
 use boring::ssl::{
     CertificateCompressionAlgorithm, CertificateCompressor, ConnectConfiguration, SslConnector,
@@ -111,22 +111,6 @@ fn add_chrome_alps(cfg: &mut ConnectConfiguration) -> anyhow::Result<()> {
         return Err(ErrorStack::get()).context("SSL_add_application_settings");
     }
     Ok(())
-}
-
-/// Parse a SHA-256 fingerprint value (hex, optionally colon-separated) into 32 bytes.
-pub fn parse_fingerprint_sha256(s: &str) -> Option<[u8; 32]> {
-    let hex: String = s
-        .chars()
-        .filter(|c| *c != ':' && !c.is_whitespace())
-        .collect();
-    if hex.len() != 64 {
-        return None;
-    }
-    let mut out = [0u8; 32];
-    for (i, b) in out.iter_mut().enumerate() {
-        *b = u8::from_str_radix(hex.get(i * 2..i * 2 + 2)?, 16).ok()?;
-    }
-    Some(out)
 }
 
 /// Custom verify callback matching the peer leaf certificate's SHA-256

@@ -3,7 +3,7 @@ use std::{future::Future, io, sync::Arc};
 use tokio::sync::Mutex;
 use tracing::{debug, warn};
 
-use super::session::H2MuxSession;
+use super::{datagram::H2MuxDatagram, session::H2MuxSession};
 use crate::{
     proxy::{AnyStream, transport::mux::MuxOption},
     session::SocksAddr,
@@ -22,6 +22,27 @@ impl H2MuxPool {
             sessions: RwLock::new(Vec::new()),
             connecting: Mutex::new(()),
         })
+    }
+
+    pub fn supports_udp(&self) -> bool {
+        !self.opt.only_tcp
+    }
+
+    pub async fn open_datagram<F, Fut>(
+        &self,
+        destination: &SocksAddr,
+        dial_carrier: F,
+    ) -> io::Result<H2MuxDatagram>
+    where
+        F: Fn() -> Fut + Send + Sync,
+        Fut: Future<Output = io::Result<AnyStream>> + Send,
+    {
+        if !self.supports_udp() {
+            return Err(io::Error::new(io::ErrorKind::Unsupported,
+                "h2mux UDP disabled by only-tcp"));
+        }
+        let stream = self.open_stream(destination, true, dial_carrier).await?;
+        Ok(H2MuxDatagram::new(stream))
     }
 
     fn choose_session(
@@ -116,6 +137,10 @@ impl H2MuxPool {
                 Ok(stream) => return Ok(stream),
                 Err(e) => {
                     warn!("h2mux open_stream failed (attempt {attempt}): {e}");
+                    if e.kind() == io::ErrorKind::WouldBlock {
+                        last_error = Some(e);
+                        continue;
+                    }
                     if e.kind() == io::ErrorKind::InvalidInput {
                         return Err(e);
                     }

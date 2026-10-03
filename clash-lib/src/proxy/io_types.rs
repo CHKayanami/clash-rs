@@ -11,7 +11,10 @@ use super::{
     transport::{
         GrpcStream, Http2Stream, HttpStream, WebsocketConn, WebsocketEarlyDataConn,
         XHttpStream,
-        mux::h2mux::stream::H2MuxStream, reality::SplicableTlsStream,
+        mux::h2mux::{
+            datagram::H2MuxDatagram, padding::PaddingStream, stream::H2MuxStream,
+        },
+        reality::SplicableTlsStream,
         uot::OutboundDatagramUotV2,
     },
     trojan::OutboundDatagramTrojan,
@@ -154,6 +157,7 @@ define_transport!($, AnyStream, DynamicStream, [ProxyStream + Sync], dispatch_st
     H2(Http2Stream),
     Grpc(GrpcStream),
     H2Mux(H2MuxStream),
+    H2MuxPadding(PaddingStream),
     Vmess(VmessStream<AnyStream>),
     Vless(VlessStream),
     VlessEncryption(EncryptionStream),
@@ -266,6 +270,7 @@ define_transport!($, AnyOutboundDatagram, DynamicDatagram, [OutboundDatagram<Udp
     Trojan(OutboundDatagramTrojan),
     Vmess(OutboundDatagramVmess),
     Uot(OutboundDatagramUotV2),
+    H2Mux(H2MuxDatagram),
     Xudp(XudpChildDatagram),
 ]);
 

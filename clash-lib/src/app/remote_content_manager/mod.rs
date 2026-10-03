@@ -803,9 +803,11 @@ impl ProxyManager {
                         new_io_error(format!("failed to handshake: {e}"))
                     })?;
 
+                    let connection_name = name.clone();
                     tokio::task::spawn(async move {
                         if let Err(err) = conn.await {
-                            warn!("HTTP connection error: {}", err);
+                            warn!(outbound = %connection_name, error = ?err,
+                                "HTTP connection error");
                         }
                     });
 
@@ -847,9 +849,11 @@ impl ProxyManager {
                         new_io_error(format!("failed to handshake: {e}"))
                     })?;
 
+                    let connection_name = name.clone();
                     tokio::task::spawn(async move {
                         if let Err(err) = conn.await {
-                            warn!("HTTP connection error: {}", err);
+                            warn!(outbound = %connection_name, error = ?err,
+                                "HTTP connection error");
                         }
                     });
 
