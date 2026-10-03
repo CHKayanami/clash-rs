@@ -20,10 +20,10 @@ A custom protocol, rule based network proxy software.
 > [!NOTE]
 > **About this Fork**:
 > - ⚡ **Performance & Stability**: Extensively refactored and performance-tuned with rewritten core protocol stacks.
-> - 🚀 **New Features**: Shadowsocks UOT (UDP-over-TCP), Domain Sniffing (TLS SNI / HTTP Host / QUIC SNI), H2MUX, TUN System Stack, etc.
+> - 🚀 **New Features**: BoringSSL-based browser TLS fingerprints, VLESS Encryption, VLESS XHTTP, Shadowsocks UOT (UDP-over-TCP), Domain Sniffing (TLS SNI / HTTP Host / QUIC SNI), H2MUX, and TUN System Stack.
 > - ⚡ **eBPF Kernel Transparent Proxy**: High-performance in-kernel transparent proxy inbound powered by eBPF with direct fast-path offload (Linux only).
 > - 🌐 **Flexible DNS2 Routing Engine**: Introduces a two-stage DNS routing subsystem, allowing flexible upstream steering (direct, proxy detour, Fake-IP) and fine-grained rule-based dispatching.
-> - 🪶 **Minimal Build**: Lightweight by design; excludes optional protocols (`SSH`, `WireGuard`, `Tailscale`, `Shadowquic`, `Tor`).
+> - 🪶 **Minimal Build**: The `minimal` feature adds Shadowsocks and TUIC to the core protocols; `standard` also adds SSH, WireGuard, Tailscale, and Shadowquic; `plus` adds Tor. Default features remain enabled unless `--no-default-features` is specified.
 > - 📖 **Configuration Documentation**: See [clash-rs-alpha-docs](https://chkayanami.github.io/clash-rs-alpha-docs).
 
 ## ✨ Features
@@ -32,8 +32,8 @@ A custom protocol, rule based network proxy software.
 - 📦 Local anti spoofing DNS with support of UDP/TCP/DoH/DoT remote, and expose it as a local UDP/TCP/DoH/DoT server.
 - 🔍 Domain Sniffer for TLS SNI, HTTP Host, and QUIC Initial SNI decryption to enable accurate routing for transparent proxies.
 - ⚡ **eBPF In-Kernel Transparent Proxy**: Wire-rate packet interception via TC Ingress/Egress and Cgroup eBPF hooks with direct kernel fast-path offload to eliminate userspace overhead.
-- ⚙️ AnyTLS/Hysteria2/Shadowquic/Shadowsocks/Socks5(TCP/UDP)/SSH/Tailscale/tor(onion)/Trojan/Tuic/VLess/Vmess/Wireguard(userspace) outbound support with different underlying transports(gRPC/TLS/H2/WebSocket/etc.).
-- 🔀 Multiple inbound modes: HTTP, SOCKS5, Mixed, Shadowsocks, AnyTLS, Redir, TProxy, eBPF, and TUN (utun) for transparent proxying.
+- ⚙️ AnyTLS/Hysteria2/Shadowquic/Shadowsocks/Socks5(TCP/UDP)/SSH/Tailscale/Tor(onion)/Trojan/TUIC/VLESS/VMess/WireGuard(userspace) outbounds, with protocol-specific TCP/HTTP/WebSocket/H2/gRPC/XHTTP transports and TLS/REALITY security.
+- 🔀 Multiple inbound modes: HTTP, SOCKS5, Mixed, Shadowsocks, AnyTLS, Redir, TProxy, eBPF, and TUN for transparent proxying.
 - 🌍 Dynamic remote rule/proxy loader.
 - 🎵 Tracing with Jaeger
 
@@ -49,30 +49,38 @@ A custom protocol, rule based network proxy software.
 | `shadowsocks` | Shadowsocks inbound with multi-user support | `shadowsocks` feature |
 | `anytls` | AnyTLS inbound with multi-user support, GFW fallback camouflage | |
 | `ebpf` | eBPF in-kernel transparent proxy (zero-copy / line-rate) | Linux; `ebpf` feature |
-| `tun` | TUN device for transparent proxying | All platforms |
+| `tun` | TUN device for transparent proxying | `tun` feature; platform-dependent device setup |
 | `tproxy` | Transparent proxy (TCP + UDP) | Linux; `tproxy` feature |
 | `redir` | TCP redirect | Linux; `redir` feature |
 | `tunnel` | Routes all traffic to a fixed target | |
 
 ### Outbounds
 
-| Protocol | Transports | Notes |
+| Protocol | Transports / Security | Notes |
 |----------|-----------|-------|
 | `direct` | — | |
 | `reject` | — | |
-| `ss` | plain · obfs-http · obfs-tls · v2ray-plugin-ws · v2ray-plugin-ws-tls · shadow-tls | `shadowsocks` feature |
+| `ss` | plain · obfs-http · obfs-tls · v2ray-plugin-ws · v2ray-plugin-ws-tls · shadow-tls | `shadowsocks` feature; UDP, UOT v2, H2MUX |
 | `socks5` | plain TCP · TLS | |
 | `anytls` | TLS | |
-| `trojan` | TLS · WebSocket+TLS · gRPC+TLS | |
-| `vmess` | TCP · TCP+TLS · WebSocket+TLS · H2+TLS · gRPC+TLS | |
-| `vless` | TLS · WebSocket+TLS · H2+TLS · gRPC+TLS · REALITY | |
-| `wireguard` | UDP (userspace) | `wireguard` feature |
+| `trojan` | TCP · WebSocket · gRPC, with TLS | TCP/UDP; H2MUX |
+| `vmess` | TCP · HTTP · WebSocket · H2 · gRPC; optional TLS | TCP/UDP; H2MUX |
+| `vless` | TCP (`tcp` / `raw`) · HTTP · WebSocket · H2 · gRPC · XHTTP; optional TLS or REALITY | TCP/XUDP; Vision; VLESS Encryption; H2MUX without Encryption |
+| `wireguard` | UDP (userspace) | `wireguard` feature (`standard` / `plus` builds) |
 | `hysteria2` | QUIC · obfs-salamander | |
 | `tuic` | QUIC (bbr / cubic / new_reno) | `tuic` feature |
-| `shadowquic` | QUIC · over-stream | `shadowquic` feature |
-| `ssh` | SSH tunnel | `ssh` feature |
+| `shadowquic` | QUIC · over-stream | `shadowquic` feature (`standard` / `plus` builds) |
+| `ssh` | SSH tunnel | `ssh` feature (`standard` / `plus` builds) |
 | `tor` | Onion routing | `onion` feature (`plus` build) |
-| `tailscale` | Mesh VPN | `tailscale` feature (`plus` build) |
+| `tailscale` | Mesh VPN | `tailscale` feature (`standard` / `plus` builds) |
+
+### VLESS and XHTTP
+
+- **VLESS Encryption**: Supports `mlkem768x25519plus`, `native` / `xorpub` / `random` modes, and `0rtt` / `1rtt`. Encryption is independent of outer TLS/REALITY and can be used across the VLESS transports above; it does not require the `shadowsocks` feature. Encryption cannot be combined with enabled `smux`.
+- **Vision and ALPN**: Supports `xtls-rprx-vision` and configurable `alpn` for TLS and REALITY. Vision over XHTTP requires VLESS Encryption.
+- **XHTTP**: VLESS only, with flat Mihomo-style `xhttp-opts`. Supports `auto`, `packet-up`, `stream-up`, and `stream-one`, HTTP/1.1 and HTTP/2, independent `download-settings`, `reuse-settings`, padding, and configurable session/sequence/data placement. `stream-one` requires HTTP/2 and cannot use `download-settings`; REALITY also requires HTTP/2. HTTP/3 is not implemented for XHTTP.
+
+H2MUX is configured through `smux` / `multiplex` for Shadowsocks, Trojan, VMess, and VLESS. Only `protocol: h2mux` is implemented; `smux` and `yamux` protocol selections are rejected. XHTTP's `reuse-settings` manages its HTTP connection pool separately.
 
 ## 🖥 Environment Support
 
