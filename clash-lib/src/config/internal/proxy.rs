@@ -399,11 +399,14 @@ pub struct OutboundVless {
     #[serde(flatten)]
     pub common_opts: CommonConfigOptions,
     pub uuid: String,
+    /// Xray VLESS Encryption string; omitted or `none` disables encryption.
+    pub encryption: Option<String>,
     pub udp: Option<bool>,
     pub tls: Option<bool>,
     pub skip_cert_verify: Option<bool>,
     #[serde(alias = "servername")]
     pub server_name: Option<String>,
+    pub alpn: Option<Vec<String>>,
     pub network: Option<String>,
     pub ws_opts: Option<WsOpt>,
     pub http_opts: Option<HttpOpt>,

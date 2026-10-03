@@ -31,7 +31,7 @@ ring = [
 ]
 
 # Protos
-shadowsocks = ["dep:shadowsocks", "dep:blake3"]
+shadowsocks = ["dep:shadowsocks"]
 tuic = []
 ssh = ["dep:russh", "dep:dirs", "dep:totp-rs"]
 onion = ["dep:arti-client", "dep:tor-rtcompat", "arti-client/onion-service-client"]
@@ -140,7 +140,7 @@ sha2 = "0.11"
 md-5 = "0.11"
 chacha20poly1305 = "0.11"
 aes = "0.9"
-blake3 = { version = "1", optional = true }
+blake3 = { workspace = true }
 aes-gcm = "0.11"
 cfb-mode = "0.9"
 const-fnv1a-hash = "1"

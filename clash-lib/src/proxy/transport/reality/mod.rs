@@ -8,7 +8,6 @@ mod splice;
 
 use std::{
     io,
-    ops::Deref,
     sync::{
         Arc,
         atomic::AtomicBool,
@@ -17,9 +16,10 @@ use std::{
 
 use async_trait::async_trait;
 
-use crate::proxy::{AnyStream, transport::Transport};
+use crate::{common::tls::validate_alpn,
+    proxy::{AnyStream, transport::Transport}};
 
-pub use handshake::reality_connect;
+use handshake::reality_connect;
 pub use splice::{SplicableTlsStream, VisionOptions};
 
 // ---------------------------------------------------------------------------
@@ -28,23 +28,15 @@ pub use splice::{SplicableTlsStream, VisionOptions};
 
 /// Parsed REALITY handshake parameters for one node.
 #[derive(Clone, Debug)]
-pub struct RealityConfig {
+struct RealityConfig {
     /// Server's X25519 public key (32 bytes).
-    pub public_key: [u8; 32],
+    public_key: [u8; 32],
     /// Short ID, right-zero-padded to 8 bytes.
-    pub short_id: [u8; 8],
+    short_id: [u8; 8],
     /// SNI sent in the ClientHello.
-    pub server_name: String,
-}
-
-impl RealityConfig {
-    pub fn new(server_name: String, public_key: [u8; 32], short_id: [u8; 8]) -> Self {
-        Self {
-            public_key,
-            short_id,
-            server_name,
-        }
-    }
+    server_name: String,
+    /// Explicit ALPN override; `None` keeps the fingerprint defaults.
+    alpn: Option<Vec<String>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -54,53 +46,39 @@ impl RealityConfig {
 #[derive(Clone)]
 pub struct Client(Arc<ClientInner>);
 
-pub struct ClientInner {
-    pub config: RealityConfig,
-    pub chrome: bool,
+struct ClientInner {
+    config: RealityConfig,
+    chrome: bool,
 }
 
 impl Client {
-    #[allow(dead_code)]
-    pub fn new(sni: String, public_key: [u8; 32], short_id: Vec<u8>) -> Self {
-        Self::new_advanced(sni, public_key, short_id, true)
-    }
-
-    pub fn new_advanced(
+    pub fn new(
         sni: String,
         public_key: [u8; 32],
-        short_id: Vec<u8>,
+        short_id: [u8; 8],
         chrome: bool,
-    ) -> Self {
-        let mut short_id_arr = [0u8; 8];
-        let copy_len = std::cmp::min(short_id.len(), 8);
-        short_id_arr[..copy_len].copy_from_slice(&short_id[..copy_len]);
-
-        Self(Arc::new(ClientInner {
-            config: RealityConfig::new(sni, public_key, short_id_arr),
+        alpn: Option<Vec<String>>,
+    ) -> io::Result<Self> {
+        if let Some(protocols) = &alpn {
+            validate_alpn(protocols)?;
+        }
+        if sni.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput, "SNI hostname cannot be empty",
+            ));
+        }
+        let config = RealityConfig { public_key, short_id, server_name: sni, alpn };
+        Ok(Self(Arc::new(ClientInner {
+            config,
             chrome,
-        }))
-    }
-}
-
-impl Deref for Client {
-    type Target = ClientInner;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
+        })))
     }
 }
 
 #[async_trait]
 impl Transport for Client {
     async fn proxy_stream(&self, stream: AnyStream) -> io::Result<AnyStream> {
-        if self.config.server_name.is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "SNI hostname cannot be empty",
-            ));
-        }
-
-        let tls = reality_connect(stream, &self.config, self.chrome).await?;
+        let tls = reality_connect(stream, &self.0.config, self.0.chrome).await?;
         Ok(AnyStream::new(tls))
     }
 
@@ -108,14 +86,7 @@ impl Transport for Client {
         &self,
         stream: AnyStream,
     ) -> io::Result<(AnyStream, Option<VisionOptions>)> {
-        if self.config.server_name.is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "SNI hostname cannot be empty",
-            ));
-        }
-
-        let tls = reality_connect(stream, &self.config, self.chrome).await?;
+        let tls = reality_connect(stream, &self.0.config, self.0.chrome).await?;
         let read_flag = Arc::new(AtomicBool::new(false));
         let write_flag = Arc::new(AtomicBool::new(false));
         let splicable = SplicableTlsStream::new(

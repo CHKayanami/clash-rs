@@ -14,7 +14,10 @@ use super::{
         uot::OutboundDatagramUotV2,
     },
     trojan::OutboundDatagramTrojan,
-    vless::{VisionStream, VlessStream, xudp::pool::XudpChildDatagram},
+    vless::{
+        VisionStream, VlessStream, encryption::EncryptionStream,
+        xudp::pool::XudpChildDatagram,
+    },
     vmess::{OutboundDatagramVmess, VmessStream},
 };
 #[cfg(all(target_os = "linux", feature = "zero_copy"))]
@@ -151,6 +154,7 @@ define_transport!($, AnyStream, DynamicStream, [ProxyStream + Sync], dispatch_st
     H2Mux(H2MuxStream),
     Vmess(VmessStream<AnyStream>),
     Vless(VlessStream),
+    VlessEncryption(EncryptionStream),
     Vision(VisionStream),
     AnyTls(AnyTlsStream),
     Prefixed(PrefixedStream<AnyStream>),

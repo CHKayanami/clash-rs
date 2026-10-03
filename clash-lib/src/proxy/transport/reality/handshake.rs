@@ -8,8 +8,6 @@ use std::{
 };
 
 use anyhow::Context as _;
-use base64::Engine as _;
-use base64::engine::general_purpose;
 use boring::error::ErrorStack;
 use boring::pkey::Id;
 use boring::ssl::SslRef;
@@ -18,7 +16,8 @@ use hkdf::Hkdf;
 use hmac::{Hmac, KeyInit, Mac};
 use sha2::{Sha256, Sha512};
 
-use crate::common::tls::boring::{add_chrome_alps_public, get_reality_connector};
+use crate::common::tls::{encode_alpn,
+    boring::{add_chrome_alps_public, get_reality_connector}};
 use super::RealityConfig;
 
 const SSL_GROUP_X25519: u16 = 29;
@@ -27,7 +26,7 @@ const SESSION_ID_OFFSET: usize = 39;
 const SESSION_ID_LEN: usize = 32;
 
 /// TLS client handshake with a REALITY server over `stream`.
-pub async fn reality_connect<S>(
+pub(super) async fn reality_connect<S>(
     stream: S,
     config: &RealityConfig,
     chrome: bool,
@@ -41,11 +40,20 @@ where
         .configure()
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
 
+    if let Some(protocols) = &config.alpn {
+        cfg.set_alpn_protos(&encode_alpn(protocols)?)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
+    }
+
     if chrome {
         cfg.set_permute_extensions(true);
         cfg.set_enable_ech_grease(true);
-        add_chrome_alps_public(&mut cfg)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
+        if config.alpn.as_ref().is_none_or(|protocols| {
+            protocols.iter().any(|protocol| protocol == "h2")
+        }) {
+            add_chrome_alps_public(&mut cfg)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
+        }
     }
 
     setup_reality_ssl(&cfg, config)
@@ -77,40 +85,7 @@ where
     Ok(tls)
 }
 
-#[allow(dead_code)]
-pub fn decode_public_key(encoded: &str) -> Option<[u8; 32]> {
-    for engine in [
-        &general_purpose::URL_SAFE_NO_PAD,
-        &general_purpose::URL_SAFE,
-        &general_purpose::STANDARD_NO_PAD,
-        &general_purpose::STANDARD,
-    ] {
-        if let Ok(bytes) = engine.decode(encoded.trim())
-            && let Ok(key) = <[u8; 32]>::try_from(bytes.as_slice())
-        {
-            return Some(key);
-        }
-    }
-    None
-}
-
-#[allow(dead_code)]
-pub fn parse_short_id(s: &str) -> Option<[u8; 8]> {
-    let s = s.trim();
-    if s.is_empty() {
-        return Some([0u8; 8]);
-    }
-    if s.len() % 2 != 0 || s.len() > 16 {
-        return None;
-    }
-    let mut out = [0u8; 8];
-    for (i, b) in out.iter_mut().enumerate().take(s.len() / 2) {
-        *b = u8::from_str_radix(s.get(i * 2..i * 2 + 2)?, 16).ok()?;
-    }
-    Some(out)
-}
-
-pub fn reality_session_id(
+fn reality_session_id(
     eph_priv: &[u8; 32],
     server_pub: &[u8; 32],
     client_random: &[u8; 32],
@@ -288,98 +263,5 @@ fn verify_server_certificate(ssl: &SslRef, auth_key: &[u8; 32]) -> anyhow::Resul
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn unhex(s: &str) -> Vec<u8> {
-        (0..s.len() / 2)
-            .map(|i| u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).unwrap())
-            .collect()
-    }
-
-    #[test]
-    fn test_parse_short_id() {
-        assert_eq!(parse_short_id(""), Some([0u8; 8]));
-        assert_eq!(
-            parse_short_id("01020304"),
-            Some([0x01, 0x02, 0x03, 0x04, 0, 0, 0, 0])
-        );
-        assert_eq!(
-            parse_short_id("0102030405060708"),
-            Some([0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08])
-        );
-        // Odd-length hex must fail
-        assert_eq!(parse_short_id("123"), None);
-        // Longer than 8 bytes (16 hex chars) must fail
-        assert_eq!(parse_short_id("010203040506070809"), None);
-    }
-
-    #[test]
-    fn test_decode_public_key() {
-        let raw = [42u8; 32];
-        let b64 = general_purpose::URL_SAFE_NO_PAD.encode(raw);
-        assert_eq!(decode_public_key(&b64), Some(raw));
-
-        let b64_std = general_purpose::STANDARD.encode(raw);
-        assert_eq!(decode_public_key(&b64_std), Some(raw));
-
-        assert_eq!(decode_public_key("invalid"), None);
-    }
-
-    #[test]
-    fn session_id_matches_reference_vector() {
-        let eph_priv = [0x42u8; 32];
-        let server_pub: [u8; 32] = general_purpose::URL_SAFE_NO_PAD
-            .decode("ubLKoDOT4sSoWuztLwduKc9szHmp4lvmKbMk4-1O518")
-            .unwrap()
-            .try_into()
-            .unwrap();
-        let mut client_random = [0u8; 32];
-        for (i, b) in client_random.iter_mut().enumerate() {
-            *b = i as u8;
-        }
-        let short_id: [u8; 8] = [0xa1, 0xb2, 0xc3, 0xd4, 0xe5, 0xf6, 0x07, 0x18];
-        let mut msg = vec![0x01, 0x00, 0x00, 0x4d, 0x03, 0x03];
-        msg.extend_from_slice(&client_random);
-        msg.push(0x20);
-        msg.extend_from_slice(&[0u8; 32]);
-        msg.extend(0xa0u8..0xb0);
-
-        let (session_id, auth_key) = reality_session_id(
-            &eph_priv,
-            &server_pub,
-            &client_random,
-            &short_id,
-            1_754_300_000,
-            &msg,
-        )
-        .unwrap();
-        assert_eq!(
-            auth_key.as_slice(),
-            unhex("5becfd7970ef3964e9a57b8b5c5d45b6cb97644e88458e3c8d61f53e3ae4015e").as_slice()
-        );
-        assert_eq!(
-            session_id.as_slice(),
-            unhex("7cfcdadbd3a5640bceef2afc7951caf671f7a737b2ba3f30eadb2d32148c542d").as_slice()
-        );
-    }
-
-    #[test]
-    fn session_id_binds_full_client_hello() {
-        let eph_priv = [0x42u8; 32];
-        let server_pub = [0x07u8; 32];
-        let client_random = [0x33u8; 32];
-        let short_id = [0u8; 8];
-        let mut msg = vec![0x01, 0x00, 0x00, 0x4d, 0x03, 0x03];
-        msg.extend_from_slice(&client_random);
-        msg.push(0x20);
-        msg.extend_from_slice(&[0u8; 32]);
-        msg.extend(0xa0u8..0xb0);
-        let (sid_a, _) =
-            reality_session_id(&eph_priv, &server_pub, &client_random, &short_id, 1, &msg).unwrap();
-        msg[80] ^= 1;
-        let (sid_b, _) =
-            reality_session_id(&eph_priv, &server_pub, &client_random, &short_id, 1, &msg).unwrap();
-        assert_ne!(sid_a, sid_b);
-    }
-}
+#[path = "tests.rs"]
+mod tests;

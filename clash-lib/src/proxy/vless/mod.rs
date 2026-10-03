@@ -1,10 +1,11 @@
 pub(crate) use stream::VlessStream;
 pub(crate) use vision::VisionStream;
+use self::encryption::{EncryptionClient, EncryptionOptions};
 use self::stream::{VLESS_COMMAND_MUX, VLESS_COMMAND_TCP, VLESS_COMMAND_UDP};
 use super::{
     AnyOutboundDatagram, AnyStream, ConnectorType, DialWithConnector,
     HandlerCommonOptions, OutboundHandler, OutboundType, PlainProxyAPIResponse,
-    transport::TransportLayer,
+    transport::{TransportLayer, VisionOptions},
     utils::{GLOBAL_DIRECT_CONNECTOR, RemoteConnector},
 };
 use crate::{
@@ -12,12 +13,16 @@ use crate::{
 };
 use async_trait::async_trait;
 use erased_serde::Serialize as ErasedSerialize;
-use std::{collections::HashMap, io, sync::Arc};
+use std::{collections::HashMap, io, sync::{Arc, atomic::AtomicBool}};
 use tracing::debug;
 
+pub mod encryption;
 mod stream;
 mod vision;
 pub mod xudp;
+
+#[cfg(test)]
+mod interop_tests;
 
 use crate::proxy::transport::mux::{H2MuxPool, MuxOption};
 
@@ -27,6 +32,7 @@ pub struct HandlerOptions {
     pub server: String,
     pub port: u16,
     pub uuid: String,
+    pub(crate) encryption: Option<Arc<EncryptionOptions>>,
     pub udp: bool,
     pub transport: Option<TransportLayer>,
     pub tls: Option<TransportLayer>,
@@ -39,6 +45,7 @@ pub struct Handler {
     connector: Option<Arc<dyn RemoteConnector>>,
     mux_pool: Option<Arc<H2MuxPool>>,
     xudp_pool: Arc<xudp::XudpPool>,
+    encryption: Option<Arc<EncryptionClient>>,
 }
 
 impl std::fmt::Debug for Handler {
@@ -63,11 +70,14 @@ impl Handler {
             .map(|s| H2MuxPool::new(s.clone()));
         let xudp_pool = xudp::XudpPool::new(4, 256);
 
+        let encryption = opts.encryption.clone().map(EncryptionClient::new);
+
         Self {
             opts,
             connector,
             mux_pool,
             xudp_pool,
+            encryption,
         }
     }
 
@@ -79,7 +89,7 @@ impl Handler {
     ) -> io::Result<AnyStream> {
         let is_udp = command == VLESS_COMMAND_UDP || command == VLESS_COMMAND_MUX;
 
-        let (s, vision_opts) = if !is_udp {
+        let (s, mut vision_opts) = if !is_udp && self.encryption.is_none() {
             if let Some(tls) = self.opts.tls.as_ref() {
                 tls.wrap_spliced(s).await?
             } else {
@@ -95,6 +105,22 @@ impl Handler {
 
         let s = if let Some(transport) = self.opts.transport.as_ref() {
             transport.wrap(s).await?
+        } else {
+            s
+        };
+
+        let s = if let Some(client) = &self.encryption {
+            let mut encrypted = client.handshake(s).await?;
+            if self.opts.flow.as_deref() == Some("xtls-rprx-vision") {
+                let read_flag = Arc::new(AtomicBool::new(false));
+                let write_flag = Arc::new(AtomicBool::new(false));
+                encrypted.set_vision(VisionOptions {
+                    read_flag: read_flag.clone(),
+                    write_flag: write_flag.clone(),
+                });
+                vision_opts = Some(VisionOptions { read_flag, write_flag });
+            }
+            AnyStream::new(encrypted)
         } else {
             s
         };
@@ -433,6 +459,7 @@ mod tests {
             common_opts: Default::default(),
             server: runner.container_ip().unwrap_or(LOCAL_ADDR.to_owned()),
             port: 8443,
+            encryption: None,
             uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".into(),
             udp: true,
             tls: tls_client(None),

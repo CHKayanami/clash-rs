@@ -10,7 +10,7 @@ use crate::{
             TransportLayer, WsClient,
         },
         utils::RemoteConnector,
-        vless::{Handler, HandlerOptions},
+        vless::{Handler, HandlerOptions, encryption::EncryptionOptions},
     },
 };
 use tracing::warn;
@@ -28,6 +28,21 @@ pub fn build_handler(
     connector: Option<Arc<dyn RemoteConnector>>,
 ) -> Result<Handler, crate::Error> {
     s.smux.as_ref().map(|m| m.validate()).transpose()?;
+    let encryption = s
+        .encryption
+        .as_deref()
+        .filter(|value| !value.is_empty() && *value != "none")
+        .map(EncryptionOptions::parse)
+        .transpose()
+        .map_err(|err| {
+            Error::InvalidConfig(format!("invalid VLESS encryption: {err}"))
+        })?;
+
+    if encryption.is_some() && s.smux.as_ref().is_some_and(|mux| mux.enable) {
+        return Err(Error::InvalidConfig(
+            "VLESS Encryption does not support smux".to_owned(),
+        ));
+    }
 
     let skip_cert_verify = s.skip_cert_verify.unwrap_or_default();
     if skip_cert_verify {
@@ -37,16 +52,16 @@ pub fn build_handler(
         );
     }
 
-    if let Some(flow) = s.flow.as_deref() {
-        if flow == "xtls-rprx-vision"
-            && !s.tls.unwrap_or_default()
-            && s.reality_opts.is_none()
-        {
-            return Err(Error::InvalidConfig(format!(
-                "flow '{}' requires TLS or Reality to be enabled for {}",
-                flow, s.common_opts.name
-            )));
-        }
+    if let Some(flow) = s.flow.as_deref()
+        && flow == "xtls-rprx-vision"
+        && encryption.is_none()
+        && !s.tls.unwrap_or_default()
+        && s.reality_opts.is_none()
+    {
+        return Err(Error::InvalidConfig(format!(
+            "flow '{}' requires TLS or Reality to be enabled for {}",
+            flow, s.common_opts.name
+        )));
     }
 
     let tls: Option<TransportLayer> = if let Some(ref reality_opts) = s.reality_opts
@@ -76,9 +91,9 @@ pub fn build_handler(
             None => true,
         };
 
-        Some(TransportLayer::Reality(RealityClient::new_advanced(
-            sni, pk_bytes, short_id, chrome,
-        )))
+        Some(TransportLayer::Reality(RealityClient::new(
+            sni, pk_bytes, short_id, chrome, s.alpn.clone(),
+        )?))
     } else {
         // vless without reality
         match s.tls.unwrap_or_default() {
@@ -96,17 +111,21 @@ pub fn build_handler(
                             })
                             .unwrap_or(s.common_opts.server.to_owned()),
                     ),
-                    s.network
-                        .as_ref()
-                        .map(|x| match x.as_str() {
-                            "tcp" | "raw" => Ok(vec![]),
-                            "ws" | "http" => Ok(vec!["http/1.1".to_owned()]),
-                            "h2" | "grpc" => Ok(vec!["h2".to_owned()]),
-                            _ => Err(Error::InvalidConfig(format!(
-                                "unsupported network: {x}"
-                            ))),
-                        })
-                        .transpose()?,
+                    match &s.alpn {
+                        Some(alpn) => Some(alpn.clone()),
+                        None => s
+                            .network
+                            .as_ref()
+                            .map(|x| match x.as_str() {
+                                "tcp" | "raw" => Ok(vec![]),
+                                "ws" | "http" => Ok(vec!["http/1.1".to_owned()]),
+                                "h2" | "grpc" => Ok(vec!["h2".to_owned()]),
+                                _ => Err(Error::InvalidConfig(format!(
+                                    "unsupported network: {x}"
+                                ))),
+                            })
+                            .transpose()?,
+                    },
                     None,
                     None,
                     s.client_fingerprint.as_deref(),
@@ -130,6 +149,7 @@ pub fn build_handler(
             server: s.common_opts.server.to_owned(),
             port: s.common_opts.port,
             uuid: s.uuid.clone(),
+            encryption,
             udp: s.udp.unwrap_or(true),
             transport: s
                 .network
@@ -209,6 +229,68 @@ impl TryFrom<&OutboundVless> for Handler {
 mod tests {
     use super::*;
     use crate::config::internal::proxy::CommonConfigOptions;
+    use crate::proxy::transport::mux::MuxOption;
+
+    #[test]
+    fn test_vless_alpn_validation_for_tls_and_reality() {
+        use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+        use crate::config::internal::proxy::RealityOpt;
+
+        crate::tests::initialize();
+        let mut config = OutboundVless {
+            common_opts: CommonConfigOptions {
+                name: "alpn".into(), server: "localhost".into(), port: 443,
+                ..Default::default()
+            },
+            tls: Some(true),
+            network: Some("tcp".into()),
+            ..Default::default()
+        };
+        for reality in [false, true] {
+            config.reality_opts = reality.then(|| RealityOpt {
+                public_key: URL_SAFE_NO_PAD.encode([7; 32]), short_id: None,
+            });
+            for alpn in [Some(vec!["http/1.1".into()]), Some(vec![]), None] {
+                config.alpn = alpn;
+                assert!(Handler::try_from(&config).is_ok());
+            }
+            for alpn in [vec![String::new()], vec!["x".repeat(256)]] {
+                config.alpn = Some(alpn);
+                assert!(Handler::try_from(&config).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn test_vless_encryption_config() {
+        use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+
+        let mut config = OutboundVless {
+            common_opts: CommonConfigOptions {
+                name: "encrypted".to_owned(),
+                server: "localhost".to_owned(),
+                port: 443,
+                ..Default::default()
+            },
+            uuid: "00000000-0000-0000-0000-000000000000".to_owned(),
+            ..Default::default()
+        };
+        for value in [None, Some("none".to_owned())] {
+            config.encryption = value;
+            assert!(Handler::try_from(&config).is_ok());
+        }
+        config.encryption = Some("unsupported".to_owned());
+        assert!(Handler::try_from(&config).is_err());
+        let key = URL_SAFE_NO_PAD.encode([7u8; 32]);
+        config.encryption = Some(format!("mlkem768x25519plus.native.0rtt.{key}"));
+        config.flow = Some("xtls-rprx-vision".to_owned());
+        assert!(Handler::try_from(&config).is_ok());
+        config.smux = Some(MuxOption {
+            enable: true,
+            ..Default::default()
+        });
+        assert!(Handler::try_from(&config).is_err());
+    }
 
     #[test]
     fn test_vless_network_tcp() {

@@ -363,6 +363,22 @@ pub struct VisionStream {
 impl crate::proxy::ProxyStream for VisionStream {}
 
 impl VisionStream {
+    #[cfg(test)]
+    pub(super) fn transport_alpn(&self) -> Option<&[u8]> {
+        match &self.inner {
+            AnyStream::Vless(vless) => vless.transport_alpn(),
+            _ => None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn direct_flags(&self) -> (Arc<AtomicBool>, Arc<AtomicBool>) {
+        (
+            self.read_splice_flag.as_ref().unwrap().clone(),
+            self.write_splice_flag.as_ref().unwrap().clone(),
+        )
+    }
+
     /// Create a `VisionStream`.
     ///
     /// Pass `Some(VisionOptions)` when the underlying transport is Reality, to

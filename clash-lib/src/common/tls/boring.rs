@@ -8,6 +8,7 @@ use std::io;
 use std::sync::LazyLock;
 
 use anyhow::Context as _;
+use super::encode_alpn;
 use boring::error::ErrorStack;
 use boring::ssl::{
     CertificateCompressionAlgorithm, CertificateCompressor, ConnectConfiguration, SslConnector,
@@ -250,37 +251,18 @@ impl BoringTlsConnector {
             }
         }
 
-        let mut offers_h2 = false;
         if chrome {
             apply_chrome_ctx(&mut builder)?;
-            if let Some(alpn_list) = alpn {
-                let mut wire = Vec::new();
-                for proto in alpn_list {
-                    if proto == "h2" {
-                        offers_h2 = true;
-                    }
-                    let bytes = proto.as_bytes();
-                    if bytes.len() <= 255 {
-                        wire.push(bytes.len() as u8);
-                        wire.extend_from_slice(bytes);
-                    }
-                }
-                builder.set_alpn_protos(&wire)?;
-            } else {
-                builder.set_alpn_protos(CHROME_ALPN_WIRE)?;
-                offers_h2 = true;
-            }
-        } else if let Some(alpn_list) = alpn {
-            let mut wire = Vec::new();
-            for proto in alpn_list {
-                let bytes = proto.as_bytes();
-                if bytes.len() <= 255 {
-                    wire.push(bytes.len() as u8);
-                    wire.extend_from_slice(bytes);
-                }
-            }
-            builder.set_alpn_protos(&wire)?;
         }
+        let offers_h2 = if let Some(protocols) = alpn {
+            builder.set_alpn_protos(&encode_alpn(protocols)?)?;
+            protocols.iter().any(|protocol| protocol == "h2")
+        } else if chrome {
+            builder.set_alpn_protos(CHROME_ALPN_WIRE)?;
+            true
+        } else {
+            false
+        };
 
         Ok(Self {
             connector: builder.build(),

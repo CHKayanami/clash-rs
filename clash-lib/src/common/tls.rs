@@ -7,7 +7,58 @@ use rustls::{
 };
 use tracing::warn;
 
-use std::sync::{Arc, LazyLock};
+use std::{io, sync::{Arc, LazyLock}};
+
+pub(crate) fn validate_alpn(protocols: &[String]) -> io::Result<usize> {
+    let mut length = 0usize;
+    for protocol in protocols {
+        if !(1..=255).contains(&protocol.len()) {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput,
+                "ALPN protocol names must contain 1 to 255 bytes"));
+        }
+        length = length.checked_add(protocol.len() + 1)
+            .filter(|length| *length <= u16::MAX as usize - 2)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput,
+                "ALPN protocol list exceeds 65533 bytes"))?;
+    }
+    Ok(length)
+}
+
+pub(crate) fn encode_alpn(protocols: &[String]) -> io::Result<Vec<u8>> {
+    let mut wire = Vec::with_capacity(validate_alpn(protocols)?);
+    for protocol in protocols {
+        wire.push(protocol.len() as u8);
+        wire.extend_from_slice(protocol.as_bytes());
+    }
+    Ok(wire)
+}
+
+#[cfg(test)]
+mod alpn_tests {
+    use super::{encode_alpn, validate_alpn};
+
+    #[test]
+    fn alpn_encoding_preserves_order_and_explicit_empty_list() {
+        assert_eq!(encode_alpn(&["http/1.1".into(), "h2".into()]).unwrap(),
+            b"\x08http/1.1\x02h2");
+        assert!(encode_alpn(&[]).unwrap().is_empty());
+        assert!(validate_alpn(&["x".repeat(255)]).is_ok());
+        let mut boundary = vec!["x".repeat(255); 255];
+        boundary.push("y".repeat(252));
+        assert_eq!(validate_alpn(&boundary).unwrap(), 65533);
+        boundary.last_mut().unwrap().push('y');
+        assert!(validate_alpn(&boundary).is_err());
+    }
+
+    #[test]
+    fn alpn_rejects_invalid_names_and_oversized_lists() {
+        for protocols in [vec![String::new()], vec!["x".repeat(256)],
+            vec!["x".repeat(255); 256]] {
+            assert!(validate_alpn(&protocols).is_err());
+            assert!(encode_alpn(&protocols).is_err());
+        }
+    }
+}
 
 pub static GLOBAL_ROOT_STORE: LazyLock<Arc<RootCertStore>> =
     LazyLock::new(global_root_store);

@@ -122,7 +122,39 @@ pub fn decode_base64_public_key(base64_public_key: &str) -> Result<[u8; 32], Err
         })
 }
 
-pub fn decode_short_id(hex_short_id: &str) -> Result<Vec<u8>, Error> {
-    hex::decode(hex_short_id)
-        .map_err(|e| Error::InvalidConfig(format!("reality short-id hex: {e}")))
+pub fn decode_short_id(hex_short_id: &str) -> Result<[u8; 8], Error> {
+    if hex_short_id.len() > 16 {
+        return Err(Error::InvalidConfig(
+            "reality short-id must contain at most 8 bytes".into(),
+        ));
+    }
+    let mut short_id = [0; 8];
+    hex::decode_to_slice(hex_short_id, &mut short_id[..hex_short_id.len() / 2])
+        .map_err(|e| Error::InvalidConfig(format!("reality short-id hex: {e}")))?;
+    Ok(short_id)
+}
+
+#[cfg(test)]
+mod reality_tests {
+    use super::{decode_base64_public_key, decode_short_id};
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+
+    #[test]
+    fn reality_short_id_validates_length_and_pads_with_zeroes() {
+        assert_eq!(decode_short_id("").unwrap(), [0; 8]);
+        assert_eq!(decode_short_id("01020304").unwrap(), [1, 2, 3, 4, 0, 0, 0, 0]);
+        assert_eq!(decode_short_id("0102030405060708").unwrap(), [1, 2, 3, 4, 5, 6, 7, 8]);
+        for invalid in ["123", "gg", "010203040506070809", "é"] {
+            assert!(decode_short_id(invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn reality_public_key_requires_32_decoded_bytes() {
+        assert_eq!(decode_base64_public_key(&URL_SAFE_NO_PAD.encode([42; 32])).unwrap(), [42; 32]);
+        for invalid in ["invalid".to_owned(), URL_SAFE_NO_PAD.encode([42; 31]),
+            URL_SAFE_NO_PAD.encode([42; 33])] {
+            assert!(decode_base64_public_key(&invalid).is_err());
+        }
+    }
 }

@@ -26,6 +26,9 @@ default-members = [
 ]
 exclude = ["clash-ebpf-bpf"]
 
+[workspace.dependencies]
+blake3 = "1"
+
 
 
 [workspace.package]

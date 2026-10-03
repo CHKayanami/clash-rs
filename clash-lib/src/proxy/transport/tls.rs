@@ -10,6 +10,7 @@ use crate::{
         tls::{
             boring::BoringTlsConnector,
             build_tls_client_config,
+            validate_alpn,
             DefaultTlsVerifier,
         },
     },
@@ -92,6 +93,9 @@ impl Client {
         tls_cert: Option<&str>,
         tls_key: Option<&str>,
     ) -> io::Result<Self> {
+        if let Some(protocols) = &alpn {
+            validate_alpn(protocols)?;
+        }
         if let Some(fp) = client_fingerprint {
             let fp_lower = fp.trim().to_ascii_lowercase();
             if !fp_lower.is_empty() && fp_lower != "none" {

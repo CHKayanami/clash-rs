@@ -49,6 +49,14 @@ pub struct VlessStream {
 impl crate::proxy::ProxyStream for VlessStream {}
 
 impl VlessStream {
+    #[cfg(test)]
+    pub(super) fn transport_alpn(&self) -> Option<&[u8]> {
+        match &self.inner {
+            AnyStream::VlessEncryption(encrypted) => encrypted.transport_alpn(),
+            _ => None,
+        }
+    }
+
     pub fn new(
         stream: AnyStream,
         uuid: &str,
