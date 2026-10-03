@@ -32,7 +32,7 @@ blake3 = "1"
 
 
 [workspace.package]
-version = "0.20.15-alpha"
+version = "0.20.16-alpha"
 repository = "https://github.com/CHKayanami/clash-rs"
 edition = "2024"
 authors = ["https://github.com/Watfaq/clash-rs/graphs/contributors"]
