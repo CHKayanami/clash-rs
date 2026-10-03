@@ -22,6 +22,12 @@ use crate::{
 /// allows a proxy to get a connection to a remote server
 #[async_trait]
 pub trait RemoteConnector: Send + Sync + Debug {
+    /// Retain the same route for transports which dial after stream creation.
+    fn clone_connector(&self) -> Option<Arc<dyn RemoteConnector>> { None }
+
+    /// Identity used to isolate connection pools for different routes.
+    fn pool_key(&self) -> usize { self as *const Self as *const () as usize }
+
     async fn connect_stream(
         &self,
         resolver: ThreadSafeDNSResolver,
@@ -42,7 +48,7 @@ pub trait RemoteConnector: Send + Sync + Debug {
     ) -> std::io::Result<AnyOutboundDatagram>;
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct DirectConnector;
 
 impl DirectConnector {
@@ -60,6 +66,12 @@ fn global_direct_connector() -> Arc<dyn RemoteConnector> {
 
 #[async_trait]
 impl RemoteConnector for DirectConnector {
+    fn clone_connector(&self) -> Option<Arc<dyn RemoteConnector>> {
+        Some(GLOBAL_DIRECT_CONNECTOR.clone())
+    }
+
+    fn pool_key(&self) -> usize { 0 }
+
     async fn connect_stream(
         &self,
         resolver: ThreadSafeDNSResolver,
@@ -105,18 +117,19 @@ impl RemoteConnector for DirectConnector {
     }
 }
 
+#[derive(Clone)]
 pub struct ProxyConnector {
     proxy: AnyOutboundHandler,
-    connector: Box<dyn RemoteConnector>,
+    connector: Arc<dyn RemoteConnector>,
+    identity: Arc<()>,
 }
 
 impl ProxyConnector {
     pub fn new(
         proxy: AnyOutboundHandler,
-        // TODO: make this Arc
         connector: Box<dyn RemoteConnector>,
     ) -> Self {
-        Self { proxy, connector }
+        Self { proxy, connector: connector.into(), identity: Arc::new(()) }
     }
 }
 
@@ -130,6 +143,12 @@ impl Debug for ProxyConnector {
 
 #[async_trait]
 impl RemoteConnector for ProxyConnector {
+    fn clone_connector(&self) -> Option<Arc<dyn RemoteConnector>> {
+        Some(Arc::new(self.clone()))
+    }
+
+    fn pool_key(&self) -> usize { Arc::as_ptr(&self.identity) as usize }
+
     async fn connect_stream(
         &self,
         resolver: ThreadSafeDNSResolver,

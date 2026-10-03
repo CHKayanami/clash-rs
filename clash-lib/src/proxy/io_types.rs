@@ -10,6 +10,7 @@ use super::{
     socks::outbound::Socks5Datagram,
     transport::{
         GrpcStream, Http2Stream, HttpStream, WebsocketConn, WebsocketEarlyDataConn,
+        XHttpStream,
         mux::h2mux::stream::H2MuxStream, reality::SplicableTlsStream,
         uot::OutboundDatagramUotV2,
     },
@@ -149,6 +150,7 @@ define_transport!($, AnyStream, DynamicStream, [ProxyStream + Sync], dispatch_st
     Websocket(WebsocketConn),
     WebsocketEarlyData(WebsocketEarlyDataConn),
     Http(HttpStream),
+    XHttp(XHttpStream),
     H2(Http2Stream),
     Grpc(GrpcStream),
     H2Mux(H2MuxStream),

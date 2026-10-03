@@ -7,6 +7,7 @@ pub(crate) use ws::{WebsocketConn, WebsocketEarlyDataConn};
 #[cfg(feature = "shadowsocks")]
 pub(crate) use shadow_tls::VerifiedStream;
 mod grpc;
+mod dial;
 mod h2;
 mod http;
 pub mod reality;
@@ -20,8 +21,10 @@ mod v2ray;
 pub mod mux;
 pub mod uot;
 mod ws;
+mod xhttp;
 
 pub use grpc::Client as GrpcClient;
+pub(crate) use dial::{TransportDialer, TransportSecurity};
 pub use h2::Client as H2Client;
 pub use http::Client as HttpClient;
 pub use reality::{Client as RealityClient, VisionOptions};
@@ -35,6 +38,8 @@ pub use tls::Client as TlsClient;
 #[cfg(feature = "shadowsocks")]
 pub use v2ray::{V2RayOBFSOption, V2rayWsClient};
 pub use ws::Client as WsClient;
+pub use xhttp::Client as XHttpClient;
+pub(crate) use xhttp::XHttpStream;
 
 #[async_trait::async_trait]
 pub trait Transport: Send + Sync {
@@ -69,6 +74,7 @@ pub enum TransportLayer {
     H2(H2Client),
     Ws(WsClient),
     Http(HttpClient),
+    XHttp(XHttpClient),
     #[cfg(feature = "shadowsocks")]
     ShadowTls(Shadowtls),
     #[cfg(feature = "shadowsocks")]
@@ -91,6 +97,7 @@ impl TransportLayer {
             Self::H2(t) => Transport::proxy_stream(t, stream).await,
             Self::Ws(t) => Transport::proxy_stream(t, stream).await,
             Self::Http(t) => Transport::proxy_stream(t, stream).await,
+            Self::XHttp(t) => Transport::proxy_stream(t, stream).await,
             #[cfg(feature = "shadowsocks")]
             Self::ShadowTls(t) => Transport::proxy_stream(t, stream).await,
             #[cfg(feature = "shadowsocks")]

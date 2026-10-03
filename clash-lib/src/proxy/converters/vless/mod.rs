@@ -6,7 +6,7 @@ use crate::{
     proxy::{
         HandlerCommonOptions,
         transport::{
-            GrpcClient, H2Client, HttpClient, RealityClient, TlsClient,
+            GrpcClient, H2Client, HttpClient,
             TransportLayer, WsClient,
         },
         utils::RemoteConnector,
@@ -14,6 +14,9 @@ use crate::{
     },
 };
 use tracing::warn;
+mod security;
+mod xhttp;
+use self::{security::build_security, xhttp::build_xhttp};
 
 impl TryFrom<OutboundVless> for Handler {
     type Error = crate::Error;
@@ -64,79 +67,14 @@ pub fn build_handler(
         )));
     }
 
-    let tls: Option<TransportLayer> = if let Some(ref reality_opts) = s.reality_opts
-    {
-        // vless with reality
+    if s.network.as_deref() == Some("xhttp")
+        && s.flow.as_deref() == Some("xtls-rprx-vision") && encryption.is_none() {
+        return Err(Error::InvalidConfig(
+            "Vision over XHTTP requires VLESS Encryption".into(),
+        ));
+    }
 
-        // reality public-key bytes
-        let pk_bytes =
-            super::utils::decode_base64_public_key(&reality_opts.public_key)?;
-
-        // reality short id bytes
-        let short_id = super::utils::decode_short_id(
-            reality_opts.short_id.as_deref().unwrap_or_default(),
-        )?;
-
-        // SNI
-        let sni = s
-            .server_name
-            .clone()
-            .unwrap_or_else(|| s.common_opts.server.clone());
-
-        let chrome = match s.client_fingerprint.as_deref() {
-            Some(fp) => {
-                let fp_lower = fp.trim().to_ascii_lowercase();
-                fp_lower != "none"
-            }
-            None => true,
-        };
-
-        Some(TransportLayer::Reality(RealityClient::new(
-            sni, pk_bytes, short_id, chrome, s.alpn.clone(),
-        )?))
-    } else {
-        // vless without reality
-        match s.tls.unwrap_or_default() {
-            true => {
-                let client = TlsClient::new_advanced(
-                    s.skip_cert_verify.unwrap_or_default(),
-                    s.server_name.as_ref().map(|x| x.to_owned()).unwrap_or(
-                        s.ws_opts
-                            .as_ref()
-                            .and_then(|x| {
-                                x.headers.clone().and_then(|x| {
-                                    let h = x.get("Host");
-                                    h.cloned()
-                                })
-                            })
-                            .unwrap_or(s.common_opts.server.to_owned()),
-                    ),
-                    match &s.alpn {
-                        Some(alpn) => Some(alpn.clone()),
-                        None => s
-                            .network
-                            .as_ref()
-                            .map(|x| match x.as_str() {
-                                "tcp" | "raw" => Ok(vec![]),
-                                "ws" | "http" => Ok(vec!["http/1.1".to_owned()]),
-                                "h2" | "grpc" => Ok(vec!["h2".to_owned()]),
-                                _ => Err(Error::InvalidConfig(format!(
-                                    "unsupported network: {x}"
-                                ))),
-                            })
-                            .transpose()?,
-                    },
-                    None,
-                    None,
-                    s.client_fingerprint.as_deref(),
-                    s.tls_cert.as_deref(),
-                    s.tls_key.as_deref(),
-                )?;
-                Some(TransportLayer::Tls(client))
-            }
-            false => None,
-        }
-    };
+    let tls = build_security(s, None)?;
 
     Ok(Handler::new(
         HandlerOptions {
@@ -156,6 +94,7 @@ pub fn build_handler(
                 .clone()
                 .map(|x| match x.as_str() {
                     "tcp" | "raw" => Ok(None),
+                    "xhttp" => Ok(Some(TransportLayer::XHttp(build_xhttp(s)?))),
                     "ws" => {
                         let opts = s.ws_opts.as_ref().ok_or_else(|| {
                             Error::InvalidConfig("ws_opts is required for ws".to_owned())

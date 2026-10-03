@@ -9,7 +9,7 @@ use tokio::{io::{AsyncReadExt, AsyncWriteExt}, time::timeout};
 use super::Handler;
 use crate::{
     app::dns::{SystemResolver, ThreadSafeDNSResolver},
-    config::internal::proxy::{CommonConfigOptions, OutboundVless, RealityOpt},
+    config::internal::proxy::{CommonConfigOptions, OutboundVless, RealityOpt, XHttpOpt},
     proxy::{AnyStream, OutboundHandler, UdpPacket,
         transport::{TlsClient, TransportLayer}},
     session::{Session, SocksAddr},
@@ -41,6 +41,10 @@ struct Case {
     reality: Option<RealityOpt>,
     #[serde(default)]
     client_fingerprint: Option<String>,
+    #[serde(default)]
+    network: Option<String>,
+    #[serde(default)]
+    xhttp_opts: Option<XHttpOpt>,
 }
 
 fn handler(fixture: &Fixture, case: &Case, resume: bool) -> Result<Handler> {
@@ -64,6 +68,8 @@ fn handler(fixture: &Fixture, case: &Case, resume: bool) -> Result<Handler> {
         alpn: case.alpn.clone(),
         reality_opts: case.reality.clone(),
         client_fingerprint: case.client_fingerprint.clone(),
+        network: case.network.clone(),
+        xhttp_opts: case.xhttp_opts.clone().map(Box::new),
         flow: case.vision.then(|| "xtls-rprx-vision".to_owned()),
         ..Default::default()
     })?)
@@ -99,12 +105,12 @@ async fn run_case(
     let client = handler(fixture, case, true)?;
     let tcp = session(&fixture.tcp_target)?;
     for connection in 0..3 {
-        if connection > 0 {
-            ensure!(client.encryption.as_ref().unwrap().cached_ticket().is_some(),
+        if connection > 0 && let Some(encryption) = &client.encryption {
+            ensure!(encryption.cached_ticket().is_some(),
                 "missing authenticated session ticket before resumption");
         }
         let mut stream = client.connect_stream(&tcp, resolver.clone()).await?;
-        if let Some(protocols) = &case.alpn {
+        if let Some(protocols) = &case.alpn && case.network.as_deref() != Some("xhttp") {
             let negotiated = match &stream {
                 AnyStream::Vless(vless) => vless.transport_alpn(),
                 AnyStream::Vision(vision) => vision.transport_alpn(),
@@ -169,9 +175,19 @@ async fn run_case(
 #[tokio::test]
 #[ignore = "requires an explicitly provisioned remote Xray and fixture manifest"]
 async fn xray_encryption_interop() -> Result<()> {
+    run_fixture("CLASH_VLESS_INTEROP_MANIFEST").await
+}
+
+#[tokio::test]
+#[ignore = "requires an explicitly provisioned Xray XHTTP server and fixture manifest"]
+async fn xray_xhttp_interop() -> Result<()> {
+    run_fixture("CLASH_XHTTP_INTEROP_MANIFEST").await
+}
+
+async fn run_fixture(manifest_env: &str) -> Result<()> {
     crate::tests::initialize();
-    let path = std::env::var("CLASH_VLESS_INTEROP_MANIFEST")
-        .context("set CLASH_VLESS_INTEROP_MANIFEST to the remote test manifest")?;
+    let path = std::env::var(manifest_env)
+        .with_context(|| format!("set {manifest_env} to the test manifest"))?;
     let fixture: Fixture = serde_json::from_slice(&std::fs::read(path)?)?;
     ensure!(!fixture.cases.is_empty(), "empty interoperability matrix");
     let resolver: ThreadSafeDNSResolver = Arc::new(SystemResolver::new(false)?);
@@ -179,8 +195,9 @@ async fn xray_encryption_interop() -> Result<()> {
         timeout(Duration::from_secs(90), run_case(&fixture, case, resolver.clone()))
             .await.context(format!("{} timed out", case.name))?
             .with_context(|| case.name.clone())?;
-        println!("{}: TCP 1-RTT/0-RTT, forced 1-RTT, XUDP{} passed",
-            case.name, if case.vision { ", TLS 1.3 Direct" } else { "" });
+        println!("{}: TCP{}, XUDP{} passed", case.name,
+            if case.encryption != "none" { " 1-RTT/0-RTT, forced 1-RTT" } else { "" },
+            if case.vision { ", TLS 1.3 Direct" } else { "" });
     }
     Ok(())
 }

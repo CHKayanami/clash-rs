@@ -49,11 +49,13 @@ impl TryFrom<TLSOptions> for Client {
     }
 }
 
+#[derive(Clone)]
 enum ConnectorBackend {
     Rustls(tokio_rustls::TlsConnector),
     Boring(BoringTlsConnector),
 }
 
+#[derive(Clone)]
 pub struct Client {
     pub sni: String,
     pub expected_alpn: Option<String>,

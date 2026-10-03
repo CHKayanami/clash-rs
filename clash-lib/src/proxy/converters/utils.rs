@@ -1,11 +1,40 @@
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use http::uri::InvalidUri;
 
+#[cfg(test)]
+#[path = "xhttp_tests.rs"]
+mod xhttp_tests;
+
 use crate::{
     Error,
-    config::proxy::{CommonConfigOptions, GrpcOpt, H2Opt, HttpOpt, WsOpt},
-    proxy::transport::{self, GrpcClient, H2Client, HttpClient, WsClient},
+    config::proxy::{CommonConfigOptions, GrpcOpt, H2Opt, HttpOpt, WsOpt, XHttpOpt},
+    proxy::transport::{self, GrpcClient, H2Client, HttpClient, WsClient, XHttpClient},
 };
+
+pub fn xhttp_client(
+    opts: Option<&XHttpOpt>, host: &str, secure: bool, reality: bool, alpn: Option<&[String]>,
+) -> Result<XHttpClient, Error> {
+    XHttpClient::new(opts.unwrap_or(&XHttpOpt::default()), host, secure, reality, alpn)
+        .map_err(|error| Error::InvalidConfig(format!("invalid XHTTP options: {error}")))
+}
+
+pub fn xhttp_alpn(
+    opts: Option<&XHttpOpt>, configured: Option<&Vec<String>>, reality: bool,
+) -> Result<Vec<String>, Error> {
+    let stream_one = opts.and_then(|opts| opts.mode.as_deref()) == Some("stream-one");
+    let require_h2 = reality || stream_one;
+    if let Some(protocols) = configured {
+        if protocols.iter().any(|protocol| !matches!(protocol.as_str(), "h2" | "http/1.1")) {
+            return Err(Error::InvalidConfig("XHTTP ALPN must be h2 or http/1.1".into()));
+        }
+        if require_h2 && !protocols.iter().any(|protocol| protocol == "h2") {
+            return Err(Error::InvalidConfig("XHTTP Reality and stream-one require h2 ALPN".into()));
+        }
+        return Ok(protocols.clone());
+    }
+    Ok(if require_h2 { vec!["h2".into()] }
+        else { vec!["h2".into(), "http/1.1".into()] })
+}
 
 impl TryFrom<(&WsOpt, &CommonConfigOptions)> for WsClient {
     type Error = std::io::Error;

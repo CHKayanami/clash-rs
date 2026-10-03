@@ -302,6 +302,68 @@ pub struct GrpcOpt {
     pub grpc_service_name: Option<String>,
 }
 
+#[derive(Clone, serde::Serialize, serde::Deserialize, Debug, Default)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct XHttpOpt {
+    pub host: Option<String>,
+    pub path: Option<String>,
+    pub mode: Option<String>,
+    pub headers: Option<HashMap<String, String>>,
+    pub no_grpc_header: Option<bool>,
+    pub x_padding_bytes: Option<String>,
+    pub sc_max_each_post_bytes: Option<String>,
+    pub sc_min_posts_interval_ms: Option<String>,
+    pub x_padding_obfs_mode: Option<bool>,
+    pub x_padding_key: Option<String>,
+    pub x_padding_header: Option<String>,
+    pub x_padding_placement: Option<String>,
+    pub x_padding_method: Option<String>,
+    pub uplink_http_method: Option<String>,
+    pub session_placement: Option<String>,
+    pub session_key: Option<String>,
+    pub session_table: Option<String>,
+    pub session_length: Option<String>,
+    pub seq_placement: Option<String>,
+    pub seq_key: Option<String>,
+    pub uplink_data_placement: Option<String>,
+    pub uplink_data_key: Option<String>,
+    pub uplink_chunk_size: Option<String>,
+    pub reuse_settings: Option<XHttpReuseSettings>,
+    pub download_settings: Option<XHttpDownloadSettings>,
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize, Debug, Default)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct XHttpReuseSettings {
+    pub max_concurrency: Option<String>,
+    pub max_connections: Option<String>,
+    pub c_max_reuse_times: Option<String>,
+    pub h_max_request_times: Option<String>,
+    pub h_max_reusable_secs: Option<String>,
+    pub h_keep_alive_period: Option<i64>,
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize, Debug, Default)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct XHttpDownloadSettings {
+    pub path: Option<String>,
+    pub host: Option<String>,
+    pub headers: Option<HashMap<String, String>>,
+    pub reuse_settings: Option<XHttpReuseSettings>,
+    pub server: Option<String>,
+    pub port: Option<u16>,
+    pub tls: Option<bool>,
+    pub alpn: Option<Vec<String>>,
+    #[serde(alias = "servername")]
+    pub server_name: Option<String>,
+    pub reality_opts: Option<RealityOpt>,
+    pub skip_cert_verify: Option<bool>,
+    pub fingerprint: Option<String>,
+    pub client_fingerprint: Option<String>,
+    pub certificate: Option<String>,
+    pub private_key: Option<String>,
+}
+
 #[derive(serde::Serialize, serde::Deserialize, Debug, Default, Clone)]
 #[serde(rename_all = "kebab-case")]
 pub struct RealityOpt {
@@ -408,6 +470,7 @@ pub struct OutboundVless {
     pub server_name: Option<String>,
     pub alpn: Option<Vec<String>>,
     pub network: Option<String>,
+    pub xhttp_opts: Option<Box<XHttpOpt>>,
     pub ws_opts: Option<WsOpt>,
     pub http_opts: Option<HttpOpt>,
     pub h2_opts: Option<H2Opt>,

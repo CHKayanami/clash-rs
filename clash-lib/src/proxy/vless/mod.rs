@@ -5,7 +5,7 @@ use self::stream::{VLESS_COMMAND_MUX, VLESS_COMMAND_TCP, VLESS_COMMAND_UDP};
 use super::{
     AnyOutboundDatagram, AnyStream, ConnectorType, DialWithConnector,
     HandlerCommonOptions, OutboundHandler, OutboundType, PlainProxyAPIResponse,
-    transport::{TransportLayer, VisionOptions},
+    transport::{TransportDialer, TransportLayer, VisionOptions},
     utils::{GLOBAL_DIRECT_CONNECTOR, RemoteConnector},
 };
 use crate::{
@@ -81,6 +81,26 @@ impl Handler {
         }
     }
 
+    async fn dial_proxy_stream(
+        &self, sess: &Session, command: u8,
+        resolver: ThreadSafeDNSResolver, connector: &dyn RemoteConnector,
+    ) -> io::Result<AnyStream> {
+        if let Some(TransportLayer::XHttp(client)) = &self.opts.transport {
+            let dialer = TransportDialer {
+                server: &self.opts.server, port: self.opts.port, common: &self.opts.common_opts,
+                session: sess, tls: self.opts.tls.as_ref(), resolver, connector,
+            };
+            let stream = client.dial(&dialer).await?;
+            return self.finish_proxy_stream(stream, None, sess, command).await;
+        }
+        let stream = connector.connect_stream(resolver, &self.opts.server, self.opts.port,
+            self.opts.common_opts.tfo, sess.iface.as_ref(),
+            #[cfg(target_os = "linux")]
+            sess.so_mark,
+        ).await?;
+        self.inner_proxy_stream(stream, sess, command).await
+    }
+
     async fn inner_proxy_stream(
         &self,
         s: AnyStream,
@@ -89,7 +109,7 @@ impl Handler {
     ) -> io::Result<AnyStream> {
         let is_udp = command == VLESS_COMMAND_UDP || command == VLESS_COMMAND_MUX;
 
-        let (s, mut vision_opts) = if !is_udp && self.encryption.is_none() {
+        let (s, vision_opts) = if !is_udp && self.encryption.is_none() {
             if let Some(tls) = self.opts.tls.as_ref() {
                 tls.wrap_spliced(s).await?
             } else {
@@ -105,10 +125,13 @@ impl Handler {
 
         let s = if let Some(transport) = self.opts.transport.as_ref() {
             transport.wrap(s).await?
-        } else {
-            s
-        };
+        } else { s };
+        self.finish_proxy_stream(s, vision_opts, sess, command).await
+    }
 
+    async fn finish_proxy_stream(
+        &self, s: AnyStream, mut vision_opts: Option<VisionOptions>, sess: &Session, command: u8,
+    ) -> io::Result<AnyStream> {
         let s = if let Some(client) = &self.encryption {
             let mut encrypted = client.handshake(s).await?;
             if self.opts.flow.as_deref() == Some("xtls-rprx-vision") {
@@ -213,17 +236,6 @@ impl OutboundHandler for Handler {
     ) -> io::Result<AnyStream> {
         if let Some(mux) = &self.mux_pool {
             let dialer = || async {
-                let stream = connector
-                    .connect_stream(
-                        resolver.clone(),
-                        self.opts.server.as_str(),
-                        self.opts.port,
-                        self.opts.common_opts.tfo,
-                        sess.iface.as_ref(),
-                        #[cfg(target_os = "linux")]
-                        sess.so_mark,
-                    )
-                    .await?;
                 let carrier_sess = Session {
                     destination: crate::session::SocksAddr::Domain(
                         crate::proxy::transport::mux::h2mux::protocol::MUX_DESTINATION_HOST
@@ -232,7 +244,7 @@ impl OutboundHandler for Handler {
                     ),
                     ..sess.clone()
                 };
-                self.inner_proxy_stream(stream, &carrier_sess, VLESS_COMMAND_TCP)
+                self.dial_proxy_stream(&carrier_sess, VLESS_COMMAND_TCP, resolver.clone(), connector)
                     .await
             };
             let s = mux.open_stream(&sess.destination, false, dialer).await?;
@@ -240,21 +252,7 @@ impl OutboundHandler for Handler {
             return Ok(s);
         }
 
-        let stream = connector
-            .connect_stream(
-                resolver,
-                self.opts.server.as_str(),
-                self.opts.port,
-                self.opts.common_opts.tfo,
-                sess.iface.as_ref(),
-                #[cfg(target_os = "linux")]
-                sess.so_mark,
-            )
-            .await?;
-
-        let s = self
-            .inner_proxy_stream(stream, sess, VLESS_COMMAND_TCP)
-            .await?;
+        let s = self.dial_proxy_stream(sess, VLESS_COMMAND_TCP, resolver, connector).await?;
         sess.push_chain(self.name());
         Ok(s)
     }
@@ -265,21 +263,7 @@ impl OutboundHandler for Handler {
         resolver: ThreadSafeDNSResolver,
         connector: &dyn RemoteConnector,
     ) -> io::Result<AnyOutboundDatagram> {
-        let dial_carrier = || async {
-            let stream = connector
-                .connect_stream(
-                    resolver.clone(),
-                    self.opts.server.as_str(),
-                    self.opts.port,
-                    self.opts.common_opts.tfo,
-                    sess.iface.as_ref(),
-                    #[cfg(target_os = "linux")]
-                    sess.so_mark,
-                )
-                .await?;
-            self.inner_proxy_stream(stream, sess, VLESS_COMMAND_MUX)
-                .await
-        };
+        let dial_carrier = || self.dial_proxy_stream(sess, VLESS_COMMAND_MUX, resolver.clone(), connector);
 
         let child_dgram = self
             .xudp_pool
