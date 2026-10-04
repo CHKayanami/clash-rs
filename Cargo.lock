@@ -1385,7 +1385,7 @@ checksum = "1c133bc6a41be0d194c306b5506d15e6feeea7b1d6604bd3f8310dfb2ca96486"
 
 [[package]]
 name = "clash-common"
-version = "0.20.17-alpha"
+version = "0.20.18-alpha"
 dependencies = [
  "bytes",
  "tokio",
@@ -1393,14 +1393,14 @@ dependencies = [
 
 [[package]]
 name = "clash-doc"
-version = "0.20.17-alpha"
+version = "0.20.18-alpha"
 dependencies = [
  "clash-lib",
 ]
 
 [[package]]
 name = "clash-ebpf"
-version = "0.20.17-alpha"
+version = "0.20.18-alpha"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -1427,7 +1427,7 @@ dependencies = [
 
 [[package]]
 name = "clash-ebpf-common"
-version = "0.20.17-alpha"
+version = "0.20.18-alpha"
 dependencies = [
  "aya",
  "network-types",
@@ -1435,14 +1435,14 @@ dependencies = [
 
 [[package]]
 name = "clash-ffi"
-version = "0.20.17-alpha"
+version = "0.20.18-alpha"
 dependencies = [
  "clash-lib",
 ]
 
 [[package]]
 name = "clash-lib"
-version = "0.20.17-alpha"
+version = "0.20.18-alpha"
 dependencies = [
  "aes 0.9.3",
  "aes-gcm 0.11.1",
@@ -1589,7 +1589,7 @@ dependencies = [
 
 [[package]]
 name = "clash-rs"
-version = "0.20.17-alpha"
+version = "0.20.18-alpha"
 dependencies = [
  "anyhow",
  "aws-lc-rs",
@@ -1604,7 +1604,7 @@ dependencies = [
 
 [[package]]
 name = "clash-shadowsocks"
-version = "0.20.17-alpha"
+version = "0.20.18-alpha"
 dependencies = [
  "aes 0.9.3",
  "base64 0.23.1",
@@ -11580,7 +11580,7 @@ dependencies = [
 
 [[package]]
 name = "watfaq-dns"
-version = "0.20.17-alpha"
+version = "0.20.18-alpha"
 dependencies = [
  "anyhow",
  "async-trait",
