@@ -1,5 +1,24 @@
-use crate::Error;
+use crate::{Error, common::domain::has_valid_domain_labels};
 use std::{fmt::Display, str::FromStr};
+
+pub(crate) fn validate_domain_rule(proto: &str, payload: &str) -> Result<(), Error> {
+    match proto {
+        "DOMAIN" | "DOMAIN-SUFFIX" => {
+            if !has_valid_domain_labels(payload) || payload.trim().is_empty() {
+                return Err(Error::InvalidConfig(format!(
+                    "invalid {proto} domain: {payload:?}"
+                )));
+            }
+        }
+        "DOMAIN-KEYWORD" | "DOMAIN-REGEX" if payload.trim().is_empty() => {
+            return Err(Error::InvalidConfig(format!(
+                "{proto} payload must not be empty"
+            )));
+        }
+        _ => {}
+    }
+    Ok(())
+}
 
 #[derive(Clone)]
 pub enum RuleType {
@@ -135,6 +154,7 @@ impl RuleType {
             .map_or(false, |p| p.iter().any(|s| s.eq_ignore_ascii_case("no-resolve")));
 
         let proto_upper = proto.to_ascii_uppercase();
+        validate_domain_rule(&proto_upper, payload)?;
 
         match proto_upper.as_str() {
             "DOMAIN" => Ok(RuleType::Domain {
@@ -344,6 +364,22 @@ impl FromStr for RuleType {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_domain_payload_validation() {
+        for proto in ["DOMAIN", "DOMAIN-SUFFIX", "DOMAIN-KEYWORD", "DOMAIN-REGEX"] {
+            for payload in ["", " "] {
+                assert!(RuleType::new(proto, payload, "DIRECT", None).is_err());
+                assert!(format!("{proto},{payload},DIRECT").parse::<RuleType>().is_err());
+            }
+        }
+        for proto in ["DOMAIN", "DOMAIN-SUFFIX"] {
+            for payload in [".example", "example.", "a..example"] {
+                assert!(RuleType::new(proto, payload, "DIRECT", None).is_err());
+            }
+            assert!(RuleType::new(proto, "EXAMPLE.COM", "DIRECT", None).is_ok());
+        }
+    }
 
     #[test]
     fn invalid_port_rule_returns_error() {

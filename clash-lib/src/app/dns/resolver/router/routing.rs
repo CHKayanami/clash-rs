@@ -3,14 +3,18 @@ use std::net::IpAddr;
 
 use tracing::debug;
 
-use crate::app::dns::query::QType;
+use crate::app::dns::{
+    domain::{DomainMatcher, normalize_domain},
+    query::QType,
+};
+use crate::common::domainset::DomainSetQuery;
 use crate::app::remote_content_manager::providers::rule_provider::ThreadSafeRuleProvider;
 
 use super::config::{
     RequestAction, RequestRule, ResponseAction, ResponseRule, RouterConfig,
 };
 use super::matcher::{
-    DomainMatcher, IpNetMatcher, QTypeMatcher, RuleSetMatcher, normalize_domain,
+    IpNetMatcher, QTypeMatcher, RuleSetMatcher,
 };
 
 #[derive(Clone)]
@@ -43,8 +47,9 @@ impl CompiledRequestRule {
         }
     }
 
-    fn matches_domain(&self, domain: &str, parts: &[&str]) -> bool {
-        (self.has_domain && self.domain.matches_parts(parts))
+    fn matches_domain(&self, domain: &str, query: Option<&DomainSetQuery<'_>>) -> bool {
+        (self.has_domain
+            && query.is_some_and(|query| self.domain.matches_query(query)))
             || (self.has_rule_set && self.rule_set.matches_domain(domain))
     }
 
@@ -55,7 +60,13 @@ impl CompiledRequestRule {
         }
     }
 
-    fn matches_parts(&self, domain: &str, parts: &[&str], qtype: QType, source_ip: Option<IpAddr>) -> bool {
+    fn matches(
+        &self,
+        domain: &str,
+        query: Option<&DomainSetQuery<'_>>,
+        qtype: QType,
+        source_ip: Option<IpAddr>,
+    ) -> bool {
         // 1. 无任何匹配条件的空规则不生效
         if !self.has_domain && !self.has_rule_set && !self.has_query_type && !self.has_source_ip {
             return false;
@@ -69,7 +80,7 @@ impl CompiledRequestRule {
         if self.has_source_ip && !self.matches_source_ip(source_ip) {
             return self.invert;
         }
-        if (self.has_domain || self.has_rule_set) && !self.matches_domain(domain, parts) {
+        if (self.has_domain || self.has_rule_set) && !self.matches_domain(domain, query) {
             return self.invert;
         }
 
@@ -118,10 +129,10 @@ impl CompiledResponseRule {
             || (self.has_rule_set && self.rule_set.matches_ip(ip))
     }
 
-    fn matches_parts(
+    fn matches(
         &self,
         from_upstream: &str,
-        parts: &[&str],
+        query: Option<&DomainSetQuery<'_>>,
         qtype: QType,
         answer_ips: &[IpAddr],
     ) -> bool {
@@ -145,7 +156,9 @@ impl CompiledResponseRule {
         if self.has_query_type && !self.query_type.matches(qtype) {
             return self.invert;
         }
-        if self.has_domain && !self.domain.matches_parts(parts) {
+        if self.has_domain
+            && !query.is_some_and(|query| self.domain.matches_query(query))
+        {
             return self.invert;
         }
 
@@ -212,9 +225,9 @@ impl DnsRouter {
         source_ip: Option<IpAddr>,
     ) -> &RequestAction {
         let domain = normalize_domain(domain);
-        let parts: Vec<_> = if self.has_request_domains { domain.split('.').collect() } else { Vec::new() };
+        let query = self.has_request_domains.then(|| DomainSetQuery::new(&domain));
         for rule in &self.request_rules {
-            if rule.matches_parts(&domain, &parts, qtype, source_ip) {
+            if rule.matches(&domain, query.as_ref(), qtype, source_ip) {
                 debug!(domain = %domain, ?qtype, action = ?rule.action(), "matched request rule");
                 return rule.action();
             }
@@ -231,9 +244,9 @@ impl DnsRouter {
         answer_ips: &[IpAddr],
     ) -> &ResponseAction {
         let domain = normalize_domain(domain);
-        let parts: Vec<_> = if self.has_response_domains { domain.split('.').collect() } else { Vec::new() };
+        let query = self.has_response_domains.then(|| DomainSetQuery::new(&domain));
         for rule in &self.response_rules {
-            if rule.matches_parts(from_upstream, &parts, qtype, answer_ips) {
+            if rule.matches(from_upstream, query.as_ref(), qtype, answer_ips) {
                 debug!(
                     from_upstream,
                     domain = %domain,

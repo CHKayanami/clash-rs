@@ -21,6 +21,7 @@ use rand::seq::IteratorRandom;
 use tracing::{debug, instrument, trace};
 
 use crate::app::dns::config::{Config, NameServer};
+use crate::app::dns::domain::{DomainMatcher, proxy_server_domain_matcher};
 use crate::app::dns::fakeip::{self, ThreadSafeFakeDns};
 use crate::app::dns::filters::{BlackDomainFilter, DomainFilter, FallbackFilter, PendingMmdb};
 use crate::app::dns::query::{DnsName, QType, QueryContext};
@@ -69,7 +70,7 @@ pub struct EnhancedResolverInner {
     policy: Option<NameServerPolicyContainer>,
 
     proxy_upstreams: Option<Vec<String>>,
-    proxy_server_domains: Option<trie::StringTrie<bool>>,
+    proxy_server_domains: Option<DomainMatcher>,
 
     fake_dns: Option<ThreadSafeFakeDns>,
     fake_ip_ttl: u32,
@@ -187,22 +188,10 @@ impl EnhancedResolver {
             }
         }
 
-        let proxy_server_domains = {
-            let plain_outbounds = outbounds.read();
-            let mut domains = trie::StringTrie::new();
-            let mut has_domain = false;
-            for x in plain_outbounds.values() {
-                if let Some(s) = x.server_name() {
-                    domains.insert(s, Arc::new(true));
-                    debug!("added proxy server domain: {}", s);
-                    has_domain = true;
-                }
-            }
-            if has_domain && !proxy_upstreams.is_empty() {
-                Some(domains)
-            } else {
-                None
-            }
+        let proxy_server_domains = if proxy_upstreams.is_empty() {
+            None
+        } else {
+            proxy_server_domain_matcher(&outbounds)
         };
 
         let pool = UpstreamPool::new(
@@ -437,7 +426,7 @@ impl EnhancedResolver {
 
         if let (Some(proxy_upstreams), Some(proxy_domains)) =
             (&self.proxy_upstreams, &self.proxy_server_domains)
-            && proxy_domains.search(qname).is_some()
+            && proxy_domains.matches(qname)
         {
             debug!(
                 domain = %qname,

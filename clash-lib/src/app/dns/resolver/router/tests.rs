@@ -12,7 +12,7 @@ use super::config::{
     RejectCode, RequestAction, RequestRule, ResponseAction, ResponseRule, RouterConfig,
 };
 use super::hosts::HostsSnapshot;
-use super::matcher::DomainMatcher;
+use crate::app::dns::domain::DomainMatcher;
 use super::routing::DnsRouter;
 
 #[tokio::test]
@@ -106,6 +106,81 @@ fn test_domain_matcher() {
     assert!(matcher.matches("test.apple.com"));
     assert!(!matcher.matches("apple.com"));
     assert!(!matcher.matches("otherapple.com"));
+}
+
+#[test]
+fn test_dns_domain_set_request_and_response_routing() {
+    let patterns = vec!["*.example".to_owned(), "ab.example".to_owned()];
+    let cfg = RouterConfig {
+        request_rules: vec![
+            RequestRule { domain: vec!["unrelated.example".to_owned()],
+                action: RequestAction::Route("unused".to_owned()),
+                rule_set: vec![], query_type: HashSet::new(),
+                source_ip_cidr: vec![], invert: false },
+            RequestRule { domain: patterns.clone(),
+                action: RequestAction::Route("matched".to_owned()),
+                rule_set: vec![], query_type: HashSet::new(),
+                source_ip_cidr: vec![], invert: false },
+        ],
+        response_rules: vec![
+            ResponseRule { domain: vec!["unrelated.example".to_owned()],
+                action: ResponseAction::Requery("unused".to_owned()),
+                rule_set: vec![], query_type: HashSet::new(),
+                ip_cidr: vec![], invert: false, from_upstream: None },
+            ResponseRule { domain: patterns,
+                from_upstream: Some("source".to_owned()),
+                action: ResponseAction::Requery("matched".to_owned()),
+                rule_set: vec![], query_type: HashSet::new(),
+                ip_cidr: vec![], invert: false },
+        ],
+        request_fallback: RequestAction::Route("fallback".to_owned()),
+        response_fallback: ResponseAction::Accept,
+        ..Default::default()
+    };
+    let router = DnsRouter::new(&cfg);
+    for domain in ["b.example", " B.EXAMPLE. "] {
+        assert_eq!(router.route_request(domain, QType::A, None),
+            &RequestAction::Route("matched".to_owned()));
+        assert_eq!(router.route_response("source", domain, QType::A, &[]),
+            &ResponseAction::Requery("matched".to_owned()));
+        assert_eq!(router.route_response("other", domain, QType::A, &[]),
+            &ResponseAction::Accept);
+    }
+    for domain in ["example", "a.b.example", "a..example", ""] {
+        assert_eq!(router.route_request(domain, QType::A, None),
+            &RequestAction::Route("fallback".to_owned()));
+        assert_eq!(router.route_response("source", domain, QType::A, &[]),
+            &ResponseAction::Accept);
+    }
+}
+
+#[test]
+fn test_dns_domain_set_routing_invert() {
+    let cfg = RouterConfig {
+        request_rules: vec![RequestRule {
+            domain: vec!["+.example".to_owned()], invert: true,
+            action: RequestAction::Route("outside".to_owned()),
+            rule_set: vec![], query_type: HashSet::new(), source_ip_cidr: vec![],
+        }],
+        response_rules: vec![ResponseRule {
+            domain: vec!["+.example".to_owned()], invert: true,
+            action: ResponseAction::Requery("outside".to_owned()),
+            rule_set: vec![], query_type: HashSet::new(), ip_cidr: vec![],
+            from_upstream: None,
+        }],
+        request_fallback: RequestAction::Route("fallback".to_owned()),
+        response_fallback: ResponseAction::Accept,
+        ..Default::default()
+    };
+    let router = DnsRouter::new(&cfg);
+    assert_eq!(router.route_request("outside.test", QType::A, None),
+        &RequestAction::Route("outside".to_owned()));
+    assert_eq!(router.route_response("source", "outside.test", QType::A, &[]),
+        &ResponseAction::Requery("outside".to_owned()));
+    assert_eq!(router.route_request("a.example", QType::A, None),
+        &RequestAction::Route("fallback".to_owned()));
+    assert_eq!(router.route_response("source", "example", QType::A, &[]),
+        &ResponseAction::Accept);
 }
 
 #[test]

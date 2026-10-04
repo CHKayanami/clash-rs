@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Error as AnyhowError, Result, bail};
 use byteorder::{BigEndian, ReadBytesExt};
 use ipnet::IpNet;
 use std::{
@@ -11,7 +11,7 @@ use crate::{
     app::remote_content_manager::providers::rule_provider::{
         RuleSetBehavior, cidr_trie::CidrTrie, provider::RuleContent,
     },
-    common::succinct_set::DomainSet,
+    common::domainset::DomainSet,
 };
 
 // MRS Magic bytes for version 1
@@ -123,17 +123,32 @@ fn parse_domain_payload<R: Read>(reader: &mut R) -> Result<RuleContent> {
         );
     }
 
+    let mut budget = 512 * 1024 * 1024;
     let leaves_len = read_u64_length(reader, "Leaves")?;
+    consume_domain_budget(&mut budget, leaves_len, 8)?;
     let leaves = read_u64_vec(reader, leaves_len, "Leaves")?;
 
     let label_bitmap_len = read_u64_length(reader, "LabelBitmap")?;
+    // Include rank and select indexes in the memory budget.
+    consume_domain_budget(&mut budget, label_bitmap_len, 16)?;
     let label_bitmap = read_u64_vec(reader, label_bitmap_len, "LabelBitmap")?;
 
     let labels_len = read_u64_length(reader, "Labels")?;
+    consume_domain_budget(&mut budget, labels_len, 1)?;
     let labels = read_byte_vec(reader, labels_len, "Labels")?;
 
-    let domain_set = DomainSet::from_mrs_parts(leaves, label_bitmap, labels);
+    let domain_set = DomainSet::from_mrs_parts(leaves, label_bitmap, labels)
+        .map_err(AnyhowError::msg)
+        .context("Invalid MRS domain tree")?;
     Ok(RuleContent::Domain(domain_set))
+}
+
+fn consume_domain_budget(budget: &mut usize, count: usize, width: usize) -> Result<()> {
+    let bytes = count.checked_mul(width)
+        .context("MRS domain size overflow")?;
+    *budget = budget.checked_sub(bytes)
+        .context("MRS domain exceeds 512 MiB budget")?;
+    Ok(())
 }
 
 // --- IPCIDR Payload Parsing ---
@@ -200,7 +215,7 @@ fn read_u64_length<R: Read>(reader: &mut R, field_name: &str) -> Result<usize> {
     if len < 0 {
         bail!("Invalid negative length for {}: {}", field_name, len);
     }
-    Ok(len as usize)
+    usize::try_from(len).context("MRS length does not fit usize")
 }
 
 fn read_u64_vec<R: Read>(
@@ -209,7 +224,11 @@ fn read_u64_vec<R: Read>(
     field_name: &str,
 ) -> Result<Vec<u64>> {
     const CHUNK_SIZE: usize = 1024;
-    let mut vec = Vec::with_capacity(count);
+    const MAX_WORDS: usize = 512 * 1024 * 1024 / 8;
+    if count > MAX_WORDS {
+        bail!("{field_name} length exceeds maximum allowed size");
+    }
+    let mut vec = Vec::new();
     let mut buf = [0u8; CHUNK_SIZE * 8];
     let mut remaining = count;
     let mut idx = 0;
@@ -245,7 +264,7 @@ fn read_byte_vec<R: Read>(
             MAX_BYTE_VEC_LEN
         );
     }
-    let mut vec = Vec::with_capacity(len);
+    let mut vec = Vec::new();
     reader
         .take(len as u64)
         .read_to_end(&mut vec)
@@ -391,7 +410,54 @@ fn range_to_cidrs(start: IpAddr, end: IpAddr) -> Result<Vec<IpNet>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zstd::encode_all;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    fn domain_payload(leaves: &[u64], bitmap: &[u64], labels: &[u8]) -> Vec<u8> {
+        let mut payload = vec![DOMAIN_SET_VERSION];
+        for words in [leaves, bitmap] {
+            payload.extend_from_slice(&(words.len() as i64).to_be_bytes());
+            for word in words {
+                payload.extend_from_slice(&word.to_be_bytes());
+            }
+        }
+        payload.extend_from_slice(&(labels.len() as i64).to_be_bytes());
+        payload.extend_from_slice(labels);
+        payload
+    }
+
+    #[test]
+    fn test_domain_payload_validation() {
+        // Root -> 'x' -> '.' -> '*', with only the final node a leaf.
+        let payload = domain_payload(&[8], &[106], b"x.*");
+        let RuleContent::Domain(set) =
+            parse_domain_payload(&mut Cursor::new(payload)).unwrap()
+        else { panic!("expected domain content"); };
+        assert!(set.has("a.x"));
+        assert!(!set.has("a.b.x"));
+        let mut file = MRS_MAGIC_BYTES.to_vec();
+        file.push(BEHAVIOR_DOMAIN);
+        file.extend_from_slice(&1i64.to_be_bytes());
+        file.extend_from_slice(&0i64.to_be_bytes());
+        file.extend_from_slice(&domain_payload(&[8], &[106], b"x.*"));
+        let compressed = encode_all(file.as_slice(), 0).unwrap();
+        let RuleContent::Domain(set) =
+            rules_mrs_parse(&compressed, RuleSetBehavior::Domain).unwrap()
+        else { panic!("expected domain content"); };
+        assert!(set.has("a.x"));
+        let invalid = domain_payload(&[0], &[0], b"a");
+        assert!(parse_domain_payload(&mut Cursor::new(invalid)).is_err());
+        let truncated = domain_payload(&[8], &[106], b"x.*");
+        let mut reader = Cursor::new(&truncated[..truncated.len() - 1]);
+        assert!(parse_domain_payload(&mut reader).is_err());
+        let mut oversized = domain_payload(&[], &[1], &[]);
+        oversized[1..9].copy_from_slice(&i64::MAX.to_be_bytes());
+        assert!(parse_domain_payload(&mut Cursor::new(oversized)).is_err());
+        let mut budget = 16;
+        consume_domain_budget(&mut budget, 1, 8).unwrap();
+        assert!(consume_domain_budget(&mut budget, 2, 8).is_err());
+        assert!(consume_domain_budget(&mut budget, usize::MAX, 8).is_err());
+    }
 
     #[test]
     fn test_range_to_cidrs_single_ip_v4() {

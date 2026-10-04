@@ -91,15 +91,11 @@ impl<T> StringTrie<T> {
             return None;
         }
 
-        self.search_parts(&parts.unwrap())
-    }
-
-    /// Search pre-split labels so routing can reuse them across domain rules.
-    pub(crate) fn search_parts(&self, parts: &[&str]) -> Option<&Node<T>> {
-        if parts.is_empty() || parts.iter().any(|part| part.is_empty()) {
+        let parts = parts.unwrap();
+        if parts.iter().any(|part| part.is_empty()) {
             return None;
         }
-        if let Some(node) = Self::search_inner(&self.root, parts)
+        if let Some(node) = Self::search_inner(&self.root, &parts)
             && node.data.is_some()
         {
             return Some(node);
@@ -111,47 +107,41 @@ impl<T> StringTrie<T> {
     where
         F: FnMut(&String, &T) -> bool,
     {
-        for (key, child) in self.root.get_children() {
-            Self::traverse_inner(&[key], child, &mut f);
-            if let Some(data) = child.get_data()
-                && !f(key, data)
-            {
-                return;
-            }
-        }
+        self.traverse_parts(|parts, data| {
+            let domain = parts.iter().rev().copied().collect::<Vec<_>>()
+                .join(DOMAIN_STEP);
+            let key = if domain.is_empty() {
+                COMPLEX_WILDCARD.to_owned()
+            } else if domain.starts_with(DOMAIN_STEP) {
+                COMPLEX_WILDCARD.to_owned() + &domain
+            } else { domain };
+            f(&key, data)
+        });
     }
 
-    fn traverse_inner<'a, F>(
-        keys: &'a [&String],
-        node: &'a Node<T>,
-        f: &mut F,
-    ) -> bool
+    /// Borrow labels in root-to-leaf order. Unlike the rendered string, this
+    /// distinguishes an empty suffix marker from a literal '+' label.
+    pub(crate) fn traverse_parts<F>(&self, mut f: F)
     where
-        F: FnMut(&String, &T) -> bool,
+        F: FnMut(&[&str], &T) -> bool,
     {
-        for (key, child) in node.get_children() {
-            let keys = [&[key], keys].concat();
-
-            let d = keys.iter().map(|x| x.as_str()).collect::<Vec<_>>();
-            if let Some(data) = child.get_data() {
-                let domain = d.join(DOMAIN_STEP);
-                let key = if domain.starts_with(DOMAIN_STEP) {
-                    COMPLEX_WILDCARD.to_string() + domain.as_str()
-                } else {
-                    domain
-                };
-
-                if !f(&key, data) {
+        fn visit<'a, T, F>(node: &'a Node<T>, parts: &mut Vec<&'a str>, f: &mut F) -> bool
+        where
+            F: FnMut(&[&str], &T) -> bool,
+        {
+            for (key, child) in node.get_children() {
+                parts.push(key);
+                if let Some(data) = child.get_data()
+                    && !f(parts, data)
+                {
                     return false;
                 }
+                if !visit(child, parts, f) { return false; }
+                parts.pop();
             }
-
-            if !Self::traverse_inner(&keys, child, f) {
-                return false;
-            }
+            true
         }
-
-        true
+        visit(&self.root, &mut Vec::new(), &mut f);
     }
 
     fn insert_inner(&mut self, parts: &[&str], data: Arc<T>) {
@@ -294,6 +284,20 @@ mod tests {
         assert_eq!(assert_fn("example.dev"), Arc::new(1));
         assert_eq!(assert_fn("foo.example.dev"), Arc::new(2));
         assert_eq!(assert_fn("test.example.dev"), Arc::new(3));
+    }
+
+    #[test]
+    fn test_traverse_stops_in_subtree() {
+        let mut tree = StringTrie::new();
+        for domain in ["example.com", "a.example.com", "b.example.com", "other.net"] {
+            tree.insert(domain, Arc::new(LOCAL_IP));
+        }
+        let mut calls = 0;
+        tree.traverse(|_, _| {
+            calls += 1;
+            false
+        });
+        assert_eq!(calls, 1);
     }
 
     #[test]

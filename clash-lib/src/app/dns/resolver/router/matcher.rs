@@ -1,4 +1,3 @@
-use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, OnceLock};
@@ -7,47 +6,7 @@ use ipnet::IpNet;
 
 use crate::app::dns::query::QType;
 use crate::app::remote_content_manager::providers::rule_provider::ThreadSafeRuleProvider;
-use crate::common::trie::StringTrie;
 use crate::session::{Session, SocksAddr};
-
-pub(super) fn normalize_domain(domain: &str) -> Cow<'_, str> {
-    let domain = domain.trim().trim_end_matches('.');
-    if domain.bytes().any(|byte| byte.is_ascii_uppercase()) {
-        Cow::Owned(domain.to_ascii_lowercase())
-    } else {
-        Cow::Borrowed(domain)
-    }
-}
-
-#[derive(Clone, Default)]
-pub struct DomainMatcher {
-    trie: Arc<StringTrie<()>>,
-}
-
-impl DomainMatcher {
-    pub fn new(domains: &[String]) -> Self {
-        let mut trie = StringTrie::new();
-        for d in domains {
-            let normalized = d.trim().trim_end_matches('.').to_ascii_lowercase();
-            if !normalized.is_empty() {
-                trie.insert(&normalized, Arc::new(()));
-            }
-        }
-        Self {
-            trie: Arc::new(trie),
-        }
-    }
-
-    #[cfg(test)]
-    pub fn matches(&self, domain: &str) -> bool {
-        let normalized = normalize_domain(domain);
-        self.trie.search(&normalized).is_some()
-    }
-
-    pub(super) fn matches_parts(&self, parts: &[&str]) -> bool {
-        self.trie.search_parts(parts).is_some()
-    }
-}
 
 #[derive(Clone, Default)]
 pub struct RuleSetMatcher {

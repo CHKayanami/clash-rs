@@ -1,6 +1,6 @@
 use crate::{
-    app::router::rules::{RuleMatcher, ends_with_ignore_ascii_case},
-    session::{Session, SocksAddr},
+    app::router::rules::{RuleMatcher, ends_with_ignore_ascii_case, matching_domain},
+    session::Session,
 };
 
 #[derive(Clone)]
@@ -17,20 +17,20 @@ impl std::fmt::Display for DomainSuffix {
 
 impl RuleMatcher for DomainSuffix {
     fn apply(&self, sess: &Session) -> bool {
-        match &sess.destination {
-            SocksAddr::Ip(_) => false,
-            SocksAddr::Domain(domain, _) => {
-                if domain.eq_ignore_ascii_case(&self.suffix) {
-                    true
-                } else if domain.len() > self.suffix.len() {
-                    let index = domain.len() - self.suffix.len() - 1;
-                    domain.as_bytes()[index] == b'.'
-                        && ends_with_ignore_ascii_case(domain, &self.suffix)
-                } else {
-                    false
-                }
+        matching_domain(sess).is_some_and(|domain| {
+            if self.suffix.is_empty() {
+                return false;
             }
-        }
+            if domain.eq_ignore_ascii_case(&self.suffix) {
+                true
+            } else if domain.len() > self.suffix.len() {
+                let index = domain.len() - self.suffix.len() - 1;
+                domain.as_bytes()[index] == b'.'
+                    && ends_with_ignore_ascii_case(domain, &self.suffix)
+            } else {
+                false
+            }
+        })
     }
 
     fn target(&self) -> &str {

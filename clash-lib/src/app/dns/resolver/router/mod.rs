@@ -40,7 +40,7 @@ use crate::app::dns::{
 };
 use crate::app::profile::ThreadSafeCacheFile;
 use crate::app::router::Router;
-use crate::common::trie::StringTrie;
+use crate::app::dns::domain::{DomainMatcher, proxy_server_domain_matcher};
 use crate::config::def::FakeIpFilterMode;
 use crate::proxy::utils::OutboundHandlerRegistry;
 
@@ -65,7 +65,7 @@ pub struct RouterResolver {
     cache: DnsCache,
     ipv6: AtomicBool,
     resolution_hook: Arc<ArcSwapOption<DnsResolutionHookWrapper>>,
-    proxy_server_domains: Option<StringTrie<bool>>,
+    proxy_server_domains: Option<DomainMatcher>,
     proxy_server_transports: Vec<Transport>,
     notifier: DnsResolvedNotifier,
     real_transport: Option<Transport>,
@@ -269,21 +269,10 @@ impl RouterResolver {
             }
         }
 
-        let proxy_server_domains = {
-            let plain_outbounds = outbounds.read();
-            let mut domains = StringTrie::new();
-            let mut has_domain = false;
-            for x in plain_outbounds.values() {
-                if let Some(s) = x.server_name() {
-                    domains.insert(s, Arc::new(true));
-                    has_domain = true;
-                }
-            }
-            if has_domain && !proxy_server_transports.is_empty() {
-                Some(domains)
-            } else {
-                None
-            }
+        let proxy_server_domains = if proxy_server_transports.is_empty() {
+            None
+        } else {
+            proxy_server_domain_matcher(&outbounds)
         };
 
         // Real connection addresses use the first non-Fake-IP upstream,
@@ -401,7 +390,7 @@ impl RouterResolver {
             &self.proxy_server_domains,
             self.proxy_server_transports.is_empty(),
         ) {
-            if domains.search(qname).is_some() {
+            if domains.matches(qname) {
                 debug!(
                     domain = qname,
                     ?qtype,

@@ -7,6 +7,7 @@ use mockall::automock;
 
 pub mod collector;
 pub mod config;
+mod domain;
 pub mod ecs;
 pub mod endpoint;
 mod fakeip;

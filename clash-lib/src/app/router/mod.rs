@@ -11,7 +11,10 @@ use crate::{
         domain::Domain, domain_keyword::DomainKeyword, domain_suffix::DomainSuffix,
         final_::Final, ipcidr::IpCidr, ruleset::RuleSet,
     },
-    config::internal::{config::RuleProviderDef, rule::RuleType},
+    config::internal::{
+        config::RuleProviderDef,
+        rule::{RuleType, validate_domain_rule},
+    },
     print_and_exit,
     proxy::utils::OutboundHandlerRegistry,
     session::Session,
@@ -447,25 +450,33 @@ pub fn map_rule_type(
 ) -> Result<Rule, Error> {
     match rule_type {
         RuleType::Domain { domain, target } => {
+            validate_domain_rule("DOMAIN", &domain)?;
             Ok(Rule::Domain(Domain { domain, target }))
         }
         RuleType::DomainRegex { regex, target } => {
+            validate_domain_rule("DOMAIN-REGEX", regex.as_str())?;
             Ok(Rule::DomainRegex(DomainRegex { regex, target }))
         }
         RuleType::DomainSuffix {
             domain_suffix,
             target,
-        } => Ok(Rule::DomainSuffix(DomainSuffix {
-            suffix: domain_suffix,
-            target,
-        })),
+        } => {
+            validate_domain_rule("DOMAIN-SUFFIX", &domain_suffix)?;
+            Ok(Rule::DomainSuffix(DomainSuffix {
+                suffix: domain_suffix,
+                target,
+            }))
+        }
         RuleType::DomainKeyword {
             domain_keyword,
             target,
-        } => Ok(Rule::DomainKeyword(DomainKeyword {
-            keyword: domain_keyword,
-            target,
-        })),
+        } => {
+            validate_domain_rule("DOMAIN-KEYWORD", &domain_keyword)?;
+            Ok(Rule::DomainKeyword(DomainKeyword {
+                keyword: domain_keyword,
+                target,
+            }))
+        }
         RuleType::IpCidr {
             ipnet,
             target,

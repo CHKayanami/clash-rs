@@ -19,7 +19,7 @@ use crate::{
     },
     common::{
         errors::map_io_error, geodata::GeoDataLookup, mmdb::MmdbLookup,
-        succinct_set, trie,
+        domainset::{DomainSet, DomainSetBuilder},
     },
     config::internal::rule::{RuleType, proto_supports_params},
     session::Session,
@@ -72,7 +72,7 @@ impl Display for RuleSetBehavior {
 
 pub enum RuleContent {
     // the left will converted into a right
-    Domain(succinct_set::DomainSet),
+    Domain(DomainSet),
     Ipcidr(Box<CidrTrie>),
     Classical(Vec<Rule>),
 }
@@ -175,7 +175,7 @@ impl RuleProviderImpl {
         let inner = Arc::new(std::sync::RwLock::new(Inner {
             content: match behavior {
                 RuleSetBehavior::Domain => {
-                    RuleContent::Domain(succinct_set::DomainSet::default())
+                    RuleContent::Domain(DomainSet::default())
                 }
                 RuleSetBehavior::Ipcidr => {
                     RuleContent::Ipcidr(Box::new(CidrTrie::new()))
@@ -528,8 +528,7 @@ fn make_rules(
 ) -> Result<RuleContent, Error> {
     match behavior {
         RuleSetBehavior::Domain => {
-            let s = make_domain_rules(rules)?;
-            Ok(RuleContent::Domain(s.into()))
+            Ok(RuleContent::Domain(make_domain_rules(rules)))
         }
         RuleSetBehavior::Ipcidr => {
             Ok(RuleContent::Ipcidr(Box::new(make_ip_cidr_rules(rules)?)))
@@ -540,12 +539,12 @@ fn make_rules(
     }
 }
 
-fn make_domain_rules(rules: Vec<String>) -> Result<trie::StringTrie<bool>, Error> {
-    let mut trie = trie::StringTrie::new();
+fn make_domain_rules(rules: Vec<String>) -> DomainSet {
+    let mut builder = DomainSetBuilder::new();
     for rule in rules {
-        trie.insert(&rule, Arc::new(true));
+        builder.insert(&rule);
     }
-    Ok(trie)
+    builder.build()
 }
 
 fn make_ip_cidr_rules(rules: Vec<String>) -> Result<CidrTrie, Error> {

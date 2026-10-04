@@ -1,6 +1,6 @@
 use crate::{
-    app::router::rules::RuleMatcher,
-    session::{Session, SocksAddr},
+    app::router::rules::{RuleMatcher, matching_domain},
+    session::Session,
 };
 
 #[derive(Clone)]
@@ -17,10 +17,7 @@ impl std::fmt::Display for DomainRegex {
 
 impl RuleMatcher for DomainRegex {
     fn apply(&self, sess: &Session) -> bool {
-        match &sess.destination {
-            SocksAddr::Ip(_) => false,
-            SocksAddr::Domain(domain, _) => self.regex.is_match(domain),
-        }
+        matching_domain(sess).is_some_and(|domain| self.regex.is_match(domain))
     }
 
     fn target(&self) -> &str {

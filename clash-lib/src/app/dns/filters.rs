@@ -4,7 +4,8 @@ use std::{
 };
 
 use crate::app::remote_content_manager::providers::rule_provider::ThreadSafeRuleProvider;
-use crate::common::{mmdb::MmdbLookup, trie};
+use crate::app::dns::domain::{DomainMatcher, normalize_domain};
+use crate::common::mmdb::MmdbLookup;
 use crate::session::{Session, SocksAddr};
 
 /// A shared, lazily-populated MMDB handle.  The `OnceLock` starts empty and is
@@ -107,45 +108,41 @@ impl IPNetFilter {
 }
 
 pub struct DomainFilter {
-    domains: trie::StringTrie<Option<String>>,
+    domains: DomainMatcher,
     ruleset_names: Vec<String>,
     rule_providers: OnceLock<Vec<ThreadSafeRuleProvider>>,
-    #[allow(dead_code)]
-    has_domains: bool,
 }
 
 impl DomainFilter {
     pub fn new<S: AsRef<str>>(entries: impl IntoIterator<Item = S>) -> Self {
-        let mut domains = trie::StringTrie::new();
+        let mut domains = Vec::new();
         let mut ruleset_names = Vec::new();
-        let mut has_domains = false;
 
         for item in entries {
             let s = item.as_ref();
             if let Some(rs_name) = s.strip_prefix("rule-set:") {
                 ruleset_names.push(rs_name.to_owned());
             } else {
-                domains.insert(s, Arc::new(None));
-                has_domains = true;
+                domains.push(item);
             }
         }
 
         Self {
-            domains,
+            domains: DomainMatcher::new(domains),
             ruleset_names,
             rule_providers: OnceLock::new(),
-            has_domains,
         }
     }
 
     pub fn apply(&self, domain: &str) -> bool {
-        if self.domains.search(domain).is_some() {
+        let domain = normalize_domain(domain);
+        if self.domains.matches_normalized(&domain) {
             return true;
         }
 
         if let Some(rps) = self.rule_providers.get() {
             let sess = Session {
-                destination: SocksAddr::Domain(domain.into(), 443),
+                destination: SocksAddr::Domain(domain.as_ref().into(), 443),
                 ..Default::default()
             };
             return rps.iter().any(|rp| rp.search(&sess));
@@ -174,7 +171,7 @@ impl DomainFilter {
 
     #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
-        !self.has_domains && self.ruleset_names.is_empty()
+        self.domains.is_empty() && self.ruleset_names.is_empty()
     }
 }
 
@@ -282,7 +279,9 @@ mod tests {
 
         assert!(!filter.is_empty());
         assert!(filter.apply("exact.com"));
+        assert!(filter.apply("EXACT.COM."));
         assert!(filter.apply("sub.bad.domain"));
+        assert!(!filter.apply("a.sub.bad.domain"));
         assert!(!filter.apply("good.com"));
         assert!(!filter.apply("ad.com"));
 
@@ -308,6 +307,7 @@ mod tests {
 
         // After adding rule set, ad.com should match
         assert!(filter.apply("ad.com"));
+        assert!(filter.apply("AD.COM."));
     }
 
     #[test]
@@ -315,6 +315,9 @@ mod tests {
         let empty_filter = DomainFilter::new(Vec::<&str>::new());
         assert!(empty_filter.is_empty());
         assert!(!empty_filter.apply("example.com"));
+        let invalid = DomainFilter::new(["", ".", "a..example"]);
+        assert!(invalid.is_empty());
+        assert!(!invalid.apply("example.com"));
     }
 
     #[tokio::test]

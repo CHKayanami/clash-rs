@@ -1,6 +1,6 @@
 use crate::session;
 
-use super::RuleMatcher;
+use super::{RuleMatcher, matching_domain};
 
 #[derive(Clone)]
 pub struct Domain {
@@ -16,12 +16,9 @@ impl std::fmt::Display for Domain {
 
 impl RuleMatcher for Domain {
     fn apply(&self, sess: &session::Session) -> bool {
-        match &sess.destination {
-            session::SocksAddr::Ip(_) => false,
-            session::SocksAddr::Domain(domain, _) => {
-                self.domain.eq_ignore_ascii_case(domain)
-            }
-        }
+        matching_domain(sess).is_some_and(|domain| {
+            self.domain.eq_ignore_ascii_case(domain)
+        })
     }
 
     fn target(&self) -> &str {

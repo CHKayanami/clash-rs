@@ -4,7 +4,7 @@ use std::fmt::{Display, Formatter};
 use crate::{
     app::router::rules::geodata::{
         attribute::{AndAttrMatcher, AttrMatcher},
-        matcher_group::{DomainGroupMatcher, SuccinctMatcherGroup},
+        matcher_group::SuccinctMatcherGroup,
     },
     common::geodata::GeoDataLookup,
 };
@@ -44,7 +44,7 @@ fn parse(country_code: &str) -> Option<(bool, String, Box<dyn AttrMatcher>)> {
 pub struct GeoSiteMatcher {
     pub country_code: String,
     pub target: String,
-    pub matcher: Box<dyn DomainGroupMatcher>,
+    pub matcher: SuccinctMatcherGroup,
     /// number of domain entries backing `matcher`, for the `/rules` API
     count: usize,
 }
@@ -75,8 +75,7 @@ impl GeoSiteMatcher {
             .collect::<Vec<_>>();
 
         let count = domains.len();
-        let matcher_group: Box<dyn DomainGroupMatcher> =
-            Box::new(SuccinctMatcherGroup::try_new(domains, not)?);
+        let matcher_group = SuccinctMatcherGroup::try_new(domains, not)?;
         Ok(Self {
             country_code,
             target,
@@ -94,18 +93,8 @@ impl Display for GeoSiteMatcher {
 
 impl RuleMatcher for GeoSiteMatcher {
     fn apply(&self, sess: &Session) -> bool {
-        match &sess.destination {
-            crate::session::SocksAddr::Ip(_) => false,
-            crate::session::SocksAddr::Domain(domain, _) => {
-                // geosite entries are lowercase and the backing trie compares
-                // byte-wise, so normalize the (client-supplied) host first
-                if domain.bytes().any(|b| b.is_ascii_uppercase()) {
-                    self.matcher.apply(&domain.to_ascii_lowercase())
-                } else {
-                    self.matcher.apply(domain.as_ref())
-                }
-            }
-        }
+        sess.destination.domain()
+            .is_some_and(|domain| self.matcher.apply(domain))
     }
 
     fn target(&self) -> &str {
@@ -134,9 +123,7 @@ mod tests {
         Error,
         app::{
             dns::SystemResolver,
-            router::rules::geodata::matcher_group::{
-                DomainGroupMatcher, SuccinctMatcherGroup,
-            },
+            router::rules::geodata::matcher_group::SuccinctMatcherGroup,
         },
         common::{
             geodata::{DEFAULT_GEOSITE_DOWNLOAD_URL, GeoData, GeoDataLookupTrait},
@@ -145,6 +132,31 @@ mod tests {
         },
         tests::initialize,
     };
+
+    #[test]
+    fn test_geosite_session_matching() {
+        use crate::{
+            common::geodata::geodata_proto::{Domain, domain::Type},
+            session::SocksAddr,
+        };
+        let matcher = GeoSiteMatcher {
+            country_code: "test".to_owned(), target: "DIRECT".to_owned(),
+            matcher: SuccinctMatcherGroup::try_new(vec![Domain {
+                r#type: Type::Regex as i32,
+                value: r"^UPPER\.example$".to_owned(),
+                ..Default::default()
+            }], false).unwrap(),
+            count: 1,
+        };
+        let mut session = Session {
+            destination: SocksAddr::Domain("UPPER.example".into(), 443),
+            ..Default::default()
+        };
+        assert!(matcher.apply(&session));
+        session.destination = SocksAddr::Domain("upper.example".into(), 443);
+        assert!(!matcher.apply(&session));
+        assert!(!matcher.apply(&Session::default()));
+    }
 
     struct TestSuite<'a> {
         country_code: &'a str,
@@ -212,8 +224,7 @@ mod tests {
                 .filter(|domain| attr_matcher.matches(domain))
                 .collect::<Vec<_>>();
 
-            let matcher_group: Box<dyn DomainGroupMatcher> =
-                Box::new(SuccinctMatcherGroup::try_new(domains, not).unwrap());
+            let matcher_group = SuccinctMatcherGroup::try_new(domains, not).unwrap();
 
             for (domain, expected) in suite.expected_results.iter() {
                 assert_eq!(matcher_group.apply(domain), *expected);

@@ -2,7 +2,7 @@ use std::fmt::Display;
 
 use crate::session;
 
-use super::{RuleMatcher, contains_ignore_ascii_case};
+use super::{RuleMatcher, contains_ignore_ascii_case, matching_domain};
 
 #[derive(Clone)]
 pub struct DomainKeyword {
@@ -18,12 +18,9 @@ impl Display for DomainKeyword {
 
 impl RuleMatcher for DomainKeyword {
     fn apply(&self, sess: &session::Session) -> bool {
-        match &sess.destination {
-            session::SocksAddr::Ip(_) => false,
-            session::SocksAddr::Domain(domain, _) => {
-                contains_ignore_ascii_case(domain, &self.keyword)
-            }
-        }
+        !self.keyword.is_empty() && matching_domain(sess).is_some_and(|domain| {
+            contains_ignore_ascii_case(domain, &self.keyword)
+        })
     }
 
     fn target(&self) -> &str {

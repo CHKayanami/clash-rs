@@ -2,7 +2,7 @@ use enum_dispatch::enum_dispatch;
 use erased_serde::Serialize;
 use std::{collections::HashMap, fmt::Display};
 
-use crate::session::Session;
+use crate::{common::domain::has_valid_domain_labels, session::Session};
 
 pub mod composite;
 pub mod domain;
@@ -17,6 +17,12 @@ pub mod network;
 pub mod port;
 pub mod process;
 pub mod ruleset;
+
+/// Shared entry for domain rules, including direct matcher calls from rule sets.
+pub(super) fn matching_domain(sess: &Session) -> Option<&str> {
+    sess.destination.domain()
+        .filter(|domain| has_valid_domain_labels(domain))
+}
 
 /// ASCII case-insensitive `str::contains`, without allocating.
 ///
@@ -116,3 +122,6 @@ impl Display for Rule {
         }
     }
 }
+
+#[cfg(test)]
+mod domain_tests;
