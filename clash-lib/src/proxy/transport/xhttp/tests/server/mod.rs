@@ -36,6 +36,7 @@ pub(super) struct Server {
     pub(super) connections: AtomicUsize,
     pub(super) max_uploads: AtomicUsize,
     pub(super) h2_streams: u32,
+    pub(super) h2_settings_delay: Duration,
     uploads: AtomicUsize,
     tasks: Mutex<Tasks>,
 }
@@ -48,6 +49,7 @@ impl Server {
             post_delay: Duration::ZERO, delay_first_packet: false, delay_headers: false, close_post: false,
             connections: AtomicUsize::new(0), max_uploads: AtomicUsize::new(0), uploads: AtomicUsize::new(0),
             h2_streams: 100,
+            h2_settings_delay: Duration::ZERO,
             tasks: Mutex::new(Tasks::new()),
         }
     }
@@ -82,7 +84,9 @@ impl Server {
                 if let Ok(data) = frame.into_data() { session.echo(data).await; }
             }
             let reply = session.body();
+            let post_delay = self.post_delay;
             self.tasks.lock().push(tokio::spawn(async move {
+                if !post_delay.is_zero() { sleep(post_delay).await; }
                 while let Some(Ok(frame)) = body.frame().await {
                     if let Ok(data) = frame.into_data() { session.echo(data).await; }
                 }
@@ -120,9 +124,11 @@ impl Server {
                 let (client, server) = duplex(4096);
                 let handler = state.clone();
                 let h2_streams = state.h2_streams;
+                let h2_settings_delay = state.h2_settings_delay;
                 state.tasks.lock().push(tokio::spawn(async move {
                     let service = service_fn(move |request| handler.clone().request(request));
                     if h2 {
+                        sleep(h2_settings_delay).await;
                         let _ = http2::Builder::new(TokioExecutor::new()).max_header_list_size(1_048_576)
                             .max_concurrent_streams(h2_streams).serve_connection(TokioIo::new(server), service).await;
                     } else {

@@ -213,3 +213,19 @@ async fn xhttp_upload_backpressure_is_bounded() {
     assert!(timeout(Duration::from_millis(100), stream.write_all(&payload)).await.is_err());
     drop(stream);
 }
+
+#[tokio::test]
+async fn xhttp_streaming_upload_backpressure_is_bounded() {
+    for mode in ["stream-up", "stream-one"] {
+        let mut state = Server::new(4_194_304);
+        state.post_delay = Duration::from_secs(5);
+        state.options = options(mode);
+        let server = Arc::new(state);
+        let client = Client::new(&options(mode), "example.test", false, false,
+            Some(&["h2".into()])).unwrap();
+        let mut stream = client.connect_with_factories(server.factory(true), None).await.unwrap();
+        let payload = vec![7; 4_194_304];
+        assert!(timeout(Duration::from_millis(100), stream.write_all(&payload)).await.is_err());
+        drop(stream);
+    }
+}

@@ -12,11 +12,9 @@ use std::{
 };
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
-    task::JoinHandle,
 };
-use tracing::warn;
 
-use super::{Transport, h2::shutdown_h2_send};
+use super::{Transport, h2_common::{ConnectionDriver, MAX_WRITE_SIZE, client_builder, poll_send_capacity, release_receive_capacity, shutdown_h2_send}};
 use crate::{
     common::errors::map_io_error,
     proxy::{AnyStream, ProxyStream},
@@ -26,11 +24,6 @@ use frame::{Decoder, encode_frame};
 mod frame;
 #[cfg(test)]
 mod tests;
-
-// Bound queued receive data and both application/h2 send buffers per connection.
-const RECEIVE_WINDOW: u32 = 1024 * 1024;
-const MAX_WRITE_SIZE: usize = 16 * 1024;
-const SEND_BUFFER_SIZE: usize = 64 * 1024;
 
 #[derive(Clone)]
 pub struct Client {
@@ -66,22 +59,14 @@ impl Client {
 impl Transport for Client {
     async fn proxy_stream(&self, stream: AnyStream) -> io::Result<AnyStream> {
         let req = self.req()?;
-        let (client, connection) = h2::client::Builder::new()
-            .initial_connection_window_size(RECEIVE_WINDOW)
-            .initial_window_size(RECEIVE_WINDOW)
-            .max_send_buffer_size(SEND_BUFFER_SIZE)
-            .enable_push(false)
+        let (client, connection) = client_builder()
             .handshake(stream)
             .await
             .map_err(map_io_error)?;
         let mut client = client.ready().await.map_err(map_io_error)?;
         let (response, send) =
             client.send_request(req, false).map_err(map_io_error)?;
-        let connection_task = tokio::spawn(async move {
-            if let Err(e) = connection.await {
-                warn!("gRPC HTTP/2 connection error: {}", e);
-            }
-        });
+        let connection_task = ConnectionDriver::spawn(connection, None);
         Ok(AnyStream::new(GrpcStream::new(response, send, connection_task)))
     }
 }
@@ -90,7 +75,7 @@ pub struct GrpcStream {
     response: Option<ResponseFuture>,
     recv: Option<RecvStream>,
     send: SendStream<Bytes>,
-    connection_task: JoinHandle<()>,
+    _driver: ConnectionDriver,
     buffer: Bytes,
     decoder: Decoder,
     pending_send: Bytes,
@@ -113,24 +98,17 @@ impl Debug for GrpcStream {
     }
 }
 
-impl Drop for GrpcStream {
-    fn drop(&mut self) {
-        // This transport owns one connection; no detached task may outlive it.
-        self.connection_task.abort();
-    }
-}
-
 impl GrpcStream {
     fn new(
         response: ResponseFuture,
         send: SendStream<Bytes>,
-        connection_task: JoinHandle<()>,
+        connection_task: ConnectionDriver,
     ) -> Self {
         Self {
             response: Some(response),
             recv: None,
             send,
-            connection_task,
+            _driver: connection_task,
             buffer: Bytes::new(),
             decoder: Decoder::default(),
             pending_send: Bytes::new(),
@@ -186,8 +164,7 @@ impl GrpcStream {
             let consumed = before - self.buffer.len();
             let recv = self.recv.as_mut().expect("response resolved");
             if consumed > 0 {
-                recv.flow_control().release_capacity(consumed)
-                    .map_err(|e| Error::new(ErrorKind::ConnectionReset, e))?;
+                release_receive_capacity(recv, consumed)?;
             }
             result?;
             if buf.filled().len() > filled_before {
@@ -230,24 +207,9 @@ impl GrpcStream {
         cx: &mut Context<'_>,
         len: usize,
     ) -> Poll<io::Result<usize>> {
-        // h2 treats this as the total target, not an additional reservation.
-        self.send.reserve_capacity(len);
-        match self.send.poll_capacity(cx) {
-            Poll::Ready(Some(Ok(capacity))) => Poll::Ready(Ok(capacity)),
-            Poll::Ready(Some(Err(e))) => {
-                let error = self.close_write(Error::new(ErrorKind::BrokenPipe, e));
-                Poll::Ready(Err(error))
-            }
-            Poll::Ready(None) => {
-                let error = self.close_write(Error::new(
-                    ErrorKind::BrokenPipe, "gRPC send stream closed",
-                ));
-                Poll::Ready(Err(error))
-            }
-            Poll::Pending if self.send.capacity() > 0 => {
-                Poll::Ready(Ok(self.send.capacity()))
-            }
-            Poll::Pending => Poll::Pending,
+        match poll_send_capacity(&mut self.send, cx, len) {
+            Poll::Ready(Err(error)) => Poll::Ready(Err(self.close_write(error))),
+            result => result,
         }
     }
 

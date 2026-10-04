@@ -13,11 +13,9 @@ use std::{
 };
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
-    spawn,
 };
-use tracing::error;
 
-use super::Transport;
+use super::{Transport, h2_common::{ConnectionDriver, client_builder, poll_send_capacity, release_receive_capacity, shutdown_h2_send}};
 use crate::{common::errors::map_io_error, proxy::AnyStream};
 
 pub struct Client {
@@ -70,19 +68,15 @@ impl Client {
 impl Transport for Client {
     async fn proxy_stream(&self, stream: AnyStream) -> io::Result<AnyStream> {
         let (mut client, h2) =
-            h2::client::handshake(stream).await.map_err(map_io_error)?;
+            client_builder().handshake(stream).await.map_err(map_io_error)?;
         let req = self.req()?;
         let (resp, send_stream) =
             client.send_request(req, false).map_err(map_io_error)?;
-        spawn(async move {
-            if let Err(e) = h2.await {
-                error!("h2 error: {}", e);
-            }
-        });
+        let driver = ConnectionDriver::spawn(h2, None);
 
         let recv_stream = resp.await.map_err(map_io_error)?.into_body();
 
-        Ok(AnyStream::new(Http2Stream::new(recv_stream, send_stream)))
+        Ok(AnyStream::new(Http2Stream::new(recv_stream, send_stream, driver)))
     }
 }
 
@@ -91,6 +85,7 @@ pub struct Http2Stream {
     send: SendStream<Bytes>,
     buffer: Bytes,
     write_closed: bool,
+    _driver: ConnectionDriver,
 }
 
 impl crate::proxy::ProxyStream for Http2Stream {}
@@ -106,12 +101,13 @@ impl Debug for Http2Stream {
 }
 
 impl Http2Stream {
-    pub fn new(recv: RecvStream, send: SendStream<Bytes>) -> Self {
+    pub(crate) fn new(recv: RecvStream, send: SendStream<Bytes>, driver: ConnectionDriver) -> Self {
         Self {
             recv,
             send,
             buffer: Bytes::new(),
             write_closed: false,
+            _driver: driver,
         }
     }
 }
@@ -143,13 +139,7 @@ impl AsyncRead for Http2Stream {
                 // window open so the remote end can send the next frame
                 // immediately rather than stalling until the application reads
                 // the buffered bytes.
-                self.recv
-                    .flow_control()
-                    .release_capacity(data.len())
-                    .map_or_else(
-                        |e| Err(io::Error::new(io::ErrorKind::ConnectionReset, e)),
-                        |_| Ok(()),
-                    )
+                release_receive_capacity(&mut self.recv, data.len())
             }
             Some(Err(e)) => Err(map_io_error(e)),
             None => Ok(()),
@@ -168,17 +158,11 @@ impl AsyncWrite for Http2Stream {
                 io::ErrorKind::BrokenPipe, "H2 stream write side is closed",
             )));
         }
-        self.send.reserve_capacity(buf.len());
-        Poll::Ready(match ready!(self.send.poll_capacity(cx)) {
-            Some(Ok(to_write)) => self
-                .send
-                .send_data(Bytes::from(buf[..to_write].to_owned()), false)
-                .map_or_else(
-                    |e| Err(io::Error::new(io::ErrorKind::BrokenPipe, e)),
-                    |_| Ok(to_write),
-                ),
-            _ => Err(io::Error::new(io::ErrorKind::BrokenPipe, "broken pipe")),
-        })
+        if buf.is_empty() { return Poll::Ready(Ok(0)); }
+        let length = ready!(poll_send_capacity(&mut self.send, cx, buf.len()))?;
+        self.send.send_data(Bytes::copy_from_slice(&buf[..length]), false)
+            .map_err(map_io_error)?;
+        Poll::Ready(Ok(length))
     }
 
     fn poll_flush(
@@ -197,36 +181,6 @@ impl AsyncWrite for Http2Stream {
     }
 }
 
-pub(crate) fn shutdown_h2_send(
-    send: &mut SendStream<Bytes>,
-    write_closed: &mut bool,
-    cx: &mut Context<'_>,
-) -> Poll<io::Result<()>> {
-    if *write_closed {
-        return Poll::Ready(Ok(()));
-    }
-    send.reserve_capacity(0);
-    match send.poll_capacity(cx) {
-        Poll::Ready(None) => {
-            *write_closed = true;
-            Poll::Ready(Ok(()))
-        }
-        Poll::Ready(Some(Err(e))) => {
-            Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, e)))
-        }
-        // An empty END_STREAM frame needs no flow-control capacity.
-        Poll::Ready(Some(Ok(_))) | Poll::Pending => {
-            match send.send_data(Bytes::new(), true) {
-                Ok(()) => {
-                    *write_closed = true;
-                    Poll::Ready(Ok(()))
-                }
-                Err(e) => Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, e))),
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -235,6 +189,7 @@ mod tests {
     use std::time::Duration;
     use tokio::{
         io::{AsyncReadExt, duplex},
+        spawn,
         time::timeout,
     };
 
@@ -269,14 +224,14 @@ mod tests {
             });
             let (mut client, connection) =
                 h2::client::handshake(client).await.unwrap();
-            let client_task = spawn(async move { connection.await });
+            let driver = ConnectionDriver::spawn(connection, None);
             let request = Request::builder()
                 .uri("https://example.org/")
                 .body(())
                 .unwrap();
             let (response, send) = client.send_request(request, true).unwrap();
             let recv = response.await.unwrap().into_body();
-            let mut stream = Http2Stream::new(recv, send);
+            let mut stream = Http2Stream::new(recv, send, driver);
             assert_eq!(stream.read(&mut []).await.unwrap(), 0);
             let mut received = Vec::new();
             let mut chunk = [0; 137];
@@ -290,7 +245,6 @@ mod tests {
             assert_eq!(received, expected);
             drop(stream);
             drop(client);
-            client_task.abort();
             server_task.abort();
         })
         .await

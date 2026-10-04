@@ -1,7 +1,7 @@
 use std::{sync::{Arc, atomic::Ordering}, time::Duration};
 use http::{Method, Version};
 use tokio::{io::{AsyncReadExt, AsyncWriteExt}, time::timeout};
-use crate::config::internal::proxy::XHttpOpt;
+use crate::config::internal::proxy::{XHttpOpt, XHttpReuseSettings};
 use super::{Client, options, server::Server};
 
 async fn exchange(client: &Client, server: &Arc<Server>, h2: bool, bytes: &[u8]) {
@@ -61,6 +61,44 @@ async fn xhttp_parallel_packets_are_reassembled_in_sequence() {
             assert!(server.max_uploads.load(Ordering::Acquire) > 1);
             assert!(server.max_uploads.load(Ordering::Acquire) <= 16);
         }
+    }).await.unwrap();
+}
+
+#[tokio::test]
+async fn xhttp_h2_packet_content_length_matches_body() {
+    let payload = vec![7; 8193];
+    let server = Arc::new(Server::new(payload.len()));
+    let client = Client::new(&options("packet-up"), "example.test", false, false,
+        Some(&["h2".into()])).unwrap();
+    timeout(Duration::from_secs(5), exchange(&client, &server, true, &payload)).await.unwrap();
+    let captures = server.captures.lock();
+    let packets: Vec<_> = captures.iter().filter(|capture| capture.sequence.is_some()).collect();
+    assert!(!packets.is_empty());
+    for packet in packets {
+        assert_eq!(packet.headers["content-length"].to_str().unwrap().parse::<usize>().unwrap(), packet.body.len());
+    }
+}
+
+#[tokio::test]
+async fn xhttp_cancelling_streaming_upload_preserves_connection() {
+    timeout(Duration::from_secs(5), async {
+        let mut opts = options("stream-up");
+        opts.reuse_settings = Some(XHttpReuseSettings {
+            max_connections: Some("1".into()), max_concurrency: Some("1".into()),
+            ..Default::default()
+        });
+        let mut state = Server::new(8193);
+        state.options = opts.clone();
+        state.post_delay = Duration::from_millis(50);
+        state.delay_headers = true;
+        let server = Arc::new(state);
+        let client = Client::new(&opts, "example.test", false, false, Some(&["h2".into()])).unwrap();
+        let mut stream = client.connect_with_factories(server.factory(true), None).await.unwrap();
+        stream.write_all(b"cancelled").await.unwrap();
+        stream.flush().await.unwrap();
+        drop(stream);
+        exchange(&client, &server, true, &vec![7; 8193]).await;
+        assert_eq!(server.connections.load(Ordering::Acquire), 1);
     }).await.unwrap();
 }
 

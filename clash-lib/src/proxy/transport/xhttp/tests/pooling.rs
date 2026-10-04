@@ -9,6 +9,22 @@ fn configured(settings: XHttpReuseSettings) -> Client {
 }
 
 #[tokio::test]
+async fn xhttp_delayed_h2_settings_wake_capacity_waiter() {
+    timeout(Duration::from_secs(5), async {
+        for mode in ["packet-up", "stream-up", "stream-one"] {
+            let opts = options(mode);
+            let mut state = Server::new(1);
+            state.options = opts.clone();
+            state.h2_streams = 1;
+            state.h2_settings_delay = Duration::from_millis(50);
+            let server = Arc::new(state);
+            let client = Client::new(&opts, "example.test", false, false, Some(&["h2".into()])).unwrap();
+            round_trip(&client, &server, None).await;
+        }
+    }).await.unwrap();
+}
+
+#[tokio::test]
 async fn xhttp_h2_peer_stream_limits_leave_room_for_uploads() {
     timeout(Duration::from_secs(10), async {
         for limit in [1, 2, 4] {

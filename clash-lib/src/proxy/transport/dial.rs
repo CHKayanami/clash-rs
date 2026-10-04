@@ -1,4 +1,5 @@
 use std::{io, sync::Arc};
+use tracing::debug;
 use crate::{
     app::dns::ThreadSafeDNSResolver,
     proxy::{AnyStream, HandlerCommonOptions, utils::RemoteConnector},
@@ -64,7 +65,10 @@ impl TransportDialer<'_> {
                     #[cfg(target_os = "linux")]
                     mark,
                 ).await?;
-                match security { Some(security) => security.wrap(stream).await, None => Ok(stream) }
+                debug!(server, port, "XHTTP TCP connection established");
+                let stream = match security { Some(security) => security.wrap(stream).await?, None => stream };
+                debug!(server, port, "XHTTP transport security established");
+                Ok(stream)
             }) as DialFuture
         });
         Ok(ConnectionFactory { key, dial })

@@ -1,8 +1,8 @@
 //! DNS over HTTPS (RFC 8484) over HTTP/2.
 
-use crate::app::dns::query::QueryContext;
+use crate::{app::dns::query::QueryContext, proxy::transport::h2_common::{ConnectionState, drive_connection, release_receive_capacity, send_bytes}};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::AtomicUsize;
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -21,7 +21,7 @@ type H2Sender = SendRequest<Bytes>;
 struct H2Session {
     sender: Mutex<Option<H2Sender>>,
     driver: OwnedTask,
-    closed: Arc<AtomicBool>,
+    state: Arc<ConnectionState>,
 }
 
 /// Shared DoH (HTTP/2) client for one upstream.
@@ -94,8 +94,7 @@ impl DohClient {
                 .send_request(req, false)
                 .map_err(|e| anyhow::Error::new(e).context("DoH send_request"))?;
 
-            send_stream
-                .send_data(Bytes::from_owner(wire), true)
+            send_bytes(&mut send_stream, Bytes::from_owner(wire), true).await
                 .map_err(|e| anyhow::Error::new(e).context("DoH send_data"))?;
 
             let response = response_fut
@@ -110,7 +109,7 @@ impl DohClient {
                 let chunk = chunk
                     .map_err(|e| anyhow::Error::new(e).context("DoH body read"))?;
                 buf.push(&chunk)?;
-                body.flow_control().release_capacity(chunk.len()).map_err(
+                release_receive_capacity(&mut body, chunk.len()).map_err(
                     |error| anyhow::Error::new(error).context("DoH flow control"),
                 )?;
             }
@@ -124,7 +123,7 @@ impl DohClient {
                 self.dial.query_timeout
             )
         })?;
-        let connection_failed = session.closed.load(Ordering::Acquire)
+        let connection_failed = session.state.closed()
             || result.as_ref().err().is_some_and(|error| {
                 error.chain().any(|cause| {
                     cause
@@ -147,7 +146,7 @@ impl DohClient {
 
     async fn get_session(&self) -> anyhow::Result<Arc<H2Session>> {
         let session = self.session.acquire(|| self.dial_session()).await?;
-        if session.closed.load(Ordering::Acquire) {
+        if session.state.closed() {
             self.session
                 .close_if(&session, |session| async move {
                     session.sender.lock().take();
@@ -181,22 +180,17 @@ impl DohClient {
                 .map_err(|_| anyhow::anyhow!("DoH H2 handshake timed out"))?
                 .map_err(|e| anyhow::anyhow!("DoH H2 handshake error: {e}"))?;
 
-        let closed = Arc::new(AtomicBool::new(false));
-        let driver_closed = Arc::clone(&closed);
+        let state = Arc::new(ConnectionState::default());
+        let driver_state = Arc::clone(&state);
         let driver = OwnedTask::spawn(
-            async move {
-                if let Err(e) = connection.await {
-                    tracing::debug!("DoH H2 connection closed: {e}");
-                }
-                driver_closed.store(true, Ordering::Release);
-            },
+            drive_connection(connection, driver_state, None),
             Arc::clone(&self.active_tasks),
         );
 
         Ok(H2Session {
             sender: Mutex::new(Some(sender)),
             driver,
-            closed,
+            state,
         })
     }
 
@@ -267,12 +261,12 @@ mod tests {
             resolver: None,
         };
         let client = DohClient::new(dial).unwrap();
-        let closed = Arc::new(AtomicBool::new(false));
-        let flag = closed.clone();
+        let state = Arc::new(ConnectionState::default());
+        let flag = state.clone();
         let driver = OwnedTask::spawn(
             async move {
                 let _ = connection.await;
-                flag.store(true, Ordering::Release);
+                flag.close();
             },
             client.active_tasks.clone(),
         );
@@ -282,7 +276,7 @@ mod tests {
                 Ok(H2Session {
                     sender: Mutex::new(Some(sender)),
                     driver,
-                    closed,
+                    state,
                 })
             })
             .await

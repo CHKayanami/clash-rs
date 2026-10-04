@@ -2,7 +2,6 @@ use std::{future::Future, io, pin::Pin,
     sync::{Arc, atomic::{AtomicBool, Ordering}}, task::{Context, Poll}};
 use bytes::Bytes;
 use futures::{Stream, ready, task::AtomicWaker};
-use hyper::body::Body;
 use parking_lot::Mutex;
 use tokio::{io::{AsyncRead, AsyncWrite, ReadBuf}, sync::{mpsc, oneshot}};
 use tokio_util::{io::StreamReader, sync::PollSender};
@@ -53,15 +52,12 @@ impl Stream for Download {
                         Err(_) => return Poll::Ready(Some(Err(io::ErrorKind::BrokenPipe.into()))),
                     }
                 }
-                Self::Reading(body) => match ready!(Pin::new(&mut body.body).poll_frame(cx)) {
-                    Some(Ok(frame)) => {
-                        if let Ok(data) = frame.into_data() && !data.is_empty() {
-                            return Poll::Ready(Some(Ok(data)));
-                        }
-                    }
+                Self::Reading(body) => match ready!(body.poll_data(cx)) {
+                    Some(Ok(data)) if !data.is_empty() => return Poll::Ready(Some(Ok(data))),
+                    Some(Ok(_)) => {},
                     Some(Err(error)) => {
                         *self = Self::Done;
-                        return Poll::Ready(Some(Err(io::Error::other(error))));
+                        return Poll::Ready(Some(Err(error)));
                     }
                     None => { *self = Self::Done; return Poll::Ready(None); }
                 },

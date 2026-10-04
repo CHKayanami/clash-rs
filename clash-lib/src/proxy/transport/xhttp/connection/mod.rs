@@ -1,20 +1,25 @@
 mod capacity;
+mod http2;
+mod response_body;
 
-use std::{future::{Future, poll_fn}, io, pin::Pin, sync::Arc, time::Duration};
+use std::{future::poll_fn, io, sync::Arc, time::Duration};
+use bytes::Bytes;
 use futures::future::BoxFuture;
 use http::{Request, Response, Version};
-use http_body_util::BodyExt;
-use hyper::{body::Incoming, client::conn::{http1, http2}};
-use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
+use h2::client::SendRequest;
+use hyper::client::conn::http1;
+use hyper_util::rt::TokioIo;
 use parking_lot::Mutex;
+use tracing::debug;
 use tokio::{sync::{Mutex as AsyncMutex, OwnedSemaphorePermit, Semaphore}, task::JoinHandle, time::timeout};
 
-use crate::proxy::AnyStream;
+use crate::proxy::{AnyStream, transport::h2_common::{ConnectionDriver, client_builder}};
 use super::{body::RequestBody, options::{HttpVersion, Mode, Options}, range::invalid};
-use self::capacity::Capacity;
+use self::{capacity::Capacity, http2::{UploadTask, send as send_h2}, response_body::IncomingBody};
+pub(super) use self::response_body::ResponseBody;
 
 pub(super) const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
-pub(super) type ResponseFuture = BoxFuture<'static, io::Result<Response<Incoming>>>;
+type ResponseFuture = BoxFuture<'static, io::Result<Response<IncomingBody>>>;
 pub(crate) type DialFuture = BoxFuture<'static, io::Result<AnyStream>>;
 
 #[derive(Clone)]
@@ -34,34 +39,37 @@ impl Drop for Tasks {
 
 enum Sender {
     Http1(http1::SendRequest<RequestBody>),
-    Http2(http2::SendRequest<RequestBody>),
+    Http2(SendRequest<Bytes>),
 }
 impl Sender {
     async fn ready(&mut self) -> io::Result<()> {
         match self {
             Self::Http1(sender) => sender.ready().await.map_err(io::Error::other),
-            Self::Http2(sender) => sender.ready().await.map_err(io::Error::other),
+            Self::Http2(sender) => poll_fn(|cx| sender.poll_ready(cx)).await.map_err(io::Error::other),
         }
     }
-    fn send(&mut self, request: Request<RequestBody>) -> ResponseFuture {
+    fn send(&mut self, request: Request<RequestBody>) -> io::Result<(ResponseFuture, Option<UploadTask>)> {
         match self {
             Self::Http1(sender) => {
                 let reply = sender.send_request(request);
-                Box::pin(async move { reply.await.map_err(io::Error::other) })
+                Ok((Box::pin(async move {
+                    let response = reply.await.map_err(io::Error::other)?;
+                    let (parts, body) = response.into_parts();
+                    Ok(Response::from_parts(parts, IncomingBody::Http1(body)))
+                }), None))
             }
-            Self::Http2(sender) => {
-                let reply = sender.send_request(request);
-                Box::pin(async move { reply.await.map_err(io::Error::other) })
-            }
+            Self::Http2(sender) => send_h2(sender, request),
         }
     }
 }
+
+enum Driver { Http1 { _tasks: Tasks }, Http2 { _driver: ConnectionDriver } }
 
 struct Connection {
     sender: AsyncMutex<Sender>,
     capacity: Arc<Capacity>,
     version: Version,
-    _driver: Tasks,
+    _driver: Driver,
 }
 
 pub(super) struct ConnectionLease {
@@ -75,21 +83,26 @@ impl Drop for ConnectionLease {
 pub(super) struct Reply {
     future: ResponseFuture,
     lease: ConnectionLease,
-}
-
-pub(super) struct ResponseBody {
-    pub(super) body: Incoming,
-    _lease: ConnectionLease,
+    upload: Option<UploadTask>,
 }
 
 impl Reply {
-    pub(super) async fn body(self) -> io::Result<ResponseBody> {
-        let response = self.future.await?;
+    pub(super) async fn body(mut self) -> io::Result<ResponseBody> {
+        let response = if let Some(upload) = &mut self.upload {
+            tokio::select! {
+                response = &mut self.future => response?,
+                result = upload.result() => {
+                    result?;
+                    self.upload = None;
+                    self.future.await?
+                }
+            }
+        } else { self.future.await? };
         if response.status() != 200 {
             return Err(io::Error::new(io::ErrorKind::ConnectionRefused,
                 format!("XHTTP server returned {}", response.status())));
         }
-        Ok(ResponseBody { body: response.into_body(), _lease: self.lease })
+        Ok(ResponseBody { body: response.into_body(), _lease: self.lease, _upload: self.upload })
     }
 }
 
@@ -100,7 +113,7 @@ pub(super) async fn response(reply: Reply) -> io::Result<ResponseBody> {
 }
 
 pub(super) async fn drain(mut body: ResponseBody) -> io::Result<()> {
-    while let Some(frame) = body.body.frame().await { frame.map_err(io::Error::other)?; }
+    while let Some(data) = body.data().await { data?; }
     Ok(())
 }
 
@@ -142,36 +155,28 @@ impl HttpTransport {
         let stream = timeout(REQUEST_TIMEOUT, (self.factory.dial)()).await
             .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "XHTTP dial timed out"))??;
         let version = version(&self.options, &stream)?;
-        let capacity = Arc::new(Capacity::default());
-        let driver_capacity = capacity.clone();
-        let mut driver = Tasks::new();
-        let io = TokioIo::new(stream);
-        let sender = if version == Version::HTTP_2 {
-            let mut builder = http2::Builder::new(TokioExecutor::new());
-            builder.max_header_list_size(1_048_576);
-            builder.initial_max_send_streams(0);
-            builder.timer(TokioTimer::new()).keep_alive_interval(self.keep_alive)
-                .keep_alive_timeout(Duration::from_secs(10)).keep_alive_while_idle(true);
-            let (sender, mut connection) = builder.handshake(io).await.map_err(io::Error::other)?;
-            driver.push(tokio::spawn(async move {
-                let _ = poll_fn(|cx| {
-                    let result = Pin::new(&mut connection).poll(cx);
-                    driver_capacity.update(connection.current_max_send_streams());
-                    result
-                }).await;
-                driver_capacity.close();
-            }));
+        debug!(?version, "XHTTP starting HTTP connection");
+        let (sender, capacity, driver) = if version == Version::HTTP_2 {
+            let mut builder = client_builder();
+            builder.max_header_list_size(1_048_576).initial_max_send_streams(0);
+            let (sender, connection) = builder.handshake(stream).await.map_err(io::Error::other)?;
+            let driver = ConnectionDriver::spawn(connection, self.keep_alive);
+            let capacity = Arc::new(Capacity::new(driver.state()));
             timeout(REQUEST_TIMEOUT, capacity.initialized()).await
                 .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "XHTTP HTTP/2 settings timed out"))??;
-            Sender::Http2(sender)
+            debug!("XHTTP HTTP/2 stream capacity initialized");
+            (Sender::Http2(sender), capacity, Driver::Http2 { _driver: driver })
         } else {
-            let (sender, connection) = http1::handshake(io).await.map_err(io::Error::other)?;
+            let capacity = Arc::new(Capacity::default());
+            let driver_capacity = capacity.clone();
+            let (sender, connection) = http1::handshake(TokioIo::new(stream)).await.map_err(io::Error::other)?;
+            let mut driver = Tasks::new();
             driver.push(tokio::spawn(async move {
                 let _ = connection.await;
                 driver_capacity.close();
             }));
             capacity.update(1);
-            Sender::Http1(sender)
+            (Sender::Http1(sender), capacity, Driver::Http1 { _tasks: driver })
         };
         if !self.reserve(&capacity, version, download) { return Err(io::ErrorKind::BrokenPipe.into()); }
         let connection = Arc::new(Connection { sender: AsyncMutex::new(sender), capacity,
@@ -206,9 +211,9 @@ impl HttpTransport {
                 if attempt == 1 { return Err(error); }
                 continue;
             }
-            let future = sender.send(request.take().expect("undispatched XHTTP request")(lease.connection.version)?);
+            let (future, upload) = sender.send(request.take().expect("undispatched XHTTP request")(lease.connection.version)?)?;
             drop(sender);
-            return Ok(Reply { future, lease });
+            return Ok(Reply { future, lease, upload });
         }
         unreachable!()
     }

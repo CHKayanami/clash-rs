@@ -184,6 +184,52 @@ async fn xray_xhttp_interop() -> Result<()> {
     run_fixture("CLASH_XHTTP_INTEROP_MANIFEST").await
 }
 
+/// Supply an OutboundVless JSON object via CLASH_XHTTP_NODE_CONFIG.
+/// Credentials stay outside the repository and test output.
+#[tokio::test]
+#[ignore = "requires an explicitly supplied live VLESS XHTTP node"]
+async fn xhttp_live_node_https() -> Result<()> {
+    crate::tests::initialize();
+    let subscriber = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .finish();
+    let _subscriber = tracing::subscriber::set_default(subscriber);
+    let config = std::env::var("CLASH_XHTTP_NODE_CONFIG")
+        .context("set CLASH_XHTTP_NODE_CONFIG to an OutboundVless JSON object")?;
+    let opts: OutboundVless = serde_json::from_str(&config)
+        .context("invalid node configuration")?;
+    ensure!(opts.network.as_deref() == Some("xhttp"), "expected XHTTP transport");
+    ensure!(opts.xhttp_opts.is_some(), "set xhttp-opts explicitly");
+    let client = Handler::try_from(opts).context("build VLESS XHTTP handler")?;
+    let resolver: ThreadSafeDNSResolver = Arc::new(SystemResolver::new(false)?);
+    timeout(Duration::from_secs(30), async {
+        let sess = Session {
+            destination: "example.com:443".parse::<SocksAddr>()?,
+            ..Default::default()
+        };
+        let stream = client.connect_stream(&sess, resolver).await
+            .context("connect through VLESS XHTTP")?;
+        let tls = TransportLayer::Tls(TlsClient::new(
+            false, "example.com".to_owned(), None, None, None, None,
+        )?);
+        let mut stream = tls.wrap(stream).await
+            .context("verify destination TLS through proxy")?;
+        stream.write_all(
+            b"GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+        ).await.context("send HTTPS request")?;
+        stream.flush().await?;
+        let mut response = Vec::new();
+        stream.take(64 * 1024).read_to_end(&mut response).await
+            .context("read HTTPS response")?;
+        ensure!(response.starts_with(b"HTTP/1.1 200 ")
+            || response.starts_with(b"HTTP/1.0 200 "), "expected HTTP 200");
+        ensure!(response.windows(b"Example Domain".len())
+            .any(|window| window == b"Example Domain"), "unexpected response body");
+        println!("VLESS XHTTP: verified destination TLS and HTTPS response passed");
+        Ok::<(), anyhow::Error>(())
+    }).await.context("live node HTTPS probe timed out after 30 seconds")?
+}
+
 async fn run_fixture(manifest_env: &str) -> Result<()> {
     crate::tests::initialize();
     let path = std::env::var(manifest_env)

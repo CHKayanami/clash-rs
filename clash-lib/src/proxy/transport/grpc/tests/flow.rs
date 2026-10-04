@@ -1,4 +1,5 @@
 use super::*;
+use crate::proxy::transport::h2_common::RECEIVE_WINDOW;
 use futures::future::{pending, poll_fn};
 use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 use tokio::{io::{DuplexStream, ReadBuf}, sync::oneshot};
@@ -206,9 +207,7 @@ async fn reset_stream() -> (GrpcStream, ServerTask) {
         drop(request);
     });
     let (mut sender, connection) = h2::client::handshake(client_io).await.unwrap();
-    let connection_task = tokio::spawn(async move {
-        let _ = connection.await;
-    });
+    let connection_task = ConnectionDriver::spawn(connection, None);
     let (response, send) = sender.send_request(client().req().unwrap(), false).unwrap();
     drop(sender);
     let mut stream = GrpcStream::new(response, send, connection_task);

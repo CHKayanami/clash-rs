@@ -9,6 +9,7 @@ pub(crate) use shadow_tls::VerifiedStream;
 mod grpc;
 mod dial;
 mod h2;
+pub(crate) mod h2_common;
 mod http;
 pub mod reality;
 #[cfg(feature = "shadowsocks")]

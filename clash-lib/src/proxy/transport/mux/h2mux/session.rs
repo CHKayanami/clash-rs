@@ -1,16 +1,14 @@
 use bytes::Bytes;
 use futures::future::poll_fn;
-use h2::client::{Builder, SendRequest};
+use h2::client::SendRequest;
 use std::{
     io,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicUsize, Ordering},
     },
 };
-use tokio::task::AbortHandle;
 use tokio::sync::Mutex;
-use tracing::debug;
 
 use super::{
     padding::PaddingStream,
@@ -19,7 +17,7 @@ use super::{
 };
 use crate::{
     common::errors::map_io_error,
-    proxy::{AnyStream, transport::mux::MuxOption},
+    proxy::{AnyStream, transport::{h2_common::{ConnectionDriver, client_builder}, mux::MuxOption}},
     session::SocksAddr,
 };
 
@@ -36,8 +34,7 @@ impl Drop for StreamLease {
 pub struct H2MuxSession {
     send_request: Mutex<SendRequest<Bytes>>,
     active_streams: AtomicUsize,
-    closed: Arc<AtomicBool>,
-    driver: AbortHandle,
+    driver: ConnectionDriver,
     opt: MuxOption,
 }
 
@@ -53,42 +50,31 @@ impl H2MuxSession {
             carrier = AnyStream::new(PaddingStream::new(carrier));
         }
 
-        let mut builder = Builder::new();
+        let mut builder = client_builder();
         builder.initial_window_size(4 * 1024 * 1024);
         builder.initial_connection_window_size(16 * 1024 * 1024);
         builder.max_concurrent_streams(1024);
-        builder.enable_push(false);
 
         let (send_request, connection) =
             builder.handshake(carrier).await.map_err(map_io_error)?;
 
-        let closed = Arc::new(AtomicBool::new(false));
-        let closed_clone = closed.clone();
-
-        let driver = tokio::spawn(async move {
-            if let Err(e) = connection.await {
-                debug!("h2mux connection closed: {}", e);
-            }
-            closed_clone.store(true, Ordering::Release);
-        });
+        let driver = ConnectionDriver::spawn(connection, None);
 
         Ok(Arc::new(Self {
             send_request: Mutex::new(send_request),
             active_streams: AtomicUsize::new(0),
-            closed,
-            driver: driver.abort_handle(),
+            driver,
             opt,
         }))
     }
 
     /// Stop using a carrier immediately after a connection-level failure.
     pub fn retire(&self) {
-        self.closed.store(true, Ordering::Release);
         self.driver.abort();
     }
 
     pub fn is_closed(&self) -> bool {
-        self.closed.load(Ordering::Acquire)
+        self.driver.closed()
     }
 
     pub fn active_streams(&self) -> usize {
@@ -143,12 +129,6 @@ impl H2MuxSession {
         let stream = H2MuxStream::new(resp, send_stream, request_bytes, Some(lease));
 
         Ok(AnyStream::new(stream))
-    }
-}
-
-impl Drop for H2MuxSession {
-    fn drop(&mut self) {
-        self.driver.abort();
     }
 }
 

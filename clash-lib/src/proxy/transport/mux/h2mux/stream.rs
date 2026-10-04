@@ -11,7 +11,7 @@ use std::{
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use super::{protocol::parse_stream_response, session::StreamLease};
-use crate::proxy::{ProxyStream, transport::h2::shutdown_h2_send};
+use crate::proxy::{ProxyStream, transport::h2_common::{poll_send_capacity, release_receive_capacity, shutdown_h2_send}};
 
 pub struct H2MuxStream {
     recv: Option<RecvStream>,
@@ -98,16 +98,7 @@ impl H2MuxStream {
     }
 
     fn poll_send_capacity(&mut self, cx: &mut Context<'_>, len: usize) -> Poll<io::Result<usize>> {
-        self.send.reserve_capacity(len);
-        let capacity = self.send.capacity();
-        if capacity > 0 {
-            return Poll::Ready(Ok(capacity));
-        }
-        match ready!(self.send.poll_capacity(cx)) {
-            Some(Ok(capacity)) => Poll::Ready(Ok(capacity)),
-            Some(Err(e)) => Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, e))),
-            None => Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, "H2 stream closed"))),
-        }
+        poll_send_capacity(&mut self.send, cx, len)
     }
 
     fn read_status_response(&mut self) -> io::Result<()> {
@@ -130,8 +121,7 @@ impl H2MuxStream {
         let recv = self.recv.as_mut().expect("recv should be resolved");
         match Pin::new(&mut *recv).poll_data(cx) {
             Poll::Ready(Some(Ok(data))) => {
-                recv.flow_control().release_capacity(data.len())
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                release_receive_capacity(recv, data.len())?;
                 Poll::Ready(Ok(Some(data)))
             }
             Poll::Ready(Some(Err(e))) => {
