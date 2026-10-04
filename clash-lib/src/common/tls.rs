@@ -105,11 +105,9 @@ pub fn load_cert_and_key(
 
     let certs: Vec<CertificateDer<'static>> =
         rustls_pemfile::certs(&mut cert_pem.as_bytes())
-            .filter_map(|r| {
-                r.map_err(|e| warn!("failed to parse certificate entry: {e}"))
-                    .ok()
-            })
-            .collect();
+            .collect::<Result<_, _>>()
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput,
+                format!("failed to parse certificate chain: {e}")))?;
 
     if certs.is_empty() {
         return Err(std::io::Error::new(
@@ -174,23 +172,21 @@ pub fn build_tls_client_config(
 
 /// Parse a SHA-256 fingerprint value (hex, optionally colon-separated) into 32 bytes.
 pub(crate) fn parse_fingerprint_sha256(s: &str) -> Option<[u8; 32]> {
-    let hex: String = s
+    let mut hex = s
         .chars()
-        .filter(|c| *c != ':' && !c.is_whitespace())
-        .collect();
-    if hex.len() != 64 {
-        return None;
-    }
+        .filter(|c| *c != ':' && !c.is_whitespace());
     let mut out = [0u8; 32];
-    for (i, b) in out.iter_mut().enumerate() {
-        *b = u8::from_str_radix(hex.get(i * 2..i * 2 + 2)?, 16).ok()?;
+    for b in &mut out {
+        let high = hex.next()?.to_digit(16)?;
+        let low = hex.next()?.to_digit(16)?;
+        *b = ((high << 4) | low) as u8;
     }
-    Some(out)
+    hex.next().is_none().then_some(out)
 }
 
 #[derive(Debug)]
 pub struct DefaultTlsVerifier {
-    fingerprint: Option<String>,
+    fingerprint: Option<Result<[u8; 32], rustls::Error>>,
     skip: bool,
     pki: Arc<WebPkiServerVerifier>,
 }
@@ -198,7 +194,13 @@ pub struct DefaultTlsVerifier {
 impl DefaultTlsVerifier {
     pub fn new(fingerprint: Option<String>, skip: bool) -> Self {
         Self {
-            fingerprint,
+            fingerprint: fingerprint.map(|pin| {
+                parse_fingerprint_sha256(&pin).ok_or_else(|| {
+                    rustls::Error::General(
+                        "invalid certificate fingerprint (expected SHA-256 hex)".into(),
+                    )
+                })
+            }),
             skip,
             pki: WebPkiServerVerifier::builder(GLOBAL_ROOT_STORE.clone())
                 .build()
@@ -210,7 +212,57 @@ impl DefaultTlsVerifier {
 #[cfg(test)]
 mod fingerprint_tests {
     use super::*;
+    use ::boring::{hash::MessageDigest, pkey::PKey, sign::Signer};
+    use rcgen::{CertificateParams, KeyPair};
+    use rustls::{DigitallySignedStruct, internal::msgs::codec::Codec};
     use std::time::Duration;
+
+    #[test]
+    fn fingerprint_parser_preserves_formats_and_rejects_invalid_lengths() {
+        let hex = "ab".repeat(32);
+        let spaced = hex.as_bytes().chunks(2)
+            .map(|pair| String::from_utf8(pair.to_vec()).unwrap())
+            .collect::<Vec<_>>().join(":\u{2003}");
+        assert_eq!(parse_fingerprint_sha256(&spaced), Some([0xab; 32]));
+        for invalid in [hex[..63].to_owned(), format!("{hex}0"), "gg".repeat(32)] {
+            assert!(parse_fingerprint_sha256(&invalid).is_none());
+        }
+    }
+
+    #[test]
+    fn skip_cert_verify_still_verifies_handshake_signatures() {
+        crate::tests::initialize();
+        let key = KeyPair::generate().unwrap();
+        let params = CertificateParams::new(vec!["localhost".into()]).unwrap();
+        let cert = params.self_signed(&key).unwrap();
+        let pkey = PKey::private_key_from_pem(key.serialize_pem().as_bytes()).unwrap();
+        let message = b"TLS handshake transcript";
+        let mut signer = Signer::new(MessageDigest::sha256(), &pkey).unwrap();
+        let signature = signer.sign_oneshot_to_vec(message).unwrap();
+        // ECDSA_NISTP256_SHA256 followed by the TLS u16-length signature.
+        let mut wire = vec![0x04, 0x03];
+        wire.extend_from_slice(&(signature.len() as u16).to_be_bytes());
+        wire.extend_from_slice(&signature);
+        let signed = DigitallySignedStruct::read_bytes(&wire).unwrap();
+        let pin = encode_hex(&sha256(cert.der().as_ref()));
+        for fingerprint in [None, Some(pin)] {
+            let verifier = DefaultTlsVerifier::new(fingerprint, true);
+            assert!(verifier.verify_tls12_signature(message, cert.der(), &signed).is_ok());
+            assert!(verifier.verify_tls13_signature(message, cert.der(), &signed).is_ok());
+            assert!(verifier.verify_tls12_signature(b"tampered", cert.der(), &signed).is_err());
+            assert!(verifier.verify_tls13_signature(b"tampered", cert.der(), &signed).is_err());
+        }
+    }
+
+    #[test]
+    fn malformed_certificate_chain_is_rejected() {
+        let key = KeyPair::generate().unwrap();
+        let params = CertificateParams::new(vec!["localhost".into()]).unwrap();
+        let cert = params.self_signed(&key).unwrap();
+        let chain = format!("{}-----BEGIN CERTIFICATE-----\n!\n-----END CERTIFICATE-----\n", cert.pem());
+        let error = load_cert_and_key(&chain, &key.serialize_pem()).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
 
     #[test]
     fn certificate_pin_accepts_equivalent_hex_formats() {
@@ -250,14 +302,13 @@ impl ServerCertVerifier for DefaultTlsVerifier {
         now: rustls::pki_types::UnixTime,
     ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
         if let Some(ref fingerprint) = self.fingerprint {
-            let expected = parse_fingerprint_sha256(fingerprint).ok_or_else(|| {
-                rustls::Error::General("invalid certificate fingerprint (expected SHA-256 hex)".into())
-            })?;
+            let expected = fingerprint.as_ref().map_err(Clone::clone)?;
             let cert_hash = sha256(end_entity.as_ref());
             if expected.as_slice() != cert_hash.as_slice() {
                 let cert_hex = encode_hex(&cert_hash);
                 return Err(rustls::Error::General(format!(
-                    "cert hash mismatch: found: {cert_hex}\nexpected: {fingerprint}"
+                    "cert hash mismatch: found: {cert_hex}\nexpected: {}",
+                    encode_hex(expected)
                 )));
             }
             // An explicit certificate pin is the trust anchor, including for
@@ -285,9 +336,6 @@ impl ServerCertVerifier for DefaultTlsVerifier {
         cert: &rustls::pki_types::CertificateDer<'_>,
         dss: &rustls::DigitallySignedStruct,
     ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        if self.skip {
-            return Ok(rustls::client::danger::HandshakeSignatureValid::assertion());
-        }
         self.pki.verify_tls12_signature(message, cert, dss)
     }
 
@@ -297,9 +345,6 @@ impl ServerCertVerifier for DefaultTlsVerifier {
         cert: &rustls::pki_types::CertificateDer<'_>,
         dss: &rustls::DigitallySignedStruct,
     ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        if self.skip {
-            return Ok(rustls::client::danger::HandshakeSignatureValid::assertion());
-        }
         self.pki.verify_tls13_signature(message, cert, dss)
     }
 

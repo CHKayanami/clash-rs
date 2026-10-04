@@ -8,11 +8,12 @@ use std::io;
 use std::sync::LazyLock;
 
 use anyhow::Context as _;
-use super::{encode_alpn, parse_fingerprint_sha256};
+use super::{encode_alpn, load_cert_and_key, parse_fingerprint_sha256};
 use boring::error::ErrorStack;
+use boring::pkey::PKey;
 use boring::ssl::{
     CertificateCompressionAlgorithm, CertificateCompressor, ConnectConfiguration, SslConnector,
-    SslContextBuilder, SslFiletype, SslMethod, SslVerifyMode, SslVersion,
+    SslContextBuilder, SslMethod, SslVerifyMode, SslVersion,
 };
 use boring::x509::X509;
 use boring::x509::store::{X509Store, X509StoreBuilder};
@@ -73,9 +74,7 @@ pub fn root_store() -> Result<X509Store, ErrorStack> {
 fn build_root_store() -> Result<X509Store, ErrorStack> {
     let mut builder = X509StoreBuilder::new()?;
     for der in webpki_root_certs::TLS_SERVER_ROOT_CERTS {
-        if let Ok(cert) = X509::from_der(der.as_ref()) {
-            builder.add_cert(cert)?;
-        }
+        builder.add_cert(X509::from_der(der.as_ref())?)?;
     }
     Ok(builder.build())
 }
@@ -218,21 +217,20 @@ impl BoringTlsConnector {
             builder.set_custom_verify_callback(SslVerifyMode::PEER, pin_sha256_custom_verify(pin));
         }
 
-        // mTLS client certificates
-        if let (Some(cert), Some(key)) = (tls_cert, tls_key) {
-            if cert.contains("-----BEGIN") {
-                let x509 = X509::from_pem(cert.as_bytes())?;
-                builder.set_certificate(&x509)?;
-            } else {
-                builder.set_certificate_file(cert, SslFiletype::PEM)?;
+        match (tls_cert, tls_key) {
+            (Some(cert), Some(key)) => {
+                let (certs, key) = load_cert_and_key(cert, key)?;
+                let leaf = X509::from_der(certs[0].as_ref())?;
+                builder.set_certificate(&leaf)?;
+                for cert in &certs[1..] {
+                    builder.add_extra_chain_cert(X509::from_der(cert.as_ref())?)?;
+                }
+                let key = PKey::private_key_from_der(key.secret_der())?;
+                builder.set_private_key(&key)?;
+                builder.check_private_key()?;
             }
-
-            if key.contains("-----BEGIN") {
-                let pkey = boring::pkey::PKey::private_key_from_pem(key.as_bytes())?;
-                builder.set_private_key(&pkey)?;
-            } else {
-                builder.set_private_key_file(key, SslFiletype::PEM)?;
-            }
+            (None, None) => {}
+            _ => anyhow::bail!("tls-cert and tls-key must both be set or both omitted"),
         }
 
         if chrome {
@@ -281,8 +279,16 @@ impl BoringTlsConnector {
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
 
         tokio_boring::connect(cfg, domain, stream).await.map_err(|e| {
+            let kind = e.as_io_error().map_or_else(
+                || if e.code().is_none() {
+                    io::ErrorKind::InvalidInput
+                } else {
+                    io::ErrorKind::InvalidData
+                },
+                io::Error::kind,
+            );
             io::Error::new(
-                io::ErrorKind::ConnectionReset,
+                kind,
                 format!("BoringSSL TLS handshake with {domain} failed: {e}"),
             )
         })
@@ -290,12 +296,16 @@ impl BoringTlsConnector {
 }
 
 #[cfg(test)]
+#[path = "boring_mtls_tests.rs"]
+mod mtls_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use boring::ssl::{SslAcceptor, SslStream};
     use std::net::TcpListener;
     use std::thread;
-    use tokio::io::AsyncWriteExt;
+    use tokio::io::{duplex, AsyncWriteExt};
 
     fn generate_test_cert() -> (String, String, [u8; 32]) {
         let mut params = rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
@@ -405,5 +415,15 @@ mod tests {
         let tcp2 = tokio::net::TcpStream::connect(("127.0.0.1", port2)).await.unwrap();
         let res = connector2.connect("localhost", tcp2).await;
         assert!(res.is_err(), "Handshake must fail on cert pin mismatch");
+        assert_eq!(res.err().unwrap().kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn handshake_preserves_transport_error_kind() {
+        let connector = BoringTlsConnector::new(false, true, None, None, None, None).unwrap();
+        let (client, server) = duplex(1024);
+        drop(server);
+        let error = connector.connect("localhost", client).await.err().unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
     }
 }

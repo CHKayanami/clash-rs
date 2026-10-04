@@ -10,11 +10,10 @@ use super::{
     socks::outbound::Socks5Datagram,
     transport::{
         GrpcStream, Http2Stream, HttpStream, WebsocketConn, WebsocketEarlyDataConn,
-        XHttpStream,
+        XHttpStream, SplicableTlsStream,
         mux::h2mux::{
             datagram::H2MuxDatagram, padding::PaddingStream, stream::H2MuxStream,
         },
-        reality::SplicableTlsStream,
         uot::OutboundDatagramUotV2,
     },
     trojan::OutboundDatagramTrojan,
@@ -149,7 +148,7 @@ define_transport!($, AnyStream, DynamicStream, [ProxyStream + Sync], dispatch_st
     ShadowQuic(ShadowQuicStream),
     Tls(TlsStream<AnyStream>),
     BoringTls(SslStream<AnyStream>),
-    Reality(SplicableTlsStream),
+    SplicableTls(SplicableTlsStream),
     Websocket(WebsocketConn),
     WebsocketEarlyData(WebsocketEarlyDataConn),
     Http(HttpStream),

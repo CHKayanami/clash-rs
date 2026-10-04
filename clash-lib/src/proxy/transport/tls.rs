@@ -1,15 +1,19 @@
 use async_trait::async_trait;
 use serde::Serialize;
-use std::{io, sync::Arc};
+use std::{
+    io,
+    sync::{Arc, LazyLock, atomic::AtomicBool},
+};
 use tracing::warn;
 
-use super::Transport;
+use super::{SplicableTlsStream, Transport, VisionOptions};
 use crate::{
     common::{
         errors::map_io_error,
         tls::{
             boring::BoringTlsConnector,
             build_tls_client_config,
+            parse_fingerprint_sha256,
             validate_alpn,
             DefaultTlsVerifier,
         },
@@ -51,8 +55,22 @@ impl TryFrom<TLSOptions> for Client {
 
 #[derive(Clone)]
 enum ConnectorBackend {
-    Rustls(tokio_rustls::TlsConnector),
+    Rustls(Arc<RustlsBackend>),
     Boring(BoringTlsConnector),
+}
+
+struct RustlsBackend {
+    connector: tokio_rustls::TlsConnector,
+    spliced: SplicedConnector,
+}
+
+type SplicedConnector = LazyLock<io::Result<BoringTlsConnector>,
+    Box<dyn FnOnce() -> io::Result<BoringTlsConnector> + Send + Sync>>;
+
+impl RustlsBackend {
+    fn spliced_connector(&self) -> io::Result<&BoringTlsConnector> {
+        self.spliced.as_ref().map_err(|e| io::Error::new(e.kind(), e.to_string()))
+    }
 }
 
 #[derive(Clone)]
@@ -98,6 +116,10 @@ impl Client {
         if let Some(protocols) = &alpn {
             validate_alpn(protocols)?;
         }
+        if fingerprint.is_some_and(|pin| parse_fingerprint_sha256(pin).is_none()) {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput,
+                "invalid certificate fingerprint (expected SHA-256 hex)"));
+        }
         if let Some(fp) = client_fingerprint {
             let fp_lower = fp.trim().to_ascii_lowercase();
             if !fp_lower.is_empty() && fp_lower != "none" {
@@ -131,9 +153,8 @@ impl Client {
         ));
         let mut tls_config = build_tls_client_config(verifier, tls_cert, tls_key)?;
 
-        tls_config.alpn_protocols = alpn
-            .unwrap_or_default()
-            .into_iter()
+        tls_config.alpn_protocols = alpn.as_deref().unwrap_or_default()
+            .iter()
             .map(|x| x.as_bytes().to_vec())
             .collect();
 
@@ -142,57 +163,85 @@ impl Client {
         }
 
         let connector = tokio_rustls::TlsConnector::from(Arc::new(tls_config));
+        let fingerprint = fingerprint.map(ToOwned::to_owned);
+        let tls_cert = tls_cert.map(ToOwned::to_owned);
+        let tls_key = tls_key.map(ToOwned::to_owned);
+        // LazyLock consumes the initializer after use, releasing the copied
+        // PEM/config strings once the shared BoringSSL context exists.
+        let spliced: SplicedConnector = LazyLock::new(Box::new(move || {
+            BoringTlsConnector::new(
+                false, skip_cert_verify, fingerprint.as_deref(),
+                alpn.as_deref(), tls_cert.as_deref(), tls_key.as_deref(),
+            ).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))
+        }));
 
         Ok(Self {
             sni,
             expected_alpn,
-            backend: ConnectorBackend::Rustls(connector),
+            backend: ConnectorBackend::Rustls(Arc::new(RustlsBackend {
+                connector,
+                spliced,
+            })),
         })
+    }
+
+    fn check_alpn(&self, negotiated: Option<&[u8]>) -> io::Result<()> {
+        if let Some(expected) = &self.expected_alpn
+            && negotiated != Some(expected.as_bytes())
+        {
+            return Err(io::Error::other(format!(
+                "unexpected alpn protocol: {:?}, expected: {:?}",
+                negotiated, expected
+            )));
+        }
+        Ok(())
+    }
+
+    async fn connect_boring(
+        &self,
+        connector: &BoringTlsConnector,
+        stream: AnyStream,
+    ) -> io::Result<tokio_boring::SslStream<AnyStream>> {
+        let tls = connector.connect(&self.sni, stream).await?;
+        self.check_alpn(tls.ssl().selected_alpn_protocol())?;
+        Ok(tls)
     }
 }
 
 #[async_trait]
 impl Transport for Client {
+    async fn proxy_stream_spliced(
+        &self,
+        stream: AnyStream,
+    ) -> io::Result<(AnyStream, Option<VisionOptions>)> {
+        // Vision needs access to raw IO after CMD_PADDING_DIRECT, including
+        // when browser fingerprinting is disabled.
+        let connector = match &self.backend {
+            ConnectorBackend::Boring(connector) => connector,
+            ConnectorBackend::Rustls(backend) => backend.spliced_connector()?,
+        };
+        let tls = self.connect_boring(connector, stream).await?;
+        let read_flag = Arc::new(AtomicBool::new(false));
+        let write_flag = Arc::new(AtomicBool::new(false));
+        let tls = SplicableTlsStream::new(tls, read_flag.clone(), write_flag.clone());
+        Ok((AnyStream::new(tls), Some(VisionOptions { read_flag, write_flag })))
+    }
+
     async fn proxy_stream(&self, stream: AnyStream) -> io::Result<AnyStream> {
         match &self.backend {
-            ConnectorBackend::Rustls(connector) => {
+            ConnectorBackend::Rustls(backend) => {
                 let dns_name =
                     rustls::pki_types::ServerName::try_from(self.sni.as_str().to_owned())
                         .map_err(map_io_error)?;
 
-                let c = connector
+                let c = backend.connector
                     .connect(dns_name, stream)
-                    .await
-                    .and_then(|x| {
-                        if let Some(expected_alpn) = self.expected_alpn.as_ref()
-                            && x.get_ref().1.alpn_protocol()
-                                != Some(expected_alpn.as_bytes())
-                        {
-                            return Err(io::Error::other(format!(
-                                "unexpected alpn protocol: {:?}, expected: {:?}",
-                                x.get_ref().1.alpn_protocol(),
-                                expected_alpn
-                            )));
-                        }
-
-                        Ok(x)
-                    })?;
+                    .await?;
+                self.check_alpn(c.get_ref().1.alpn_protocol())?;
                 Ok(AnyStream::new(c))
             }
             ConnectorBackend::Boring(connector) => {
-                let s = connector.connect(&self.sni, stream).await.and_then(|x| {
-                    if let Some(expected_alpn) = self.expected_alpn.as_ref()
-                        && x.ssl().selected_alpn_protocol() != Some(expected_alpn.as_bytes())
-                    {
-                        return Err(io::Error::other(format!(
-                            "unexpected alpn protocol: {:?}, expected: {:?}",
-                            x.ssl().selected_alpn_protocol(),
-                            expected_alpn
-                        )));
-                    }
-
-                    Ok(x)
-                })?;
+                let s = self.connect_boring(connector, stream).await?;
                 Ok(AnyStream::new(s))
             }
         }
@@ -200,64 +249,5 @@ impl Transport for Client {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use boring::ssl::{SslAcceptor, SslMethod, SslStream};
-    use boring::x509::X509;
-    use std::net::TcpListener;
-    use std::thread;
-    use tokio::io::AsyncWriteExt;
-
-    fn generate_test_cert() -> (String, String) {
-        let mut params = rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
-        params.distinguished_name = rcgen::DistinguishedName::new();
-        let key = rcgen::KeyPair::generate().unwrap();
-        let cert = params.self_signed(&key).unwrap();
-        (cert.pem(), key.serialize_pem())
-    }
-
-    fn spawn_server(cert_pem: &str, key_pem: &str) -> (u16, thread::JoinHandle<Vec<u8>>) {
-        let mut acceptor = SslAcceptor::mozilla_intermediate(SslMethod::tls()).unwrap();
-        acceptor
-            .set_certificate(&X509::from_pem(cert_pem.as_bytes()).unwrap())
-            .unwrap();
-        let pkey = boring::pkey::PKey::private_key_from_pem(key_pem.as_bytes()).unwrap();
-        acceptor.set_private_key(&pkey).unwrap();
-        let acceptor = acceptor.build();
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let handle = thread::spawn(move || {
-            let (stream, _) = listener.accept().unwrap();
-            let mut tls: SslStream<_> = acceptor.accept(stream).unwrap();
-            use std::io::Read;
-            let mut buf = Vec::new();
-            tls.read_to_end(&mut buf).ok();
-            buf
-        });
-        (port, handle)
-    }
-
-    #[tokio::test]
-    async fn test_transport_tls_client_chrome_fingerprint() {
-        let (cert, key) = generate_test_cert();
-        let (port, server) = spawn_server(&cert, &key);
-
-        let opts = TLSOptions {
-            skip_cert_verify: true,
-            sni: "localhost".to_string(),
-            alpn: Some(vec!["h2".to_string(), "http/1.1".to_string()]),
-            client_fingerprint: Some("chrome".to_string()),
-            ..Default::default()
-        };
-
-        let client: Client = opts.try_into().unwrap();
-        let tcp = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
-        let mut stream = client.proxy_stream(AnyStream::Tcp(tcp)).await.unwrap();
-
-        stream.write_all(b"ping from chrome").await.unwrap();
-        stream.shutdown().await.unwrap();
-
-        let received = server.join().unwrap();
-        assert_eq!(received, b"ping from chrome");
-    }
-}
+#[path = "tls_tests.rs"]
+mod tests;

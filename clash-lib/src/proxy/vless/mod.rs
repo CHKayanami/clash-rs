@@ -19,6 +19,9 @@ use tracing::debug;
 pub mod encryption;
 mod stream;
 mod vision;
+
+#[cfg(test)]
+mod memory_tests;
 pub mod xudp;
 
 #[cfg(test)]
@@ -122,7 +125,10 @@ impl Handler {
     ) -> io::Result<AnyStream> {
         let is_udp = command == VLESS_COMMAND_UDP || command == VLESS_COMMAND_MUX;
 
-        let (s, vision_opts) = if !is_udp && self.encryption.is_none() {
+        let (s, vision_opts) = if !is_udp && self.encryption.is_none()
+            && self.opts.flow.as_deref() == Some("xtls-rprx-vision")
+            && self.opts.transport.is_none()
+        {
             if let Some(tls) = self.opts.tls.as_ref() {
                 tls.wrap_spliced(s).await?
             } else {

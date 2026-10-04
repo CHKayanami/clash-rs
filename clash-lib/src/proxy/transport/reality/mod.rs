@@ -4,7 +4,6 @@
 //! XTLS-Vision Direct splice capability.
 
 mod handshake;
-mod splice;
 
 use std::{
     io,
@@ -17,10 +16,9 @@ use std::{
 use async_trait::async_trait;
 
 use crate::{common::tls::validate_alpn,
-    proxy::{AnyStream, transport::Transport}};
+    proxy::{AnyStream, transport::{SplicableTlsStream, Transport, VisionOptions}}};
 
 use handshake::reality_connect;
-pub use splice::{SplicableTlsStream, VisionOptions};
 
 // ---------------------------------------------------------------------------
 // Configuration

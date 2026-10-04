@@ -381,10 +381,10 @@ impl VisionStream {
 
     /// Create a `VisionStream`.
     ///
-    /// Pass `Some(VisionOptions)` when the underlying transport is Reality, to
-    /// enable XTLS-splice: once `CMD_PADDING_DIRECT` is exchanged, the flags
-    /// inside `opts` signal `SplicableTlsStream` to bypass Reality TLS and
-    /// communicate over raw TCP.  Pass `None` for plain TLS (no splice).
+    /// Pass `Some(VisionOptions)` when the underlying transport supports
+    /// XTLS-splice: once `CMD_PADDING_DIRECT` is exchanged, the flags
+    /// inside `opts` signal `SplicableTlsStream` to bypass outer TLS and
+    /// communicate over raw TCP. Pass `None` when no splice is available.
     pub fn new(
         inner: AnyStream,
         uuid: &str,
@@ -419,11 +419,6 @@ impl VisionStream {
     fn build_vision_frame(&mut self, data: &[u8]) {
         let is_first_frame = self.user_uuid.is_some();
 
-        // Prepend UUID on the first frame (cleared immediately after).
-        if let Some(uuid) = self.user_uuid.take() {
-            self.write_buf.put_slice(&uuid);
-        }
-
         self.filter.filter_client_data(data);
 
         // Check if data is TLS ApplicationData: [0x17, 0x03] and len >= 3
@@ -451,9 +446,13 @@ impl VisionStream {
         } else {
             0
         };
-        let frame_len = 5 + data.len() + padding_len as usize;
+        let frame_len = 5 + data.len() + padding_len as usize
+            + if is_first_frame { 16 } else { 0 };
         self.write_buf.reserve(frame_len);
 
+        if let Some(uuid) = self.user_uuid.take() {
+            self.write_buf.put_slice(&uuid);
+        }
         self.write_buf.put_u8(command);
         self.write_buf.put_u16(content_len);
         self.write_buf.put_u16(padding_len);
@@ -467,6 +466,22 @@ impl VisionStream {
 
         if command == CMD_PADDING_DIRECT || command == CMD_PADDING_END {
             self.write_buf_app_data = true;
+        }
+    }
+
+    fn finish_pending_frame(&mut self) {
+        self.write_buf_consumed = 0;
+        if self.write_buf_app_data {
+            self.write_direct = true;
+            self.write_buf_app_data = false;
+            // Framing is finished permanently; an empty BytesMut still owns
+            // its allocation after advance(), so release the scratch buffer.
+            self.write_buf = BytesMut::new();
+            if self.filter.supports_xtls()
+                && let Some(flag) = &self.write_splice_flag
+            {
+                flag.store(true, Ordering::Release);
+            }
         }
     }
 }
@@ -494,6 +509,9 @@ impl AsyncRead for VisionStream {
                 data.advance(amt);
                 if data.is_empty() {
                     this.decoded.pop_front();
+                    if this.read_state.is_done() && this.decoded.is_empty() {
+                        this.decoded = VecDeque::new();
+                    }
                 }
                 return Poll::Ready(Ok(()));
             }
@@ -517,6 +535,11 @@ impl AsyncRead for VisionStream {
                 && let Some(flag) = &this.read_splice_flag
             {
                 flag.store(true, Ordering::Release);
+            }
+            if this.read_state.is_done() {
+                // Decoded Bytes keep any remaining payload alive until it is
+                // consumed; the raw scratch buffer is no longer needed.
+                this.raw = BytesMut::new();
             }
 
             if changed {
@@ -657,16 +680,7 @@ impl AsyncWrite for VisionStream {
         }
 
         // All framed bytes written.
-        this.write_buf_consumed = 0;
-        if this.write_buf_app_data {
-            this.write_direct = true;
-            this.write_buf_app_data = false;
-            if this.filter.supports_xtls() {
-                if let Some(flag) = &this.write_splice_flag {
-                    flag.store(true, Ordering::Release);
-                }
-            }
-        }
+        this.finish_pending_frame();
         Poll::Ready(Ok(consumed))
     }
 
@@ -696,16 +710,7 @@ impl AsyncWrite for VisionStream {
             };
             this.write_buf.advance(n);
         }
-        if this.write_buf_app_data {
-            this.write_direct = true;
-            this.write_buf_app_data = false;
-            if this.filter.supports_xtls() {
-                if let Some(flag) = &this.write_splice_flag {
-                    flag.store(true, Ordering::Release);
-                }
-            }
-        }
-        this.write_buf_consumed = 0;
+        this.finish_pending_frame();
 
         Pin::new(&mut this.inner).poll_flush(cx)
     }
