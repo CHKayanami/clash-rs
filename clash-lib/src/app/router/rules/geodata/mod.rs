@@ -44,7 +44,8 @@ fn parse(country_code: &str) -> Option<(bool, String, Box<dyn AttrMatcher>)> {
 pub struct GeoSiteMatcher {
     pub country_code: String,
     pub target: String,
-    pub matcher: SuccinctMatcherGroup,
+    // Keep the group indirect so it does not enlarge every Rule variant.
+    pub matcher: Box<SuccinctMatcherGroup>,
     /// number of domain entries backing `matcher`, for the `/rules` API
     count: usize,
 }
@@ -79,7 +80,7 @@ impl GeoSiteMatcher {
         Ok(Self {
             country_code,
             target,
-            matcher: matcher_group,
+            matcher: Box::new(matcher_group),
             count,
         })
     }
@@ -116,6 +117,7 @@ impl RuleMatcher for GeoSiteMatcher {
 
 #[cfg(test)]
 mod tests {
+    use std::mem::{align_of, size_of};
     use std::sync::Arc;
 
     use super::*;
@@ -123,6 +125,7 @@ mod tests {
         Error,
         app::{
             dns::SystemResolver,
+            router::{Rule, rules::composite::CompositeRule},
             router::rules::geodata::matcher_group::SuccinctMatcherGroup,
         },
         common::{
@@ -134,6 +137,15 @@ mod tests {
     };
 
     #[test]
+    fn test_geosite_matcher_layout() {
+        let size = 2 * size_of::<String>() + 2 * size_of::<usize>();
+        assert_eq!(size_of::<GeoSiteMatcher>(), size);
+        // Composite rules provide the existing largest payload. GEOSITE must
+        // not raise the enum's storage budget for ordinary/classical rules.
+        assert!(size_of::<Rule>() <= size_of::<CompositeRule>() + align_of::<Rule>());
+    }
+
+    #[test]
     fn test_geosite_session_matching() {
         use crate::{
             common::geodata::geodata_proto::{Domain, domain::Type},
@@ -141,11 +153,11 @@ mod tests {
         };
         let matcher = GeoSiteMatcher {
             country_code: "test".to_owned(), target: "DIRECT".to_owned(),
-            matcher: SuccinctMatcherGroup::try_new(vec![Domain {
+            matcher: Box::new(SuccinctMatcherGroup::try_new(vec![Domain {
                 r#type: Type::Regex as i32,
                 value: r"^UPPER\.example$".to_owned(),
                 ..Default::default()
-            }], false).unwrap(),
+            }], false).unwrap()),
             count: 1,
         };
         let mut session = Session {
