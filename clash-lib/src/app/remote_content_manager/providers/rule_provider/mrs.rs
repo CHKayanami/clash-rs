@@ -200,6 +200,9 @@ fn parse_ipcidr_payload<R: Read>(reader: &mut R) -> Result<RuleContent> {
         current_idx += to_read;
     }
 
+    let nets = cidr_trie.get_ip_cidrs();
+    drop(cidr_trie);
+    let cidr_trie = CidrTrie::from_nets(nets);
     debug!(
         "Successfully parsed and inserted CIDRs from {} ranges.",
         ranges_len
@@ -457,6 +460,24 @@ mod tests {
         consume_domain_budget(&mut budget, 1, 8).unwrap();
         assert!(consume_domain_budget(&mut budget, 2, 8).is_err());
         assert!(consume_domain_budget(&mut budget, usize::MAX, 8).is_err());
+    }
+
+    #[test]
+    fn test_ipcidr_payload_aggregation() {
+        let mut payload = vec![IP_CIDR_SET_VERSION];
+        payload.extend_from_slice(&3i64.to_be_bytes());
+        for (start, end) in [(0, 255), (256, 511), (1, 1)] {
+            for value in [start, end] {
+                let ip = Ipv4Addr::from(0x0a000000 + value);
+                payload.extend_from_slice(&ip.to_ipv6_mapped().octets());
+            }
+        }
+        let RuleContent::Ipcidr(trie) =
+            parse_ipcidr_payload(&mut Cursor::new(payload)).unwrap()
+        else { panic!("expected ipcidr content"); };
+        assert_eq!(trie.get_ip_cidrs(), vec!["10.0.0.0/23".parse().unwrap()]);
+        assert!(trie.contains("10.0.1.255".parse().unwrap()));
+        assert!(!trie.contains("10.0.2.0".parse().unwrap()));
     }
 
     #[test]

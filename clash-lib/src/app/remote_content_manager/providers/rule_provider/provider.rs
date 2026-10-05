@@ -548,11 +548,8 @@ fn make_domain_rules(rules: Vec<String>) -> DomainSet {
 }
 
 fn make_ip_cidr_rules(rules: Vec<String>) -> Result<CidrTrie, Error> {
-    let mut trie = CidrTrie::new();
-    for rule in rules {
-        trie.insert(&rule);
-    }
-    Ok(trie)
+    let nets = rules.iter().filter_map(|rule| rule.parse().ok()).collect();
+    Ok(CidrTrie::from_nets(nets))
 }
 
 fn make_classical_rules(
@@ -607,6 +604,7 @@ fn make_classical_rules(
 
 #[cfg(test)]
 mod tests {
+    use super::make_ip_cidr_rules;
     use crate::{
         app::remote_content_manager::providers::{
             MockProviderVehicle, Provider, ProviderVehicleType,
@@ -620,6 +618,14 @@ mod tests {
     };
     use std::{path::Path, sync::Arc, time::Duration};
     use tokio_test::assert_ok;
+
+    #[test]
+    fn test_ipcidr_rules_aggregation() {
+        let rules = ["10.0.0.0/24", "10.0.1.0/24", "10.0.0.1/32"]
+            .into_iter().map(String::from).collect();
+        let trie = make_ip_cidr_rules(rules).unwrap();
+        assert_eq!(trie.get_ip_cidrs(), vec!["10.0.0.0/23".parse().unwrap()]);
+    }
 
     #[tokio::test]
     async fn test_inline_provider() {
