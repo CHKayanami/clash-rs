@@ -1,5 +1,7 @@
 #[path = "wideindex.rs"]
 mod wideindex;
+#[path = "conversion.rs"]
+mod conversion;
 #[path = "keys.rs"]
 mod keys;
 

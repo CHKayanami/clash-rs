@@ -16,7 +16,7 @@ struct IndexNode {
     mask: u32,
 }
 
-fn table_size(children: usize) -> usize {
+pub(super) fn table_size(children: usize) -> usize {
     children.checked_mul(4).map(|count| count.div_ceil(3))
         .and_then(usize::checked_next_power_of_two)
         .expect("domain hash table size overflow")

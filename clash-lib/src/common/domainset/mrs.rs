@@ -3,86 +3,52 @@
 //! Temporary MRS decoding trie encoded in breadth-first order: each node stores its
 //! outgoing labels as zero bits followed by a one-bit terminator.
 
-use std::str;
+use std::ops::Range;
 
 #[cfg(test)]
 use std::collections::VecDeque;
-
 #[cfg(test)]
 use crate::common::trie::StringTrie;
-use super::compact::{DomainKey, EXACT, SUFFIX};
-use crate::common::domain::has_valid_domain_labels;
+
+const DEAD: u32 = 1 << 31;
 
 #[derive(Default)]
 pub(crate) struct MrsDomainTrie {
     pub(super) leaves: Box<[u64]>,
+    #[cfg(test)]
     pub(super) label_bit_map: Box<[u64]>,
     pub(super) labels: Box<[u8]>,
-    ranks: Box<[i32]>,
-    selects: Box<[i32]>,
+    starts: Box<[u32]>,
+    node_capacity: usize,
+    source_capacity: usize,
 }
 
 impl MrsDomainTrie {
-    /// Consume validated MRS data; release the byte trie before freezing labels.
-    pub(super) fn into_domain_keys(self) -> Result<Vec<DomainKey>, &'static str> {
-        let mut keys = Vec::with_capacity(self.len());
-        if self.label_bit_map.is_empty() { return Ok(keys); }
-        let mut path = Vec::new();
-        let mut pending = vec![(0usize, self.node_start(0), 0usize)];
-        while let Some((node, edge, depth)) = pending.pop() {
-            path.truncate(depth);
-            if edge == self.node_start(node) && get_bit(&self.leaves, node as isize) {
-                let reversed = str::from_utf8(&path)
-                    .map_err(|_| "invalid UTF-8 domain in MRS")?;
-                let mut domain = String::with_capacity(reversed.len());
-                domain.extend(reversed.chars().rev());
-                domain.make_ascii_lowercase();
-                let flags = if domain == "+" {
-                    domain.clear();
-                    SUFFIX
-                } else if domain.starts_with("+.") {
-                    drop(domain.drain(..2));
-                    SUFFIX
-                } else {
-                    EXACT
-                };
-                if !(domain.is_empty() && flags == SUFFIX)
-                    && !has_valid_domain_labels(&domain)
-                {
-                    return Err("invalid domain in MRS");
-                }
-                keys.push(DomainKey { domain, flags });
-            }
-            if get_bit(&self.label_bit_map, edge as isize) { continue; }
-            pending.push((node, edge + 1, depth));
-            path.push(self.labels[edge - node]);
-            let child = edge - node + 1;
-            pending.push((child, self.node_start(child), depth + 1));
-        }
-        Ok(keys)
-    }
-
-    fn node_start(&self, node: usize) -> usize {
-        if node == 0 {
-            0
-        } else {
-            select_ith_one(&self.label_bit_map, &self.ranks, &self.selects, node - 1) + 1
-        }
-    }
-
-    /// Number of keys in the set. Each key terminates at exactly one node, and
-    /// each such node sets one bit in `leaves`.
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.leaves.iter().map(|x| x.count_ones() as usize).sum()
     }
-}
 
-impl MrsDomainTrie {
-    /// Validate the LOUDS tree before converting its domain rules.
+    pub(super) fn children(&self, node: usize) -> Range<usize> {
+        (self.starts[node] & !DEAD) as usize..(self.starts[node + 1] & !DEAD) as usize
+    }
+
+    pub(super) fn live(&self, node: usize) -> bool {
+        self.starts.get(node).is_some_and(|start| start & DEAD == 0)
+    }
+
+    pub(super) fn capacities(&self) -> (usize, usize) {
+        (self.node_capacity, self.source_capacity)
+    }
+
+    pub(super) fn terminal(&self, node: usize) -> bool {
+        get_bit(&self.leaves, node as isize)
+    }
+
+    /// Validate topology and child order while constructing direct edge ranges.
+    /// The high bit marks subtrees without terminals; edge offsets fit 31 bits.
     pub(crate) fn from_mrs_parts(
-        leaves: Vec<u64>,
-        label_bit_map: Vec<u64>,
-        labels: Vec<u8>,
+        leaves: Vec<u64>, label_bit_map: Vec<u64>, labels: Vec<u8>,
     ) -> Result<Self, &'static str> {
         if leaves.is_empty() && label_bit_map.is_empty() && labels.is_empty() {
             return Ok(Self::default());
@@ -92,28 +58,24 @@ impl MrsDomainTrie {
         if bits > i32::MAX as usize || label_bit_map.len() != bits.div_ceil(64) {
             return Err("invalid label bitmap length");
         }
-        if leaves.len() > nodes.div_ceil(64) {
-            return Err("invalid leaves length");
-        }
+        if leaves.len() > nodes.div_ceil(64) { return Err("invalid leaves length"); }
         for bit in bits..label_bit_map.len() * 64 {
             if get_bit(&label_bit_map, bit as isize) {
                 return Err("nonzero label bitmap padding");
             }
         }
         for bit in nodes..leaves.len() * 64 {
-            if get_bit(&leaves, bit as isize) {
-                return Err("leaf outside tree");
-            }
+            if get_bit(&leaves, bit as isize) { return Err("leaf outside tree"); }
         }
-        let mut node = 0;
+        let mut starts = Vec::with_capacity(nodes + 1);
+        starts.push(0);
         let mut edges = 0;
         let mut previous = None;
         for bit in 0..bits {
             if get_bit(&label_bit_map, bit as isize) {
-                node += 1;
-                if node < nodes && edges < node {
-                    return Err("unreachable node");
-                }
+                let node = starts.len();
+                if node < nodes && edges < node { return Err("unreachable node"); }
+                starts.push(edges as u32);
                 previous = None;
             } else {
                 let label = *labels.get(edges).ok_or("too many edges")?;
@@ -124,59 +86,59 @@ impl MrsDomainTrie {
                 edges += 1;
             }
         }
-        if node != nodes || edges != labels.len()
+        if starts.len() != nodes + 1 || edges != labels.len()
             || !get_bit(&label_bit_map, (bits - 1) as isize)
-        {
-            return Err("invalid tree topology");
-        }
-        Ok(Self::from_parts(leaves, label_bit_map, labels))
-    }
-
-    fn from_parts(
-        leaves: Vec<u64>,
-        label_bit_map: Vec<u64>,
-        labels: Vec<u8>,
-    ) -> Self {
-        let (ranks, selects) = Self::compute_ranks_and_selects(&label_bit_map);
-        Self {
+        { return Err("invalid tree topology"); }
+        let (node_capacity, source_capacity) = mark_live_nodes(&leaves, &labels, &mut starts);
+        Ok(Self {
             leaves: leaves.into_boxed_slice(),
+            #[cfg(test)]
             label_bit_map: label_bit_map.into_boxed_slice(),
-            labels: labels.into_boxed_slice(),
-            ranks,
-            selects,
-        }
+            labels: labels.into_boxed_slice(), starts: starts.into_boxed_slice(),
+            node_capacity, source_capacity,
+        })
     }
 
-    fn compute_ranks_and_selects(label_bit_map: &[u64]) -> (Box<[i32]>, Box<[i32]>) {
-        let mut ranks = Vec::with_capacity(label_bit_map.len() + 1);
-        ranks.push(0);
+    #[cfg(test)]
+    fn from_parts(leaves: Vec<u64>, bitmap: Vec<u64>, labels: Vec<u8>) -> Self {
+        Self::from_mrs_parts(leaves, bitmap, labels).unwrap()
+    }
+}
 
-        let mut total_ones: usize = 0;
-        for &word in label_bit_map {
-            let n = word.count_ones() as usize;
-            total_ones += n;
-            ranks.push(total_ones as i32);
-        }
-
-        let select_cap = (total_ones + 63) / 64;
-        let mut selects = Vec::with_capacity(select_cap);
-
-        let mut ones_count: usize = 0;
-        for (word_idx, &word) in label_bit_map.iter().enumerate() {
-            let mut w = word;
-            let base_bit = (word_idx * 64) as i32;
-            while w != 0 {
-                let bit_idx = w.trailing_zeros() as i32;
-                if ones_count & 63 == 0 {
-                    selects.push(base_bit + bit_idx);
+// The validated BFS topology places every child after its parent. Walk backward
+// to prune dead subtrees and count label endpoints before case-folding merges.
+fn mark_live_nodes(leaves: &[u64], labels: &[u8], starts: &mut [u32]) -> (usize, usize) {
+    let nodes = labels.len() + 1;
+    let mut endpoints = 0usize;
+    let mut sources = 1usize;
+    for node in (0..nodes).rev() {
+        let start = (starts[node] & !DEAD) as usize;
+        let end = (starts[node + 1] & !DEAD) as usize;
+        let terminal = get_bit(&leaves, node as isize);
+        let mut live = terminal;
+        let mut dot = false;
+        for edge in start..end {
+            let child = edge + 1;
+            if starts[child] & DEAD != 0 { continue; }
+            live = true;
+            dot |= labels[edge] == b'.';
+            // A terminal single '+' segment is a flag on its parent,
+            // unless it also has ordinary rules below another dot.
+            if labels[edge] == b'+' && get_bit(&leaves, child as isize)
+                && (node == 0 || labels[node - 1] == b'.')
+            {
+                let first = (starts[child] & !DEAD) as usize;
+                let last = (starts[child + 1] & !DEAD) as usize;
+                if !(first..last).any(|e| labels[e] == b'.' && starts[e + 1] & DEAD == 0) {
+                    endpoints -= 1;
                 }
-                ones_count += 1;
-                w &= w - 1; // Clear lowest set bit
             }
         }
-
-        (ranks.into_boxed_slice(), selects.into_boxed_slice())
+        if !live { starts[node] |= DEAD; }
+        if dot { sources += 1; }
+        if node != 0 && (dot || terminal) { endpoints += 1; }
     }
+    (endpoints + 2, sources)
 }
 
 #[cfg(test)]
@@ -278,30 +240,4 @@ fn set_bit(bm: &mut Vec<u64>, i: usize, v: bool) {
     } else {
         bm[word_idx] &= !(1u64 << (i & 63));
     }
-}
-
-#[inline]
-fn select_ith_one(bm: &[u64], ranks: &[i32], selects: &[i32], i: usize) -> usize {
-    let base = (selects[i >> 6] & !63) as usize >> 6;
-    let mut find_ith_one = i as isize - ranks[base] as isize;
-
-    for (word_idx, &w) in bm.iter().enumerate().skip(base) {
-        let ones = w.count_ones() as isize;
-        if find_ith_one >= ones {
-            find_ith_one -= ones;
-            continue;
-        }
-
-        let mut w = w;
-        while w > 0 {
-            let bit_idx = w.trailing_zeros() as usize;
-            if find_ith_one == 0 {
-                return (word_idx << 6) + bit_idx;
-            }
-            find_ith_one -= 1;
-            w &= w - 1; // Clear lowest set bit
-        }
-    }
-
-    unreachable!("invalid data");
 }

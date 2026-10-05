@@ -251,7 +251,7 @@ fn test_mrs_conversion_rejects_invalid_domain_bytes() {
 }
 
 #[test]
-fn test_rank_select_boundaries() {
+fn test_mrs_large_branch_boundaries() {
     let rules: Vec<_> = (0..256)
         .map(|i| format!("host{i}.example.com")).collect();
     let refs: Vec<_> = rules.iter().map(String::as_str).collect();
@@ -298,4 +298,68 @@ fn test_dump(data_src: &Vec<String>, set: &DomainSet) {
     data_set.sort();
 
     assert_eq!(data_src, &data_set);
+}
+
+#[test]
+fn test_mrs_case_folding_merges_subtrees_and_terminals() {
+    // Root has 'X' and 'x'; each has a dot followed by 'a' or 'b'.
+    // Both root children are also exact terminals, and must become one node.
+    let set = DomainSet::from_mrs_parts(
+        vec![(1 << 1) | (1 << 2) | (1 << 5) | (1 << 6)],
+        vec![0x1d54], b"Xx..ab".to_vec(),
+    ).unwrap();
+    assert_eq!(set.len(), 3);
+    for query in ["x", "X", "a.x", "A.X", "b.x", "B.X"] {
+        assert!(set.has(query), "{query}");
+    }
+    assert!(!set.has("c.x"));
+    test_dump(&vec!["a.x".into(), "b.x".into(), "x".into()], &set);
+}
+
+#[test]
+fn test_mrs_ignores_dead_branches() {
+    // The invalid UTF-8 edge has no terminal and must not become a rule.
+    let set = DomainSet::from_mrs_parts(vec![2], vec![28], vec![b'a', 0xff]).unwrap();
+    assert_eq!(set.len(), 1);
+    assert!(set.has("a"));
+    let empty = DomainSet::from_mrs_parts(vec![], vec![6], vec![0xff]).unwrap();
+    assert!(empty.is_empty());
+}
+
+#[test]
+fn test_mrs_terminal_inside_label_and_unicode_reversal() {
+    let patterns = ["é界.x", "é界long.x", "+.é界.x", "literal+.x", "a.+.x"];
+    let mut trie = StringTrie::new();
+    let mut builder = DomainSetBuilder::new();
+    for pattern in patterns {
+        assert!(trie.insert(pattern, Arc::new(())));
+        assert!(builder.insert(pattern));
+    }
+    let encoded = MrsDomainTrie::from(trie);
+    let converted = DomainSet::from_mrs_parts(
+        encoded.leaves.to_vec(), encoded.label_bit_map.to_vec(), encoded.labels.to_vec(),
+    ).unwrap();
+    let direct = builder.build();
+    assert_eq!(converted.len(), direct.len());
+    for query in ["é界.x", "é界long.x", "a.é界.x", "literal+.x", "a.+.x", "界é.x", "+.x"] {
+        assert_eq!(converted.has(query), direct.has(query), "{query}");
+    }
+}
+
+#[test]
+fn test_mrs_label_arena_handles_oversized_chunks() {
+    let label = format!("{}é", "a".repeat(70_000));
+    let suffix = format!("+.{label}.x");
+    let mut trie = StringTrie::new();
+    assert!(trie.insert(&suffix, Arc::new(())));
+    assert!(trie.insert("other.x", Arc::new(())));
+    let encoded = MrsDomainTrie::from(trie);
+    let converted = DomainSet::from_mrs_parts(
+        encoded.leaves.to_vec(), encoded.label_bit_map.to_vec(), encoded.labels.to_vec(),
+    ).unwrap();
+    assert_eq!(converted.len(), 3);
+    assert!(converted.has(&format!("{label}.x")));
+    assert!(converted.has(&format!("child.{label}.x")));
+    assert!(converted.has("other.x"));
+    assert!(!converted.has("unknown.x"));
 }

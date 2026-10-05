@@ -41,7 +41,7 @@ impl Path {
     }
 }
 
-fn compare_labels(a: &[u8], b: &[u8]) -> Ordering {
+pub(super) fn compare_labels(a: &[u8], b: &[u8]) -> Ordering {
     match (a == b"*", b == b"*") {
         (true, false) => Ordering::Less,
         (false, true) => Ordering::Greater,

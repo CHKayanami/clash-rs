@@ -37,8 +37,7 @@ impl DomainSet {
         leaves: Vec<u64>, bitmap: Vec<u64>, labels: Vec<u8>,
     ) -> Result<Self, &'static str> {
         let set = MrsDomainTrie::from_mrs_parts(leaves, bitmap, labels)?;
-        let keys = set.into_domain_keys()?;
-        Ok(Self { storage: CompactDomainSet::from_keys(keys) })
+        Ok(Self { storage: CompactDomainSet::from_mrs(set)? })
     }
 
     #[cfg(test)]
