@@ -5,55 +5,30 @@ use aya_ebpf::btf_maps::{
 use aya_ebpf::macros::btf_map;
 use clash_ebpf_common::{
     DaeEvent, DaeParam, DirectTrackEntry, PIDName, ParseTransportCtx, RedirectEntry,
-    RedirectTuple, STATIC_BYPASS_DST_MAX_ENTRIES,
-    STATIC_BYPASS_DST_PORT_MAX_ENTRIES, STATIC_BYPASS_SRC_MAX_ENTRIES,
-    STATIC_BYPASS_SRC_PORT_MAX_ENTRIES,
+    RedirectTuple,
 };
 
 #[btf_map]
 pub static DAE_PARAM: Array<DaeParam, 1> = Array::new();
 
+// Userspace overrides these minimal capacities before creating the maps.
 #[btf_map]
-pub static BYPASS_SRC_PORTS: HashMap<
-    u16,
-    u8,
-    { STATIC_BYPASS_SRC_PORT_MAX_ENTRIES as usize },
-> = HashMap::new();
+pub static BYPASS_SRC_PORTS: HashMap<u16, u8, 1> = HashMap::new();
 
 #[btf_map]
-pub static BYPASS_DST_PORTS: HashMap<
-    u16,
-    u8,
-    { STATIC_BYPASS_DST_PORT_MAX_ENTRIES as usize },
-> = HashMap::new();
+pub static BYPASS_DST_PORTS: HashMap<u16, u8, 1> = HashMap::new();
 
 #[btf_map]
-pub static BYPASS_SRC_IPS: LpmTrie<
-    u32,
-    u8,
-    { STATIC_BYPASS_SRC_MAX_ENTRIES as usize },
-> = LpmTrie::new();
+pub static BYPASS_SRC_IPS: LpmTrie<u32, u8, 1> = LpmTrie::new();
 
 #[btf_map]
-pub static BYPASS_SRC_IP6S: LpmTrie<
-    [u8; 16],
-    u8,
-    { STATIC_BYPASS_SRC_MAX_ENTRIES as usize },
-> = LpmTrie::new();
+pub static BYPASS_SRC_IP6S: LpmTrie<[u8; 16], u8, 1> = LpmTrie::new();
 
 #[btf_map]
-pub static BYPASS_DST_IPS: LpmTrie<
-    u32,
-    u8,
-    { STATIC_BYPASS_DST_MAX_ENTRIES as usize },
-> = LpmTrie::new();
+pub static BYPASS_DST_IPS: LpmTrie<u32, u8, 1> = LpmTrie::new();
 
 #[btf_map]
-pub static BYPASS_DST_IP6S: LpmTrie<
-    [u8; 16],
-    u8,
-    { STATIC_BYPASS_DST_MAX_ENTRIES as usize },
-> = LpmTrie::new();
+pub static BYPASS_DST_IP6S: LpmTrie<[u8; 16], u8, 1> = LpmTrie::new();
 
 #[btf_map]
 pub static PROXY_SRC_PORTS: HashMap<u16, u8, 256> = HashMap::new();

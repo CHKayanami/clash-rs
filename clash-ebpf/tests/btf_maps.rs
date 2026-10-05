@@ -6,9 +6,7 @@ use aya::programs::Program;
 use aya_obj::{Map, Object, generated::bpf_map_type::*};
 use clash_ebpf_common::{
     DaeParam, DirectTrackEntry, PIDName, ParseTransportCtx, RedirectEntry,
-    RedirectTuple, STATIC_BYPASS_DST_MAX_ENTRIES,
-    STATIC_BYPASS_DST_PORT_MAX_ENTRIES, STATIC_BYPASS_SRC_MAX_ENTRIES,
-    STATIC_BYPASS_SRC_PORT_MAX_ENTRIES,
+    RedirectTuple,
 };
 use std::mem::size_of;
 
@@ -36,42 +34,42 @@ fn btf_map_definitions_match_userspace_abi() {
         (
             "BYPASS_SRC_PORTS",
             BPF_MAP_TYPE_HASH,
-            STATIC_BYPASS_SRC_PORT_MAX_ENTRIES,
+            1,
             2,
             Some(1),
         ),
         (
             "BYPASS_DST_PORTS",
             BPF_MAP_TYPE_HASH,
-            STATIC_BYPASS_DST_PORT_MAX_ENTRIES,
+            1,
             2,
             Some(1),
         ),
         (
             "BYPASS_SRC_IPS",
             BPF_MAP_TYPE_LPM_TRIE,
-            STATIC_BYPASS_SRC_MAX_ENTRIES,
+            1,
             8,
             Some(1),
         ),
         (
             "BYPASS_SRC_IP6S",
             BPF_MAP_TYPE_LPM_TRIE,
-            STATIC_BYPASS_SRC_MAX_ENTRIES,
+            1,
             20,
             Some(1),
         ),
         (
             "BYPASS_DST_IPS",
             BPF_MAP_TYPE_LPM_TRIE,
-            STATIC_BYPASS_DST_MAX_ENTRIES,
+            1,
             8,
             Some(1),
         ),
         (
             "BYPASS_DST_IP6S",
             BPF_MAP_TYPE_LPM_TRIE,
-            STATIC_BYPASS_DST_MAX_ENTRIES,
+            1,
             20,
             Some(1),
         ),

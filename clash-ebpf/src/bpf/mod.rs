@@ -15,18 +15,26 @@ use aya::programs::{
     CgroupAttachMode, CgroupSock, CgroupSockAddr, SchedClassifier, TcAttachType,
 };
 use aya::{Ebpf, EbpfLoader};
-use std::collections::HashSet;
+
 use std::fs::File;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::os::fd::{AsFd, AsRawFd, RawFd};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU8, Ordering};
 use tracing::{debug, error, info, warn};
 
+mod static_bypass;
+use static_bypass::StaticBypass;
+
 /// Keep inactive process tracking maps minimal; their BPF references still
 /// require a real map, so zero capacity is not valid for a hash map.
-fn load_object(obj_bytes: &[u8], proxy_local: bool) -> Result<Ebpf, String> {
+fn load_object(
+    obj_bytes: &[u8], proxy_local: bool, static_bypass: &StaticBypass,
+) -> Result<Ebpf, String> {
     let mut loader = EbpfLoader::new();
+    for (name, capacity) in static_bypass.map_capacities()? {
+        loader.map_max_entries(name, capacity);
+    }
     if !proxy_local {
         loader.map_max_entries("COOKIE_PID_MAP", 1);
     }
@@ -39,84 +47,6 @@ const BPF_MAP_UPDATE_ELEM: libc::c_long = 2;
 const BPF_MAP_DELETE_ELEM: libc::c_long = 3;
 const BPF_MAP_UPDATE_BATCH: libc::c_long = 26;
 const BPF_MAP_DELETE_BATCH: libc::c_long = 27;
-
-fn parse_static_bypass_nets(
-    entries: &[String],
-    label: &str,
-    limit: usize,
-) -> Result<(Vec<ipnet::Ipv4Net>, Vec<ipnet::Ipv6Net>), String> {
-    let mut v4 = Vec::new();
-    let mut v6 = Vec::new();
-    for entry in entries {
-        if let Ok(net) = ipnet::IpNet::from_str(entry) {
-            match net {
-                ipnet::IpNet::V4(net) => v4.push(net),
-                ipnet::IpNet::V6(net) => v6.push(net),
-            }
-        } else if let Ok(ip) = IpAddr::from_str(entry) {
-            match ip {
-                IpAddr::V4(ip) => {
-                    v4.push(ipnet::Ipv4Net::new(ip, 32).map_err(|e| {
-                        format!("invalid static {label} bypass IP {ip}: {e}")
-                    })?)
-                }
-                IpAddr::V6(ip) => {
-                    v6.push(ipnet::Ipv6Net::new(ip, 128).map_err(|e| {
-                        format!("invalid static {label} bypass IP {ip}: {e}")
-                    })?)
-                }
-            }
-        } else {
-            return Err(format!("invalid static {label} bypass IP/CIDR: {entry}"));
-        }
-    }
-
-    let mut v4 = ipnet::Ipv4Net::aggregate(&v4);
-    let mut v6 = ipnet::Ipv6Net::aggregate(&v6);
-    if v4.len() > limit {
-        warn!(
-            "Static {label} bypass IPv4 CIDRs exceed eBPF map capacity: {} aggregated, retaining first {limit}, dropping {}",
-            v4.len(),
-            v4.len() - limit
-        );
-        v4.truncate(limit);
-    }
-    if v6.len() > limit {
-        warn!(
-            "Static {label} bypass IPv6 CIDRs exceed eBPF map capacity: {} aggregated, retaining first {limit}, dropping {}",
-            v6.len(),
-            v6.len() - limit
-        );
-        v6.truncate(limit);
-    }
-    Ok((v4, v6))
-}
-
-fn select_static_bypass_ports(
-    configured: &[u16],
-    tproxy_port: u16,
-    label: &str,
-    limit: usize,
-) -> Vec<u16> {
-    let mut seen = HashSet::new();
-    let mut selected = Vec::with_capacity(limit.min(configured.len() + 1));
-    let mut distinct = 0usize;
-    for port in std::iter::once(tproxy_port).chain(configured.iter().copied()) {
-        if seen.insert(port) {
-            distinct += 1;
-            if selected.len() < limit {
-                selected.push(port);
-            }
-        }
-    }
-    if distinct > limit {
-        warn!(
-            "Static {label} bypass ports exceed eBPF map capacity: {distinct} distinct, retaining first {limit}, dropping {}",
-            distinct - limit
-        );
-    }
-    selected
-}
 
 #[repr(C)]
 struct BpfElemAttr {
@@ -410,7 +340,16 @@ impl BpfProgramManager {
             "Loading embedded eBPF programs ({} bytes)...",
             obj_bytes.len()
         );
-        let mut bpf = load_object(obj_bytes, param.proxy_local != 0)?;
+        let static_bypass = StaticBypass::new(
+            bypass_src_ports, bypass_dst_ports, bypass_src_ips, bypass_dst_ips,
+            param.tproxy_port as u16,
+        )?;
+        let mut bpf = load_object(obj_bytes, param.proxy_local != 0, &static_bypass)?;
+        let StaticBypass {
+            source_ports: source_bypass_ports, dest_ports: dest_bypass_ports,
+            source_v4: bypass_src_v4, source_v6: bypass_src_v6,
+            dest_v4: bypass_dst_v4, dest_v6: bypass_dst_v6,
+        } = static_bypass;
 
         // 1. Initialize parameter map
         let map = bpf
@@ -427,12 +366,6 @@ impl BpfProgramManager {
         );
 
         // 2. Populate BYPASS_SRC_PORTS map (e.g., local server ports)
-        let source_bypass_ports = select_static_bypass_ports(
-            bypass_src_ports,
-            param.tproxy_port as u16,
-            "source",
-            clash_ebpf_common::STATIC_BYPASS_SRC_PORT_MAX_ENTRIES as usize,
-        );
         let map = bpf.map_mut("BYPASS_SRC_PORTS").ok_or_else(|| {
             "required map 'BYPASS_SRC_PORTS' not found".to_string()
         })?;
@@ -450,12 +383,6 @@ impl BpfProgramManager {
         );
 
         // 3. Populate BYPASS_DST_PORTS map (e.g., direct destination service ports)
-        let dest_bypass_ports = select_static_bypass_ports(
-            bypass_dst_ports,
-            param.tproxy_port as u16,
-            "destination",
-            clash_ebpf_common::STATIC_BYPASS_DST_PORT_MAX_ENTRIES as usize,
-        );
         let map = bpf.map_mut("BYPASS_DST_PORTS").ok_or_else(|| {
             "required map 'BYPASS_DST_PORTS' not found".to_string()
         })?;
@@ -475,11 +402,6 @@ impl BpfProgramManager {
         );
 
         // 4. Populate BYPASS_SRC_IPS and BYPASS_SRC_IP6S maps
-        let (bypass_src_v4, bypass_src_v6) = parse_static_bypass_nets(
-            bypass_src_ips,
-            "source",
-            clash_ebpf_common::STATIC_BYPASS_SRC_MAX_ENTRIES as usize,
-        )?;
         {
             let map = bpf.map_mut("BYPASS_SRC_IPS").ok_or_else(|| {
                 "required map 'BYPASS_SRC_IPS' not found".to_string()
@@ -522,11 +444,6 @@ impl BpfProgramManager {
         }
 
         // 5. Populate BYPASS_DST_IPS and BYPASS_DST_IP6S maps
-        let (bypass_dst_v4, bypass_dst_v6) = parse_static_bypass_nets(
-            bypass_dst_ips,
-            "destination",
-            clash_ebpf_common::STATIC_BYPASS_DST_MAX_ENTRIES as usize,
-        )?;
         {
             let map = bpf.map_mut("BYPASS_DST_IPS").ok_or_else(|| {
                 "required map 'BYPASS_DST_IPS' not found".to_string()
@@ -1536,87 +1453,60 @@ mod tests {
     use super::*;
 
     #[test]
-    fn static_bypass_dst_entries_are_counted_per_family_after_aggregation() {
-        let entries = vec![
-            "1.1.1.1".to_string(),
-            "1.1.1.1/32".to_string(),
-            "2001:db8::/64".to_string(),
-        ];
-        let (v4, v6) = parse_static_bypass_nets(
-            &entries,
-            "destination",
-            clash_ebpf_common::STATIC_BYPASS_DST_MAX_ENTRIES as usize,
-        )
-        .unwrap();
-        assert_eq!(v4.len(), 1);
-        assert_eq!(v6.len(), 1);
-    }
-
-    #[test]
-    fn static_bypass_dst_over_capacity_is_truncated() {
-        let entries: Vec<_> = (0..=clash_ebpf_common::STATIC_BYPASS_DST_MAX_ENTRIES)
-            .map(|i| format!("{}/32", Ipv4Addr::from(0x0a00_0000 + i * 2)))
-            .collect();
-        let (v4, v6) = parse_static_bypass_nets(
-            &entries,
-            "destination",
-            clash_ebpf_common::STATIC_BYPASS_DST_MAX_ENTRIES as usize,
-        )
-        .unwrap();
-        assert_eq!(
-            v4.len(),
-            clash_ebpf_common::STATIC_BYPASS_DST_MAX_ENTRIES as usize
-        );
-        assert!(v6.is_empty());
-    }
-
-    #[test]
-    fn static_bypass_src_over_capacity_is_truncated() {
-        let entries: Vec<_> = (0..=clash_ebpf_common::STATIC_BYPASS_SRC_MAX_ENTRIES)
-            .map(|i| format!("{}/32", Ipv4Addr::from(0x0a00_0000 + i * 2)))
-            .collect();
-        let (v4, v6) = parse_static_bypass_nets(
-            &entries,
-            "source",
-            clash_ebpf_common::STATIC_BYPASS_SRC_MAX_ENTRIES as usize,
-        )
-        .unwrap();
-        assert_eq!(
-            v4.len(),
-            clash_ebpf_common::STATIC_BYPASS_SRC_MAX_ENTRIES as usize
-        );
-        assert!(v6.is_empty());
-    }
-
-    #[test]
-    fn static_bypass_ports_keep_tproxy_port_when_truncated() {
-        let ports = select_static_bypass_ports(
-            &[80, 80, 443, 8080],
-            12345,
-            "destination",
-            3,
-        );
-        assert_eq!(ports, vec![12345, 80, 443]);
-    }
-
-    #[test]
-    fn static_bypass_truncates_each_address_family_independently() {
-        let entries = vec![
-            "1.1.1.1".to_string(),
-            "2.2.2.2".to_string(),
-            "2001:db8::1".to_string(),
-            "2001:db8:1::1".to_string(),
-        ];
-        let (v4, v6) = parse_static_bypass_nets(&entries, "destination", 1).unwrap();
-        assert_eq!(v4.len(), 1);
-        assert_eq!(v6.len(), 1);
-    }
-
-    #[test]
     #[ignore = "requires root and freshly built eBPF bytecode"]
     fn process_tracking_capacity_follows_local_proxy_setting() {
+        let mut ips: Vec<String> = (0..5000u32)
+            .map(|i| Ipv4Addr::from(0x0a00_0000 + i * 2).to_string())
+            .collect();
+        ips.extend((0..5000u128)
+            .map(|i| Ipv6Addr::from(0x20010db8u128 << 96 | i * 2).to_string()));
+        let ports: Vec<u16> = (1..=300).collect();
+        let bypass = StaticBypass::new(&ports, &ports, &ips, &ips, 12345).unwrap();
         for (proxy_local, expected) in [(false, 1), (true, 65536)] {
-            let mut bpf = load_object(EMBEDDED_BPF_OBJECT, proxy_local).unwrap();
+            let mut bpf = load_object(EMBEDDED_BPF_OBJECT, proxy_local, &bypass).unwrap();
+            for (name, capacity) in bypass.map_capacities().unwrap() {
+                let map = match bpf.map(name).unwrap() {
+                    aya::maps::Map::HashMap(map) | aya::maps::Map::LpmTrie(map) => map,
+                    _ => panic!("unexpected static bypass map type: {name}"),
+                };
+                assert_eq!(map.info().unwrap().max_entries(), capacity);
+            }
+            for (name, nets) in [
+                ("BYPASS_SRC_IPS", &bypass.source_v4),
+                ("BYPASS_DST_IPS", &bypass.dest_v4),
+            ] {
+                let mut map = LpmTrie::<_, u32, u8>::try_from(bpf.map_mut(name).unwrap())
+                    .unwrap();
+                for net in nets {
+                    let key = Key::new(net.prefix_len() as u32,
+                        u32::from_ne_bytes(net.network().octets()));
+                    map.insert(&key, 1, 0).unwrap();
+                    assert_eq!(map.get(&key, 0).unwrap(), 1);
+                }
+            }
+            for (name, nets) in [
+                ("BYPASS_SRC_IP6S", &bypass.source_v6),
+                ("BYPASS_DST_IP6S", &bypass.dest_v6),
+            ] {
+                let mut map = LpmTrie::<_, [u8; 16], u8>::try_from(bpf.map_mut(name).unwrap())
+                    .unwrap();
+                for net in nets {
+                    let key = Key::new(net.prefix_len() as u32, net.network().octets());
+                    map.insert(&key, 1, 0).unwrap();
+                    assert_eq!(map.get(&key, 0).unwrap(), 1);
+                }
+            }
+            for (name, ports) in [
+                ("BYPASS_SRC_PORTS", &bypass.source_ports),
+                ("BYPASS_DST_PORTS", &bypass.dest_ports),
+            ] {
+                let mut map = HashMap::<_, u16, u8>::try_from(bpf.map_mut(name).unwrap())
+                    .unwrap();
+                for port in ports {
+                    map.insert(*port, 1, 0).unwrap();
+                    assert_eq!(map.get(port, 0).unwrap(), 1);
+                }
+            }
             let aya::maps::Map::HashMap(map) = bpf.map("COOKIE_PID_MAP").unwrap() else {
                 panic!("COOKIE_PID_MAP must be a hash map");
             };
