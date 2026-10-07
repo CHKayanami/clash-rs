@@ -38,6 +38,14 @@ edition = "2024"
 authors = ["https://github.com/Watfaq/clash-rs/graphs/contributors"]
 homepage = "https://github.com/CHKayanami/clash-rs"
 
+[profile.dev]
+debug = 0
+incremental = false
+
+[profile.debug]
+inherits = "dev"
+debug = 2
+
 [profile.release]
 opt-level = 3
 codegen-units = 1
