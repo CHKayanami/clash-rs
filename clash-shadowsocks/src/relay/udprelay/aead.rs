@@ -59,7 +59,7 @@ pub fn encrypt_payload_aead(
     let salt = &mut dst[..salt_len];
 
     if salt_len > 0 {
-        context.generate_nonce(method, salt, false);
+        context.generate_nonce(method, salt);
         trace!("UDP packet generated aead salt {:?}", ByteStr::new(salt));
     }
 

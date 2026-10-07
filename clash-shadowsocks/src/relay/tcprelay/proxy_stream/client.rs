@@ -12,12 +12,17 @@ use futures::ready;
 use pin_project::pin_project;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
+#[cfg(feature = "aead-cipher")]
+use crate::relay::tcprelay::aead::MAX_PACKET_SIZE as AEAD_MAX_PACKET_SIZE;
 #[cfg(feature = "aead-cipher-2022")]
-use crate::relay::get_aead_2022_padding_size;
+use crate::relay::tcprelay::aead_2022::MAX_PACKET_SIZE as AEAD2022_MAX_PACKET_SIZE;
+
+#[cfg(feature = "aead-cipher-2022")]
+use crate::relay::{get_aead_2022_padding_size, write_aead_2022_padding};
 use crate::{
     config::ServerConfig,
     context::SharedContext,
-    crypto::CipherKind,
+    crypto::{CipherCategory, CipherKind},
     relay::{
         socks5::Address,
         tcprelay::crypto_io::{CryptoRead, CryptoStream, CryptoWrite, StreamType},
@@ -27,7 +32,7 @@ use crate::{
 #[derive(Debug)]
 enum ProxyClientStreamWriteState {
     Connect(Address),
-    Connecting(BytesMut),
+    Connecting { buffer: BytesMut, payload_len: usize },
     Connected,
 }
 
@@ -153,10 +158,19 @@ where
 }
 
 #[inline]
-fn make_first_packet_buffer(method: CipherKind, addr: &Address, buf: &[u8]) -> BytesMut {
+fn make_first_packet_buffer(method: CipherKind, addr: &Address, buf: &[u8]) -> (BytesMut, usize) {
     // Target Address should be sent with the first packet together,
     // which would prevent from being detected.
 
+    let max_packet_size = match method.category() {
+        #[cfg(feature = "aead-cipher")]
+        CipherCategory::Aead => AEAD_MAX_PACKET_SIZE,
+        #[cfg(feature = "aead-cipher-2022")]
+        CipherCategory::Aead2022 => AEAD2022_MAX_PACKET_SIZE,
+        CipherCategory::None => usize::MAX,
+        #[cfg(feature = "stream-cipher")]
+        CipherCategory::Stream => usize::MAX,
+    };
     let addr_length = addr.serialized_len();
     let mut buffer = BytesMut::new();
 
@@ -164,17 +178,18 @@ fn make_first_packet_buffer(method: CipherKind, addr: &Address, buf: &[u8]) -> B
         if #[cfg(feature = "aead-cipher-2022")] {
             let padding_size = get_aead_2022_padding_size(buf);
             let header_length = if method.is_aead_2022() {
-                addr_length + 2 + padding_size + buf.len()
+                addr_length + 2 + padding_size
             } else {
-                addr_length + buf.len()
+                addr_length
             };
         } else {
             let _ = method;
-            let header_length = addr_length + buf.len();
+            let header_length = addr_length;
         }
     }
 
-    buffer.reserve(header_length);
+    let payload_len = buf.len().min(max_packet_size - header_length);
+    buffer.reserve(header_length + payload_len);
 
     // STREAM / AEAD / AEAD2022 protocol, append the Address before payload
     addr.write_to_buf(&mut buffer);
@@ -183,16 +198,12 @@ fn make_first_packet_buffer(method: CipherKind, addr: &Address, buf: &[u8]) -> B
     if method.is_aead_2022() {
         buffer.put_u16(padding_size as u16);
 
-        if padding_size > 0 {
-            unsafe {
-                buffer.advance_mut(padding_size);
-            }
-        }
+        write_aead_2022_padding(&mut buffer, padding_size);
     }
 
-    buffer.put_slice(buf);
+    buffer.put_slice(&buf[..payload_len]);
 
-    buffer
+    (buffer, payload_len)
 }
 
 impl<S> AsyncWrite for ProxyClientStream<S>
@@ -205,19 +216,21 @@ where
         loop {
             match this.writer_state {
                 &mut ProxyClientStreamWriteState::Connect(ref addr) => {
-                    let buffer = make_first_packet_buffer(this.stream.method(), addr, buf);
+                    let (buffer, payload_len) = make_first_packet_buffer(this.stream.method(), addr, buf);
 
                     // Save the concatenated buffer before it is written successfully.
                     // APIs require buffer to be kept alive before Poll::Ready
                     //
                     // Proactor APIs like IOCP on Windows, pointers of buffers have to be kept alive
                     // before IO completion.
-                    *(this.writer_state) = ProxyClientStreamWriteState::Connecting(buffer);
+                    *(this.writer_state) = ProxyClientStreamWriteState::Connecting { buffer, payload_len };
                 }
-                &mut ProxyClientStreamWriteState::Connecting(ref buffer) => {
+                &mut ProxyClientStreamWriteState::Connecting { ref buffer, payload_len } => {
                     let n = ready!(this.stream.poll_write_encrypted(cx, buffer))?;
 
-                    // In general, poll_write_encrypted should perform like write_all.
+                    // The first packet fits in one encrypted chunk, including
+                    // the address and padding. Remaining payload is retried by
+                    // the caller according to the returned payload length.
                     debug_assert!(n == buffer.len());
 
                     *(this.writer_state) = ProxyClientStreamWriteState::Connected;
@@ -230,7 +243,7 @@ where
                     //
                     // For protocols that requires *Server Hello* message, like FTP, clients won't send anything to the server until server sends handshake messages.
                     // This could be achieved by calling poll_write with an empty input buffer.
-                    return Ok(buf.len()).into();
+                    return Ok(payload_len).into();
                 }
                 ProxyClientStreamWriteState::Connected => {
                     return this.stream.poll_write_encrypted(cx, buf).map_err(Into::into);

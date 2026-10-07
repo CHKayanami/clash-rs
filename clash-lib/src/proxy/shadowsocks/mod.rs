@@ -1,8 +1,18 @@
-use shadowsocks::crypto::CipherKind;
+use crate::session::SocksAddr;
+use shadowsocks::{crypto::CipherKind, relay::Address};
 use std::io;
 
 pub mod inbound;
 pub mod outbound;
+
+impl From<&SocksAddr> for Address {
+    fn from(addr: &SocksAddr) -> Self {
+        match addr {
+            SocksAddr::Ip(addr) => Self::SocketAddress(*addr),
+            SocksAddr::Domain(host, port) => Self::DomainNameAddress(host.to_string(), *port),
+        }
+    }
+}
 
 pub(crate) fn map_cipher(cipher: &str) -> std::io::Result<CipherKind> {
     let lower = cipher.to_lowercase();
@@ -33,6 +43,18 @@ pub(crate) fn map_cipher(cipher: &str) -> std::io::Result<CipherKind> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn address_conversion_preserves_ip_wire_representation() {
+        for value in ["127.0.0.1:53", "[::1]:53"] {
+            let socket = value.parse().unwrap();
+            assert_eq!(Address::from(&SocksAddr::Ip(socket)), Address::SocketAddress(socket));
+        }
+        assert_eq!(
+            Address::from(&SocksAddr::Domain("example.test".into(), 53)),
+            Address::DomainNameAddress("example.test".into(), 53),
+        );
+    }
 
     #[test]
     fn test_map_cipher_aliases_and_case() {

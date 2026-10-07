@@ -5,18 +5,22 @@ use crate::{
 };
 use futures::ready;
 use shadowsocks::{
-    ProxySocket, relay::udprelay::options::UdpSocketControlData,
+    ProxySocket, net::UdpSocket as SsUdpSocket,
+    relay::{Address, udprelay::options::UdpSocketControlData},
     security::replay::PacketWindow,
 };
 use std::{
     collections::{HashMap, HashSet, hash_map::Entry},
-    net::SocketAddr,
+    io,
+    net::{IpAddr, SocketAddr},
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
-    time::{Duration, Instant},
+    time::Duration,
 };
 use tokio::io::ReadBuf;
+use tokio_util::time::{DelayQueue, delay_queue::Key};
+use network_interface::{NetworkInterface, NetworkInterfaceConfig};
 use tracing::{debug, error};
 
 pub(crate) struct InboundShadowsocksDatagram {
@@ -34,8 +38,10 @@ pub(crate) struct InboundShadowsocksDatagram {
     client_controls: HashMap<ClientSessionKey, ClientControl>,
     address_sessions: HashMap<SocketAddr, ClientSessionKey>,
     server_session_ids: HashSet<u64>,
+    expirations: DelayQueue<ClientSessionKey>,
+    allowed_sources: Option<HashSet<IpAddr>>,
 
-    socket: ProxySocket<shadowsocks::net::UdpSocket>,
+    socket: ProxySocket<SsUdpSocket>,
 
     // for Sink
     flushed: bool,
@@ -46,23 +52,22 @@ pub(crate) struct InboundShadowsocksDatagram {
     consecutive_recv_errors: usize,
 }
 
-/// A client's control block plus the last time we saw traffic from it, so the
-/// map can be bounded — see [`InboundShadowsocksDatagram::evict_stale_clients`].
+/// A client's control block and its idle expiration timer.
 struct ClientControl {
     // Allocated once for this authenticated client session, shared by its packets.
     inbound_user: Option<Arc<str>>,
     ctrl: UdpSocketControlData,
     logical_addr: SocketAddr,
     client_addr: SocketAddr,
-    last_seen: Instant,
+    expiry: Key,
     window: PacketWindow,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum ClientSessionKey {
     Aead2022 {
         client_session_id: u64,
-        user_hash: Option<bytes::Bytes>,
+        user_hash: Option<[u8; 16]>,
     },
     Legacy(SocketAddr),
 }
@@ -87,42 +92,37 @@ impl std::fmt::Debug for InboundShadowsocksDatagram {
 }
 
 impl InboundShadowsocksDatagram {
-    pub fn new(socket: ProxySocket<shadowsocks::net::UdpSocket>) -> Self {
-        Self {
+    pub fn new(
+        socket: ProxySocket<SsUdpSocket>,
+        allow_lan: bool,
+    ) -> io::Result<Self> {
+        let local_ip = socket.local_addr()?.ip().to_canonical();
+        let allowed_sources = if allow_lan {
+            None
+        } else if local_ip.is_unspecified() {
+            // Wildcard UDP sockets have no per-packet local endpoint. Resolve
+            // local interface addresses once instead of allowing remote hosts.
+            let interfaces = NetworkInterface::show().map_err(new_io_error)?;
+            Some(interfaces.into_iter()
+                .flat_map(|iface| iface.addr)
+                .map(|addr| addr.ip().to_canonical())
+                .collect())
+        } else {
+            Some(HashSet::from([local_ip]))
+        };
+        Ok(Self {
             buf: bytes::BytesMut::with_capacity(65535),
             socket,
             client_controls: HashMap::new(),
             address_sessions: HashMap::new(),
             server_session_ids: HashSet::new(),
+            expirations: DelayQueue::new(),
+            allowed_sources,
             consecutive_recv_errors: 0,
 
             flushed: true,
             pkt: None,
-        }
-    }
-
-    /// Drop expired control blocks once the map reaches its cap. Live sessions
-    /// are retained for the full timeout so their IDs cannot be replayed early.
-    fn evict_stale_clients(
-        client_controls: &mut HashMap<ClientSessionKey, ClientControl>,
-        address_sessions: &mut HashMap<SocketAddr, ClientSessionKey>,
-        server_session_ids: &mut HashSet<u64>,
-        now: Instant,
-    ) {
-        if client_controls.len() < MAX_TRACKED_CLIENTS {
-            return;
-        }
-
-        client_controls
-            .retain(|_, c| now.duration_since(c.last_seen) < CLIENT_CONTROL_TTL);
-
-        address_sessions.retain(|_, key| client_controls.contains_key(key));
-        server_session_ids.clear();
-        server_session_ids.extend(
-            client_controls
-                .values()
-                .map(|client| client.ctrl.server_session_id),
-        );
+        })
     }
 
     fn new_server_session_id(server_session_ids: &HashSet<u64>) -> u64 {
@@ -165,8 +165,32 @@ impl futures::Stream for InboundShadowsocksDatagram {
             ref mut address_sessions,
             ref mut server_session_ids,
             ref mut consecutive_recv_errors,
+            ref mut expirations,
+            ref allowed_sources,
             ..
         } = *self.get_mut();
+
+        // Bound work per poll when many sessions expire together. Each removal
+        // touches only that session's indexes; no full-map scans or rebuilds.
+        let mut exhausted = true;
+        for _ in 0..128 {
+            match expirations.poll_expired(cx) {
+                Poll::Ready(Some(expired)) => {
+                    if let Some(client) = client_controls.remove(expired.get_ref()) {
+                        address_sessions.remove(&client.logical_addr);
+                        server_session_ids.remove(&client.ctrl.server_session_id);
+                    }
+                }
+                _ => {
+                    exhausted = false;
+                    break;
+                }
+            }
+        }
+        if exhausted {
+            // A remaining ready timer must be polled again even if UDP is idle.
+            cx.waker().wake_by_ref();
+        }
 
         loop {
             buf.resize(buf.capacity(), 0);
@@ -188,24 +212,24 @@ impl futures::Stream for InboundShadowsocksDatagram {
                     // producing "no control entry" and dropping all IPv4 UDP
                     // replies.
                     let src = src.to_canonical();
+                    if allowed_sources.as_ref()
+                        .is_some_and(|ips| !ips.contains(&src.ip()))
+                    {
+                        debug!("dropping non-local shadowsocks UDP source {}", src);
+                        continue;
+                    }
 
                     // Upsert the per-client control entry so responses to this
                     // client are encrypted with the correct uPSK and echo the
                     // correct client_session_id.  packet_id is kept per-client
                     // for monotonic replay protection at each individual client.
-                    let now = Instant::now();
-                    Self::evict_stale_clients(
-                        client_controls,
-                        address_sessions,
-                        server_session_ids,
-                        now,
-                    );
 
                     let session_key = match ctrl.as_ref() {
                         Some(control) => ClientSessionKey::Aead2022 {
                             client_session_id: control.client_session_id,
                             user_hash: control.user.as_ref().map(|user| {
-                                bytes::Bytes::copy_from_slice(user.identity_hash())
+                                user.identity_hash().try_into()
+                                    .expect("16-byte user identity")
                             }),
                         },
                         None => ClientSessionKey::Legacy(src),
@@ -224,7 +248,7 @@ impl futures::Stream for InboundShadowsocksDatagram {
                             let new_logical_addr =
                                 Self::new_logical_addr(src, address_sessions);
                             address_sessions
-                                .insert(new_logical_addr, entry.key().clone());
+                                .insert(new_logical_addr, *entry.key());
                             let server_session_id =
                                 Self::new_server_session_id(server_session_ids);
                             server_session_ids.insert(server_session_id);
@@ -238,13 +262,13 @@ impl futures::Stream for InboundShadowsocksDatagram {
                                 ctrl: d,
                                 logical_addr: new_logical_addr,
                                 client_addr: src,
-                                last_seen: now,
+                                expiry: expirations.insert(
+                                    session_key, CLIENT_CONTROL_TTL,
+                                ),
                                 window: PacketWindow::new(),
                             })
                         }
                     };
-                    entry.last_seen = now;
-                    entry.client_addr = src;
                     if let Some(ref c) = ctrl {
                         if entry.window.check_and_set(c.packet_id) {
                             debug!(
@@ -256,6 +280,8 @@ impl futures::Stream for InboundShadowsocksDatagram {
                         entry.ctrl.client_session_id = c.client_session_id;
                         entry.ctrl.user = c.user.clone();
                     }
+                    entry.client_addr = src;
+                    expirations.reset(&entry.expiry, CLIENT_CONTROL_TTL);
                     let logical_addr = entry.logical_addr;
 
                     return Poll::Ready(Some(UdpPacket {
@@ -353,17 +379,7 @@ impl futures::Sink<UdpPacket> for InboundShadowsocksDatagram {
         let pkt_container = pkt;
 
         if let Some(pkt) = pkt_container {
-            let addr: shadowsocks::relay::Address = match &pkt.src_addr {
-                SocksAddr::Ip(addr) => {
-                    shadowsocks::relay::Address::SocketAddress(*addr)
-                }
-                SocksAddr::Domain(host, port) => {
-                    shadowsocks::relay::Address::DomainNameAddress(
-                        host.to_string(),
-                        *port,
-                    )
-                }
-            };
+            let addr = Address::from(&pkt.src_addr);
 
             // Look up the per-client control for this response's destination.
             // This entry must already exist: a response can only arrive after
@@ -385,7 +401,7 @@ impl futures::Sink<UdpPacket> for InboundShadowsocksDatagram {
                 *flushed = true;
                 return Poll::Ready(Ok(()));
             };
-            let control_key = address_sessions.get(&client_addr).cloned();
+            let control_key = address_sessions.get(&client_addr).copied();
             let client = match control_key
                 .as_ref()
                 .and_then(|key| client_controls.get_mut(key))
@@ -450,3 +466,7 @@ impl futures::Sink<UdpPacket> for InboundShadowsocksDatagram {
         Poll::Ready(Ok(()))
     }
 }
+
+#[cfg(test)]
+#[path = "datagram_tests.rs"]
+mod tests;

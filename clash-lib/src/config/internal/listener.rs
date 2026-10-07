@@ -10,8 +10,8 @@ use super::config::BindAddress;
 
 /// A single user entry for SS2022 multi-user inbound.
 /// `name` is stored in session metadata as `inboundUser` for traffic
-/// attribution. `password` is a base64-encoded 32-byte key (for
-/// 2022-blake3-aes-256-gcm).
+/// attribution. For Shadowsocks, `password` is a base64-encoded 16-byte key
+/// for 2022-blake3-aes-128-gcm or 32-byte key for 2022-blake3-aes-256-gcm.
 #[derive(Serialize, Deserialize, Debug, Clone, Hash, Eq, PartialEq)]
 pub struct InboundUser {
     pub name: String,

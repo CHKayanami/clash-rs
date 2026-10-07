@@ -47,7 +47,6 @@
 use std::{
     cell::RefCell,
     io::{self, Cursor, Seek, SeekFrom},
-    slice,
     sync::{Arc, LazyLock},
     time::SystemTime,
 };
@@ -71,7 +70,7 @@ use crate::{
         v2::udp::{ChaCha20Poly1305Cipher, UdpCipher},
     },
     relay::{
-        get_aead_2022_padding_size,
+        get_aead_2022_padding_size, write_aead_2022_padding,
         socks5::{Address, Error as Socks5Error},
     },
 };
@@ -119,8 +118,17 @@ impl CipherKey {
         Self {
             method,
             key_hash: *blake3::hash(key).as_bytes(),
-            session_id,
+            session_id: cache_session_id(method, session_id),
         }
+    }
+}
+
+fn cache_session_id(method: CipherKind, session_id: u64) -> u64 {
+    match method {
+        CipherKind::AEAD2022_BLAKE3_CHACHA20_POLY1305 => 0,
+        #[cfg(feature = "aead-cipher-2022-extra")]
+        CipherKind::AEAD2022_BLAKE3_CHACHA8_POLY1305 => 0,
+        _ => session_id,
     }
 }
 
@@ -146,6 +154,7 @@ impl UdpCipherCache {
 
     #[inline]
     pub fn get_or_create(&self, is_send: bool, method: CipherKind, key: &[u8], session_id: u64) -> Arc<UdpCipher> {
+        let session_id = cache_session_id(method, session_id);
         let slot = if is_send { &self.send } else { &self.recv };
         {
             if let Ok(guard) = slot.lock()
@@ -303,16 +312,8 @@ fn decrypt_message(
 
             let (nonce, message) = packet.split_at_mut(nonce_size);
 
-            // NOTE: ChaCha20-Poly1305's session_id is not required because it uses PSK directly
-            //
-            // But still, we get the session_id for cache
-            let session_id = {
-                let session_id_buf = &message[0..8];
-                let session_id_slice: &[u64] = unsafe { slice::from_raw_parts(session_id_buf.as_ptr() as *const _, 1) };
-                u64::from_be(session_id_slice[0])
-            };
-
-            let cipher = get_udp_cipher(false, session_id, key);
+            // ChaCha uses the PSK directly; the encrypted session ID is not a cache key.
+            let cipher = get_udp_cipher(false, 0, key);
 
             if !cipher.decrypt_packet(nonce, message) {
                 return Err(ProtocolError::DecryptPayloadError);
@@ -325,16 +326,8 @@ fn decrypt_message(
 
             let (nonce, message) = packet.split_at_mut(nonce_size);
 
-            // NOTE: ChaCha20-Poly1305's session_id is not required because it uses PSK directly
-            //
-            // But still, we get the session_id for cache
-            let session_id = {
-                let session_id_buf = &message[0..8];
-                let session_id_slice: &[u64] = unsafe { slice::from_raw_parts(session_id_buf.as_ptr() as *const _, 1) };
-                u64::from_be(session_id_slice[0])
-            };
-
-            let cipher = get_udp_cipher(false, session_id, key);
+            // ChaCha uses the PSK directly; the encrypted session ID is not a cache key.
+            let cipher = get_udp_cipher(false, 0, key);
 
             if !cipher.decrypt_packet(nonce, message) {
                 return Err(ProtocolError::DecryptPayloadError);
@@ -367,11 +360,9 @@ fn decrypt_message(
 
             // Session ID is the first 64-bits
 
-            let session_id = {
-                let session_id_buf = &packet_header[0..8];
-                let session_id_slice: &[u64] = unsafe { slice::from_raw_parts(session_id_buf.as_ptr() as *const _, 1) };
-                u64::from_be(session_id_slice[0])
-            };
+            let session_id = u64::from_be_bytes(
+                packet_header[..8].try_into().expect("fixed packet header"),
+            );
 
             let cipher = if method_support_eih(method) {
                 if let Some(user_manager) = user_manager {
@@ -515,7 +506,7 @@ pub fn encrypt_client_payload_aead_2022_cached(
         }
         let nonce = &mut dst[..nonce_size];
 
-        context.generate_nonce(method, nonce, false);
+        context.generate_nonce(method, nonce);
         trace!("UDP packet generated aead nonce {:?}", ByteStr::new(nonce));
     }
 
@@ -583,11 +574,7 @@ pub fn encrypt_client_payload_aead_2022_cached(
     dst.put_u8(CLIENT_SOCKET_TYPE);
     dst.put_u64(get_now_timestamp());
     dst.put_u16(padding_size as u16);
-    if padding_size > 0 {
-        unsafe {
-            dst.advance_mut(padding_size);
-        }
-    }
+    write_aead_2022_padding(dst, padding_size);
     addr.write_to_buf(dst);
     dst.put_slice(payload);
 
@@ -689,7 +676,7 @@ pub fn encrypt_server_payload_aead_2022(
         }
         let nonce = &mut dst[..nonce_size];
 
-        context.generate_nonce(method, nonce, false);
+        context.generate_nonce(method, nonce);
         trace!("UDP packet generated aead nonce {:?}", ByteStr::new(nonce));
     }
 
@@ -700,11 +687,7 @@ pub fn encrypt_server_payload_aead_2022(
     dst.put_u64(get_now_timestamp());
     dst.put_u64(control.client_session_id);
     dst.put_u16(padding_size as u16);
-    if padding_size > 0 {
-        unsafe {
-            dst.advance_mut(padding_size);
-        }
-    }
+    write_aead_2022_padding(dst, padding_size);
     addr.write_to_buf(dst);
     dst.put_slice(payload);
 
@@ -790,6 +773,35 @@ mod tests {
     const METHOD: CipherKind = CipherKind::AEAD2022_BLAKE3_CHACHA20_POLY1305;
 
     #[test]
+    fn unaligned_packets_decrypt_for_aes_and_chacha() {
+        let context = Context::new(crate::config::ServerType::Local);
+        let key = [7_u8; 32];
+        let addr = Address::SocketAddress("127.0.0.1:53".parse().unwrap());
+        let mut control = UdpSocketControlData::default();
+        control.client_session_id = 123;
+        control.server_session_id = 456;
+        for method in [METHOD, CipherKind::AEAD2022_BLAKE3_AES_256_GCM] {
+            let mut encrypted = BytesMut::new();
+            encrypt_client_payload_aead_2022(&context, method, &key, &addr, &control, &[], b"request", &mut encrypted);
+            let mut unaligned = vec![0; encrypted.len() + 8];
+            let offset = (1..8).find(|offset| (unaligned.as_ptr() as usize + offset) % 8 != 0).unwrap();
+            unaligned[offset..offset + encrypted.len()].copy_from_slice(&encrypted);
+            let (length, target, _) = decrypt_client_payload_aead_2022(&context, method, &key, &mut unaligned[offset..offset + encrypted.len()], None).unwrap();
+            assert_eq!(length, 7);
+            assert_eq!(target, addr);
+            assert_eq!(&unaligned[offset..offset + length], b"request");
+            encrypted.clear();
+            encrypt_server_payload_aead_2022(&context, method, &key, &addr, &control, b"response", &mut encrypted);
+            unaligned.resize(encrypted.len() + 8, 0);
+            let offset = (1..8).find(|offset| (unaligned.as_ptr() as usize + offset) % 8 != 0).unwrap();
+            unaligned[offset..offset + encrypted.len()].copy_from_slice(&encrypted);
+            let (length, target, _) = decrypt_server_payload_aead_2022(&context, method, &key, &mut unaligned[offset..offset + encrypted.len()]).unwrap();
+            assert_eq!(target, addr);
+            assert_eq!(&unaligned[offset..offset + length], b"response");
+        }
+    }
+
+    #[test]
     fn cipher_key_depends_on_key_material_not_allocation_address() {
         let first = vec![7_u8; 32];
         let same_contents_different_allocation = first.clone();
@@ -801,7 +813,7 @@ mod tests {
     }
 
     #[test]
-    fn per_socket_cache_reuses_only_the_matching_session() {
+    fn chacha_cache_reuses_cipher_across_sessions() {
         let cache = UdpCipherCache::new();
         let key = [9_u8; 32];
 
@@ -810,6 +822,10 @@ mod tests {
         let next_session = cache.get_or_create(true, METHOD, &key, 2);
 
         assert!(Arc::ptr_eq(&first, &reused));
-        assert!(!Arc::ptr_eq(&first, &next_session));
+        assert!(Arc::ptr_eq(&first, &next_session));
+        let aes = CipherKind::AEAD2022_BLAKE3_AES_256_GCM;
+        let first = cache.get_or_create(false, aes, &key, 1);
+        let next = cache.get_or_create(false, aes, &key, 2);
+        assert!(!Arc::ptr_eq(&first, &next));
     }
 }

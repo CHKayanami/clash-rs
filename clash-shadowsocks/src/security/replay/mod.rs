@@ -1,7 +1,9 @@
-use std::fmt;
+use std::{fmt, io};
 
 #[cfg(feature = "aead-cipher-2022")]
-use quick_cache::sync::Cache;
+mod nonce;
+#[cfg(feature = "aead-cipher-2022")]
+use nonce::Nonces;
 
 use crate::{config::ServerType, crypto::CipherKind};
 
@@ -11,7 +13,7 @@ pub struct ReplayProtector {
     // AEAD 2022 TCP protocol has a timestamp, which can already reject most of the replay requests,
     // so we only need to remember nonce that are in the valid time range
     #[cfg(feature = "aead-cipher-2022")]
-    nonce_set: Cache<Vec<u8>, ()>,
+    nonce_set: Nonces,
 }
 
 impl fmt::Debug for ReplayProtector {
@@ -26,30 +28,21 @@ impl ReplayProtector {
     pub fn new(config_type: ServerType) -> Self {
         Self {
             #[cfg(feature = "aead-cipher-2022")]
-            nonce_set: Cache::new(16384),
+            nonce_set: Nonces::default(),
         }
     }
 
-    /// Check if nonce exist or not
-    #[inline(always)]
-    pub fn check_nonce_and_set(&self, method: CipherKind, nonce: &[u8]) -> bool {
-        // Plain cipher doesn't have a nonce
-        // Always treated as non-duplicated
+    /// Check and retain incoming salts for the complete protocol replay window.
+    pub fn check_nonce_and_set(&self, method: CipherKind, nonce: &[u8]) -> io::Result<()> {
         if nonce.is_empty() {
-            return false;
+            return Ok(());
         }
-
         #[cfg(feature = "aead-cipher-2022")]
         if method.is_aead_2022() {
-            if self.nonce_set.contains_key(nonce) {
-                return true;
-            }
-            self.nonce_set.insert(nonce.to_vec(), ());
-            return false;
+            return self.nonce_set.check_and_set(nonce);
         }
-
         let _ = method;
-        false
+        Ok(())
     }
 }
 
@@ -137,7 +130,36 @@ impl PacketWindow {
 
 #[cfg(all(test, feature = "aead-cipher-2022"))]
 mod tests {
-    use super::PacketWindow;
+    use super::{PacketWindow, ReplayProtector};
+    use crate::{config::ServerType, crypto::CipherKind};
+    use std::{sync::{Barrier, atomic::{AtomicUsize, Ordering}}, thread};
+
+    #[test]
+    fn concurrent_nonce_replays_are_accepted_only_once() {
+        let protector = ReplayProtector::new(ServerType::Server);
+        let barrier = Barrier::new(8);
+        let accepted: Vec<_> = (0..128).map(|_| AtomicUsize::new(0)).collect();
+        thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    for (round, count) in accepted.iter().enumerate() {
+                        let mut nonce = [0_u8; 32];
+                        nonce[..8].copy_from_slice(&(round as u64).to_be_bytes());
+                        barrier.wait();
+                        if protector.check_nonce_and_set(
+                            CipherKind::AEAD2022_BLAKE3_AES_256_GCM, &nonce,
+                        ).is_ok() {
+                            count.fetch_add(1, Ordering::Relaxed);
+                        }
+                        barrier.wait();
+                    }
+                });
+            }
+        });
+        for count in accepted {
+            assert_eq!(count.load(Ordering::Relaxed), 1);
+        }
+    }
 
     #[test]
     fn udp_window_rejects_duplicates_and_old_packets() {

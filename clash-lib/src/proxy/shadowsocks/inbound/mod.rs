@@ -1,6 +1,8 @@
 use crate::runner::ListenerReady;
 use crate::proxy::AnyStream;
+mod auth;
 mod datagram;
+use auth::Authentication;
 
 use crate::{
     Dispatcher,
@@ -16,7 +18,7 @@ use crate::{
 use async_trait::async_trait;
 use shadowsocks::{
     ProxySocket,
-    config::{ServerConfig, ServerUser, ServerUserManager},
+    config::ServerConfig,
     context::Context,
     relay::{Address, tcprelay::proxy_stream::server::ProxyServerStream},
 };
@@ -26,7 +28,7 @@ impl<S: AsyncRead + AsyncWrite + Send + Unpin + 'static> crate::proxy::ProxyStre
     for ProxyServerStream<S>
 {
 }
-use std::{collections::HashMap, net::SocketAddr, sync::Arc};
+use std::{net::SocketAddr, sync::Arc};
 use tracing::{debug, info, warn};
 
 pub struct ShadowsocksInbound {
@@ -91,48 +93,6 @@ impl ShadowsocksInbound {
     }
 }
 
-/// Build a `ServerUserManager` from a slice of `InboundUser` entries.
-/// Returns `None` when the slice is empty (single-user mode).
-fn build_user_manager(
-    users: &[InboundUser],
-    addr: SocketAddr,
-) -> Option<ServerUserManager> {
-    if users.is_empty() {
-        return None;
-    }
-    let mut mgr = ServerUserManager::new();
-    let mut loaded = 0usize;
-    for u in users {
-        match ServerUser::with_encoded_key(&u.name, &u.password) {
-            Ok(user) => {
-                mgr.add_user(user);
-                loaded += 1;
-            }
-            Err(e) => warn!("Skipping invalid SS user '{}': {}", u.name, e),
-        }
-    }
-    info!(
-        "shadowsocks inbound {addr}: loaded {loaded}/{} users",
-        users.len()
-    );
-    Some(mgr)
-}
-
-/// Index from uPSK to user name, so resolving the authenticated user after a
-/// handshake is a hash lookup rather than a scan of the whole user list on
-/// every connection.
-fn build_user_index(
-    mgr: Option<&ServerUserManager>,
-) -> Arc<HashMap<Vec<u8>, Arc<str>>> {
-    let mut index = HashMap::new();
-    if let Some(mgr) = mgr {
-        for u in mgr.users_iter() {
-            index.insert(u.key().to_vec(), Arc::<str>::from(u.name()));
-        }
-    }
-    Arc::new(index)
-}
-
 #[async_trait]
 impl InboundHandlerTrait for ShadowsocksInbound {
     fn handle_tcp(&self) -> bool {
@@ -152,10 +112,7 @@ impl InboundHandlerTrait for ShadowsocksInbound {
         let raw_listener = try_create_dualstack_tcplistener(self.addr)?;
 
         let mut users_rx = self.users_rx.clone();
-        let initial_users =
-            build_user_manager(&users_rx.borrow_and_update(), self.addr);
-        let mut user_index = build_user_index(initial_users.as_ref());
-        let mut user_manager = initial_users.map(Arc::new);
+        let mut auth = Authentication::new(method, &users_rx.borrow_and_update())?;
 
         ready.notify();
 
@@ -189,8 +146,8 @@ impl InboundHandlerTrait for ShadowsocksInbound {
                     let dispatcher = self.dispatcher.clone();
                     let context = context.clone();
                     let key_bytes = Arc::clone(&server_key_bytes);
-                    let mgr = user_manager.clone();
-                    let index = Arc::clone(&user_index);
+                    let mgr = auth.manager.clone();
+                    let index = Arc::clone(&auth.index);
                     let fw_mark = self.fw_mark;
 
                     tokio::spawn(async move {
@@ -237,14 +194,16 @@ impl InboundHandlerTrait for ShadowsocksInbound {
 
                 Ok(()) = users_rx.changed() => {
                     let users = users_rx.borrow_and_update().clone();
-                    info!(
-                        "shadowsocks inbound {}: TCP user list updated ({} users)",
-                        self.addr,
-                        users.len()
-                    );
-                    let mgr = build_user_manager(&users, self.addr);
-                    user_index = build_user_index(mgr.as_ref());
-                    user_manager = mgr.map(Arc::new);
+                    match auth.update(&users) {
+                        Ok(()) => info!(
+                            "shadowsocks inbound {}: TCP user list updated ({} users)",
+                            self.addr, users.len(),
+                        ),
+                        Err(e) => warn!(
+                            "shadowsocks inbound {}: rejecting TCP user update: {}",
+                            self.addr, e,
+                        ),
+                    }
                 }
             }
         }
@@ -253,6 +212,9 @@ impl InboundHandlerTrait for ShadowsocksInbound {
     async fn listen_udp(&self, ready: ListenerReady) -> std::io::Result<()> {
         let mut ready = Some(ready);
         let mut users_rx = self.users_rx.clone();
+        let mut auth = Authentication::new(
+            map_cipher(&self.cipher)?, &users_rx.borrow_and_update(),
+        )?;
 
         loop {
             // Create UDP socket with the current user list.
@@ -260,11 +222,8 @@ impl InboundHandlerTrait for ShadowsocksInbound {
                 Context::new_shared(shadowsocks::config::ServerType::Server);
             let mut config = self.build_server_config()?;
 
-            {
-                let users = users_rx.borrow_and_update();
-                if let Some(mgr) = build_user_manager(&users, self.addr) {
-                    config.set_user_manager(mgr);
-                }
+            if let Some(manager) = &auth.manager {
+                config.set_user_manager((**manager).clone());
             }
 
             // Rebinding races the previous socket's close, so a failure here is
@@ -307,13 +266,14 @@ impl InboundHandlerTrait for ShadowsocksInbound {
                     socket.into(),
                 );
 
+            let wrapped_socket = Box::new(InboundShadowsocksDatagram::new(
+                proxy_socket, self.allow_lan,
+            )?);
             if let Some(ready) = ready.take() {
                 ready.notify();
             }
 
             let dispatcher = self.dispatcher.clone();
-            let wrapped_socket =
-                Box::new(InboundShadowsocksDatagram::new(proxy_socket));
             let sess = Session {
                 network: Network::Udp,
                 typ: Type::Shadowsocks,
@@ -331,29 +291,37 @@ impl InboundHandlerTrait for ShadowsocksInbound {
 
             // Block until the user list changes; then close the UDP socket and
             // loop to rebind with the new users.
-            match users_rx.changed().await {
-                Ok(()) => {
-                    info!(
-                        "shadowsocks inbound {}: user list changed, restarting UDP \
-                         socket",
-                        self.addr
-                    );
-                    if let Some(c) = self.udp_closer.lock().await.take() {
-                        let _ = c.send(0);
+            loop {
+                match users_rx.changed().await {
+                    Ok(()) => {
+                        if let Err(e) = auth.update(&users_rx.borrow_and_update()) {
+                            warn!(
+                                "shadowsocks inbound {}: rejecting UDP user update: {}",
+                                self.addr, e,
+                            );
+                            continue;
+                        }
+                        info!(
+                            "shadowsocks inbound {}: user list changed, restarting UDP \
+                             socket",
+                            self.addr
+                        );
+                        if let Some(c) = self.udp_closer.lock().await.take() {
+                            let _ = c.send(0);
+                        }
+                        // Brief yield so the dispatcher can drop the old socket;
+                        // the bind retry above covers the case where it needs
+                        // longer than this.
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        break;
                     }
-                    // Brief yield so the dispatcher can drop the old socket;
-                    // the bind retry above covers the case where it needs
-                    // longer than this.
-                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                }
-                Err(_) => {
-                    // Sender dropped — listener is shutting down.
-                    break;
+                    Err(_) => {
+                        // Sender dropped — listener is shutting down.
+                        return Ok(());
+                    }
                 }
             }
         }
-
-        Ok(())
     }
 }
 
@@ -361,60 +329,7 @@ impl InboundHandlerTrait for ShadowsocksInbound {
 mod tests {
     use super::*;
 
-    // A valid 32-byte base64 key (same value used in the test server config).
-    const VALID_KEY: &str = "3SYJ/f8nmVuzKvKglykRQDSgg10e/ADilkdRWrrY9HU=";
-
-    fn addr() -> std::net::SocketAddr {
-        "127.0.0.1:8080".parse().unwrap()
-    }
-
-    #[test]
-    fn test_build_user_manager_empty_returns_none() {
-        assert!(
-            build_user_manager(&[], addr()).is_none(),
-            "empty user list should yield single-user mode (None)"
-        );
-    }
-
-    #[test]
-    fn test_build_user_manager_valid_user_returns_some() {
-        let users = vec![InboundUser {
-            name: "user1".to_string(),
-            password: VALID_KEY.to_string(),
-        }];
-        assert!(
-            build_user_manager(&users, addr()).is_some(),
-            "valid user should produce a ServerUserManager"
-        );
-    }
-
-    #[test]
-    fn test_build_user_manager_invalid_password_does_not_panic() {
-        // Invalid base64 — should be skipped with a warning, not panic.
-        let users = vec![InboundUser {
-            name: "bad".to_string(),
-            password: "not-valid-base64!!!".to_string(),
-        }];
-        // Returns Some because the users slice is non-empty, even though
-        // the single entry failed to load.
-        let _mgr = build_user_manager(&users, addr());
-    }
-
-    #[test]
-    fn test_build_user_manager_mixes_valid_and_invalid() {
-        let users = vec![
-            InboundUser {
-                name: "good".to_string(),
-                password: VALID_KEY.to_string(),
-            },
-            InboundUser {
-                name: "bad".to_string(),
-                password: "!!!".to_string(),
-            },
-        ];
-        // Invalid entry is skipped; valid entry is loaded — must not panic.
-        assert!(build_user_manager(&users, addr()).is_some());
-    }
+    use shadowsocks::config::{ServerUser, ServerUserManager};
 
     #[tokio::test]
     async fn test_classic_udp_inbound() -> anyhow::Result<()> {
@@ -449,7 +364,7 @@ mod tests {
             server_socket.into(),
         );
 
-        let mut inbound_datagram = InboundShadowsocksDatagram::new(proxy_socket);
+        let mut inbound_datagram = InboundShadowsocksDatagram::new(proxy_socket, true)?;
 
         // Client wraps in shadowsocks client ProxySocket
         let client_context = Context::new_shared(ServerType::Local);
@@ -536,7 +451,7 @@ mod tests {
             &config,
             socket.into(),
         );
-        let mut inbound = InboundShadowsocksDatagram::new(server);
+        let mut inbound = InboundShadowsocksDatagram::new(server, true)?;
         let client_config =
             ServerConfig::new(address, format!("{server_key}:{user_key}"), method)?;
         let client: ProxySocket<shadowsocks::net::UdpSocket> =
@@ -606,7 +521,7 @@ mod tests {
             &config,
             server_socket.into(),
         );
-        let mut inbound = InboundShadowsocksDatagram::new(server);
+        let mut inbound = InboundShadowsocksDatagram::new(server, true)?;
 
         let client1_socket = UdpSocket::bind("127.0.0.1:0").await?;
         let client1_addr = client1_socket.local_addr()?;

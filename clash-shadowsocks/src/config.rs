@@ -67,7 +67,7 @@ impl Debug for ServerUser {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ServerUser")
             .field("name", &self.name)
-            .field("key", &USER_KEY_BASE64_ENGINE.encode(&self.key))
+            .field("key", &"[REDACTED]")
             .field("identity_hash", &ByteStr::new(&self.identity_hash))
             .finish()
     }

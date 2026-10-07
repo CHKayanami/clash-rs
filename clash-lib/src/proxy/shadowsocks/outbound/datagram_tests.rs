@@ -1,5 +1,12 @@
 use super::*;
 use std::{collections::VecDeque, sync::Arc};
+use base64::{Engine, engine::general_purpose::STANDARD};
+use bytes::BytesMut;
+use shadowsocks::{
+    ServerConfig, config::ServerType, context::Context as SsContext,
+    crypto::CipherKind,
+    relay::{Address, udprelay::{crypto_io::encrypt_server_payload, proxy_socket::UdpSocketType}},
+};
 
 #[derive(Default)]
 struct Probe {
@@ -209,4 +216,62 @@ fn zero_length_pending_send_and_receive_truncation() {
     assert!(
         matches!(io.poll_recv(&mut cx, &mut received), Poll::Ready(Err(e)) if e.kind() == io::ErrorKind::UnexpectedEof)
     );
+}
+
+#[test]
+fn alternating_authenticated_server_sessions_reject_replayed_responses() {
+    let (io, probe, server_addr) = fixture();
+    let method = CipherKind::AEAD2022_BLAKE3_AES_256_GCM;
+    let cfg = ServerConfig::new(server_addr, STANDARD.encode([7_u8; 32]), method).unwrap();
+    let socket = ProxySocket::from_socket(
+        UdpSocketType::Client,
+        SsContext::new_shared(ServerType::Local),
+        &cfg,
+        io,
+    );
+    let mut outbound = OutboundDatagramShadowsocks::new(socket, server_addr);
+    let ctx = SsContext::new(ServerType::Server);
+    let target: Address = "1.1.1.1:53".parse::<SocketAddr>().unwrap().into();
+    let response = |session_id, packet_id, payload: &[u8]| {
+        let mut control = UdpSocketControlData::default();
+        control.server_session_id = session_id;
+        control.packet_id = packet_id;
+        control.client_session_id = outbound.ss_control.client_session_id;
+        let mut encrypted = BytesMut::new();
+        encrypt_server_payload(&ctx, method, cfg.key(), &target, &control, payload, &mut encrypted);
+        UdpPacket {
+            data: encrypted.freeze(),
+            src_addr: server_addr.into(),
+            dst_addr: SocksAddr::any_ipv4(),
+            inbound_user: None,
+        }
+    };
+    let first = response(1, 0, b"first");
+    let second = response(2, 0, b"second");
+    let fresh = response(1, 1, b"fresh");
+    probe.lock().received.extend([
+        first.clone(), second.clone(), first, second, fresh,
+    ]);
+    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+    for expected in [b"first".as_slice(), b"second", b"fresh"] {
+        match outbound.poll_next_unpin(&mut cx) {
+            Poll::Ready(Some(packet)) => assert_eq!(packet.data.as_ref(), expected),
+            _ => panic!("expected authenticated UDP response"),
+        }
+    }
+    assert!(outbound.poll_next_unpin(&mut cx).is_pending());
+}
+
+#[test]
+fn chained_shadowsocks_receives_can_lease_nested_buffers() {
+    let (io, _, server_addr) = fixture();
+    let config = ServerConfig::new(server_addr, "synthetic-password", CipherKind::AES_256_GCM).unwrap();
+    let socket = ProxySocket::from_socket(UdpSocketType::Client, SsContext::new_shared(ServerType::Local), &config, io);
+    let inner = OutboundDatagramShadowsocks::new(socket, server_addr);
+    let io = ShadowsocksUdpIo::new(AnyOutboundDatagram::dynamic(inner));
+    let socket = ProxySocket::from_socket(UdpSocketType::Client, SsContext::new_shared(ServerType::Local), &config, io);
+    let mut outer = OutboundDatagramShadowsocks::new(socket, server_addr);
+    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+    assert!(outer.poll_next_unpin(&mut cx).is_pending());
+    assert!(outer.poll_next_unpin(&mut cx).is_pending());
 }

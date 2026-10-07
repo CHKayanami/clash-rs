@@ -2,6 +2,7 @@ pub(crate) use datagram::{OutboundDatagramShadowsocks, ShadowsocksUdpIo};
 pub(crate) use stream::ShadowSocksStream;
 mod datagram;
 mod stream;
+mod udp_replay;
 
 use crate::{
     app::dns::ThreadSafeDNSResolver,
@@ -18,6 +19,7 @@ use crate::{
 use async_trait::async_trait;
 use erased_serde::Serialize as ErasedSerialize;
 use shadowsocks::{
+    relay::Address,
     ProxyClientStream, ProxySocket, ServerConfig, config::ServerType,
     context::Context, relay::udprelay::proxy_socket::UdpSocketType,
 };
@@ -123,7 +125,7 @@ impl Handler {
             self.ctx.clone(),
             stream,
             cfg,
-            (sess.destination.host(), sess.destination.port()),
+            Address::from(&sess.destination),
         );
 
         Ok(AnyStream::new(ShadowSocksStream(stream)))
