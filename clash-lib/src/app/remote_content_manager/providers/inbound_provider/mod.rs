@@ -1,13 +1,15 @@
 use crate::{
+    Result,
     app::remote_content_manager::providers::{
         ThreadSafeProviderVehicle, fetcher::Fetcher,
     },
     config::internal::listener::InboundOpts,
 };
 use futures::future::BoxFuture;
+use tracing::error;
 use serde::{Deserialize, Serialize};
 use yaml_serde::Value;
-use std::{sync::Arc, time::Duration};
+use std::{sync::{Arc, atomic::{AtomicBool, Ordering}}, time::Duration};
 
 /// The YAML structure expected at the provider URL / file.
 ///
@@ -28,11 +30,15 @@ struct ProviderScheme {
 
 type InboundUpdater =
     Box<dyn Fn(Vec<InboundOpts>) -> BoxFuture<'static, ()> + Send + Sync + 'static>;
+type ListenerUpdater =
+    dyn Fn(Vec<InboundOpts>) -> BoxFuture<'static, Result<()>>
+    + Send + Sync + 'static;
 type InboundParser =
     Box<dyn Fn(&[u8]) -> anyhow::Result<Vec<InboundOpts>> + Send + Sync + 'static>;
 
 pub struct InboundSetProvider {
     fetcher: Fetcher<InboundUpdater, InboundParser>,
+    on_update: Arc<ListenerUpdater>,
 }
 
 impl InboundSetProvider {
@@ -40,7 +46,7 @@ impl InboundSetProvider {
         name: String,
         interval: Duration,
         vehicle: ThreadSafeProviderVehicle,
-        on_update: impl Fn(Vec<InboundOpts>) -> BoxFuture<'static, ()>
+        on_update: impl Fn(Vec<InboundOpts>) -> BoxFuture<'static, Result<()>>
         + Send
         + Sync
         + 'static,
@@ -64,19 +70,40 @@ impl InboundSetProvider {
             Ok(opts)
         });
 
-        let updater: InboundUpdater = Box::new(move |opts| on_update(opts));
+        let on_update: Arc<ListenerUpdater> = Arc::new(on_update);
+        let update = on_update.clone();
+        let retry = Arc::new(AtomicBool::new(false));
+        let update_retry = retry.clone();
+        let updater: InboundUpdater = Box::new(move |opts| {
+            let future = update(opts);
+            let retry = update_retry.clone();
+            Box::pin(async move {
+                let result = future.await;
+                retry.store(result.is_err(), Ordering::Release);
+                if let Err(e) = result {
+                    error!("inbound provider update failed: {e}");
+                }
+            })
+        });
 
         Ok(Self {
-            fetcher: Fetcher::new(name, interval, vehicle, parser, Some(updater)),
+            fetcher: Fetcher::new(name, interval, vehicle, parser, Some(updater))
+                .with_update_retry(retry),
+            on_update,
         })
     }
 
     pub async fn initialize(&self) -> anyhow::Result<Vec<InboundOpts>> {
         let items = self.fetcher.initial().await?;
-        if let Some(updater) = self.fetcher.on_update.as_ref() {
-            updater(items.clone()).await;
+        if let Err(e) = (self.on_update)(items.clone()).await {
+            self.fetcher.stop_and_wait().await;
+            return Err(e.into());
         }
         Ok(items)
+    }
+
+    pub async fn stop(&self) {
+        self.fetcher.stop_and_wait().await;
     }
 }
 
@@ -125,6 +152,7 @@ listeners:
                 let received = received_clone.clone();
                 Box::pin(async move {
                     received.lock().await.extend(opts);
+                    Ok(())
                 })
             },
         )
@@ -165,6 +193,7 @@ listeners:
                 let received = received_clone.clone();
                 Box::pin(async move {
                     received.lock().await.extend(opts);
+                    Ok(())
                 })
             },
         )
@@ -191,6 +220,7 @@ listeners:
                 Box::pin(async move {
                     assert!(opts.is_empty());
                     *called.lock().await = true;
+                    Ok(())
                 })
             },
         )
@@ -226,6 +256,7 @@ listeners:
                 let received = received_clone.clone();
                 Box::pin(async move {
                     received.lock().await.extend(opts);
+                    Ok(())
                 })
             },
         )

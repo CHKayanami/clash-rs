@@ -5,13 +5,15 @@ use std::sync::{Arc, OnceLock};
 use ipnet::IpNet;
 
 use crate::app::dns::query::QType;
-use crate::app::remote_content_manager::providers::rule_provider::ThreadSafeRuleProvider;
+use crate::app::remote_content_manager::providers::rule_provider::{
+    ThreadSafeRuleProvider, WeakRuleProvider,
+};
 use crate::session::{Session, SocksAddr};
 
 #[derive(Clone, Default)]
 pub struct RuleSetMatcher {
     names: Vec<String>,
-    providers: Arc<OnceLock<Vec<ThreadSafeRuleProvider>>>,
+    providers: Arc<OnceLock<Vec<WeakRuleProvider>>>,
 }
 
 impl RuleSetMatcher {
@@ -31,7 +33,7 @@ impl RuleSetMatcher {
         for name in &self.names {
             let clean_name = name.strip_prefix("rule-set:").unwrap_or(name);
             if let Some(p) = map.get(clean_name) {
-                list.push(p.clone());
+                list.push(Arc::downgrade(p));
             }
         }
         let _ = self.providers.set(list);
@@ -46,7 +48,8 @@ impl RuleSetMatcher {
                 destination: SocksAddr::Domain(domain.to_string().into(), 443),
                 ..Default::default()
             };
-            return providers.iter().any(|p| p.search(&session));
+            return providers.iter().any(|p| p.upgrade()
+                .is_some_and(|p| p.search(&session)));
         }
         false
     }
@@ -60,7 +63,8 @@ impl RuleSetMatcher {
                 destination: SocksAddr::Ip(SocketAddr::new(*ip, 443)),
                 ..Default::default()
             };
-            return providers.iter().any(|p| p.search(&session));
+            return providers.iter().any(|p| p.upgrade()
+                .is_some_and(|p| p.search(&session)));
         }
         false
     }

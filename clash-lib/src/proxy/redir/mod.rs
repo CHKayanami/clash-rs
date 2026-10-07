@@ -1,3 +1,4 @@
+use crate::runner::ListenerReady;
 use crate::proxy::AnyStream;
 use super::inbound::InboundHandlerTrait;
 use crate::{
@@ -53,8 +54,10 @@ impl InboundHandlerTrait for RedirInbound {
         false
     }
 
-    async fn listen_tcp(&self) -> std::io::Result<()> {
+    async fn listen_tcp(&self, ready: ListenerReady) -> std::io::Result<()> {
         let listener = try_create_dualstack_tcplistener(self.addr)?;
+
+        ready.notify();
 
         loop {
             let (socket, peer_addr) = match listener.accept().await {
@@ -125,7 +128,7 @@ impl InboundHandlerTrait for RedirInbound {
         }
     }
 
-    async fn listen_udp(&self) -> std::io::Result<()> {
+    async fn listen_udp(&self, _ready: ListenerReady) -> std::io::Result<()> {
         Err(new_io_error("unsupported UDP protocol for Redir inbound"))
     }
 }

@@ -3,7 +3,10 @@ use std::net::SocketAddr;
 use tokio::net::TcpStream;
 use tracing::warn;
 
-use crate::proxy::utils::{ToCanonical, apply_tcp_options};
+use crate::{
+    proxy::utils::{ToCanonical, apply_tcp_options},
+    runner::ListenerReady,
+};
 
 #[async_trait]
 pub trait InboundHandlerTrait: Sync + Send {
@@ -11,8 +14,8 @@ pub trait InboundHandlerTrait: Sync + Send {
     fn handle_tcp(&self) -> bool;
     /// support udp or not
     fn handle_udp(&self) -> bool;
-    async fn listen_tcp(&self) -> std::io::Result<()>;
-    async fn listen_udp(&self) -> std::io::Result<()>;
+    async fn listen_tcp(&self, ready: ListenerReady) -> std::io::Result<()>;
+    async fn listen_udp(&self, ready: ListenerReady) -> std::io::Result<()>;
 }
 
 /// Accept-time gate shared by every TCP inbound.

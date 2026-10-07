@@ -1,3 +1,4 @@
+use crate::runner::ListenerReady;
 use crate::proxy::AnyStream;
 use crate::{
     app::dispatcher::Dispatcher,
@@ -63,22 +64,21 @@ impl TunnelInbound {
 #[async_trait]
 impl InboundHandlerTrait for TunnelInbound {
     fn handle_tcp(&self) -> bool {
-        true
+        self.network.iter().any(|network| network.eq_ignore_ascii_case("tcp"))
     }
 
     fn handle_udp(&self) -> bool {
-        true
+        self.network.iter().any(|network| network.eq_ignore_ascii_case("udp"))
     }
 
-    async fn listen_tcp(&self) -> std::io::Result<()> {
-        if !self.network.contains(&"tcp".to_string()) {
-            return Ok(());
-        }
+    async fn listen_tcp(&self, ready: ListenerReady) -> std::io::Result<()> {
         info!(
             "[Tunnel-TCP] listening on {}, remote: {}",
             self.listen, self.target
         );
         let listener = try_create_dualstack_tcplistener(self.listen)?;
+
+        ready.notify();
 
         loop {
             let (socket, peer_addr) = match listener.accept().await {
@@ -113,10 +113,7 @@ impl InboundHandlerTrait for TunnelInbound {
         }
     }
 
-    async fn listen_udp(&self) -> std::io::Result<()> {
-        if !self.network.contains(&"udp".to_string()) {
-            return Ok(());
-        }
+    async fn listen_udp(&self, ready: ListenerReady) -> std::io::Result<()> {
         info!(
             "[Tunnel-UDP] listening on {}, remote: {}",
             self.listen, self.target
@@ -138,6 +135,7 @@ impl InboundHandlerTrait for TunnelInbound {
             .dispatch_datagram(sess, Box::new(inbound))
             .await;
 
+        ready.notify();
         std::future::pending::<()>().await;
         Ok(())
     }

@@ -1,4 +1,4 @@
-use std::{collections::HashMap, fmt::Display, sync::Arc, time::Duration};
+use std::{collections::HashMap, fmt::Display, sync::{Arc, Weak}, time::Duration};
 
 use async_trait::async_trait;
 use erased_serde::Serialize as ESerialize;
@@ -139,6 +139,7 @@ pub trait RuleProvider: Provider {
 }
 
 pub type ThreadSafeRuleProvider = Arc<dyn RuleProvider + Send + Sync>;
+pub type WeakRuleProvider = Weak<dyn RuleProvider + Send + Sync>;
 
 type RuleUpdater =
     Box<dyn Fn(RuleContent) -> BoxFuture<'static, ()> + Send + Sync + 'static>;

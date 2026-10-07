@@ -2,7 +2,10 @@ use std::sync::{Arc, OnceLock};
 use tracing::warn;
 
 use crate::{
-    app::router::{GeoSiteMatcher, Router, RuleMatcher, ThreadSafeRuleProvider},
+    app::{
+        router::{GeoSiteMatcher, Router, RuleMatcher},
+        remote_content_manager::providers::rule_provider::WeakRuleProvider,
+    },
     common::trie,
     session::{Session, SocksAddr},
 };
@@ -14,7 +17,7 @@ pub struct NameServerPolicyContainer {
     has_entries: bool,
 
     geosite_matchers: OnceLock<Vec<(GeoSiteMatcher, Vec<String>)>>,
-    bound_rule_providers: OnceLock<Vec<(ThreadSafeRuleProvider, Vec<String>)>>,
+    bound_rule_providers: OnceLock<Vec<(WeakRuleProvider, Vec<String>)>>,
 }
 
 impl Default for NameServerPolicyContainer {
@@ -92,7 +95,7 @@ impl NameServerPolicyContainer {
             let rp_map = router.get_rule_providers();
             for (rs_name, upstreams) in &self.ruleset_entries {
                 if let Some(rp) = rp_map.get(rs_name) {
-                    providers.push((rp.clone(), upstreams.clone()));
+                    providers.push((Arc::downgrade(rp), upstreams.clone()));
                 } else {
                     warn!(
                         "nameserver-policy rule-set provider not found: {}",
@@ -124,7 +127,7 @@ impl NameServerPolicyContainer {
 
         if let Some(providers) = self.bound_rule_providers.get() {
             for (rp, upstreams) in providers {
-                if rp.search(&sess) {
+                if rp.upgrade().is_some_and(|rp| rp.search(&sess)) {
                     return Some(upstreams.as_slice());
                 }
             }

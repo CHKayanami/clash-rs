@@ -1,24 +1,26 @@
 use std::net::IpAddr;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, Weak};
 
 use crate::app::dns::endpoint::DnsEndpoint;
-use crate::app::{outbound::manager::ThreadSafeOutboundManager, router::ArcRouter};
+use crate::app::{outbound::manager::OutboundManager, router::Router};
 use crate::proxy::AnyOutboundHandler;
 use crate::session::{Network, Session, SocksAddr, Type};
 
 /// Late-bound reference to `Router`. Populated by `lib.rs` after the router
 /// is constructed; the DNS resolver itself is built earlier.
-pub type PendingRouter = Arc<OnceLock<ArcRouter>>;
+pub type PendingRouter = Arc<OnceLock<Weak<Router>>>;
 
 /// Late-bound reference to `OutboundManager`. Populated by `lib.rs` after the
 /// outbound manager is constructed.
-pub type PendingOutboundManager = Arc<OnceLock<ThreadSafeOutboundManager>>;
+pub type PendingOutboundManager = Arc<OnceLock<Weak<OutboundManager>>>;
 
 /// Bundle of late-bound handles consulted by DNS upstreams when
 /// `dns.respect-rules` is enabled, allowing upstream DNS dials to be routed
 /// through the rule engine.
 ///
 /// Both `OnceLock`s start empty and are filled exactly once during startup.
+/// The runtime owns these managers; weak references avoid keeping their DNS
+/// resolver alive through a reference cycle after a configuration reload.
 /// Until both are set, callers fall back to the static `outbound` handler —
 /// this keeps early DNS lookups (during startup before the rule engine
 /// exists) working.
@@ -40,8 +42,8 @@ impl RuleDispatch {
         endpoint: &DnsEndpoint,
         network: Network,
     ) -> Option<AnyOutboundHandler> {
-        let router = self.router.get()?.clone();
-        let outbound_manager = self.outbound_manager.get()?.clone();
+        let router = self.router.get()?.upgrade()?;
+        let outbound_manager = self.outbound_manager.get()?.upgrade()?;
 
         let dst = if let Ok(ip) = endpoint.host.parse::<IpAddr>() {
             SocksAddr::from((ip, endpoint.port))

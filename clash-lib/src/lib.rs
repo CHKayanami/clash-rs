@@ -9,7 +9,7 @@ use crate::{
         dns::{self, SystemResolver, ThreadSafeDNSResolver, config::DNSListenAddr},
         inbound::manager::InboundManager,
         logging::LogEvent,
-        net::{init_net_config, set_tun_somark},
+        net::NetworkConfig,
         outbound::manager::OutboundManager,
         profile,
         router::Router,
@@ -25,12 +25,13 @@ use crate::{
     config::{
         InternalConfig,
         def::{self, LogLevel},
-        internal::proxy::OutboundProxy,
+        internal::{proxy::OutboundProxy, listener::InboundProviderDef},
     },
     runner::{ArcService, AsyncService, CriticalTaskGuard, ServiceContext},
 };
 
 use std::{
+    collections::HashMap,
     io,
     path::PathBuf,
     sync::{Arc, OnceLock},
@@ -45,6 +46,7 @@ pub mod config;
 mod common;
 mod proxy;
 mod runner;
+mod reload;
 mod session;
 
 use crate::common::{geodata, mmdb::MmdbLookup};
@@ -371,9 +373,9 @@ pub async fn start(
     let controller_cfg = config.general.controller.clone();
     let log_level = config.general.log_level;
     let (fatal_tx, mut fatal_rx) = mpsc::channel(16);
-    let mut active_config = config.clone();
+    let active_config = config.clone();
 
-    let mut components = create_components(
+    let components = create_components(
         cwd_path.clone(),
         config,
         None,
@@ -408,34 +410,42 @@ pub async fn start(
         components.dns_enabled,
     );
 
-    let mut api_listener = Arc::new(app::api::ApiRunner::from_context(
+    let api_listener = Arc::new(app::api::ApiRunner::from_context(
         controller_cfg.clone(),
         log_tx.clone(),
         initial_runtime_ctx,
         Some(shutdown_token.child_token()),
     ));
 
-    let mut api_service_context = ServiceContext::with_fatal_tx(
+    let api_service_context = ServiceContext::with_fatal_tx(
         shutdown_token.child_token(),
         fatal_tx.clone(),
     );
-    api_listener.start(&api_service_context).await?;
-
-    {
-        let mut g = global_state.lock().await;
-        #[cfg(feature = "tun")]
-        {
-            g.tunnel_runner = components.tun_runner.clone();
-        }
-        g.dns_listener = components.dns_listener.clone();
+    let previous_network = NetworkConfig::capture();
+    components.network_config.apply();
+    if let Err(e) = components.start_all().await {
+        components.stop_all().await;
+        previous_network.apply();
+        return Err(e);
+    }
+    if let Err(e) = api_listener.start(&api_service_context).await {
+        components.stop_all().await;
+        previous_network.apply();
+        return Err(e);
     }
 
-    components.start_all().await?;
-
-    let cwd_clone = cwd.clone();
-    let reload_token = shutdown_token.child_token();
+    let mut runtime = reload::RuntimeState {
+        components,
+        api_listener,
+        api_service_context,
+        active_config,
+        global_state,
+        log_tx,
+        shutdown_token: shutdown_token.clone(),
+        fatal_tx: fatal_tx.clone(),
+        dns_collect_file,
+    };
     let shutdown_token_clone = shutdown_token.clone();
-    let fatal_tx_for_reload = fatal_tx.clone();
     let reload_guard = CriticalTaskGuard::new(
         "config_reloader",
         shutdown_token.clone(),
@@ -459,166 +469,14 @@ pub async fn start(
                                 }
                             };
 
-                            let controller_cfg = new_config.general.controller.clone();
-                            let previous_controller_cfg = api_listener.controller_config().clone();
-
-                            let new_components = match create_components(
-                                PathBuf::from(&cwd_clone),
-                                new_config.clone(),
-                                Some(&components),
-                                dns_collect_file.clone(),
-                                Some(fatal_tx_for_reload.clone()),
-                            ).await {
-                                Ok(nc) => nc,
-                                Err(e) => {
-                                    error!("failed to reload config: {}", e);
-                                    let _ = done.send(Err(e.to_string()));
-                                    continue;
-                                }
-                            };
-
-                            components.stop_all().await;
-                            if let Err(e) = new_components.start_all().await {
-                                error!("failed to start new components during reload: {}", e);
-
-                                let restored_components = match create_components(
-                                    PathBuf::from(&cwd_clone),
-                                    active_config.clone(),
-                                    None,
-                                    dns_collect_file.clone(),
-                                    Some(fatal_tx_for_reload.clone()),
-                                ).await {
-                                    Ok(restored) => restored,
-                                    Err(restore_err) => {
-                                        error!("failed to rebuild previous components after reload failure: {}", restore_err);
-                                        let message = format!(
-                                            "reload failed: {e}; rollback failed: {restore_err}"
-                                        );
-                                        let _ = done.send(Err(message));
-                                        let _ = fatal_tx_for_reload.send(restore_err).await;
-                                        break;
-                                    }
-                                };
-
-                                if let Err(restore_err) = restored_components.start_all().await {
-                                    error!("failed to restart previous components after reload failure: {}", restore_err);
-                                    let message = format!(
-                                        "reload failed: {e}; rollback failed: {restore_err}"
-                                    );
-                                    let _ = done.send(Err(message));
-                                    let _ = fatal_tx_for_reload.send(restore_err).await;
-                                    break;
-                                }
-
-                                let restored_runtime_ctx = app::api::RuntimeContext::new(
-                                    restored_components.inbound_manager.clone(),
-                                    restored_components.dispatcher.clone(),
-                                    global_state.clone(),
-                                    restored_components.dns_resolver.clone(),
-                                    restored_components.outbound_manager.clone(),
-                                    restored_components.statistics_manager.clone(),
-                                    restored_components.cache_store.clone(),
-                                    restored_components.router.clone(),
-                                    cwd_clone.clone(),
-                                    restored_components.dns_listen.clone(),
-                                    restored_components.dns_enabled,
-                                );
-
-                                {
-                                    let mut g = global_state.lock().await;
-                                    #[cfg(feature = "tun")]
-                                    {
-                                        g.tunnel_runner = restored_components.tun_runner.clone();
-                                    }
-                                    g.dns_listener = restored_components.dns_listener.clone();
-                                }
-
-                                let _ = api_listener.stop().await;
-                                api_service_context.tracker().close();
-                                api_service_context.tracker().wait().await;
-
-                                let restored_api_listener = Arc::new(
-                                    app::api::ApiRunner::from_context(
-                                        previous_controller_cfg,
-                                        log_tx.clone(),
-                                        restored_runtime_ctx,
-                                        Some(reload_token.child_token()),
-                                    ),
-                                );
-                                let restored_api_context = ServiceContext::with_fatal_tx(
-                                    reload_token.child_token(),
-                                    fatal_tx_for_reload.clone(),
-                                );
-                                if let Err(restore_err) = restored_api_listener
-                                    .start(&restored_api_context)
-                                    .await
-                                {
-                                    error!("failed to restore API listener after reload failure: {}", restore_err);
-                                    restored_components.stop_all().await;
-                                    let message = format!(
-                                        "reload failed: {e}; API rollback failed: {restore_err}"
-                                    );
-                                    let _ = done.send(Err(message));
-                                    let _ = fatal_tx_for_reload.send(restore_err).await;
-                                    break;
-                                }
-
-                                api_listener = restored_api_listener;
-                                api_service_context = restored_api_context;
-                                components = restored_components;
-                                let _ = done.send(Err(e.to_string()));
-                                continue;
+                            let result = runtime.reload(new_config).await;
+                            if let Err(e) = &result {
+                                error!("failed to reload config: {}", e);
                             }
-
-                            let new_runtime_ctx = app::api::RuntimeContext::new(
-                                new_components.inbound_manager.clone(),
-                                new_components.dispatcher.clone(),
-                                global_state.clone(),
-                                new_components.dns_resolver.clone(),
-                                new_components.outbound_manager.clone(),
-                                new_components.statistics_manager.clone(),
-                                new_components.cache_store.clone(),
-                                new_components.router.clone(),
-                                cwd_clone.clone(),
-                                new_components.dns_listen.clone(),
-                                new_components.dns_enabled,
-                            );
-
-                            let mut g = global_state.lock().await;
-                            #[cfg(feature = "tun")]
-                            {
-                                g.tunnel_runner = new_components.tun_runner.clone();
-                            }
-                            g.dns_listener = new_components.dns_listener.clone();
-                            drop(g);
-
-                            info!("Recreating API routes for the reloaded runtime");
-                            let _ = api_listener.stop().await;
-                            api_service_context.tracker().close();
-                            api_service_context.tracker().wait().await;
-
-                            let new_api_listener = Arc::new(app::api::ApiRunner::from_context(
-                                controller_cfg,
-                                log_tx.clone(),
-                                new_runtime_ctx,
-                                Some(reload_token.child_token()),
-                            ));
-                            let new_api_service_context = ServiceContext::with_fatal_tx(
-                                reload_token.child_token(),
-                                fatal_tx_for_reload.clone(),
-                            );
-                            if let Err(e) = new_api_listener.start(&new_api_service_context).await {
-                                error!("failed to start new API listener: {}", e);
-                                new_components.stop_all().await;
-                                let _ = done.send(Err(e.to_string()));
-                                let _ = fatal_tx_for_reload.send(e).await;
+                            let _ = done.send(result.map_err(|e| e.to_string()));
+                            if shutdown_token_clone.is_cancelled() {
                                 break;
                             }
-                            api_listener = new_api_listener;
-                            api_service_context = new_api_service_context;
-                            components = new_components;
-                            active_config = new_config;
-                            let _ = done.send(Ok(()));
                         }
                         None => {
                             break;
@@ -630,10 +488,7 @@ pub async fn start(
                 }
             }
         }
-        components.stop_all().await;
-        let _ = api_listener.stop().await;
-        api_service_context.tracker().close();
-        api_service_context.tracker().wait().await;
+        runtime.stop().await;
         Ok::<(), Error>(())
     });
 
@@ -687,6 +542,9 @@ struct RuntimeComponents {
     dns_listen: DNSListenAddr,
     dns_enabled: bool,
     service_context: ServiceContext,
+    network_config: NetworkConfig,
+    inbound_providers: HashMap<String, InboundProviderDef>,
+    cwd: String,
 
     country_mmdb: Option<MmdbLookup>,
     country_mmdb_path: Option<PathBuf>,
@@ -698,20 +556,18 @@ struct RuntimeComponents {
 
 impl RuntimeComponents {
     async fn start_all(&self) -> Result<()> {
-        if let Err(e) = self.start_all_inner().await {
-            self.stop_all().await;
-            return Err(e);
-        }
-        Ok(())
-    }
-
-    async fn start_all_inner(&self) -> Result<()> {
         #[cfg(feature = "tun")]
         self.tun_runner.start(&self.service_context).await?;
         #[cfg(all(target_os = "linux", feature = "ebpf"))]
         self.ebpf_runner.start(&self.service_context).await?;
         self.dns_listener.start(&self.service_context).await?;
         self.inbound_manager.start(&self.service_context).await?;
+        if !self.inbound_providers.is_empty() {
+            self.inbound_manager.load_inbound_providers(
+                self.cwd.clone(), self.inbound_providers.clone(),
+                self.dns_resolver.clone(),
+            ).await?;
+        }
         Ok(())
     }
 
@@ -735,51 +591,34 @@ async fn create_components(
     dns_collect_file: Option<String>,
     fatal_tx: Option<tokio::sync::mpsc::Sender<crate::Error>>,
 ) -> Result<RuntimeComponents> {
-    if config.tun.enable {
-        let explicit_iface = config
-            .general
-            .interface
-            .as_ref()
-            .and_then(|i| i.clone().into_iface_name());
-        let need_iface = explicit_iface.is_some()
-            || config.tun.route_all
-            || config.tun.auto_detect_interface;
-        let mark = config.tun.so_mark;
-        if need_iface {
-            debug!(
-                "tun enabled with auto-route or explicit interface, initializing default outbound interface"
-            );
-            init_net_config(explicit_iface.as_deref(), mark).await;
-        } else {
-            debug!(
-                "tun enabled without auto-route/auto-detect, skipping default outbound interface binding"
-            );
-            set_tun_somark(mark);
-        }
-    }
-
+    let explicit_iface = config.tun.enable.then(|| {
+        config.general.interface.as_ref()
+            .and_then(|i| i.clone().into_iface_name())
+    }).flatten();
+    let detect_interface = config.tun.enable
+        && (config.tun.route_all || config.tun.auto_detect_interface);
+    let so_mark = config.tun.enable.then_some(config.tun.so_mark).flatten();
     #[cfg(all(target_os = "linux", feature = "ebpf"))]
-    if let Some(ebpf_cfg) = &config.ebpf
-        && ebpf_cfg.enable
-    {
-        let mark = config
-            .tun
-            .so_mark
-            .or(ebpf_cfg.routing_mark)
-            .or(Some(clash_ebpf::DAE_BYPASS_MARK));
-        debug!("ebpf enabled, setting default outbound SO_MARK to {:?}", mark);
-        set_tun_somark(mark);
-    }
+    let so_mark = match &config.ebpf {
+        Some(ebpf) if ebpf.enable => config.tun.so_mark.or(ebpf.routing_mark)
+            .or(Some(clash_ebpf::DAE_BYPASS_MARK)),
+        _ => so_mark,
+    };
+    let network_config = NetworkConfig::resolve(
+        explicit_iface.as_deref(), detect_interface, so_mark,
+    );
 
     let cancellation_token = tokio_util::sync::CancellationToken::new();
     let cwd_str = cwd.to_string_lossy().to_string();
 
     debug!("initializing cache store");
-    let cache_store = profile::ThreadSafeCacheFile::new(
-        &cwd.join("cache.db").to_string_lossy(),
-        config.profile.store_selected,
-    )
-    .map_err(|e| Error::ProfileError(e.to_string()))?;
+    let cache_store = match old_components {
+        Some(old) => old.cache_store.with_store_selected(config.profile.store_selected),
+        None => profile::ThreadSafeCacheFile::new(
+            &cwd.join("cache.db").to_string_lossy(),
+            config.profile.store_selected,
+        ).map_err(|e| Error::ProfileError(e.to_string()))?,
+    };
 
     let system_resolver = Arc::new(
         SystemResolver::new(config.dns.ipv6)
@@ -899,7 +738,7 @@ async fn create_components(
     );
 
     if let Some(rd) = &rule_dispatch
-        && rd.outbound_manager.set(outbound_manager.clone()).is_err()
+        && rd.outbound_manager.set(Arc::downgrade(&outbound_manager)).is_err()
     {
         warn!(
             "RuleDispatch outbound_manager OnceLock was already set — this is \
@@ -1014,7 +853,7 @@ async fn create_components(
     );
 
     if let Some(rd) = &rule_dispatch
-        && rd.router.set(router.clone()).is_err()
+        && rd.router.set(Arc::downgrade(&router)).is_err()
     {
         warn!(
             "RuleDispatch router OnceLock was already set — this is unexpected and \
@@ -1055,17 +894,6 @@ async fn create_components(
         )
         .await,
     );
-    if !config.inbound_providers.is_empty() {
-        debug!("loading inbound providers");
-        inbound_manager
-            .load_inbound_providers(
-                cwd_str.clone(),
-                config.inbound_providers,
-                dns_resolver.clone(),
-            )
-            .await;
-    }
-
     #[cfg(feature = "tun")]
     debug!("initializing tun runner");
     #[cfg(feature = "tun")]
@@ -1117,6 +945,9 @@ async fn create_components(
         dns_listen,
         dns_enabled: dns_enable,
         service_context,
+        network_config,
+        inbound_providers: config.inbound_providers,
+        cwd: cwd_str,
         country_mmdb,
         country_mmdb_path,
         asn_mmdb,

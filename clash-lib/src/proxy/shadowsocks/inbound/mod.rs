@@ -1,3 +1,4 @@
+use crate::runner::ListenerReady;
 use crate::proxy::AnyStream;
 mod datagram;
 
@@ -142,7 +143,7 @@ impl InboundHandlerTrait for ShadowsocksInbound {
         self.udp
     }
 
-    async fn listen_tcp(&self) -> std::io::Result<()> {
+    async fn listen_tcp(&self, ready: ListenerReady) -> std::io::Result<()> {
         let context = Context::new_shared(shadowsocks::config::ServerType::Server);
         let config = self.build_server_config()?;
         let method = map_cipher(&self.cipher)?;
@@ -155,6 +156,8 @@ impl InboundHandlerTrait for ShadowsocksInbound {
             build_user_manager(&users_rx.borrow_and_update(), self.addr);
         let mut user_index = build_user_index(initial_users.as_ref());
         let mut user_manager = initial_users.map(Arc::new);
+
+        ready.notify();
 
         loop {
             tokio::select! {
@@ -247,7 +250,8 @@ impl InboundHandlerTrait for ShadowsocksInbound {
         }
     }
 
-    async fn listen_udp(&self) -> std::io::Result<()> {
+    async fn listen_udp(&self, ready: ListenerReady) -> std::io::Result<()> {
+        let mut ready = Some(ready);
         let mut users_rx = self.users_rx.clone();
 
         loop {
@@ -280,6 +284,7 @@ impl InboundHandlerTrait for ShadowsocksInbound {
                     .await
                     {
                         Ok(s) => break s,
+                        Err(e) if ready.is_some() => return Err(e),
                         Err(e) => {
                             warn!(
                                 "shadowsocks inbound {}: failed to bind UDP \
@@ -301,6 +306,10 @@ impl InboundHandlerTrait for ShadowsocksInbound {
                     &config,
                     socket.into(),
                 );
+
+            if let Some(ready) = ready.take() {
+                ready.notify();
+            }
 
             let dispatcher = self.dispatcher.clone();
             let wrapped_socket =

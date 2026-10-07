@@ -1,3 +1,4 @@
+use crate::runner::ListenerReady;
 use crate::proxy::AnyStream;
 use super::{
     datagram::{ChannelDatagram, UdpPacket},
@@ -83,7 +84,7 @@ impl InboundHandlerTrait for TproxyInbound {
         self.udp
     }
 
-    async fn listen_tcp(&self) -> std::io::Result<()> {
+    async fn listen_tcp(&self, ready: ListenerReady) -> std::io::Result<()> {
         warn_allow_lan_unenforced(self.addr, self.allow_lan);
 
         let (socket, dualstack) =
@@ -104,6 +105,8 @@ impl InboundHandlerTrait for TproxyInbound {
         socket.listen(1024)?;
 
         let listener = TcpListener::from_std(socket.into())?;
+
+        ready.notify();
 
         loop {
             let (socket, peer_addr) = match listener.accept().await {
@@ -149,7 +152,7 @@ impl InboundHandlerTrait for TproxyInbound {
         }
     }
 
-    async fn listen_udp(&self) -> std::io::Result<()> {
+    async fn listen_udp(&self, ready: ListenerReady) -> std::io::Result<()> {
         warn_allow_lan_unenforced(self.addr, self.allow_lan);
 
         let (socket, dual_stack) =
@@ -180,6 +183,8 @@ impl InboundHandlerTrait for TproxyInbound {
         socket.bind(&self.addr.into())?;
 
         let listener = unix_udp_sock::UdpSocket::from_std(socket.into())?;
+
+        ready.notify();
 
         handle_inbound_datagram(
             self.fw_mark,

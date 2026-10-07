@@ -1,3 +1,4 @@
+use crate::runner::ListenerReady;
 use std::net::SocketAddr;
 
 use axum::{Router, ServiceExt};
@@ -13,6 +14,7 @@ pub async fn serve_tcp(
     router: Router,
     auth_secret: String,
     cors_allow_origins: Option<Vec<String>>,
+    ready: ListenerReady,
 ) -> Result<(), crate::Error> {
     let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
     info!(
@@ -54,6 +56,7 @@ pub async fn serve_tcp(
     }
     let app = router.route_layer(AuthMiddlewareLayer::new(auth_secret));
     let app = MapRequestLayer::new(rewrite_websocket_uri).layer(app);
+    ready.notify();
     axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),

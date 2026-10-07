@@ -1,3 +1,4 @@
+use crate::runner::ListenerReady;
 use crate::app::dns::query::IngressProfile;
 use async_trait::async_trait;
 use std::net::IpAddr;
@@ -204,13 +205,15 @@ impl InboundHandlerTrait for EbpfInbound {
         true
     }
 
-    async fn listen_tcp(&self) -> std::io::Result<()> {
+    async fn listen_tcp(&self, ready: ListenerReady) -> std::io::Result<()> {
         use super::dns::handle_tcp_dns;
         use crate::session::{Network, Session, Type};
 
         let listener = self.listener()?;
         info!("clash-ebpf TCP inbound worker running");
         let mut connections = tokio::task::JoinSet::new();
+
+        ready.notify();
 
         loop {
             while connections.try_join_next().is_some() {}
@@ -253,10 +256,11 @@ impl InboundHandlerTrait for EbpfInbound {
         }
     }
 
-    async fn listen_udp(&self) -> std::io::Result<()> {
+    async fn listen_udp(&self, ready: ListenerReady) -> std::io::Result<()> {
         use crate::session::{Network, Session, Type};
 
         let listener = self.listener()?;
+        ready.notify();
         info!("clash-ebpf UDP inbound worker running");
 
         const UDP_CHANNEL_CAPACITY: usize = 1024;

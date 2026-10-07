@@ -16,7 +16,10 @@ use crate::proxy::redir::RedirInbound;
 #[cfg(all(target_os = "linux", feature = "tproxy"))]
 use crate::proxy::tproxy::TproxyInbound;
 
-use crate::Dispatcher;
+use crate::{
+    Dispatcher, Error, Result,
+    runner::prepare_service,
+};
 use futures::future::BoxFuture;
 use tracing::{error, info, warn};
 
@@ -37,15 +40,18 @@ async fn listen_with_rebind_retry(
     handler: Arc<dyn InboundHandlerTrait>,
     transport: ListenerTransport,
     name: &str,
-) -> std::io::Result<()> {
+) -> Result<BoxFuture<'static, Result<()>>> {
     for attempt in 0..REBIND_ATTEMPTS {
-        let result = match transport {
-            ListenerTransport::Tcp => handler.listen_tcp().await,
-            ListenerTransport::Udp => handler.listen_udp().await,
-        };
+        let handler = handler.clone();
+        let result = prepare_service(move |ready| async move {
+            match transport {
+                ListenerTransport::Tcp => handler.listen_tcp(ready).await,
+                ListenerTransport::Udp => handler.listen_udp(ready).await,
+            }.map_err(Error::from)
+        }).await;
 
         match result {
-            Err(e)
+            Err(Error::Io(e))
                 if e.kind() == std::io::ErrorKind::AddrInUse
                     && attempt + 1 < REBIND_ATTEMPTS =>
             {
@@ -63,59 +69,39 @@ async fn listen_with_rebind_retry(
     unreachable!("rebind loop always returns on its final attempt")
 }
 
-pub(crate) fn build_network_listeners(
+pub(crate) async fn build_network_listeners(
     inbound_opts: &InboundOpts,
     dispatcher: Arc<Dispatcher>,
     authenticator: ThreadSafeAuthenticator,
     users_rx: Option<tokio::sync::watch::Receiver<Vec<InboundUser>>>,
-) -> Option<Vec<BoxFuture<'static, Result<(), crate::Error>>>> {
+) -> Result<Vec<BoxFuture<'static, Result<()>>>> {
     let name = &inbound_opts.common_opts().name;
     let addr = inbound_opts.common_opts().listen.0;
     let port = inbound_opts.common_opts().port;
-
-    if let Some(handler) =
-        build_handler(inbound_opts, dispatcher, authenticator, users_rx)
-    {
-        let mut runners: Vec<BoxFuture<'static, Result<(), crate::Error>>> =
-            Vec::new();
-
-        if handler.handle_tcp() {
-            let tcp_listener = handler.clone();
-
-            let name = name.clone();
-            runners.push(Box::pin(async move {
-                info!("{} TCP listening at: {}:{}", name, addr, port,);
-                listen_with_rebind_retry(tcp_listener, ListenerTransport::Tcp, &name)
-                    .await
-                    .inspect_err(|x| {
-                        error!("handler {} tcp listen failed: {x}", name);
-                    })
-                    .map_err(|e| e.into())
-            }));
+    let handler = build_handler(
+        inbound_opts, dispatcher, authenticator, users_rx,
+    ).ok_or_else(|| Error::InvalidConfig(format!(
+        "could not initialize inbound {name}"
+    )))?;
+    let mut runners = Vec::new();
+    for (enabled, transport, label) in [
+        (handler.handle_tcp(), ListenerTransport::Tcp, "TCP"),
+        (handler.handle_udp(), ListenerTransport::Udp, "UDP"),
+    ] {
+        if enabled {
+            let runner = listen_with_rebind_retry(
+                handler.clone(), transport, name,
+            ).await.inspect_err(|e| {
+                error!("handler {} {} listen failed: {}", name, label, e);
+            })?;
+            info!("{} {} listening at: {}:{}", name, label, addr, port);
+            runners.push(runner);
         }
-
-        if handler.handle_udp() {
-            let udp_listener = handler.clone();
-            let name = name.clone();
-            runners.push(Box::pin(async move {
-                info!("{} UDP listening at: {}:{}", name, addr, port,);
-                listen_with_rebind_retry(udp_listener, ListenerTransport::Udp, &name)
-                    .await
-                    .inspect_err(|x| {
-                        error!("handler {} udp listen failed: {x}", name);
-                    })
-                    .map_err(|e| e.into())
-            }));
-        }
-
-        if runners.is_empty() {
-            warn!("no listener for {}", name);
-            return None;
-        }
-        Some(runners)
-    } else {
-        None
     }
+    if runners.is_empty() {
+        return Err(Error::InvalidConfig(format!("no listener for {name}")));
+    }
+    Ok(runners)
 }
 
 fn build_handler(
@@ -275,7 +261,9 @@ mod tests {
         atomic::{AtomicUsize, Ordering},
     };
 
+    use std::future::pending;
     use async_trait::async_trait;
+    use crate::runner::ListenerReady;
 
     use super::*;
 
@@ -295,16 +283,17 @@ mod tests {
             false
         }
 
-        async fn listen_tcp(&self) -> std::io::Result<()> {
+        async fn listen_tcp(&self, ready: ListenerReady) -> std::io::Result<()> {
             let attempt = self.attempts.fetch_add(1, Ordering::SeqCst);
             if attempt < self.failures_before_success {
                 Err(std::io::Error::from(self.error_kind))
             } else {
-                Ok(())
+                ready.notify();
+                pending().await
             }
         }
 
-        async fn listen_udp(&self) -> std::io::Result<()> {
+        async fn listen_udp(&self, _ready: ListenerReady) -> std::io::Result<()> {
             unreachable!()
         }
     }
@@ -317,9 +306,11 @@ mod tests {
             error_kind: std::io::ErrorKind::AddrInUse,
         });
 
-        listen_with_rebind_retry(handler.clone(), ListenerTransport::Tcp, "test")
+        let _listener = listen_with_rebind_retry(
+            handler.clone(), ListenerTransport::Tcp, "test",
+        )
             .await
-            .expect("transient address-in-use should be retried");
+            .unwrap_or_else(|e| panic!("transient address-in-use: {e}"));
 
         assert_eq!(handler.attempts.load(Ordering::SeqCst), 3);
     }
@@ -332,15 +323,15 @@ mod tests {
             error_kind: std::io::ErrorKind::PermissionDenied,
         });
 
-        let err = listen_with_rebind_retry(
+        let result = listen_with_rebind_retry(
             handler.clone(),
             ListenerTransport::Tcp,
             "test",
         )
-        .await
-        .expect_err("non-address-in-use errors should be returned immediately");
+        .await;
 
-        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(matches!(result, Err(Error::Io(e))
+            if e.kind() == std::io::ErrorKind::PermissionDenied));
         assert_eq!(handler.attempts.load(Ordering::SeqCst), 1);
     }
 }

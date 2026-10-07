@@ -14,7 +14,7 @@ use tower_http::{
     services::ServeDir,
     trace::TraceLayer,
 };
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 
 use super::context::RuntimeContext;
 use crate::{
@@ -29,7 +29,7 @@ use crate::{
         router::ArcRouter,
     },
     config::config::Controller,
-    runner::{AsyncService, ServiceContext},
+    runner::{AsyncService, ServiceContext, prepare_service},
 };
 
 pub struct ApiRunner {
@@ -260,127 +260,46 @@ impl AsyncService for ApiRunner {
             }
         }
 
-        let tcp_addr_display = tcp_addr.clone();
-        let ipc_addr_display = ipc_addr.clone();
+        let mut listeners = Vec::new();
+        if let Some(bind_addr) = tcp_addr {
+            let bind_addr = if bind_addr.starts_with(':') {
+                format!("127.0.0.1{bind_addr}")
+            } else {
+                bind_addr
+            };
+            let auth_secret = controller_cfg.secret.clone().unwrap_or_default();
+            let origins = controller_cfg.cors_allow_origins.clone();
+            let router = router.clone();
+            listeners.push(prepare_service(move |ready| async move {
+                super::tcp::serve_tcp(
+                    bind_addr, router, auth_secret, origins, ready,
+                ).await
+            }).await?);
+        }
+        if let Some(path) = ipc_addr {
+            listeners.push(prepare_service(move |ready| async move {
+                ipc::serve_ipc(router, &path, ready).await
+            }).await?);
+        }
 
         let cancellation_token = self.cancellation_token.clone();
-        let cancel_child = cancellation_token.child_token();
         let ctx_cancel = ctx.cancellation_token().clone();
         let lifecycle_tokens = vec![cancellation_token.clone(), ctx_cancel.clone()];
-
         ctx.spawn_critical_with_tokens("api_server", lifecycle_tokens, async move {
-            let tcp_cancel = cancel_child.child_token();
-            let ipc_cancel = cancel_child.child_token();
-
-            let tcp_handle = tcp_addr.map(|bind_addr| {
-                let bind_addr = if bind_addr.starts_with(':') {
-                    info!(
-                        "TCP API Server address not supplied, listening on \
-                         `127.0.0.1`"
-                    );
-                    format!("127.0.0.1{bind_addr}")
-                } else {
-                    bind_addr
-                };
-                let auth_secret = controller_cfg.secret.clone().unwrap_or_default();
-                let cors_allow_origins = controller_cfg.cors_allow_origins.clone();
-                let router = router.clone();
-                let cancel = tcp_cancel.clone();
-                tokio::spawn(async move {
-                    tokio::select! {
-                        res = super::tcp::serve_tcp(
-                            bind_addr,
-                            router,
-                            auth_secret,
-                            cors_allow_origins,
-                        ) => res,
-                        _ = cancel.cancelled() => {
-                            debug!("TCP API server gracefully cancelled");
-                            Ok(())
-                        }
-                    }
-                })
-            });
-
-            let ipc_handle = ipc_addr.as_ref().map(|ipc_path| {
-                let ipc_path = ipc_path.clone();
-                let router = router.clone();
-                let cancel = ipc_cancel.clone();
-                tokio::spawn(async move {
-                    tokio::select! {
-                        res = ipc::serve_ipc(router, &ipc_path) => res,
-                        _ = cancel.cancelled() => {
-                            debug!("IPC API server gracefully cancelled");
-                            Ok(())
-                        }
-                    }
-                })
-            });
-
-            match (tcp_addr_display.as_deref(), ipc_addr_display.as_deref()) {
-                (Some(tcp), Some(ipc)) => debug!(
-                    "API server is running on both TCP {} and IPC {}",
-                    tcp, ipc
-                ),
-                (Some(tcp), None) => debug!("API server is running on TCP {}", tcp),
-                (None, Some(ipc)) => debug!("API server is running on IPC {}", ipc),
-                (None, None) => unreachable!(),
-            }
-
-            let mut tcp_running = tcp_handle.is_some();
-            let mut ipc_running = ipc_handle.is_some();
-
-            let mut tcp_task = futures::future::OptionFuture::from(tcp_handle);
-            let mut ipc_task = futures::future::OptionFuture::from(ipc_handle);
-
             tokio::select! {
-                Some(res) = &mut tcp_task => {
-                    tcp_running = false;
-                    match res {
-                        Ok(Err(e)) => {
-                            error!("TCP API server failed: {}", e);
-                        }
-                        Err(join_err) => {
-                            error!("TCP API server task panicked: {}", join_err);
-                        }
-                        Ok(Ok(())) => {
-                            info!("TCP API server stopped");
-                        }
+                result = futures::future::try_join_all(listeners) => {
+                    if let Err(e) = result {
+                        error!("API server failed: {}", e);
                     }
                 }
-                Some(res) = &mut ipc_task => {
-                    ipc_running = false;
-                    match res {
-                        Ok(Err(e)) => {
-                            error!("IPC API server failed: {}", e);
-                        }
-                        Err(join_err) => {
-                            error!("IPC API server task panicked: {}", join_err);
-                        }
-                        Ok(Ok(())) => {
-                            info!("IPC API server stopped");
-                        }
-                    }
-                }
-                _ = cancel_child.cancelled() => {
+                _ = cancellation_token.cancelled() => {
                     info!("API server closed gracefully");
                 }
                 _ = ctx_cancel.cancelled() => {
                     info!("API server closed gracefully via context");
                 }
             }
-
-            tcp_cancel.cancel();
-            ipc_cancel.cancel();
-
-            if tcp_running {
-                let _ = tcp_task.await;
-            }
-            if ipc_running {
-                let _ = ipc_task.await;
-            }
         });
-
         Ok(())
     }
 

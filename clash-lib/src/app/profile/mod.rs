@@ -96,6 +96,13 @@ impl ThreadSafeCacheFile {
         self.store_selected
     }
 
+    pub fn with_store_selected(&self, store_selected: bool) -> Self {
+        Self {
+            db: self.db.clone(),
+            store_selected,
+        }
+    }
+
     pub fn set_selected(&self, group: &str, server: &str) {
         if !self.store_selected {
             return;
@@ -488,6 +495,24 @@ mod tests {
 
         let map = cache.get_selected_map();
         assert_eq!(map.get("PROXY"), Some(&"Node-2".to_string()));
+    }
+
+    #[test]
+    fn test_reload_shares_database_with_independent_selection_policy() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("cache.db");
+        let original = ThreadSafeCacheFile::new(path.to_str().unwrap(), true).unwrap();
+        original.set_selected("PROXY", "Node-1");
+
+        let disabled = original.with_store_selected(false);
+        disabled.set_selected("PROXY", "Node-2");
+        assert_eq!(disabled.get_selected("PROXY"), None);
+        assert_eq!(original.get_selected("PROXY").as_deref(), Some("Node-1"));
+
+        let enabled = disabled.with_store_selected(true);
+        assert_eq!(enabled.get_selected("PROXY").as_deref(), Some("Node-1"));
+        enabled.set_selected("PROXY", "Node-3");
+        assert_eq!(original.get_selected("PROXY").as_deref(), Some("Node-3"));
     }
 
     #[test]

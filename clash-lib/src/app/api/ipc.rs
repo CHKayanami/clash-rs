@@ -1,8 +1,9 @@
+use crate::runner::ListenerReady;
 use axum::Router;
 use tracing::error;
 
 #[cfg(windows)]
-pub async fn serve_ipc(router: Router, path: &str) -> crate::Result<()> {
+pub async fn serve_ipc(router: Router, path: &str, ready: ListenerReady) -> crate::Result<()> {
     use axum::ServiceExt;
     use tower::{Layer, util::MapRequestLayer};
     use tracing::info;
@@ -12,10 +13,11 @@ pub async fn serve_ipc(router: Router, path: &str) -> crate::Result<()> {
 
     let listener = NamedPipeListener {
         path: path.to_string(),
-        first_instance: true,
+        pending: Some(create_named_pipe_with_security(path, true)?),
     };
     let app = MapRequestLayer::new(rewrite_websocket_uri).layer(router);
 
+    ready.notify();
     axum::serve(listener, app.into_make_service())
         .await
         .map_err(|e| {
@@ -26,7 +28,7 @@ pub async fn serve_ipc(router: Router, path: &str) -> crate::Result<()> {
 }
 
 #[cfg(unix)]
-pub async fn serve_ipc(router: Router, path: &str) -> crate::Result<()> {
+pub async fn serve_ipc(router: Router, path: &str, ready: ListenerReady) -> crate::Result<()> {
     use axum::ServiceExt;
     use std::path::PathBuf;
     use tower::{Layer, util::MapRequestLayer};
@@ -57,6 +59,7 @@ pub async fn serve_ipc(router: Router, path: &str) -> crate::Result<()> {
 
     let app = MapRequestLayer::new(rewrite_websocket_uri).layer(router);
 
+    ready.notify();
     axum::serve(uds, app.into_make_service())
         .await
         .map_err(|e| {
@@ -66,7 +69,7 @@ pub async fn serve_ipc(router: Router, path: &str) -> crate::Result<()> {
 }
 
 #[cfg(all(not(unix), not(windows)))]
-pub async fn serve_ipc(_router: Router, _path: &str) -> crate::Result<()> {
+pub async fn serve_ipc(_router: Router, _path: &str, _ready: ListenerReady) -> crate::Result<()> {
     error!("IPC only get supported on Unix and Windows");
     Err(crate::Error::Operation(
         "IPC only get supported on Unix and Windows".to_string(),
@@ -178,7 +181,7 @@ use tokio::net::windows::named_pipe::NamedPipeServer;
 #[cfg(windows)]
 struct NamedPipeListener {
     path: String,
-    first_instance: bool,
+    pending: Option<NamedPipeServer>,
 }
 
 #[cfg(windows)]
@@ -192,35 +195,37 @@ impl axum::serve::Listener for NamedPipeListener {
 
         let mut retry_count = 0u32;
 
-        let server = loop {
-            match create_named_pipe_with_security(&self.path, self.first_instance) {
-                Ok(server) => break server,
-                Err(e) => {
-                    retry_count += 1;
-                    // Use exponential backoff capped at 30 seconds
-                    let delay = Duration::from_millis(200)
-                        .saturating_mul(retry_count)
-                        .min(Duration::from_secs(30));
+        let server = if let Some(server) = self.pending.take() {
+            server
+        } else {
+            loop {
+                match create_named_pipe_with_security(&self.path, false) {
+                    Ok(server) => break server,
+                    Err(e) => {
+                        retry_count += 1;
+                        // Use exponential backoff capped at 30 seconds
+                        let delay = Duration::from_millis(200)
+                            .saturating_mul(retry_count)
+                            .min(Duration::from_secs(30));
 
-                    if retry_count.is_multiple_of(10) {
-                        error!(
-                            "Failed to create named pipe after {} attempts: {}. \
-                             Continuing to retry...",
-                            retry_count, e
-                        );
-                    } else {
-                        warn!(
-                            "Failed to create named pipe (attempt {}): {}. \
-                             Retrying in {:?}...",
-                            retry_count, e, delay
-                        );
+                        if retry_count.is_multiple_of(10) {
+                            error!(
+                                "Failed to create named pipe after {} attempts: {}. \
+                                 Continuing to retry...",
+                                retry_count, e
+                            );
+                        } else {
+                            warn!(
+                                "Failed to create named pipe (attempt {}): {}. \
+                                 Retrying in {:?}...",
+                                retry_count, e, delay
+                            );
+                        }
+                        sleep(delay).await;
                     }
-                    sleep(delay).await;
                 }
             }
         };
-
-        self.first_instance = false;
 
         // Wait for client connection with indefinite retry
         loop {
@@ -315,7 +320,7 @@ mod tests {
     #[cfg(all(not(unix), not(windows)))]
     async fn test_serve_ipc_unsupported_platform() {
         let router = test_router();
-        let result = serve_ipc(router, "test_path").await;
+        let result = serve_ipc(router, "test_path", ListenerReady::default()).await;
         assert!(result.is_err());
         assert!(logs_contain("IPC only get supported on Unix and Windows"));
     }
@@ -337,7 +342,7 @@ mod tests {
         let server_handle = tokio::spawn({
             let router = router.clone();
             async move {
-                let _ = serve_ipc(router, path).await;
+                let _ = serve_ipc(router, path, ListenerReady::default()).await;
             }
         });
 
@@ -415,7 +420,7 @@ mod tests {
         let server_handle = tokio::spawn({
             let socket_path = socket_path.clone();
             async move {
-                let _ = serve_ipc(router, socket_path.to_str().unwrap()).await;
+                let _ = serve_ipc(router, socket_path.to_str().unwrap(), ListenerReady::default()).await;
             }
         });
 
@@ -494,7 +499,7 @@ mod tests {
         let server_handle = tokio::spawn({
             let socket_path = socket_path.clone();
             async move {
-                let _ = serve_ipc(router, socket_path.to_str().unwrap()).await;
+                let _ = serve_ipc(router, socket_path.to_str().unwrap(), ListenerReady::default()).await;
             }
         });
 
@@ -583,7 +588,7 @@ mod tests {
         let server_handle = tokio::spawn({
             let router = router.clone();
             async move {
-                let _ = serve_ipc(router, path).await;
+                let _ = serve_ipc(router, path, ListenerReady::default()).await;
             }
         });
 
@@ -670,7 +675,7 @@ mod tests {
         let server_handle = tokio::spawn({
             let router = router.clone();
             async move {
-                serve_ipc(router, path).await.unwrap();
+                serve_ipc(router, path, ListenerReady::default()).await.unwrap();
             }
         });
 

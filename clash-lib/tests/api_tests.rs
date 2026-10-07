@@ -5,7 +5,7 @@ use crate::common::{
 use bytes::{Buf, Bytes};
 use clash_lib::{Config, Options};
 use http_body_util::BodyExt;
-use std::{path::PathBuf, time::Duration};
+use std::{fs, net::{TcpListener, UdpSocket}, path::PathBuf, time::Duration};
 
 mod common;
 
@@ -182,6 +182,247 @@ proxies:
         !get_allow_lan(port_base + 7).await,
         "expected allow-lan=false after reload"
     );
+}
+
+fn reload_config(api_port: u16, socks_port: u16) -> String {
+    format!(r#"bind-address: 127.0.0.1
+socks-port: {socks_port}
+external-controller: 127.0.0.1:{api_port}
+secret: clash-rs
+mode: direct
+allow-lan: false
+tun:
+  enable: false
+"#)
+}
+
+fn start_reload_client() -> (tempfile::TempDir, ClashInstance, u16, u16) {
+    let dir = tempfile::tempdir().unwrap();
+    let api_port = alloc_ports(2);
+    let socks_port = api_port + 1;
+    let instance = ClashInstance::start(
+        Options {
+            config: Config::Str(reload_config(api_port, socks_port)),
+            cwd: Some(dir.path().to_string_lossy().to_string()),
+            rt: None,
+            log_file: None,
+            config_path: None,
+            dns_collect_file: None,
+        },
+        vec![api_port, socks_port],
+    ).unwrap();
+    wait_port_ready(socks_port).unwrap();
+    (dir, instance, api_port, socks_port)
+}
+
+fn occupy_tcp_port() -> (TcpListener, u16, String) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let error = TcpListener::bind(address).unwrap_err().to_string();
+    (listener, address.port(), error)
+}
+
+async fn send_reload(api_port: u16, payload: String) -> (http::StatusCode, String) {
+    let url = format!("http://127.0.0.1:{api_port}/configs");
+    let request = hyper::Request::builder()
+        .uri(&url)
+        .header(hyper::header::AUTHORIZATION, "Bearer clash-rs")
+        .header(hyper::header::CONTENT_TYPE, "application/json")
+        .method(http::method::Method::PUT)
+        .body(serde_json::json!({"payload": payload}).to_string())
+        .unwrap();
+    let response = send_http_request::<String>(url.parse().unwrap(), request)
+        .await.unwrap();
+    let status = response.status();
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    (status, String::from_utf8(body.to_vec()).unwrap())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_config_reload_single_protocol_tunnel() {
+    for network in ["tcp", "udp"] {
+        let dir = tempfile::tempdir().unwrap();
+        let api_port = alloc_ports(2);
+        let socks_port = api_port + 1;
+        // Occupy the disabled transport to verify it is never initialized.
+        let disabled_tcp = (network == "udp")
+            .then(|| TcpListener::bind("127.0.0.1:0").unwrap());
+        let disabled_udp = (network == "tcp")
+            .then(|| UdpSocket::bind("127.0.0.1:0").unwrap());
+        let address = if let Some(listener) = &disabled_tcp {
+            listener.local_addr().unwrap()
+        } else {
+            disabled_udp.as_ref().unwrap().local_addr().unwrap()
+        };
+        let payload = format!(r#"{}listeners:
+  - name: single-protocol-tunnel
+    type: tunnel
+    listen: 127.0.0.1
+    port: {}
+    network: [{network}]
+    target: 127.0.0.1:9
+"#, reload_config(api_port, socks_port), address.port());
+        let _clash = ClashInstance::start(
+            Options {
+                config: Config::Str(payload.clone()),
+                cwd: Some(dir.path().to_string_lossy().to_string()),
+                rt: None,
+                log_file: None,
+                config_path: None,
+                dns_collect_file: None,
+            },
+            vec![api_port, socks_port],
+        ).unwrap();
+        for _ in 0..2 {
+            if network == "tcp" {
+                wait_port_ready(address.port()).unwrap();
+            } else {
+                assert!(UdpSocket::bind(address).is_err());
+            }
+            let (status, body) = send_reload(api_port, payload.clone()).await;
+            assert_eq!(status, http::StatusCode::NO_CONTENT, "{network}: {body}");
+        }
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_config_reload_repeatedly_reuses_cache() {
+    let (_dir, _clash, api_port, socks_port) = start_reload_client();
+    for store_selected in [false, true, false] {
+        let payload = format!(
+            "{}profile:\n  store-selected: {store_selected}\n",
+            reload_config(api_port, socks_port),
+        );
+        let (status, body) = send_reload(api_port, payload).await;
+        assert_eq!(status, http::StatusCode::NO_CONTENT, "{body}");
+        assert!(!get_allow_lan(api_port).await);
+        wait_port_ready(socks_port).unwrap();
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_config_reload_rolls_back_occupied_api_port() {
+    let (_dir, _clash, api_port, socks_port) = start_reload_client();
+    let (_occupied, occupied_port, expected_error) = occupy_tcp_port();
+    let new_socks_port = alloc_ports(1);
+    let payload = reload_config(occupied_port, new_socks_port);
+    let (status, body) = send_reload(api_port, payload).await;
+    assert_eq!(status, http::StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.contains(&expected_error), "{body}");
+    assert!(!get_allow_lan(api_port).await);
+    wait_port_ready(socks_port).unwrap();
+    // The new proxy listener started before API binding failed, and must close.
+    let _released = TcpListener::bind(("127.0.0.1", new_socks_port)).unwrap();
+    let (status, body) = send_reload(api_port, reload_config(api_port, socks_port)).await;
+    assert_eq!(status, http::StatusCode::NO_CONTENT, "{body}");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_config_reload_rolls_back_occupied_inbound_port() {
+    let (_dir, _clash, api_port, socks_port) = start_reload_client();
+    let (_occupied, occupied_port, expected_error) = occupy_tcp_port();
+    let payload = reload_config(api_port, occupied_port);
+    let (status, body) = send_reload(api_port, payload).await;
+    assert_eq!(status, http::StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.contains(&expected_error), "{body}");
+    assert!(!get_allow_lan(api_port).await);
+    wait_port_ready(socks_port).unwrap();
+    let (status, body) = send_reload(api_port, reload_config(api_port, socks_port)).await;
+    assert_eq!(status, http::StatusCode::NO_CONTENT, "{body}");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_config_reload_rolls_back_partial_dns_startup() {
+    let (_dir, _clash, api_port, socks_port) = start_reload_client();
+    let (_occupied, occupied_port, expected_error) = occupy_tcp_port();
+    let dns_port = occupied_port;
+    let payload = format!(
+        "{}dns:\n  enable: true\n  listen:\n    udp: 127.0.0.1:{dns_port}\n    tcp: 127.0.0.1:{dns_port}\n  nameserver: [udp://127.0.0.1:9]\n",
+        reload_config(api_port, socks_port),
+    );
+    let (status, body) = send_reload(api_port, payload).await;
+    assert_eq!(status, http::StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.contains(&expected_error), "{body}");
+    assert!(!get_allow_lan(api_port).await);
+    wait_port_ready(socks_port).unwrap();
+    // UDP binds before TCP; its socket must be released on TCP bind failure.
+    let _released = UdpSocket::bind(("127.0.0.1", dns_port)).unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_config_reload_rolls_back_occupied_shadowsocks_udp_port() {
+    let (_dir, _clash, api_port, socks_port) = start_reload_client();
+    let occupied = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let address = occupied.local_addr().unwrap();
+    let expected_error = UdpSocket::bind(address).unwrap_err().to_string();
+    let payload = format!(r#"{}listeners:
+  - name: ss-local
+    type: shadowsocks
+    listen: 127.0.0.1
+    port: {}
+    cipher: aes-128-gcm
+    password: test-password
+    udp: true
+"#, reload_config(api_port, socks_port), address.port());
+    let (status, body) = send_reload(api_port, payload).await;
+    assert_eq!(status, http::StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.contains(&expected_error), "{body}");
+    assert!(!get_allow_lan(api_port).await);
+    wait_port_ready(socks_port).unwrap();
+    // TCP initialized before UDP failed; its socket must also be released.
+    let _released = TcpListener::bind(address).unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_config_reload_rebinds_provider_after_stopping_old_runtime() {
+    let (dir, _clash, api_port, socks_port) = start_reload_client();
+    let provider_port = alloc_ports(1);
+    let path = dir.path().join("inbounds.yaml");
+    fs::write(&path, format!(
+        "listeners:\n  - name: local\n    type: socks\n    listen: 127.0.0.1\n    port: {provider_port}\n",
+    )).unwrap();
+    let payload = format!(
+        "{}inbound-providers:\n  local:\n    type: file\n    path: {}\n    interval: 0\n",
+        reload_config(api_port, socks_port),
+        serde_json::to_string(path.to_str().unwrap()).unwrap(),
+    );
+    for _ in 0..2 {
+        let (status, body) = send_reload(api_port, payload.clone()).await;
+        assert_eq!(status, http::StatusCode::NO_CONTENT, "{body}");
+        wait_port_ready(provider_port).unwrap();
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_config_reload_cleans_up_partial_provider_startup() {
+    let (dir, _clash, api_port, socks_port) = start_reload_client();
+    let provider_port = alloc_ports(1);
+    let (_occupied, occupied_port, expected_error) = occupy_tcp_port();
+    let path = dir.path().join("inbounds.yaml");
+    fs::write(&path, format!(
+        r#"listeners:
+  - name: ready
+    type: socks
+    listen: 127.0.0.1
+    port: {provider_port}
+  - name: occupied
+    type: socks
+    listen: 127.0.0.1
+    port: {}
+"#,
+        occupied_port,
+    )).unwrap();
+    let payload = format!(
+        "{}inbound-providers:\n  local:\n    type: file\n    path: {}\n    interval: 0\n",
+        reload_config(api_port, socks_port),
+        serde_json::to_string(path.to_str().unwrap()).unwrap(),
+    );
+    let (status, body) = send_reload(api_port, payload).await;
+    assert_eq!(status, http::StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.contains(&expected_error), "{body}");
+    assert!(!get_allow_lan(api_port).await);
+    wait_port_ready(socks_port).unwrap();
+    let _released = TcpListener::bind(("127.0.0.1", provider_port)).unwrap();
 }
 
 #[tokio::test(flavor = "current_thread")]

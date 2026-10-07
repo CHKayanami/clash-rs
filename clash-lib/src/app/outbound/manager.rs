@@ -76,6 +76,18 @@ static DEFAULT_LATENCY_TEST_URL: &str = "http://www.gstatic.com/generate_204";
 
 pub type ThreadSafeOutboundManager = Arc<OutboundManager>;
 
+impl Drop for OutboundManager {
+    fn drop(&mut self) {
+        // DNS and HTTP bootstrap clients share this generation's registry.
+        // Groups in it hold health checks which refer back to DNS. Release
+        // the owned entries when the manager goes away to break that cycle.
+        // Drop handlers outside the registry lock, since their cleanup may
+        // itself access shared runtime resources.
+        let handlers = std::mem::take(&mut *self.registry.write());
+        drop(handlers);
+    }
+}
+
 /// Init process:
 /// 1. Load all plaint outbounds from config using the unbounded function
 ///    `load_plain_outbounds`, so that any bootstrap proxy can be used to

@@ -4,10 +4,11 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 
 use crate::{
+    Error,
     app::{dispatcher::Dispatcher, dns::ThreadSafeDNSResolver},
     config::def::EbpfConfig,
     proxy::{ebpf::EbpfInbound, inbound::InboundHandlerTrait},
-    runner::{AsyncService, ServiceContext},
+    runner::{AsyncService, ServiceContext, prepare_service},
 };
 
 pub struct EbpfRunner {
@@ -59,36 +60,33 @@ impl AsyncService for EbpfRunner {
         })?;
         let inbound = Arc::new(inbound);
 
+        let initialized = async {
+            let tcp_inbound = inbound.clone();
+            let tcp = prepare_service(move |ready| async move {
+                tcp_inbound.listen_tcp(ready).await.map_err(Error::from)
+            }).await?;
+            let udp_inbound = inbound.clone();
+            let udp = prepare_service(move |ready| async move {
+                udp_inbound.listen_udp(ready).await.map_err(Error::from)
+            }).await?;
+            Ok::<_, Error>((tcp, udp))
+        }.await;
+        let (tcp, udp) = match initialized {
+            Ok(listeners) => listeners,
+            Err(e) => {
+                inbound.stop().await;
+                return Err(e);
+            }
+        };
         ctx.spawn_critical_with_token("ebpf_inbound", lifecycle_token, async move {
-            let inbound_tcp = inbound.clone();
-            let mut tcp_task = tokio::spawn(async move {
-                if let Err(err) = inbound_tcp.listen_tcp().await {
-                    error!("eBPF TCP inbound error: {err}");
-                }
-            });
-
-            let inbound_udp = inbound.clone();
-            let mut udp_task = tokio::spawn(async move {
-                if let Err(err) = inbound_udp.listen_udp().await {
-                    error!("eBPF UDP inbound error: {err}");
-                }
-            });
-
             tokio::select! {
                 _ = cancel.cancelled() => {
                     info!("eBPF inbound cancelled, shutting down");
                 }
-                res = &mut tcp_task => {
-                    error!("eBPF TCP inbound task unexpectedly terminated: {res:?}");
-                }
-                res = &mut udp_task => {
-                    error!("eBPF UDP inbound task unexpectedly terminated: {res:?}");
+                result = futures::future::try_join(tcp, udp) => {
+                    error!("eBPF inbound unexpectedly terminated: {result:?}");
                 }
             }
-            tcp_task.abort();
-            udp_task.abort();
-            let _ = tcp_task.await;
-            let _ = udp_task.await;
             inbound.stop().await;
         });
 

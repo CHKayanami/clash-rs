@@ -298,7 +298,7 @@ impl FakeDns {
                 // store, so the callback carries a handle rather than a
                 // back-reference to `FakeDns` — no reference cycle, and nothing
                 // here keeps the resolver alive.
-                for rp in providers {
+                for rp in providers.iter().filter_map(|rp| rp.upgrade()) {
                     let cache = self.skip_cache.clone();
                     let name = rp.name().to_owned();
                     rp.on_change(Arc::new(move || {

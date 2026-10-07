@@ -1,3 +1,4 @@
+use crate::runner::ListenerReady;
 mod datagram;
 mod stream;
 
@@ -61,8 +62,10 @@ impl InboundHandlerTrait for SocksInbound {
         false
     }
 
-    async fn listen_tcp(&self) -> std::io::Result<()> {
+    async fn listen_tcp(&self, ready: ListenerReady) -> std::io::Result<()> {
         let listener = try_create_dualstack_tcplistener(self.addr)?;
+
+        ready.notify();
 
         loop {
             let (socket, peer_addr) = match listener.accept().await {
@@ -96,7 +99,7 @@ impl InboundHandlerTrait for SocksInbound {
         }
     }
 
-    async fn listen_udp(&self) -> std::io::Result<()> {
+    async fn listen_udp(&self, _ready: ListenerReady) -> std::io::Result<()> {
         Err(new_io_error("UDP is not supported"))
     }
 }

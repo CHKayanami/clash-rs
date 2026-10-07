@@ -1,9 +1,12 @@
 use std::{
+    collections::HashMap,
     net,
     sync::{Arc, OnceLock},
 };
 
-use crate::app::remote_content_manager::providers::rule_provider::ThreadSafeRuleProvider;
+use crate::app::remote_content_manager::providers::rule_provider::{
+    ThreadSafeRuleProvider, WeakRuleProvider,
+};
 use crate::app::dns::domain::{DomainMatcher, normalize_domain};
 use crate::common::mmdb::MmdbLookup;
 use crate::session::{Session, SocksAddr};
@@ -12,6 +15,21 @@ use crate::session::{Session, SocksAddr};
 /// filled in after the `OutboundManager` (and its full outbound registry) is
 /// ready, so that any MMDB download can use proxy groups if needed.
 pub type PendingMmdb = Arc<OnceLock<MmdbLookup>>;
+
+fn bind_rule_sets<'a>(
+    names: &[String],
+    bound: &'a OnceLock<Vec<WeakRuleProvider>>,
+    providers: &HashMap<String, ThreadSafeRuleProvider>,
+) -> Option<&'a [WeakRuleProvider]> {
+    if names.is_empty() {
+        return None;
+    }
+    let providers = bound.get_or_init(|| {
+        names.iter().filter_map(|name| providers.get(name))
+            .map(Arc::downgrade).collect()
+    });
+    Some(providers.as_slice())
+}
 
 pub struct GeoIPFilter(String, Option<PendingMmdb>);
 
@@ -40,7 +58,7 @@ impl GeoIPFilter {
 pub struct IPNetFilter {
     subnets: Vec<ipnet::IpNet>,
     ruleset_names: Vec<String>,
-    rule_providers: OnceLock<Vec<ThreadSafeRuleProvider>>,
+    rule_providers: OnceLock<Vec<WeakRuleProvider>>,
 }
 
 impl IPNetFilter {
@@ -70,19 +88,8 @@ impl IPNetFilter {
     pub fn add_rule_set(
         &self,
         rp_map: &std::collections::HashMap<String, ThreadSafeRuleProvider>,
-    ) -> Option<&Vec<ThreadSafeRuleProvider>> {
-        if !self.ruleset_names.is_empty() {
-            let mut providers = Vec::new();
-            for name in &self.ruleset_names {
-                if let Some(rp) = rp_map.get(name) {
-                    providers.push(rp.clone());
-                }
-            }
-            let _ = self.rule_providers.set(providers);
-            self.rule_providers.get()
-        } else {
-            None
-        }
+    ) -> Option<&[WeakRuleProvider]> {
+        bind_rule_sets(&self.ruleset_names, &self.rule_providers, rp_map)
     }
 
     pub fn apply(&self, ip: &net::IpAddr) -> bool {
@@ -95,7 +102,8 @@ impl IPNetFilter {
                 destination: SocksAddr::Ip(net::SocketAddr::new(*ip, 443)),
                 ..Default::default()
             };
-            return rps.iter().any(|rp| rp.search(&sess));
+            return rps.iter().any(|rp| rp.upgrade()
+                .is_some_and(|rp| rp.search(&sess)));
         }
 
         false
@@ -110,7 +118,9 @@ impl IPNetFilter {
 pub struct DomainFilter {
     domains: DomainMatcher,
     ruleset_names: Vec<String>,
-    rule_providers: OnceLock<Vec<ThreadSafeRuleProvider>>,
+    // Router owns providers. HTTP providers can themselves refer to DNS, so
+    // DNS filters must not keep them alive after that router is released.
+    rule_providers: OnceLock<Vec<WeakRuleProvider>>,
 }
 
 impl DomainFilter {
@@ -145,7 +155,8 @@ impl DomainFilter {
                 destination: SocksAddr::Domain(domain.as_ref().into(), 443),
                 ..Default::default()
             };
-            return rps.iter().any(|rp| rp.search(&sess));
+            return rps.iter().any(|rp| rp.upgrade()
+                .is_some_and(|rp| rp.search(&sess)));
         }
 
         false
@@ -154,19 +165,8 @@ impl DomainFilter {
     pub fn add_rule_set(
         &self,
         rp_map: &std::collections::HashMap<String, ThreadSafeRuleProvider>,
-    ) -> Option<&Vec<ThreadSafeRuleProvider>> {
-        if !self.ruleset_names.is_empty() {
-            let mut providers = Vec::new();
-            for name in &self.ruleset_names {
-                if let Some(rp) = rp_map.get(name) {
-                    providers.push(rp.clone());
-                }
-            }
-            let _ = self.rule_providers.set(providers);
-            self.rule_providers.get()
-        } else {
-            None
-        }
+    ) -> Option<&[WeakRuleProvider]> {
+        bind_rule_sets(&self.ruleset_names, &self.rule_providers, rp_map)
     }
 
     #[allow(dead_code)]
@@ -376,5 +376,4 @@ mod tests {
         assert!(!filter.match_ip(&ip2));
     }
 }
-
 

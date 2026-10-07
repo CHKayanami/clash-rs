@@ -1,5 +1,7 @@
 //! AnyTLS inbound listener — thin orchestrator.
 
+use crate::runner::ListenerReady;
+
 mod datagram;
 mod framing;
 mod handler;
@@ -89,7 +91,7 @@ impl InboundHandlerTrait for AnytlsInbound {
         false // UDP is tunnelled over TCP; no separate UDP listener needed.
     }
 
-    async fn listen_tcp(&self) -> std::io::Result<()> {
+    async fn listen_tcp(&self, ready: ListenerReady) -> std::io::Result<()> {
         let listener = try_create_dualstack_tcplistener(self.addr)?;
         let local_addr = listener.local_addr()?;
         let local_ip = local_addr.ip();
@@ -97,6 +99,8 @@ impl InboundHandlerTrait for AnytlsInbound {
         let mut users_rx = self.users_rx.clone();
         let mut user_map =
             build_user_map(&users_rx.borrow_and_update(), &self.password);
+
+        ready.notify();
 
         loop {
             tokio::select! {
@@ -150,7 +154,7 @@ impl InboundHandlerTrait for AnytlsInbound {
         }
     }
 
-    async fn listen_udp(&self) -> std::io::Result<()> {
+    async fn listen_udp(&self, _ready: ListenerReady) -> std::io::Result<()> {
         // UDP is handled inside TCP connections via UoT v2; no UDP socket.
         Ok(())
     }

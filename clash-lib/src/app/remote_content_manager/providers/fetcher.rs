@@ -1,7 +1,7 @@
 use std::{
     fs::{self, metadata},
     path::Path,
-    sync::Arc,
+    sync::{Arc, atomic::{AtomicBool, Ordering}},
     time::{Duration, SystemTime},
 };
 
@@ -38,6 +38,15 @@ pub struct Fetcher<U, P> {
     parser: Arc<P>,
     pub on_update: Option<Arc<U>>,
     cancellation_token: tokio_util::sync::CancellationToken,
+    update_retry: Option<Arc<AtomicBool>>,
+}
+
+impl<U, P> Drop for Fetcher<U, P> {
+    fn drop(&mut self) {
+        // A sleeping pull loop may still hold Inner, so Inner::drop alone
+        // cannot promptly release its vehicle, parser and update callback.
+        self.cancellation_token.cancel();
+    }
 }
 
 impl<T, U, P> Fetcher<U, P>
@@ -66,11 +75,17 @@ where
             parser: Arc::new(parser),
             on_update: on_update.map(Arc::new),
             cancellation_token: tokio_util::sync::CancellationToken::new(),
+            update_retry: None,
         }
     }
 
     pub fn name(&self) -> &str {
         self.name.as_str()
+    }
+
+    pub(crate) fn with_update_retry(mut self, retry: Arc<AtomicBool>) -> Self {
+        self.update_retry = Some(retry);
+        self
     }
 
     pub fn vehicle_type(&self) -> ProviderVehicleType {
@@ -79,6 +94,16 @@ where
 
     pub async fn updated_at(&self) -> DateTime<Utc> {
         self.inner.read().await.updated_at.into()
+    }
+
+    /// Finish an in-flight update before stopping, so its listener handles
+    /// remain available for the inbound manager to clean up.
+    pub async fn stop_and_wait(&self) {
+        self.cancellation_token.cancel();
+        let handle = self.inner.write().await.thread_handle.take();
+        if let Some(handle) = handle {
+            let _ = handle.await;
+        }
     }
 
     pub async fn initial(&self) -> anyhow::Result<T> {
@@ -230,6 +255,7 @@ where
         let name = self.name.clone();
         let fire_immediately = immediately_update;
         let cancel = self.cancellation_token.clone();
+        let update_retry = self.update_retry.clone();
 
         let thread_handle = Some(tokio::spawn(async move {
             loop {
@@ -244,21 +270,29 @@ where
                 let parser = parser.clone();
                 let name = name.clone();
                 let on_update = on_update.clone();
+                let update_retry = update_retry.clone();
                 trace!("fetcher {} tick", &name);
 
+                let update_cancel = cancel.clone();
                 let update = || async move {
-                    let (elm, same) =
-                        match Fetcher::<U, P>::update_inner(inner, vehicle, parser)
-                            .await
-                        {
-                            Ok((elm, same)) => (elm, same),
-                            Err(e) => {
-                                warn!("{} update failed: {}", &name, e);
-                                return;
-                            }
-                        };
+                    // Cancelling fetch/parse is safe before the listener update
+                    // callback starts. Once started, let that transaction finish.
+                    let result = tokio::select! {
+                        biased;
+                        _ = update_cancel.cancelled() => return,
+                        result = Fetcher::<U, P>::update_inner(inner, vehicle, parser) => result,
+                    };
+                    let (elm, same) = match result {
+                        Ok(result) => result,
+                        Err(e) => {
+                            warn!("{} update failed: {}", &name, e);
+                            return;
+                        }
+                    };
 
-                    if same {
+                    if same && !update_retry.as_ref()
+                        .is_some_and(|retry| retry.load(Ordering::Acquire))
+                    {
                         trace!("fetcher {} no update", &name);
                         return;
                     }
@@ -310,6 +344,115 @@ mod tests {
     };
 
     use super::Fetcher;
+    use super::super::ProviderVehicle;
+
+    struct BlockingVehicle {
+        started: tokio::sync::Notify,
+    }
+
+    #[async_trait::async_trait]
+    impl ProviderVehicle for BlockingVehicle {
+        async fn read(&self) -> std::io::Result<Vec<u8>> {
+            self.started.notify_one();
+            futures::future::pending().await
+        }
+
+        fn path(&self) -> &str { "unused" }
+        fn typ(&self) -> ProviderVehicleType { ProviderVehicleType::Http }
+    }
+
+    #[tokio::test]
+    async fn stopping_fetcher_cancels_in_flight_download() {
+        let vehicle = Arc::new(BlockingVehicle {
+            started: tokio::sync::Notify::new(),
+        });
+        let fetcher = Fetcher::new(
+            "cancel-test".into(), Duration::from_secs(3600), vehicle.clone(),
+            |input: &[u8]| -> anyhow::Result<Vec<u8>> { Ok(input.to_vec()) },
+            Some(|_: Vec<u8>| -> BoxFuture<'static, ()> {
+                Box::pin(async { panic!("cancelled download reached callback") })
+            }),
+        );
+        fetcher.pull_loop(true, tokio::time::interval(Duration::from_secs(3600))).await;
+        vehicle.started.notified().await;
+        tokio::time::timeout(Duration::from_secs(1), fetcher.stop_and_wait())
+            .await.expect("stop waited for the blocked download");
+    }
+
+    #[tokio::test]
+    async fn stopping_fetcher_finishes_in_flight_callback() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("provider.yaml");
+        std::fs::write(&path, b"updated").unwrap();
+        let mut vehicle = MockProviderVehicle::new();
+        vehicle.expect_path().return_const(path.to_str().unwrap().to_owned());
+        vehicle.expect_typ().return_const(ProviderVehicleType::File);
+        vehicle.expect_read().returning(|| Ok(b"updated".to_vec()));
+        let started = Arc::new(tokio::sync::Notify::new());
+        let finish = Arc::new(tokio::sync::Notify::new());
+        let (committed_tx, committed_rx) = tokio::sync::oneshot::channel();
+        let committed = Arc::new(std::sync::Mutex::new(Some(committed_tx)));
+        let callback_started = started.clone();
+        let callback_finish = finish.clone();
+        let fetcher = Arc::new(Fetcher::new(
+            "transaction-test".into(), Duration::from_secs(3600), Arc::new(vehicle),
+            |input: &[u8]| -> anyhow::Result<Vec<u8>> { Ok(input.to_vec()) },
+            Some(move |_: Vec<u8>| -> BoxFuture<'static, ()> {
+                let started = callback_started.clone();
+                let finish = callback_finish.clone();
+                let committed = committed.clone();
+                Box::pin(async move {
+                    started.notify_one();
+                    finish.notified().await;
+                    committed.lock().unwrap().take().unwrap().send(()).unwrap();
+                })
+            }),
+        ));
+        fetcher.pull_loop(true, tokio::time::interval(Duration::from_secs(3600))).await;
+        started.notified().await;
+        let stopping_fetcher = fetcher.clone();
+        let stop = tokio::spawn(async move { stopping_fetcher.stop_and_wait().await });
+        fetcher.cancellation_token.cancelled().await;
+        assert!(!stop.is_finished());
+        finish.notify_one();
+        tokio::time::timeout(Duration::from_secs(1), stop).await.unwrap().unwrap();
+        committed_rx.await.expect("stop interrupted the update transaction");
+    }
+
+    #[tokio::test]
+    async fn dropping_fetcher_releases_sleeping_update_resources() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("provider.yaml");
+        std::fs::write(&path, b"unchanged").unwrap();
+        let ticked = Arc::new(tokio::sync::Notify::new());
+        let notify_tick = ticked.clone();
+        let mut vehicle = MockProviderVehicle::new();
+        vehicle.expect_path().return_const(path.to_str().unwrap().to_owned());
+        vehicle.expect_typ().return_const(ProviderVehicleType::File);
+        vehicle.expect_read().returning(move || {
+            notify_tick.notify_one();
+            Ok(b"unchanged".to_vec())
+        });
+        let resource = Arc::new(());
+        let weak = Arc::downgrade(&resource);
+        let parser = move |input: &[u8]| -> anyhow::Result<Vec<u8>> {
+            assert!(Arc::strong_count(&resource) > 0);
+            Ok(input.to_vec())
+        };
+        let fetcher = Fetcher::new(
+            "drop-test".into(), Duration::from_secs(3600), Arc::new(vehicle),
+            parser, None::<fn(Vec<u8>) -> BoxFuture<'static, ()>>,
+        );
+        fetcher.initial().await.unwrap();
+        ticked.notified().await;
+        tokio::task::yield_now().await;
+        drop(fetcher);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while weak.strong_count() != 0 {
+                tokio::task::yield_now().await;
+            }
+        }).await.expect("sleeping provider retained its parser after drop");
+    }
 
     #[tokio::test]
     async fn test_fetcher() {

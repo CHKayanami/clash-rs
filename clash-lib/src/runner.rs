@@ -1,7 +1,50 @@
 use std::{borrow::Cow, future::Future, sync::Arc};
 
+use crate::{Error, Result as ClashResult};
+
 use async_trait::async_trait;
+use futures::future::BoxFuture;
+use tokio::sync::oneshot;
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
+
+/// Sent only after all fallible listener initialization has completed.
+#[derive(Default)]
+pub(crate) struct ListenerReady(Option<oneshot::Sender<()>>);
+
+impl ListenerReady {
+    pub fn notify(self) {
+        if let Some(tx) = self.0 {
+            let _ = tx.send(());
+        }
+    }
+}
+
+/// Drive initialization before transferring the listener to a supervised task.
+/// On failure, dropping the future releases any partially initialized resources.
+pub(crate) async fn prepare_service<F>(
+    service: impl FnOnce(ListenerReady) -> F,
+) -> ClashResult<BoxFuture<'static, ClashResult<()>>>
+where
+    F: Future<Output = ClashResult<()>> + Send + 'static,
+{
+    let (tx, rx) = oneshot::channel();
+    let mut future: BoxFuture<'static, ClashResult<()>> =
+        Box::pin(service(ListenerReady(Some(tx))));
+    tokio::select! {
+        result = &mut future => {
+            result?;
+            Err(Error::Operation(
+                "listener exited during initialization".to_string(),
+            ))
+        }
+        result = rx => {
+            result.map_err(|_| Error::Operation(
+                "listener did not report readiness".to_string(),
+            ))?;
+            Ok(future)
+        }
+    }
+}
 
 /// Guard that triggers a fatal error if a critical background task exits unexpectedly.
 ///
@@ -95,6 +138,13 @@ impl ServiceContext {
         &self.tracker
     }
 
+    pub(crate) fn report_fatal(&self, message: String) {
+        if let Some(tx) = &self.fatal_tx {
+            let _ = tx.try_send(Error::Operation(message));
+        }
+        self.cancellation_token.cancel();
+    }
+
     /// Spawns a background task tracked by the service context's [`TaskTracker`].
     pub fn spawn<F>(&self, future: F) -> tokio::task::JoinHandle<F::Output>
     where
@@ -138,7 +188,7 @@ impl ServiceContext {
             CriticalTaskGuard::new_with_tokens(name, lifecycle_tokens, tx.clone())
         });
 
-        self.tracker.spawn(async move {
+        self.spawn(async move {
             let _guard = guard;
             future.await
         })

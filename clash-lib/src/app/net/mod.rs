@@ -19,7 +19,7 @@ use std::sync::Mutex;
 static DEFAULT_OUTBOUND_INTERFACE: ArcSwapOption<OutboundInterface> =
     ArcSwapOption::const_empty();
 
-/// Protects write operations (init_net_config vs auto_detect) from lost updates and race conditions.
+/// Protects runtime switches and auto-detection from lost updates.
 static WRITE_MUTEX: Mutex<WriteState> = Mutex::new(WriteState {
     is_explicit: false,
 });
@@ -81,33 +81,55 @@ pub fn update_default_outbound_interface_if_changed(
     }
 }
 
-/// Initialize network configuration
-/// globally manage default outbound interface
-/// This function should be called as early as possible
-/// so that other config initialization can use the default outbound interface
-pub async fn init_net_config(explicit_iface: Option<&str>, tun_somark: Option<u32>) {
-    let explicit_matched = explicit_iface.and_then(get_interface_by_name);
-    if explicit_iface.is_some() && explicit_matched.is_none() {
-        warn!(
-            "configured explicit interface {:?} not found, falling back to auto-detected outbound interface",
-            explicit_iface
+/// Network defaults belonging to one runtime generation. Resolving them does
+/// not mutate the running generation; apply only during the service switch.
+#[derive(Clone)]
+pub(crate) struct NetworkConfig {
+    interface: Option<Arc<OutboundInterface>>,
+    is_explicit: bool,
+    so_mark: Option<u32>,
+}
+
+impl NetworkConfig {
+    pub fn resolve(
+        explicit_iface: Option<&str>,
+        detect_interface: bool,
+        so_mark: Option<u32>,
+    ) -> Self {
+        let explicit = explicit_iface.and_then(get_interface_by_name);
+        if explicit_iface.is_some() && explicit.is_none() {
+            warn!(
+                "configured explicit interface {:?} not found, falling back to auto-detected outbound interface",
+                explicit_iface
+            );
+        }
+        let is_explicit = explicit.is_some();
+        let interface = explicit.or_else(|| {
+            (detect_interface || explicit_iface.is_some())
+                .then(get_outbound_interface).flatten()
+        }).map(Arc::new);
+        Self { interface, is_explicit, so_mark }
+    }
+
+    pub fn capture() -> Self {
+        let state = WRITE_MUTEX.lock().unwrap();
+        Self {
+            interface: DEFAULT_OUTBOUND_INTERFACE.load_full(),
+            is_explicit: state.is_explicit,
+            so_mark: get_tun_somark(),
+        }
+    }
+
+    pub fn apply(&self) {
+        let mut state = WRITE_MUTEX.lock().unwrap();
+        state.is_explicit = self.is_explicit;
+        DEFAULT_OUTBOUND_INTERFACE.store(self.interface.clone());
+        set_tun_somark(self.so_mark);
+        trace!(
+            "default outbound interface: {:?}, tun somark: {:?}",
+            self.interface, self.so_mark
         );
     }
-    let is_explicit = explicit_matched.is_some();
-    let iface = explicit_matched.or_else(get_outbound_interface);
-
-    {
-        let mut state = WRITE_MUTEX.lock().unwrap();
-        state.is_explicit = is_explicit;
-        DEFAULT_OUTBOUND_INTERFACE.store(iface.map(Arc::new));
-    }
-    set_tun_somark(tun_somark);
-
-    trace!(
-        "default outbound interface: {:?}, tun somark: {:?}",
-        get_default_outbound_interface(),
-        get_tun_somark()
-    );
 }
 
 /// Represents a parsed outbound interface for use in runtime.
