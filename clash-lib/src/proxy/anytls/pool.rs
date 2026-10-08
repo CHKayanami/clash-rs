@@ -50,21 +50,14 @@ impl SessionPoolInner {
     /// Prune closed sessions and idle sessions exceeding idle_timeout when pool size > min_connections
     fn prune_sessions(&self) {
         let mut sessions = self.sessions.write();
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-
         let mut i = 0;
         while i < sessions.len() {
             let session = &sessions[i];
             let is_closed = session.is_closed();
-            let streams_count = session.total_streams_count();
-            let idle_secs = now.saturating_sub(session.last_active_secs());
-
-            let should_prune_idle = streams_count == 0
-                && idle_secs >= self.config.idle_timeout.as_secs()
-                && sessions.len() > self.config.min_connections;
+            let should_prune_idle = sessions.len() > self.config.min_connections
+                && session.idle_duration().is_some_and(|idle| {
+                    idle >= self.config.idle_timeout
+                });
 
             if is_closed || should_prune_idle {
                 sessions.swap_remove(i);
@@ -119,50 +112,42 @@ impl SessionPool {
     /// Get an available active session with streams count < max_streams_per_connection.
     /// Returns None if a new session needs to be dialed.
     pub async fn get_available_session(&self) -> Option<Arc<AnyTlsClientSession>> {
-        self.inner.prune_sessions();
-
         let guard = self.inner.sessions.read();
-
-        // 收集所有未关闭且当前流计数（活跃+已预占）小于上限的会话候选
-        let mut candidates: Vec<(usize, Arc<AnyTlsClientSession>)> = guard
-            .iter()
-            .filter(|s| !s.is_closed())
-            .map(|s| (s.total_streams_count(), Arc::clone(s)))
-            .filter(|(count, _)| *count < self.inner.config.max_streams_per_connection)
-            .collect();
-
-        // 按流数量从少到多排序，优先复用负载较低的会话
-        candidates.sort_by_key(|(count, _)| *count);
-
-        // 尝试原子预占槽位；CAS 成功则防止并发调用同时选中同一会话导致突破上限
-        for (_, session) in candidates {
-            if session.try_reserve_stream(self.inner.config.max_streams_per_connection) {
-                return Some(session);
+        let mut selected = None;
+        let mut minimum = usize::MAX;
+        for session in guard.iter().filter(|session| !session.is_closed()) {
+            let count = session.total_streams_count();
+            if count < minimum
+                && count < self.inner.config.max_streams_per_connection
+            {
+                minimum = count;
+                selected = Some(session);
+            }
+        }
+        if let Some(session) = selected {
+            if session.try_reserve_stream(self.inner.config.max_streams_per_connection)
+            {
+                return Some(Arc::clone(session));
+            }
+            // Another caller won the reservation; try the remaining sessions.
+            for session in guard.iter().filter(|session| !session.is_closed()) {
+                if session.try_reserve_stream(self.inner.config.max_streams_per_connection)
+                {
+                    return Some(Arc::clone(session));
+                }
             }
         }
 
         // 若连接池已达到最大连接数限制，回退到全局负载最小的会话并强制分配
-        if guard.len() >= self.inner.config.max_connections {
-            let mut min_session: Option<(usize, Arc<AnyTlsClientSession>)> = None;
-            for session in guard.iter() {
-                if session.is_closed() {
-                    continue;
-                }
-                let count = session.total_streams_count();
-                match &min_session {
-                    None => {
-                        min_session = Some((count, Arc::clone(session)));
-                    }
-                    Some((min_c, _)) => {
-                        if count < *min_c {
-                            min_session = Some((count, Arc::clone(session)));
-                        }
-                    }
-                }
-            }
-            if let Some((_, session)) = min_session {
+        if guard.iter().filter(|session| !session.is_closed()).count()
+            >= self.inner.config.max_connections
+        {
+            if let Some(session) = guard.iter()
+                .filter(|session| !session.is_closed())
+                .min_by_key(|session| session.total_streams_count())
+            {
                 session.force_reserve_stream();
-                return Some(session);
+                return Some(Arc::clone(session));
             }
         }
 
@@ -194,6 +179,7 @@ mod tests {
     use crate::proxy::anytls::padding::PaddingFactory;
     use crate::session::SocksAddr;
     use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt};
+    use tokio::time::advance;
 
     #[tokio::test]
     async fn test_pool_defaults() {
@@ -297,4 +283,73 @@ mod tests {
         let guard = pool.inner.sessions.read();
         assert_eq!(guard.len(), 0);
     }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_idle_timeout_starts_when_last_stream_exits() {
+        let pool = SessionPool::new(SessionPoolConfig {
+            min_connections: 0,
+            ..SessionPoolConfig::default()
+        });
+        let (client, _server) = duplex(65536);
+        let session = AnyTlsClientSession::new(AnyStream::new(client), "secret",
+            PaddingFactory::default_factory()).await.unwrap();
+        pool.add_session(Arc::clone(&session)).await;
+        let reserved = pool.get_available_session().await.unwrap();
+        let dest = SocksAddr::try_from(("example.com".to_owned(), 80)).unwrap();
+        let stream = reserved.open_stream(&dest).await.unwrap();
+        advance(Duration::from_secs(120)).await;
+        pool.prune_sessions();
+        assert_eq!(pool.inner.sessions.read().len(), 1);
+        drop(stream);
+        assert_eq!(session.total_streams_count(), 0);
+        assert_eq!(session.idle_duration(), Some(Duration::ZERO));
+        advance(Duration::from_secs(59)).await;
+        pool.prune_sessions();
+        assert_eq!(pool.inner.sessions.read().len(), 1);
+        advance(Duration::from_secs(1)).await;
+        pool.prune_sessions();
+        assert!(pool.inner.sessions.read().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_releasing_last_reservation_restarts_idle_timeout() {
+        let (client, _server) = duplex(65536);
+        let session = AnyTlsClientSession::new(AnyStream::new(client), "secret",
+            PaddingFactory::default_factory()).await.unwrap();
+        assert!(session.try_reserve_stream(1));
+        advance(Duration::from_secs(120)).await;
+        session.release_reserved_stream();
+        assert_eq!(session.idle_duration(), Some(Duration::ZERO));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_pending_reservation_keeps_session_busy_after_stream_closes() {
+        let pool = SessionPool::new(SessionPoolConfig {
+            min_connections: 0,
+            ..SessionPoolConfig::default()
+        });
+        let (client, _server) = duplex(65536);
+        let session = AnyTlsClientSession::new(
+            AnyStream::new(client), "secret", PaddingFactory::default_factory(),
+        ).await.unwrap();
+        pool.add_session(Arc::clone(&session)).await;
+        let reserved = pool.get_available_session().await.unwrap();
+        let dest = SocksAddr::try_from(("example.com".to_owned(), 80)).unwrap();
+        let stream = reserved.open_stream(&dest).await.unwrap();
+        let pending = pool.get_available_session().await.unwrap();
+        advance(Duration::from_secs(120)).await;
+        drop(stream);
+        assert_eq!(session.idle_duration(), None);
+        pool.prune_sessions();
+        assert_eq!(pool.inner.sessions.read().len(), 1);
+        advance(Duration::from_secs(120)).await;
+        pending.release_reserved_stream();
+        assert_eq!(session.idle_duration(), Some(Duration::ZERO));
+        pool.prune_sessions();
+        assert_eq!(pool.inner.sessions.read().len(), 1);
+        advance(Duration::from_secs(60)).await;
+        pool.prune_sessions();
+        assert!(pool.inner.sessions.read().is_empty());
+    }
+
 }

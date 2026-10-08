@@ -9,8 +9,10 @@ use std::collections::HashMap;
 use std::io;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
+use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot, Mutex as AsyncMutex};
+use tokio::time::Instant;
 use tracing::{debug, trace, warn};
 
 use crate::proxy::AnyStream;
@@ -113,18 +115,13 @@ pub struct AnyTlsClientSession {
     /// Flag indicating that the initial Settings frame has been committed to outgoing_tx
     settings_sent: AtomicBool,
 
-    /// Last active timestamp in Unix seconds
-    last_active: AtomicU64,
+    /// Monotonic origin for the session's relative timestamps.
+    clock_origin: Instant,
+    /// Idle start in nanoseconds since clock_origin, published before a zero count.
+    idle_since: AtomicU64,
 
     /// Notify handle to break loops on session drop
     close_notify: Arc<tokio::sync::Notify>,
-}
-
-fn current_unix_timestamp() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
 }
 
 impl std::fmt::Debug for AnyTlsClientSession {
@@ -173,7 +170,8 @@ impl AnyTlsClientSession {
             pkt_counter: AtomicU32::new(1),
             initial_settings: AsyncMutex::new(Some(initial_buffer)),
             settings_sent: AtomicBool::new(false),
-            last_active: AtomicU64::new(current_unix_timestamp()),
+            clock_origin: Instant::now(),
+            idle_since: AtomicU64::new(0),
             close_notify: Arc::new(tokio::sync::Notify::new()),
         });
 
@@ -195,15 +193,34 @@ impl AnyTlsClientSession {
         self.streams.write().clear();
     }
 
-    pub(super) fn decrement_active_streams(&self) {
+    fn release_stream_slot(
+        &self,
+        decrement: impl Fn(usize, usize) -> (usize, usize),
+    ) {
         let _ = self.stream_counts.try_update(
             Ordering::AcqRel,
             Ordering::Relaxed,
             |val| {
                 let (active, reserved) = unpack_stream_counts(val);
-                Some(pack_stream_counts(active.saturating_sub(1), reserved))
+                let (active, reserved) = decrement(active, reserved);
+                let next = pack_stream_counts(active, reserved);
+                if val != 0 && next == 0 {
+                    // Publish the idle timestamp before the release CAS makes
+                    // zero visible to pruning's acquire load. A failed CAS can
+                    // conservatively refresh it; fetch_max prevents an older
+                    // concurrent attempt from moving the timestamp backwards.
+                    let elapsed = self.clock_origin.elapsed().as_nanos() as u64;
+                    self.idle_since.fetch_max(elapsed, Ordering::Relaxed);
+                }
+                Some(next)
             },
         );
+    }
+
+    pub(super) fn decrement_active_streams(&self) {
+        self.release_stream_slot(|active, reserved| {
+            (active.saturating_sub(1), reserved)
+        });
     }
 
     /// Unregister a stream from active streams map and decrement active_streams counter.
@@ -248,14 +265,9 @@ impl AnyTlsClientSession {
 
     /// Release a previously reserved stream slot without registering a stream
     pub fn release_reserved_stream(&self) {
-        let _ = self.stream_counts.try_update(
-            Ordering::AcqRel,
-            Ordering::Relaxed,
-            |val| {
-                let (active, reserved) = unpack_stream_counts(val);
-                Some(pack_stream_counts(active, reserved.saturating_sub(1)))
-            },
-        );
+        self.release_stream_slot(|active, reserved| {
+            (active, reserved.saturating_sub(1))
+        });
     }
 
     /// Atomically transition one reserved stream slot to an active stream
@@ -281,15 +293,18 @@ impl AnyTlsClientSession {
         self.peer_version.store(v, Ordering::Relaxed);
     }
 
-    /// Update last active timestamp to current time
-    pub fn touch_last_active(&self) {
-        self.last_active
-            .store(current_unix_timestamp(), Ordering::Relaxed);
+    /// Returns None while any active or reserved stream keeps the session busy.
+    pub fn idle_duration(&self) -> Option<Duration> {
+        if self.stream_counts.load(Ordering::Acquire) != 0 {
+            return None;
+        }
+        let since = self.idle_since.load(Ordering::Relaxed);
+        Some(self.clock_origin.elapsed().saturating_sub(Duration::from_nanos(since)))
     }
 
-    /// Get last active timestamp in Unix seconds
-    pub fn last_active_secs(&self) -> u64 {
-        self.last_active.load(Ordering::Relaxed)
+    #[cfg(test)]
+    pub(crate) fn peer_version(&self) -> u8 {
+        self.peer_version.load(Ordering::Relaxed)
     }
 
     /// Pre-encode Settings frame into initial buffer
@@ -394,9 +409,8 @@ impl AnyTlsClientSession {
     where
         W: AsyncWrite + Send + Unpin,
     {
-        let mut write_buf = BytesMut::with_capacity(65536 + FRAME_HEADER_SIZE + 64);
-        let mut padding_buf =
-            BytesMut::with_capacity(65536 + FRAME_HEADER_SIZE * 2 + 64);
+        let mut write_buf = BytesMut::with_capacity(256);
+        let mut padding_buf = BytesMut::new();
 
         loop {
             let msg = tokio::select! {
@@ -431,7 +445,6 @@ impl AnyTlsClientSession {
                         &mut padding_buf,
                     )
                     .await?;
-                    writer.flush().await?;
                 }
                 OutgoingMessage::Control {
                     cmd,
@@ -447,9 +460,10 @@ impl AnyTlsClientSession {
                         &mut padding_buf,
                     )
                     .await?;
-                    writer.flush().await?;
                 }
                 OutgoingMessage::Data { stream_id, data } => {
+                    // Keep header and payload in one plaintext write: rustls
+                    // can emit a TLS record immediately on each write.
                     Frame::encode_parts(
                         Command::Psh,
                         stream_id,
@@ -463,7 +477,6 @@ impl AnyTlsClientSession {
                         &mut padding_buf,
                     )
                     .await?;
-                    writer.flush().await?;
                 }
                 OutgoingMessage::Fin { stream_id } => {
                     Frame::control(Command::Fin, stream_id)
@@ -475,7 +488,6 @@ impl AnyTlsClientSession {
                         &mut padding_buf,
                     )
                     .await?;
-                    writer.flush().await?;
                     // AnyTLS 协议规范明确规定：收到 FIN 后关闭流，无需向对端回发 FIN。
                     // 因此 AnyTLS 的 FIN 表示整条流的关闭（而非 TCP 半关闭）。本地 FIN 真正写出后，
                     // 立即注销流并关闭接收通道（drop data_tx）。流读取侧在排空已经收到并入队的数据后
@@ -844,8 +856,6 @@ impl AnyTlsClientSession {
                 "AnyTLS session is closed",
             ));
         }
-
-        self.touch_last_active();
 
         let stream_id = self.stream_id_counter.fetch_add(1, Ordering::Relaxed) + 1;
         let (data_tx, data_rx) = mpsc::channel(STREAM_CHANNEL_BUFFER);

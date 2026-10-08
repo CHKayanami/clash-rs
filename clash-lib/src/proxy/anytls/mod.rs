@@ -24,10 +24,14 @@ pub mod session;
 pub mod stream;
 pub mod types;
 
+#[cfg(test)]
+mod tls_records_tests;
+
 use super::transport::uot::OutboundDatagramUotV2;
 use padding::{PaddingFactory, SharedPaddingFactory};
 use pool::{SessionPool, SessionPoolConfig};
 use session::AnyTlsClientSession;
+use stream::AnyTlsStream;
 
 pub struct HandlerOptions {
     pub name: String,
@@ -150,7 +154,7 @@ impl Handler {
         connector: &dyn RemoteConnector,
         sess: &Session,
         dest: &SocksAddr,
-    ) -> io::Result<crate::proxy::anytls::stream::AnyTlsStream> {
+    ) -> io::Result<AnyTlsStream> {
         let session = self
             .get_or_create_session(resolver.clone(), connector, sess)
             .await?;
@@ -166,7 +170,7 @@ impl Handler {
                 self.session_pool.prune_sessions();
 
                 let fresh_session =
-                    self.create_fresh_session(resolver, connector, sess).await?;
+                    self.get_or_create_session(resolver, connector, sess).await?;
                 fresh_session.open_stream(dest).await
             }
             Err(err) => Err(err),
@@ -328,6 +332,8 @@ impl PlainProxyAPIResponse for Handler {
 
 #[cfg(test)]
 mod tests {
+    mod retry;
+
     use bytes::{Bytes, BytesMut};
     use sha2::{Digest, Sha256};
     use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
@@ -864,7 +870,7 @@ mod tests {
             // 尝试读取 stream1 接收通道（此时没有数据，仅仅让出调度给 reader）
             tokio::task::yield_now().await;
             // 检查 session 的 peer_version
-            if session.last_active_secs() > 0 {
+            if session.peer_version() >= 2 {
                 // 已处理帧
                 tokio::time::sleep(std::time::Duration::from_millis(20)).await;
                 v2_confirmed = true;

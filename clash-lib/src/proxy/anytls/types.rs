@@ -2,7 +2,7 @@
 //!
 //! Based on the AnyTLS protocol specification v2.
 
-use bytes::{Buf, BufMut, Bytes, BytesMut};
+use bytes::{Buf, Bytes, BytesMut};
 use std::io;
 
 /// Frame header size: 1 (cmd) + 4 (stream_id) + 2 (data_len) = 7 bytes
@@ -96,13 +96,24 @@ impl Frame {
         Self::with_data(Command::Psh, stream_id, data)
     }
 
+    /// Encode a header without copying the payload into a staging buffer.
+    pub fn encode_header(
+        cmd: Command,
+        stream_id: u32,
+        data_len: u16,
+    ) -> [u8; FRAME_HEADER_SIZE] {
+        let id = stream_id.to_be_bytes();
+        let len = data_len.to_be_bytes();
+        [cmd as u8, id[0], id[1], id[2], id[3], len[0], len[1]]
+    }
+
     /// Encode frame parts into an existing buffer (zero allocation)
     #[inline]
     pub fn encode_parts(cmd: Command, stream_id: u32, data: &[u8], buf: &mut BytesMut) {
         buf.reserve(FRAME_HEADER_SIZE + data.len());
-        buf.put_u8(cmd as u8);
-        buf.put_u32(stream_id);
-        buf.put_u16(data.len() as u16);
+        buf.extend_from_slice(&Self::encode_header(
+            cmd, stream_id, data.len() as u16,
+        ));
         if !data.is_empty() {
             buf.extend_from_slice(data);
         }

@@ -1,30 +1,16 @@
 //! Connection-handling logic for the AnyTLS inbound listener.
 
-use super::{
-    datagram::InboundDatagramAnytls,
-    framing::{
-        CMD_ALERT, CMD_FIN, CMD_PSH, CMD_SETTINGS, CMD_SYN, CMD_WASTE,
-        UDP_OVER_TCP_V2_MAGIC_HOST, read_frame, write_frame,
-    },
-};
+use super::{datagram::InboundDatagramAnytls, session::run_session};
 use crate::{
     Dispatcher,
-    proxy::AnyStream,
+    proxy::{AnyStream, transport::uot::UDP_OVER_TCP_V2_MAGIC_HOST},
     session::{Network, Session, SocksAddr, Type},
 };
-use bytes::BufMut;
-use std::{collections::HashMap, net::SocketAddr, sync::Arc};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use std::{collections::HashMap, io, net::SocketAddr, sync::Arc};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 use tokio_rustls::TlsAcceptor;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
-
-/// Size of the in-process duplex pipe between the AnyTLS relay and the
-/// dispatcher (mirrors the outbound).
-const DUPLEX_BUFFER_SIZE: usize = 64 * 1024;
-
-/// Read buffer size for framed relay (mirrors the outbound).
-const RELAY_BUFFER_SIZE: usize = 16 * 1024;
 
 /// Forward an unauthenticated TLS stream to a fallback backend for camouflage.
 ///
@@ -69,8 +55,8 @@ async fn handle_fallback(
     let _ = tls_stream.shutdown().await;
 }
 
-/// Pre-authentication handshake: TLS + password + padding + frame loop.
-/// Returns `Some((tls_stream, inbound_user, destination, stream_id))` on
+/// Authentication handshake: TLS + password + padding.
+/// Returns `Some((tls_stream, inbound_user))` on
 /// success. Returns `None` on any error or if auth fails (fallback is handled
 /// internally).
 async fn do_handshake(
@@ -82,8 +68,6 @@ async fn do_handshake(
 ) -> Option<(
     tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
     Option<Arc<str>>,
-    SocksAddr,
-    u32,
 )> {
     // ── TLS handshake ────────────────────────────────────────────────────────
     let mut tls_stream = match acceptor.accept(raw_stream).await {
@@ -140,96 +124,7 @@ async fn do_handshake(
         }
     }
 
-    // ── Read frames until we have SYN + PSH with destination ─────────────────
-    let mut stream_id: Option<u32> = None;
-    let destination: SocksAddr;
-
-    /// Frames an authenticated client may send before SYN + PSH. SETTINGS and
-    /// WASTE are legitimately skipped, but nothing else bounded the loop — only
-    /// the outer handshake timeout.
-    const MAX_HANDSHAKE_FRAMES: usize = 64;
-    let mut frames_seen = 0usize;
-
-    'handshake: loop {
-        frames_seen += 1;
-        if frames_seen > MAX_HANDSHAKE_FRAMES {
-            warn!(
-                "anytls inbound: {src_addr} sent {MAX_HANDSHAKE_FRAMES} frames                  without completing the handshake"
-            );
-            return None;
-        }
-
-        let (cmd, sid, data) = match read_frame(&mut tls_stream).await {
-            Ok(f) => f,
-            Err(e) => {
-                debug!(
-                    "anytls inbound failed to read handshake frame from \
-                     {src_addr}: {e}"
-                );
-                return None;
-            }
-        };
-
-        match cmd {
-            CMD_SETTINGS | CMD_WASTE => {
-                // SETTINGS carries client metadata; we skip it.
-            }
-            CMD_SYN => match stream_id {
-                None => stream_id = Some(sid),
-                Some(existing) if existing == sid => {}
-                Some(existing) => {
-                    warn!(
-                        "anytls inbound received mismatched SYN stream_id={sid} \
-                         (expected {existing}) from {src_addr}"
-                    );
-                    return None;
-                }
-            },
-            CMD_PSH => {
-                let Some(expected_sid) = stream_id else {
-                    warn!("anytls inbound missing SYN before PSH from {src_addr}");
-                    return None;
-                };
-                if sid != expected_sid {
-                    warn!(
-                        "anytls inbound received PSH on stream_id={sid} (expected \
-                         {expected_sid}) from {src_addr}"
-                    );
-                    return None;
-                }
-                // Parse SocksAddr from the PSH frame data.
-                let mut cursor = std::io::Cursor::new(data);
-                match SocksAddr::read_from(&mut cursor).await {
-                    Ok(addr) => {
-                        destination = addr;
-                        break 'handshake;
-                    }
-                    Err(e) => {
-                        debug!(
-                            "anytls inbound failed to parse destination from \
-                             {src_addr}: {e}"
-                        );
-                        return None;
-                    }
-                }
-            }
-            CMD_FIN | CMD_ALERT => {
-                debug!("anytls inbound received early {cmd} from {src_addr}");
-                return None;
-            }
-            _ => {}
-        }
-    }
-
-    let sid = match stream_id {
-        Some(s) => s,
-        None => {
-            warn!("anytls inbound: no SYN received from {src_addr}");
-            return None;
-        }
-    };
-
-    Some((tls_stream, inbound_user, destination, sid))
+    Some((tls_stream, inbound_user))
 }
 
 /// Handle one accepted TCP connection (runs in a spawned task).
@@ -255,7 +150,7 @@ pub(super) async fn handle_connection(
     )
     .await;
 
-    let (tls_stream, inbound_user, dest, sid) = match handshake_result {
+    let (tls_stream, inbound_user) = match handshake_result {
         Ok(Some(result)) => result,
         Ok(None) => return, // protocol error or auth failure, already logged
         Err(_elapsed) => {
@@ -264,321 +159,68 @@ pub(super) async fn handle_connection(
         }
     };
 
-    debug!(
-        "anytls inbound accepted stream_id={sid} dest={dest} from {src_addr} \
-         user={:?}",
-        inbound_user
-    );
-
-    // ── Branch: UDP-over-TCP v2 or plain TCP relay ───────────────────────────
-    if dest.host() == UDP_OVER_TCP_V2_MAGIC_HOST {
-        handle_udp_session(
-            tls_stream,
-            src_addr,
-            sid,
-            dispatcher,
-            inbound_user,
-            fw_mark,
-        )
-        .await;
-    } else {
-        handle_tcp_relay(
-            tls_stream,
-            src_addr,
-            dest,
-            sid,
-            dispatcher,
-            inbound_user,
-            fw_mark,
-        )
-        .await;
+    let result = run_session(tls_stream, move |dest, stream, cancel| {
+        let dispatcher = Arc::clone(&dispatcher);
+        let inbound_user = inbound_user.clone();
+        async move {
+            let sess = Session {
+                network: Network::Tcp,
+                typ: Type::Anytls,
+                source: src_addr,
+                so_mark: fw_mark,
+                destination: dest,
+                inbound_user,
+                ..Default::default()
+            };
+            if sess.destination.host() == UDP_OVER_TCP_V2_MAGIC_HOST {
+                dispatch_udp(stream, &dispatcher, sess, cancel).await;
+            } else {
+                tokio::select! {
+                    _ = cancel.cancelled() => {},
+                    _ = dispatcher.dispatch_stream(sess, AnyStream::new(stream)) => {},
+                }
+            }
+        }
+    })
+    .await;
+    if let Err(err) = result {
+        debug!("anytls inbound session ended from {src_addr}: {err}");
     }
 }
 
-/// Handle a UDP-over-TCP v2 session.
-///
-/// The outbound wraps ALL application data (including the UoT connect header
-/// and datagrams) in CMD_PSH frames via its relay layer. So this function
-/// must set up the same CMD_PSH relay as `handle_tcp_relay`, then read the
-/// UoT connect header (`u8(isConnect=1) | SocksAddr`) from the unwrapped
-/// application stream, and pass that stream to `InboundDatagramAnytls` for
-/// `u16(len) | payload` datagram exchange.
-async fn handle_udp_session(
-    tls_stream: tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
-    src_addr: SocketAddr,
-    stream_id: u32,
-    dispatcher: Arc<Dispatcher>,
-    inbound_user: Option<Arc<str>>,
-    fw_mark: Option<u32>,
+async fn dispatch_udp(
+    mut stream: DuplexStream,
+    dispatcher: &Dispatcher,
+    mut sess: Session,
+    cancel: CancellationToken,
 ) {
-    let (mut remote_read, mut remote_write) = tokio::io::split(tls_stream);
-    let (mut app_stream, relay_stream) = tokio::io::duplex(DUPLEX_BUFFER_SIZE);
-    let (mut relay_read, mut relay_write) = tokio::io::split(relay_stream);
-
-    let cancel = CancellationToken::new();
-    let cancel_a = cancel.clone();
-    let cancel_b = cancel.clone();
-    let cancel_c = cancel;
-
-    // Task A: relay_read (writes from InboundDatagramAnytls) → CMD_PSH → TLS
-    tokio::spawn(async move {
-        let mut buf = vec![0u8; RELAY_BUFFER_SIZE];
-        loop {
-            tokio::select! {
-                biased;
-                _ = cancel_a.cancelled() => break,
-                result = relay_read.read(&mut buf) => {
-                    let n = match result {
-                        Ok(0) | Err(_) => { cancel_a.cancel(); break; }
-                        Ok(n) => n,
-                    };
-                    let mut psh_header = bytes::BytesMut::with_capacity(7);
-                    psh_header.put_u8(CMD_PSH);
-                    psh_header.put_u32(stream_id);
-                    psh_header.put_u16(n as u16);
-                    if remote_write.write_all(&psh_header).await.is_err()
-                        || remote_write.write_all(&buf[..n]).await.is_err()
-                        || remote_write.flush().await.is_err()
-                    {
-                        cancel_a.cancel();
-                        break;
-                    }
-                }
+    let request = async {
+        let is_connect = stream.read_u8().await?;
+        if is_connect != 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "anytls UoT requires isConnect=1",
+            ));
+        }
+        SocksAddr::read_from(&mut stream).await
+    };
+    let dest = tokio::select! {
+        _ = cancel.cancelled() => return,
+        result = request => match result {
+            Ok(dest) => dest,
+            Err(err) => {
+                debug!("anytls inbound UoT request failed: {err}");
+                return;
             }
         }
-    });
-
-    // Task B: TLS → CMD_PSH frames → relay_write (reads by InboundDatagramAnytls)
-    tokio::spawn(async move {
-        loop {
-            tokio::select! {
-                biased;
-                _ = cancel_b.cancelled() => break,
-                result = read_frame(&mut remote_read) => {
-                    let (cmd, sid, data) = match result {
-                        Ok(f) => f,
-                        Err(_) => { cancel_b.cancel(); break; }
-                    };
-                    match cmd {
-                        CMD_PSH if sid == stream_id
-                            && relay_write.write_all(&data).await.is_err() =>
-                        {
-                            cancel_b.cancel();
-                            break;
-                        }
-                        CMD_PSH if sid == stream_id => {}
-                        CMD_FIN if sid == stream_id => {
-                            cancel_b.cancel();
-                            break;
-                        }
-                        _ => {}
-                    }
-                }
-            }
-        }
-    });
-
-    // ── Read UoT v2 connect header from the unwrapped app stream ─────────────
-    let is_connect = match app_stream.read_u8().await {
-        Ok(b) => b,
-        Err(e) => {
-            debug!(
-                "anytls inbound UoT: failed to read isConnect from {src_addr}: {e}"
-            );
-            cancel_c.cancel();
-            return;
-        }
     };
-    if is_connect != 1 {
-        warn!(
-            "anytls inbound UoT: unexpected isConnect={is_connect} from {src_addr}"
-        );
-        cancel_c.cancel();
-        return;
-    }
-
-    let real_dest = match SocksAddr::read_from(&mut app_stream).await {
-        Ok(a) => a,
-        Err(e) => {
-            debug!(
-                "anytls inbound UoT: failed to read real destination from \
-                 {src_addr}: {e}"
-            );
-            cancel_c.cancel();
-            return;
-        }
-    };
-
-    debug!(
-        "anytls inbound UoT session: src={src_addr} dest={real_dest} user={:?}",
-        inbound_user
-    );
-
-    let inner: AnyStream = AnyStream::new(app_stream);
-    let datagram = InboundDatagramAnytls::new(inner, real_dest.clone());
-
-    let sess = Session {
-        network: Network::Udp,
-        typ: Type::Anytls,
-        source: src_addr,
-        so_mark: fw_mark,
-        destination: real_dest,
-        inbound_user,
-        ..Default::default()
-    };
-
-    let closer = dispatcher.dispatch_datagram(sess, Box::new(datagram)).await;
-
-    // Hold the close handle for the life of the UoT session. Dropping it
-    // immediately (`let _ = ...`) left the dispatcher's relay tasks with no way
-    // to be torn down, so they lingered until the UDP idle sweep noticed. Tasks
-    // A and B above cancel this token when the anytls stream dies.
-    cancel_c.cancelled().await;
+    sess.network = Network::Udp;
+    sess.destination = dest.clone();
+    let datagram = InboundDatagramAnytls::new(AnyStream::new(stream), dest);
+    let closer = dispatcher
+        .dispatch_datagram(sess, Box::new(datagram)).await;
+    cancel.cancelled().await;
     let _ = closer.send(0);
-}
-
-/// Handle a plain TCP relay session (the common case).
-///
-/// After the handshake we set up a duplex and relay frames bidirectionally.
-async fn handle_tcp_relay(
-    tls_stream: tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
-    src_addr: SocketAddr,
-    dest: SocksAddr,
-    stream_id: u32,
-    dispatcher: Arc<Dispatcher>,
-    inbound_user: Option<Arc<str>>,
-    fw_mark: Option<u32>,
-) {
-    let (mut remote_read, mut remote_write) = tokio::io::split(tls_stream);
-    let (app_stream, relay_stream) = tokio::io::duplex(DUPLEX_BUFFER_SIZE);
-    let (mut relay_read, mut relay_write) = tokio::io::split(relay_stream);
-
-    let cancel = CancellationToken::new();
-    let cancel_a = cancel.clone();
-    let cancel_b = cancel;
-
-    // Task A: relay_read (from dispatcher) → CMD_PSH frames → remote_write
-    tokio::spawn(async move {
-        let mut buf = vec![0u8; RELAY_BUFFER_SIZE];
-        loop {
-            tokio::select! {
-                biased;
-                _ = cancel_a.cancelled() => break,
-                result = relay_read.read(&mut buf) => {
-                    let n = match result {
-                        Ok(n) => n,
-                        Err(err) => {
-                            debug!("anytls inbound relay read error (src={src_addr}): {err}");
-                            cancel_a.cancel();
-                            break;
-                        }
-                    };
-                    if n == 0 {
-                        // Dispatcher closed its end — send FIN to client.
-                        if let Err(err) = write_frame(&mut remote_write, CMD_FIN, stream_id, &[]).await {
-                            debug!("anytls inbound send FIN failed (src={src_addr}): {err}");
-                        }
-                        let _ = remote_write.flush().await;
-                        cancel_a.cancel();
-                        break;
-                    }
-                    let mut psh_header = bytes::BytesMut::with_capacity(7);
-                    psh_header.put_u8(CMD_PSH);
-                    psh_header.put_u32(stream_id);
-                    psh_header.put_u16(n as u16);
-                    // Write header + data together to reduce syscalls.
-                    if let Err(err) = remote_write.write_all(&psh_header).await {
-                        debug!("anytls inbound PSH header write failed (src={src_addr}): {err}");
-                        cancel_a.cancel();
-                        break;
-                    }
-                    if let Err(err) = remote_write.write_all(&buf[..n]).await {
-                        debug!("anytls inbound PSH data write failed (src={src_addr}): {err}");
-                        cancel_a.cancel();
-                        break;
-                    }
-                    if let Err(err) = remote_write.flush().await {
-                        debug!("anytls inbound flush failed (src={src_addr}): {err}");
-                        cancel_a.cancel();
-                        break;
-                    }
-                }
-            }
-        }
-    });
-
-    // Task B: remote_read → CMD_PSH frames → relay_write (to dispatcher)
-    tokio::spawn(async move {
-        loop {
-            tokio::select! {
-                biased;
-                _ = cancel_b.cancelled() => break,
-                result = read_frame(&mut remote_read) => {
-                    let (cmd, sid, data) = match result {
-                        Ok(f) => f,
-                        Err(err) => {
-                            debug!("anytls inbound read frame error (src={src_addr}): {err}");
-                            cancel_b.cancel();
-                            break;
-                        }
-                    };
-                    match cmd {
-                        CMD_PSH => {
-                            if sid != stream_id {
-                                warn!(
-                                    "anytls inbound PSH on unexpected \
-                                     stream_id={sid} (expected {stream_id}) \
-                                     from {src_addr}, ignoring"
-                                );
-                                continue;
-                            }
-                            if let Err(err) = relay_write.write_all(&data).await {
-                                debug!("anytls inbound relay write failed (src={src_addr}): {err}");
-                                cancel_b.cancel();
-                                break;
-                            }
-                        }
-                        CMD_FIN => {
-                            if sid != stream_id {
-                                continue;
-                            }
-                            // Client finished sending — shutdown the write side.
-                            let _ = relay_write.shutdown().await;
-                            cancel_b.cancel();
-                            break;
-                        }
-                        CMD_ALERT => {
-                            if sid != stream_id {
-                                continue;
-                            }
-                            let msg = String::from_utf8_lossy(&data);
-                            warn!("anytls inbound alert from {src_addr}: {msg}");
-                            let _ = relay_write.shutdown().await;
-                            cancel_b.cancel();
-                            break;
-                        }
-                        // Control frames we don't need to act on server-side.
-                        CMD_WASTE | CMD_SYN | CMD_SETTINGS => {}
-                        _ => {}
-                    }
-                }
-            }
-        }
-    });
-
-    let sess = Session {
-        network: Network::Tcp,
-        typ: Type::Anytls,
-        source: src_addr,
-        so_mark: fw_mark,
-        destination: dest,
-        inbound_user,
-        ..Default::default()
-    };
-
-    dispatcher
-        .dispatch_stream(sess, AnyStream::new(app_stream))
-        .await;
 }
 
 #[cfg(test)]
