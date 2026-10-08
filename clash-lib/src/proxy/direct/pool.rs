@@ -3,7 +3,7 @@ use crate::{
     proxy::{datagram::UdpPacket, utils::new_dual_stack_udp_socket},
     session::SocksAddr,
 };
-use futures::{Sink, Stream, ready};
+use futures::{Sink, Stream, ready, task::AtomicWaker};
 use parking_lot::RwLock;
 use std::{
     collections::{HashMap, HashSet},
@@ -50,11 +50,26 @@ const MAX_CONSECUTIVE_RECV_ERRORS: usize = 10;
 const MAX_BATCH_RECV_PACKETS: usize = 32;
 const MAX_LOGICAL_MAPPINGS: usize = 128;
 
+#[derive(Clone)]
+struct SessionSender {
+    tx: Sender<UdpPacket>,
+    recv_waker: Arc<AtomicWaker>,
+}
+
+impl SessionSender {
+    fn new(tx: Sender<UdpPacket>) -> Self {
+        Self {
+            tx,
+            recv_waker: Arc::new(AtomicWaker::new()),
+        }
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct SocketRoutingTable {
     is_closed: bool,
-    /// Active sessions on this socket: SessionId -> Sender<UdpPacket>
-    sessions: HashMap<SessionId, Sender<UdpPacket>>,
+    /// Active sessions and receive-task closure wakers on this socket.
+    sessions: HashMap<SessionId, SessionSender>,
     /// Remote destination index: peer SocketAddr -> SessionId (strictly 1:1)
     dest_to_session: HashMap<SocketAddr, SessionId>,
     /// Tracks which session was most recently active for delivering unsolicited Full-Cone packets
@@ -77,7 +92,7 @@ impl SocketRoutingTable {
     fn try_register(
         &mut self,
         session_id: SessionId,
-        tx: Sender<UdpPacket>,
+        tx: SessionSender,
         initial_dst: Option<SocketAddr>,
     ) -> bool {
         if self.is_closed {
@@ -129,15 +144,18 @@ impl SocketRoutingTable {
         }
         // 1. Exact match on registered remote destination
         if let Some(session_id) = self.dest_to_session.get(&peer) {
-            return self.sessions.get(session_id).cloned();
+            return self.sessions.get(session_id)
+                .map(|session| session.tx.clone());
         }
 
         // 2. Unregistered remote address (Full-Cone NAT behavior)
         // Under Full-Cone NAT, deliver unsolicited packets (such as P2P hole-punching packets)
         // to the active session on this socket.
         self.last_active_session
-            .and_then(|id| self.sessions.get(&id).cloned())
-            .or_else(|| self.sessions.values().next().cloned())
+            .and_then(|id| self.sessions.get(&id).map(|session| session.tx.clone()))
+            .or_else(|| {
+                self.sessions.values().next().map(|session| session.tx.clone())
+            })
     }
 
     fn on_transmit(&mut self, session_id: SessionId) -> bool {
@@ -166,6 +184,9 @@ impl SocketRoutingTable {
 
     fn close(&mut self) {
         self.is_closed = true;
+        for session in self.sessions.values() {
+            session.recv_waker.wake();
+        }
         self.sessions.clear();
         self.dest_to_session.clear();
         self.last_active_session = None;
@@ -314,6 +335,7 @@ impl DirectDatagramPool {
 
         let session_id = NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = channel(64);
+        let tx = SessionSender::new(tx);
 
         // 1. Fast-path: Under read lock, try to find an existing socket that doesn't conflict with canon_dst
         let mut chosen_entry = None;
@@ -400,7 +422,7 @@ impl DirectDatagramPool {
         key: &DirectSocketKey,
         current_entry: &Arc<DirectSocketEntry>,
         session_id: SessionId,
-        tx: Sender<UdpPacket>,
+        tx: SessionSender,
         dst: SocketAddr,
         iface: Option<&OutboundInterface>,
     ) -> io::Result<Arc<DirectSocketEntry>> {
@@ -502,7 +524,7 @@ pub struct PooledDirectDatagram {
     base_key: DirectSocketKey,
     resolver: ThreadSafeDNSResolver,
     iface: Option<OutboundInterface>,
-    tx: Sender<UdpPacket>,
+    tx: SessionSender,
     registered_dsts: HashSet<SocketAddr>,
     retained_entries: Vec<(Arc<DirectSocketEntry>, HashSet<SocketAddr>)>,
     last_dst: Option<SocketAddr>,
@@ -540,7 +562,27 @@ impl Stream for PooledDirectDatagram {
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Self::Item>> {
-        match ready!(self.rx.poll_recv(cx)) {
+        let received = match self.rx.poll_recv(cx) {
+            Poll::Ready(packet) => packet,
+            Poll::Pending => {
+                // Only empty queues need closure notifications. Register before
+                // checking so a concurrent receiver exit cannot lose a wakeup.
+                self.tx.recv_waker.register(cx.waker());
+                if self.entry.routing.read().is_closed()
+                    && self.retained_entries.iter().all(|(entry, _)| {
+                        entry.routing.read().is_closed()
+                    })
+                {
+                    self.rx.close();
+                    // A reply may have arrived since the first poll. Drain it
+                    // before ending, even though we still own a sender.
+                    ready!(self.rx.poll_recv(cx))
+                } else {
+                    return Poll::Pending;
+                }
+            }
+        };
+        match received {
             Some(mut packet) => {
                 // Restore logical domain when the source IP matches a resolved domain target.
                 // Full-Cone unsolicited packets from third parties retain their raw physical address.
@@ -728,6 +770,8 @@ impl Sink<UdpPacket> for PooledDirectDatagram {
                     {
                         ip_to_logical.insert(canon_dst, logical);
                     }
+                } else {
+                    ip_to_logical.remove(&canon_dst);
                 }
                 Poll::Ready(Ok(()))
             }
@@ -750,10 +794,155 @@ mod tests {
     use crate::app::dns::MockClashResolver;
     use bytes::Bytes;
     use futures::{SinkExt, StreamExt};
-    use std::{net::IpAddr, time::Duration};
+    use std::{
+        net::{IpAddr, Ipv4Addr},
+        time::Duration,
+    };
 
     fn resolver() -> ThreadSafeDNSResolver {
         Arc::new(MockClashResolver::new())
+    }
+
+    #[tokio::test]
+    async fn test_closed_sockets_wake_and_drain_stream() {
+        use std::sync::atomic::AtomicBool;
+        use std::task::{Wake, Waker};
+
+        struct WakeFlag(AtomicBool);
+        impl Wake for WakeFlag {
+            fn wake(self: Arc<Self>) {
+                self.0.store(true, Ordering::Relaxed);
+            }
+        }
+
+        let pool = Arc::new(DirectDatagramPool::new());
+        let key = DirectSocketKey {
+            source: "127.0.0.1:43103".parse().unwrap(),
+            iface_name: None,
+            so_mark: None,
+        };
+        let dst = "127.0.0.1:53".parse().unwrap();
+        let mut datagram = pool
+            .connect(key.clone(), None, SocksAddr::Ip(dst), resolver())
+            .unwrap();
+        let retained = Arc::new(
+            DirectDatagramPool::create_entry(&key, None, None).unwrap(),
+        );
+        retained.routing.write().try_register(
+            datagram.session_id,
+            datagram.tx.clone(),
+            Some(dst),
+        );
+        datagram.retained_entries
+            .push((retained.clone(), HashSet::from([dst])));
+
+        let flag = Arc::new(WakeFlag(AtomicBool::new(false)));
+        let waker = Waker::from(flag.clone());
+        let mut cx = Context::from_waker(&waker);
+        datagram.tx.tx
+            .try_send(UdpPacket::new(
+                Bytes::from_static(b"buffered"),
+                SocksAddr::Ip(dst),
+                SocksAddr::any_ipv4(),
+            ))
+            .unwrap();
+        assert!(matches!(
+            Pin::new(&mut datagram).poll_next(&mut cx),
+            Poll::Ready(Some(_))
+        ));
+        datagram.tx.recv_waker.wake();
+        assert!(!flag.0.load(Ordering::Relaxed));
+        assert!(Pin::new(&mut datagram).poll_next(&mut cx).is_pending());
+        datagram.entry.routing.write().close();
+        assert!(flag.0.swap(false, Ordering::Relaxed));
+        assert!(Pin::new(&mut datagram).poll_next(&mut cx).is_pending());
+
+        datagram.tx.tx
+            .try_send(UdpPacket::new(
+                Bytes::from_static(b"queued"),
+                SocksAddr::Ip(dst),
+                SocksAddr::any_ipv4(),
+            ))
+            .unwrap();
+        flag.0.store(false, Ordering::Relaxed);
+        retained.routing.write().close();
+        assert!(flag.0.load(Ordering::Relaxed));
+        let Poll::Ready(Some(packet)) = Pin::new(&mut datagram).poll_next(&mut cx)
+        else {
+            panic!("queued reply must be drained");
+        };
+        assert_eq!(packet.data.as_ref(), b"queued");
+        assert!(matches!(
+            Pin::new(&mut datagram).poll_next(&mut cx),
+            Poll::Ready(None)
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_socket_closed_before_first_receive_poll() {
+        let pool = Arc::new(DirectDatagramPool::new());
+        let key = DirectSocketKey {
+            source: "127.0.0.1:43105".parse().unwrap(),
+            iface_name: None,
+            so_mark: None,
+        };
+        let mut datagram = pool
+            .connect(
+                key,
+                None,
+                SocksAddr::Ip("127.0.0.1:53".parse().unwrap()),
+                resolver(),
+            )
+            .unwrap();
+        // Closure happens before any waker is registered. The cold-path
+        // check must still end the stream despite its own sender staying alive.
+        datagram.entry.routing.write().close();
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        assert!(matches!(
+            Pin::new(&mut datagram).poll_next(&mut cx),
+            Poll::Ready(None)
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_ip_send_clears_previous_domain_mapping() {
+        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let dst = peer.local_addr().unwrap();
+        let mut dns = MockClashResolver::new();
+        dns.expect_resolve().returning(|_, _| {
+            Ok(Some(IpAddr::V4(Ipv4Addr::LOCALHOST)))
+        });
+        dns.expect_resolve_v4().returning(|_, _| {
+            Ok(Some(Ipv4Addr::LOCALHOST))
+        });
+        let pool = Arc::new(DirectDatagramPool::new());
+        let domain = SocksAddr::Domain("echo.test".into(), dst.port());
+        let key = DirectSocketKey {
+            source: "127.0.0.1:43104".parse().unwrap(),
+            iface_name: None,
+            so_mark: None,
+        };
+        let mut datagram = pool
+            .connect(key, None, domain.clone(), Arc::new(dns))
+            .unwrap();
+        for destination in [domain, SocksAddr::Ip(dst)] {
+            datagram
+                .send(UdpPacket::new(
+                    Bytes::from_static(b"probe"),
+                    SocksAddr::any_ipv4(),
+                    destination.clone(),
+                ))
+                .await
+                .unwrap();
+            let mut buf = [0u8; 32];
+            let (_, return_addr) = peer.recv_from(&mut buf).await.unwrap();
+            peer.send_to(b"reply", return_addr).await.unwrap();
+            let reply = tokio::time::timeout(Duration::from_secs(2), datagram.next())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(reply.src_addr, destination);
+        }
     }
 
     #[tokio::test]
@@ -910,6 +1099,7 @@ mod tests {
         let entry1 =
             Arc::new(DirectDatagramPool::create_entry(&key, None, None).unwrap());
         let (tx10, _rx10) = channel(1);
+        let tx10 = SessionSender::new(tx10);
         let old_dst: SocketAddr = "1.1.1.1:53".parse().unwrap();
         entry1.routing.write().try_register(10, tx10, Some(old_dst));
 
@@ -922,6 +1112,7 @@ mod tests {
         let entry0 =
             Arc::new(DirectDatagramPool::create_entry(&key, None, None).unwrap());
         let (tx20, _rx20) = channel(1);
+        let tx20 = SessionSender::new(tx20);
         let new_dst: SocketAddr = "2.2.2.2:53".parse().unwrap();
         entry0
             .routing

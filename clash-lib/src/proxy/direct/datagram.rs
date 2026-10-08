@@ -186,6 +186,8 @@ impl Sink<UdpPacket> for OutboundDatagramImpl {
 
         let n = ready!(inner.poll_send_to(cx, p.data.as_ref(), send_dst))?;
 
+        let canon_dst = canonicalize_src(dst);
+
         // Only register logical domain mappings for Domain destinations.
         // Pure IP destinations do not need logical domain restoration, avoiding
         // unnecessary heap allocations and hash map thrashing on high-PPS IP flows.
@@ -199,7 +201,9 @@ impl Sink<UdpPacket> for OutboundDatagramImpl {
                 });
                 *last_sweep = now;
             }
-            ip_to_logical.insert(dst, (p.dst_addr.clone(), now));
+            ip_to_logical.insert(canon_dst, (p.dst_addr.clone(), now));
+        } else {
+            ip_to_logical.remove(&canon_dst);
         }
 
         // Save length before clearing pkt (NLL ends p's borrow after this).
@@ -292,9 +296,17 @@ impl Stream for OutboundDatagramImpl {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::dns::MockClashResolver;
+    use crate::{
+        app::dns::MockClashResolver,
+        proxy::utils::new_dual_stack_udp_socket,
+    };
     use futures::{SinkExt, StreamExt};
-    use std::{collections::HashSet, net::Ipv4Addr, sync::Arc, time::Duration};
+    use std::{
+        collections::HashSet,
+        net::{IpAddr, Ipv4Addr},
+        sync::Arc,
+        time::Duration,
+    };
     use tokio::net::UdpSocket;
 
     /// Spawn a loopback UDP echo server; returns its port.
@@ -322,6 +334,81 @@ mod tests {
             .returning(|_, _| Ok(Some(Ipv4Addr::LOCALHOST)));
         let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         OutboundDatagramImpl::new(udp, Arc::new(resolver))
+    }
+
+    #[tokio::test]
+    async fn test_ip_send_clears_previous_domain_mapping() {
+        let port = spawn_echo_server().await;
+        let mut datagram = make_datagram().await;
+        let domain = SocksAddr::Domain("echo.test".into(), port);
+        let ip = SocksAddr::Ip(SocketAddr::from((Ipv4Addr::LOCALHOST, port)));
+        for destination in [domain, ip] {
+            datagram
+                .send(UdpPacket {
+                    data: bytes::Bytes::from_static(b"probe"),
+                    dst_addr: destination.clone(),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            let reply = tokio::time::timeout(Duration::from_secs(2), datagram.next())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(reply.src_addr, destination);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_mapped_ipv6_domain_mapping_uses_canonical_key() {
+        let port = spawn_echo_server().await;
+        let mapped_ip = Ipv4Addr::LOCALHOST.to_ipv6_mapped();
+        let mut resolver = MockClashResolver::new();
+        resolver.expect_resolve().returning(move |_, _| {
+            Ok(Some(IpAddr::V6(mapped_ip)))
+        });
+        let udp = new_dual_stack_udp_socket(
+            None,
+            #[cfg(target_os = "linux")]
+            None,
+        )
+        .unwrap();
+        assert!(udp.local_addr().unwrap().is_ipv6());
+        let mut datagram = OutboundDatagramImpl::new(udp, Arc::new(resolver));
+        let domain = SocksAddr::Domain("echo.test".into(), port);
+        let canonical = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+        let mapped = SocketAddr::from((mapped_ip, port));
+
+        // Both mapped and native IP sends must clear a mapping created from
+        // a mapped DNS answer; domain replies must restore the logical source.
+        for destination in [
+            domain.clone(),
+            SocksAddr::Ip(mapped),
+            domain,
+            SocksAddr::Ip(canonical),
+        ] {
+            datagram
+                .send(UdpPacket {
+                    data: bytes::Bytes::from_static(b"probe"),
+                    dst_addr: destination.clone(),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            assert!(!datagram.ip_to_logical.contains_key(&mapped));
+            let expected = if matches!(destination, SocksAddr::Domain(..)) {
+                assert!(datagram.ip_to_logical.contains_key(&canonical));
+                destination
+            } else {
+                assert!(datagram.ip_to_logical.is_empty());
+                SocksAddr::Ip(canonical)
+            };
+            let reply = tokio::time::timeout(Duration::from_secs(2), datagram.next())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(reply.src_addr, expected);
+        }
     }
 
     #[tokio::test]
