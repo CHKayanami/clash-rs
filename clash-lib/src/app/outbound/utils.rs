@@ -7,7 +7,7 @@ pub fn proxy_groups_dag_sort(
     groups: &mut [OutboundGroupProtocol],
 ) -> Result<(), Error> {
     let n = groups.len();
-    if n <= 1 {
+    if n == 0 {
         return Ok(());
     }
 
@@ -27,12 +27,16 @@ pub fn proxy_groups_dag_sort(
     let mut in_degree = vec![0; n];
 
     for (j, group) in groups.iter().enumerate() {
-        if let Some(proxies) = group.proxies() {
-            for proxy in proxies {
-                if let Some(&i) = name_to_idx.get(proxy.as_str()) {
-                    adj[i].push(j);
-                    in_degree[j] += 1;
-                }
+        let dependencies = group
+            .proxies()
+            .into_iter()
+            .flatten()
+            .map(String::as_str)
+            .chain(group.empty_fallback());
+        for proxy in dependencies {
+            if let Some(&i) = name_to_idx.get(proxy) {
+                adj[i].push(j);
+                in_degree[j] += 1;
             }
         }
     }
@@ -95,6 +99,25 @@ mod tests {
         OutboundGroupRelay, OutboundGroupSelect, OutboundGroupSmart,
         OutboundGroupUrlTest,
     };
+
+    #[test]
+    fn test_empty_fallback_dependencies() {
+        let make_group = |name: &str, fallback: Option<&str>| {
+            OutboundGroupProtocol::Select(OutboundGroupSelect {
+                name: name.to_owned(),
+                empty_fallback: fallback.map(str::to_owned),
+                ..Default::default()
+            })
+        };
+        let mut groups = vec![make_group("a", Some("b")), make_group("b", None)];
+        super::proxy_groups_dag_sort(&mut groups).unwrap();
+        assert_eq!(groups[0].name(), "b");
+
+        let mut cycle = vec![make_group("a", Some("b")), make_group("b", Some("a"))];
+        assert!(super::proxy_groups_dag_sort(&mut cycle).is_err());
+        let mut self_cycle = vec![make_group("a", Some("a"))];
+        assert!(super::proxy_groups_dag_sort(&mut self_cycle).is_err());
+    }
 
     #[test]
     fn test_proxy_groups_dag_sort_ok() {

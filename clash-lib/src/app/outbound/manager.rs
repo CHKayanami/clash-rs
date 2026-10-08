@@ -439,7 +439,7 @@ impl OutboundManager {
 
     pub fn load_plain_outbounds(
         outbounds: Vec<OutboundProxyProtocol>,
-    ) -> Vec<AnyOutboundHandler> {
+    ) -> Result<Vec<AnyOutboundHandler>, Error> {
         let mut loaded: HashMap<String, AnyOutboundHandler> = HashMap::new();
         let mut pending: Vec<OutboundProxyProtocol> = outbounds;
         let mut progress = true;
@@ -481,21 +481,20 @@ impl OutboundManager {
             pending = remaining;
         }
 
-        for outbound in pending {
-            if let Some(d) = outbound.dialer_proxy() {
-                tracing::warn!(
-                    "dialer-proxy '{}' for outbound '{}' not resolved in plain proxies (may be cyclic or in a group)",
-                    d,
-                    outbound.name()
-                );
-            }
-            let name = outbound.name().to_string();
-            if let Some(handler) = Self::load_single_plain_outbound(outbound, None) {
-                loaded.insert(name, handler);
-            }
+        if !pending.is_empty() {
+            let unresolved = pending
+                .iter()
+                .map(|outbound| {
+                    format!("{} -> {}", outbound.name(), outbound.dialer_proxy().unwrap())
+                })
+                .collect::<Vec<_>>();
+            return Err(Error::InvalidConfig(format!(
+                "unresolved dialer-proxy dependencies (missing, cyclic or unsupported group): {}",
+                unresolved.join(", ")
+            )));
         }
 
-        loaded.into_values().collect()
+        Ok(loaded.into_values().collect())
     }
 }
 
@@ -596,6 +595,7 @@ impl OutboundManager {
         provider_registry: &mut HashMap<String, ArcProxyProvider>,
     ) -> Result<Vec<ArcProxyProvider>, Error> {
         let name = group.name();
+        let url = group.url().unwrap_or(DEFAULT_LATENCY_TEST_URL);
         let mut providers: Vec<ArcProxyProvider> = vec![];
         let include_all = group.include_all().unwrap_or(false);
 
@@ -656,6 +656,7 @@ impl OutboundManager {
             let pd = Self::make_provider_from_proxies(
                 name,
                 &group_proxies,
+                url,
                 interval,
                 lazy,
                 handlers,
@@ -705,7 +706,7 @@ impl OutboundManager {
                 let fallback_proxies = vec![fb_handler];
                 let hc = HealthCheck::new(
                     fallback_proxies.clone(),
-                    DEFAULT_LATENCY_TEST_URL.to_owned(),
+                    url.to_owned(),
                     interval,
                     lazy,
                     proxy_manager.clone(),
@@ -727,6 +728,7 @@ impl OutboundManager {
     fn make_provider_from_proxies(
         name: &str,
         proxies: &[String],
+        url: &str,
         interval: u64,
         lazy: bool,
         handlers: &HashMap<String, AnyOutboundHandler>,
@@ -752,7 +754,7 @@ impl OutboundManager {
 
         let hc = HealthCheck::new(
             proxies.clone(),
-            DEFAULT_LATENCY_TEST_URL.to_owned(),
+            url.to_owned(),
             interval,
             lazy,
             proxy_manager,
@@ -1126,9 +1128,59 @@ mod tests {
     use crate::app::remote_content_manager::ProxyManager;
     use crate::config::internal::proxy::{
         CommonConfigOptions, OutboundGroupProtocol, OutboundProxyProtocol,
-        OutboundShadowsocks,
+        OutboundShadowsocks, OutboundGroupUrlTest,
     };
     use crate::proxy::utils::test_utils::noop::NoopResolver;
+
+    #[test]
+    fn test_unresolved_dialer_dependencies_are_rejected() {
+        let make_proxy = |name: &str, dialer: &str| {
+            let yaml = format!(
+                "type: socks5\nname: {name}\nserver: 127.0.0.1\nport: 1080\ndialer-proxy: {dialer}\n"
+            );
+            yaml_serde::from_str::<OutboundProxyProtocol>(&yaml).unwrap()
+        };
+        assert!(OutboundManager::load_plain_outbounds(vec![make_proxy("a", "missing")]).is_err());
+        assert!(OutboundManager::load_plain_outbounds(vec![make_proxy("a", "a")]).is_err());
+        assert!(OutboundManager::load_plain_outbounds(vec![
+            make_proxy("a", "b"), make_proxy("b", "a"),
+        ]).is_err());
+    }
+
+    #[tokio::test]
+    async fn test_group_healthcheck_uses_configured_url() {
+        use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::TcpListener};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/probe", listener.local_addr().unwrap());
+        let group = OutboundGroupProtocol::UrlTest(
+            OutboundGroupUrlTest {
+                name: "test".to_owned(),
+                proxies: Some(vec![PROXY_DIRECT.to_owned()]),
+                url,
+                ..Default::default()
+            },
+        );
+        let handlers = HashMap::from([(
+            PROXY_DIRECT.to_owned(),
+            Arc::new(direct::Handler::new(PROXY_DIRECT)) as AnyOutboundHandler,
+        )]);
+        let manager = ProxyManager::new(Arc::new(NoopResolver), None);
+        let mut registry = HashMap::new();
+        let providers = OutboundManager::build_group_providers(
+            &group, 0, true, &handlers, &[], &manager, &mut registry,
+        ).unwrap();
+        let server = async {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0; 4096];
+            let len = stream.read(&mut request).await.unwrap();
+            assert!(String::from_utf8_lossy(&request[..len]).contains("/probe"));
+            stream.write_all(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n").await.unwrap();
+        };
+        tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(server, providers[0].healthcheck());
+        }).await.unwrap();
+    }
 
     #[test]
     #[cfg(feature = "shadowsocks")]
@@ -1169,7 +1221,7 @@ mod tests {
 
         // Pass ss2 before ss1 in the input list to verify topological sort resolves ss1 first
         let outbounds = vec![ss2, ss1];
-        let handlers = OutboundManager::load_plain_outbounds(outbounds);
+        let handlers = OutboundManager::load_plain_outbounds(outbounds).unwrap();
 
         assert_eq!(handlers.len(), 2);
         let handler_map: HashMap<String, AnyOutboundHandler> = handlers

@@ -719,6 +719,18 @@ impl OutboundGroupProtocol {
         }
     }
 
+    /// Returns the latency test URL of the group, if configured.
+    pub fn url(&self) -> Option<&str> {
+        match self {
+            OutboundGroupProtocol::Relay(g) => g.url.as_deref(),
+            OutboundGroupProtocol::UrlTest(g) => Some(g.url.as_str()),
+            OutboundGroupProtocol::Fallback(g) => Some(g.url.as_str()),
+            OutboundGroupProtocol::LoadBalance(g) => Some(g.url.as_str()),
+            OutboundGroupProtocol::Smart(g) => g.url.as_deref(),
+            OutboundGroupProtocol::Select(g) => g.url.as_deref(),
+        }
+    }
+
     /// Returns the proxies in the group, if any.
     pub fn proxies(&self) -> Option<&Vec<String>> {
         match &self {

@@ -636,7 +636,7 @@ async fn create_components(
                 _ => None,
             })
             .collect(),
-    );
+    )?;
 
     let outbound_registry = Arc::new(parking_lot::RwLock::new(
         plain_outbounds
