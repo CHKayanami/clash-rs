@@ -21,7 +21,7 @@ use tokio::{
         mpsc::{self, error::TrySendError},
     },
 };
-use tokio_util::sync::PollSender;
+use tokio_util::sync::{CancellationToken, PollSender};
 use tracing::{debug, trace};
 
 use super::frame::{
@@ -85,12 +85,22 @@ impl XudpCarrier {
         });
 
         // Spawn coalescing writer task
+        let cancel = CancellationToken::new();
+        let cancel_w = cancel.clone();
         let closed_w = closed.clone();
+        let sessions_w = sessions.clone();
         tokio::spawn(async move {
-            if let Err(e) = Self::writer_loop(write_half, writer_rx).await {
-                debug!("XUDP carrier [{}] writer error: {}", carrier_id, e);
+            tokio::select! {
+                _ = cancel_w.cancelled() => {}
+                result = Self::writer_loop(write_half, writer_rx) => {
+                    if let Err(e) = result {
+                        debug!("XUDP carrier [{}] writer error: {}", carrier_id, e);
+                    }
+                }
             }
             closed_w.store(true, Ordering::SeqCst);
+            sessions_w.write().clear();
+            cancel_w.cancel();
         });
 
         // Spawn zero-allocation reader task
@@ -98,14 +108,18 @@ impl XudpCarrier {
         let sessions_r = sessions.clone();
         let last_active_ms_r = last_active_ms.clone();
         tokio::spawn(async move {
-            if let Err(e) =
-                Self::reader_loop(carrier_id, read_half, sessions_r.clone(), last_active_ms_r).await
-            {
-                debug!("XUDP carrier [{}] reader error/EOF: {}", carrier_id, e);
+            tokio::select! {
+                _ = cancel.cancelled() => {}
+                result = Self::reader_loop(carrier_id, read_half, sessions_r.clone(), last_active_ms_r) => {
+                    if let Err(e) = result {
+                        debug!("XUDP carrier [{}] reader error/EOF: {}", carrier_id, e);
+                    }
+                }
             }
             closed_r.store(true, Ordering::SeqCst);
             // Drop all senders to notify active child datagrams of stream closure
             sessions_r.write().clear();
+            cancel.cancel();
         });
 
         carrier
@@ -263,6 +277,13 @@ impl XudpCarrier {
 
         {
             let mut sessions = self.sessions.write();
+            if self.is_closed() {
+                self.active_streams.fetch_sub(1, Ordering::SeqCst);
+                return Err(io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "XUDP carrier is closed",
+                ));
+            }
             sessions.insert(session_id, ChildSession { tx, peer: target });
         }
 
@@ -582,7 +603,87 @@ impl XudpPool {
 mod tests {
     use super::*;
     use futures::{SinkExt, StreamExt};
-    use tokio::io::duplex;
+    use tokio::io::{AsyncRead, AsyncWrite, ReadBuf, duplex};
+    use tokio::time::{Duration, timeout};
+    use crate::proxy::ProxyStream;
+
+    struct FailedWriter(Arc<Notify>);
+
+    impl ProxyStream for FailedWriter {}
+
+    impl AsyncRead for FailedWriter {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    impl AsyncWrite for FailedWriter {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()))
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>, _cx: &mut Context<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: Pin<&mut Self>, _cx: &mut Context<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl Drop for FailedWriter {
+        fn drop(&mut self) {
+            self.0.notify_one();
+        }
+    }
+
+    #[tokio::test]
+    async fn writer_failure_closes_children_and_releases_transport() {
+        let dropped = Arc::new(Notify::new());
+        let stream = AnyStream::Dynamic(Box::new(FailedWriter(dropped.clone())));
+        let carrier = XudpCarrier::new(stream, 1, 8);
+        let target: SocksAddr = "1.1.1.1:443".parse().unwrap();
+        let mut child = carrier.open_child(target.clone()).unwrap();
+        child.send(UdpPacket {
+            data: Bytes::from_static(b"query"),
+            src_addr: SocksAddr::any_ipv4(),
+            dst_addr: target.clone(),
+            inbound_user: None,
+        }).await.unwrap();
+        let packet = timeout(Duration::from_secs(1), child.next()).await.unwrap();
+        assert!(packet.is_none());
+        timeout(Duration::from_secs(1), dropped.notified()).await.unwrap();
+        assert!(carrier.is_closed());
+        assert!(carrier.open_child(target).is_err());
+    }
+
+    #[tokio::test]
+    async fn reader_eof_cancels_waiting_writer() {
+        let (client, mut server) = duplex(1024);
+        let carrier = XudpCarrier::new(AnyStream::new(client), 1, 8);
+        let target: SocksAddr = "1.1.1.1:53".parse().unwrap();
+        let mut child = carrier.open_child(target).unwrap();
+        server.shutdown().await.unwrap();
+        let packet = timeout(Duration::from_secs(1), child.next()).await.unwrap();
+        assert!(packet.is_none());
+        let mut buf = [0; 1];
+        let read = timeout(Duration::from_secs(1), server.read(&mut buf))
+            .await.unwrap().unwrap();
+        assert_eq!(read, 0);
+        assert!(carrier.is_closed());
+    }
 
     #[tokio::test]
     async fn test_xudp_pool_multiplexing_and_graceful_end() {

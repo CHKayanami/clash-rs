@@ -53,6 +53,38 @@ pub struct Handler {
     encryption: Option<Arc<EncryptionClient>>,
 }
 
+#[cfg(test)]
+mod config_tests {
+    use super::Handler;
+    use crate::config::internal::proxy::OutboundVless;
+
+    #[test]
+    fn vision_udp443_normalizes_and_validates_transport() {
+        crate::tests::initialize();
+        let mut config = OutboundVless {
+            uuid: "00000000-0000-0000-0000-000000000000".into(),
+            tls: Some(true),
+            flow: Some("xtls-rprx-vision-udp443".into()),
+            ..Default::default()
+        };
+        config.common_opts.server = "localhost".into();
+        for network in [None, Some("tcp"), Some("raw")] {
+            config.network = network.map(str::to_owned);
+            let handler = Handler::try_from(&config).unwrap();
+            assert_eq!(handler.opts.flow.as_deref(), Some("xtls-rprx-vision"));
+            assert!(handler.opts.udp);
+        }
+        for flow in ["xtls-rprx-vision", "xtls-rprx-vision-udp443"] {
+            config.flow = Some(flow.into());
+            for network in ["ws", "grpc", "h2", "http", "xhttp"] {
+                config.network = Some(network.into());
+                let error = Handler::try_from(&config).unwrap_err();
+                assert!(error.to_string().contains("requires VLESS Encryption"));
+            }
+        }
+    }
+}
+
 impl std::fmt::Debug for Handler {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Vless")

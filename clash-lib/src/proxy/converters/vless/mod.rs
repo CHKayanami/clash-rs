@@ -30,6 +30,10 @@ pub fn build_handler(
     s: &OutboundVless,
     connector: Option<Arc<dyn RemoteConnector>>,
 ) -> Result<Handler, crate::Error> {
+    let flow = s.flow.as_deref().map(|flow| match flow {
+        "xtls-rprx-vision-udp443" => "xtls-rprx-vision",
+        flow => flow,
+    });
     s.smux.as_ref().map(|m| m.validate()).transpose()?;
     let encryption = s
         .encryption
@@ -55,7 +59,7 @@ pub fn build_handler(
         );
     }
 
-    if let Some(flow) = s.flow.as_deref()
+    if let Some(flow) = flow
         && flow == "xtls-rprx-vision"
         && encryption.is_none()
         && !s.tls.unwrap_or_default()
@@ -67,10 +71,10 @@ pub fn build_handler(
         )));
     }
 
-    if s.network.as_deref() == Some("xhttp")
-        && s.flow.as_deref() == Some("xtls-rprx-vision") && encryption.is_none() {
+    if flow == Some("xtls-rprx-vision") && encryption.is_none()
+        && !matches!(s.network.as_deref(), None | Some("tcp" | "raw")) {
         return Err(Error::InvalidConfig(
-            "Vision over XHTTP requires VLESS Encryption".into(),
+            "Vision over non-RAW transports requires VLESS Encryption".into(),
         ));
     }
 
@@ -149,7 +153,7 @@ pub fn build_handler(
                 .transpose()?
                 .flatten(),
             tls,
-            flow: s.flow.clone(),
+            flow: flow.map(str::to_owned),
             smux: s.smux.clone(),
         },
         connector,
