@@ -9,7 +9,7 @@ use crate::{
         router::{Rule, RuleMatcher, map_rule_type},
     },
     common::{geodata::GeoDataLookup, mmdb::MmdbLookup},
-    config::internal::rule::RuleType,
+    config::internal::rule::{RULE_PARAMS, RuleType, proto_supports_params},
     session,
 };
 
@@ -187,28 +187,13 @@ impl CompositeRule {
                 )));
             }
 
-            // Find matching closing paren
             let start = i;
-            let mut depth = 0;
-            while i < chars.len() {
-                if chars[i] == '(' {
-                    depth += 1;
-                } else if chars[i] == ')' {
-                    depth -= 1;
-                    if depth == 0 {
-                        i += 1; // Move past the closing paren
-                        break;
-                    }
-                }
-                i += 1;
-            }
-
-            if depth != 0 {
-                return Err(crate::Error::InvalidConfig(format!(
+            i = expression_end(&chars, start).ok_or_else(|| {
+                crate::Error::InvalidConfig(format!(
                     "unbalanced parentheses in: {}",
                     input
-                )));
-            }
+                ))
+            })?;
 
             // Extract the expression
             let expr_str: String = chars[start..i].iter().collect();
@@ -291,15 +276,89 @@ impl CompositeRule {
         // `rest` may carry trailing parameters, e.g. (IP-CIDR,10.0.0.0/8,no-resolve).
         // Only split those off, so payloads that legitimately contain commas
         // (DOMAIN-REGEX, most obviously) survive intact.
-        let (payload, params) = split_trailing_params(rest);
+        let (payload, params) = if proto_supports_params(rule_type) {
+            split_trailing_params(rest)
+        } else {
+            (rest.trim(), None)
+        };
         let rule = RuleType::new(rule_type, payload, "", params)?;
         let matcher = map_rule_type(rule, mmdb, geodata, rule_provider_registry)?;
         Ok(RuleExpression::Rule(Box::new(matcher)))
     }
 }
 
-/// Known trailing modifiers a leaf rule may carry after its payload.
-const RULE_PARAMS: &[&str] = &["no-resolve"];
+/// Find the end of a structural expression, respecting regex escapes, groups
+/// and character classes within DOMAIN-REGEX leaves.
+fn expression_end(chars: &[char], start: usize) -> Option<usize> {
+    let mut i = start;
+    let mut depth = 0;
+    let mut regex_depth = None;
+    let mut escaped = false;
+    // Per-class prefix: 0 = empty, 1 = leading '^', 2 = an item consumed.
+    let mut classes = Vec::new();
+    while i < chars.len() {
+        if regex_depth.is_some() {
+            if escaped {
+                escaped = false;
+                if let Some(state) = classes.last_mut() {
+                    *state = 2;
+                }
+                i += 1;
+                continue;
+            }
+            if chars[i] == '\\' {
+                escaped = true;
+                i += 1;
+                continue;
+            }
+            // Rust regex classes can nest and can begin with a literal
+            // ']' (also after '^'). Parentheses inside them are literal.
+            if chars[i] == '[' {
+                if let Some(state) = classes.last_mut() {
+                    *state = 2;
+                }
+                classes.push(0);
+                i += 1;
+                continue;
+            }
+            if let Some(state) = classes.last_mut() {
+                if chars[i] == ']' && *state == 2 {
+                    classes.pop();
+                } else if chars[i] == '^' && *state == 0 {
+                    *state = 1;
+                } else {
+                    *state = 2;
+                }
+                i += 1;
+                continue;
+            }
+        }
+        if chars[i] == '(' {
+            depth += 1;
+            if regex_depth.is_none() {
+                let is_regex = chars[i + 1..]
+                    .iter()
+                    .take_while(|&&ch| ch != ',' && ch != '(' && ch != ')')
+                    .filter(|ch| !ch.is_whitespace())
+                    .map(|ch| ch.to_ascii_uppercase())
+                    .eq("DOMAIN-REGEX".chars());
+                if is_regex {
+                    regex_depth = Some(depth);
+                }
+            }
+        } else if chars[i] == ')' {
+            if regex_depth == Some(depth) {
+                regex_depth = None;
+            }
+            depth -= 1;
+            if depth == 0 {
+                return Some(i + 1);
+            }
+        }
+        i += 1;
+    }
+    None
+}
 
 /// Peel recognised trailing `,param` tokens off the end of a rule body,
 /// returning the payload and the params (in source order).
@@ -386,6 +445,64 @@ mod tests {
             destination: SocksAddr::Domain(domain.into(), port),
             network,
             ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_regex_parentheses_in_composite() {
+        for (pattern, matching, nonmatching) in [
+            (r"^[)]$", ")", "("),
+            (r"^[(]$", "(", ")"),
+            (r"^\($", "(", ")"),
+            (r"^\)$", ")", "("),
+            (r"^(foo|bar)$", "foo", "other"),
+            (r"^[a-z&&[^()]]$", "a", "("),
+            (r"^[])]$", ")", "("),
+            (r"^[^](]$", "a", "("),
+            (r"^\\(foo)$", r"\foo", "foo"),
+        ] {
+            let expression = format!(
+                "((OR,((DOMAIN-REGEX,{pattern}),(DOMAIN,other.example))),(NETWORK,TCP))"
+            );
+            let rule = CompositeRule::new(
+                "AND", &expression, "PROXY", None, None, None,
+            ).unwrap();
+            assert!(rule.apply(&create_test_session(matching, 443, Network::Tcp)), "{pattern}");
+            assert!(!rule.apply(&create_test_session(nonmatching, 443, Network::Tcp)), "{pattern}");
+            assert!(!rule.apply(&create_test_session(matching, 443, Network::Udp)), "{pattern}");
+            assert!(rule.apply(&create_test_session("other.example", 443, Network::Tcp)), "{pattern}");
+        }
+    }
+
+    #[test]
+    fn test_no_resolve_preserved_in_leaf_payloads() {
+        for proto in ["DOMAIN-REGEX", "DOMAIN", "DOMAIN-KEYWORD"] {
+            let payload = if proto == "DOMAIN-REGEX" {
+                "^foo,no-resolve"
+            } else {
+                "foo,no-resolve"
+            };
+            let expression = format!("(({proto},{payload}),(NETWORK,TCP))");
+            let rule = CompositeRule::new(
+                "AND", &expression, "PROXY", None, None, None,
+            ).unwrap();
+            assert!(rule.apply(&create_test_session("foo,no-resolve", 443, Network::Tcp)));
+            assert!(!rule.apply(&create_test_session("foo", 443, Network::Tcp)));
+        }
+    }
+
+    #[test]
+    fn test_composite_ip_rule_no_resolve() {
+        for proto in ["IP-CIDR", "ip-cidr"] {
+            let expression = format!("(({proto},10.0.0.0/8,No-Resolve),(NETWORK,TCP))");
+            let rule = CompositeRule::new(
+                "AND", &expression, "DIRECT", None, None, None,
+            ).unwrap();
+            assert!(!rule.should_resolve_ip());
+            let mut sess = create_test_session("example.com", 443, Network::Tcp);
+            assert!(!rule.apply(&sess));
+            sess.resolved_ip = Some("10.1.2.3".parse().unwrap());
+            assert!(rule.apply(&sess));
         }
     }
 
