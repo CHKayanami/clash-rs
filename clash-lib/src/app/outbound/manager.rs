@@ -41,6 +41,7 @@ use crate::{
         direct::{self},
         fallback,
         group::smart,
+        converters::http::build_handler as build_http_handler,
         hysteria2, loadbalance, reject, relay,
         selector::{self, ThreadSafeSelectorControl},
         socks, trojan, urltest,
@@ -313,6 +314,15 @@ impl OutboundManager {
                             "failed to load shadowsocks outbound {}: {}",
                             name, e
                         );
+                    })
+                    .ok()
+            }
+            OutboundProxyProtocol::Http(s) => {
+                let name = s.common_opts.name.clone();
+                build_http_handler(&s, connector)
+                    .map(|x| Arc::new(x) as AnyOutboundHandler)
+                    .inspect_err(|e| {
+                        error!("failed to load http outbound {}: {}", name, e);
                     })
                     .ok()
             }

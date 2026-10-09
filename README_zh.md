@@ -32,7 +32,7 @@
 - 📦 **本地防污染 DNS**：支持 UDP / TCP / DoH / DoT / DoH3 上游，并可作为本地 DNS 服务器对外暴露服务；支持 Fake-IP、策略分流（`nameserver-policy`）与纯 IP 反查。
 - 🔍 **域名嗅探（Domain Sniffer）**：从 TCP/UDP 首包中零拷贝解密提取 TLS SNI、HTTP Host、QUIC Initial SNI，无缝支持透明代理域名还原与分流规则匹配。
 - ⚡ **eBPF 内核线速透明代理**：利用 TC Ingress/Egress 与 Cgroup eBPF Hook 拦截转发流量，并在内核态完成直连 IP 规则快路径转发（Direct Offload），避免用户态开销与数据包拷贝。
-- ⚙️ **丰富的出站协议支持**：AnyTLS / Hysteria2 / Shadowquic / Shadowsocks / Socks5(TCP/UDP) / SSH / Tailscale / Tor(onion) / Trojan / TUIC / VLESS / VMess / WireGuard(userspace)，各协议分别支持 TCP / HTTP / WebSocket / H2 / gRPC / XHTTP 传输及 TLS / REALITY 安全层。
+- ⚙️ **丰富的出站协议支持**：AnyTLS / Hysteria2 / Shadowquic / Shadowsocks / HTTP(S) / Socks5(TCP/UDP) / SSH / Tailscale / Tor(onion) / Trojan / TUIC / VLESS / VMess / WireGuard(userspace)，各协议分别支持 TCP / HTTP / WebSocket / H2 / gRPC / XHTTP 传输及 TLS / REALITY 安全层。
 - 🔀 **多样化入站模式**：HTTP、SOCKS5、Mixed、Shadowsocks、AnyTLS、Redir、TProxy、eBPF 以及 TUN 透明代理。
 - 🌍 **动态远程规则/节点加载**：支持订阅与 Rule-Provider 动态更新。
 - 🎵 **分布式追踪**：集成 Jaeger Tracing。
@@ -62,6 +62,7 @@
 | `reject` | 拦截丢弃 | |
 | `ss` | plain · obfs-http · obfs-tls · v2ray-plugin-ws · v2ray-plugin-ws-tls · shadow-tls | `shadowsocks` 特性；UDP、UOT v2、H2MUX |
 | `socks5` | plain TCP · TLS | |
+| `http` | HTTP CONNECT · HTTPS CONNECT | TCP；Basic 认证、自定义请求头 |
 | `anytls` | TLS | |
 | `trojan` | TCP · WebSocket · gRPC，使用 TLS | TCP/UDP；H2MUX |
 | `vmess` | TCP · HTTP · WebSocket · H2 · gRPC；可选 TLS | TCP/UDP；H2MUX |
@@ -88,26 +89,7 @@ Shadowsocks、Trojan、VMess 和 VLESS 可通过 `smux` / `multiplex` 配置 H2M
 - macOS
 - Windows
   - 需要将与系统架构对应的 [wintun.dll](https://wintun.net/) 文件复制到可执行程序同级目录下，并以管理员身份运行。
-- iOS
-  - [![ChocLite App Store](https://developer.apple.com/app-store/marketing/guidelines/images/badge-example-preferred_2x.png)](https://apps.apple.com/by/app/choclite/id6467517938)
-  - TestFlight 访问：[TestFlight](https://testflight.apple.com/join/cLy4Ub5C)
 
-## 💰 赞助商
-- [Fast Access Cloud](https://fast-access.cloud/)
-
-## 📦 安装
-
-### 使用图形界面 (GUI)
-
-- [Clash Nyanpasu](https://github.com/LibNyanpasu/clash-nyanpasu)
-
-### 下载预编译二进制文件
-
-前往 Releases 页面获取：https://github.com/Watfaq/clash-rs/releases
-
-### Docker 镜像
-
-https://github.com/Watfaq/clash-rs/pkgs/container/clash-rs
 
 ### 本地编译
 
@@ -116,12 +98,8 @@ https://github.com/Watfaq/clash-rs/pkgs/container/clash-rs
 * cmake (3.29 或更新版本)
 * libclang ([LLVM](https://github.com/llvm/llvm-project/releases/tag/llvmorg-16.0.4))
 * [nasm](https://www.nasm.us/pub/nasm/releasebuilds/2.16/win64/) (Windows)
-* protoc (用于 GeoData protobuf 代码生成)
-* [pre-commit](https://pre-commit.com/) (用于管理 git hooks)
 
 ```shell
-$ pipx install pre-commit
-$ pre-commit install
 
 $ cargo build
 ```
@@ -165,7 +143,7 @@ Options:
 为 iOS 与 macOS 构建 framework：
 
 ```shell
-git clone https://github.com/Watfaq/clash-rs.git
+git clone https://github.com/CHKayanami/clash-rs.git
 cd clash-rs
 chmod +x scripts/build_apple.sh
 ./scripts/build_apple.sh
@@ -175,14 +153,9 @@ chmod +x scripts/build_apple.sh
 
 ## 🔗 相关链接
 
-- [文档手册 (User Manual)](https://watfaq.gitbook.io/clashrs-user-manual/)
-- [完整配置参考 (Config Reference)](https://watfaq.github.io/clash-rs/)
-- [路线图 (Roadmap)](https://github.com/Watfaq/clash-rs/issues/59)
+- [文档手册 (User Manual)](https://chkayanami.github.io/clash-rs-alpha-docs)
 
-## 🤝 贡献参与
 
-- [CONTRIBUTING.md](CONTRIBUTING.md)
-- [Telegram 用户群](https://t.me/thisisnotclash)
 
 ## ❤️ 致敬与灵感来源
 - [Dreamacro/clash](https://github.com/Dreamacro/clash)

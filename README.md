@@ -32,7 +32,7 @@ A custom protocol, rule based network proxy software.
 - 📦 Local anti spoofing DNS with support of UDP/TCP/DoH/DoT remote, and expose it as a local UDP/TCP/DoH/DoT server.
 - 🔍 Domain Sniffer for TLS SNI, HTTP Host, and QUIC Initial SNI decryption to enable accurate routing for transparent proxies.
 - ⚡ **eBPF In-Kernel Transparent Proxy**: Wire-rate packet interception via TC Ingress/Egress and Cgroup eBPF hooks with direct kernel fast-path offload to eliminate userspace overhead.
-- ⚙️ AnyTLS/Hysteria2/Shadowquic/Shadowsocks/Socks5(TCP/UDP)/SSH/Tailscale/Tor(onion)/Trojan/TUIC/VLESS/VMess/WireGuard(userspace) outbounds, with protocol-specific TCP/HTTP/WebSocket/H2/gRPC/XHTTP transports and TLS/REALITY security.
+- ⚙️ **Outbound Protocol Support**: AnyTLS/Hysteria2/Shadowquic/Shadowsocks/HTTP(S)/Socks5(TCP/UDP)/SSH/Tailscale/Tor(onion)/Trojan/TUIC/VLESS/VMess/WireGuard(userspace) outbounds, with protocol-specific TCP/HTTP/WebSocket/H2/gRPC/XHTTP transports and TLS/REALITY security.
 - 🔀 Multiple inbound modes: HTTP, SOCKS5, Mixed, Shadowsocks, AnyTLS, Redir, TProxy, eBPF, and TUN for transparent proxying.
 - 🌍 Dynamic remote rule/proxy loader.
 - 🎵 Tracing with Jaeger
@@ -62,6 +62,7 @@ A custom protocol, rule based network proxy software.
 | `reject` | — | |
 | `ss` | plain · obfs-http · obfs-tls · v2ray-plugin-ws · v2ray-plugin-ws-tls · shadow-tls | `shadowsocks` feature; UDP, UOT v2, H2MUX |
 | `socks5` | plain TCP · TLS | |
+| `http` | HTTP CONNECT · HTTPS CONNECT | TCP; Basic authentication, custom headers |
 | `anytls` | TLS | |
 | `trojan` | TCP · WebSocket · gRPC, with TLS | TCP/UDP; H2MUX |
 | `vmess` | TCP · HTTP · WebSocket · H2 · gRPC; optional TLS | TCP/UDP; H2MUX |
@@ -88,27 +89,7 @@ H2MUX is configured through `smux` / `multiplex` for Shadowsocks, Trojan, VMess,
 - macOS
 - Windows
   - You need to copy the [wintun.dll](https://wintun.net/) file which matches your architecture to the same directory as your executable and run your program as administrator.
-- iOS
-  - [![ChocLite App Store](https://developer.apple.com/app-store/marketing/guidelines/images/badge-example-preferred_2x.png)](https://apps.apple.com/by/app/choclite/id6467517938)
-  - TestFlight Access: [TestFlight](https://testflight.apple.com/join/cLy4Ub5C)
 
-## 💰 Sponsors
-- [Fast Access Cloud](https://fast-access.cloud/)
-
-
-## 📦 Install
-
-### Use With GUI
-
-https://github.com/LibNyanpasu/clash-nyanpasu
-
-### Download Prebuilt Binary
-
-Can be found at https://github.com/Watfaq/clash-rs/releases
-
-### Docker Image
-
-https://github.com/Watfaq/clash-rs/pkgs/container/clash-rs
 
 ### Local Build
 
@@ -117,13 +98,8 @@ Dependencies
 * cmake (3.29 or newer)
 * libclang([LLVM](https://github.com/llvm/llvm-project/releases/tag/llvmorg-16.0.4))
 * [nasm](https://www.nasm.us/pub/nasm/releasebuilds/2.16/win64/) (Windows)
-* protoc(for geodata proto generation)
-* [pre-commit](https://pre-commit.com/) for managing git hooks
 
-```
-$ pipx install pre-commit
-$ pre-commit install
-
+```shell
 $ cargo build
 ```
 
@@ -166,7 +142,7 @@ Options:
 To create a framework for iOS and macOS platforms
 
 ```shell
-git clone https://github.com/Watfaq/clash-rs.git
+git clone https://github.com/CHKayanami/clash-rs.git
 cd clash-rs
 chmod +x scripts/build_apple.sh
 ./scripts/build_apple.sh
@@ -176,15 +152,9 @@ This command will generate a `clashrs.xcframework` file in the `build` directory
 
 ## 🔗 Links
 
-- [Documentation](https://watfaq.gitbook.io/clashrs-user-manual/)
-- [Config Reference](https://watfaq.github.io/clash-rs/)
-- [Roadmap](https://github.com/Watfaq/clash-rs/issues/59)
+- [Documentation](https://chkayanami.github.io/clash-rs-alpha-docs)
 
 
-## 🤝 Contributing
-
-- [CONTRIBUTING.md](CONTRIBUTING.md)
-- [Telegram User Group](https://t.me/thisisnotclash)
 
 ## ❤️ Inspired By
 - [Dreamacro/clash](https://github.com/Dreamacro/clash)

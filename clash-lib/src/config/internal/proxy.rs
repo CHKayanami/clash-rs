@@ -61,6 +61,8 @@ pub enum OutboundProxyProtocol {
     Ss(OutboundShadowsocks),
     #[serde(rename = "socks5")]
     Socks5(OutboundSocks5),
+    #[serde(rename = "http")]
+    Http(OutboundHttp),
     #[serde(rename = "anytls")]
     Anytls(OutboundAnytls),
     #[serde(rename = "trojan")]
@@ -98,6 +100,7 @@ impl OutboundProxyProtocol {
             OutboundProxyProtocol::Reject(reject) => &reject.name,
             #[cfg(feature = "shadowsocks")]
             OutboundProxyProtocol::Ss(ss) => &ss.common_opts.name,
+            OutboundProxyProtocol::Http(http) => &http.common_opts.name,
             OutboundProxyProtocol::Socks5(socks5) => &socks5.common_opts.name,
             OutboundProxyProtocol::Anytls(anytls) => &anytls.common_opts.name,
             OutboundProxyProtocol::Trojan(trojan) => &trojan.common_opts.name,
@@ -126,6 +129,7 @@ impl OutboundProxyProtocol {
             OutboundProxyProtocol::Direct(_) | OutboundProxyProtocol::Reject(_) => None,
             #[cfg(feature = "shadowsocks")]
             OutboundProxyProtocol::Ss(ss) => ss.common_opts.connect_via.as_deref(),
+            OutboundProxyProtocol::Http(http) => http.common_opts.connect_via.as_deref(),
             OutboundProxyProtocol::Socks5(socks5) => {
                 socks5.common_opts.connect_via.as_deref()
             }
@@ -185,6 +189,7 @@ impl Display for OutboundProxyProtocol {
         match self {
             #[cfg(feature = "shadowsocks")]
             OutboundProxyProtocol::Ss(_) => write!(f, "Shadowsocks"),
+            OutboundProxyProtocol::Http(_) => write!(f, "Http"),
             OutboundProxyProtocol::Socks5(_) => write!(f, "Socks5"),
             OutboundProxyProtocol::Anytls(_) => write!(f, "AnyTLS"),
             OutboundProxyProtocol::Direct(_) => write!(f, "{PROXY_DIRECT}"),
@@ -270,6 +275,23 @@ pub struct OutboundSocks5 {
     pub udp: bool,
     #[serde(default, alias = "multiplex")]
     pub smux: Option<crate::proxy::transport::mux::MuxOption>,
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize, Debug, Default)]
+#[serde(rename_all = "kebab-case")]
+pub struct OutboundHttp {
+    #[serde(flatten)]
+    pub common_opts: CommonConfigOptions,
+    pub username: Option<String>,
+    pub password: Option<String>,
+    #[serde(default)]
+    pub tls: bool,
+    pub sni: Option<String>,
+    #[serde(default)]
+    pub skip_cert_verify: bool,
+    pub fingerprint: Option<String>,
+    #[serde(default)]
+    pub headers: Option<HashMap<String, String>>,
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize, Debug, Default)]

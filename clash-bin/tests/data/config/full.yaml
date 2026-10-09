@@ -824,6 +824,32 @@ proxies:
     skip-cert-verify: false
     udp: true
 
+  # ── HTTP / HTTPS ────────────────────────────────────────────────────────────
+  # HTTP CONNECT tunnels support TCP only (no UDP).
+  # Configuration reference: https://wiki.metacubex.one/config/proxies/http/
+  # name-cert-verify and ip-version are not currently supported.
+  - name: http-plain
+    type: http
+    server: proxy.example.com
+    port: 8080
+
+  - name: http-auth-tls
+    type: http
+    server: proxy.example.com
+    port: 443
+    username: example-user          # Optional Basic authentication
+    password: example-password
+    tls: true                       # HTTPS proxy; default: false
+    sni: proxy.example.com          # Defaults to server
+    skip-cert-verify: false
+    # fingerprint: ...             # Optional SHA-256 certificate fingerprint
+    # dialer-proxy: socks5-plain    # Chain through another proxy (alias: connect-via)
+    tfo: false
+    # Headers apply to the CONNECT request. With username configured, generated
+    # Basic authentication overrides a custom Proxy-Authorization header.
+    headers:
+      X-Proxy-Tag: example
+
   # ── VMess ────────────────────────────────────────────────────────────────────
   - name: vmess-tcp
     type: vmess

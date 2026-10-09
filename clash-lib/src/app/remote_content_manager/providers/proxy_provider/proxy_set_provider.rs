@@ -25,6 +25,7 @@ use crate::{
     proxy::{
         AnyOutboundHandler, anytls,
         direct::{self},
+        http::outbound::Handler as HttpHandler,
         hysteria2, reject, socks, trojan, vless, vmess,
     },
 };
@@ -145,6 +146,10 @@ impl ProxySetProvider {
                                 OutboundProxyProtocol::Ss(s) => {
                                     let h: shadowsocks::outbound::Handler =
                                         s.try_into()?;
+                                    Ok(Arc::new(h) as _)
+                                }
+                                OutboundProxyProtocol::Http(s) => {
+                                    let h: HttpHandler = s.try_into()?;
                                     Ok(Arc::new(h) as _)
                                 }
                                 OutboundProxyProtocol::Socks5(s) => {
