@@ -193,12 +193,12 @@ pub fn start_scaffold(opts: Options) -> Result<()> {
 
     let log_collector = app::logging::EventCollector::new(vec![log_tx.clone()]);
 
-    app::logging::setup_logging(
+    let _logging_guard = app::logging::setup_logging(
         config.general.log_level,
         log_collector,
         &cwd,
         log_file,
-    );
+    )?;
 
     let shutdown_token = tokio_util::sync::CancellationToken::new();
     {

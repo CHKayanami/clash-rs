@@ -6,8 +6,12 @@ use tracing::info;
 
 use crate::{
     Error, GlobalState, Result, RuntimeComponents, create_components,
-    app::{api::{ApiRunner, RuntimeContext}, logging::LogEvent, net::NetworkConfig},
-    config::{InternalConfig, config::Controller},
+    app::{
+        api::{ApiRunner, RuntimeContext},
+        logging::{LogEvent, set_log_level},
+        net::NetworkConfig,
+    },
+    config::{InternalConfig, config::Controller, def::LogLevel},
     runner::{AsyncService, ServiceContext},
 };
 
@@ -52,23 +56,53 @@ impl RuntimeState {
         (api, service_context)
     }
 
-    async fn stop_api(&self) {
-        let _ = self.api_listener.stop().await;
-        self.api_service_context.tracker().close();
-        self.api_service_context.tracker().wait().await;
+    async fn stop_api_instance(api: &ApiRunner, context: &ServiceContext) {
+        let _ = api.stop().await;
+        context.tracker().close();
+        context.tracker().wait().await;
     }
 
-    async fn publish(&self, components: &RuntimeComponents, config: &InternalConfig) {
+    async fn stop_api(&self) {
+        Self::stop_api_instance(&self.api_listener, &self.api_service_context).await;
+    }
+
+    async fn start_api_and_publish(
+        &self, components: &RuntimeComponents, config: &InternalConfig,
+        update_log_level: &mut impl FnMut(LogLevel) -> anyhow::Result<()>,
+    ) -> Result<(Arc<ApiRunner>, ServiceContext)> {
+        let (api, context) = self.api_for(components, config.general.controller.clone());
+        let result = async {
+            api.start(&context).await?;
+            self.publish(components, config, update_log_level).await
+        }.await;
+        if let Err(error) = result {
+            // This generation is not owned by RuntimeState until publication succeeds.
+            // Release its listener before rollback attempts to bind the old API.
+            Self::stop_api_instance(&api, &context).await;
+            return Err(error);
+        }
+        Ok((api, context))
+    }
+
+    async fn publish(
+        &self, components: &RuntimeComponents, config: &InternalConfig,
+        update_log_level: &mut impl FnMut(LogLevel) -> anyhow::Result<()>,
+    ) -> Result<()> {
         let mut global = self.global_state.lock().await;
+        update_log_level(config.general.log_level)?;
         global.log_level = config.general.log_level;
         #[cfg(feature = "tun")]
         {
             global.tunnel_runner = components.tun_runner.clone();
         }
         global.dns_listener = components.dns_listener.clone();
+        Ok(())
     }
 
-    async fn restore(&mut self, network: NetworkConfig) -> Result<()> {
+    async fn restore(
+        &mut self, network: NetworkConfig,
+        update_log_level: &mut impl FnMut(LogLevel) -> anyhow::Result<()>,
+    ) -> Result<()> {
         network.apply();
         let restored = create_components(
             PathBuf::from(&self.components.cwd),
@@ -80,14 +114,15 @@ impl RuntimeState {
             return Err(e);
         }
         self.stop_api().await;
-        let (api, context) = self.api_for(
-            &restored, self.api_listener.controller_config().clone(),
-        );
-        if let Err(e) = api.start(&context).await {
-            restored.stop_all().await;
-            return Err(e);
-        }
-        self.publish(&restored, &self.active_config).await;
+        let (api, context) = match self.start_api_and_publish(
+            &restored, &self.active_config, update_log_level,
+        ).await {
+            Ok(api) => api,
+            Err(error) => {
+                restored.stop_all().await;
+                return Err(error);
+            }
+        };
         self.components = restored;
         self.api_listener = api;
         self.api_service_context = context;
@@ -95,6 +130,13 @@ impl RuntimeState {
     }
 
     pub async fn reload(&mut self, config: InternalConfig) -> Result<()> {
+        self.reload_with_log_level(config, set_log_level).await
+    }
+
+    async fn reload_with_log_level(
+        &mut self, config: InternalConfig,
+        mut update_log_level: impl FnMut(LogLevel) -> anyhow::Result<()>,
+    ) -> Result<()> {
         // Preparation shares persistent resources and leaves the old listeners
         // and global network defaults untouched.
         let next = create_components(
@@ -109,16 +151,11 @@ impl RuntimeState {
         let result = async {
             next.start_all().await?;
             self.stop_api().await;
-            let (api, context) = self.api_for(
-                &next, config.general.controller.clone(),
-            );
-            api.start(&context).await?;
-            Ok::<_, Error>((api, context))
+            self.start_api_and_publish(&next, &config, &mut update_log_level).await
         }.await;
 
         match result {
             Ok((api, context)) => {
-                self.publish(&next, &config).await;
                 self.components = next;
                 self.api_listener = api;
                 self.api_service_context = context;
@@ -128,7 +165,9 @@ impl RuntimeState {
             }
             Err(error) => {
                 next.stop_all().await;
-                if let Err(restore_error) = self.restore(previous_network).await {
+                if let Err(restore_error) = self.restore(
+                    previous_network, &mut update_log_level,
+                ).await {
                     let message = format!(
                         "reload failed: {error}; rollback failed: {restore_error}"
                     );
@@ -151,10 +190,9 @@ impl RuntimeState {
 mod tests {
     use super::*;
     use crate::{Config, setup_default_crypto_provider};
-    use crate::config::def::LogLevel;
     use crate::app::net::{get_default_outbound_interface, get_tun_somark};
     use serial_test::serial;
-    use tokio::net::TcpListener;
+    use tokio::net::{TcpListener, TcpStream};
     use std::{io::ErrorKind, path::Path};
     use watfaq_dns::DNSError as ServerDNSError;
 
@@ -216,6 +254,53 @@ mod tests {
             active_config: config, global_state, log_tx, shutdown_token,
             fatal_tx, dns_collect_file: None,
         }, fatal_rx)
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn publish_failure_releases_new_api_before_rollback() {
+        let _restore = RestoreNetwork(NetworkConfig::capture());
+        for fail_rollback in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let reservation = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = reservation.local_addr().unwrap();
+            drop(reservation);
+            let config = Config::Str(format!(
+                "mode: direct\nexternal-controller: {address}\nsecret: test-secret\ntun:\n  enable: false\n",
+            )).try_parse().unwrap();
+            let (mut runtime, mut fatal_rx) = runtime_for_config(dir.path(), config).await;
+            let previous_level = runtime.active_config.general.log_level;
+            let mut next = runtime.active_config.clone();
+            next.general.log_level = LogLevel::Debug;
+            let mut attempts = 0;
+            let error = runtime.reload_with_log_level(next, |_| {
+                attempts += 1;
+                if attempts == 1 || fail_rollback {
+                    Err(anyhow::anyhow!("injected log filter failure"))
+                } else {
+                    Ok(())
+                }
+            }).await.unwrap_err();
+
+            // Both publications were reached after successfully binding the same port.
+            assert_eq!(attempts, 2);
+            assert!(error.to_string().contains("injected log filter failure"));
+            assert_eq!(runtime.active_config.general.log_level, previous_level);
+            assert_eq!(runtime.global_state.lock().await.log_level, previous_level);
+            if fail_rollback {
+                assert!(runtime.shutdown_token.is_cancelled());
+                assert!(fatal_rx.try_recv().is_ok());
+            } else {
+                assert!(!runtime.shutdown_token.is_cancelled());
+                assert!(fatal_rx.try_recv().is_err());
+                drop(TcpStream::connect(address).await.unwrap());
+                runtime.reload(runtime.active_config.clone()).await.unwrap();
+                drop(TcpStream::connect(address).await.unwrap());
+            }
+            runtime.stop().await;
+            // Neither failed generation may leave a listener behind.
+            drop(TcpListener::bind(address).await.unwrap());
+        }
     }
 
     #[tokio::test]

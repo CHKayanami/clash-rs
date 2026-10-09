@@ -10,7 +10,7 @@ use opentelemetry_semantic_conventions::{
     attribute::{DEPLOYMENT_ENVIRONMENT_NAME, SERVICE_VERSION},
 };
 use serde::Serialize;
-use std::{io::IsTerminal, sync::Once};
+use std::{io::IsTerminal, sync::OnceLock};
 use tokio::sync::broadcast::Sender;
 use tracing::level_filters::LevelFilter;
 use tracing_log::LogTracer;
@@ -18,7 +18,10 @@ use tracing_log::LogTracer;
 use tracing_opentelemetry::OpenTelemetryLayer;
 #[cfg(target_os = "ios")]
 use tracing_oslog::OsLogger;
-use tracing_subscriber::{EnvFilter, Layer, filter::filter_fn, prelude::*};
+use tracing_appender::non_blocking::{ErrorCounter, WorkerGuard};
+use tracing_subscriber::{
+    EnvFilter, Layer, filter::filter_fn, prelude::*, registry::Registry, reload,
+};
 
 impl From<LogLevel> for LevelFilter {
     fn from(level: LogLevel) -> Self {
@@ -153,8 +156,8 @@ where
         event: &tracing::Event<'_>,
     ) -> std::fmt::Result {
         let mut trace_id = None;
-        if let Some(current_span) = ctx.lookup_current() {
-            for span in current_span.scope() {
+        if let Some(scope) = ctx.event_scope() {
+            for span in scope {
                 if let Some(ext) = span.extensions().get::<TraceIdExtension>() {
                     trace_id = Some(ext.0);
                     break;
@@ -186,6 +189,9 @@ where
         event: &tracing::Event<'_>,
         ctx: tracing_subscriber::layer::Context<'_, S>,
     ) {
+        if self.0.iter().all(|tx| tx.receiver_count() == 0) {
+            return;
+        }
         let mut strs = vec![];
         if let Some(trace_id) = find_trace_id(&ctx, event) {
             strs.push(format!("[#{trace_id}]"));
@@ -203,42 +209,88 @@ where
             msg: strs.join(" "),
         };
         for tx in &self.0 {
-            _ = tx.send(event.clone());
+            if tx.receiver_count() != 0 {
+                _ = tx.send(event.clone());
+            }
         }
     }
 }
 
-struct LoggingGuard {
-    _file_appender: Option<tracing_appender::non_blocking::WorkerGuard>,
+#[must_use = "keep the guard alive until the runtime has stopped"]
+pub struct LoggingGuard {
+    file_errors: Option<ErrorCounter>,
+    stdout_errors: ErrorCounter,
+    _file_appender: Option<WorkerGuard>,
+    _stdout_appender: WorkerGuard,
     #[cfg(feature = "telemetry")]
     _tracing_chrome: Option<tracing_chrome::FlushGuard>,
     #[cfg(feature = "telemetry")]
     _tracer_provider: Option<opentelemetry_sdk::trace::SdkTracerProvider>,
 }
 
-static SETUP_LOGGING: Once = Once::new();
-static mut LOGGING_GUARD: Option<LoggingGuard> = None;
+static LOG_FILTER: OnceLock<reload::Handle<EnvFilter, Registry>> = OnceLock::new();
+
+// RUST_LOG supplies the startup filter. An explicit runtime change replaces it.
+pub fn set_log_level(level: LogLevel) -> anyhow::Result<()> {
+    if let Some(handle) = LOG_FILTER.get() {
+        handle.reload(log_filter(level))?;
+    }
+    Ok(())
+}
+
+fn log_filter(level: LogLevel) -> EnvFilter {
+    let filter = if matches!(level, LogLevel::Silent) {
+        EnvFilter::new("off")
+    } else {
+        EnvFilter::new(format!(
+            "warn,clash={level},clash_shadowsocks={level},watfaq_dns={level},watfaq_netstack={level}"
+        ))
+    };
+    #[cfg(all(feature = "telemetry", tokio_unstable))]
+    let filter = filter
+        .add_directive("tokio=trace".parse().unwrap())
+        .add_directive("runtime=trace".parse().unwrap());
+    filter
+}
 
 pub fn setup_logging(
     level: LogLevel,
     collector: EventCollector,
     cwd: &str,
     log_file: Option<String>,
-) {
-    unsafe {
-        SETUP_LOGGING.call_once(|| {
-            LogTracer::init().unwrap_or_else(|e| {
-                eprintln!(
-                    "Failed to init tracing-log: {e}, another env_logger might \
-                     have been initialized"
-                );
-            });
-            LOGGING_GUARD = setup_logging_inner(level, collector, cwd, log_file)
-                .unwrap_or_else(|e| {
-                    eprintln!("Failed to setup logging: {e}");
-                    None
-                });
-        });
+) -> anyhow::Result<LoggingGuard> {
+    let guard = setup_logging_inner(level, collector, cwd, log_file)?;
+    LogTracer::init().unwrap_or_else(|e| {
+        eprintln!("Failed to init tracing-log: {e}");
+    });
+    Ok(guard)
+}
+
+impl LoggingGuard {
+    /// Dropped queue lines for file and stdout, respectively.
+    pub fn dropped_lines(&self) -> (usize, usize) {
+        (
+            self.file_errors.as_ref().map_or(0, |counter| counter.dropped_lines()),
+            self.stdout_errors.dropped_lines(),
+        )
+    }
+}
+
+impl Drop for LoggingGuard {
+    fn drop(&mut self) {
+        #[cfg(feature = "telemetry")]
+        if let Some(provider) = self._tracer_provider.take() {
+            if let Err(e) = provider.shutdown() {
+                eprintln!("Failed to shut down telemetry: {e}");
+            }
+        }
+        let (file_dropped, stdout_dropped) = self.dropped_lines();
+        if file_dropped != 0 || stdout_dropped != 0 {
+            eprintln!(
+                "Logging queue dropped lines: file={file_dropped}, stdout={stdout_dropped}"
+            );
+        }
+        // Worker guards drain their queues when the owning runtime returns.
     }
 }
 
@@ -247,8 +299,8 @@ fn setup_logging_inner(
     collector: EventCollector,
     cwd: &str,
     log_file: Option<String>,
-) -> anyhow::Result<Option<LoggingGuard>> {
-    let default_log_level = format!("warn,clash={level}");
+) -> anyhow::Result<LoggingGuard> {
+    let default_log_level = log_filter(level);
     let filter = EnvFilter::try_from_default_env()
         .inspect(|f| {
             eprintln!("using env log level: {f}");
@@ -259,7 +311,7 @@ fn setup_logging_inner(
                 eprintln!("Using default log level: {default_log_level}");
             }
         })
-        .unwrap_or(EnvFilter::new(default_log_level));
+        .unwrap_or(default_log_level);
 
     let (appender, guard) = if let Some(log_file) = log_file {
         let path_buf = std::path::PathBuf::from(&log_file);
@@ -296,8 +348,7 @@ fn setup_logging_inner(
     let exporter = opentelemetry_otlp::SpanExporter::builder()
         .with_http()
         .with_protocol(Protocol::HttpBinary)
-        .build()
-        .unwrap();
+        .build()?;
 
     #[cfg(feature = "telemetry")]
     let tracer_provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
@@ -329,7 +380,12 @@ fn setup_logging_inner(
     #[cfg(feature = "telemetry")]
     let tracer = tracer_provider.tracer("tracing-otel-subscriber");
 
-    let subscriber = tracing_subscriber::registry().with(TraceIdLayer);
+    #[cfg(all(feature = "telemetry", tokio_unstable))]
+    let filter = filter
+        .add_directive("tokio=trace".parse().unwrap())
+        .add_directive("runtime=trace".parse().unwrap());
+    let (filter, filter_handle) = reload::Layer::new(filter);
+    let subscriber = tracing_subscriber::registry().with(filter).with(TraceIdLayer);
 
     // Collect and expose data about the Tokio runtime (tasks, threads, resources,
     // etc.) — gated on tokio_unstable because console_subscriber panics at
@@ -339,10 +395,6 @@ fn setup_logging_inner(
     // excludes this code.
     #[cfg(all(feature = "telemetry", tokio_unstable))]
     let subscriber = subscriber.with(console_subscriber::spawn());
-    #[cfg(all(feature = "telemetry", tokio_unstable))]
-    let filter = filter
-        .add_directive("tokio=trace".parse().unwrap())
-        .add_directive("runtime=trace".parse().unwrap());
     let exclude = filter_fn(|metadata| {
         !metadata.target().contains("tokio")
             && !metadata.target().contains("runtime")
@@ -357,6 +409,7 @@ fn setup_logging_inner(
     // 💡 这样即使在没有任何时区配置的裸 OpenWrt 固件上运行也绝对不会 Panic
     let timer = tracing_subscriber::fmt::time::OffsetTime::new(offset, format);
 
+    let file_errors = appender.as_ref().map(|writer| writer.error_counter());
     let log_to_file_layer = appender.map(|x| {
         tracing_subscriber::fmt::Layer::new()
             .event_format(TraceIdEventFormatter::new(
@@ -371,6 +424,13 @@ fn setup_logging_inner(
             .with_writer(x)
             .with_filter(exclude.clone())
     });
+    let (stdout_writer, stdout_guard) =
+        tracing_appender::non_blocking::NonBlockingBuilder::default()
+            .buffered_lines_limit(16_000)
+            .lossy(true)
+            .thread_name("clash-logger-stdout")
+            .finish(std::io::stdout());
+    let stdout_errors = stdout_writer.error_counter();
     let log_stdout_layer = tracing_subscriber::fmt::Layer::new()
         .event_format(TraceIdEventFormatter::new(
             tracing_subscriber::fmt::format()
@@ -383,14 +443,13 @@ fn setup_logging_inner(
                 .with_level(true)
                 .with_thread_ids(cfg!(debug_assertions)),
         ))
-        .with_writer(std::io::stdout)
+        .with_writer(stdout_writer)
         .with_filter(exclude.clone());
 
     let subscriber = {
         #[cfg(feature = "telemetry")]
         {
             subscriber
-        .with(filter) // Global filter
         .with(tracing_chrome)
         .with(OpenTelemetryLayer::new(tracer))
         .with(collector.with_filter(exclude.clone()))
@@ -399,7 +458,7 @@ fn setup_logging_inner(
         }
         #[cfg(not(feature = "telemetry"))]
         {
-            subscriber.with(filter) // Global filter
+            subscriber
         .with(collector.with_filter(exclude.clone()))
         .with(log_to_file_layer)
         .with(log_stdout_layer)
@@ -413,13 +472,18 @@ fn setup_logging_inner(
     tracing::subscriber::set_global_default(subscriber)
         .map_err(|x| anyhow!("setup logging error: {}", x))?;
 
-    Ok(Some(LoggingGuard {
+    let _ = LOG_FILTER.set(filter_handle);
+
+    Ok(LoggingGuard {
+        file_errors,
+        stdout_errors,
+        _stdout_appender: stdout_guard,
         _file_appender: guard,
         #[cfg(feature = "telemetry")]
         _tracing_chrome: tracing_chrome_g,
         #[cfg(feature = "telemetry")]
         _tracer_provider: Some(tracer_provider),
-    }))
+    })
 }
 
 struct EventVisitor<'a>(&'a mut Vec<String>);
@@ -430,7 +494,9 @@ impl EventVisitor<'_> {
         field: &tracing::field::Field,
         value: impl std::fmt::Display,
     ) {
-        if field.name() != "message" {
+        if field.name() == "message" {
+            self.0.push(value.to_string());
+        } else {
             self.0.push(format!("{}={}", field.name(), value));
         }
     }
@@ -497,8 +563,106 @@ impl tracing::field::Visit for EventVisitor<'_> {
 #[cfg(test)]
 mod tests {
     use super::{EventCollector, LogLevel};
+    use tempfile::tempdir;
     use tokio::sync::broadcast;
     use tracing_subscriber::{layer::SubscriberExt, registry};
+
+    #[test]
+    fn debug_connection_span_is_only_retained_at_debug_level() {
+        use super::{TraceIdLayer, log_filter, reload};
+        let (tx, mut rx) = broadcast::channel(4);
+        let (filter, handle) = reload::Layer::new(log_filter(LogLevel::Info));
+        let subscriber = registry().with(filter).with(TraceIdLayer)
+            .with(EventCollector::new(vec![tx]));
+        tracing::subscriber::with_default(subscriber, || {
+            {
+                let span = tracing::debug_span!("connection", trace_id = 11u64);
+                let _entered = span.enter();
+                tracing::warn!("info mode");
+            }
+            handle.reload(log_filter(LogLevel::Debug)).unwrap();
+            let span = tracing::debug_span!("connection", trace_id = 11u64);
+            let _entered = span.enter();
+            tracing::warn!("debug mode");
+        });
+        assert_eq!(rx.try_recv().unwrap().msg, "info mode");
+        assert_eq!(rx.try_recv().unwrap().msg, "[#11] debug mode");
+    }
+
+    #[test]
+    fn file_open_failure_is_reported_before_subscriber_installation() {
+        use super::setup_logging_inner;
+        let directory = tempdir().unwrap();
+        let result = setup_logging_inner(
+            LogLevel::Info, EventCollector::new(vec![]),
+            directory.path().to_str().unwrap(), Some("missing/log.txt".into()),
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn runtime_filter_changes_enabled_events() {
+        use super::{log_filter, reload};
+        let (tx, mut rx) = broadcast::channel(4);
+        let (filter, handle) = reload::Layer::new(log_filter(LogLevel::Info));
+        let subscriber = registry().with(filter).with(EventCollector::new(vec![tx]));
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::debug!("hidden");
+            tracing::debug!(target: "clash_shadowsocks::relay", "ss hidden");
+            handle.reload(log_filter(LogLevel::Debug)).unwrap();
+            tracing::debug!("visible");
+            tracing::debug!(target: "clash_shadowsocks::relay", "ss visible");
+            handle.reload(log_filter(LogLevel::Silent)).unwrap();
+            tracing::error!("hidden too");
+            tracing::error!(target: "clash_shadowsocks::relay", "ss silent");
+        });
+        assert_eq!(rx.try_recv().unwrap().msg, "visible");
+        assert_eq!(rx.try_recv().unwrap().msg, "ss visible");
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn formatter_and_collector_use_explicit_event_parent() {
+        use super::{TraceIdEventFormatter, TraceIdLayer};
+        use std::sync::{Arc, Mutex};
+        use std::io::{self, Write};
+
+        #[derive(Clone)]
+        struct Buffer(Arc<Mutex<Vec<u8>>>);
+        impl Write for Buffer {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let output = Buffer(Arc::new(Mutex::new(Vec::new())));
+        let writer = output.clone();
+        let (tx, mut rx) = broadcast::channel(4);
+        let fmt = tracing_subscriber::fmt::layer()
+            .event_format(TraceIdEventFormatter::new(
+                tracing_subscriber::fmt::format().without_time().with_ansi(false),
+            ))
+            .with_writer(move || writer.clone());
+        let subscriber = registry().with(TraceIdLayer)
+            .with(EventCollector::new(vec![tx])).with(fmt);
+        tracing::subscriber::with_default(subscriber, || {
+            let parent = tracing::info_span!("parent", trace_id = 11u64);
+            let current = tracing::info_span!("current", trace_id = 22u64);
+            let _entered = current.enter();
+            tracing::info!(parent: &parent, "explicit");
+            tracing::info!(parent: None, "root");
+        });
+        assert!(rx.try_recv().unwrap().msg.starts_with("[#11]"));
+        assert_eq!(rx.try_recv().unwrap().msg, "root");
+        let bytes = output.0.lock().unwrap();
+        let text = std::str::from_utf8(&bytes).unwrap();
+        let mut lines = text.lines();
+        assert!(lines.next().unwrap().starts_with("[#11]"));
+        assert!(!lines.next().unwrap().starts_with("[#"));
+    }
 
     #[test]
     fn collector_keeps_message_and_fields_inline() {

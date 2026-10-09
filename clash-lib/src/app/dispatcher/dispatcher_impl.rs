@@ -31,7 +31,7 @@ use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tokio_util::task::AbortOnDropHandle;
 use tokio_util::time::DelayQueue;
-use tracing::{Instrument, debug, error, info, info_span, instrument, trace, warn};
+use tracing::{Instrument, Span, debug, error, info, info_span, instrument, trace, warn};
 
 use crate::app::dns::ThreadSafeDNSResolver;
 
@@ -287,7 +287,7 @@ impl Dispatcher {
         &self.router
     }
 
-    #[instrument(skip(self, sess, lhs), fields(trace_id = sess.id))]
+    #[instrument(level = "info", skip(self, sess, lhs), fields(trace_id = sess.id))]
     pub async fn dispatch_stream(&self, mut sess: Session, mut lhs: AnyStream) {
         let orig_dest = sess.destination.clone();
         sess.orig_destination = Some(orig_dest.clone());
@@ -478,7 +478,7 @@ impl Dispatcher {
         }
     }
 
-    #[instrument(skip(self, sess, udp_inbound), fields(trace_id = sess.id))]
+    #[instrument(level = "info", skip(self, sess, udp_inbound), fields(trace_id = sess.id))]
     pub async fn dispatch_datagram(
         &self,
         sess: Session,
@@ -1054,7 +1054,7 @@ fn spawn_establish_session(
             None => EstablishOutcome::Failed(session_key, sess_id),
         };
         let _ = established_tx.send(outcome).await;
-    })
+    }.instrument(info_span!("udp_outbound", trace_id = sess_id)))
 }
 
 async fn establish_outbound_session(
@@ -1251,7 +1251,7 @@ fn spawn_udp_relay<D: OutboundDatagram<UdpPacket>>(
                 relay_sess_id,
             ))
             .await;
-    });
+    }.instrument(Span::current()));
 
     EstablishedSession {
         session_key: (sess.source, orig_inbound_dst),

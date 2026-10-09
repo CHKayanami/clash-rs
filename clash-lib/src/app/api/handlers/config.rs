@@ -18,6 +18,7 @@ use crate::{
         api::AppState,
         dispatcher,
         dns::{ThreadSafeDNSResolver, config::DNSListenAddr},
+        logging::set_log_level,
         inbound::manager::{InboundEndpoint, InboundManager, Ports},
     },
     config::{def, internal::config::BindAddress},
@@ -338,6 +339,12 @@ async fn patch_configs(
     // blocking concurrent GET /configs requests unnecessarily.
     if let Some(log_level) = payload.log_level {
         let mut global_state = state.global_state.lock().await;
+        if let Err(e) = set_log_level(log_level) {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"message": format!("failed to update log level: {e}")})),
+            ).into_response();
+        }
         global_state.log_level = log_level;
     }
 
