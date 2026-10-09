@@ -29,6 +29,7 @@ use std::{
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
+use tokio_util::task::AbortOnDropHandle;
 use tokio_util::time::DelayQueue;
 use tracing::{Instrument, debug, error, info, info_span, instrument, trace, warn};
 
@@ -443,6 +444,8 @@ impl Dispatcher {
         udp_inbound: AnyInboundDatagram,
     ) -> tokio::sync::oneshot::Sender<u8> {
         let (mut local_w, mut local_r) = udp_inbound.split();
+        let (local_sender, mut local_receiver) =
+            tokio::sync::mpsc::channel::<UdpPacket>(UDP_CHANNEL_CAPACITY);
         let (remote_receiver_w, mut remote_receiver_r) =
             tokio::sync::mpsc::channel::<DownstreamPacket>(UDP_CHANNEL_CAPACITY);
         let (session_established_tx, mut session_established_rx) =
@@ -478,6 +481,16 @@ impl Dispatcher {
                     .udp_timeout
                     .unwrap_or_else(|| Duration::from_secs(DEFAULT_UDP_SESSION_TIMEOUT_SECS));
 
+                // Cancel inbound writes when the actor exits, even if the sink
+                // remains backpressured. The queue bounds outstanding replies.
+                let _local_writer = AbortOnDropHandle::new(tokio::spawn(async move {
+                    while let Some(packet) = local_receiver.recv().await {
+                        if let Err(err) = local_w.send(packet).await {
+                            error!("failed to send packet to local: {}", err);
+                        }
+                    }
+                }.instrument(tracing::Span::current())));
+
                 loop {
                     tokio::select! {
                         // 1. Close signal from caller (explicit close or sender drop)
@@ -506,8 +519,15 @@ impl Dispatcher {
                                 session.refresh_idle(&mut delay_queue, next_timeout);
                             }
 
-                            if let Err(err) = local_w.send(packet).await {
-                                error!("failed to send packet to local: {}", err);
+                            match local_sender.try_send(packet) {
+                                Ok(()) => {}
+                                Err(TrySendError::Full(_)) => {
+                                    debug!("[UDP] inbound reply queue full, dropping packet");
+                                }
+                                Err(TrySendError::Closed(_)) => {
+                                    warn!("UDP inbound reply writer stopped for {}, closing session actor", sess);
+                                    break;
+                                }
                             }
                         }
 
@@ -1057,8 +1077,6 @@ async fn establish_outbound_session(
     } else {
         handler.proto()
     };
-    let is_direct = matches!(effective_proto, OutboundType::Direct);
-
     if matches!(effective_proto, OutboundType::Reject) {
         trace!(
             "[UDP Short-Circuit] Drop packet immediately for sess: {}",
@@ -1088,6 +1106,10 @@ async fn establish_outbound_session(
             return None;
         }
     };
+
+    // Groups return the selected transport, including nested selectors and
+    // per-flow strategies. Only a physical Direct socket preserves peer sources.
+    let is_direct = matches!(outbound_datagram, AnyOutboundDatagram::Direct(_));
 
     debug!("{} outbound datagram connected", sess);
 
@@ -1435,6 +1457,7 @@ mod tests {
     use super::*;
 
     /// Flush remains pending until the test releases a token, independently of reads.
+    #[derive(Debug)]
     struct BackpressuredDatagram {
         replies: tokio::sync::mpsc::Receiver<UdpPacket>,
         permits: tokio::sync::mpsc::Receiver<()>,
@@ -1596,7 +1619,9 @@ mod tests {
     use crate::app::dns::MockClashResolver;
     use crate::app::outbound::manager::OutboundManager;
     use crate::app::router::Router;
-    use crate::proxy::AnyOutboundHandler;
+    use crate::proxy::{AnyOutboundHandler, loadbalance, selector};
+    use crate::proxy::mocks::MockDummyProxyProvider;
+    use crate::app::remote_content_manager::ProxyManager;
     use crate::proxy::direct::Handler as DirectHandler;
     use crate::session::{Network, Type};
     use bytes::Bytes;
@@ -1815,15 +1840,15 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn test_dispatcher_full_cone_relay_preserves_peer_source_address_end_to_end()
-     {
-        let server_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let server_addr = server_socket.local_addr().unwrap();
+    fn test_provider(handler: AnyOutboundHandler) -> Arc<MockDummyProxyProvider> {
+        let mut provider = MockDummyProxyProvider::new();
+        let proxies = Arc::new(vec![handler]);
+        provider.expect_proxies().returning(move || proxies.clone());
+        provider.expect_touch().return_const(());
+        Arc::new(provider)
+    }
 
-        let peer_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let peer_addr = peer_socket.local_addr().unwrap();
-
+    async fn test_dispatcher(proto: OutboundType) -> Arc<Dispatcher> {
         let direct_handler: AnyOutboundHandler =
             Arc::new(DirectHandler::new("DIRECT"));
         let mut mock_resolver = MockClashResolver::new();
@@ -1838,8 +1863,41 @@ mod tests {
         });
         let resolver: ThreadSafeDNSResolver = Arc::new(mock_resolver);
 
+        let handler = match proto {
+            OutboundType::Selector => {
+                let inner = selector::Handler::new(
+                    selector::HandlerOptions {
+                        name: "inner".into(),
+                        udp: true,
+                        ..Default::default()
+                    },
+                    vec![test_provider(direct_handler)],
+                    None,
+                ).await;
+                Arc::new(selector::Handler::new(
+                    selector::HandlerOptions {
+                        name: "outer".into(),
+                        udp: true,
+                        ..Default::default()
+                    },
+                    vec![test_provider(Arc::new(inner))],
+                    None,
+                ).await) as AnyOutboundHandler
+            }
+            OutboundType::LoadBalance => Arc::new(loadbalance::Handler::new(
+                loadbalance::HandlerOptions {
+                    name: "balance".into(),
+                    udp: true,
+                    ..Default::default()
+                },
+                vec![test_provider(direct_handler)],
+                ProxyManager::new(resolver.clone(), None),
+            )) as AnyOutboundHandler,
+            OutboundType::Direct => direct_handler,
+            _ => unreachable!(),
+        };
         let mut handlers = HashMap::new();
-        handlers.insert("DIRECT".to_string(), direct_handler);
+        handlers.insert("DIRECT".to_string(), handler);
         let outbound_manager = Arc::new(OutboundManager::new_for_test(handlers));
 
         let router = Arc::new(
@@ -1859,7 +1917,7 @@ mod tests {
         );
 
         let manager = StatisticsManager::new();
-        let dispatcher = Arc::new(Dispatcher::new(
+        Arc::new(Dispatcher::new(
             outbound_manager,
             router,
             resolver,
@@ -1868,7 +1926,103 @@ mod tests {
             None,
             None,
             true,
-        ));
+        ))
+    }
+
+    #[tokio::test]
+    async fn inbound_backpressure_does_not_block_upstream_or_close() {
+        check_inbound_backpressure(true).await;
+    }
+
+    #[tokio::test]
+    async fn inbound_backpressure_does_not_block_expiration() {
+        check_inbound_backpressure(false).await;
+    }
+
+    async fn check_inbound_backpressure(explicit_close: bool) {
+        let dispatcher = test_dispatcher(OutboundType::Direct).await;
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let destination = SocksAddr::Ip(server.local_addr().unwrap());
+        let source: SocketAddr = "127.0.0.1:54323".parse().unwrap();
+        let sess = Session {
+            network: Network::Udp,
+            source,
+            destination: destination.clone(),
+            udp_timeout: Some(Duration::from_millis(500)),
+            ..Default::default()
+        };
+        let (client_tx, client_rx) = tokio::sync::mpsc::channel(4);
+        let (_permit_tx, permit_rx) = tokio::sync::mpsc::channel(4);
+        let (sent_tx, _sent_rx) = tokio::sync::mpsc::channel(4);
+        let (started_tx, mut started_rx) = tokio::sync::mpsc::channel(4);
+        let closer = dispatcher.dispatch_datagram(sess, Box::new(
+            BackpressuredDatagram {
+                replies: client_rx,
+                permits: permit_rx,
+                sent: sent_tx,
+                staged: None,
+                started: started_tx,
+                fail_first: false,
+            },
+        )).await;
+        let packet = UdpPacket::new(
+            Bytes::from_static(b"request"),
+            SocksAddr::Ip(source),
+            destination,
+        );
+        client_tx.send(packet.clone()).await.unwrap();
+        let mut buf = [0u8; 64];
+        let (_, outbound_addr) = tokio::time::timeout(
+            Duration::from_secs(2), server.recv_from(&mut buf),
+        ).await.unwrap().unwrap();
+        server.send_to(b"reply", outbound_addr).await.unwrap();
+        // The inbound sink has accepted the reply, but its flush is blocked.
+        tokio::time::timeout(Duration::from_secs(2), started_rx.recv())
+            .await.unwrap().unwrap();
+
+        client_tx.send(packet).await.unwrap();
+        let (len, _) = tokio::time::timeout(
+            Duration::from_secs(2), server.recv_from(&mut buf),
+        ).await.unwrap().unwrap();
+        assert_eq!(&buf[..len], b"request");
+        if explicit_close {
+            closer.send(0).unwrap();
+            tokio::time::timeout(Duration::from_secs(2), client_tx.closed())
+                .await.unwrap();
+        }
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while dispatcher.udp_session_semaphore.available_permits()
+                != MAX_GLOBAL_UDP_SESSIONS
+                || !dispatcher.manager.active_connections_snapshot().is_empty()
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await.expect("blocked inbound must not retain expired or closed sessions");
+    }
+
+    #[tokio::test]
+    async fn test_dispatcher_full_cone_relay_preserves_peer_source_address_end_to_end() {
+        check_full_cone_relay(OutboundType::Direct).await;
+    }
+
+    #[tokio::test]
+    async fn nested_selector_direct_preserves_peer_source() {
+        check_full_cone_relay(OutboundType::Selector).await;
+    }
+
+    #[tokio::test]
+    async fn loadbalance_direct_preserves_peer_source() {
+        check_full_cone_relay(OutboundType::LoadBalance).await;
+    }
+
+    async fn check_full_cone_relay(proto: OutboundType) {
+        let server_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = server_socket.local_addr().unwrap();
+
+        let peer_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = peer_socket.local_addr().unwrap();
+
+        let dispatcher = test_dispatcher(proto).await;
 
         let client_src: SocketAddr = "127.0.0.1:54321".parse().unwrap();
         let sess = Session {
@@ -1903,7 +2057,9 @@ mod tests {
         // 2. Server receives packet from Direct Outbound socket
         let mut buf = [0u8; 1024];
         let (n, direct_outbound_addr) =
-            server_socket.recv_from(&mut buf).await.unwrap();
+            tokio::time::timeout(
+                Duration::from_secs(2), server_socket.recv_from(&mut buf),
+            ).await.unwrap().unwrap();
         assert_eq!(&buf[..n], b"hello-server");
 
         // 3. A third-party peer sends an unsolicited hole-punching UDP packet to Direct Outbound
