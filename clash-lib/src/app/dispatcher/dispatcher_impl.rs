@@ -22,7 +22,7 @@ use std::{
     net::SocketAddr,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU8, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -79,6 +79,34 @@ pub struct Dispatcher {
 type SessionKey = (SocketAddr, SocksAddr);
 type OutboundPacketSender = tokio::sync::mpsc::Sender<UdpPacket>;
 
+/// The relay has one writer and the actor only needs a timestamp, so no
+/// associated state requires synchronization beyond a relaxed atomic access.
+struct UdpReplyActivity {
+    epoch: Instant,
+    last_reply: AtomicU64,
+}
+
+impl UdpReplyActivity {
+    fn new() -> Self {
+        Self {
+            epoch: Instant::now(),
+            last_reply: AtomicU64::new(0),
+        }
+    }
+
+    fn record(&self) {
+        // Reserve zero for no reply. Nanoseconds cover over 584 years, well
+        // beyond the lifetime of a UDP session.
+        let elapsed = self.epoch.elapsed().as_nanos() as u64;
+        self.last_reply.store(elapsed + 1, Ordering::Relaxed);
+    }
+
+    fn latest(&self) -> Option<Instant> {
+        let elapsed = self.last_reply.load(Ordering::Relaxed);
+        (elapsed != 0).then(|| self.epoch + Duration::from_nanos(elapsed - 1))
+    }
+}
+
 struct OutboundSession {
     id: u64,
     dest: SocksAddr,
@@ -86,6 +114,8 @@ struct OutboundSession {
     delay_key: tokio_util::time::delay_queue::Key,
     idle_deadline: Instant,
     scheduled_deadline: Instant,
+    last_upload: Instant,
+    reply_activity: Arc<UdpReplyActivity>,
     _relay_handle: JoinHandle<()>,
     _capacity_permit: tokio::sync::OwnedSemaphorePermit,
     upload_count: u32,
@@ -98,12 +128,27 @@ impl OutboundSession {
         delay_queue: &mut DelayQueue<UdpQueueEvent>,
         timeout: Duration,
     ) {
-        self.idle_deadline = Instant::now() + timeout;
+        self.last_upload = Instant::now();
+        self.idle_deadline = self.last_upload + timeout;
         // Keep an earlier timer in place. When it fires, the actor will check
         // the latest activity and reschedule only if the flow is still active.
         if self.idle_deadline < self.scheduled_deadline {
             delay_queue.reset_at(&self.delay_key, self.idle_deadline);
             self.scheduled_deadline = self.idle_deadline;
+        }
+    }
+
+    fn latest_idle_deadline(&self, timeout: Duration) -> Instant {
+        match self.reply_activity.latest() {
+            Some(reply) if reply > self.last_upload => {
+                let reply_timeout = if self.is_short_flow {
+                    FAST_RESPONSE_TIMEOUT
+                } else {
+                    timeout
+                };
+                reply + reply_timeout
+            }
+            _ => self.idle_deadline,
         }
     }
 }
@@ -121,6 +166,7 @@ struct EstablishedSession {
     sender: OutboundPacketSender,
     relay_handle: JoinHandle<()>,
     relay_start: tokio::sync::oneshot::Sender<()>,
+    reply_activity: Arc<UdpReplyActivity>,
 }
 
 enum EstablishOutcome {
@@ -156,19 +202,14 @@ impl Drop for ConnectingSession {
 }
 
 #[derive(Clone)]
-struct DownstreamPacket {
-    packet: UdpPacket,
-    session_key: Arc<SessionKey>,
-}
-
-#[derive(Clone)]
 struct UdpDispatchContext {
     outbound_manager: ThreadSafeOutboundManager,
     router: ArcRouter,
     resolver: ThreadSafeDNSResolver,
     manager: Arc<Manager>,
     mode: Arc<AtomicU8>,
-    remote_receiver_w: tokio::sync::mpsc::Sender<DownstreamPacket>,
+    reply_sender: OutboundPacketSender,
+    allow_quic: Arc<AtomicBool>,
     session_semaphore: Arc<tokio::sync::Semaphore>,
 }
 
@@ -446,8 +487,6 @@ impl Dispatcher {
         let (mut local_w, mut local_r) = udp_inbound.split();
         let (local_sender, mut local_receiver) =
             tokio::sync::mpsc::channel::<UdpPacket>(UDP_CHANNEL_CAPACITY);
-        let (remote_receiver_w, mut remote_receiver_r) =
-            tokio::sync::mpsc::channel::<DownstreamPacket>(UDP_CHANNEL_CAPACITY);
         let (session_established_tx, mut session_established_rx) =
             tokio::sync::mpsc::channel::<EstablishOutcome>(64);
         let (close_sender, mut close_receiver) =
@@ -459,7 +498,8 @@ impl Dispatcher {
             resolver: self.resolver.clone(),
             manager: self.manager.clone(),
             mode: self.mode.clone(),
-            remote_receiver_w,
+            reply_sender: local_sender,
+            allow_quic: self.allow_quic.clone(),
             session_semaphore: self.udp_session_semaphore.clone(),
         };
         let sniffer = self.sniffer.clone();
@@ -499,39 +539,13 @@ impl Dispatcher {
                             break;
                         }
 
-                        // 2. Reply packets from remote outbounds -> send to local_w
-                        Some(DownstreamPacket { packet, session_key }) = remote_receiver_r.recv() => {
-                            if !allow_quic.load(Ordering::Relaxed) && packet.src_addr.port() == 443 {
-                                trace!(
-                                    "QUIC reply packet dropped (UDP 443) from {}",
-                                    packet.src_addr
-                                );
-                                continue;
-                            }
-
-                            // Refresh session activity on downstream reply packets
-                            if let Some(session) = sessions.get_mut(session_key.as_ref()) {
-                                let next_timeout = if !has_explicit_timeout && session.is_short_flow {
-                                    FAST_RESPONSE_TIMEOUT
-                                } else {
-                                    timeout_duration
-                                };
-                                session.refresh_idle(&mut delay_queue, next_timeout);
-                            }
-
-                            match local_sender.try_send(packet) {
-                                Ok(()) => {}
-                                Err(TrySendError::Full(_)) => {
-                                    debug!("[UDP] inbound reply queue full, dropping packet");
-                                }
-                                Err(TrySendError::Closed(_)) => {
-                                    warn!("UDP inbound reply writer stopped for {}, closing session actor", sess);
-                                    break;
-                                }
-                            }
+                        // Detect an unexpected writer exit even without reply traffic.
+                        _ = ctx.reply_sender.closed() => {
+                            warn!("UDP inbound reply writer stopped for {}, closing session actor", sess);
+                            break;
                         }
 
-                        // 3. Asynchronously established outbound session ready
+                        // 2. Asynchronously established outbound session ready
                         Some(outcome) = session_established_rx.recv() => {
                             match outcome {
                                 EstablishOutcome::Success(established, capacity_permit) => {
@@ -555,6 +569,7 @@ impl Dispatcher {
                                         sender,
                                         relay_handle,
                                         relay_start,
+                                        reply_activity,
                                         ..
                                     } = established;
 
@@ -571,10 +586,19 @@ impl Dispatcher {
                                         timeout_duration
                                     };
 
-                                    let idle_deadline = Instant::now() + initial_timeout;
+                                    let last_upload = Instant::now();
+                                    let idle_deadline = last_upload + initial_timeout;
+                                    // A first reply can shorten a short flow's timeout.
+                                    // Check at the earliest possible deadline without
+                                    // sending per-packet activity messages to the actor.
+                                    let scheduled_deadline = if is_short_flow {
+                                        last_upload + FAST_RESPONSE_TIMEOUT
+                                    } else {
+                                        idle_deadline
+                                    };
                                     let delay_key = delay_queue.insert_at(
                                         UdpQueueEvent::SessionIdle(session_key.clone()),
-                                        idle_deadline,
+                                        scheduled_deadline,
                                     );
 
                                     sessions.insert(
@@ -585,7 +609,9 @@ impl Dispatcher {
                                             sender,
                                             delay_key,
                                             idle_deadline,
-                                            scheduled_deadline: idle_deadline,
+                                            scheduled_deadline,
+                                            last_upload,
+                                            reply_activity,
                                             _relay_handle: relay_handle,
                                             _capacity_permit: capacity_permit,
                                             upload_count: initial_upload_count,
@@ -615,17 +641,18 @@ impl Dispatcher {
                             }
                         }
 
-                        // 4. Idle timeout expiration or pending sniff timeout from DelayQueue
+                        // 3. Idle timeout expiration or pending sniff timeout from DelayQueue
                         Some(expired) = delay_queue.next() => {
                             match expired.into_inner() {
                                 UdpQueueEvent::SessionIdle(key) => {
                                     if let Some(session) = sessions.get_mut(&key) {
-                                        if session.idle_deadline > Instant::now() {
+                                        let deadline = session.latest_idle_deadline(timeout_duration);
+                                        if deadline > Instant::now() {
                                             session.delay_key = delay_queue.insert_at(
                                                 UdpQueueEvent::SessionIdle(key.clone()),
-                                                session.idle_deadline,
+                                                deadline,
                                             );
-                                            session.scheduled_deadline = session.idle_deadline;
+                                            session.scheduled_deadline = deadline;
                                         } else {
                                             trace!("UDP session expired for src: {}, dst: {}", key.0, key.1);
                                             sessions.remove(&key);
@@ -665,7 +692,7 @@ impl Dispatcher {
                             }
                         }
 
-                        // 5. Inbound packets from local_r -> route & forward to remote
+                        // 4. Inbound packets from local_r -> route & forward to remote
                         inbound_opt = local_r.next() => {
                             let mut packet = match inbound_opt {
                                 Some(pkt) => pkt,
@@ -1149,9 +1176,11 @@ fn spawn_udp_relay<D: OutboundDatagram<UdpPacket>>(
     let orig_inbound_dst_for_relay = orig_inbound_dst.clone();
     let relay_sess = sess.clone();
     let relay_session_key = (sess.source, orig_inbound_dst.clone());
-    let relay_session_key_for_incoming = Arc::new(relay_session_key.clone());
     let relay_sess_id = sess.id;
-    let remote_receiver_w_clone = ctx.remote_receiver_w.clone();
+    let reply_sender = ctx.reply_sender.clone();
+    let allow_quic = ctx.allow_quic.clone();
+    let reply_activity = Arc::new(UdpReplyActivity::new());
+    let relay_reply_activity = reply_activity.clone();
     let tracker = TrafficTracker::new(tracker_info, ctx.manager.clone());
     let (relay_start, relay_start_rx) = tokio::sync::oneshot::channel();
 
@@ -1180,15 +1209,16 @@ fn spawn_udp_relay<D: OutboundDatagram<UdpPacket>>(
 
             packet.dst_addr = relay_sess.source.into();
             debug!("UDP NAT for packet: {:?}, session: {}", packet, relay_sess);
-            let msg = DownstreamPacket {
-                packet,
-                session_key: relay_session_key_for_incoming.clone(),
-            };
-            match remote_receiver_w_clone.try_send(msg) {
+            if !allow_quic.load(Ordering::Relaxed) && packet.src_addr.port() == 443 {
+                trace!("QUIC reply packet dropped (UDP 443) from {}", packet.src_addr);
+                return true;
+            }
+            relay_reply_activity.record();
+            match reply_sender.try_send(packet) {
                 Ok(_) => {}
                 Err(TrySendError::Full(_)) => {
                     debug!(
-                        "[UDP NAT] Backpressure: remote_receiver channel is full for sess: {}",
+                        "[UDP NAT] Backpressure: inbound reply queue is full for sess: {}",
                         relay_sess
                     );
                 }
@@ -1230,6 +1260,7 @@ fn spawn_udp_relay<D: OutboundDatagram<UdpPacket>>(
         sender: remote_sender,
         relay_handle,
         relay_start,
+        reply_activity,
     }
 }
 
@@ -1623,6 +1654,7 @@ mod tests {
     use crate::proxy::mocks::MockDummyProxyProvider;
     use crate::app::remote_content_manager::ProxyManager;
     use crate::proxy::direct::Handler as DirectHandler;
+    use crate::proxy::datagram::ChannelDatagram;
     use crate::session::{Network, Type};
     use bytes::Bytes;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -1729,6 +1761,8 @@ mod tests {
             delay_key,
             idle_deadline: Instant::now() + Duration::from_secs(60),
             scheduled_deadline: Instant::now() + Duration::from_secs(60),
+            last_upload: Instant::now(),
+            reply_activity: Arc::new(UdpReplyActivity::new()),
             _relay_handle: relay_handle,
             _capacity_permit: permit,
             upload_count: 1,
@@ -1762,6 +1796,8 @@ mod tests {
             delay_key,
             idle_deadline: deadline,
             scheduled_deadline: deadline,
+            last_upload: Instant::now(),
+            reply_activity: Arc::new(UdpReplyActivity::new()),
             _relay_handle: relay_handle,
             _capacity_permit: permit,
             upload_count: 1,
@@ -1776,6 +1812,52 @@ mod tests {
         session.refresh_idle(&mut delay_queue, Duration::from_secs(1));
         assert!(delay_queue.deadline(&session.delay_key) < queued_deadline);
         assert_eq!(session.idle_deadline, session.scheduled_deadline);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reply_activity_obeys_latest_direction_and_short_flow_timeout() {
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = semaphore.acquire_owned().await.unwrap();
+        let (sender, _receiver) = tokio::sync::mpsc::channel(1);
+        let mut delay_queue = DelayQueue::new();
+        let now = Instant::now();
+        let delay_key = delay_queue.insert_at(
+            UdpQueueEvent::SessionIdle((
+                "127.0.0.1:12345".parse().unwrap(),
+                SocksAddr::Ip("1.1.1.1:53".parse().unwrap()),
+            )),
+            now + FAST_RESPONSE_TIMEOUT,
+        );
+        let mut session = OutboundSession {
+            id: 42,
+            dest: SocksAddr::Ip("1.1.1.1:53".parse().unwrap()),
+            sender,
+            delay_key,
+            idle_deadline: now + SHORT_FLOW_INIT_TIMEOUT,
+            scheduled_deadline: now + FAST_RESPONSE_TIMEOUT,
+            last_upload: now,
+            reply_activity: Arc::new(UdpReplyActivity::new()),
+            _relay_handle: tokio::spawn(std::future::pending::<()>()),
+            _capacity_permit: permit,
+            upload_count: 1,
+            is_short_flow: true,
+        };
+        let timeout = Duration::from_secs(60);
+        assert_eq!(session.latest_idle_deadline(timeout), now + SHORT_FLOW_INIT_TIMEOUT);
+
+        tokio::time::advance(Duration::from_secs(1)).await;
+        session.reply_activity.record();
+        assert_eq!(session.latest_idle_deadline(timeout), Instant::now() + FAST_RESPONSE_TIMEOUT);
+
+        tokio::time::advance(Duration::from_secs(1)).await;
+        session.refresh_idle(&mut delay_queue, SHORT_FLOW_INIT_TIMEOUT);
+        assert_eq!(session.latest_idle_deadline(timeout), Instant::now() + SHORT_FLOW_INIT_TIMEOUT);
+
+        // Once uploads promote the flow, later replies use the normal timeout.
+        session.is_short_flow = false;
+        tokio::time::advance(Duration::from_secs(1)).await;
+        session.reply_activity.record();
+        assert_eq!(session.latest_idle_deadline(timeout), Instant::now() + timeout);
     }
 
     #[test]
@@ -1937,6 +2019,116 @@ mod tests {
     #[tokio::test]
     async fn inbound_backpressure_does_not_block_expiration() {
         check_inbound_backpressure(false).await;
+    }
+
+    #[tokio::test]
+    async fn downstream_only_activity_keeps_session_alive_until_idle() {
+        let dispatcher = test_dispatcher(OutboundType::Direct).await;
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let destination = SocksAddr::Ip(server.local_addr().unwrap());
+        let source: SocketAddr = "127.0.0.1:54324".parse().unwrap();
+        let sess = Session {
+            network: Network::Udp,
+            source,
+            destination: destination.clone(),
+            udp_timeout: Some(Duration::from_millis(500)),
+            ..Default::default()
+        };
+        let (client_tx, inbound_rx) = tokio::sync::mpsc::channel(4);
+        let (inbound_tx, mut client_rx) = tokio::sync::mpsc::channel(4);
+        let _closer = dispatcher.dispatch_datagram(sess, Box::new(
+            MockInboundDatagram { rx: inbound_rx, tx: inbound_tx },
+        )).await;
+        client_tx.send(UdpPacket::new(
+            Bytes::from_static(b"request"), SocksAddr::Ip(source), destination,
+        )).await.unwrap();
+        let mut buf = [0u8; 64];
+        let (_, outbound_addr) = tokio::time::timeout(
+            Duration::from_secs(2), server.recv_from(&mut buf),
+        ).await.unwrap().unwrap();
+        let session_id = dispatcher.manager.active_connections_snapshot()[0].id;
+
+        // Cross the initial idle deadline without any additional upstream packet.
+        for _ in 0..3 {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            server.send_to(b"reply", outbound_addr).await.unwrap();
+            let reply = tokio::time::timeout(Duration::from_secs(2), client_rx.recv())
+                .await.unwrap().unwrap();
+            assert_eq!(reply.data.as_ref(), b"reply");
+            assert_eq!(dispatcher.manager.active_connections_snapshot()[0].id, session_id);
+        }
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while dispatcher.udp_session_semaphore.available_permits()
+                != MAX_GLOBAL_UDP_SESSIONS
+                || !dispatcher.manager.active_connections_snapshot().is_empty()
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await.expect("downstream activity must expire after replies stop");
+    }
+
+    #[tokio::test]
+    async fn direct_reply_delivery_honors_dynamic_quic_setting() {
+        let dispatcher = test_dispatcher(OutboundType::Direct).await;
+        dispatcher.set_quic(false);
+        let (reply_sender, mut replies) = tokio::sync::mpsc::channel(4);
+        let ctx = UdpDispatchContext {
+            outbound_manager: dispatcher.outbound_manager.clone(),
+            router: dispatcher.router.clone(),
+            resolver: dispatcher.resolver.clone(),
+            manager: dispatcher.manager.clone(),
+            mode: dispatcher.mode.clone(),
+            reply_sender,
+            allow_quic: dispatcher.allow_quic.clone(),
+            session_semaphore: dispatcher.udp_session_semaphore.clone(),
+        };
+        let sess = Session {
+            network: Network::Udp,
+            source: "127.0.0.1:54325".parse().unwrap(),
+            destination: SocksAddr::Ip("127.0.0.1:443".parse().unwrap()),
+            ..Default::default()
+        };
+        let tracker_info = Arc::new(TrackerInfo::new(&sess, None));
+        let (incoming_tx, incoming_rx) = tokio::sync::mpsc::channel(4);
+        let (sent_tx, _sent_rx) = tokio::sync::mpsc::channel(4);
+        let (established_tx, _established_rx) = tokio::sync::mpsc::channel(4);
+        let established = spawn_udp_relay(
+            ChannelDatagram::new(sent_tx, incoming_rx),
+            sess.clone(),
+            sess.destination.clone(),
+            &ctx,
+            established_tx,
+            tracker_info.clone(),
+            (false, false),
+        );
+        let _relay = AbortOnDropHandle::new(established.relay_handle);
+        let _outgoing = established.sender;
+        established.relay_start.send(()).unwrap();
+        incoming_tx.send(UdpPacket {
+            data: Bytes::from_static(b"blocked"),
+            src_addr: SocksAddr::Ip("127.0.0.1:8443".parse().unwrap()),
+            ..Default::default()
+        }).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while tracker_info.download_total.load(Ordering::Relaxed) == 0 {
+                tokio::task::yield_now().await;
+            }
+        }).await.unwrap();
+        assert!(replies.try_recv().is_err());
+        assert!(established.reply_activity.latest().is_none());
+
+        dispatcher.set_quic(true);
+        incoming_tx.send(UdpPacket {
+            data: Bytes::from_static(b"allowed"),
+            src_addr: SocksAddr::Ip("127.0.0.1:8443".parse().unwrap()),
+            ..Default::default()
+        }).await.unwrap();
+        let reply = tokio::time::timeout(Duration::from_secs(2), replies.recv())
+            .await.unwrap().unwrap();
+        assert_eq!(reply.data.as_ref(), b"allowed");
+        assert_eq!(reply.src_addr, sess.destination);
+        assert_eq!(reply.dst_addr, SocksAddr::Ip(sess.source));
+        assert!(established.reply_activity.latest().is_some());
     }
 
     async fn check_inbound_backpressure(explicit_close: bool) {
