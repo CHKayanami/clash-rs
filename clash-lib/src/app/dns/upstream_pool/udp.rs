@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::future::Future;
+use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -9,17 +10,27 @@ use arc_swap::ArcSwapOption;
 use parking_lot::Mutex;
 
 use crate::app::dns::endpoint::{DnsEndpoint, DnsStrategy};
-use crate::app::dns::transport::UdpPool;
+use crate::app::dns::transport::{
+    UdpPool, NETWORK_RETRY_DELAY, SocketFailure, network_error,
+};
+use tokio::time::Instant;
 
 struct CachedPool {
     address: SocketAddr,
     pool: Arc<UdpPool>,
 }
 
+struct RetryFailure {
+    address: SocketAddr,
+    until: Instant,
+    error: SocketFailure,
+}
+
 #[derive(Default)]
 struct UdpSlot {
     active: ArcSwapOption<CachedPool>,
     init: tokio::sync::Mutex<()>,
+    retry: ArcSwapOption<RetryFailure>,
 }
 
 impl UdpSlot {
@@ -29,6 +40,19 @@ impl UdpSlot {
             .as_ref()
             .filter(|cached| cached.address == address && !cached.pool.is_closed())
             .map(|cached| Arc::clone(&cached.pool))
+    }
+
+    fn retry_error(&self, address: SocketAddr) -> Option<io::Error> {
+        if let Some(cached) = self.active.load().as_ref()
+            && cached.address == address
+            && let Some(error) = cached.pool.retry_error()
+        {
+            return Some(error);
+        }
+        self.retry.load().as_ref().and_then(|failure| {
+            (failure.address == address && Instant::now() < failure.until)
+                .then(|| failure.error.error())
+        })
     }
 
     async fn acquire<F, Fut>(
@@ -43,11 +67,30 @@ impl UdpSlot {
         if let Some(pool) = self.cached(address) {
             return Ok(pool);
         }
+        if let Some(error) = self.retry_error(address) {
+            return Err(error.into());
+        }
         let _init = self.init.lock().await;
         if let Some(pool) = self.cached(address) {
             return Ok(pool);
         }
-        let pool = build().await?;
+        if let Some(error) = self.retry_error(address) {
+            return Err(error.into());
+        }
+        let pool = match build().await {
+            Ok(pool) => pool,
+            Err(error) => {
+                if let Some(failure) = network_error(&error) {
+                    self.retry.store(Some(Arc::new(RetryFailure {
+                        address,
+                        until: Instant::now() + NETWORK_RETRY_DELAY,
+                        error: failure,
+                    })));
+                }
+                return Err(error);
+            }
+        };
+        self.retry.store(None);
         // In-flight exchanges retain the old pool during address refreshes.
         self.active.store(Some(Arc::new(CachedPool {
             address,
@@ -254,6 +297,12 @@ impl UdpUpstream {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use libc::ENETUNREACH;
+    #[cfg(windows)]
+    use windows::Win32::Networking::WinSock::WSAENETUNREACH;
+    #[cfg(windows)]
+    const ENETUNREACH: i32 = WSAENETUNREACH.0;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
@@ -267,6 +316,76 @@ mod tests {
         )
         .await
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn cooldown_does_not_wait_for_init_or_block_other_addresses() {
+        let slot = UdpSlot::default();
+        let address = "127.0.0.1:53".parse().unwrap();
+        let other_address = "127.0.0.2:53".parse().unwrap();
+        let error = io::Error::from_raw_os_error(ENETUNREACH);
+        let failure = network_error(&error.into()).unwrap();
+        slot.retry.store(Some(Arc::new(RetryFailure {
+            address, until: Instant::now() + NETWORK_RETRY_DELAY, error: failure,
+        })));
+        let init = slot.init.lock().await;
+        let result = tokio::time::timeout(Duration::from_millis(100),
+            slot.acquire(address, || async { panic!("cooldown must skip initialization") }),
+        ).await.expect("cooldown must not wait for init");
+        assert_eq!(result.err().unwrap().downcast_ref::<io::Error>().unwrap().raw_os_error(),
+            Some(ENETUNREACH));
+        drop(init);
+        let pool = slot.acquire(other_address, || async { Ok(pool().await) }).await.unwrap();
+        assert!(slot.retry.load().is_none());
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn network_failure_cools_down_and_coalesces_rebuilds() {
+        let slot = Arc::new(UdpSlot::default());
+        let address = "127.0.0.1:53".parse().unwrap();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let error = slot.acquire(address, || async {
+            attempts.fetch_add(1, Ordering::Relaxed);
+            Err(io::Error::from(io::ErrorKind::NetworkUnreachable).into())
+        }).await.err().unwrap();
+        assert_eq!(network_error(&error).unwrap().error().kind(), io::ErrorKind::NetworkUnreachable);
+        let mut tasks = Vec::new();
+        for _ in 0..16 {
+            let slot = slot.clone();
+            let attempts = attempts.clone();
+            tasks.push(tokio::spawn(async move {
+                slot.acquire(address, || async {
+                    attempts.fetch_add(1, Ordering::Relaxed);
+                    Ok(pool().await)
+                }).await
+            }));
+        }
+        for task in tasks {
+            assert!(task.await.unwrap().is_err());
+        }
+        assert_eq!(attempts.load(Ordering::Relaxed), 1);
+        slot.retry.store(Some(Arc::new(RetryFailure {
+            address, until: Instant::now(), error: network_error(&error).unwrap(),
+        })));
+        let mut tasks = Vec::new();
+        for _ in 0..16 {
+            let slot = slot.clone();
+            let attempts = attempts.clone();
+            tasks.push(tokio::spawn(async move {
+                slot.acquire(address, || async {
+                    attempts.fetch_add(1, Ordering::Relaxed);
+                    Ok(pool().await)
+                }).await.unwrap()
+            }));
+        }
+        let first = tasks.remove(0).await.unwrap();
+        for task in tasks {
+            assert!(Arc::ptr_eq(&first, &task.await.unwrap()));
+        }
+        assert_eq!(attempts.load(Ordering::Relaxed), 2);
+        assert!(slot.retry.load().is_none());
+        first.close().await;
     }
 
     #[tokio::test]

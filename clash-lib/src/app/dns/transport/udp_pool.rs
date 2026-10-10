@@ -3,21 +3,72 @@
 use bytes::Bytes;
 use crate::app::dns::query::QueryContext;
 
+use std::io;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
+#[cfg(unix)]
+use libc::EMSGSIZE;
+#[cfg(windows)]
+use windows::Win32::Networking::WinSock::WSAEMSGSIZE;
 use futures::stream::SplitStream;
 use futures::{SinkExt, StreamExt};
 use parking_lot::Mutex;
 use tokio::net::UdpSocket;
 use tokio::sync::oneshot;
+use tokio::time::Instant as TokioInstant;
+use tracing::warn;
 
 use super::dial::DialContext;
 use super::owned_task::OwnedTask;
 use crate::proxy::AnyOutboundDatagram;
 use crate::proxy::datagram::UdpPacket;
+
+pub(crate) const NETWORK_RETRY_DELAY: Duration = Duration::from_secs(1);
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SocketFailure {
+    kind: io::ErrorKind,
+    code: Option<i32>,
+}
+
+impl SocketFailure {
+    fn new(error: &io::Error) -> Self {
+        Self { kind: error.kind(), code: error.raw_os_error() }
+    }
+
+    pub(crate) fn error(self) -> io::Error {
+        self.code.map(io::Error::from_raw_os_error)
+            .unwrap_or_else(|| io::Error::from(self.kind))
+    }
+}
+
+fn is_network_error(error: &io::Error) -> bool {
+    matches!(error.kind(),
+        io::ErrorKind::NetworkUnreachable
+        | io::ErrorKind::HostUnreachable
+        | io::ErrorKind::NetworkDown
+        | io::ErrorKind::AddrNotAvailable
+    )
+}
+
+fn message_too_large(error: &io::Error) -> bool {
+    #[cfg(unix)]
+    { error.raw_os_error() == Some(EMSGSIZE) }
+    #[cfg(windows)]
+    { error.raw_os_error() == Some(WSAEMSGSIZE.0) }
+    #[cfg(not(any(unix, windows)))]
+    { let _ = error; false }
+}
+
+pub(crate) fn network_error(error: &anyhow::Error) -> Option<SocketFailure> {
+    error.chain().find_map(|cause| {
+        let error = cause.downcast_ref::<io::Error>()?;
+        is_network_error(error).then(|| SocketFailure::new(error))
+    })
+}
 
 const SLOT_COUNT: usize = 1024;
 const SLOT_MASK: usize = SLOT_COUNT - 1; // 0x3FF (10 bits)
@@ -69,6 +120,8 @@ pub struct UdpPool {
     slots: Box<[Slot; SLOT_COUNT]>,
     cursor: AtomicUsize,
     closed: AtomicBool,
+    socket_failure: OnceLock<(TokioInstant, SocketFailure)>,
+    receive_error_log_after: AtomicUsize,
     cancelled: tokio_util::sync::CancellationToken,
     tasks: Mutex<Vec<OwnedTask>>,
     target_addr: SocketAddr,
@@ -129,6 +182,8 @@ impl UdpPool {
             slots,
             cursor: AtomicUsize::new(0),
             closed: AtomicBool::new(false),
+            socket_failure: OnceLock::new(),
+            receive_error_log_after: AtomicUsize::new(0),
             cancelled: tokio_util::sync::CancellationToken::new(),
             tasks: Mutex::new(Vec::new()),
             target_addr: address,
@@ -180,6 +235,8 @@ impl UdpPool {
             slots,
             cursor: AtomicUsize::new(0),
             closed: AtomicBool::new(false),
+            socket_failure: OnceLock::new(),
+            receive_error_log_after: AtomicUsize::new(0),
             cancelled: tokio_util::sync::CancellationToken::new(),
             tasks: Mutex::new(Vec::new()),
             target_addr: address,
@@ -234,6 +291,27 @@ impl UdpPool {
         self.closed.load(Ordering::Acquire)
     }
 
+    pub(crate) fn retry_error(&self) -> Option<io::Error> {
+        self.socket_failure.get().and_then(|(until, failure)| {
+            (TokioInstant::now() < *until).then(|| failure.error())
+        })
+    }
+
+    fn fail_socket(&self, failure: SocketFailure) {
+        // Concurrent failures from this generation must not extend its cooldown.
+        self.socket_failure.get_or_init(|| {
+            (TokioInstant::now() + NETWORK_RETRY_DELAY, failure)
+        });
+        self.mark_closed();
+    }
+
+    fn closed_error(&self) -> anyhow::Error {
+        match self.socket_failure.get() {
+            Some((_, failure)) => failure.error().into(),
+            None => anyhow::anyhow!("UDP DNS exchange pool is closed: receive loop stopped"),
+        }
+    }
+
     fn mark_closed(&self) {
         if self.closed.swap(true, Ordering::AcqRel) {
             return;
@@ -258,7 +336,7 @@ impl UdpPool {
     pub async fn exchange(&self, context: &QueryContext) -> anyhow::Result<Vec<u8>> {
         let query = context.wire();
         if self.is_closed() {
-            anyhow::bail!("UDP DNS exchange pool is closed");
+            return Err(self.closed_error());
         }
 
         let original_id = context.txid().get().to_be_bytes();
@@ -295,6 +373,9 @@ impl UdpPool {
             };
 
             if let Err(error) = send_res {
+                if let Some(failure) = network_error(&error) {
+                    self.fail_socket(failure);
+                }
                 return Err(error);
             }
 
@@ -303,7 +384,7 @@ impl UdpPool {
                     guard.disarm();
                     Ok(response)
                 }
-                Err(_) => anyhow::bail!("UDP DNS receive loop stopped"),
+                Err(_) => Err(self.closed_error()),
             }
         })
         .await
@@ -333,7 +414,7 @@ impl UdpPool {
                 let mut data = slot.data.lock();
                 if self.is_closed() {
                     slot.in_use.store(false, Ordering::Release);
-                    anyhow::bail!("UDP DNS exchange pool is closed");
+                    return Err(self.closed_error());
                 }
                 let previous = slot.salt.load(Ordering::Relaxed);
                 let Some(salt) = (1..=64)
@@ -358,18 +439,24 @@ impl UdpPool {
     }
 
     async fn direct_receive_loop(pool: Weak<Self>, socket: Arc<UdpSocket>) {
+        let Some(cancelled) = pool.upgrade().map(|pool| pool.cancelled.clone()) else {
+            return;
+        };
         let mut buffer = [0u8; 8192];
         loop {
-            let Ok(Ok(length)) = tokio::time::timeout(
-                Duration::from_secs(1),
-                socket.recv(&mut buffer),
-            )
-            .await
-            else {
-                if pool.strong_count() == 0 {
-                    break;
+            let received = tokio::select! {
+                _ = cancelled.cancelled() => break,
+                result = socket.recv(&mut buffer) => result,
+            };
+            let length = match received {
+                Ok(length) => length,
+                Err(error) => {
+                    let Some(pool) = pool.upgrade() else { break };
+                    if !pool.handle_receive_error(&error).await {
+                        break;
+                    }
+                    continue;
                 }
-                continue;
             };
             if length < 12 {
                 continue;
@@ -378,6 +465,39 @@ impl UdpPool {
                 break;
             };
             pool.handle_response(&buffer[..length]);
+        }
+    }
+
+    async fn handle_receive_error(&self, error: &io::Error) -> bool {
+        // ICMP packet errors do not necessarily invalidate the socket. Bound
+        // retries even when the OS repeatedly reports an immediately ready error.
+        let recoverable = matches!(error.kind(),
+            io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
+            | io::ErrorKind::ConnectionRefused | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::TimedOut
+        ) || message_too_large(error);
+        if !recoverable {
+            warn!(upstream = %self.target_addr, error = %error,
+                error_kind = ?error.kind(), os_error = ?error.raw_os_error(),
+                "UDP DNS receive failed; closing socket and cooling down");
+            self.fail_socket(SocketFailure::new(error));
+            return false;
+        }
+        // Log the first recoverable error immediately, then at most once per
+        // second for this socket. Error logging adds no work to successful reads.
+        let now = self.epoch.elapsed().as_secs() as usize;
+        if self.receive_error_log_after.try_update(
+            Ordering::Relaxed, Ordering::Relaxed,
+            |after| (now >= after).then_some(now.saturating_add(1)),
+        ).is_ok() {
+            warn!(upstream = %self.target_addr, error = %error,
+                error_kind = ?error.kind(), os_error = ?error.raw_os_error(),
+                retry_delay_ms = 10,
+                "recoverable UDP DNS receive error; retrying");
+        }
+        tokio::select! {
+            _ = self.cancelled.cancelled() => false,
+            _ = tokio::time::sleep(Duration::from_millis(10)) => true,
         }
     }
 
@@ -479,11 +599,22 @@ mod tests {
     use std::net::SocketAddr;
     use std::sync::Arc;
     use std::sync::atomic::AtomicUsize;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use tokio::net::UdpSocket;
 
-    use super::UdpPool;
+    use std::io::{Error as IoError, ErrorKind};
+    #[cfg(unix)]
+    use libc::{EBADF, ENETUNREACH, EMSGSIZE};
+    #[cfg(windows)]
+    use windows::Win32::Networking::WinSock::{
+        WSAEMSGSIZE, WSAENETUNREACH, WSAENOTSOCK,
+    };
+    #[cfg(windows)]
+    const EBADF: i32 = WSAENOTSOCK.0;
+    #[cfg(windows)]
+    const ENETUNREACH: i32 = WSAENETUNREACH.0;
+    use super::{SocketFailure, UdpPool};
 
     fn build_test_query(id: u16, name: &str) -> Vec<u8> {
         let mut msg = Vec::new();
@@ -525,6 +656,68 @@ mod tests {
             active.clone(),
         );
         (pool, sender, receiver, active)
+    }
+
+    #[cfg(any(unix, windows))]
+    #[tokio::test]
+    async fn oversized_datagram_error_keeps_pool_available() {
+        #[cfg(unix)]
+        let code = EMSGSIZE;
+        #[cfg(windows)]
+        let code = WSAEMSGSIZE.0;
+        let (pool, _incoming, _outgoing, _active) =
+            proxied_fixture(Duration::from_secs(10));
+        assert!(pool.handle_receive_error(&IoError::from_raw_os_error(code)).await);
+        assert!(!pool.is_closed());
+        assert!(pool.socket_failure.get().is_none());
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn receive_errors_stop_fatal_sockets_and_delay_recoverable_errors() {
+        let (pool, _incoming, _outgoing, _active) =
+            proxied_fixture(Duration::from_secs(10));
+        let started = Instant::now();
+        assert!(pool.handle_receive_error(&IoError::from(ErrorKind::ConnectionRefused)).await);
+        assert!(started.elapsed() >= Duration::from_millis(10));
+        assert!(!pool.is_closed());
+        assert!(!pool.handle_receive_error(&IoError::from_raw_os_error(EBADF)).await);
+        assert!(pool.is_closed());
+        assert_eq!(pool.closed_error().downcast_ref::<IoError>().unwrap().raw_os_error(),
+            Some(EBADF));
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn socket_failure_stops_pending_queries_without_extending_cooldown() {
+        let (pool, _incoming, mut outgoing, _active) =
+            proxied_fixture(Duration::from_secs(10));
+        let query_pool = pool.clone();
+        let query = tokio::spawn(async move {
+            let wire = build_test_query(1, "network.test");
+            let context = QueryContext::parse(
+                Bytes::from(wire), IngressProfile::Internal,
+            ).unwrap();
+            query_pool.exchange(&context).await
+        });
+        outgoing.recv().await.unwrap();
+        pool.fail_socket(SocketFailure::new(
+            &IoError::from_raw_os_error(ENETUNREACH),
+        ));
+        let error = query.await.unwrap().unwrap_err();
+        assert_eq!(error.downcast_ref::<IoError>().unwrap().raw_os_error(),
+            Some(ENETUNREACH));
+        assert!(pool.is_closed());
+        assert_eq!(
+            pool.retry_error().unwrap().kind(),
+            ErrorKind::NetworkUnreachable,
+        );
+        let deadline = pool.socket_failure.get().unwrap().0;
+        pool.fail_socket(SocketFailure::new(
+            &IoError::from_raw_os_error(ENETUNREACH),
+        ));
+        assert_eq!(pool.socket_failure.get().unwrap().0, deadline);
+        pool.close().await;
     }
 
     #[tokio::test]
