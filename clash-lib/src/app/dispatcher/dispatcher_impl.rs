@@ -10,7 +10,7 @@ use crate::{
         internal::proxy::{PROXY_DIRECT, PROXY_GLOBAL},
     },
     proxy::{
-        AnyInboundDatagram, AnyOutboundDatagram, AnyStream, OutboundDatagram, OutboundType,
+        AnyInboundDatagram, AnyOutboundDatagram, AnyStream, OutboundDatagram, OutboundNode, OutboundType,
         datagram::UdpPacket,
     },
     session::{Session, SocksAddr},
@@ -363,6 +363,11 @@ impl Dispatcher {
             }
         };
 
+        if matches!(effective_outbound_type(&handler).await, OutboundType::Reject) {
+            info!("[TCP Short-Circuit] Reject connection for sess: {}", sess);
+            return;
+        }
+
         match handler
             .connect_stream(&sess, self.resolver.clone())
             .instrument(info_span!("connect_stream", outbound_name = outbound_name,))
@@ -470,10 +475,14 @@ impl Dispatcher {
                 }
             }
             Err(err) => {
-                warn!(
-                    "failed to establish remote connection for {}: {}",
-                    sess, err
-                );
+                if is_reject_error(&err) {
+                    info!("[TCP Short-Circuit] Reject connection for sess: {}", sess);
+                } else {
+                    warn!(
+                        "failed to establish remote connection for {}: {}",
+                        sess, err
+                    );
+                }
             }
         }
     }
@@ -1096,16 +1105,9 @@ async fn establish_outbound_session(
         }
     };
 
-    let effective_proto = if let Some(group) = handler.as_group() {
-        match group.get_active_proxy().await {
-            Some(active) => active.proto(),
-            None => handler.proto(),
-        }
-    } else {
-        handler.proto()
-    };
+    let effective_proto = effective_outbound_type(&handler).await;
     if matches!(effective_proto, OutboundType::Reject) {
-        trace!(
+        info!(
             "[UDP Short-Circuit] Drop packet immediately for sess: {}",
             sess
         );
@@ -1123,7 +1125,7 @@ async fn establish_outbound_session(
         Ok(v) => v,
         Err(err) => {
             if is_reject_error(&err) {
-                trace!(
+                info!(
                     "[UDP Short-Circuit] Drop packet immediately for sess: {}",
                     sess
                 );
@@ -1396,11 +1398,19 @@ fn decode_mode(raw: u8) -> RunMode {
     }
 }
 
+async fn effective_outbound_type(handler: &OutboundNode) -> OutboundType {
+    if let Some(group) = handler.as_group()
+        && let Some(active) = group.get_active_proxy().await
+    {
+        return active.proto();
+    }
+    handler.proto()
+}
+
 /// `proxy/reject/mod.rs` signals a rejected connection with
-/// `io::Error::other("REJECT")`. The type-based short-circuit in
-/// `dispatch_datagram` catches the common cases, but a nested group can still
-/// surface this here, so recognise it and stay quiet instead of logging an
-/// error for traffic the config asked us to drop.
+/// `io::Error::other("REJECT")`. Type-based short-circuits catch direct rejects,
+/// but nested groups can still return this error from stream or datagram
+/// connections. Keep configured rejections out of connection failure logs.
 fn is_reject_error(err: &std::io::Error) -> bool {
     err.kind() == std::io::ErrorKind::Other
         && err.get_ref().is_some_and(|e| e.to_string() == "REJECT")
@@ -1654,6 +1664,7 @@ mod tests {
     use crate::proxy::mocks::MockDummyProxyProvider;
     use crate::app::remote_content_manager::ProxyManager;
     use crate::proxy::direct::Handler as DirectHandler;
+    use crate::proxy::reject::Handler as RejectHandler;
     use crate::proxy::datagram::ChannelDatagram;
     use crate::session::{Network, Type};
     use bytes::Bytes;
@@ -1928,6 +1939,19 @@ mod tests {
         provider.expect_proxies().returning(move || proxies.clone());
         provider.expect_touch().return_const(());
         Arc::new(provider)
+    }
+
+    #[tokio::test]
+    async fn selector_reject_is_detected_before_connecting() {
+        let reject = OutboundNode::protocol(Arc::new(RejectHandler::new("REJECT")));
+        let selector = OutboundNode::group(Arc::new(selector::Handler::new(
+            selector::HandlerOptions { name: "reject-group".into(), ..Default::default() },
+            vec![test_provider(reject.clone())],
+            None,
+        ).await));
+        assert_eq!(selector.proto(), OutboundType::Selector);
+        assert_eq!(effective_outbound_type(&selector).await, OutboundType::Reject);
+        assert_eq!(effective_outbound_type(&reject).await, OutboundType::Reject);
     }
 
     async fn test_dispatcher(proto: OutboundType) -> Arc<Dispatcher> {
