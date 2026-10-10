@@ -7,23 +7,22 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use futures::future::BoxFuture;
 use murmur3::murmur3_32;
 use public_suffix::{DEFAULT_PROVIDER, EffectiveTLDProvider};
 
 use crate::{
-    app::remote_content_manager::ProxyManager, proxy::AnyOutboundHandler,
+    app::remote_content_manager::ProxyManager, proxy::OutboundNode,
     session::Session,
 };
 
-pub type StrategyFn = Box<
-    dyn Fn(
-            Arc<Vec<AnyOutboundHandler>>,
-            &Session,
-        ) -> BoxFuture<'static, std::io::Result<AnyOutboundHandler>>
-        + Send
-        + Sync,
->;
+pub enum Strategy {
+    RoundRobin(AtomicUsize),
+    ConsistentHashing,
+    StickySession {
+        manager: ProxyManager,
+        cache: moka::sync::Cache<u64, String>,
+    },
+}
 
 fn get_key(sess: &Session) -> String {
     match &sess.destination {
@@ -56,45 +55,8 @@ fn jump_hash(key: u64, buckets: i32) -> i32 {
     b as i32
 }
 
-pub fn strategy_rr() -> StrategyFn {
-    let index = AtomicUsize::new(0);
-    Box::new(move |proxies: Arc<Vec<AnyOutboundHandler>>, _: &Session| {
-        let len = proxies.len();
-        // `% len` on an empty group panicked. A group whose provider fetched an
-        // empty (or failed) subscription reaches here with nothing to pick.
-        if len == 0 {
-            return Box::pin(futures::future::err(std::io::Error::other(
-                "no proxy found",
-            )));
-        }
-        // Read then advance, so the first call uses the first proxy rather
-        // than skipping it.
-        let previous = index
-            .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
-                Some((value % len).wrapping_add(1))
-            })
-            .expect("round-robin update always succeeds");
-        let picked = previous % len;
-        Box::pin(futures::future::ok(proxies[picked].clone()))
-    })
-}
-
-pub fn strategy_consistent_hashring() -> StrategyFn {
-    let max_retry = 5;
-    Box::new(move |proxies, sess| {
-        let key = murmur3_32(&mut Cursor::new(get_key(sess)), 0).unwrap() as u64;
-        let buckets = proxies.len() as i32;
-        for _ in 0..max_retry {
-            let index = jump_hash(key, buckets);
-            if let Some(proxy) = proxies.get(index as usize) {
-                return Box::pin(futures::future::ok(proxy.clone()));
-            }
-        }
-        Box::pin(futures::future::err(std::io::Error::other(
-            "no proxy found",
-        )))
-    })
-}
+pub fn strategy_rr() -> Strategy { Strategy::RoundRobin(AtomicUsize::new(0)) }
+pub fn strategy_consistent_hashring() -> Strategy { Strategy::ConsistentHashing }
 
 #[cfg(test)]
 static TEST_LRU_STATE: std::sync::atomic::AtomicUsize =
@@ -106,80 +68,95 @@ const CACHE_HIT: usize = 1;
 #[cfg(test)]
 const CACHE_UPDATE: usize = 2;
 
-pub fn strategy_sticky_session(proxy_manager: ProxyManager) -> StrategyFn {
-    // 10 minutes, 1024 entries
-    let lru_cache: moka::sync::Cache<u64, String> = moka::sync::Cache::builder()
+pub fn strategy_sticky_session(manager: ProxyManager) -> Strategy {
+    let cache = moka::sync::Cache::builder()
         .max_capacity(1024)
         .time_to_live(std::time::Duration::from_secs(60 * 10))
         .build();
-    Box::new(move |proxies, sess| {
-        let key_str = get_key_src_and_dst(sess);
-        let key = murmur3_32(&mut Cursor::new(&key_str), 0).unwrap() as u64;
-        let proxy_manager_clone = proxy_manager.clone();
-        let lru_cache_clone = lru_cache.clone();
-        let timestamp = || {
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos() as u64
-        };
+    Strategy::StickySession { manager, cache }
+}
 
-        Box::pin(async move {
-            if proxies.is_empty() {
-                return Err(std::io::Error::other("no proxy found"));
+impl Strategy {
+    pub async fn pick(&self, proxies: Arc<Vec<OutboundNode>>, sess: &Session) -> std::io::Result<OutboundNode> {
+        if proxies.is_empty() { return Err(std::io::Error::other("no proxy found")); }
+        match self {
+            Self::RoundRobin(index) => {
+                let len = proxies.len();
+                let previous = index.try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                    Some((value % len).wrapping_add(1))
+                }).expect("round-robin update always succeeds");
+                Ok(proxies[previous % len].clone())
             }
-            let cached_name = lru_cache_clone.get(&key);
-            let cached_index = cached_name.as_deref().and_then(|name| {
-                proxies.iter().position(|proxy| proxy.name() == name)
-            });
-            let (start_index, hit) = match cached_index {
-                Some(index) => {
-                    #[cfg(test)]
-                    {
-                        TEST_LRU_STATE
-                            .store(CACHE_HIT, std::sync::atomic::Ordering::Relaxed);
-                    }
-                    (index, true)
-                }
-                None => (
-                    jump_hash(key + timestamp(), proxies.len() as i32) as usize,
-                    false,
-                ),
-            };
+            Self::ConsistentHashing => {
+                let key = murmur3_32(&mut Cursor::new(get_key(sess)), 0).unwrap() as u64;
+                Ok(proxies[jump_hash(key, proxies.len() as i32) as usize].clone())
+            }
+            Self::StickySession { manager, cache } => {
+                let key = murmur3_32(&mut Cursor::new(get_key_src_and_dst(sess)), 0).unwrap() as u64;
+                sticky_pick(proxies, key, manager, cache).await
+            }
+        }
+    }
+}
 
-            // Visit each member once, starting with the cached choice when it
-            // is still present. Random retries can miss a healthy member.
-            for offset in 0..proxies.len() {
-                let index = (start_index + offset) % proxies.len();
-                let proxy = &proxies[index];
-                if proxy_manager_clone.alive(proxy.name()).await {
-                    // now it's a valid proxy
-                    // check if it's the same as the last one(likely)
-                    // update the cache if:
-                    //   1. the index is not the same as the start_index
-                    //   2. the start_index is not fetched from the cache
-                    if index != start_index || !hit {
-                        lru_cache_clone.insert(key, proxy.name().to_owned());
-                        #[cfg(test)]
-                        {
-                            TEST_LRU_STATE.store(
-                                CACHE_UPDATE,
-                                std::sync::atomic::Ordering::Relaxed,
-                            );
-                        }
-                    }
-                    return Ok(proxy.clone());
-                }
-            }
-            lru_cache_clone.invalidate(&key);
+async fn sticky_pick(
+    proxies: Arc<Vec<OutboundNode>>, key: u64, manager: &ProxyManager,
+    cache: &moka::sync::Cache<u64, String>,
+) -> std::io::Result<OutboundNode> {
+    let timestamp = || SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64;
+    if proxies.is_empty() {
+        return Err(std::io::Error::other("no proxy found"));
+    }
+    let cached_name = cache.get(&key);
+    let cached_index = cached_name.as_deref().and_then(|name| {
+        proxies.iter().position(|proxy| proxy.name() == name)
+    });
+    let (start_index, hit) = match cached_index {
+        Some(index) => {
             #[cfg(test)]
             {
                 TEST_LRU_STATE
-                    .store(CACHE_MISS, std::sync::atomic::Ordering::Relaxed);
+                    .store(CACHE_HIT, std::sync::atomic::Ordering::Relaxed);
             }
-            Err(std::io::Error::other("no proxy found"))
-        })
-    })
+            (index, true)
+        }
+        None => (
+            jump_hash(key + timestamp(), proxies.len() as i32) as usize,
+            false,
+        ),
+    };
+
+    // Visit each member once, starting with the cached choice when it
+    // is still present. Random retries can miss a healthy member.
+    for offset in 0..proxies.len() {
+        let index = (start_index + offset) % proxies.len();
+        let proxy = &proxies[index];
+        if manager.alive(proxy.name()).await {
+            // now it's a valid proxy
+            // check if it's the same as the last one(likely)
+            // update the cache if:
+            //   1. the index is not the same as the start_index
+            //   2. the start_index is not fetched from the cache
+            if index != start_index || !hit {
+                cache.insert(key, proxy.name().to_owned());
+                #[cfg(test)]
+                {
+                    TEST_LRU_STATE.store(
+                        CACHE_UPDATE,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                }
+            }
+            return Ok(proxy.clone());
+        }
+    }
+    cache.invalidate(&key);
+    #[cfg(test)]
+    {
+        TEST_LRU_STATE
+            .store(CACHE_MISS, std::sync::atomic::Ordering::Relaxed);
+    }
+    Err(std::io::Error::other("no proxy found"))
 }
 
 #[cfg(test)]
@@ -209,16 +186,16 @@ mod tests {
     #[serial_test::serial]
     async fn test_sticky_session() {
         let resolver = Arc::new(NoopResolver);
-        let proxies: Arc<Vec<AnyOutboundHandler>> = Arc::new(vec![
-            Arc::new(NoopOutboundHandler {
+        let proxies: Arc<Vec<OutboundNode>> = Arc::new(vec![
+            OutboundNode::protocol(Arc::new(NoopOutboundHandler {
                 name: "a".to_string(),
-            }) as _,
-            Arc::new(NoopOutboundHandler {
+            })),
+            OutboundNode::protocol(Arc::new(NoopOutboundHandler {
                 name: "b".to_string(),
-            }) as _,
-            Arc::new(NoopOutboundHandler {
+            })),
+            OutboundNode::protocol(Arc::new(NoopOutboundHandler {
                 name: "c".to_string(),
-            }) as _,
+            })),
         ]);
         let manager = ProxyManager::new(resolver, None);
         // if the proxy alive state isn't set, will return true by default
@@ -230,7 +207,7 @@ mod tests {
         let strategy_fn = strategy_sticky_session(manager.clone());
 
         // all proxies is not alive since we have not setup the proxy manager
-        let res = strategy_fn(proxies.clone(), &Session::default()).await;
+        let res = strategy_fn.pick(proxies.clone(), &Session::default()).await;
         assert!(res.is_err());
         assert_cache_state!(CACHE_MISS);
 
@@ -246,16 +223,16 @@ mod tests {
             SocksAddr::Ip(SocketAddr::V4(SocketAddrV4::new(dst1, 80)));
 
         // 1.1 first time, cache miss & update
-        let res = strategy_fn(proxies.clone(), &session1).await;
+        let res = strategy_fn.pick(proxies.clone(), &session1).await;
         assert_cache_state!(CACHE_UPDATE);
         let session1_outbound_name_1 = res.unwrap().name().to_owned();
 
         // 1.2 second time, cache hit
-        let res = strategy_fn(proxies.clone(), &session1).await;
+        let res = strategy_fn.pick(proxies.clone(), &session1).await;
         assert_eq!(res.unwrap().name(), session1_outbound_name_1);
         assert_cache_state!(CACHE_HIT);
         // 1.3 third time, cache hit
-        let res = strategy_fn(proxies.clone(), &session1).await;
+        let res = strategy_fn.pick(proxies.clone(), &session1).await;
         assert_eq!(res.unwrap().name(), session1_outbound_name_1);
         assert_cache_state!(CACHE_HIT);
 
@@ -263,12 +240,12 @@ mod tests {
         let dst1_2 = Ipv4Addr::new(8, 8, 8, 8);
         session1.destination =
             SocksAddr::Ip(SocketAddr::V4(SocketAddrV4::new(dst1_2, 80)));
-        let res = strategy_fn(proxies.clone(), &session1).await;
+        let res = strategy_fn.pick(proxies.clone(), &session1).await;
         assert_cache_state!(CACHE_UPDATE);
         let session1_outbound_name_2 = res.unwrap().name().to_owned();
 
         // 1.5 cache hit
-        let res = strategy_fn(proxies.clone(), &session1).await;
+        let res = strategy_fn.pick(proxies.clone(), &session1).await;
         assert_eq!(res.unwrap().name(), session1_outbound_name_2);
         assert_cache_state!(CACHE_HIT);
 
@@ -276,12 +253,12 @@ mod tests {
             // 1.6 change the src address, cache miss & update
             let src1_new = Ipv4Addr::new(192, 168, 2, i);
             session1.source = SocketAddr::V4(SocketAddrV4::new(src1_new, 8964));
-            let res = strategy_fn(proxies.clone(), &session1).await;
+            let res = strategy_fn.pick(proxies.clone(), &session1).await;
             assert_cache_state!(CACHE_UPDATE);
             let session1_outbound_name_new = res.unwrap().name().to_owned();
 
             // 1.6 cache hit
-            let res = strategy_fn(proxies.clone(), &session1).await;
+            let res = strategy_fn.pick(proxies.clone(), &session1).await;
             assert_eq!(res.unwrap().name(), session1_outbound_name_new);
             assert_cache_state!(CACHE_HIT);
         }
@@ -292,24 +269,24 @@ mod tests {
     async fn test_sticky_session_survives_reorder_and_checks_all_members() {
         let manager = ProxyManager::new(Arc::new(NoopResolver), None);
         let strategy = strategy_sticky_session(manager.clone());
-        let make_proxy = |name: &str| -> AnyOutboundHandler {
-            Arc::new(NoopOutboundHandler {
+        let make_proxy = |name: &str| -> OutboundNode {
+            OutboundNode::protocol(Arc::new(NoopOutboundHandler {
                 name: name.to_owned(),
-            })
+            }))
         };
         let a = make_proxy("a");
         let b = make_proxy("b");
         let sess = Session::default();
 
         assert_eq!(
-            strategy(Arc::new(vec![a.clone()]), &sess)
+            strategy.pick(Arc::new(vec![a.clone()]), &sess)
                 .await
                 .unwrap()
                 .name(),
             "a"
         );
         assert_eq!(
-            strategy(Arc::new(vec![b.clone(), a.clone()]), &sess)
+            strategy.pick(Arc::new(vec![b.clone(), a.clone()]), &sess)
                 .await
                 .unwrap()
                 .name(),
@@ -324,20 +301,20 @@ mod tests {
             members.push(make_proxy(&name));
         }
         members.push(b);
-        assert_eq!(strategy(Arc::new(members), &sess).await.unwrap().name(), "b");
+        assert_eq!(strategy.pick(Arc::new(members), &sess).await.unwrap().name(), "b");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn round_robin_distributes_concurrent_picks_and_handles_resize() {
         let strategy = Arc::new(strategy_rr());
         let proxies = Arc::new((0..4).map(|index| {
-            Arc::new(NoopOutboundHandler { name: index.to_string() }) as AnyOutboundHandler
+            OutboundNode::protocol(Arc::new(NoopOutboundHandler { name: index.to_string() }))
         }).collect::<Vec<_>>());
         let tasks = (0..400).map(|_| {
             let strategy = strategy.clone();
             let proxies = proxies.clone();
             tokio::spawn(async move {
-                strategy(proxies, &Session::default()).await.unwrap()
+                strategy.pick(proxies, &Session::default()).await.unwrap()
                     .name().parse::<usize>().unwrap()
             })
         });
@@ -349,10 +326,10 @@ mod tests {
         let session = Session::default();
         let small = Arc::new(vec![proxies[0].clone(), proxies[1].clone()]);
         // The previous call left index=4: shrinking normalizes to index=0.
-        assert_eq!(strategy(small.clone(), &session).await.unwrap().name(), "0");
-        assert_eq!(strategy(small, &session).await.unwrap().name(), "1");
-        assert!(strategy(Arc::new(Vec::new()), &session).await.is_err());
-        assert_eq!(strategy(proxies, &session).await.unwrap().name(), "2");
+        assert_eq!(strategy.pick(small.clone(), &session).await.unwrap().name(), "0");
+        assert_eq!(strategy.pick(small, &session).await.unwrap().name(), "1");
+        assert!(strategy.pick(Arc::new(Vec::new()), &session).await.is_err());
+        assert_eq!(strategy.pick(proxies, &session).await.unwrap().name(), "2");
     }
 
 }

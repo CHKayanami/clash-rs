@@ -1096,7 +1096,7 @@ async fn establish_outbound_session(
         }
     };
 
-    let effective_proto = if let Some(group) = handler.try_as_group_handler() {
+    let effective_proto = if let Some(group) = handler.as_group() {
         match group.get_active_proxy().await {
             Some(active) => active.proto(),
             None => handler.proto(),
@@ -1650,7 +1650,7 @@ mod tests {
     use crate::app::dns::MockClashResolver;
     use crate::app::outbound::manager::OutboundManager;
     use crate::app::router::Router;
-    use crate::proxy::{AnyOutboundHandler, loadbalance, selector};
+    use crate::proxy::{OutboundNode, loadbalance, selector};
     use crate::proxy::mocks::MockDummyProxyProvider;
     use crate::app::remote_content_manager::ProxyManager;
     use crate::proxy::direct::Handler as DirectHandler;
@@ -1922,7 +1922,7 @@ mod tests {
         }
     }
 
-    fn test_provider(handler: AnyOutboundHandler) -> Arc<MockDummyProxyProvider> {
+    fn test_provider(handler: OutboundNode) -> Arc<MockDummyProxyProvider> {
         let mut provider = MockDummyProxyProvider::new();
         let proxies = Arc::new(vec![handler]);
         provider.expect_proxies().returning(move || proxies.clone());
@@ -1931,8 +1931,8 @@ mod tests {
     }
 
     async fn test_dispatcher(proto: OutboundType) -> Arc<Dispatcher> {
-        let direct_handler: AnyOutboundHandler =
-            Arc::new(DirectHandler::new("DIRECT"));
+        let direct_handler: OutboundNode =
+            OutboundNode::protocol(Arc::new(DirectHandler::new("DIRECT")));
         let mut mock_resolver = MockClashResolver::new();
         mock_resolver.expect_fake_ip_enabled().returning(|| false);
         mock_resolver.expect_is_fake_ip().returning(|_| false);
@@ -1956,17 +1956,17 @@ mod tests {
                     vec![test_provider(direct_handler)],
                     None,
                 ).await;
-                Arc::new(selector::Handler::new(
+                OutboundNode::group(Arc::new(selector::Handler::new(
                     selector::HandlerOptions {
                         name: "outer".into(),
                         udp: true,
                         ..Default::default()
                     },
-                    vec![test_provider(Arc::new(inner))],
+                    vec![test_provider(OutboundNode::group(Arc::new(inner)))],
                     None,
-                ).await) as AnyOutboundHandler
+                ).await))
             }
-            OutboundType::LoadBalance => Arc::new(loadbalance::Handler::new(
+            OutboundType::LoadBalance => OutboundNode::group(Arc::new(loadbalance::Handler::new(
                 loadbalance::HandlerOptions {
                     name: "balance".into(),
                     udp: true,
@@ -1974,7 +1974,7 @@ mod tests {
                 },
                 vec![test_provider(direct_handler)],
                 ProxyManager::new(resolver.clone(), None),
-            )) as AnyOutboundHandler,
+            ))),
             OutboundType::Direct => direct_handler,
             _ => unreachable!(),
         };
@@ -2301,8 +2301,8 @@ mod tests {
             server_addr.port(),
         );
 
-        let direct_handler: AnyOutboundHandler =
-            Arc::new(DirectHandler::new("DIRECT"));
+        let direct_handler: OutboundNode =
+            OutboundNode::protocol(Arc::new(DirectHandler::new("DIRECT")));
         let mut mock_resolver = MockClashResolver::new();
         mock_resolver.expect_fake_ip_enabled().returning(|| true);
         mock_resolver.expect_is_fake_ip().returning(|ip| {

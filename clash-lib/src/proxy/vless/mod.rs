@@ -1,9 +1,12 @@
+#[cfg(all(test, docker_test))]
+use crate::proxy::OutboundNode;
+
 pub(crate) use stream::VlessStream;
 pub(crate) use vision::VisionStream;
 use self::encryption::{EncryptionClient, EncryptionOptions};
 use self::stream::{VLESS_COMMAND_MUX, VLESS_COMMAND_TCP, VLESS_COMMAND_UDP};
 use super::{
-    AnyOutboundDatagram, AnyStream, ConnectorType, DialWithConnector,
+    AnyOutboundDatagram, AnyStream, DialWithConnector,
     HandlerCommonOptions, OutboundHandler, OutboundType, PlainProxyAPIResponse,
     transport::{TransportDialer, TransportLayer, VisionOptions},
     utils::{GLOBAL_DIRECT_CONNECTOR, RemoteConnector},
@@ -11,7 +14,6 @@ use super::{
 use crate::{
     app::dns::ThreadSafeDNSResolver, impl_default_connector, session::Session,
 };
-use async_trait::async_trait;
 use erased_serde::Serialize as ErasedSerialize;
 use std::{collections::HashMap, io, sync::{Arc, atomic::AtomicBool}};
 use tracing::debug;
@@ -47,7 +49,7 @@ pub struct HandlerOptions {
 
 pub struct Handler {
     opts: HandlerOptions,
-    connector: Option<Arc<dyn RemoteConnector>>,
+    connector: Option<Arc<RemoteConnector>>,
     mux_pool: Option<Arc<H2MuxPool>>,
     xudp_pool: Arc<xudp::XudpPool>,
     encryption: Option<Arc<EncryptionClient>>,
@@ -100,7 +102,7 @@ impl Handler {
         &self,
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
-        connector: &dyn RemoteConnector,
+        connector: &RemoteConnector,
     ) -> io::Result<AnyStream> {
         let carrier_sess = carrier_session(sess);
         self.dial_proxy_stream(&carrier_sess, VLESS_COMMAND_TCP, resolver, connector)
@@ -109,7 +111,7 @@ impl Handler {
 
     pub fn new(
         opts: HandlerOptions,
-        connector: Option<Arc<dyn RemoteConnector>>,
+        connector: Option<Arc<RemoteConnector>>,
     ) -> Self {
         let mux_pool = opts
             .smux
@@ -131,7 +133,7 @@ impl Handler {
 
     async fn dial_proxy_stream(
         &self, sess: &Session, command: u8,
-        resolver: ThreadSafeDNSResolver, connector: &dyn RemoteConnector,
+        resolver: ThreadSafeDNSResolver, connector: &RemoteConnector,
     ) -> io::Result<AnyStream> {
         if let Some(TransportLayer::XHttp(client)) = &self.opts.transport {
             let dialer = TransportDialer {
@@ -219,7 +221,6 @@ impl Handler {
     }
 }
 
-#[async_trait]
 impl OutboundHandler for Handler {
     fn name(&self) -> &str {
         &self.opts.name
@@ -233,7 +234,7 @@ impl OutboundHandler for Handler {
         OutboundType::Vless
     }
 
-    async fn support_udp(&self) -> bool {
+    fn support_udp(&self) -> bool {
         self.opts.udp
             || self.mux_pool.as_ref().is_some_and(|pool| pool.supports_udp())
     }
@@ -276,15 +277,11 @@ impl OutboundHandler for Handler {
         }
     }
 
-    async fn support_connector(&self) -> ConnectorType {
-        ConnectorType::All
-    }
-
     async fn connect_stream_with_connector(
         &self,
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
-        connector: &dyn RemoteConnector,
+        connector: &RemoteConnector,
     ) -> io::Result<AnyStream> {
         if let Some(mux) = &self.mux_pool {
             let dialer = || self.dial_mux_carrier(sess, resolver.clone(), connector);
@@ -302,7 +299,7 @@ impl OutboundHandler for Handler {
         &self,
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
-        connector: &dyn RemoteConnector,
+        connector: &RemoteConnector,
     ) -> io::Result<AnyOutboundDatagram> {
         if let Some(mux) = self.mux_pool.as_ref().filter(|pool| pool.supports_udp()) {
             let dialer = || self.dial_mux_carrier(sess, resolver.clone(), connector);
@@ -322,12 +319,8 @@ impl OutboundHandler for Handler {
         Ok(AnyOutboundDatagram::new(child_dgram))
     }
 
-    fn try_as_plain_handler(&self) -> Option<&dyn PlainProxyAPIResponse> {
-        Some(self as _)
-    }
 }
 
-#[async_trait]
 impl PlainProxyAPIResponse for Handler {
     async fn as_map(&self) -> HashMap<String, Box<dyn ErasedSerialize + Send>> {
         let mut m = HashMap::new();
@@ -500,7 +493,7 @@ mod tests {
         };
         let handler = Arc::new(Handler::new(opts, None));
 
-        run_test_suites_and_cleanup(handler, runner, Suite::all()).await
+        run_test_suites_and_cleanup(OutboundNode::protocol(handler), runner, Suite::all()).await
     }
 }
 

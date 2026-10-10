@@ -3,13 +3,13 @@ use std::sync::Arc;
 use tokio::time::Instant;
 use tracing::debug;
 
-use crate::proxy::AnyOutboundHandler;
+use crate::proxy::OutboundNode;
 
 use super::ProxyManager;
 
 struct HealthCheckInner {
     last_check: Instant,
-    proxies: Vec<AnyOutboundHandler>,
+    proxies: Vec<OutboundNode>,
     task_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
@@ -32,7 +32,7 @@ pub struct HealthCheck {
 
 impl HealthCheck {
     pub fn new(
-        proxies: Vec<AnyOutboundHandler>,
+        proxies: Vec<OutboundNode>,
         url: String,
         interval: u64,
         lazy: bool,
@@ -109,7 +109,7 @@ impl HealthCheck {
         self.proxy_manager.check(&proxies, &self.url, None).await;
     }
 
-    pub async fn update(&self, proxies: Vec<AnyOutboundHandler>) {
+    pub async fn update(&self, proxies: Vec<OutboundNode>) {
         self.inner.write().proxies = proxies;
     }
 

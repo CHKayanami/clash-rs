@@ -20,14 +20,14 @@ use crate::{
     app::profile::ThreadSafeCacheFile,
     dns::{RuleDispatch, filters::PendingMmdb},
     print_and_exit,
-    proxy::utils::OutboundHandlerRegistry,
+    proxy::utils::OutboundNodeRegistry,
 };
 
 pub async fn new(
     mut cfg: Config,
     store: Option<ThreadSafeCacheFile>,
     mmdb: Option<PendingMmdb>,
-    outbounds: OutboundHandlerRegistry,
+    outbounds: OutboundNodeRegistry,
     rule_dispatch: Option<Arc<RuleDispatch>>,
     collector: Option<super::ThreadSafeDnsCollector>,
 ) -> ThreadSafeDNSResolver {

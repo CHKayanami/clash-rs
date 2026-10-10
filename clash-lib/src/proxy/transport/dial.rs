@@ -33,7 +33,7 @@ pub(crate) struct TransportDialer<'a> {
     pub(crate) session: &'a Session,
     pub(crate) tls: Option<&'a TransportLayer>,
     pub(crate) resolver: ThreadSafeDNSResolver,
-    pub(crate) connector: &'a dyn RemoteConnector,
+    pub(crate) connector: &'a RemoteConnector,
 }
 
 impl TransportDialer<'_> {
@@ -44,9 +44,8 @@ impl TransportDialer<'_> {
     pub(crate) fn endpoint_factory(
         &self, server: &str, port: u16, security: Option<TransportSecurity>,
     ) -> io::Result<ConnectionFactory> {
-        let connector = self.connector.clone_connector().ok_or_else(|| io::Error::new(
-            io::ErrorKind::Unsupported, "XHTTP requires a shareable remote connector"))?;
-        let key = format!("{}:{:p}:{:?}:{:?}:{server:?}:{port}:{}", self.connector.pool_key(),
+        let connector = self.connector.clone_connector();
+        let key = format!("{}:{}:{:p}:{:?}:{:?}:{server:?}:{port}:{}", connector.pool_key(), connector.pool_context(),
             Arc::as_ptr(&self.resolver), self.session.iface, self.session.so_mark, self.common.tfo);
         let resolver = self.resolver.clone();
         let server = server.to_owned();
@@ -81,7 +80,7 @@ mod tests {
     use std::sync::Arc;
     use crate::{
         app::dns::MockClashResolver,
-        proxy::{HandlerCommonOptions, utils::DirectConnector},
+        proxy::{HandlerCommonOptions, utils::RemoteConnector},
         session::Session,
     };
 
@@ -89,7 +88,7 @@ mod tests {
     fn xhttp_endpoint_pool_keys_isolate_servers_and_ports() {
         let common = HandlerCommonOptions::default();
         let session = Session::default();
-        let connector = DirectConnector::new();
+        let connector = RemoteConnector::Direct;
         let dialer = TransportDialer {
             server: "upload.example", port: 443, common: &common,
             session: &session, tls: None,

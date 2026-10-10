@@ -1,3 +1,6 @@
+#[cfg(all(test, docker_test))]
+use crate::proxy::OutboundNode;
+
 pub(crate) use datagram::{OutboundDatagramShadowsocks, ShadowsocksUdpIo};
 pub(crate) use stream::ShadowSocksStream;
 mod datagram;
@@ -7,8 +10,9 @@ mod udp_replay;
 use crate::{
     app::dns::ThreadSafeDNSResolver,
     common::errors::new_io_error,
+    impl_default_connector,
     proxy::{
-        AnyOutboundDatagram, AnyStream, ConnectorType, DialWithConnector,
+        AnyOutboundDatagram, AnyStream, DialWithConnector,
         HandlerCommonOptions, OutboundHandler, OutboundType,
         PlainProxyAPIResponse, shadowsocks::map_cipher,
         transport::TransportLayer,
@@ -16,7 +20,6 @@ use crate::{
     },
     session::{Session, SocksAddr},
 };
-use async_trait::async_trait;
 use erased_serde::Serialize as ErasedSerialize;
 use shadowsocks::{
     relay::Address,
@@ -47,19 +50,14 @@ pub struct HandlerOptions {
 pub struct Handler {
     opts: HandlerOptions,
     ctx: Arc<shadowsocks::context::Context>,
-    connector: Option<Arc<dyn RemoteConnector>>,
+    connector: Option<Arc<RemoteConnector>>,
     /// Built lazily and reused: `ServerConfig::new` re-derives the key from the
     /// password, and this used to run on every single connection.
     cfg: std::sync::OnceLock<ServerConfig>,
     mux_pool: Option<Arc<H2MuxPool>>,
 }
 
-#[async_trait]
-impl DialWithConnector for Handler {
-    fn support_dialer(&self) -> Option<&str> {
-        self.opts.common_opts.connector.as_deref()
-    }
-}
+impl_default_connector!(Handler);
 
 impl Debug for Handler {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -74,7 +72,7 @@ impl Handler {
         &self,
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
-        connector: &dyn RemoteConnector,
+        connector: &RemoteConnector,
     ) -> io::Result<AnyStream> {
         let stream = connector
             .connect_stream(
@@ -92,7 +90,7 @@ impl Handler {
             .await
     }
 
-    pub fn new(opts: HandlerOptions, connector: Option<Arc<dyn RemoteConnector>>) -> Self {
+    pub fn new(opts: HandlerOptions, connector: Option<Arc<RemoteConnector>>) -> Self {
         let mux_pool = opts
             .smux
             .as_ref()
@@ -188,7 +186,6 @@ impl Handler {
     }
 }
 
-#[async_trait]
 impl OutboundHandler for Handler {
     fn name(&self) -> &str {
         self.opts.name.as_str()
@@ -202,7 +199,7 @@ impl OutboundHandler for Handler {
         OutboundType::Shadowsocks
     }
 
-    async fn support_udp(&self) -> bool {
+    fn support_udp(&self) -> bool {
         self.opts.udp || self.opts.uot
             || self.mux_pool.as_ref().is_some_and(|pool| pool.supports_udp())
     }
@@ -249,15 +246,11 @@ impl OutboundHandler for Handler {
         }
     }
 
-    async fn support_connector(&self) -> ConnectorType {
-        ConnectorType::All
-    }
-
     async fn connect_stream_with_connector(
         &self,
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
-        connector: &dyn RemoteConnector,
+        connector: &RemoteConnector,
     ) -> io::Result<AnyStream> {
         if let Some(mux) = &self.mux_pool {
             let dialer = || self.dial_mux_carrier(sess, resolver.clone(), connector);
@@ -287,7 +280,7 @@ impl OutboundHandler for Handler {
         &self,
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
-        connector: &dyn RemoteConnector,
+        connector: &RemoteConnector,
     ) -> io::Result<AnyOutboundDatagram> {
         if let Some(mux) = self.mux_pool.as_ref().filter(|pool| pool.supports_udp()) {
             let dialer = || self.dial_mux_carrier(sess, resolver.clone(), connector);
@@ -378,12 +371,8 @@ impl OutboundHandler for Handler {
         Ok(AnyOutboundDatagram::new(d))
     }
 
-    fn try_as_plain_handler(&self) -> Option<&dyn PlainProxyAPIResponse> {
-        Some(self as _)
-    }
 }
 
-#[async_trait]
 impl PlainProxyAPIResponse for Handler {
     async fn as_map(&self) -> HashMap<String, Box<dyn ErasedSerialize + Send>> {
         let mut m = HashMap::new();
@@ -498,7 +487,7 @@ mod tests {
             opts,
             Some(GLOBAL_DIRECT_CONNECTOR.clone()),
         ));
-        run_test_suites_and_cleanup(handler, container, Suite::all()).await
+        run_test_suites_and_cleanup(OutboundNode::protocol(handler), container, Suite::all()).await
     }
 
     async fn get_shadowtls_runner(
@@ -564,7 +553,7 @@ mod tests {
             udp: false,
             uot: false,
         };
-        let handler: Arc<dyn OutboundHandler> = Arc::new(Handler::new(opts, None));
+        let handler: Arc<Handler> = Arc::new(Handler::new(opts, None));
         // we need to store all the runners in a container, to make sure all of
         // them can be destroyed after the test
         let mut chained = MultiDockerTestRunner::default();
@@ -572,7 +561,7 @@ mod tests {
         chained.add_with_runner(container2);
         // currently, shadow-tls does't support udp proxy
         // see: https://github.com/ihciah/shadow-tls/issues/54
-        run_test_suites_and_cleanup(handler, chained, Suite::tcp_tests()).await
+        run_test_suites_and_cleanup(OutboundNode::protocol(handler), chained, Suite::tcp_tests()).await
     }
 
     async fn get_obfs_runner(
@@ -636,11 +625,11 @@ mod tests {
             uot: false,
         };
 
-        let handler: Arc<dyn OutboundHandler> = Arc::new(Handler::new(opts, None));
+        let handler: Arc<Handler> = Arc::new(Handler::new(opts, None));
         let mut chained = MultiDockerTestRunner::default();
         chained.add_with_runner(container1);
         chained.add_with_runner(container2);
-        run_test_suites_and_cleanup(handler, chained, Suite::tcp_tests()).await
+        run_test_suites_and_cleanup(OutboundNode::protocol(handler), chained, Suite::tcp_tests()).await
     }
 
     #[tokio::test]
@@ -682,8 +671,8 @@ mod tests {
             uot: false,
         };
 
-        let handler: Arc<dyn OutboundHandler> = Arc::new(Handler::new(opts, None));
-        run_test_suites_and_cleanup(handler, container, Suite::tcp_tests()).await
+        let handler: Arc<Handler> = Arc::new(Handler::new(opts, None));
+        run_test_suites_and_cleanup(OutboundNode::protocol(handler), container, Suite::tcp_tests()).await
     }
 
     #[tokio::test]
@@ -703,7 +692,7 @@ mod tests {
         assert!(ss_config.udp_over_tcp);
 
         let handler = Handler::try_from(ss_config).expect("failed to convert handler");
-        assert!(handler.support_udp().await);
+        assert!(handler.support_udp());
         assert!(handler.opts.uot);
     }
 }

@@ -23,7 +23,7 @@ impl TryFrom<OutboundAnytls> for Handler {
 
 pub fn build_handler(
     s: &OutboundAnytls,
-    connector: Option<Arc<dyn RemoteConnector>>,
+    connector: Option<Arc<RemoteConnector>>,
 ) -> Result<Handler, crate::Error> {
     let skip_cert_verify = s.skip_cert_verify.unwrap_or_default();
     if skip_cert_verify {

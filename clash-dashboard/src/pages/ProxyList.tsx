@@ -10,7 +10,7 @@ import type { Proxy, ProxyProvider } from '../lib/api';
 const TEST_URL = 'http://www.gstatic.com/generate_204';
 const TEST_TIMEOUT = 5000;
 
-const GROUP_TYPES = ['Selector', 'URLTest', 'Fallback', 'LoadBalance', 'Relay'];
+const GROUP_TYPES = ['Selector', 'URLTest', 'Fallback', 'LoadBalance', 'Smart'];
 
 function getLastDelay(history: Proxy['history']): number | undefined {
   if (!history || history.length === 0) return undefined;

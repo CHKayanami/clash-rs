@@ -18,6 +18,8 @@ pub use stream::handle_tcp;
 use tracing::{debug, warn};
 
 use crate::common::errors::new_io_error;
+pub(crate) use datagram::Socks5UDPCodec;
+#[cfg(test)]
 pub(crate) use datagram::Socks5UdpFramed;
 
 pub struct SocksInbound {

@@ -4,12 +4,12 @@ use arc_swap::ArcSwapOption;
 
 use crate::{
     app::remote_content_manager::providers::proxy_provider::ArcProxyProvider,
-    proxy::AnyOutboundHandler,
+    proxy::OutboundNode,
 };
 
 struct AggregatedSnapshot {
-    sub_snapshots: Vec<Arc<Vec<AnyOutboundHandler>>>,
-    merged: Arc<Vec<AnyOutboundHandler>>,
+    sub_snapshots: Vec<Arc<Vec<OutboundNode>>>,
+    merged: Arc<Vec<OutboundNode>>,
 }
 
 #[derive(Clone)]
@@ -26,7 +26,7 @@ impl Providers {
         }
     }
 
-    pub fn get_proxies(&self, touch: bool) -> Arc<Vec<AnyOutboundHandler>> {
+    pub fn get_proxies(&self, touch: bool) -> Arc<Vec<OutboundNode>> {
         if self.providers.is_empty() {
             return Arc::new(Vec::new());
         }
@@ -41,7 +41,7 @@ impl Providers {
             return self.providers[0].proxies();
         }
 
-        let current_sub_snapshots: Vec<Arc<Vec<AnyOutboundHandler>>> =
+        let current_sub_snapshots: Vec<Arc<Vec<OutboundNode>>> =
             self.providers.iter().map(|p| p.proxies()).collect();
 
         let cached_guard = self.cached_merged.load();
@@ -89,11 +89,11 @@ mod tests {
 
         let mut h1 = MockDummyOutboundHandler::new();
         h1.expect_name().return_const("p1-node1".to_owned());
-        let h1: AnyOutboundHandler = Arc::new(h1);
+        let h1: OutboundNode = OutboundNode::protocol(Arc::new(h1));
 
         let mut h2 = MockDummyOutboundHandler::new();
         h2.expect_name().return_const("p2-node1".to_owned());
-        let h2: AnyOutboundHandler = Arc::new(h2);
+        let h2: OutboundNode = OutboundNode::protocol(Arc::new(h2));
 
         let snap1 = Arc::new(vec![h1.clone()]);
         let snap2 = Arc::new(vec![h2.clone()]);

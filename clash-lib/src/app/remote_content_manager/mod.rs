@@ -1,3 +1,4 @@
+use std::pin::pin;
 use super::dns::ThreadSafeDNSResolver;
 use crate::{
     app::net::get_default_outbound_interface_cloned,
@@ -7,7 +8,7 @@ use crate::{
         tls::GLOBAL_ROOT_STORE,
         utils::serialize_duration,
     },
-    proxy::AnyOutboundHandler,
+    proxy::OutboundNode,
     session::Session,
 };
 use anyhow::Context;
@@ -133,7 +134,7 @@ impl ProxyManager {
     #[instrument(skip(self))]
     pub async fn check(
         &self,
-        outbounds: &Vec<AnyOutboundHandler>,
+        outbounds: &Vec<OutboundNode>,
         url: &str,
         timeout: Option<Duration>,
     ) -> Vec<std::io::Result<(Duration, Duration)>> {
@@ -720,7 +721,7 @@ impl ProxyManager {
     /// overall_round_trip_time_including_tls_handshake)
     pub async fn url_test(
         &self,
-        outbound: AnyOutboundHandler,
+        outbound: OutboundNode,
         url: &str,
         timeout: Option<Duration>,
     ) -> std::io::Result<(Duration, Duration)> {
@@ -766,7 +767,7 @@ impl ProxyManager {
 
             let (stream, connect_delay) = tokio::time::timeout(
                 timeout,
-                TimedFuture::new(outbound.connect_stream(&sess, dns_resolver)),
+                TimedFuture::new(pin!(outbound.connect_stream(&sess, dns_resolver))),
             )
             .await
             .context("URL test timeout")
@@ -1037,7 +1038,7 @@ impl ProxyManager {
 
 #[cfg(test)]
 mod tests {
-    use crate::proxy::AnyStream;
+    use crate::proxy::{OutboundNode, AnyStream};
     use crate::{
         app::{dns::MockClashResolver, remote_content_manager},
         config::internal::proxy::PROXY_DIRECT,
@@ -1071,7 +1072,7 @@ mod tests {
         let mock_handler = Arc::new(direct::Handler::new(PROXY_DIRECT));
 
         manager
-            .url_test(mock_handler.clone(), &url, None)
+            .url_test(OutboundNode::protocol(mock_handler.clone()), &url, None)
             .await
             .expect("test failed");
 
@@ -1089,7 +1090,7 @@ mod tests {
 
         for _ in 0..10 {
             manager
-                .url_test(mock_handler.clone(), &url, None)
+                .url_test(OutboundNode::protocol(mock_handler.clone()), &url, None)
                 .await
                 .expect("test failed");
         }
@@ -1133,7 +1134,7 @@ mod tests {
 
         let result = manager
             .url_test(
-                mock_handler.clone(),
+                OutboundNode::protocol(mock_handler.clone()),
                 "http://www.gstatic.com/generate_204",
                 Some(Duration::from_secs(3)),
             )

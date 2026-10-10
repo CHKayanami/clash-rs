@@ -4,7 +4,7 @@ use erased_serde::Serialize;
 use mockall::mock;
 
 use super::{
-    AnyOutboundDatagram, AnyOutboundHandler, AnyStream, DialWithConnector,
+    AnyOutboundDatagram, OutboundNode, AnyStream, DialWithConnector,
     OutboundHandler, OutboundType,
 };
 use crate::{
@@ -35,7 +35,7 @@ mock! {
 
     #[async_trait::async_trait]
     impl ProxyProvider for DummyProxyProvider {
-        fn proxies(&self) -> std::sync::Arc<Vec<AnyOutboundHandler>>;
+        fn proxies(&self) -> std::sync::Arc<Vec<OutboundNode>>;
         fn touch(&self);
         async fn healthcheck(&self);
     }
@@ -45,8 +45,7 @@ mock! {
     #[derive(Debug)]
     pub DummyOutboundHandler {}
 
-    #[async_trait::async_trait]
-    impl OutboundHandler for DummyOutboundHandler {
+        impl OutboundHandler for DummyOutboundHandler {
         /// The name of the outbound handler
         fn name(&self) -> &str;
 
@@ -55,7 +54,7 @@ mock! {
         fn proto(&self) -> OutboundType;
 
         /// whether the outbound handler support UDP
-        async fn support_udp(&self) -> bool;
+        fn support_udp(&self) -> bool;
 
         /// connect to remote target via TCP
         async fn connect_stream(
@@ -64,7 +63,6 @@ mock! {
             resolver: ThreadSafeDNSResolver,
         ) -> io::Result<AnyStream>;
 
-
         /// connect to remote target via UDP
         async fn connect_datagram(
             &self,
@@ -72,8 +70,6 @@ mock! {
             resolver: ThreadSafeDNSResolver,
         ) -> io::Result<AnyOutboundDatagram>;
 
-        /// relay related
-        async fn support_connector(&self) -> crate::proxy::ConnectorType;
     }
 
     impl DialWithConnector for DummyOutboundHandler {}

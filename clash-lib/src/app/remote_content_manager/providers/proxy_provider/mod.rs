@@ -11,14 +11,14 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use crate::{
-    app::remote_content_manager::providers::Provider, proxy::AnyOutboundHandler,
+    app::remote_content_manager::providers::Provider, proxy::OutboundNode,
 };
 
 pub type ArcProxyProvider = Arc<dyn ProxyProvider + Send + Sync>;
 
 #[async_trait]
 pub trait ProxyProvider: Provider {
-    fn proxies(&self) -> Arc<Vec<AnyOutboundHandler>>;
+    fn proxies(&self) -> Arc<Vec<OutboundNode>>;
     fn touch(&self);
     /// this is a blocking call, you may want to spawn a new task to run this
     async fn healthcheck(&self);

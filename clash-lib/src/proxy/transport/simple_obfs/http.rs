@@ -1,4 +1,3 @@
-use async_trait::async_trait;
 use base64::Engine;
 use bytes::{BufMut, BytesMut};
 use std::{
@@ -21,7 +20,6 @@ impl Client {
     }
 }
 
-#[async_trait]
 impl Transport for Client {
     async fn proxy_stream(&self, stream: AnyStream) -> std::io::Result<AnyStream> {
         Ok(HTTPObfs::new(stream, self.host.clone(), self.port).into())

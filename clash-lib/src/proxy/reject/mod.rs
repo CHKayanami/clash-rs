@@ -4,12 +4,11 @@ use crate::{
     proxy::{AnyOutboundDatagram, AnyStream, OutboundHandler},
     session::Session,
 };
-use async_trait::async_trait;
 use erased_serde::Serialize as ErasedSerialize;
 use serde::Serialize;
 use std::{collections::HashMap, io};
 
-use super::{ConnectorType, DialWithConnector, OutboundType, PlainProxyAPIResponse};
+use super::{DialWithConnector, OutboundType, PlainProxyAPIResponse};
 
 #[derive(Serialize)]
 pub struct Handler {
@@ -32,7 +31,6 @@ impl Handler {
 
 impl DialWithConnector for Handler {}
 
-#[async_trait]
 impl OutboundHandler for Handler {
     fn name(&self) -> &str {
         PROXY_REJECT
@@ -42,7 +40,7 @@ impl OutboundHandler for Handler {
         OutboundType::Reject
     }
 
-    async fn support_udp(&self) -> bool {
+    fn support_udp(&self) -> bool {
         false
     }
 
@@ -62,16 +60,10 @@ impl OutboundHandler for Handler {
         Err(io::Error::other("REJECT"))
     }
 
-    async fn support_connector(&self) -> ConnectorType {
-        ConnectorType::All
-    }
 
-    fn try_as_plain_handler(&self) -> Option<&dyn PlainProxyAPIResponse> {
-        Some(self as _)
-    }
+
 }
 
-#[async_trait]
 impl PlainProxyAPIResponse for Handler {
     async fn as_map(&self) -> HashMap<String, Box<dyn ErasedSerialize + Send>> {
         HashMap::new()

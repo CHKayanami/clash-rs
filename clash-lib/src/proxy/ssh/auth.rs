@@ -1,6 +1,5 @@
-use std::{collections::HashSet, io, ops::Deref, sync::Arc};
+use std::{collections::{HashMap, HashSet}, io, ops::Deref, sync::Arc};
 
-use async_trait::async_trait;
 use russh::{
     MethodKind,
     client::{AuthResult, Handle, Prompt},
@@ -63,17 +62,18 @@ pub async fn authenticate(
     client: &mut Handle<Client>,
     opts: &HandlerOptions,
 ) -> core::result::Result<AuthResult, russh::Error> {
-    let mut auth: &dyn Auth = &NoneAuth;
+    let none = Auth::None(NoneAuth);
+    let mut auth = &none;
     let mut tried: HashSet<MethodKindAdapter> = HashSet::new();
 
     let mut config_auth = Vec::with_capacity(3);
     if let Some(password) = opts.password.clone() {
-        config_auth.push(Box::new(PasswordAuth { password }) as Box<dyn Auth>);
+        config_auth.push(Auth::Password(PasswordAuth { password }));
     }
     match load_private_key(opts) {
         Ok(private_key) => {
             config_auth
-                .push(Box::new(PublicKeyAuth { private_key }) as Box<dyn Auth>);
+                .push(Auth::PublicKey(PublicKeyAuth { private_key }));
         }
         Err(e) => {
             tracing::warn!("load private key failed: {:?}", e);
@@ -106,15 +106,15 @@ pub async fn authenticate(
             vec![]
         }
     };
-    config_auth.push(Box::new(KeyboardInteractiveAuth {
+    config_auth.push(Auth::KeyboardInteractive(KeyboardInteractiveAuth {
         handler: prompt_handler,
         mac_retry: 5,
-    }) as Box<dyn Auth>);
+    }));
 
     let config_auth = config_auth
         .into_iter()
         .map(|auth| (auth.method().into(), auth))
-        .collect::<std::collections::HashMap<MethodKindAdapter, _>>();
+        .collect::<HashMap<MethodKindAdapter, _>>();
 
     #[allow(unused_assignments)]
     let mut remaining_methods: Vec<MethodKindAdapter> = vec![];
@@ -151,7 +151,7 @@ pub async fn authenticate(
             }
 
             if let Some(a) = config_auth.get(remaining_method) {
-                auth = a.as_ref();
+                auth = a;
                 find = true;
                 break 'outer;
             }
@@ -162,22 +162,38 @@ pub async fn authenticate(
     }
 }
 
-#[async_trait]
-trait Auth: Send + Sync {
-    fn method(&self) -> russh::MethodKind;
+enum Auth<T> {
+    None(NoneAuth),
+    Password(PasswordAuth),
+    PublicKey(PublicKeyAuth),
+    KeyboardInteractive(KeyboardInteractiveAuth<T>),
+}
 
-    /// return (AuthResult, can skip)
-    async fn auth(
-        &self,
-        client: &mut Handle<Client>,
-        username: &str,
-    ) -> core::result::Result<AuthResult, russh::Error>;
+impl<T> Auth<T>
+where T: Sync + Send + Fn(String, String, Vec<Prompt>, &str) -> Vec<String>,
+{
+    fn method(&self) -> MethodKind {
+        match self {
+            Self::None(auth) => auth.method(),
+            Self::Password(auth) => auth.method(),
+            Self::PublicKey(auth) => auth.method(),
+            Self::KeyboardInteractive(auth) => auth.method(),
+        }
+    }
+    async fn auth(&self, client: &mut Handle<Client>, username: &str)
+        -> Result<AuthResult, russh::Error> {
+        match self {
+            Self::None(auth) => auth.auth(client, username).await,
+            Self::Password(auth) => auth.auth(client, username).await,
+            Self::PublicKey(auth) => auth.auth(client, username).await,
+            Self::KeyboardInteractive(auth) => auth.auth(client, username).await,
+        }
+    }
 }
 
 struct NoneAuth;
 
-#[async_trait]
-impl Auth for NoneAuth {
+impl NoneAuth {
     fn method(&self) -> russh::MethodKind {
         russh::MethodKind::None
     }
@@ -195,8 +211,7 @@ struct PasswordAuth {
     password: String,
 }
 
-#[async_trait]
-impl Auth for PasswordAuth {
+impl PasswordAuth {
     fn method(&self) -> russh::MethodKind {
         russh::MethodKind::Password
     }
@@ -214,8 +229,7 @@ struct PublicKeyAuth {
     private_key: PrivateKey,
 }
 
-#[async_trait]
-impl Auth for PublicKeyAuth {
+impl PublicKeyAuth {
     fn method(&self) -> russh::MethodKind {
         russh::MethodKind::PublicKey
     }
@@ -271,8 +285,7 @@ struct KeyboardInteractiveAuth<T> {
 
 // (name, instruction, prompts) -> response
 
-#[async_trait]
-impl<T> Auth for KeyboardInteractiveAuth<T>
+impl<T> KeyboardInteractiveAuth<T>
 where
     T: Sync + Send + Fn(String, String, Vec<Prompt>, &str) -> Vec<String>,
 {

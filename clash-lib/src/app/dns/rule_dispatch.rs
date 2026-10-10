@@ -3,7 +3,7 @@ use std::sync::{Arc, OnceLock, Weak};
 
 use crate::app::dns::endpoint::DnsEndpoint;
 use crate::app::{outbound::manager::OutboundManager, router::Router};
-use crate::proxy::AnyOutboundHandler;
+use crate::proxy::OutboundNode;
 use crate::session::{Network, Session, SocksAddr, Type};
 
 /// Late-bound reference to `Router`. Populated by `lib.rs` after the router
@@ -41,7 +41,7 @@ impl RuleDispatch {
         &self,
         endpoint: &DnsEndpoint,
         network: Network,
-    ) -> Option<AnyOutboundHandler> {
+    ) -> Option<OutboundNode> {
         let router = self.router.get()?.upgrade()?;
         let outbound_manager = self.outbound_manager.get()?.upgrade()?;
 

@@ -1,5 +1,5 @@
 use arc_swap::ArcSwap;
-use crate::proxy::AnyOutboundHandler;
+use crate::proxy::OutboundNode;
 use bytes::Bytes;
 use crate::app::dns::query::IngressProfile;
 use std::collections::{HashMap, HashSet};
@@ -25,7 +25,7 @@ use crate::app::dns::response::{
 use crate::app::dns::wire::{extract_ips_from_dns_response, skip_dns_name};
 use crate::config::def::{Dns2Config, Dns2StringOrList, Dns2UpstreamDef};
 use crate::proxy::socks::outbound::{Handler, HandlerOptions};
-use crate::proxy::utils::OutboundHandlerRegistry;
+use crate::proxy::utils::OutboundNodeRegistry;
 
 struct TestServer {
     ns: NameServer,
@@ -216,12 +216,12 @@ async fn independent_proxy_nameserver_resolves_node_domain() {
     let mut cfg = RouterConfig::default();
     cfg.proxy_server_nameserver.push(server.ns.clone());
     // No remote upstream contains this nameserver; fallback rejects everything.
-    let outbounds: OutboundHandlerRegistry = Arc::new(ArcSwap::from_pointee(HashMap::new()));
-    let mut handlers: HashMap<String, AnyOutboundHandler> = HashMap::new();
-    handlers.insert("node".into(), Arc::new(Handler::new(HandlerOptions {
+    let outbounds: OutboundNodeRegistry = Arc::new(ArcSwap::from_pointee(HashMap::new()));
+    let mut handlers: HashMap<String, OutboundNode> = HashMap::new();
+    handlers.insert("node".into(), OutboundNode::protocol(Arc::new(Handler::new(HandlerOptions {
         name: "node".into(), server: "example.test".into(), port: 1080,
         ..Default::default()
-    }, None)));
+    }, None))));
     outbounds.store(Arc::new(handlers));
     let resolver = RouterResolver::new(cfg, None, None, outbounds, None).await.unwrap();
     assert_eq!(resolver.resolve("example.test", false).await.unwrap(), Some("192.0.2.2".parse().unwrap()));

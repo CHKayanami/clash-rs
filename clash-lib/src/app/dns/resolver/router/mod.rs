@@ -42,7 +42,7 @@ use crate::app::profile::ThreadSafeCacheFile;
 use crate::app::router::Router;
 use crate::app::dns::domain::{DomainMatcher, proxy_server_domain_matcher};
 use crate::config::def::FakeIpFilterMode;
-use crate::proxy::utils::OutboundHandlerRegistry;
+use crate::proxy::utils::OutboundNodeRegistry;
 
 use self::config::{
     RejectCode, RequestAction, ResponseAction, RouterConfig, UpstreamType,
@@ -76,7 +76,7 @@ impl RouterResolver {
         cfg: RouterConfig,
         fw_mark: Option<u32>,
         store: Option<ThreadSafeCacheFile>,
-        outbounds: OutboundHandlerRegistry,
+        outbounds: OutboundNodeRegistry,
         collector: Option<ThreadSafeDnsCollector>,
     ) -> Result<Self, Error> {
         cfg.validate()?;

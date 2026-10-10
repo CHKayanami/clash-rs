@@ -1,3 +1,4 @@
+#![recursion_limit = "256"]
 #![feature(ip)]
 #![feature(duration_millis_float)]
 
@@ -50,6 +51,10 @@ mod proxy;
 mod runner;
 mod reload;
 mod session;
+
+#[cfg(feature = "allocation-tests")]
+#[path = "proxy/dispatch_measurement.rs"]
+pub mod dispatch_measurement;
 
 use crate::common::{geodata, mmdb::MmdbLookup};
 pub use config::{
@@ -629,6 +634,8 @@ async fn create_components(
 
     debug!("initializing bootstrap outbounds");
 
+    let outbound_registry = Arc::new(ArcSwap::from_pointee(HashMap::new()));
+
     let plain_outbounds = OutboundManager::load_plain_outbounds(
         config
             .proxies
@@ -638,13 +645,11 @@ async fn create_components(
                 _ => None,
             })
             .collect(),
+        &outbound_registry,
     )?;
 
-    let outbound_registry = Arc::new(ArcSwap::from_pointee(
-        plain_outbounds
-            .iter()
-            .map(|x| (x.name().to_string(), x.clone()))
-            .collect(),
+    outbound_registry.store(Arc::new(
+        plain_outbounds.iter().map(|x| (x.name().to_string(), x.clone())).collect(),
     ));
 
     let client =

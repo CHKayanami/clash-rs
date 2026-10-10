@@ -1,6 +1,9 @@
 #[cfg(test)]
 use arc_swap::ArcSwap;
-use super::utils::proxy_groups_dag_sort;
+use super::{
+    dependencies::{validate, validate_plain},
+    utils::proxy_groups_dag_sort,
+};
 #[cfg(feature = "shadowquic")]
 use crate::proxy::shadowquic;
 #[cfg(feature = "shadowsocks")]
@@ -39,17 +42,16 @@ use crate::{
     },
     print_and_exit,
     proxy::{
-        AnyOutboundHandler, OutboundType, anytls,
+        OutboundNode, OutboundType, anytls,
         direct::{self},
         fallback,
         group::smart,
         converters::http::build_handler as build_http_handler,
-        hysteria2, loadbalance, reject, relay,
+        hysteria2, loadbalance, reject,
         selector::{self, ThreadSafeSelectorControl},
         socks, trojan, urltest,
         utils::{
-            DirectConnector, OutboundHandlerRegistry, ProxyConnector,
-            RemoteConnector,
+            DialerProxyConnector, OutboundNodeRegistry, ProviderRegistry, RemoteConnector,
         },
         vless, vmess,
     },
@@ -58,7 +60,7 @@ use anyhow::Result;
 use erased_serde::Serialize;
 use hyper::Uri;
 use fancy_regex::Regex;
-use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Duration};
+use std::{collections::{HashMap, HashSet}, path::PathBuf, sync::Arc, time::Duration};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
@@ -68,7 +70,7 @@ pub struct OutboundManager {
     /// Shared registry used by both OutboundManager lookups and the DNS /
     /// HTTP bootstrap clients.  Populated at the end of `new()` and is the
     /// single source of truth for all handlers after initialization.
-    registry: OutboundHandlerRegistry,
+    registry: OutboundNodeRegistry,
     /// name -> provider
     proxy_providers: HashMap<String, ArcProxyProvider>,
     proxy_manager: ProxyManager,
@@ -92,11 +94,11 @@ impl Drop for OutboundManager {
 }
 
 /// Init process:
-/// 1. Load all plaint outbounds from config using the unbounded function
-///    `load_plain_outbounds`, so that any bootstrap proxy can be used to
+/// 1. Construct plain outbounds and publish bootstrap entries using
+///    `load_plain_outbounds`, so available plain routes can be used to
 ///    download datasets
 /// 2. Load all proxy providers from config, this should happen before loading
-///    groups as groups my reference providers with `use_provider`
+///    groups as groups may reference providers with `use_provider`
 /// 3. Finally load all groups, and create `PlainProvider` for each explicit
 ///    referenced proxies in each group and register them in the
 ///    `proxy_providers` map.
@@ -110,7 +112,7 @@ impl Drop for OutboundManager {
 #[allow(clippy::too_many_arguments)]
 impl OutboundManager {
     pub async fn new(
-        outbounds: Vec<AnyOutboundHandler>,
+        outbounds: Vec<OutboundNode>,
         outbound_groups: Vec<OutboundGroupProtocol>,
         proxy_providers: HashMap<String, OutboundProxyProviderDef>,
         proxy_names: Vec<String>,
@@ -119,12 +121,12 @@ impl OutboundManager {
         cache_store: ThreadSafeCacheFile,
         cwd: String,
         fw_mark: Option<u32>,
-        registry: OutboundHandlerRegistry,
+        registry: OutboundNodeRegistry,
     ) -> Result<Self, Error> {
         // Build all handlers in a plain HashMap during initialization.
         // Once fully assembled it is written into the shared registry so that
         // DNS clients and the HTTP client can look up any handler by name.
-        let mut handlers: HashMap<String, AnyOutboundHandler> = HashMap::new();
+        let mut handlers: HashMap<String, OutboundNode> = HashMap::new();
         let provider_registry = HashMap::new();
         let selector_control = HashMap::new();
         let proxy_manager = ProxyManager::new(dns_resolver.clone(), fw_mark);
@@ -150,6 +152,8 @@ impl OutboundManager {
         )
         .await?;
 
+        validate(&handlers).await?;
+
         // Publish the complete generation, removing stale bootstrap entries.
         m.registry.store(Arc::new(handlers));
 
@@ -158,7 +162,7 @@ impl OutboundManager {
 
     /// Look up a handler by name. Returns `None` when the name is not
     /// registered.  The registry is read from an immutable snapshot.
-    pub fn get_outbound(&self, name: &str) -> Option<AnyOutboundHandler> {
+    pub fn get_outbound(&self, name: &str) -> Option<OutboundNode> {
         self.registry.load().get(name).cloned()
     }
 
@@ -182,13 +186,7 @@ impl OutboundManager {
         let handlers = self.registry.load_full();
 
         for (k, v) in handlers.iter() {
-            let mut m = if let Some(g) = v.try_as_group_handler() {
-                g.as_map().await
-            } else if let Some(p) = v.try_as_plain_handler() {
-                p.as_map().await
-            } else {
-                HashMap::new()
-            };
+            let mut m = v.as_map().await;
 
             self.apply_common_proxy_fields(&mut m, v, k).await;
 
@@ -200,15 +198,9 @@ impl OutboundManager {
 
     pub async fn get_proxy(
         &self,
-        proxy: &AnyOutboundHandler,
+        proxy: &OutboundNode,
     ) -> HashMap<String, Box<dyn Serialize + Send>> {
-        let mut r = if let Some(g) = proxy.try_as_group_handler() {
-            g.as_map().await
-        } else if let Some(p) = proxy.try_as_plain_handler() {
-            p.as_map().await
-        } else {
-            HashMap::new()
-        };
+        let mut r = proxy.as_map().await;
         self.apply_common_proxy_fields(&mut r, proxy, proxy.name())
             .await;
 
@@ -218,7 +210,7 @@ impl OutboundManager {
     async fn apply_common_proxy_fields(
         &self,
         m: &mut HashMap<String, Box<dyn Serialize + Send>>,
-        proxy: &AnyOutboundHandler,
+        proxy: &OutboundNode,
         name: &str,
     ) {
         let alive = self.proxy_manager.alive(name).await;
@@ -250,7 +242,7 @@ impl OutboundManager {
     /// a wrapper of proxy_manager.url_test so that proxy_manager is not exposed
     pub async fn url_test(
         &self,
-        outbounds: &Vec<AnyOutboundHandler>,
+        outbounds: &Vec<OutboundNode>,
         url: &str,
         timeout: Duration,
     ) -> Vec<std::io::Result<(Duration, Duration)>> {
@@ -263,7 +255,7 @@ impl OutboundManager {
     }
 
     #[cfg(test)]
-    pub fn new_for_test(handlers: HashMap<String, AnyOutboundHandler>) -> Self {
+    pub fn new_for_test(handlers: HashMap<String, OutboundNode>) -> Self {
         let registry = Arc::new(ArcSwap::from_pointee(handlers));
         let proxy_manager = ProxyManager::new(Arc::new(crate::app::dns::MockClashResolver::new()), None);
         Self {
@@ -278,21 +270,21 @@ impl OutboundManager {
 
     fn load_single_plain_outbound(
         outbound: OutboundProxyProtocol,
-        connector: Option<Arc<dyn RemoteConnector>>,
-    ) -> Option<AnyOutboundHandler> {
+        connector: Option<Arc<RemoteConnector>>,
+    ) -> Option<OutboundNode> {
         match outbound {
             OutboundProxyProtocol::Direct(d) => {
-                Some(Arc::new(direct::Handler::new(&d.name)) as _)
+                Some(OutboundNode::protocol(Arc::new(direct::Handler::new(&d.name))))
             }
             OutboundProxyProtocol::Reject(r) => {
-                Some(Arc::new(reject::Handler::new(&r.name)) as _)
+                Some(OutboundNode::protocol(Arc::new(reject::Handler::new(&r.name))))
             }
             #[cfg(feature = "shadowsocks")]
             OutboundProxyProtocol::Ss(s) => {
                 let name = s.common_opts.name.clone();
                 crate::proxy::converters::shadowsocks::build_handler(&s, connector)
                     .map(|x: shadowsocks::outbound::Handler| {
-                        Arc::new(x) as AnyOutboundHandler
+                        OutboundNode::protocol(Arc::new(x))
                     })
                     .inspect_err(|e| {
                         error!(
@@ -305,7 +297,7 @@ impl OutboundManager {
             OutboundProxyProtocol::Http(s) => {
                 let name = s.common_opts.name.clone();
                 build_http_handler(&s, connector)
-                    .map(|x| Arc::new(x) as AnyOutboundHandler)
+                    .map(|x| OutboundNode::protocol(Arc::new(x)))
                     .inspect_err(|e| {
                         error!("failed to load http outbound {}: {}", name, e);
                     })
@@ -315,7 +307,7 @@ impl OutboundManager {
                 let name = s.common_opts.name.clone();
                 crate::proxy::converters::socks5::build_handler(&s, connector)
                     .map(|x: socks::outbound::Handler| {
-                        Arc::new(x) as AnyOutboundHandler
+                        OutboundNode::protocol(Arc::new(x))
                     })
                     .inspect_err(|e| {
                         error!("failed to load socks5 outbound {}: {}", name, e);
@@ -325,7 +317,7 @@ impl OutboundManager {
             OutboundProxyProtocol::Anytls(v) => {
                 let name = v.common_opts.name.clone();
                 crate::proxy::converters::anytls::build_handler(&v, connector)
-                    .map(|x: anytls::Handler| Arc::new(x) as _)
+                    .map(|x: anytls::Handler| OutboundNode::protocol(Arc::new(x)))
                     .inspect_err(|e| {
                         error!("failed to load anytls outbound {}: {}", name, e);
                     })
@@ -334,7 +326,7 @@ impl OutboundManager {
             OutboundProxyProtocol::Vmess(v) => {
                 let name = v.common_opts.name.clone();
                 crate::proxy::converters::vmess::build_handler(&v, connector)
-                    .map(|x: vmess::Handler| Arc::new(x) as AnyOutboundHandler)
+                    .map(|x: vmess::Handler| OutboundNode::protocol(Arc::new(x)))
                     .inspect_err(|e| {
                         error!("failed to load vmess outbound {}: {}", name, e);
                     })
@@ -343,7 +335,7 @@ impl OutboundManager {
             OutboundProxyProtocol::Vless(v) => {
                 let name = v.common_opts.name.clone();
                 crate::proxy::converters::vless::build_handler(&v, connector)
-                    .map(|x: vless::Handler| Arc::new(x) as AnyOutboundHandler)
+                    .map(|x: vless::Handler| OutboundNode::protocol(Arc::new(x)))
                     .inspect_err(|e| {
                         error!("failed to load vless outbound {}: {}", name, e);
                     })
@@ -352,7 +344,7 @@ impl OutboundManager {
             OutboundProxyProtocol::Trojan(v) => {
                 let name = v.common_opts.name.clone();
                 crate::proxy::converters::trojan::build_handler(&v, connector)
-                    .map(|x: trojan::Handler| Arc::new(x) as _)
+                    .map(|x: trojan::Handler| OutboundNode::protocol(Arc::new(x)))
                     .inspect_err(|e| {
                         error!("failed to load trojan outbound {}: {}", name, e);
                     })
@@ -361,7 +353,7 @@ impl OutboundManager {
             OutboundProxyProtocol::Hysteria2(h) => {
                 let name = h.name.clone();
                 h.try_into()
-                    .map(|x: hysteria2::Handler| Arc::new(x) as _)
+                    .map(|x: hysteria2::Handler| OutboundNode::protocol(Arc::new(x)))
                     .inspect_err(|e| {
                         error!("failed to load hysteria2 outbound {}: {}", name, e);
                     })
@@ -371,7 +363,7 @@ impl OutboundManager {
             OutboundProxyProtocol::Wireguard(wg) => {
                 let name = wg.common_opts.name.clone();
                 crate::proxy::converters::wireguard::build_handler(&wg, connector)
-                    .map(|x: wg::Handler| Arc::new(x) as AnyOutboundHandler)
+                    .map(|x: wg::Handler| OutboundNode::protocol(Arc::new(x)))
                     .inspect_err(|e| {
                         error!("failed to load wireguard outbound {}: {}", name, e);
                     })
@@ -381,7 +373,7 @@ impl OutboundManager {
             OutboundProxyProtocol::Ssh(ssh) => {
                 let name = ssh.common_opts.name.clone();
                 crate::proxy::converters::ssh::build_handler(&ssh, connector)
-                    .map(|x: ssh::Handler| Arc::new(x) as _)
+                    .map(|x: ssh::Handler| OutboundNode::protocol(Arc::new(x)))
                     .inspect_err(|e| {
                         error!("failed to load ssh outbound {}: {}", name, e);
                     })
@@ -391,7 +383,7 @@ impl OutboundManager {
             OutboundProxyProtocol::Tor(tor) => {
                 let name = tor.name.clone();
                 tor.try_into()
-                    .map(|x: tor::Handler| Arc::new(x) as _)
+                    .map(|x: tor::Handler| OutboundNode::protocol(Arc::new(x)))
                     .inspect_err(|e| {
                         error!("failed to load tor outbound {}: {}", name, e);
                     })
@@ -401,7 +393,7 @@ impl OutboundManager {
             OutboundProxyProtocol::Tuic(tuic) => {
                 let name = tuic.common_opts.name.clone();
                 tuic.try_into()
-                    .map(|x: tuic::Handler| Arc::new(x) as _)
+                    .map(|x: tuic::Handler| OutboundNode::protocol(Arc::new(x)))
                     .inspect_err(|e| {
                         error!("failed to load tuic outbound {}: {}", name, e);
                     })
@@ -412,7 +404,7 @@ impl OutboundManager {
                 let name = sqcfg.common_opts.name.clone();
                 sqcfg
                     .try_into()
-                    .map(|x: shadowquic::Handler| Arc::new(x) as AnyOutboundHandler)
+                    .map(|x: shadowquic::Handler| OutboundNode::protocol(Arc::new(x)))
                     .inspect_err(|e| {
                         error!("failed to load shadowquic outbound {}: {}", name, e);
                     })
@@ -423,7 +415,7 @@ impl OutboundManager {
                 let name = tscfg.name.clone();
                 tscfg
                     .try_into()
-                    .map(|x: tailscale::Handler| Arc::new(x) as AnyOutboundHandler)
+                    .map(|x: tailscale::Handler| OutboundNode::protocol(Arc::new(x)))
                     .inspect_err(|e| {
                         error!("failed to load tailscale outbound {}: {}", name, e);
                     })
@@ -434,63 +426,43 @@ impl OutboundManager {
 
     pub fn load_plain_outbounds(
         outbounds: Vec<OutboundProxyProtocol>,
-    ) -> Result<Vec<AnyOutboundHandler>, Error> {
-        let mut loaded: HashMap<String, AnyOutboundHandler> = HashMap::new();
-        let mut pending: Vec<OutboundProxyProtocol> = outbounds;
-        let mut progress = true;
-
-        while progress && !pending.is_empty() {
-            progress = false;
-            let mut remaining = Vec::new();
-
-            for outbound in pending {
-                let dialer_name = outbound.dialer_proxy();
-                let can_load = match dialer_name {
-                    None => true,
-                    Some(d) => loaded.contains_key(d),
-                };
-
-                if can_load {
-                    let connector = dialer_name.and_then(|d| {
-                        loaded.get(d).map(|h| {
-                            Arc::new(ProxyConnector::new(
-                                h.clone(),
-                                Box::new(DirectConnector::new()),
-                            ))
-                                as Arc<dyn RemoteConnector>
-                        })
-                    });
-
-                    let name = outbound.name().to_string();
-                    if let Some(handler) =
-                        Self::load_single_plain_outbound(outbound, connector)
-                    {
-                        loaded.insert(name, handler);
-                    }
-                    progress = true;
-                } else {
-                    remaining.push(outbound);
-                }
-            }
-
-            pending = remaining;
-        }
-
-        if !pending.is_empty() {
-            let unresolved = pending
-                .iter()
-                .map(|outbound| {
-                    format!("{} -> {}", outbound.name(), outbound.dialer_proxy().unwrap())
-                })
-                .collect::<Vec<_>>();
-            return Err(Error::InvalidConfig(format!(
-                "unresolved dialer-proxy dependencies (missing, cyclic or unsupported group): {}",
-                unresolved.join(", ")
-            )));
-        }
-
-        Ok(loaded.into_values().collect())
+        registry: &OutboundNodeRegistry,
+    ) -> Result<Vec<OutboundNode>, Error> {
+        Self::load_provider_outbounds(outbounds, registry, None)
     }
+
+    pub(crate) fn load_provider_outbounds(
+        outbounds: Vec<OutboundProxyProtocol>,
+        registry: &OutboundNodeRegistry,
+        local: Option<&ProviderRegistry>,
+    ) -> Result<Vec<OutboundNode>, Error> {
+        validate_plain(&outbounds)?;
+        let mut handlers = Vec::with_capacity(outbounds.len());
+        let mut names = HashSet::new();
+        for outbound in outbounds {
+            let name = outbound.name().to_owned();
+            if !names.insert(name.clone()) {
+                return Err(Error::InvalidConfig(format!("duplicate proxy name: {name}")));
+            }
+            let dialer = outbound.dialer_proxy().map(str::to_owned);
+            let connector = dialer.as_ref().map(|name| {
+                let connector = DialerProxyConnector::new(name.clone(), registry);
+                let connector = match local {
+                    Some(local) => connector.with_local(local),
+                    None => connector,
+                };
+                Arc::new(RemoteConnector::DialerProxy(connector))
+            });
+            let handler = Self::load_single_plain_outbound(outbound, connector)
+                .ok_or_else(|| Error::InvalidConfig(format!("failed to construct outbound {name}")))?;
+            if dialer.as_deref() != handler.support_dialer() {
+                return Err(Error::InvalidConfig(format!("dialer-proxy is unsupported for {name}")));
+            }
+            handlers.push(handler);
+        }
+        Ok(handlers)
+    }
+
 }
 
 impl OutboundManager {
@@ -499,8 +471,8 @@ impl OutboundManager {
     /// the provider separately.
     async fn load_handlers(
         &mut self,
-        handlers: &mut HashMap<String, AnyOutboundHandler>,
-        outbounds: Vec<AnyOutboundHandler>,
+        handlers: &mut HashMap<String, OutboundNode>,
+        outbounds: Vec<OutboundNode>,
         outbound_groups: Vec<OutboundGroupProtocol>,
         proxy_names: Vec<String>,
         cache_store: ThreadSafeCacheFile,
@@ -569,7 +541,7 @@ impl OutboundManager {
 
         self.proxy_providers
             .insert(RESERVED_PROVIDER_NAME.to_owned(), pd);
-        handlers.insert(PROXY_GLOBAL.to_owned(), Arc::new(h.clone()));
+        handlers.insert(PROXY_GLOBAL.to_owned(), OutboundNode::group(Arc::new(h.clone())));
         self.selector_control
             .insert(PROXY_GLOBAL.to_owned(), Arc::new(h));
 
@@ -584,7 +556,7 @@ impl OutboundManager {
         group: &OutboundGroupProtocol,
         interval: u64,
         lazy: bool,
-        handlers: &HashMap<String, AnyOutboundHandler>,
+        handlers: &HashMap<String, OutboundNode>,
         proxy_names: &[String],
         proxy_manager: &ProxyManager,
         provider_registry: &mut HashMap<String, ArcProxyProvider>,
@@ -610,9 +582,9 @@ impl OutboundManager {
                 .cloned()
                 .or_else(|| {
                     if fb == PROXY_DIRECT || fb.eq_ignore_ascii_case("direct") {
-                        Some(Arc::new(direct::Handler::new(fb)) as _)
+                        Some(OutboundNode::protocol(Arc::new(direct::Handler::new(fb))))
                     } else if fb == PROXY_REJECT || fb.eq_ignore_ascii_case("reject") {
-                        Some(Arc::new(reject::Handler::new(fb)) as _)
+                        Some(OutboundNode::protocol(Arc::new(reject::Handler::new(fb))))
                     } else {
                         warn!(
                             "empty-fallback proxy `{}` not found for group `{}`, ignoring",
@@ -634,7 +606,7 @@ impl OutboundManager {
                     && !p_name.eq_ignore_ascii_case("reject")
                     && !group_proxies.contains(p_name)
                     && let Some(h) = handlers.get(p_name)
-                    && h.try_as_group_handler().is_none()
+                    && h.as_group().is_none()
                     && !matches!(h.proto(), OutboundType::Reject)
                 {
                     if let Some(re) = &filter_re {
@@ -726,7 +698,7 @@ impl OutboundManager {
         url: &str,
         interval: u64,
         lazy: bool,
-        handlers: &HashMap<String, AnyOutboundHandler>,
+        handlers: &HashMap<String, OutboundNode>,
         proxy_manager: ProxyManager,
         provider_registry: &mut HashMap<String, ArcProxyProvider>,
     ) -> Result<ArcProxyProvider, Error> {
@@ -768,7 +740,7 @@ impl OutboundManager {
 
     async fn load_group_outbounds(
         &mut self,
-        handlers: &mut HashMap<String, AnyOutboundHandler>,
+        handlers: &mut HashMap<String, OutboundNode>,
         outbound_groups: Vec<OutboundGroupProtocol>,
         proxy_names: &[String],
         cache_store: ThreadSafeCacheFile,
@@ -784,39 +756,6 @@ impl OutboundManager {
         // Initialize handlers for each outbound group protocol
         for outbound_group in outbound_groups.iter() {
             match outbound_group {
-                OutboundGroupProtocol::Relay(proto) => {
-                    let providers = Self::build_group_providers(
-                        outbound_group,
-                        0,
-                        true,
-                        handlers,
-                        proxy_names,
-                        proxy_manager,
-                        provider_registry,
-                    )?;
-                    if providers.is_empty() {
-                        return Err(Error::InvalidConfig(format!(
-                            "proxy group {} has no proxies",
-                            proto.name
-                        )));
-                    }
-
-                    handlers.insert(
-                        proto.name.clone(),
-                        relay::Handler::new(
-                            relay::HandlerOptions {
-                                name: proto.name.clone(),
-                                common_opts: crate::proxy::HandlerCommonOptions {
-                                    icon: proto.icon.clone(),
-                                    url: proto.url.clone(),
-                                    connector: None,
-                                    tfo: false,
-                                },
-                            },
-                            providers,
-                        ),
-                    );
-                }
                 OutboundGroupProtocol::UrlTest(proto) => {
                     let providers = Self::build_group_providers(
                         outbound_group,
@@ -850,7 +789,7 @@ impl OutboundManager {
                         proxy_manager.clone(),
                     );
 
-                    handlers.insert(proto.name.clone(), Arc::new(url_test));
+                    handlers.insert(proto.name.clone(), OutboundNode::group(Arc::new(url_test)));
                 }
                 OutboundGroupProtocol::Fallback(proto) => {
                     let providers = Self::build_group_providers(
@@ -871,7 +810,7 @@ impl OutboundManager {
 
                     handlers.insert(
                         proto.name.clone(),
-                        Arc::new(fallback::Handler::new(
+                        OutboundNode::group(Arc::new(fallback::Handler::new(
                             fallback::HandlerOptions {
                                 name: proto.name.clone(),
                                 common_opts: crate::proxy::HandlerCommonOptions {
@@ -884,7 +823,7 @@ impl OutboundManager {
                             },
                             providers,
                             proxy_manager.clone(),
-                        )),
+                        ))),
                     );
                 }
                 OutboundGroupProtocol::LoadBalance(proto) => {
@@ -906,7 +845,7 @@ impl OutboundManager {
 
                     handlers.insert(
                         proto.name.clone(),
-                        Arc::new(loadbalance::Handler::new(
+                        OutboundNode::group(Arc::new(loadbalance::Handler::new(
                             loadbalance::HandlerOptions {
                                 name: proto.name.clone(),
                                 common_opts: crate::proxy::HandlerCommonOptions {
@@ -919,7 +858,7 @@ impl OutboundManager {
                             },
                             providers,
                             proxy_manager.clone(),
-                        )),
+                        ))),
                     );
                 }
                 OutboundGroupProtocol::Select(proto) => {
@@ -958,7 +897,7 @@ impl OutboundManager {
                     )
                     .await;
 
-                    handlers.insert(proto.name.clone(), Arc::new(selector.clone()));
+                    handlers.insert(proto.name.clone(), OutboundNode::group(Arc::new(selector.clone())));
                     selector_control.insert(proto.name.clone(), Arc::new(selector));
                 }
                 OutboundGroupProtocol::Smart(proto) => {
@@ -980,7 +919,7 @@ impl OutboundManager {
 
                     handlers.insert(
                         proto.name.clone(),
-                        Arc::new(
+                        OutboundNode::group(Arc::new(
                             smart::Handler::new_with_cache(
                                 smart::HandlerOptions {
                                     name: proto.name.clone(),
@@ -1000,7 +939,7 @@ impl OutboundManager {
                                 cache_store.clone(),
                             )
                             .await,
-                        ),
+                        )),
                     );
                 }
             }
@@ -1023,12 +962,14 @@ impl OutboundManager {
             vehicle: ThreadSafeProviderVehicle,
             interval_secs: u64,
             hc: HealthCheck,
+            registry: &OutboundNodeRegistry,
         ) -> Result<ArcProxyProvider, Error> {
             ProxySetProvider::new(
                 name.to_owned(),
                 Duration::from_secs(interval_secs),
                 vehicle,
                 hc,
+                Some(registry.clone()),
             )
             .map(|p| Arc::new(p) as ArcProxyProvider)
             .map_err(|x| {
@@ -1093,7 +1034,9 @@ impl OutboundManager {
             );
 
             let provider =
-                make_proxy_set_provider(&name, vehicle, interval_secs, hc)?;
+                make_proxy_set_provider(
+                    &name, vehicle, interval_secs, hc, &self.registry,
+                )?;
             provider_registry.insert(name, provider);
         }
 
@@ -1129,8 +1072,8 @@ mod tests {
 
     #[test]
     fn test_drop_clears_registry_while_readers_keep_their_snapshot() {
-        let handler: AnyOutboundHandler = Arc::new(direct::Handler::new("node"));
-        let weak = Arc::downgrade(&handler);
+        let handler: OutboundNode = OutboundNode::protocol(Arc::new(direct::Handler::new("node")));
+        let weak = handler.downgrade();
         let manager = OutboundManager::new_for_test(
             HashMap::from([("node".to_owned(), handler)]),
         );
@@ -1146,19 +1089,25 @@ mod tests {
         assert!(weak.upgrade().is_none());
     }
 
-    #[test]
-    fn test_unresolved_dialer_dependencies_are_rejected() {
+    #[tokio::test]
+    async fn test_unresolved_dialer_dependencies_are_rejected() {
         let make_proxy = |name: &str, dialer: &str| {
             let yaml = format!(
                 "type: socks5\nname: {name}\nserver: 127.0.0.1\nport: 1080\ndialer-proxy: {dialer}\n"
             );
             yaml_serde::from_str::<OutboundProxyProtocol>(&yaml).unwrap()
         };
-        assert!(OutboundManager::load_plain_outbounds(vec![make_proxy("a", "missing")]).is_err());
-        assert!(OutboundManager::load_plain_outbounds(vec![make_proxy("a", "a")]).is_err());
-        assert!(OutboundManager::load_plain_outbounds(vec![
-            make_proxy("a", "b"), make_proxy("b", "a"),
-        ]).is_err());
+        for configs in [
+            vec![make_proxy("a", "missing")],
+            vec![make_proxy("a", "a")],
+            vec![make_proxy("a", "b"), make_proxy("b", "a")],
+        ] {
+            let registry = Arc::new(ArcSwap::from_pointee(HashMap::new()));
+            if let Ok(handlers) = OutboundManager::load_plain_outbounds(configs, &registry) {
+                let handlers = handlers.into_iter().map(|h| (h.name().to_owned(), h)).collect();
+                assert!(validate(&handlers).await.is_err());
+            }
+        }
     }
 
     #[tokio::test]
@@ -1177,7 +1126,7 @@ mod tests {
         );
         let handlers = HashMap::from([(
             PROXY_DIRECT.to_owned(),
-            Arc::new(direct::Handler::new(PROXY_DIRECT)) as AnyOutboundHandler,
+            OutboundNode::protocol(Arc::new(direct::Handler::new(PROXY_DIRECT))),
         )]);
         let manager = ProxyManager::new(Arc::new(NoopResolver), None);
         let mut registry = HashMap::new();
@@ -1198,7 +1147,7 @@ mod tests {
 
     #[test]
     #[cfg(feature = "shadowsocks")]
-    fn test_load_plain_outbounds_topological_sort() {
+    fn test_load_plain_outbounds_accepts_forward_dialer_reference() {
         let ss1 = OutboundProxyProtocol::Ss(OutboundShadowsocks {
             common_opts: CommonConfigOptions {
                 name: "ss1".to_string(),
@@ -1233,12 +1182,13 @@ mod tests {
             smux: None,
         });
 
-        // Pass ss2 before ss1 in the input list to verify topological sort resolves ss1 first
+        // Forward references are resolved at dial time against the registry.
         let outbounds = vec![ss2, ss1];
-        let handlers = OutboundManager::load_plain_outbounds(outbounds).unwrap();
+        let registry = Arc::new(ArcSwap::from_pointee(HashMap::new()));
+        let handlers = OutboundManager::load_plain_outbounds(outbounds, &registry).unwrap();
 
         assert_eq!(handlers.len(), 2);
-        let handler_map: HashMap<String, AnyOutboundHandler> = handlers
+        let handler_map: HashMap<String, OutboundNode> = handlers
             .into_iter()
             .map(|h| (h.name().to_string(), h))
             .collect();
@@ -1260,9 +1210,9 @@ include-all: true
         assert_eq!(group.filter(), Some("HK.*"));
         assert_eq!(group.empty_fallback(), Some("REJECT"));
 
-        let hk_node: AnyOutboundHandler = Arc::new(direct::Handler::new("HK 01"));
-        let us_node: AnyOutboundHandler = Arc::new(direct::Handler::new("US 01"));
-        let reject_node: AnyOutboundHandler = Arc::new(reject::Handler::new(PROXY_REJECT));
+        let hk_node: OutboundNode = OutboundNode::protocol(Arc::new(direct::Handler::new("HK 01")));
+        let us_node: OutboundNode = OutboundNode::protocol(Arc::new(direct::Handler::new("US 01")));
+        let reject_node: OutboundNode = OutboundNode::protocol(Arc::new(reject::Handler::new(PROXY_REJECT)));
 
         let mut handlers = HashMap::new();
         handlers.insert("HK 01".to_string(), hk_node);
@@ -1302,9 +1252,9 @@ include-all: true
 "#;
         let group: OutboundGroupProtocol = yaml_serde::from_str(yaml).unwrap();
 
-        let hk_node: AnyOutboundHandler = Arc::new(direct::Handler::new("香港 01 节点"));
-        let hk_excluded: AnyOutboundHandler = Arc::new(direct::Handler::new("香港 02 排除1"));
-        let us_node: AnyOutboundHandler = Arc::new(direct::Handler::new("US 01"));
+        let hk_node: OutboundNode = OutboundNode::protocol(Arc::new(direct::Handler::new("香港 01 节点")));
+        let hk_excluded: OutboundNode = OutboundNode::protocol(Arc::new(direct::Handler::new("香港 02 排除1")));
+        let us_node: OutboundNode = OutboundNode::protocol(Arc::new(direct::Handler::new("US 01")));
 
         let mut handlers = HashMap::new();
         handlers.insert("香港 01 节点".to_string(), hk_node);
@@ -1347,8 +1297,8 @@ include-all: true
 "#;
         let group: OutboundGroupProtocol = yaml_serde::from_str(yaml).unwrap();
 
-        let us_node: AnyOutboundHandler = Arc::new(direct::Handler::new("US 01"));
-        let reject_node: AnyOutboundHandler = Arc::new(reject::Handler::new(PROXY_REJECT));
+        let us_node: OutboundNode = OutboundNode::protocol(Arc::new(direct::Handler::new("US 01")));
+        let reject_node: OutboundNode = OutboundNode::protocol(Arc::new(reject::Handler::new(PROXY_REJECT)));
 
         let mut handlers = HashMap::new();
         handlers.insert("US 01".to_string(), us_node);
@@ -1386,7 +1336,7 @@ include-all: true
 "#;
         let group: OutboundGroupProtocol = yaml_serde::from_str(yaml).unwrap();
 
-        let us_node: AnyOutboundHandler = Arc::new(direct::Handler::new("US 01"));
+        let us_node: OutboundNode = OutboundNode::protocol(Arc::new(direct::Handler::new("US 01")));
         let mut handlers = HashMap::new();
         handlers.insert("US 01".to_string(), us_node);
 

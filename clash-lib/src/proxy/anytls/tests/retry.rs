@@ -10,7 +10,6 @@ use crate::{
     },
     session::{Session, SocksAddr},
 };
-use async_trait::async_trait;
 use futures::future::join_all;
 use std::{
     io,
@@ -25,7 +24,7 @@ use tokio::{
 };
 
 #[derive(Debug, Default)]
-struct CountingConnector {
+pub struct CountingConnector {
     dials: AtomicUsize,
 }
 
@@ -37,9 +36,8 @@ async fn consume_auth(stream: &mut (impl AsyncReadExt + Unpin)) {
     stream.read_exact(&mut padding).await.unwrap();
 }
 
-#[async_trait]
-impl RemoteConnector for CountingConnector {
-    async fn connect_stream(
+impl CountingConnector {
+    pub async fn connect_stream(
         &self,
         _resolver: ThreadSafeDNSResolver,
         _address: &str,
@@ -60,7 +58,7 @@ impl RemoteConnector for CountingConnector {
         Ok(AnyStream::new(client))
     }
 
-    async fn connect_datagram(
+    pub async fn connect_datagram(
         &self,
         _resolver: ThreadSafeDNSResolver,
         _src: Option<SocketAddr>,
@@ -110,7 +108,7 @@ async fn concurrent_broken_session_retries_share_one_dial() {
                     ..Default::default()
                 };
                 start.wait().await;
-                handler.open_stream_with_retry(resolver, connector.as_ref(),
+                handler.open_stream_with_retry(resolver, &RemoteConnector::Counting(connector.clone()),
                     &sess, &sess.destination).await.unwrap()
             }));
         }

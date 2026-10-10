@@ -13,7 +13,6 @@ mod upload;
 mod tests;
 
 use std::{io, sync::Arc};
-use async_trait::async_trait;
 use tokio::{sync::{mpsc, oneshot}, time::timeout};
 use crate::{config::internal::proxy::XHttpOpt, proxy::AnyStream};
 use super::{Transport, TransportDialer, dial::TransportSecurity};
@@ -138,7 +137,6 @@ impl Client {
     }
 }
 
-#[async_trait]
 impl Transport for Client {
     async fn proxy_stream(&self, _stream: AnyStream) -> io::Result<AnyStream> {
         Err(invalid("XHTTP requires a connection factory"))

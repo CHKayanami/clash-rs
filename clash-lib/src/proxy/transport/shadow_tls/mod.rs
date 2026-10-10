@@ -1,4 +1,3 @@
-use async_trait::async_trait;
 use rand::{RngExt, distr::Distribution};
 use std::{io, sync::Arc};
 pub(crate) use stream::VerifiedStream;
@@ -181,7 +180,6 @@ impl Client {
     }
 }
 
-#[async_trait]
 impl Transport for Client {
     async fn proxy_stream(
         &self,

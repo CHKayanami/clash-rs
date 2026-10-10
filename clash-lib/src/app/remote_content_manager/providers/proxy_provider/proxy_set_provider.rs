@@ -1,33 +1,19 @@
 use super::ProxyProvider;
-#[cfg(feature = "shadowsocks")]
-use crate::proxy::shadowsocks;
-#[cfg(feature = "ssh")]
-use crate::proxy::ssh;
-#[cfg(feature = "tailscale")]
-use crate::proxy::tailscale;
-#[cfg(feature = "onion")]
-use crate::proxy::tor;
-#[cfg(feature = "tuic")]
-use crate::proxy::tuic;
-#[cfg(feature = "wireguard")]
-use crate::proxy::wg;
 use crate::{
     Error,
-    app::remote_content_manager::{
-        healthcheck::HealthCheck,
-        providers::{
-            Provider, ProviderType, ProviderVehicleType, ThreadSafeProviderVehicle,
-            fetcher::Fetcher,
+    app::{
+        outbound::manager::OutboundManager,
+        remote_content_manager::{
+            healthcheck::HealthCheck,
+            providers::{
+                Provider, ProviderType, ProviderVehicleType,
+                ThreadSafeProviderVehicle, fetcher::Fetcher,
+            },
         },
     },
     common::errors::map_io_error,
     config::internal::proxy::OutboundProxyProtocol,
-    proxy::{
-        AnyOutboundHandler, anytls,
-        direct::{self},
-        http::outbound::Handler as HttpHandler,
-        hysteria2, reject, socks, trojan, vless, vmess,
-    },
+    proxy::{OutboundNode, utils::{OutboundNodeRegistry, ProviderRegistry, ProviderSnapshot}},
 };
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
@@ -35,7 +21,11 @@ use erased_serde::Serialize as ESerialize;
 use futures::future::BoxFuture;
 use serde::{Deserialize, Serialize};
 use yaml_serde::Value;
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Weak},
+    time::Duration,
+};
 use tracing::{debug, warn};
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -45,19 +35,19 @@ struct ProviderScheme {
 }
 
 type ProxyUpdater = Box<
-    dyn Fn(Vec<AnyOutboundHandler>) -> BoxFuture<'static, ()>
+    dyn Fn(Vec<OutboundNode>) -> BoxFuture<'static, ()>
         + Send
         + Sync
         + 'static,
 >;
 type ProxyParser = Box<
-    dyn Fn(&[u8]) -> anyhow::Result<Vec<AnyOutboundHandler>> + Send + Sync + 'static,
+    dyn Fn(&[u8]) -> anyhow::Result<Vec<OutboundNode>> + Send + Sync + 'static,
 >;
 
 pub struct ProxySetProvider {
     fetcher: Fetcher<ProxyUpdater, ProxyParser>,
     hc: Arc<HealthCheck>,
-    proxies: Arc<ArcSwap<Vec<AnyOutboundHandler>>>,
+    proxies: ProviderRegistry,
 }
 
 impl ProxySetProvider {
@@ -66,6 +56,7 @@ impl ProxySetProvider {
         interval: Duration,
         vehicle: ThreadSafeProviderVehicle,
         hc: HealthCheck,
+        registry: Option<OutboundNodeRegistry>,
     ) -> anyhow::Result<Self> {
         let hc = Arc::new(hc);
 
@@ -77,19 +68,19 @@ impl ProxySetProvider {
             });
         }
 
-        let proxies = Arc::new(ArcSwap::from_pointee(Vec::new()));
+        let proxies = Arc::new(ArcSwap::from_pointee(ProviderSnapshot::default()));
         let proxies_clone = proxies.clone();
 
         let n = name.clone();
         let hc_updater = hc.clone();
         let updater: ProxyUpdater = Box::new(
-            move |input: Vec<AnyOutboundHandler>| -> BoxFuture<'static, ()> {
+            move |input: Vec<OutboundNode>| -> BoxFuture<'static, ()> {
                 let hc = hc_updater.clone();
                 let n = n.clone();
                 let proxies = proxies_clone.clone();
                 Box::pin(async move {
                     debug!("updating {} proxies for: {}", n, input.len());
-                    proxies.store(Arc::new(input.clone()));
+                    proxies.store(Arc::new(ProviderSnapshot::new(input.clone())));
                     hc.update(input).await;
                     tokio::spawn(async move {
                         hc.check().await;
@@ -98,9 +89,13 @@ impl ProxySetProvider {
             },
         );
 
+        // Parsing constructs candidates; only the updater publishes a generation.
+        let parser_registry = proxies.clone();
+        let fallback_registry = Arc::new(ArcSwap::from_pointee(HashMap::new()));
+        let global_registry = registry.as_ref().map(Arc::downgrade);
         let n = name.clone();
         let parser: ProxyParser = Box::new(
-            move |input: &[u8]| -> anyhow::Result<Vec<AnyOutboundHandler>> {
+            move |input: &[u8]| -> anyhow::Result<Vec<OutboundNode>> {
                 let mut val: Value =
                     yaml_serde::from_slice(input).map_err(|x| {
                         Error::InvalidConfig(format!(
@@ -135,81 +130,13 @@ impl ProxySetProvider {
                                     }
                                 }
                             })
-                            .map(|x| match x {
-                                OutboundProxyProtocol::Direct(d) => {
-                                    Ok(Arc::new(direct::Handler::new(&d.name)) as _)
-                                }
-                                OutboundProxyProtocol::Reject(r) => {
-                                    Ok(Arc::new(reject::Handler::new(&r.name)) as _)
-                                }
-                                #[cfg(feature = "shadowsocks")]
-                                OutboundProxyProtocol::Ss(s) => {
-                                    let h: shadowsocks::outbound::Handler =
-                                        s.try_into()?;
-                                    Ok(Arc::new(h) as _)
-                                }
-                                OutboundProxyProtocol::Http(s) => {
-                                    let h: HttpHandler = s.try_into()?;
-                                    Ok(Arc::new(h) as _)
-                                }
-                                OutboundProxyProtocol::Socks5(s) => {
-                                    let h: socks::outbound::Handler =
-                                        s.try_into()?;
-                                    Ok(Arc::new(h) as _)
-                                }
-                                OutboundProxyProtocol::Anytls(anytls) => {
-                                    let h: anytls::Handler = anytls.try_into()?;
-                                    Ok(Arc::new(h) as _)
-                                }
-                                OutboundProxyProtocol::Trojan(tr) => {
-                                    let h: trojan::Handler = tr.try_into()?;
-                                    Ok(Arc::new(h) as _)
-                                }
-                                OutboundProxyProtocol::Vmess(vm) => {
-                                    let h: vmess::Handler = vm.try_into()?;
-                                    Ok(Arc::new(h) as _)
-                                }
-                                OutboundProxyProtocol::Vless(vl) => {
-                                    let h: vless::Handler = vl.try_into()?;
-                                    Ok(Arc::new(h) as _)
-                                }
-                                OutboundProxyProtocol::Hysteria2(h) => {
-                                    let h: hysteria2::Handler = h.try_into()?;
-                                    Ok(Arc::new(h) as _)
-                                }
-                                #[cfg(feature = "ssh")]
-                                OutboundProxyProtocol::Ssh(s) => {
-                                    let h: ssh::Handler = s.try_into()?;
-                                    Ok(Arc::new(h) as _)
-                                }
-                                #[cfg(feature = "wireguard")]
-                                OutboundProxyProtocol::Wireguard(wg) => {
-                                    let h: wg::Handler = wg.try_into()?;
-                                    Ok(Arc::new(h) as _)
-                                }
-                                #[cfg(feature = "onion")]
-                                OutboundProxyProtocol::Tor(tor) => {
-                                    let h: tor::Handler = tor.try_into()?;
-                                    Ok(Arc::new(h) as _)
-                                }
-                                #[cfg(feature = "tuic")]
-                                OutboundProxyProtocol::Tuic(tuic) => {
-                                    let h: tuic::Handler = tuic.try_into()?;
-                                    Ok(Arc::new(h) as _)
-                                }
-                                #[cfg(feature = "shadowquic")]
-                                OutboundProxyProtocol::ShadowQuic(sq) => {
-                                    let h: crate::proxy::shadowquic::Handler =
-                                        sq.try_into()?;
-                                    Ok(Arc::new(h) as _)
-                                }
-                                #[cfg(feature = "tailscale")]
-                                OutboundProxyProtocol::Tailscale(tscfg) => {
-                                    let h: tailscale::Handler = tscfg.try_into()?;
-                                    Ok(Arc::new(h) as _)
-                                }
-                            })
-                            .collect::<Result<Vec<_>, crate::Error>>();
+                            .collect::<Vec<_>>();
+                        let global = global_registry.as_ref()
+                            .and_then(Weak::upgrade)
+                            .unwrap_or_else(|| fallback_registry.clone());
+                        let proxies = OutboundManager::load_provider_outbounds(
+                            proxies, &global, Some(&parser_registry),
+                        );
                         match proxies {
                             Ok(proxies) => Ok(proxies),
                             Err(e) => {
@@ -295,8 +222,8 @@ impl Provider for ProxySetProvider {
 
 #[async_trait]
 impl ProxyProvider for ProxySetProvider {
-    fn proxies(&self) -> Arc<Vec<AnyOutboundHandler>> {
-        self.proxies.load_full()
+    fn proxies(&self) -> Arc<Vec<OutboundNode>> {
+        self.proxies.load().proxies.clone()
     }
 
     fn touch(&self) {
@@ -327,6 +254,51 @@ mod tests {
             },
         },
     };
+
+    #[tokio::test]
+    async fn dialer_snapshot_changes_only_after_successful_commit() {
+        use std::fs;
+        use parking_lot::Mutex;
+        use tempfile::tempdir;
+        use crate::proxy::utils::test_utils::noop::NoopResolver;
+
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("provider.yaml");
+        let config = |port| format!("proxies:\n  - type: direct\n    name: local-entry\n  - type: socks5\n    name: exit\n    server: 127.0.0.1\n    port: {port}\n    dialer-proxy: local-entry\n").into_bytes();
+        let content = Arc::new(Mutex::new(config(1080)));
+        let source = content.clone();
+        let mut vehicle = MockProviderVehicle::new();
+        vehicle.expect_read().returning(move || Ok(source.lock().clone()));
+        vehicle.expect_path().return_const(path.to_string_lossy().into_owned());
+        vehicle.expect_typ().return_const(ProviderVehicleType::Http);
+        let manager = ProxyManager::new(Arc::new(NoopResolver), None);
+        let hc = HealthCheck::new(vec![], "invalid-url".to_owned(), 0, true, manager);
+        let provider = ProxySetProvider::new("snapshot".to_owned(), Duration::ZERO, Arc::new(vehicle), hc, None).unwrap();
+        provider.initialize().await.unwrap();
+        let original = provider.proxies();
+        let entry = original[0].clone();
+        let exit = original[1].clone();
+        assert!(exit.dialer_dependency().unwrap().ptr_eq(&entry));
+
+        provider.update().await.unwrap();
+        assert!(Arc::ptr_eq(&original, &provider.proxies()));
+        assert!(exit.dialer_dependency().unwrap().ptr_eq(&entry));
+
+        *content.lock() = config(1081);
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+        assert!(provider.update().await.is_err());
+        assert!(Arc::ptr_eq(&original, &provider.proxies()));
+        assert!(exit.dialer_dependency().unwrap().ptr_eq(&entry));
+
+        fs::remove_dir(&path).unwrap();
+        provider.update().await.unwrap();
+        let committed = provider.proxies();
+        assert!(!Arc::ptr_eq(&original, &committed));
+        assert!(!committed[0].ptr_eq(&entry));
+        assert!(committed[1].dialer_dependency().unwrap().ptr_eq(&committed[0]));
+        assert!(exit.dialer_dependency().unwrap().ptr_eq(&committed[0]));
+    }
 
     #[tokio::test]
     async fn test_proxy_set_provider() {
@@ -369,6 +341,7 @@ proxies:
             Duration::from_secs(1),
             vehicle,
             hc,
+            None,
         )
         .unwrap();
 
@@ -425,6 +398,7 @@ proxies:
             Duration::from_secs(1),
             vehicle,
             hc,
+            None,
         )
         .unwrap();
 

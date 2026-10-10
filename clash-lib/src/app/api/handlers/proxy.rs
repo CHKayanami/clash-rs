@@ -22,7 +22,7 @@ use crate::{
         outbound::manager::ThreadSafeOutboundManager,
         profile::ThreadSafeCacheFile,
     },
-    proxy::AnyOutboundHandler,
+    proxy::OutboundNode,
 };
 
 #[derive(Clone)]
@@ -81,7 +81,7 @@ async fn find_proxy_by_name(
 }
 
 async fn get_proxy(
-    Extension(proxy): Extension<AnyOutboundHandler>,
+    Extension(proxy): Extension<OutboundNode>,
     State(state): State<ProxyState>,
 ) -> impl IntoResponse {
     let outbound_manager = state.outbound_manager.clone();
@@ -96,7 +96,7 @@ struct UpdateProxyRequest {
 
 async fn update_proxy(
     State(state): State<ProxyState>,
-    Extension(proxy): Extension<AnyOutboundHandler>,
+    Extension(proxy): Extension<OutboundNode>,
     Json(payload): Json<UpdateProxyRequest>,
 ) -> impl IntoResponse {
     let outbound_manager = state.outbound_manager.clone();
@@ -134,7 +134,7 @@ async fn update_proxy(
 
 async fn get_proxy_delay(
     State(state): State<ProxyState>,
-    Extension(proxy): Extension<AnyOutboundHandler>,
+    Extension(proxy): Extension<OutboundNode>,
     Query(q): Query<DelayRequest>,
 ) -> impl IntoResponse {
     let outbound_manager = state.outbound_manager.clone();
@@ -143,7 +143,7 @@ async fn get_proxy_delay(
     let mut headers = HeaderMap::new();
     headers.insert(header::CONNECTION, "close".parse().unwrap());
 
-    let (actual, overall) = if proxy.try_as_group_handler().is_some() {
+    let (actual, overall) = if proxy.as_group().is_some() {
         match group_url_test(&outbound_manager, proxy, &q.url, timeout).await {
             Ok(latency) => latency,
             Err(err) => {

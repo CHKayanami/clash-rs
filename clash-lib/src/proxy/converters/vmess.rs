@@ -25,7 +25,7 @@ impl TryFrom<OutboundVmess> for Handler {
 
 pub fn build_handler(
     s: &OutboundVmess,
-    connector: Option<Arc<dyn RemoteConnector>>,
+    connector: Option<Arc<RemoteConnector>>,
 ) -> Result<Handler, crate::Error> {
     s.smux.as_ref().map(|m| m.validate()).transpose()?;
 

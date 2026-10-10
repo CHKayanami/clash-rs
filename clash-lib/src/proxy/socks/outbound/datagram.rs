@@ -1,37 +1,41 @@
 use std::{
     net::SocketAddr,
     pin::Pin,
+    sync::Arc,
     task::{Context, Poll},
 };
 
-use futures::{Sink, SinkExt, Stream, StreamExt};
-use tokio::net::UdpSocket;
-use tracing::{error, trace};
+use crate::proxy::utils::dialer_route::{self, Route};
+
+use futures::{Sink, SinkExt, Stream, StreamExt, ready};
+use bytes::BytesMut;
+use tokio_util::codec::{Decoder, Encoder};
+use tracing::trace;
 
 use crate::{
-    proxy::{AnyStream, datagram::UdpPacket, socks::inbound::Socks5UdpFramed},
-    session::SocksAddr,
+    proxy::{AnyOutboundDatagram, AnyStream, datagram::UdpPacket, socks::inbound::Socks5UDPCodec},
 };
 
 pub struct Socks5Datagram {
     // hold the socket to keep it alive and drop it when this is dropped
     _socket: AnyStream,
     remote: SocketAddr,
-    inner: Socks5UdpFramed,
+    inner: AnyOutboundDatagram,
+    // Keep pinned routes alive for transport workers until the association closes.
+    _route: Option<Arc<Route>>,
 }
 
 impl Socks5Datagram {
     pub(crate) fn new(
         socket: AnyStream,
         remote: SocketAddr,
-        udp_socket: UdpSocket,
+        datagram: AnyOutboundDatagram,
     ) -> Self {
-        let framed = Socks5UdpFramed::new(udp_socket);
-
         Self {
             _socket: socket,
             remote,
-            inner: framed,
+            inner: datagram,
+            _route: dialer_route::retain(),
         }
     }
 }
@@ -67,8 +71,11 @@ impl Sink<UdpPacket> for Socks5Datagram {
             remote, item.dst_addr
         );
         let pin = self.get_mut();
-        pin.inner
-            .start_send_unpin(((item.data, item.dst_addr), remote))
+        let mut data = BytesMut::new();
+        Socks5UDPCodec.encode((item.data, item.dst_addr), &mut data)?;
+        pin.inner.start_send_unpin(UdpPacket {
+            data: data.freeze(), dst_addr: remote.into(), ..Default::default()
+        })
     }
 
     fn poll_flush(
@@ -96,27 +103,25 @@ impl Stream for Socks5Datagram {
         cx: &mut Context<'_>,
     ) -> Poll<Option<Self::Item>> {
         let pin = self.get_mut();
-        pin.inner.poll_next_unpin(cx).map(|opt| {
-            opt.map(|res| match res {
-                Ok(((src, data), dst)) => {
-                    trace!("received UDP packet from {} to {}", src, dst,);
-                    UdpPacket {
-                        src_addr: src,
-                        dst_addr: SocksAddr::Ip(dst),
-                        data: data.freeze(),
-                        inbound_user: None,
-                    }
-                }
-                Err(_) => {
-                    error!("failed to decode UDP packet from remote");
-                    UdpPacket {
-                        src_addr: SocksAddr::any_ipv4(),
-                        dst_addr: SocksAddr::any_ipv4(),
-                        data: bytes::Bytes::new(),
-                        inbound_user: None,
-                    }
-                }
-            })
-        })
+        loop {
+            let packet = match ready!(pin.inner.poll_next_unpin(cx)) {
+                Some(packet) => packet,
+                None => return Poll::Ready(None),
+            };
+            if packet.src_addr.ip().is_some_and(|ip| ip != pin.remote.ip())
+                || packet.src_addr.port() != pin.remote.port()
+            {
+                trace!("dropping socks5 UDP packet from unexpected relay {}", packet.src_addr);
+                continue;
+            }
+            let mut data = BytesMut::from(packet.data.as_ref());
+            match Socks5UDPCodec.decode(&mut data) {
+                Ok(Some((src_addr, data))) => return Poll::Ready(Some(UdpPacket {
+                    src_addr, dst_addr: pin.remote.into(),
+                    data: data.freeze(), inbound_user: None,
+                })),
+                _ => trace!("dropping malformed socks5 UDP packet"),
+            }
+        }
     }
 }

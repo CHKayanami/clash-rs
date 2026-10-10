@@ -1,4 +1,3 @@
-use async_trait::async_trait;
 use http::{Request, StatusCode};
 use std::collections::HashMap;
 use tokio_tungstenite::{
@@ -65,7 +64,6 @@ impl Client {
     }
 }
 
-#[async_trait]
 impl Transport for Client {
     async fn proxy_stream(&self, stream: AnyStream) -> std::io::Result<AnyStream> {
         let req = self.req();

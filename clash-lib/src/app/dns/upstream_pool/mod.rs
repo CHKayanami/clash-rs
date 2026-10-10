@@ -18,12 +18,12 @@ pub use udp::UdpUpstream;
 
 use crate::app::dns::ClashResolver;
 use crate::app::dns::query::QueryContext;
-use crate::proxy::utils::OutboundHandlerRegistry;
+use crate::proxy::utils::OutboundNodeRegistry;
 
 pub struct UpstreamPool {
     pub entries: HashMap<String, UpstreamEntry>,
     pub admission: AdmissionGate,
-    pub outbounds: OutboundHandlerRegistry,
+    pub outbounds: OutboundNodeRegistry,
     pub bootstrap_resolver: Option<Arc<dyn ClashResolver>>,
     pub active_transport_tasks: Arc<AtomicUsize>,
     pub dns_query_timeout: Duration,
@@ -36,7 +36,7 @@ pub struct UpstreamPool {
 impl UpstreamPool {
     pub fn new(
         entries: HashMap<String, UpstreamEntry>,
-        outbounds: OutboundHandlerRegistry,
+        outbounds: OutboundNodeRegistry,
         bootstrap_resolver: Option<Arc<dyn ClashResolver>>,
         fw_mark: Option<u32>,
         default_interface: Option<crate::app::net::OutboundInterface>,

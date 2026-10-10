@@ -5,7 +5,7 @@ use crate::{
         errors::map_io_error,
         http::{ClashHTTPClientExt, HttpClient, DEFAULT_USER_AGENT},
     },
-    proxy::utils::OutboundHandlerRegistry,
+    proxy::utils::OutboundNodeRegistry,
 };
 
 use async_trait::async_trait;
@@ -41,7 +41,7 @@ impl Vehicle {
         cwd: Option<P>,
         dns_resolver: ThreadSafeDNSResolver,
         outbound: Option<String>,
-        outbounds: Option<OutboundHandlerRegistry>,
+        outbounds: Option<OutboundNodeRegistry>,
         headers: Option<HashMap<String, Vec<String>>>,
     ) -> Self {
         Self::new_with_timeout(
@@ -62,7 +62,7 @@ impl Vehicle {
         cwd: Option<P>,
         dns_resolver: ThreadSafeDNSResolver,
         outbound: Option<String>,
-        outbounds: Option<OutboundHandlerRegistry>,
+        outbounds: Option<OutboundNodeRegistry>,
         headers: Option<HashMap<String, Vec<String>>>,
         timeout: Option<tokio::time::Duration>,
     ) -> Self {
@@ -229,6 +229,7 @@ impl ProviderVehicle for Vehicle {
 
 #[cfg(test)]
 mod tests {
+    use crate::proxy::{OutboundNode, direct::Handler as DirectHandler};
     use arc_swap::ArcSwap;
     use super::ProviderVehicle;
     use crate::{
@@ -331,8 +332,7 @@ mod tests {
         let r = Arc::new(EnhancedResolver::new_default().await);
 
         let mut registry_map = std::collections::HashMap::new();
-        let direct_handler = Arc::new(crate::proxy::direct::Handler::new("my-proxy"))
-            as crate::proxy::AnyOutboundHandler;
+        let direct_handler = OutboundNode::protocol(Arc::new(DirectHandler::new("my-proxy")));
         registry_map.insert("my-proxy".to_string(), direct_handler);
         let registry = Arc::new(ArcSwap::from_pointee(registry_map));
 

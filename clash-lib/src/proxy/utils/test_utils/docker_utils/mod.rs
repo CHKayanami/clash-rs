@@ -4,7 +4,7 @@ use crate::{
         dispatcher::{BoxedChainedDatagram, ChainedStream},
         remote_content_manager::ProxyManager,
     },
-    proxy::{OutboundHandler, datagram::UdpPacket},
+    proxy::{OutboundNode, datagram::UdpPacket},
     session::{Session, SocksAddr},
 };
 use anyhow::{anyhow, bail};
@@ -182,7 +182,7 @@ fn destination_list(gateway_ip: Option<String>) -> Vec<String> {
 
 // TODO: add the throughput metrics
 pub async fn ping_pong_test(
-    handler: Arc<dyn OutboundHandler>,
+    handler: OutboundNode,
     gateway_ip: Option<String>,
 ) -> anyhow::Result<()> {
     // PATH: our proxy handler -> proxy-server(container) -> target local
@@ -394,7 +394,7 @@ pub async fn ping_pong_test(
 }
 
 pub async fn ping_pong_udp_test(
-    handler: Arc<dyn OutboundHandler>,
+    handler: OutboundNode,
     gateway_ip: Option<String>,
 ) -> anyhow::Result<()> {
     // PATH: our proxy handler -> proxy-server(container) -> target local
@@ -584,7 +584,7 @@ pub async fn ping_pong_udp_test(
 
 // latency test of the proxy, will reuse the `url_test` ability
 pub async fn latency_test(
-    handler: Arc<dyn OutboundHandler>,
+    handler: OutboundNode,
 ) -> anyhow::Result<(Duration, Duration)> {
     let resolver = config_helper::build_dns_resolver().await?;
     let proxy_manager = ProxyManager::new(resolver.clone(), None);
@@ -608,7 +608,7 @@ pub async fn latency_test(
     unreachable!()
 }
 
-pub async fn dns_test(handler: Arc<dyn OutboundHandler>) -> anyhow::Result<()> {
+pub async fn dns_test(handler: OutboundNode) -> anyhow::Result<()> {
     let src = SocksAddr::Ip(
         "127.0.0.1:0"
             .parse()
@@ -1053,7 +1053,7 @@ pub async fn clash_process_e2e_throughput(
 // ─────────────────────────────────────────────────────────────────────────────
 
 pub async fn run_test_suites_and_cleanup(
-    handler: Arc<dyn OutboundHandler>,
+    handler: OutboundNode,
     docker_test_runner: impl RunAndCleanup,
     suites: &[Suite],
 ) -> anyhow::Result<()> {

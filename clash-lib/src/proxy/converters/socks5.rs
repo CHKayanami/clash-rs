@@ -20,7 +20,7 @@ impl TryFrom<OutboundSocks5> for Handler {
 
 pub fn build_handler(
     s: &OutboundSocks5,
-    connector: Option<Arc<dyn RemoteConnector>>,
+    connector: Option<Arc<RemoteConnector>>,
 ) -> Result<Handler, crate::Error> {
     let tls_client = if s.tls {
         Some(crate::proxy::transport::TransportLayer::Tls(

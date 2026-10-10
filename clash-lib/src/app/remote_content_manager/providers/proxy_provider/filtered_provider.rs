@@ -9,14 +9,14 @@ use crate::{
     app::remote_content_manager::providers::{
         Provider, ProviderType, ProviderVehicleType,
     },
-    proxy::AnyOutboundHandler,
+    proxy::OutboundNode,
 };
 
 use super::{ArcProxyProvider, ProxyProvider};
 
 struct FilteredSnapshot {
-    raw_snapshot: Arc<Vec<AnyOutboundHandler>>,
-    filtered_snapshot: Arc<Vec<AnyOutboundHandler>>,
+    raw_snapshot: Arc<Vec<OutboundNode>>,
+    filtered_snapshot: Arc<Vec<OutboundNode>>,
 }
 
 /// A wrapper around another `ProxyProvider` that filters its proxy nodes
@@ -24,7 +24,7 @@ struct FilteredSnapshot {
 pub struct FilteredProxyProvider {
     inner: ArcProxyProvider,
     filter: Arc<Regex>,
-    empty_fallback: Option<AnyOutboundHandler>,
+    empty_fallback: Option<OutboundNode>,
     cache: Arc<ArcSwapOption<FilteredSnapshot>>,
 }
 
@@ -32,7 +32,7 @@ impl FilteredProxyProvider {
     pub fn new(
         inner: ArcProxyProvider,
         filter: Arc<Regex>,
-        empty_fallback: Option<AnyOutboundHandler>,
+        empty_fallback: Option<OutboundNode>,
     ) -> Self {
         Self {
             inner,
@@ -72,7 +72,7 @@ impl Provider for FilteredProxyProvider {
 
 #[async_trait]
 impl ProxyProvider for FilteredProxyProvider {
-    fn proxies(&self) -> Arc<Vec<AnyOutboundHandler>> {
+    fn proxies(&self) -> Arc<Vec<OutboundNode>> {
         let current = self.inner.proxies();
         let cached_guard = self.cache.load();
 
@@ -82,7 +82,7 @@ impl ProxyProvider for FilteredProxyProvider {
             }
         }
 
-        let mut filtered: Vec<AnyOutboundHandler> = current
+        let mut filtered: Vec<OutboundNode> = current
             .iter()
             .filter(|p| self.filter.is_match(p.name()).unwrap_or(false))
             .cloned()
@@ -122,7 +122,7 @@ mod tests {
 
     struct DummyProvider {
         name: String,
-        proxies: Arc<Vec<AnyOutboundHandler>>,
+        proxies: Arc<Vec<OutboundNode>>,
     }
 
     #[async_trait]
@@ -154,7 +154,7 @@ mod tests {
 
     #[async_trait]
     impl ProxyProvider for DummyProvider {
-        fn proxies(&self) -> Arc<Vec<AnyOutboundHandler>> {
+        fn proxies(&self) -> Arc<Vec<OutboundNode>> {
             self.proxies.clone()
         }
 
@@ -165,11 +165,11 @@ mod tests {
 
     #[test]
     fn test_filtered_proxy_provider() {
-        let p1: AnyOutboundHandler = Arc::new(direct::Handler::new("HK 01"));
-        let p2: AnyOutboundHandler = Arc::new(direct::Handler::new("US 01"));
-        let p3: AnyOutboundHandler = Arc::new(direct::Handler::new("TW 01"));
-        let reject_handler: AnyOutboundHandler =
-            Arc::new(reject::Handler::new("REJECT"));
+        let p1: OutboundNode = OutboundNode::protocol(Arc::new(direct::Handler::new("HK 01")));
+        let p2: OutboundNode = OutboundNode::protocol(Arc::new(direct::Handler::new("US 01")));
+        let p3: OutboundNode = OutboundNode::protocol(Arc::new(direct::Handler::new("TW 01")));
+        let reject_handler: OutboundNode =
+            OutboundNode::protocol(Arc::new(reject::Handler::new("REJECT")));
 
         let dummy = Arc::new(DummyProvider {
             name: "test_provider".to_string(),

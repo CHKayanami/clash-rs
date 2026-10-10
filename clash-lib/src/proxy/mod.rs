@@ -1,17 +1,14 @@
 use crate::{
     app::dns::ThreadSafeDNSResolver, proxy::datagram::UdpPacket, session::Session,
 };
-use async_trait::async_trait;
 use erased_serde::Serialize as ErasedSerialize;
 use futures::{Sink, Stream};
 use serde::{Deserialize, Serialize};
-use tracing::error;
 
 use std::{
     collections::HashMap,
     fmt::{Debug, Display},
-    io,
-    sync::Arc,
+    io, future::Future,
 };
 
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -59,15 +56,17 @@ pub mod vmess;
 pub mod wg;
 
 pub mod group;
-pub use group::{fallback, loadbalance, relay, selector, urltest};
+pub use group::{fallback, loadbalance, selector, urltest};
 
 mod common;
+mod outbound;
+mod protocol;
+pub use protocol::{ProtocolOutbound, WeakProtocolOutbound};
 pub mod inbound;
 mod options;
 pub mod transport;
 pub mod tunnel;
 
-use crate::proxy::group::GroupProxyAPIResponse;
 pub use options::HandlerCommonOptions;
 
 #[cfg(test)]
@@ -191,7 +190,6 @@ pub enum OutboundType {
     #[serde(rename = "URLTest")]
     UrlTest,
     Selector,
-    Relay,
     LoadBalance,
     Smart,
     Fallback,
@@ -220,7 +218,6 @@ impl Display for OutboundType {
 
             OutboundType::UrlTest => write!(f, "URLTest"),
             OutboundType::Selector => write!(f, "Selector"),
-            OutboundType::Relay => write!(f, "Relay"),
             OutboundType::LoadBalance => write!(f, "LoadBalance"),
             OutboundType::Smart => write!(f, "Smart"),
             OutboundType::Fallback => write!(f, "Fallback"),
@@ -231,13 +228,6 @@ impl Display for OutboundType {
     }
 }
 
-pub enum ConnectorType {
-    Tcp,
-    All,
-    None,
-}
-
-#[async_trait]
 pub trait OutboundHandler: Sync + Send + Unpin + DialWithConnector + Debug {
     /// The name of the outbound handler
     fn name(&self) -> &str;
@@ -253,62 +243,57 @@ pub trait OutboundHandler: Sync + Send + Unpin + DialWithConnector + Debug {
     fn proto(&self) -> OutboundType;
 
     /// whether the outbound handler support UDP
-    async fn support_udp(&self) -> bool;
+    fn support_udp(&self) -> bool;
 
     /// connect to remote target via TCP
-    async fn connect_stream(
+    fn connect_stream(
         &self,
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
-    ) -> io::Result<AnyStream>;
+    ) -> impl Future<Output = io::Result<AnyStream>> + Send;
 
     /// connect to remote target via UDP
-    async fn connect_datagram(
+    fn connect_datagram(
         &self,
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
-    ) -> io::Result<AnyOutboundDatagram>;
+    ) -> impl Future<Output = io::Result<AnyOutboundDatagram>> + Send;
 
-    /// relay related
-    async fn support_connector(&self) -> ConnectorType;
-
-    async fn connect_stream_with_connector(
+    fn connect_stream_with_connector(
         &self,
         _sess: &Session,
         _resolver: ThreadSafeDNSResolver,
-        _connector: &dyn RemoteConnector,
-    ) -> io::Result<AnyStream> {
-        error!("tcp relay not supported for {}", self.proto());
-        Err(io::Error::other(format!(
-            "tcp relay not supported for {}",
-            self.proto()
-        )))
+        _connector: &RemoteConnector,
+    ) -> impl Future<Output = io::Result<AnyStream>> + Send {
+        async move {
+            Err(io::Error::other(format!(
+                "tcp connector not supported for {}",
+                self.proto()
+            )))
+
+        }
     }
 
-    async fn connect_datagram_with_connector(
+    fn connect_datagram_with_connector(
         &self,
         _sess: &Session,
         _resolver: ThreadSafeDNSResolver,
-        _connector: &dyn RemoteConnector,
-    ) -> io::Result<AnyOutboundDatagram> {
-        Err(io::Error::other(format!(
-            "udp relay not supported for {}",
-            self.proto()
-        )))
+        _connector: &RemoteConnector,
+    ) -> impl Future<Output = io::Result<AnyOutboundDatagram>> + Send {
+        async move {
+            Err(io::Error::other(format!(
+                "udp connector not supported for {}",
+                self.proto()
+            )))
+
+        }
     }
 
-    fn try_as_group_handler(&self) -> Option<&dyn GroupProxyAPIResponse> {
-        None
-    }
-
-    fn try_as_plain_handler(&self) -> Option<&dyn PlainProxyAPIResponse> {
-        None
-    }
 }
-pub type AnyOutboundHandler = Arc<dyn OutboundHandler>;
+pub use outbound::{OutboundNode, WeakOutboundNode};
 
-#[async_trait]
 pub trait DialWithConnector {
+    fn dialer_dependency(&self) -> Option<OutboundNode> { None }
     fn support_dialer(&self) -> Option<&str> {
         None
     }
@@ -316,8 +301,7 @@ pub trait DialWithConnector {
 
 /// Plain outbound implements this trait to serialize itself for rest API
 /// response.
-#[async_trait]
-pub trait PlainProxyAPIResponse: OutboundHandler {
+pub trait PlainProxyAPIResponse: Send + Sync {
     /// used in the API responses.
-    async fn as_map(&self) -> HashMap<String, Box<dyn ErasedSerialize + Send>>;
+    fn as_map(&self) -> impl Future<Output = HashMap<String, Box<dyn ErasedSerialize + Send>>> + Send;
 }

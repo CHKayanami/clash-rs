@@ -10,7 +10,7 @@ use crate::{
         healthcheck::HealthCheck,
         providers::{Provider, ProviderType, ProviderVehicleType},
     },
-    proxy::AnyOutboundHandler,
+    proxy::OutboundNode,
 };
 
 use super::ProxyProvider;
@@ -20,14 +20,14 @@ use super::ProxyProvider;
 /// Used in GroupOutbounds to manage proxy health checks.
 pub struct PlainProvider {
     name: String,
-    proxies: Arc<Vec<AnyOutboundHandler>>,
+    proxies: Arc<Vec<OutboundNode>>,
     hc: Arc<HealthCheck>,
 }
 
 impl PlainProvider {
     pub fn new(
         name: String,
-        proxies: Vec<AnyOutboundHandler>,
+        proxies: Vec<OutboundNode>,
         hc: HealthCheck,
     ) -> anyhow::Result<Self> {
         let hc = Arc::new(hc);
@@ -92,7 +92,7 @@ impl Provider for PlainProvider {
 
 #[async_trait]
 impl ProxyProvider for PlainProvider {
-    fn proxies(&self) -> Arc<Vec<AnyOutboundHandler>> {
+    fn proxies(&self) -> Arc<Vec<OutboundNode>> {
         self.proxies.clone()
     }
 

@@ -1,7 +1,6 @@
 mod stream;
 
 use arti_client::{StreamPrefs, TorClientConfig};
-use async_trait::async_trait;
 
 use crate::{
     app::dns::ThreadSafeDNSResolver,
@@ -13,7 +12,7 @@ use crate::{
 pub(crate) use self::stream::StreamWrapper;
 
 use super::{
-    ConnectorType, DialWithConnector, OutboundHandler, OutboundType,
+    DialWithConnector, OutboundHandler, OutboundType,
     PlainProxyAPIResponse,
 };
 use erased_serde::Serialize as ErasedSerialize;
@@ -50,7 +49,6 @@ impl Handler {
 
 impl DialWithConnector for Handler {}
 
-#[async_trait]
 impl OutboundHandler for Handler {
     fn name(&self) -> &str {
         &self.opts.name
@@ -60,7 +58,7 @@ impl OutboundHandler for Handler {
         OutboundType::Tor
     }
 
-    async fn support_udp(&self) -> bool {
+    fn support_udp(&self) -> bool {
         false
     }
 
@@ -96,16 +94,10 @@ impl OutboundHandler for Handler {
         Err(new_io_error("Tor outbound handler does not support UDP"))
     }
 
-    async fn support_connector(&self) -> ConnectorType {
-        ConnectorType::None
-    }
 
-    fn try_as_plain_handler(&self) -> Option<&dyn PlainProxyAPIResponse> {
-        Some(self as _)
-    }
+
 }
 
-#[async_trait]
 impl PlainProxyAPIResponse for Handler {
     async fn as_map(&self) -> HashMap<String, Box<dyn ErasedSerialize + Send>> {
         HashMap::new()

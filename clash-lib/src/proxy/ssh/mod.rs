@@ -1,8 +1,10 @@
+#[cfg(all(test, docker_test))]
+use crate::proxy::OutboundNode;
+
 use std::{
     borrow::Cow, collections::HashMap, io, pin::Pin, sync::Arc, time::Duration,
 };
 
-use async_trait::async_trait;
 use erased_serde::Serialize as ErasedSerialize;
 
 mod auth;
@@ -22,9 +24,10 @@ use crate::{
     common::errors::new_io_error,
     impl_default_connector,
     proxy::{
-        AnyOutboundDatagram, AnyStream, ConnectorType, DialWithConnector,
+        AnyOutboundDatagram, AnyStream, DialWithConnector,
         HandlerCommonOptions, OutboundHandler, OutboundType,
-        PlainProxyAPIResponse, ProxyStream, utils::RemoteConnector,
+        PlainProxyAPIResponse, ProxyStream,
+        utils::{GLOBAL_DIRECT_CONNECTOR, RemoteConnector},
     },
     session::Session,
 };
@@ -109,14 +112,13 @@ pub struct HandlerOptions {
 pub struct Handler {
     opts: HandlerOptions,
 
-    #[allow(dead_code)]
-    connector: Option<Arc<dyn RemoteConnector>>,
+    connector: Option<Arc<RemoteConnector>>,
 }
 
 impl_default_connector!(Handler);
 
 impl Handler {
-    pub fn new(opts: HandlerOptions, connector: Option<Arc<dyn RemoteConnector>>) -> Self {
+    pub fn new(opts: HandlerOptions, connector: Option<Arc<RemoteConnector>>) -> Self {
         Self { opts, connector }
     }
 }
@@ -137,7 +139,6 @@ const KEX_ALGORITHMS: &[Name] = &[
     EXTENSION_SUPPORT_AS_CLIENT,
 ];
 
-#[async_trait]
 impl OutboundHandler for Handler {
     fn name(&self) -> &str {
         &self.opts.name
@@ -151,18 +152,30 @@ impl OutboundHandler for Handler {
         OutboundType::Ssh
     }
 
-    async fn support_udp(&self) -> bool {
+    fn support_udp(&self) -> bool {
         false
-    }
-
-    async fn support_connector(&self) -> ConnectorType {
-        ConnectorType::Tcp
     }
 
     async fn connect_stream(
         &self,
         sess: &Session,
-        _resolver: ThreadSafeDNSResolver,
+        resolver: ThreadSafeDNSResolver,
+    ) -> io::Result<AnyStream> {
+        let connector = match self.connector.as_deref() {
+            Some(connector) => connector,
+            None if self.opts.common_opts.connector.is_some() => {
+                return Err(io::Error::other("ssh dialer-proxy connector is unavailable"));
+            }
+            None => GLOBAL_DIRECT_CONNECTOR.as_ref(),
+        };
+        self.connect_stream_with_connector(sess, resolver, connector).await
+    }
+
+    async fn connect_stream_with_connector(
+        &self,
+        sess: &Session,
+        resolver: ThreadSafeDNSResolver,
+        connector: &RemoteConnector,
     ) -> io::Result<AnyStream> {
         // key exchange algorithms
         let kex = Cow::Borrowed(KEX_ALGORITHMS);
@@ -193,11 +206,14 @@ impl OutboundHandler for Handler {
         });
         let sh = connector::Client { server_public_key };
 
-        // TODO: adding fw_mark
-        let mut session =
-            client::connect(config, (self.opts.server.as_str(), self.opts.port), sh)
-                .await
-                .map_err(io::Error::other)?;
+        let stream = connector.connect_stream(
+            resolver, &self.opts.server, self.opts.port,
+            self.opts.common_opts.tfo, sess.iface.as_ref(),
+            #[cfg(target_os = "linux")]
+            sess.so_mark,
+        ).await?;
+        let mut session = client::connect_stream(config, stream, sh)
+            .await.map_err(io::Error::other)?;
 
         auth0(&mut session, &self.opts).await?;
 
@@ -227,12 +243,8 @@ impl OutboundHandler for Handler {
         Err(new_io_error("ssh udp is not implemented yet"))
     }
 
-    fn try_as_plain_handler(&self) -> Option<&dyn PlainProxyAPIResponse> {
-        Some(self as _)
-    }
 }
 
-#[async_trait]
 impl PlainProxyAPIResponse for Handler {
     async fn as_map(&self) -> HashMap<String, Box<dyn ErasedSerialize + Send>> {
         let mut m = HashMap::new();
@@ -266,6 +278,10 @@ async fn auth0(
         }
     }
 }
+
+#[cfg(test)]
+#[path = "outbound_tests.rs"]
+mod outbound_tests;
 
 #[cfg(test)]
 mod totp_tests {
@@ -540,9 +556,9 @@ mod tests {
             ]),
             totp: None,
         };
-        let handler: Arc<dyn OutboundHandler> = Arc::new(Handler::new(opts, None));
+        let handler: Arc<Handler> = Arc::new(Handler::new(opts, None));
 
-        run_test_suites_and_cleanup(handler, container, Suite::tcp_tests()).await
+        run_test_suites_and_cleanup(OutboundNode::protocol(handler), container, Suite::tcp_tests()).await
     }
 
     /// Recursively copy a directory using async Rust APIs

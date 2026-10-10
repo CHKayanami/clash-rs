@@ -1,4 +1,3 @@
-use async_trait::async_trait;
 use bytes::{BufMut, BytesMut};
 use std::{
     collections::HashMap,
@@ -42,7 +41,6 @@ impl Client {
     }
 }
 
-#[async_trait]
 impl Transport for Client {
     async fn proxy_stream(&self, stream: AnyStream) -> std::io::Result<AnyStream> {
         Ok(HttpStream::new(

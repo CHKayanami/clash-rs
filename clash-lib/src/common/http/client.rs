@@ -2,7 +2,7 @@ use crate::{
     app::dns::ThreadSafeDNSResolver,
     common::tls::GLOBAL_ROOT_STORE,
     config::internal::proxy::PROXY_DIRECT,
-    proxy::{AnyOutboundHandler, direct, utils::OutboundHandlerRegistry},
+    proxy::{OutboundNode, direct, utils::OutboundNodeRegistry},
     session::Session,
 };
 use futures::FutureExt;
@@ -20,7 +20,7 @@ pub(crate) struct ClashHTTPClientExt {
 #[derive(Clone)]
 pub struct HttpClient {
     dns_resolver: ThreadSafeDNSResolver,
-    outbounds: Option<OutboundHandlerRegistry>,
+    outbounds: Option<OutboundNodeRegistry>,
     tls_config: Arc<rustls::ClientConfig>,
     timeout: tokio::time::Duration,
 }
@@ -30,7 +30,7 @@ pub const DEFAULT_HTTP_TIMEOUT: tokio::time::Duration = tokio::time::Duration::f
 impl HttpClient {
     pub fn new(
         dns_resolver: ThreadSafeDNSResolver,
-        bootstrap_outbounds: Option<OutboundHandlerRegistry>,
+        bootstrap_outbounds: Option<OutboundNodeRegistry>,
         timeout: Option<tokio::time::Duration>,
     ) -> std::io::Result<HttpClient> {
         let mut tls_config = rustls::ClientConfig::builder()
@@ -102,8 +102,8 @@ impl HttpClient {
             .get::<ClashHTTPClientExt>()
             .and_then(|ext| ext.outbound.clone());
         let make_direct =
-            || Arc::new(direct::Handler::new(PROXY_DIRECT)) as AnyOutboundHandler;
-        let outbound: AnyOutboundHandler = if let Some(name) = outbound_name {
+            || OutboundNode::protocol(Arc::new(direct::Handler::new(PROXY_DIRECT)));
+        let outbound: OutboundNode = if let Some(name) = outbound_name {
             if let Some(registry) = &self.outbounds {
                 registry
                     .load()
@@ -217,7 +217,7 @@ impl HttpClient {
 /// outbounds, that is used by clash to send outgoing HTTP requests.
 pub fn new_http_client(
     dns_resolver: ThreadSafeDNSResolver,
-    bootstrap_outbounds: Option<OutboundHandlerRegistry>,
+    bootstrap_outbounds: Option<OutboundNodeRegistry>,
 ) -> std::io::Result<HttpClient> {
     HttpClient::new(dns_resolver, bootstrap_outbounds, None)
 }

@@ -1,3 +1,7 @@
+use crate::proxy::utils::dialer_route;
+#[cfg(all(test, docker_test))]
+use crate::proxy::OutboundNode;
+
 mod datagram;
 
 use super::socks5::{client_handshake, socks_command};
@@ -6,14 +10,13 @@ use crate::{
     common::errors::new_io_error,
     impl_default_connector,
     proxy::{
-        AnyOutboundDatagram, AnyStream, ConnectorType, DialWithConnector,
+        AnyOutboundDatagram, AnyStream, DialWithConnector,
         HandlerCommonOptions, OutboundHandler, OutboundType,
         PlainProxyAPIResponse, transport::TransportLayer,
-        utils::{GLOBAL_DIRECT_CONNECTOR, RemoteConnector, new_udp_socket},
+        utils::{GLOBAL_DIRECT_CONNECTOR, RemoteConnector},
     },
     session::Session,
 };
-use async_trait::async_trait;
 pub(crate) use datagram::Socks5Datagram;
 use erased_serde::Serialize as ErasedSerialize;
 use std::{collections::HashMap, fmt::Debug, sync::Arc};
@@ -34,7 +37,7 @@ pub struct HandlerOptions {
 pub struct Handler {
     opts: HandlerOptions,
 
-    connector: Option<Arc<dyn RemoteConnector>>,
+    connector: Option<Arc<RemoteConnector>>,
 }
 
 impl_default_connector!(Handler);
@@ -48,7 +51,7 @@ impl Debug for Handler {
 }
 
 impl Handler {
-    pub fn new(opts: HandlerOptions, connector: Option<Arc<dyn RemoteConnector>>) -> Self {
+    pub fn new(opts: HandlerOptions, connector: Option<Arc<RemoteConnector>>) -> Self {
         Self { opts, connector }
     }
 
@@ -80,6 +83,7 @@ impl Handler {
         s: AnyStream,
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
+        connector: &RemoteConnector,
     ) -> std::io::Result<Socks5Datagram> {
         let mut s = if let Some(tls_client) = self.opts.tls_client.as_ref() {
             tls_client.wrap(s).await?
@@ -116,24 +120,17 @@ impl Handler {
         let bind_port = bind_addr.port();
         trace!("bind address resolved to {}:{}", bind_ip, bind_port);
 
-        let udp_socket = new_udp_socket(
-            None,
-            sess.iface.as_ref(),
+        let remote = (bind_ip, bind_port).into();
+        let datagram = connector.connect_datagram(
+            resolver, None, remote, sess.iface.as_ref(),
             #[cfg(target_os = "linux")]
             sess.so_mark,
-            Some((bind_ip, bind_port).into()),
-        )
-        .await?;
+        ).await?;
 
-        Ok(Socks5Datagram::new(
-            s,
-            (bind_ip, bind_port).into(),
-            udp_socket,
-        ))
+        Ok(Socks5Datagram::new(s, (bind_ip, bind_port).into(), datagram))
     }
 }
 
-#[async_trait]
 impl OutboundHandler for Handler {
     fn name(&self) -> &str {
         &self.opts.name
@@ -147,7 +144,7 @@ impl OutboundHandler for Handler {
         OutboundType::Socks5
     }
 
-    async fn support_udp(&self) -> bool {
+    fn support_udp(&self) -> bool {
         self.opts.udp
     }
 
@@ -191,15 +188,11 @@ impl OutboundHandler for Handler {
         }
     }
 
-    async fn support_connector(&self) -> ConnectorType {
-        ConnectorType::All
-    }
-
     async fn connect_stream_with_connector(
         &self,
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
-        connector: &dyn RemoteConnector,
+        connector: &RemoteConnector,
     ) -> std::io::Result<AnyStream> {
         let s = connector
             .connect_stream(
@@ -223,32 +216,30 @@ impl OutboundHandler for Handler {
         &self,
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
-        connector: &dyn RemoteConnector,
+        connector: &RemoteConnector,
     ) -> std::io::Result<AnyOutboundDatagram> {
-        let s = connector
-            .connect_stream(
-                resolver.clone(),
-                self.opts.server.as_str(),
-                self.opts.port,
-                self.opts.common_opts.tfo,
-                sess.iface.as_ref(),
-                #[cfg(target_os = "linux")]
-                sess.so_mark,
-            )
-            .await?;
+        dialer_route::association(matches!(connector, RemoteConnector::DialerProxy(_)), async {
+            let s = connector
+                .connect_stream(
+                    resolver.clone(),
+                    self.opts.server.as_str(),
+                    self.opts.port,
+                    self.opts.common_opts.tfo,
+                    sess.iface.as_ref(),
+                    #[cfg(target_os = "linux")]
+                    sess.so_mark,
+                )
+                .await?;
 
-        let d = self.inner_connect_datagram(s, sess, resolver).await?;
+            let d = self.inner_connect_datagram(s, sess, resolver, connector).await?;
 
-        sess.push_chain(self.name());
-        Ok(AnyOutboundDatagram::new(d))
+            sess.push_chain(self.name());
+            Ok(AnyOutboundDatagram::new(d))
+        }).await
     }
 
-    fn try_as_plain_handler(&self) -> Option<&dyn PlainProxyAPIResponse> {
-        Some(self as _)
-    }
 }
 
-#[async_trait]
 impl PlainProxyAPIResponse for Handler {
     async fn as_map(&self) -> HashMap<String, Box<dyn ErasedSerialize + Send>> {
         let mut m = HashMap::new();
@@ -389,7 +380,7 @@ mod tests {
             ..Default::default()
         };
         let handler = Arc::new(Handler::new(opts, None));
-        run_test_suites_and_cleanup(handler, runner, Suite::all()).await
+        run_test_suites_and_cleanup(OutboundNode::protocol(handler), runner, Suite::all()).await
     }
 
     #[tokio::test]
@@ -412,7 +403,7 @@ mod tests {
             opts,
             Some(GLOBAL_DIRECT_CONNECTOR.clone()),
         ));
-        run_test_suites_and_cleanup(handler, runner, Suite::all()).await
+        run_test_suites_and_cleanup(OutboundNode::protocol(handler), runner, Suite::all()).await
     }
 }
 
@@ -607,3 +598,6 @@ rules:
             .await
     }
 }
+
+#[cfg(test)]
+pub(crate) mod dialer_tests;

@@ -48,8 +48,14 @@ tun = [
 redir = []
 zero_copy = []
 bench = ["dep:criterion"]
+# Internal future measurement hook for the isolated allocation test.
+allocation-tests = []
 telemetry = ["tokio/tracing", "dep:tracing-opentelemetry", "dep:tracing-chrome", "dep:opentelemetry", "dep:opentelemetry-otlp", "dep:opentelemetry_sdk", "dep:opentelemetry-semantic-conventions"]
 dashboard = ["dep:rust-embed"]
+
+[[test]]
+name = "dispatch_allocations"
+required-features = ["allocation-tests"]
 
 [dependencies]
 clash-common = { path = "../clash-common" }

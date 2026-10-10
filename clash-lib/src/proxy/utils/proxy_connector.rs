@@ -1,78 +1,123 @@
-use async_trait::async_trait;
 use std::{
-    fmt::Debug,
+    io,
     net::SocketAddr,
     sync::{Arc, LazyLock},
 };
-use tracing::trace;
 
-use super::{dial_tcp_with_happy_eyeballs, new_udp_socket};
+use super::{DialerProxyConnector, dial_tcp_with_happy_eyeballs, new_udp_socket};
+#[cfg(test)]
+use crate::proxy::{socks::outbound::dialer_tests::RecordingConnector, anytls::tests::retry::CountingConnector};
 use crate::{
     app::{
         dns::ThreadSafeDNSResolver,
         net::OutboundInterface,
     },
     proxy::{
-        AnyOutboundDatagram, AnyOutboundHandler, AnyStream,
+        AnyOutboundDatagram, OutboundNode, AnyStream,
         direct::datagram::OutboundDatagramImpl,
     },
-    session::{Network, Session, SocksAddr, Type},
+    session::SocksAddr,
 };
 
-/// allows a proxy to get a connection to a remote server
-#[async_trait]
-pub trait RemoteConnector: Send + Sync + Debug {
-    /// Retain the same route for transports which dial after stream creation.
-    fn clone_connector(&self) -> Option<Arc<dyn RemoteConnector>> { None }
+/// Static dispatch for direct transport and named dialer routes.
+#[derive(Debug, Clone)]
+pub enum RemoteConnector {
+    Direct,
+    DialerProxy(DialerProxyConnector),
+    #[cfg(test)]
+    Recording(Arc<RecordingConnector>),
+    #[cfg(test)]
+    Counting(Arc<CountingConnector>),
+}
 
-    /// Identity used to isolate connection pools for different routes.
-    fn pool_key(&self) -> usize { self as *const Self as *const () as usize }
+impl RemoteConnector {
+    pub fn outbound_dependency(&self) -> Option<OutboundNode> {
+        match self { Self::DialerProxy(connector) => connector.outbound_dependency(), _ => None }
+    }
 
-    async fn connect_stream(
-        &self,
-        resolver: ThreadSafeDNSResolver,
-        address: &str,
-        port: u16,
-        tfo: bool,
-        iface: Option<&OutboundInterface>,
+    pub fn clone_connector(&self) -> Arc<Self> {
+        match self {
+            Self::Direct => GLOBAL_DIRECT_CONNECTOR.clone(),
+            Self::DialerProxy(connector) => connector.clone_connector(),
+            #[cfg(test)]
+            Self::Recording(_) | Self::Counting(_) => Arc::new(self.clone()),
+        }
+    }
+
+    pub fn pool_key(&self) -> usize {
+        match self {
+            Self::Direct => 0,
+            Self::DialerProxy(connector) => connector.pool_key(),
+            #[cfg(test)]
+            Self::Recording(connector) => Arc::as_ptr(connector) as usize,
+            #[cfg(test)]
+            Self::Counting(connector) => Arc::as_ptr(connector) as usize,
+        }
+    }
+
+    pub fn pool_context(&self) -> String {
+        match self { Self::DialerProxy(connector) => connector.pool_context(), _ => String::new() }
+    }
+
+    pub async fn connect_stream(
+        &self, resolver: ThreadSafeDNSResolver, address: &str, port: u16,
+        tfo: bool, iface: Option<&OutboundInterface>,
         #[cfg(target_os = "linux")] packet_mark: Option<u32>,
-    ) -> std::io::Result<AnyStream>;
+    ) -> io::Result<AnyStream> {
+        match self {
+            Self::Direct => DirectConnector.connect_stream(resolver, address, port, tfo, iface,
+                #[cfg(target_os = "linux")] packet_mark,
+            ).await,
+            Self::DialerProxy(connector) => connector.connect_stream(resolver, address, port, tfo, iface,
+                #[cfg(target_os = "linux")] packet_mark,
+            ).await,
+            #[cfg(test)]
+            Self::Recording(connector) => connector.connect_stream(resolver, address, port, tfo, iface,
+                #[cfg(target_os = "linux")] packet_mark,
+            ).await,
+            #[cfg(test)]
+            Self::Counting(connector) => connector.connect_stream(resolver, address, port, tfo, iface,
+                #[cfg(target_os = "linux")] packet_mark,
+            ).await,
+        }
+    }
 
-    async fn connect_datagram(
-        &self,
-        resolver: ThreadSafeDNSResolver,
-        src: Option<SocketAddr>,
-        destination: SocksAddr,
-        iface: Option<&OutboundInterface>,
+    pub async fn connect_datagram(
+        &self, resolver: ThreadSafeDNSResolver, src: Option<SocketAddr>,
+        destination: SocksAddr, iface: Option<&OutboundInterface>,
         #[cfg(target_os = "linux")] packet_mark: Option<u32>,
-    ) -> std::io::Result<AnyOutboundDatagram>;
+    ) -> io::Result<AnyOutboundDatagram> {
+        match self {
+            Self::Direct => DirectConnector.connect_datagram(resolver, src, destination, iface,
+                #[cfg(target_os = "linux")] packet_mark,
+            ).await,
+            Self::DialerProxy(connector) => connector.connect_datagram(resolver, src, destination, iface,
+                #[cfg(target_os = "linux")] packet_mark,
+            ).await,
+            #[cfg(test)]
+            Self::Recording(connector) => connector.connect_datagram(resolver, src, destination, iface,
+                #[cfg(target_os = "linux")] packet_mark,
+            ).await,
+            #[cfg(test)]
+            Self::Counting(connector) => connector.connect_datagram(resolver, src, destination, iface,
+                #[cfg(target_os = "linux")] packet_mark,
+            ).await,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
 pub struct DirectConnector;
 
-impl DirectConnector {
-    pub fn new() -> Self {
-        Self
-    }
-}
-
-pub static GLOBAL_DIRECT_CONNECTOR: LazyLock<Arc<dyn RemoteConnector>> =
+pub static GLOBAL_DIRECT_CONNECTOR: LazyLock<Arc<RemoteConnector>> =
     LazyLock::new(global_direct_connector);
 
-fn global_direct_connector() -> Arc<dyn RemoteConnector> {
-    Arc::new(DirectConnector::new())
+fn global_direct_connector() -> Arc<RemoteConnector> {
+    Arc::new(RemoteConnector::Direct)
 }
 
-#[async_trait]
-impl RemoteConnector for DirectConnector {
-    fn clone_connector(&self) -> Option<Arc<dyn RemoteConnector>> {
-        Some(GLOBAL_DIRECT_CONNECTOR.clone())
-    }
-
-    fn pool_key(&self) -> usize { 0 }
-
-    async fn connect_stream(
+impl DirectConnector {
+    pub async fn connect_stream(
         &self,
         resolver: ThreadSafeDNSResolver,
         address: &str,
@@ -93,7 +138,7 @@ impl RemoteConnector for DirectConnector {
         .await
     }
 
-    async fn connect_datagram(
+    pub async fn connect_datagram(
         &self,
         resolver: ThreadSafeDNSResolver,
         src: Option<SocketAddr>,
@@ -114,103 +159,5 @@ impl RemoteConnector for DirectConnector {
         .map(|x| OutboundDatagramImpl::new(x, resolver))?;
 
         Ok(AnyOutboundDatagram::Udp(Box::new(dgram)))
-    }
-}
-
-#[derive(Clone)]
-pub struct ProxyConnector {
-    proxy: AnyOutboundHandler,
-    connector: Arc<dyn RemoteConnector>,
-    identity: Arc<()>,
-}
-
-impl ProxyConnector {
-    pub fn new(
-        proxy: AnyOutboundHandler,
-        connector: Box<dyn RemoteConnector>,
-    ) -> Self {
-        Self { proxy, connector: connector.into(), identity: Arc::new(()) }
-    }
-}
-
-impl Debug for ProxyConnector {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ProxyConnector")
-            .field("proxy", &self.proxy.name())
-            .finish()
-    }
-}
-
-#[async_trait]
-impl RemoteConnector for ProxyConnector {
-    fn clone_connector(&self) -> Option<Arc<dyn RemoteConnector>> {
-        Some(Arc::new(self.clone()))
-    }
-
-    fn pool_key(&self) -> usize { Arc::as_ptr(&self.identity) as usize }
-
-    async fn connect_stream(
-        &self,
-        resolver: ThreadSafeDNSResolver,
-        address: &str,
-        port: u16,
-        _tfo: bool,
-        iface: Option<&OutboundInterface>,
-        #[cfg(target_os = "linux")] so_mark: Option<u32>,
-    ) -> std::io::Result<AnyStream> {
-        let sess = Session {
-            network: Network::Tcp,
-            typ: Type::Ignore,
-            destination: SocksAddr::Domain(address.into(), port),
-            iface: iface.cloned(),
-            #[cfg(target_os = "linux")]
-            so_mark,
-            ..Default::default()
-        };
-
-        trace!(
-            "proxy connector `{}` connecting to {}:{}",
-            self.proxy.name(),
-            address,
-            port
-        );
-
-        let s = self
-            .proxy
-            .connect_stream_with_connector(&sess, resolver, self.connector.as_ref())
-            .await?;
-
-        sess.push_chain(self.proxy.name());
-        Ok(s)
-    }
-
-    async fn connect_datagram(
-        &self,
-        resolver: ThreadSafeDNSResolver,
-        _src: Option<SocketAddr>,
-        destination: SocksAddr,
-        iface: Option<&OutboundInterface>,
-        #[cfg(target_os = "linux")] so_mark: Option<u32>,
-    ) -> std::io::Result<AnyOutboundDatagram> {
-        let sess = Session {
-            network: Network::Udp,
-            typ: Type::Ignore,
-            iface: iface.cloned(),
-            destination: destination.clone(),
-            #[cfg(target_os = "linux")]
-            so_mark,
-            ..Default::default()
-        };
-        let s = self
-            .proxy
-            .connect_datagram_with_connector(
-                &sess,
-                resolver,
-                self.connector.as_ref(),
-            )
-            .await?;
-
-        sess.push_chain(self.proxy.name());
-        Ok(s)
     }
 }

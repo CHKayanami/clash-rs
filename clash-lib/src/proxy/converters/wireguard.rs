@@ -21,7 +21,7 @@ impl TryFrom<OutboundWireguard> for Handler {
 
 pub fn build_handler(
     s: &OutboundWireguard,
-    connector: Option<Arc<dyn RemoteConnector>>,
+    connector: Option<Arc<RemoteConnector>>,
 ) -> Result<Handler, crate::Error> {
     for (name, key) in [
         ("private-key", &s.private_key),

@@ -1,16 +1,13 @@
-use async_trait::async_trait;
-
+use std::{future::Future, io};
 use super::Transport;
 use crate::proxy::AnyStream;
 
-#[async_trait]
 pub trait Plugin: Send + Sync {
-    async fn proxy_stream(&self, stream: AnyStream) -> std::io::Result<AnyStream>;
+    fn proxy_stream(&self, stream: AnyStream) -> impl Future<Output = io::Result<AnyStream>> + Send;
 }
 
-#[async_trait]
 impl<T: Transport> Plugin for T {
-    async fn proxy_stream(&self, stream: AnyStream) -> std::io::Result<AnyStream> {
+    async fn proxy_stream(&self, stream: AnyStream) -> io::Result<AnyStream> {
         Transport::proxy_stream(self, stream).await
     }
 }

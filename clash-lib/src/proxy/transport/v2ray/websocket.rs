@@ -1,6 +1,5 @@
 use std::{collections::HashMap, io};
 
-use async_trait::async_trait;
 
 use crate::proxy::{
     AnyStream,
@@ -98,7 +97,6 @@ impl V2rayWsClient {
     }
 }
 
-#[async_trait]
 impl Transport for V2rayWsClient {
     async fn proxy_stream(&self, stream: AnyStream) -> std::io::Result<AnyStream> {
         self.new_v2ray_websocket_stream(stream).await

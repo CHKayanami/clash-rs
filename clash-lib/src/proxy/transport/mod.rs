@@ -1,3 +1,5 @@
+use std::{future::Future, io};
+use crate::proxy::AnyStream;
 #[cfg(feature = "shadowsocks")]
 pub(crate) use simple_obfs::{HTTPObfs, TLSObfs};
 pub(crate) use grpc::GrpcStream;
@@ -44,22 +46,14 @@ pub use ws::Client as WsClient;
 pub use xhttp::Client as XHttpClient;
 pub(crate) use xhttp::XHttpStream;
 
-#[async_trait::async_trait]
+/// Static transport contract; the enum owns runtime dispatch.
 pub trait Transport: Send + Sync {
-    async fn proxy_stream(
-        &self,
-        stream: super::AnyStream,
-    ) -> std::io::Result<super::AnyStream>;
+    fn proxy_stream(&self, stream: AnyStream)
+        -> impl Future<Output = io::Result<AnyStream>> + Send;
 
-    /// Like `proxy_stream`, but additionally returns a `VisionOptions` for
-    /// transports that support XTLS-splice (TLS and Reality).  The default
-    /// implementation delegates to `proxy_stream` and returns `None`,
-    /// meaning no splice is available.
-    async fn proxy_stream_spliced(
-        &self,
-        stream: super::AnyStream,
-    ) -> std::io::Result<(super::AnyStream, Option<VisionOptions>)> {
-        Ok((self.proxy_stream(stream).await?, None))
+    fn proxy_stream_spliced(&self, stream: AnyStream)
+        -> impl Future<Output = io::Result<(AnyStream, Option<VisionOptions>)>> + Send {
+        async move { Ok((self.proxy_stream(stream).await?, None)) }
     }
 }
 
@@ -102,7 +96,9 @@ impl TransportLayer {
             Self::Http(t) => Transport::proxy_stream(t, stream).await,
             Self::XHttp(t) => Transport::proxy_stream(t, stream).await,
             #[cfg(feature = "shadowsocks")]
-            Self::ShadowTls(t) => Transport::proxy_stream(t, stream).await,
+            // ShadowTLS retains large TLS frame buffers across awaits. Box
+            // this concrete future so every other transport stays compact.
+            Self::ShadowTls(t) => Box::pin(Transport::proxy_stream(t, stream)).await,
             #[cfg(feature = "shadowsocks")]
             Self::SimpleObfsHttp(t) => Transport::proxy_stream(t, stream).await,
             #[cfg(feature = "shadowsocks")]

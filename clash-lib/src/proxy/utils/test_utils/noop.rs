@@ -9,7 +9,7 @@ use crate::{
         router::Router,
     },
     proxy::{
-        AnyOutboundDatagram, AnyStream, ConnectorType, DialWithConnector,
+        AnyOutboundDatagram, AnyStream, DialWithConnector,
         OutboundHandler, OutboundType,
     },
     session::Session,
@@ -82,14 +82,12 @@ pub struct NoopOutboundHandler {
     pub name: String,
 }
 
-#[async_trait]
 impl DialWithConnector for NoopOutboundHandler {
     fn support_dialer(&self) -> Option<&str> {
         None
     }
 }
 
-#[async_trait]
 impl OutboundHandler for NoopOutboundHandler {
     fn name(&self) -> &str {
         &self.name
@@ -99,7 +97,7 @@ impl OutboundHandler for NoopOutboundHandler {
         OutboundType::Direct
     }
 
-    async fn support_udp(&self) -> bool {
+    fn support_udp(&self) -> bool {
         false
     }
 
@@ -119,7 +117,5 @@ impl OutboundHandler for NoopOutboundHandler {
         Err(io::Error::other("noop"))
     }
 
-    async fn support_connector(&self) -> ConnectorType {
-        ConnectorType::None
-    }
+
 }

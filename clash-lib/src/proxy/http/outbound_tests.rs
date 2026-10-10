@@ -20,7 +20,7 @@ headers:
     assert_eq!(config.common_opts.connect_via.as_deref(), Some("upstream"));
     let handler: Handler = config.try_into().unwrap();
     assert!(handler.opts.common_opts.tfo);
-    assert!(!handler.support_udp().await);
+    assert!(!handler.support_udp());
     let (client, mut server) = duplex(4096);
     let peer = tokio::spawn(async move {
         let mut request = Vec::new();

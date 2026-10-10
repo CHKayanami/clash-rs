@@ -13,7 +13,6 @@ use std::{
     },
 };
 
-use async_trait::async_trait;
 
 use crate::{common::tls::validate_alpn,
     proxy::{AnyStream, transport::{SplicableTlsStream, Transport, VisionOptions}}};
@@ -73,7 +72,6 @@ impl Client {
     }
 }
 
-#[async_trait]
 impl Transport for Client {
     async fn proxy_stream(&self, stream: AnyStream) -> io::Result<AnyStream> {
         let tls = reality_connect(stream, &self.0.config, self.0.chrome).await?;

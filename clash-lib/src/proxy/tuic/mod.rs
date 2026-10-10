@@ -11,7 +11,6 @@ use crate::{
 };
 use anyhow::Result;
 use arc_swap::ArcSwapOption;
-use async_trait::async_trait;
 
 use quinn::{
     ClientConfig as QuinnConfig, Endpoint as QuinnEndpoint, EndpointConfig,
@@ -49,7 +48,7 @@ use tokio::sync::{Mutex as AsyncMutex, OnceCell};
 use self::types::{CongestionControl, TuicConnection, UdpRelayMode, UdpSession};
 
 use super::{
-    ConnectorType, HandlerCommonOptions, OutboundHandler, OutboundType,
+    HandlerCommonOptions, OutboundHandler, OutboundType,
     PlainProxyAPIResponse, datagram::UdpPacket,
 };
 
@@ -108,7 +107,6 @@ impl std::fmt::Debug for Handler {
 
 impl DialWithConnector for Handler {}
 
-#[async_trait]
 impl OutboundHandler for Handler {
     fn name(&self) -> &str {
         &self.opts.name
@@ -122,7 +120,7 @@ impl OutboundHandler for Handler {
         OutboundType::Tuic
     }
 
-    async fn support_udp(&self) -> bool {
+    fn support_udp(&self) -> bool {
         true
     }
 
@@ -148,16 +146,10 @@ impl OutboundHandler for Handler {
         })
     }
 
-    async fn support_connector(&self) -> ConnectorType {
-        ConnectorType::None
-    }
 
-    fn try_as_plain_handler(&self) -> Option<&dyn PlainProxyAPIResponse> {
-        Some(self as _)
-    }
+
 }
 
-#[async_trait]
 impl PlainProxyAPIResponse for Handler {
     async fn as_map(&self) -> HashMap<String, Box<dyn ErasedSerialize + Send>> {
         let mut m = HashMap::new();

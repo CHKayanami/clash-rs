@@ -1,6 +1,5 @@
 // a rust implementation of https://github.com/shadowsocks/simple-obfs
 
-use async_trait::async_trait;
 use byteorder::{BigEndian, ByteOrder, WriteBytesExt};
 use bytes::BufMut;
 use chrono::Utc;
@@ -26,7 +25,6 @@ impl Client {
     }
 }
 
-#[async_trait]
 impl Transport for Client {
     async fn proxy_stream(&self, stream: AnyStream) -> std::io::Result<AnyStream> {
         Ok(TLSObfs::new(stream, self.server.clone()).into())

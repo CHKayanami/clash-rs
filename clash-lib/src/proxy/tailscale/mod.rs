@@ -11,7 +11,6 @@ use std::{
     sync::{Arc, Mutex as StdMutex},
 };
 
-use async_trait::async_trait;
 use erased_serde::Serialize as ErasedSerialize;
 use tailscale::config::{BadFormatBehavior, load_key_file};
 use tailscale::Device as TailscaleDevice;
@@ -25,7 +24,7 @@ use crate::{
 };
 
 use super::{
-    ConnectorType, DialWithConnector, OutboundHandler, OutboundType,
+    DialWithConnector, OutboundHandler, OutboundType,
     PlainProxyAPIResponse,
 };
 
@@ -239,7 +238,6 @@ impl Handler {
 
 impl DialWithConnector for Handler {}
 
-#[async_trait]
 impl OutboundHandler for Handler {
     fn name(&self) -> &str {
         &self.opts.name
@@ -249,7 +247,7 @@ impl OutboundHandler for Handler {
         OutboundType::Tailscale
     }
 
-    async fn support_udp(&self) -> bool {
+    fn support_udp(&self) -> bool {
         true
     }
 
@@ -338,16 +336,10 @@ impl OutboundHandler for Handler {
         Ok(AnyOutboundDatagram::new(d))
     }
 
-    async fn support_connector(&self) -> ConnectorType {
-        ConnectorType::None
-    }
 
-    fn try_as_plain_handler(&self) -> Option<&dyn PlainProxyAPIResponse> {
-        Some(self as _)
-    }
+
 }
 
-#[async_trait]
 impl PlainProxyAPIResponse for Handler {
     async fn as_map(&self) -> HashMap<String, Box<dyn ErasedSerialize + Send>> {
         let mut m = HashMap::new();
@@ -485,7 +477,7 @@ mod tests {
             client_name: None,
             ephemeral: false,
         });
-        assert!(h.support_udp().await);
+        assert!(h.support_udp());
     }
 
     #[tokio::test]

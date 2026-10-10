@@ -1,7 +1,9 @@
+#[cfg(all(test, docker_test))]
+use crate::proxy::OutboundNode;
+
 use erased_serde::Serialize as ErasedSerialize;
 use std::{collections::HashMap, fmt::Debug, io, net::SocketAddr, str::FromStr};
 
-use async_trait::async_trait;
 
 pub(crate) use compat::UdpSessionWrapper;
 use shadowquic::{
@@ -21,7 +23,7 @@ use crate::{
 };
 
 use super::{
-    ConnectorType, DialWithConnector, OutboundHandler, OutboundType,
+    DialWithConnector, OutboundHandler, OutboundType,
     PlainProxyAPIResponse,
 };
 // This is ugly, it may be exposed better by shadowquic in the future
@@ -123,7 +125,6 @@ impl Handler {
 
 impl DialWithConnector for Handler {}
 
-#[async_trait]
 impl OutboundHandler for Handler {
     /// The name of the outbound handler
     fn name(&self) -> &str {
@@ -141,7 +142,7 @@ impl OutboundHandler for Handler {
     }
 
     /// whether the outbound handler support UDP
-    async fn support_udp(&self) -> bool {
+    fn support_udp(&self) -> bool {
         true
     }
 
@@ -196,17 +197,10 @@ impl OutboundHandler for Handler {
         Ok(AnyOutboundDatagram::new(chain))
     }
 
-    /// relay related
-    async fn support_connector(&self) -> ConnectorType {
-        ConnectorType::None
-    }
 
-    fn try_as_plain_handler(&self) -> Option<&dyn PlainProxyAPIResponse> {
-        Some(self as _)
-    }
+
 }
 
-#[async_trait]
 impl PlainProxyAPIResponse for Handler {
     async fn as_map(&self) -> HashMap<String, Box<dyn ErasedSerialize + Send>> {
         let mut m = HashMap::new();
@@ -339,7 +333,7 @@ log-level: "trace"
         let opts = gen_options(container_ip, host_port, false)?;
 
         let handler = Arc::new(Handler::new("test-shadowquic".into(), opts));
-        run_test_suites_and_cleanup(handler, container, Suite::all()).await
+        run_test_suites_and_cleanup(OutboundNode::protocol(handler), container, Suite::all()).await
     }
     #[tokio::test]
     async fn test_shadowquic_over_stream() -> anyhow::Result<()> {
@@ -353,7 +347,7 @@ log-level: "trace"
         opts.over_stream = true;
 
         let handler = Arc::new(Handler::new("test-shadowquic".into(), opts));
-        run_test_suites_and_cleanup(handler, container, Suite::all()).await
+        run_test_suites_and_cleanup(OutboundNode::protocol(handler), container, Suite::all()).await
     }
 }
 

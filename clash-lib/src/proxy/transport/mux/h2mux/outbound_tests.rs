@@ -2,10 +2,10 @@ use std::sync::Arc;
 
 use crate::{
     config::internal::proxy::OutboundProxyProtocol,
-    proxy::{AnyOutboundHandler, converters},
+    proxy::{OutboundNode, converters},
 };
 
-fn handler(protocol: &str, enabled: bool, only_tcp: bool) -> AnyOutboundHandler {
+fn handler(protocol: &str, enabled: bool, only_tcp: bool) -> OutboundNode {
     let yaml = format!("type: {protocol}
 name: mux-udp-test
 server: 127.0.0.1
@@ -21,14 +21,14 @@ smux:
 ");
     match yaml_serde::from_str::<OutboundProxyProtocol>(&yaml).unwrap() {
         OutboundProxyProtocol::Vless(config) =>
-            Arc::new(converters::vless::build_handler(&config, None).unwrap()),
+            OutboundNode::protocol(Arc::new(converters::vless::build_handler(&config, None).unwrap())),
         OutboundProxyProtocol::Vmess(config) =>
-            Arc::new(converters::vmess::build_handler(&config, None).unwrap()),
+            OutboundNode::protocol(Arc::new(converters::vmess::build_handler(&config, None).unwrap())),
         OutboundProxyProtocol::Trojan(config) =>
-            Arc::new(converters::trojan::build_handler(&config, None).unwrap()),
+            OutboundNode::protocol(Arc::new(converters::trojan::build_handler(&config, None).unwrap())),
         #[cfg(feature = "shadowsocks")]
         OutboundProxyProtocol::Ss(config) =>
-            Arc::new(converters::shadowsocks::build_handler(&config, None).unwrap()),
+            OutboundNode::protocol(Arc::new(converters::shadowsocks::build_handler(&config, None).unwrap())),
         _ => panic!("unexpected outbound protocol"),
     }
 }

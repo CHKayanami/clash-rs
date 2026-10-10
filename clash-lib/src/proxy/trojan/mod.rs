@@ -1,8 +1,10 @@
+#[cfg(all(test, docker_test))]
+use crate::proxy::OutboundNode;
+
 pub(crate) use datagram::OutboundDatagramTrojan;
 use erased_serde::Serialize as ErasedSerialize;
 use std::{collections::HashMap, io, sync::Arc};
 
-use async_trait::async_trait;
 use bytes::{BufMut, BytesMut};
 use sha2::{Digest, Sha224};
 use tokio::io::AsyncWriteExt;
@@ -13,7 +15,7 @@ use crate::{
     common::utils,
     impl_default_connector,
     proxy::{
-        AnyOutboundDatagram, AnyStream, ConnectorType, DialWithConnector,
+        AnyOutboundDatagram, AnyStream, DialWithConnector,
         HandlerCommonOptions, OutboundHandler, OutboundType,
         PlainProxyAPIResponse, transport::TransportLayer,
         utils::{GLOBAL_DIRECT_CONNECTOR, RemoteConnector},
@@ -43,7 +45,7 @@ pub struct HandlerOptions {
 pub struct Handler {
     opts: HandlerOptions,
 
-    connector: Option<Arc<dyn RemoteConnector>>,
+    connector: Option<Arc<RemoteConnector>>,
     mux_pool: Option<Arc<H2MuxPool>>,
 }
 
@@ -62,7 +64,7 @@ impl Handler {
         &self,
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
-        connector: &dyn RemoteConnector,
+        connector: &RemoteConnector,
     ) -> io::Result<AnyStream> {
         let stream = connector
             .connect_stream(
@@ -79,7 +81,7 @@ impl Handler {
         self.inner_proxy_stream(stream, &carrier_sess, false).await
     }
 
-    pub fn new(opts: HandlerOptions, connector: Option<Arc<dyn RemoteConnector>>) -> Self {
+    pub fn new(opts: HandlerOptions, connector: Option<Arc<RemoteConnector>>) -> Self {
         let mux_pool = opts
             .smux
             .as_ref()
@@ -127,7 +129,6 @@ impl Handler {
     }
 }
 
-#[async_trait]
 impl OutboundHandler for Handler {
     fn name(&self) -> &str {
         &self.opts.name
@@ -141,7 +142,7 @@ impl OutboundHandler for Handler {
         OutboundType::Trojan
     }
 
-    async fn support_udp(&self) -> bool {
+    fn support_udp(&self) -> bool {
         self.opts.udp
             || self.mux_pool.as_ref().is_some_and(|pool| pool.supports_udp())
     }
@@ -184,15 +185,11 @@ impl OutboundHandler for Handler {
         }
     }
 
-    async fn support_connector(&self) -> ConnectorType {
-        ConnectorType::All
-    }
-
     async fn connect_stream_with_connector(
         &self,
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
-        connector: &dyn RemoteConnector,
+        connector: &RemoteConnector,
     ) -> io::Result<AnyStream> {
         if let Some(mux) = &self.mux_pool {
             let dialer = || self.dial_mux_carrier(sess, resolver.clone(), connector);
@@ -222,7 +219,7 @@ impl OutboundHandler for Handler {
         &self,
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
-        connector: &dyn RemoteConnector,
+        connector: &RemoteConnector,
     ) -> io::Result<AnyOutboundDatagram> {
         if let Some(mux) = self.mux_pool.as_ref().filter(|pool| pool.supports_udp()) {
             let dialer = || self.dial_mux_carrier(sess, resolver.clone(), connector);
@@ -251,12 +248,8 @@ impl OutboundHandler for Handler {
         Ok(AnyOutboundDatagram::new(d))
     }
 
-    fn try_as_plain_handler(&self) -> Option<&dyn PlainProxyAPIResponse> {
-        Some(self as _)
-    }
 }
 
-#[async_trait]
 impl PlainProxyAPIResponse for Handler {
     async fn as_map(&self) -> HashMap<String, Box<dyn ErasedSerialize + Send>> {
         let mut m = HashMap::new();
@@ -422,7 +415,7 @@ mod tests {
             Some(GLOBAL_DIRECT_CONNECTOR.clone()),
         ));
         // ignore the udp test
-        run_test_suites_and_cleanup(handler, container, Suite::all()).await
+        run_test_suites_and_cleanup(OutboundNode::protocol(handler), container, Suite::all()).await
     }
 
     async fn get_grpc_runner(host_port: u16) -> anyhow::Result<DockerTestRunner> {
@@ -484,7 +477,7 @@ mod tests {
             opts,
             Some(GLOBAL_DIRECT_CONNECTOR.clone()),
         ));
-        run_test_suites_and_cleanup(handler, runner, Suite::all()).await
+        run_test_suites_and_cleanup(OutboundNode::protocol(handler), runner, Suite::all()).await
     }
 }
 

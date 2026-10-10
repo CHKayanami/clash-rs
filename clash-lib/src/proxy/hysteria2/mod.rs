@@ -1,3 +1,6 @@
+#[cfg(all(test, docker_test))]
+use crate::proxy::OutboundNode;
+
 pub(crate) use datagram::HysteriaDatagramOutbound;
 mod codec;
 mod congestion;
@@ -18,7 +21,7 @@ use self::{
     },
 };
 use super::{
-    ConnectorType, DialWithConnector, OutboundHandler, OutboundType,
+    DialWithConnector, OutboundHandler, OutboundType,
     PlainProxyAPIResponse, converters::hysteria2::PortGenerator,
     datagram::UdpPacket, utils::new_udp_socket,
 };
@@ -517,7 +520,6 @@ impl Handler {
 
 impl DialWithConnector for Handler {}
 
-#[async_trait::async_trait]
 impl OutboundHandler for Handler {
     fn name(&self) -> &str {
         &self.opts.name
@@ -531,12 +533,8 @@ impl OutboundHandler for Handler {
         OutboundType::Hysteria2
     }
 
-    async fn support_udp(&self) -> bool {
+    fn support_udp(&self) -> bool {
         self.support_udp.load(Ordering::Relaxed)
-    }
-
-    async fn support_connector(&self) -> ConnectorType {
-        ConnectorType::Tcp
     }
 
     async fn connect_stream(
@@ -589,12 +587,8 @@ impl OutboundHandler for Handler {
         Ok(AnyOutboundDatagram::new(hy_datagram))
     }
 
-    fn try_as_plain_handler(&self) -> Option<&dyn PlainProxyAPIResponse> {
-        Some(self as _)
-    }
 }
 
-#[async_trait::async_trait]
 impl PlainProxyAPIResponse for Handler {
     async fn as_map(&self) -> HashMap<String, Box<dyn ErasedSerialize + Send>> {
         let mut m = HashMap::new();
@@ -1132,7 +1126,7 @@ mod tests {
         let handler = Arc::new(
             Handler::new(opts).expect("failed to create hysteria2 handler"),
         );
-        run_test_suites_and_cleanup(handler, container, Suite::all()).await
+        run_test_suites_and_cleanup(OutboundNode::protocol(handler), container, Suite::all()).await
     }
 }
 

@@ -28,7 +28,7 @@ impl TryFrom<OutboundVless> for Handler {
 
 pub fn build_handler(
     s: &OutboundVless,
-    connector: Option<Arc<dyn RemoteConnector>>,
+    connector: Option<Arc<RemoteConnector>>,
 ) -> Result<Handler, crate::Error> {
     let flow = s.flow.as_deref().map(|flow| match flow {
         "xtls-rprx-vision-udp443" => "xtls-rprx-vision",

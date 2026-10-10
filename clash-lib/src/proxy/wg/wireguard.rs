@@ -93,7 +93,7 @@ impl WireguardTunnel {
         packet_writer: Sender<(PortProtocol, Bytes)>,
         packet_reader: Receiver<Bytes>,
         resolver: ThreadSafeDNSResolver,
-        connector: Option<Arc<dyn RemoteConnector>>,
+        connector: Option<Arc<RemoteConnector>>,
         sess: &Session,
     ) -> Result<Self, Error> {
         let peer = Tunn::new(

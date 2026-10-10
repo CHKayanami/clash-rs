@@ -4,7 +4,7 @@ use http::{HeaderMap, header};
 use serde::Deserialize;
 
 use crate::{
-    app::outbound::manager::ThreadSafeOutboundManager, proxy::AnyOutboundHandler,
+    app::outbound::manager::ThreadSafeOutboundManager, proxy::OutboundNode,
 };
 
 /// Shared query-string parameters for all latency-test endpoints.
@@ -21,11 +21,11 @@ pub struct DelayRequest {
 /// latency of the group itself.
 pub async fn group_url_test(
     outbound_manager: &ThreadSafeOutboundManager,
-    proxy: AnyOutboundHandler,
+    proxy: OutboundNode,
     fallback_url: &str,
     timeout: Duration,
 ) -> std::io::Result<(Duration, Duration)> {
-    let group = proxy.try_as_group_handler().ok_or_else(|| {
+    let group = proxy.as_group().ok_or_else(|| {
         io::Error::new(io::ErrorKind::InvalidInput, "proxy is not a group")
     })?;
     let latency_test_url = group.get_latency_test_url();

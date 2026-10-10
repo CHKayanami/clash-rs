@@ -11,10 +11,10 @@ use crate::app::dns::endpoint::DnsProtocol;
 use crate::app::dns::transport::{
     DialContext, Doh3Client, DohClient, DoqClient, DotPool, LifecycleSlot, TcpPool,
 };
-use crate::proxy::AnyOutboundHandler;
+use crate::proxy::OutboundNode;
 
 pub(crate) struct ResolvedOutbound {
-    pub handler: Option<AnyOutboundHandler>,
+    pub handler: Option<OutboundNode>,
     pub name: Option<String>,
 }
 
@@ -116,7 +116,7 @@ impl UpstreamPool {
     pub fn dial_context(
         &self,
         entry: &UpstreamEntry,
-        outbound: Option<AnyOutboundHandler>,
+        outbound: Option<OutboundNode>,
     ) -> DialContext {
         DialContext {
             endpoint: entry.endpoint.clone(),
@@ -135,7 +135,7 @@ impl UpstreamPool {
     pub async fn build_transport(
         &self,
         entry: &UpstreamEntry,
-        outbound: Option<AnyOutboundHandler>,
+        outbound: Option<OutboundNode>,
     ) -> anyhow::Result<PooledTransport> {
         let dial = self.dial_context(entry, outbound);
         Ok(match entry.protocol {
@@ -252,8 +252,7 @@ mod tests {
             for name in ["fixed", "override"] {
                 outbounds.insert(
                     name.to_string(),
-                    Arc::new(crate::proxy::direct::Handler::new(name))
-                        as AnyOutboundHandler,
+                    OutboundNode::protocol(Arc::new(crate::proxy::direct::Handler::new(name))),
                 );
             }
             let pool = UpstreamPool::new(

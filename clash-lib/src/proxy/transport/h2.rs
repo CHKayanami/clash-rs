@@ -1,4 +1,3 @@
-use async_trait::async_trait;
 use bytes::Bytes;
 use futures::ready;
 use h2::{RecvStream, SendStream};
@@ -64,7 +63,6 @@ impl Client {
     }
 }
 
-#[async_trait]
 impl Transport for Client {
     async fn proxy_stream(&self, stream: AnyStream) -> io::Result<AnyStream> {
         let (mut client, h2) =

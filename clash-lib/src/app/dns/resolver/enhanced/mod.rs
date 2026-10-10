@@ -42,7 +42,7 @@ use crate::app::profile::ThreadSafeCacheFile;
 use crate::app::router::Router;
 use crate::common::trie;
 use crate::config::def::DNSMode;
-use crate::proxy::utils::OutboundHandlerRegistry;
+use crate::proxy::utils::OutboundNodeRegistry;
 use crate::Error;
 
 #[derive(Clone)]
@@ -92,7 +92,7 @@ impl EnhancedResolver {
         cfg: Config,
         store: ThreadSafeCacheFile,
         mmdb: Option<PendingMmdb>,
-        outbounds: OutboundHandlerRegistry,
+        outbounds: OutboundNodeRegistry,
         rule_dispatch: Option<Arc<RuleDispatch>>,
         collector: Option<ThreadSafeDnsCollector>,
     ) -> Self {

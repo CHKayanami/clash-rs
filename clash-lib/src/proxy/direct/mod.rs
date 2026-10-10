@@ -19,10 +19,9 @@ use erased_serde::Serialize as ErasedSerialize;
 use std::collections::HashMap;
 
 use super::{
-    ConnectorType, DialWithConnector, OutboundType, PlainProxyAPIResponse,
+    DialWithConnector, OutboundType, PlainProxyAPIResponse,
     utils::RemoteConnector,
 };
-use async_trait::async_trait;
 
 #[derive(Clone)]
 pub struct Handler {
@@ -47,7 +46,6 @@ impl Handler {
 
 impl DialWithConnector for Handler {}
 
-#[async_trait]
 impl OutboundHandler for Handler {
     /// The configured name, not the literal `DIRECT`.
     ///
@@ -63,7 +61,7 @@ impl OutboundHandler for Handler {
         OutboundType::Direct
     }
 
-    async fn support_udp(&self) -> bool {
+    fn support_udp(&self) -> bool {
         true
     }
 
@@ -119,15 +117,11 @@ impl OutboundHandler for Handler {
         Ok(AnyOutboundDatagram::Direct(Box::new(datagram)))
     }
 
-    async fn support_connector(&self) -> ConnectorType {
-        ConnectorType::Tcp
-    }
-
     async fn connect_stream_with_connector(
         &self,
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
-        connector: &dyn RemoteConnector,
+        connector: &RemoteConnector,
     ) -> std::io::Result<AnyStream> {
         let s = connector
             .connect_stream(
@@ -148,7 +142,7 @@ impl OutboundHandler for Handler {
         &self,
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
-        connector: &dyn RemoteConnector,
+        connector: &RemoteConnector,
     ) -> std::io::Result<AnyOutboundDatagram> {
         let d = connector
             .connect_datagram(
@@ -164,12 +158,8 @@ impl OutboundHandler for Handler {
         Ok(d)
     }
 
-    fn try_as_plain_handler(&self) -> Option<&dyn PlainProxyAPIResponse> {
-        Some(self as _)
-    }
 }
 
-#[async_trait]
 impl PlainProxyAPIResponse for Handler {
     async fn as_map(&self) -> HashMap<String, Box<dyn ErasedSerialize + Send>> {
         HashMap::new()

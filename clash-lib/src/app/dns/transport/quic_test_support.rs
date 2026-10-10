@@ -12,6 +12,7 @@ use tokio::task::JoinHandle;
 
 use super::dial::DialContext;
 use crate::app::dns::endpoint::{DnsEndpoint, DnsProtocol, DnsStrategy};
+use crate::proxy::OutboundNode;
 use crate::proxy::socks::inbound::Socks5UdpFramed;
 use crate::proxy::socks::outbound::{Handler, HandlerOptions};
 use crate::session::SocksAddr;
@@ -137,7 +138,7 @@ impl SocksProxy {
             endpoint,
             query_timeout: Duration::from_secs(2),
             dial_timeout: Duration::from_secs(2),
-            outbound: Some(Arc::new(handler)),
+            outbound: Some(OutboundNode::protocol(Arc::new(handler))),
             iface: None,
             so_mark: None,
             resolver: None,

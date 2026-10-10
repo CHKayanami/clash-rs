@@ -20,7 +20,7 @@ use crate::{
         },
         outbound::manager::ThreadSafeOutboundManager,
     },
-    proxy::AnyOutboundHandler,
+    proxy::OutboundNode,
 };
 
 #[derive(Clone)]
@@ -64,14 +64,14 @@ async fn find_group_by_name(
 #[instrument(skip_all, fields(name = %proxy.name()))]
 async fn get_group_delay(
     State(state): State<GroupState>,
-    Extension(proxy): Extension<AnyOutboundHandler>,
+    Extension(proxy): Extension<OutboundNode>,
     Query(q): Query<DelayRequest>,
 ) -> impl IntoResponse {
     let outbound_manager = state.outbound_manager.clone();
     let timeout = Duration::from_millis(q.timeout.into());
     let name = proxy.name().to_owned();
 
-    if proxy.try_as_group_handler().is_some() {
+    if proxy.as_group().is_some() {
         let (actual, _) =
             match group_url_test(&outbound_manager, proxy, &q.url, timeout).await {
                 Ok(result) => result,

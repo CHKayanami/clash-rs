@@ -1,6 +1,5 @@
 use std::{collections::HashMap, fmt::Debug, io, sync::Arc};
 
-use async_trait::async_trait;
 use base64::{Engine, prelude::BASE64_STANDARD};
 use erased_serde::Serialize as ErasedSerialize;
 use http::{HeaderMap, HeaderName, HeaderValue, header::{HOST, PROXY_AUTHORIZATION}, uri::Authority};
@@ -11,7 +10,7 @@ use crate::{
     common::io::SlideBuffer,
     impl_default_connector,
     proxy::{
-        AnyOutboundDatagram, AnyStream, ConnectorType, DialWithConnector,
+        AnyOutboundDatagram, AnyStream, DialWithConnector,
         HandlerCommonOptions, OutboundHandler, OutboundType,
         PlainProxyAPIResponse, transport::TransportLayer,
         utils::{GLOBAL_DIRECT_CONNECTOR, RemoteConnector},
@@ -36,7 +35,7 @@ pub struct HandlerOptions {
 pub struct Handler {
     opts: HandlerOptions,
     headers: HeaderMap,
-    connector: Option<Arc<dyn RemoteConnector>>,
+    connector: Option<Arc<RemoteConnector>>,
 }
 
 impl_default_connector!(Handler);
@@ -50,7 +49,7 @@ impl Debug for Handler {
 impl Handler {
     pub fn new(
         opts: HandlerOptions,
-        connector: Option<Arc<dyn RemoteConnector>>,
+        connector: Option<Arc<RemoteConnector>>,
     ) -> io::Result<Self> {
         let mut headers = HeaderMap::new();
         for (name, value) in &opts.headers {
@@ -155,13 +154,11 @@ async fn read_response(stream: AnyStream) -> io::Result<AnyStream> {
     Ok(AnyStream::new(PrefixedStream::new(prefix, stream.into_inner())))
 }
 
-#[async_trait]
 impl OutboundHandler for Handler {
     fn name(&self) -> &str { &self.opts.name }
     fn server_name(&self) -> Option<&str> { Some(&self.opts.server) }
     fn proto(&self) -> OutboundType { OutboundType::Http }
-    async fn support_udp(&self) -> bool { false }
-    async fn support_connector(&self) -> ConnectorType { ConnectorType::Tcp }
+    fn support_udp(&self) -> bool { false }
 
     async fn connect_stream(&self, sess: &Session, resolver: ThreadSafeDNSResolver) -> io::Result<AnyStream> {
         let connector = self.connector.as_ref().unwrap_or(&GLOBAL_DIRECT_CONNECTOR);
@@ -170,7 +167,7 @@ impl OutboundHandler for Handler {
 
     async fn connect_stream_with_connector(
         &self, sess: &Session, resolver: ThreadSafeDNSResolver,
-        connector: &dyn RemoteConnector,
+        connector: &RemoteConnector,
     ) -> io::Result<AnyStream> {
         let stream = connector.connect_stream(
             resolver, &self.opts.server, self.opts.port, self.opts.common_opts.tfo,
@@ -187,10 +184,8 @@ impl OutboundHandler for Handler {
         Err(io::Error::new(io::ErrorKind::Unsupported, "HTTP outbound does not support UDP"))
     }
 
-    fn try_as_plain_handler(&self) -> Option<&dyn PlainProxyAPIResponse> { Some(self) }
 }
 
-#[async_trait]
 impl PlainProxyAPIResponse for Handler {
     async fn as_map(&self) -> HashMap<String, Box<dyn ErasedSerialize + Send>> {
         let mut m: HashMap<String, Box<dyn ErasedSerialize + Send>> = HashMap::new();

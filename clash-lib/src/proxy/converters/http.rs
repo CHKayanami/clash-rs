@@ -13,7 +13,7 @@ use crate::{
 
 pub fn build_handler(
     s: &OutboundHttp,
-    connector: Option<Arc<dyn RemoteConnector>>,
+    connector: Option<Arc<RemoteConnector>>,
 ) -> Result<Handler, Error> {
     let tls_client = if s.tls {
         Some(TransportLayer::Tls(TlsClient::new_advanced(

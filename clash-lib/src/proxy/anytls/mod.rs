@@ -1,7 +1,6 @@
 use erased_serde::Serialize as ErasedSerialize;
 use std::{collections::HashMap, io, sync::Arc};
 
-use async_trait::async_trait;
 use tokio::io::AsyncWriteExt;
 use tracing::debug;
 
@@ -9,7 +8,7 @@ use crate::{
     app::dns::ThreadSafeDNSResolver,
     impl_default_connector,
     proxy::{
-        AnyOutboundDatagram, AnyStream, ConnectorType, DialWithConnector,
+        AnyOutboundDatagram, AnyStream, DialWithConnector,
         HandlerCommonOptions, OutboundHandler, OutboundType, PlainProxyAPIResponse,
         transport::TransportLayer,
         utils::{GLOBAL_DIRECT_CONNECTOR, RemoteConnector},
@@ -53,7 +52,7 @@ pub struct Handler {
     /// arriving at a cold pool dialled its own TLS session simultaneously.
     session_create_lock: tokio::sync::Mutex<()>,
 
-    connector: Option<Arc<dyn RemoteConnector>>,
+    connector: Option<Arc<RemoteConnector>>,
 }
 
 impl_default_connector!(Handler);
@@ -69,7 +68,7 @@ impl std::fmt::Debug for Handler {
 impl Handler {
     pub fn new(
         opts: HandlerOptions,
-        connector: Option<Arc<dyn RemoteConnector>>,
+        connector: Option<Arc<RemoteConnector>>,
     ) -> Self {
         let pool = SessionPool::new(opts.pool_config.clone());
 
@@ -86,7 +85,7 @@ impl Handler {
     async fn create_fresh_session(
         &self,
         resolver: ThreadSafeDNSResolver,
-        connector: &dyn RemoteConnector,
+        connector: &RemoteConnector,
         sess: &Session,
     ) -> io::Result<Arc<AnyTlsClientSession>> {
         let stream = connector
@@ -130,7 +129,7 @@ impl Handler {
     async fn get_or_create_session(
         &self,
         resolver: ThreadSafeDNSResolver,
-        connector: &dyn RemoteConnector,
+        connector: &RemoteConnector,
         sess: &Session,
     ) -> io::Result<Arc<AnyTlsClientSession>> {
         if let Some(session) = self.session_pool.get_available_session().await {
@@ -151,7 +150,7 @@ impl Handler {
     async fn open_stream_with_retry(
         &self,
         resolver: ThreadSafeDNSResolver,
-        connector: &dyn RemoteConnector,
+        connector: &RemoteConnector,
         sess: &Session,
         dest: &SocksAddr,
     ) -> io::Result<AnyTlsStream> {
@@ -205,7 +204,6 @@ fn is_session_broken_err(err: &io::Error) -> bool {
     ) || err.to_string().contains("closed")
 }
 
-#[async_trait]
 impl OutboundHandler for Handler {
     fn name(&self) -> &str {
         &self.opts.name
@@ -219,7 +217,7 @@ impl OutboundHandler for Handler {
         OutboundType::Anytls
     }
 
-    async fn support_udp(&self) -> bool {
+    fn support_udp(&self) -> bool {
         self.opts.udp
     }
 
@@ -261,15 +259,11 @@ impl OutboundHandler for Handler {
         }
     }
 
-    async fn support_connector(&self) -> ConnectorType {
-        ConnectorType::All
-    }
-
     async fn connect_stream_with_connector(
         &self,
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
-        connector: &dyn RemoteConnector,
+        connector: &RemoteConnector,
     ) -> io::Result<AnyStream> {
         let stream = self
             .open_stream_with_retry(resolver, connector, sess, &sess.destination)
@@ -283,7 +277,7 @@ impl OutboundHandler for Handler {
         &self,
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
-        connector: &dyn RemoteConnector,
+        connector: &RemoteConnector,
     ) -> io::Result<AnyOutboundDatagram> {
         let uot_dest = SocksAddr::try_from((
             crate::proxy::transport::uot::UDP_OVER_TCP_V2_MAGIC_HOST.to_owned(),
@@ -308,12 +302,8 @@ impl OutboundHandler for Handler {
         Ok(AnyOutboundDatagram::new(datagram))
     }
 
-    fn try_as_plain_handler(&self) -> Option<&dyn PlainProxyAPIResponse> {
-        Some(self as _)
-    }
 }
 
-#[async_trait]
 impl PlainProxyAPIResponse for Handler {
     async fn as_map(&self) -> HashMap<String, Box<dyn ErasedSerialize + Send>> {
         let mut m = HashMap::new();
@@ -331,8 +321,8 @@ impl PlainProxyAPIResponse for Handler {
 }
 
 #[cfg(test)]
-mod tests {
-    mod retry;
+pub(crate) mod tests {
+    pub(crate) mod retry;
 
     use bytes::{Bytes, BytesMut};
     use sha2::{Digest, Sha256};
@@ -469,13 +459,13 @@ mod tests {
     #[tokio::test]
     async fn test_handler_support_udp_true() {
         let h = make_handler(true, false);
-        assert!(h.support_udp().await);
+        assert!(h.support_udp());
     }
 
     #[tokio::test]
     async fn test_handler_support_udp_false() {
         let h = make_handler(false, false);
-        assert!(!h.support_udp().await);
+        assert!(!h.support_udp());
     }
 
     #[tokio::test]

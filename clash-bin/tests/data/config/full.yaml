@@ -1273,19 +1273,7 @@ proxy-groups:
     strategy: round-robin
     icon: "https://example.com/icon.png"
 
-  # 7. relay — chain proxies sequentially: traffic flows A -> B -> C -> destination
-  - name: "Relay"
-    type: relay
-    proxies:
-      - ss-legacy
-      - trojan-tcp
-    # use:
-    #   - local-proxies
-    # filter: ".*"
-    # empty-fallback: "DIRECT"
-    icon: "https://example.com/icon.png"
-
-  # 8. smart — adaptive selection using latency, success rate, and optional bandwidth
+  # 7. smart — adaptive selection using latency, success rate, and optional bandwidth
   - name: "Smart"
     type: smart
     proxies:

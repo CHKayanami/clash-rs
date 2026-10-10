@@ -52,7 +52,7 @@ fn str_to_algo(value: &str) -> Option<russh::keys::Algorithm> {
 
 pub fn build_handler(
     s: &OutboundSsh,
-    connector: Option<Arc<dyn RemoteConnector>>,
+    connector: Option<Arc<RemoteConnector>>,
 ) -> Result<Handler, crate::Error> {
     let host_key_algorithms = s.host_key_algorithms.clone().map(|algos| {
         algos

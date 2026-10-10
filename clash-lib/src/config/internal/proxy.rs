@@ -712,8 +712,6 @@ pub enum Hysteria2Obfs {
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 #[serde(tag = "type")]
 pub enum OutboundGroupProtocol {
-    #[serde(rename = "relay")]
-    Relay(OutboundGroupRelay),
     #[serde(rename = "url-test")]
     UrlTest(OutboundGroupUrlTest),
     #[serde(rename = "fallback")]
@@ -727,12 +725,11 @@ pub enum OutboundGroupProtocol {
 }
 
 /// Only used statically in config parsing.
-/// Runtime access is done via the `try_as_group_handler`.
+/// Runtime group access is provided by `OutboundNode::as_group`.
 impl OutboundGroupProtocol {
     /// Returns the name of the group.
     pub fn name(&self) -> &str {
         match &self {
-            OutboundGroupProtocol::Relay(g) => &g.name,
             OutboundGroupProtocol::UrlTest(g) => &g.name,
             OutboundGroupProtocol::Fallback(g) => &g.name,
             OutboundGroupProtocol::LoadBalance(g) => &g.name,
@@ -744,7 +741,6 @@ impl OutboundGroupProtocol {
     /// Returns the latency test URL of the group, if configured.
     pub fn url(&self) -> Option<&str> {
         match self {
-            OutboundGroupProtocol::Relay(g) => g.url.as_deref(),
             OutboundGroupProtocol::UrlTest(g) => Some(g.url.as_str()),
             OutboundGroupProtocol::Fallback(g) => Some(g.url.as_str()),
             OutboundGroupProtocol::LoadBalance(g) => Some(g.url.as_str()),
@@ -756,7 +752,6 @@ impl OutboundGroupProtocol {
     /// Returns the proxies in the group, if any.
     pub fn proxies(&self) -> Option<&Vec<String>> {
         match &self {
-            OutboundGroupProtocol::Relay(g) => g.proxies.as_ref(),
             OutboundGroupProtocol::UrlTest(g) => g.proxies.as_ref(),
             OutboundGroupProtocol::Fallback(g) => g.proxies.as_ref(),
             OutboundGroupProtocol::LoadBalance(g) => g.proxies.as_ref(),
@@ -768,7 +763,6 @@ impl OutboundGroupProtocol {
     /// Returns the proxy providers used in the group, if any.
     pub fn use_provider(&self) -> Option<&Vec<String>> {
         match &self {
-            OutboundGroupProtocol::Relay(g) => g.use_provider.as_ref(),
             OutboundGroupProtocol::UrlTest(g) => g.use_provider.as_ref(),
             OutboundGroupProtocol::Fallback(g) => g.use_provider.as_ref(),
             OutboundGroupProtocol::LoadBalance(g) => g.use_provider.as_ref(),
@@ -780,7 +774,6 @@ impl OutboundGroupProtocol {
     /// Returns whether include-all is set for the group.
     pub fn include_all(&self) -> Option<bool> {
         match &self {
-            OutboundGroupProtocol::Relay(g) => g.include_all,
             OutboundGroupProtocol::UrlTest(g) => g.include_all,
             OutboundGroupProtocol::Fallback(g) => g.include_all,
             OutboundGroupProtocol::LoadBalance(g) => g.include_all,
@@ -792,7 +785,6 @@ impl OutboundGroupProtocol {
     /// Returns the filter regex string for the group, if any.
     pub fn filter(&self) -> Option<&str> {
         match &self {
-            OutboundGroupProtocol::Relay(g) => g.filter.as_deref(),
             OutboundGroupProtocol::UrlTest(g) => g.filter.as_deref(),
             OutboundGroupProtocol::Fallback(g) => g.filter.as_deref(),
             OutboundGroupProtocol::LoadBalance(g) => g.filter.as_deref(),
@@ -804,7 +796,6 @@ impl OutboundGroupProtocol {
     /// Returns the empty-fallback proxy name for the group, if any.
     pub fn empty_fallback(&self) -> Option<&str> {
         match &self {
-            OutboundGroupProtocol::Relay(g) => g.empty_fallback.as_deref(),
             OutboundGroupProtocol::UrlTest(g) => g.empty_fallback.as_deref(),
             OutboundGroupProtocol::Fallback(g) => g.empty_fallback.as_deref(),
             OutboundGroupProtocol::LoadBalance(g) => g.empty_fallback.as_deref(),
@@ -817,7 +808,6 @@ impl OutboundGroupProtocol {
 impl Display for OutboundGroupProtocol {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
-            OutboundGroupProtocol::Relay(g) => write!(f, "{}", g.name),
             OutboundGroupProtocol::UrlTest(g) => write!(f, "{}", g.name),
             OutboundGroupProtocol::Fallback(g) => write!(f, "{}", g.name),
             OutboundGroupProtocol::LoadBalance(g) => write!(f, "{}", g.name),
@@ -825,21 +815,6 @@ impl Display for OutboundGroupProtocol {
             OutboundGroupProtocol::Smart(g) => write!(f, "{}", g.name),
         }
     }
-}
-
-#[derive(serde::Serialize, serde::Deserialize, Debug, Default, Clone)]
-pub struct OutboundGroupRelay {
-    pub name: String,
-    pub proxies: Option<Vec<String>>,
-    #[serde(rename = "use")]
-    pub use_provider: Option<Vec<String>>,
-    #[serde(rename = "include-all")]
-    pub include_all: Option<bool>,
-    pub icon: Option<String>,
-    pub url: Option<String>,
-    pub filter: Option<String>,
-    #[serde(rename = "empty-fallback")]
-    pub empty_fallback: Option<String>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Default, Clone)]
@@ -1297,5 +1272,17 @@ mod proxy_group_tests {
         } else {
             panic!("expected Trojan variant");
         }
+    }
+}
+
+#[cfg(test)]
+mod group_removal_tests {
+    use super::OutboundGroupProtocol;
+
+    #[test]
+    fn relay_group_is_rejected() {
+        assert!(yaml_serde::from_str::<OutboundGroupProtocol>(
+            "name: old-chain\ntype: relay\nproxies: [a, b]\n"
+        ).is_err());
     }
 }

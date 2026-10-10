@@ -24,7 +24,7 @@ use crate::{
         remote_content_manager::providers::proxy_provider::ArcProxyProvider,
         router::ArcRouter,
     },
-    proxy::AnyOutboundHandler,
+    proxy::OutboundNode,
     session::{Network, Session, SocksAddr, Type},
 };
 #[derive(Clone)]
@@ -173,7 +173,7 @@ async fn find_proxy_provider_proxy_by_name(
 }
 
 async fn get_proxy(
-    Extension(proxy): Extension<AnyOutboundHandler>,
+    Extension(proxy): Extension<OutboundNode>,
     State(state): State<ProviderState>,
 ) -> impl IntoResponse {
     let outbound_manager = state.outbound_manager.clone();
@@ -182,7 +182,7 @@ async fn get_proxy(
 
 async fn get_proxy_delay(
     State(state): State<ProviderState>,
-    Extension(proxy): Extension<AnyOutboundHandler>,
+    Extension(proxy): Extension<OutboundNode>,
     Query(q): Query<DelayRequest>,
 ) -> impl IntoResponse {
     let outbound_manager = state.outbound_manager.clone();

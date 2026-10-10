@@ -7,7 +7,7 @@ use crate::app::dns::ClashResolver;
 use crate::app::dns::endpoint::DnsEndpoint;
 use crate::app::net::OutboundInterface;
 use crate::config::proxy::PROXY_DIRECT;
-use crate::proxy::{AnyOutboundHandler, AnyStream, OutboundHandler};
+use crate::proxy::{OutboundNode, AnyStream, OutboundHandler};
 use crate::session::{Network, Session, Type};
 
 /// Shared dial context for transports that may go direct or via a proxy handler.
@@ -16,7 +16,7 @@ pub struct DialContext {
     pub endpoint: DnsEndpoint,
     pub query_timeout: Duration,
     pub dial_timeout: Duration,
-    pub outbound: Option<AnyOutboundHandler>,
+    pub outbound: Option<OutboundNode>,
     pub iface: Option<OutboundInterface>,
     pub so_mark: Option<u32>,
     pub resolver: Option<Arc<dyn ClashResolver>>,

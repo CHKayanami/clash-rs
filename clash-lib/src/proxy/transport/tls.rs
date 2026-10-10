@@ -1,4 +1,3 @@
-use async_trait::async_trait;
 use serde::Serialize;
 use std::{
     io,
@@ -208,7 +207,6 @@ impl Client {
     }
 }
 
-#[async_trait]
 impl Transport for Client {
     async fn proxy_stream_spliced(
         &self,

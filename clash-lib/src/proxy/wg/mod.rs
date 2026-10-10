@@ -1,7 +1,10 @@
+#[cfg(all(test, docker_test))]
+use crate::proxy::OutboundNode;
+
 pub(crate) use stack::{tcp::SocketPair, udp::UdpPair};
 use self::wireguard::Config;
 use super::{
-    AnyOutboundDatagram, AnyStream, ConnectorType, DialWithConnector,
+    AnyOutboundDatagram, AnyStream, DialWithConnector,
     HandlerCommonOptions, OutboundHandler, OutboundType, PlainProxyAPIResponse,
     utils::RemoteConnector,
 };
@@ -12,7 +15,6 @@ use crate::{
     impl_default_connector,
     session::Session,
 };
-use async_trait::async_trait;
 use erased_serde::Serialize as ErasedSerialize;
 use futures::TryFutureExt;
 use ipnet::IpNet;
@@ -70,7 +72,7 @@ pub struct Handler {
     opts: HandlerOptions,
     inner: OnceCell<Inner>,
 
-    connector: Option<Arc<dyn RemoteConnector>>,
+    connector: Option<Arc<RemoteConnector>>,
 }
 
 impl std::fmt::Debug for Handler {
@@ -86,7 +88,7 @@ impl_default_connector!(Handler);
 impl Handler {
     pub fn new(
         opts: HandlerOptions,
-        connector: Option<Arc<dyn RemoteConnector>>,
+        connector: Option<Arc<RemoteConnector>>,
     ) -> Self {
         Self {
             opts,
@@ -235,7 +237,6 @@ impl Handler {
     }
 }
 
-#[async_trait]
 impl OutboundHandler for Handler {
     fn name(&self) -> &str {
         &self.opts.name
@@ -249,7 +250,7 @@ impl OutboundHandler for Handler {
         OutboundType::WireGuard
     }
 
-    async fn support_udp(&self) -> bool {
+    fn support_udp(&self) -> bool {
         self.opts.udp
     }
 
@@ -321,16 +322,10 @@ impl OutboundHandler for Handler {
         Ok(AnyOutboundDatagram::new(socket))
     }
 
-    async fn support_connector(&self) -> ConnectorType {
-        ConnectorType::None
-    }
 
-    fn try_as_plain_handler(&self) -> Option<&dyn PlainProxyAPIResponse> {
-        Some(self as _)
-    }
+
 }
 
-#[async_trait]
 impl PlainProxyAPIResponse for Handler {
     async fn as_map(&self) -> HashMap<String, Box<dyn ErasedSerialize + Send>> {
         let mut m = HashMap::new();
@@ -431,7 +426,7 @@ mod tests {
         // FIXME: wait for the startup of the test runner in a more elegant way
         tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
         run_test_suites_and_cleanup(
-            handler,
+            OutboundNode::protocol(handler),
             runner,
             &[Suite::LatencyTcp, Suite::DnsUdp],
         )

@@ -425,22 +425,6 @@ impl Display for LogLevel {
 ///   store-fake-ip: false
 ///
 /// proxy-groups:
-///   - name: "relay"
-///     type: relay
-///     proxies:
-///       - "plain-vmess"
-///       - "ws-vmess"
-///       - "auto"
-///       - "fallback-auto"
-///       - "load-balance"
-///       - "select"
-///       - DIRECT
-///
-///   - name: "relay-one"
-///     type: relay
-///     use:
-///       - "file-provider"
-///
 ///   - name: "auto"
 ///     type: url-test
 ///     use:
@@ -579,9 +563,9 @@ impl Display for LogLevel {
 ///     behavior: domain
 ///
 /// rules:
-///   - DOMAIN,ipinfo.io,relay
+///   - DOMAIN,ipinfo.io,select
 ///   - RULE-SET,file-provider,trojan
-///   - GEOIP,CN,relay
+///   - GEOIP,CN,select
 ///   - DOMAIN-SUFFIX,facebook.com,REJECT
 ///   - DOMAIN-KEYWORD,google,select
 ///   - DOMAIN,google.com,select
@@ -1880,13 +1864,6 @@ proxies:
     down: 200
 
 proxy-groups:
-  - name: "relay"
-    type: relay
-    proxies:
-      - vmess
-      - ss1
-      - ss2
-
   - name: "auto"
     type: url-test
     proxies:
@@ -2042,12 +2019,6 @@ rules:
             .proxy_group
             .as_ref()
             .expect("proxy-groups should be set");
-        assert!(
-            groups
-                .iter()
-                .any(|g| matches!(g, OutboundGroupProtocol::Relay(_))),
-            "relay group missing"
-        );
         assert!(
             groups
                 .iter()

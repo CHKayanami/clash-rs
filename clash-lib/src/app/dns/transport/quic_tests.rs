@@ -1,6 +1,6 @@
 use super::*;
 use crate::app::dns::endpoint::{DnsProtocol, DnsStrategy};
-use crate::proxy::direct;
+use crate::proxy::{OutboundNode, direct, reject};
 use std::sync::atomic::Ordering;
 
 fn dial() -> super::super::dial::DialContext {
@@ -15,7 +15,7 @@ fn dial() -> super::super::dial::DialContext {
         .unwrap(),
         dial_timeout: Duration::from_secs(1),
         query_timeout: Duration::from_secs(1),
-        outbound: Some(Arc::new(direct::Handler::new("test-outbound"))),
+        outbound: Some(OutboundNode::protocol(Arc::new(direct::Handler::new("test-outbound")))),
         iface: None,
         so_mark: None,
         resolver: None,
@@ -143,7 +143,7 @@ async fn outbound_without_udp_fails_without_direct_fallback() {
     let active = Arc::new(AtomicUsize::new(0));
     let mut context = dial();
     context.outbound =
-        Some(Arc::new(crate::proxy::reject::Handler::new("no-udp")));
+        Some(OutboundNode::protocol(Arc::new(reject::Handler::new("no-udp"))));
     let shared = SharedQuicEndpoint::with_dial(context, active.clone());
     let result = shared.get("127.0.0.1:853".parse().unwrap()).await;
     assert!(

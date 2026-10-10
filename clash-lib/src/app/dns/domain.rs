@@ -2,7 +2,7 @@ use std::{borrow::Cow, sync::Arc};
 
 use crate::{
     common::domainset::{DomainSet, DomainSetBuilder, DomainSetQuery},
-    proxy::utils::OutboundHandlerRegistry,
+    proxy::utils::OutboundNodeRegistry,
 };
 
 pub(super) fn normalize_domain(domain: &str) -> Cow<'_, str> {
@@ -49,7 +49,7 @@ impl DomainMatcher {
 }
 
 pub(super) fn proxy_server_domain_matcher(
-    outbounds: &OutboundHandlerRegistry,
+    outbounds: &OutboundNodeRegistry,
 ) -> Option<DomainMatcher> {
     let names: Vec<_> = {
         let handlers = outbounds.load();

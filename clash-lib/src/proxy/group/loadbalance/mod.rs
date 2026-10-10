@@ -1,24 +1,21 @@
+use super::UdpPolicy;
+use std::collections::HashSet;
+use super::GroupHandler;
 mod helpers;
 
-use async_trait::async_trait;
 use helpers::strategy_sticky_session;
 use std::{io, sync::Arc};
-use tracing::debug;
 
-use self::helpers::{StrategyFn, strategy_consistent_hashring, strategy_rr};
+use self::helpers::{Strategy, strategy_consistent_hashring, strategy_rr};
 use crate::{
-    app::{
-        dns::ThreadSafeDNSResolver,
-        remote_content_manager::{
-            ProxyManager, providers::proxy_provider::ArcProxyProvider,
-        },
+    app::remote_content_manager::{
+        ProxyManager, providers::proxy_provider::ArcProxyProvider,
     },
     config::internal::proxy::LoadBalanceStrategy,
     proxy::{
-        AnyOutboundDatagram, AnyOutboundHandler, AnyStream, ConnectorType,
-        DialWithConnector, HandlerCommonOptions, OutboundHandler, OutboundType,
+        OutboundNode, HandlerCommonOptions, OutboundType,
         group::GroupProxyAPIResponse,
-        utils::{RemoteConnector, provider_helper::Providers},
+        utils::provider_helper::Providers,
     },
     session::Session,
 };
@@ -36,7 +33,7 @@ pub struct Handler {
 
     providers: Providers,
 
-    strategy_fn: StrategyFn,
+    strategy_fn: Strategy,
 }
 
 impl std::fmt::Debug for Handler {
@@ -68,12 +65,12 @@ impl Handler {
         }
     }
 
-    fn get_proxies(&self, touch: bool) -> Arc<Vec<AnyOutboundHandler>> {
+    fn get_proxies(&self, touch: bool) -> Arc<Vec<OutboundNode>> {
         self.providers.get_proxies(touch)
     }
 
     /// Run the configured strategy over the group's current members.
-    async fn pick(&self, sess: &Session) -> io::Result<AnyOutboundHandler> {
+    async fn pick(&self, sess: &Session) -> io::Result<OutboundNode> {
         let proxies = self.get_proxies(false);
         if proxies.is_empty() {
             return Err(io::Error::other(format!(
@@ -81,90 +78,35 @@ impl Handler {
                 self.name()
             )));
         }
-        (self.strategy_fn)(proxies, sess).await
+        self.strategy_fn.pick(proxies, sess).await
     }
 }
 
-impl DialWithConnector for Handler {}
-
-#[async_trait]
-impl OutboundHandler for Handler {
-    /// The name of the outbound handler
+impl GroupHandler for Handler {
     fn name(&self) -> &str {
         &self.opts.name
     }
 
-    /// The protocol of the outbound handler
-    /// only contains Type information, do not rely on the underlying value
     fn proto(&self) -> OutboundType {
         OutboundType::LoadBalance
     }
 
-    /// whether the outbound handler support UDP
-    async fn support_udp(&self) -> bool {
-        self.opts.udp
+    fn udp_policy(&self) -> UdpPolicy {
+        if self.opts.udp { UdpPolicy::Enabled } else { UdpPolicy::Disabled }
     }
 
-    /// connect to remote target via TCP
-    async fn connect_stream(
+    async fn select(
         &self,
         sess: &Session,
-        resolver: ThreadSafeDNSResolver,
-    ) -> io::Result<AnyStream> {
-        let proxy = self.pick(sess).await?;
-        debug!("{} use proxy {}", self.name(), proxy.name());
-
-        let s = proxy.connect_stream(sess, resolver).await?;
-
-        sess.push_chain(self.name());
-
-        Ok(s)
-    }
-
-    /// connect to remote target via UDP
-    async fn connect_datagram(
-        &self,
-        sess: &Session,
-        resolver: ThreadSafeDNSResolver,
-    ) -> io::Result<AnyOutboundDatagram> {
-        let proxy = self.pick(sess).await?;
-        debug!("{} use proxy {}", self.name(), proxy.name());
-
-        let s = proxy.connect_datagram(sess, resolver).await?;
-
-        sess.push_chain(self.name());
-
-        Ok(s)
-    }
-
-    async fn support_connector(&self) -> ConnectorType {
-        ConnectorType::Tcp
-    }
-
-    async fn connect_stream_with_connector(
-        &self,
-        sess: &Session,
-        resolver: ThreadSafeDNSResolver,
-        connector: &dyn RemoteConnector,
-    ) -> io::Result<AnyStream> {
-        let proxy = self.pick(sess).await?;
-        debug!("{} use proxy {}", self.name(), proxy.name());
-        let s = proxy
-            .connect_stream_with_connector(sess, resolver, connector)
-            .await?;
-
-        sess.push_chain(self.name());
-        Ok(s)
-    }
-
-    fn try_as_group_handler(&self) -> Option<&dyn GroupProxyAPIResponse> {
-        Some(self as _)
+        excluded: &HashSet<String>,
+    ) -> io::Result<Option<OutboundNode>> {
+        let _ = (sess, excluded);
+        self.pick(sess).await.map(Some)
     }
 }
 
-#[async_trait]
 impl GroupProxyAPIResponse for Handler {
-    async fn get_proxies(&self) -> Vec<AnyOutboundHandler> {
+    async fn get_proxies(&self) -> Vec<OutboundNode> {
         Handler::get_proxies(self, false).to_vec()
     }
 
@@ -175,7 +117,7 @@ impl GroupProxyAPIResponse for Handler {
     /// NAT re-keying and REJECT short-circuit (`dispatcher_impl.rs`), which key
     /// off the active proxy. Rejected traffic still fails at `connect_*`; it
     /// just is not short-circuited before the channel is set up.
-    async fn get_active_proxy(&self) -> Option<AnyOutboundHandler> {
+    async fn get_active_proxy(&self) -> Option<OutboundNode> {
         None
     }
 

@@ -96,7 +96,7 @@ pub fn proxy_groups_dag_sort(
 mod tests {
     use crate::config::internal::proxy::{
         OutboundGroupFallback, OutboundGroupLoadBalance, OutboundGroupProtocol,
-        OutboundGroupRelay, OutboundGroupSelect, OutboundGroupSmart,
+        OutboundGroupSelect, OutboundGroupSmart,
         OutboundGroupUrlTest,
     };
 
@@ -121,8 +121,8 @@ mod tests {
 
     #[test]
     fn test_proxy_groups_dag_sort_ok() {
-        let g1 = OutboundGroupRelay {
-            name: "relay".to_owned(),
+        let g1 = OutboundGroupSelect {
+            name: "outer-select".to_owned(),
             proxies: Some(vec![
                 "ss".to_owned(),
                 "auto".to_owned(),
@@ -165,7 +165,7 @@ mod tests {
         };
 
         let mut groups = vec![
-            OutboundGroupProtocol::Relay(g1),
+            OutboundGroupProtocol::Select(g1),
             OutboundGroupProtocol::UrlTest(g2),
             OutboundGroupProtocol::Fallback(g3),
             OutboundGroupProtocol::LoadBalance(g4),
@@ -175,13 +175,13 @@ mod tests {
 
         super::proxy_groups_dag_sort(&mut groups).unwrap();
 
-        assert_eq!(groups.last().unwrap().name(), "relay");
+        assert_eq!(groups.last().unwrap().name(), "outer-select");
     }
 
     #[test]
     fn test_proxy_groups_dag_sort_cycle() {
-        let g1 = OutboundGroupRelay {
-            name: "relay".to_owned(),
+        let g1 = OutboundGroupSelect {
+            name: "outer-select".to_owned(),
             proxies: Some(vec![
                 "ss".to_owned(),
                 "auto".to_owned(),
@@ -203,13 +203,13 @@ mod tests {
             proxies: Some(vec![
                 "ss".to_owned(),
                 "DIRECT".to_owned(),
-                "relay".to_owned(),
+                "outer-select".to_owned(),
             ]),
             ..Default::default()
         };
 
         let mut groups = vec![
-            OutboundGroupProtocol::Relay(g1),
+            OutboundGroupProtocol::Select(g1),
             OutboundGroupProtocol::UrlTest(g2),
             OutboundGroupProtocol::Fallback(g3),
         ];

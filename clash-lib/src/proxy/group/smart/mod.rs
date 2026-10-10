@@ -8,21 +8,19 @@
 //! - [`stats`] - Statistics collection and performance metrics
 //! - [`state`] - Centralized state management
 
-use async_trait::async_trait;
-use std::{collections::HashSet, io, sync::Arc, time::Instant};
+use super::UdpPolicy;
+use std::{collections::HashSet, time::Duration};
+use super::GroupHandler;
+use std::{io, sync::Arc};
 use tracing::{debug, info};
 
 use crate::{
-    app::{
-        dns::ThreadSafeDNSResolver,
-        remote_content_manager::{
-            ProxyManager, providers::proxy_provider::ArcProxyProvider,
-        },
+    app::remote_content_manager::{
+        ProxyManager, providers::proxy_provider::ArcProxyProvider,
     },
     proxy::{
-        AnyOutboundDatagram, AnyOutboundHandler, AnyStream, ConnectorType,
-        DialWithConnector, HandlerCommonOptions, OutboundHandler, OutboundType,
-        utils::{RemoteConnector, provider_helper::Providers},
+        OutboundNode, HandlerCommonOptions, OutboundType,
+        utils::provider_helper::Providers,
     },
     session::Session,
 };
@@ -34,40 +32,6 @@ pub mod stats;
 use crate::proxy::group::GroupProxyAPIResponse;
 pub use state::SmartState;
 use stats::SiteStats;
-
-/// Error type for smart group failures
-#[derive(Debug)]
-enum SmartError {
-    /// No proxy available in the smart group
-    NoProxy,
-    /// All proxies in the group failed to connect
-    AllProxiesFailed(Vec<String>),
-}
-
-impl std::fmt::Display for SmartError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::NoProxy => write!(f, "no available proxy in smart group"),
-            Self::AllProxiesFailed(names) => {
-                write!(f, "all proxies failed: {names:?}")
-            }
-        }
-    }
-}
-
-impl std::error::Error for SmartError {}
-
-impl SmartError {
-    /// Log the error using the tracing framework
-    fn log_error(&self) {
-        match self {
-            Self::NoProxy => debug!("no available proxy in smart group"),
-            Self::AllProxiesFailed(names) => {
-                debug!("all proxies failed: {:?}", names)
-            }
-        }
-    }
-}
 
 #[derive(Default, Clone)]
 pub struct HandlerOptions {
@@ -171,7 +135,7 @@ impl Handler {
     ///
     /// # Returns
     /// Vector of available proxy handlers
-    fn get_proxies(&self, touch: bool) -> Arc<Vec<AnyOutboundHandler>> {
+    fn get_proxies(&self, touch: bool) -> Arc<Vec<OutboundNode>> {
         self.providers.get_proxies(touch)
     }
 
@@ -194,7 +158,7 @@ impl Handler {
         &self,
         sess: &Session,
         excluded: Option<&HashSet<String>>,
-    ) -> Option<AnyOutboundHandler> {
+    ) -> Option<OutboundNode> {
         let proxies = self.get_proxies(false);
         if proxies.is_empty() {
             debug!("{} no proxies available", self.name());
@@ -255,7 +219,7 @@ impl Handler {
                 .collect::<Vec<_>>()
         };
 
-        let mut candidates: Vec<(f64, AnyOutboundHandler, String)> = Vec::new();
+        let mut candidates: Vec<(f64, OutboundNode, String)> = Vec::new();
 
         for (proxy, site_stats, ip_stats, penalty_score) in histories {
             let name = proxy.name().to_string();
@@ -415,144 +379,6 @@ impl Handler {
         Some(selected_proxy)
     }
 
-    /// Adaptive retry mechanism with exponential backoff and state updates
-    ///
-    /// Implements intelligent retry logic that:
-    /// - Calculates optimal retry count based on site history
-    /// - Uses exponential backoff for retry delays
-    /// - Updates performance metrics and penalties
-    /// - Tracks traffic patterns and site preferences
-    /// - Avoids trying the same failed proxy repeatedly
-    ///
-    /// # Arguments
-    /// * `sess` - Session information
-    /// * `resolver` - DNS resolver for name resolution
-    ///
-    /// # Returns
-    /// Successful connection stream or error
-    async fn adaptive_retry(
-        &self,
-        sess: &Session,
-        resolver: &ThreadSafeDNSResolver,
-    ) -> io::Result<AnyStream> {
-        let site = sess.destination.host_cow();
-        let dest_ip = sess.destination.ip().map(|ip| ip.to_string());
-        let mut tried = HashSet::new();
-        let mut retry_delay = 100; // Initial retry delay in ms
-
-        // Start traffic tracking for this session
-        {
-            let mut state_guard = self.smart_state.lock().await;
-            state_guard.start_traffic_tracking(sess);
-            state_guard.record_request(sess);
-        }
-
-        // Calculate adaptive retry configuration
-        let max_retries = self.calculate_max_retries(&site).await;
-        let mut retries = 0;
-
-        debug!(
-            "{} starting adaptive retry for {}, max_retries: {}",
-            self.name(),
-            site,
-            max_retries
-        );
-
-        while retries < max_retries {
-            match self.pick_smart(sess, Some(&tried)).await {
-                Some(proxy) => {
-                    let name = proxy.name().to_string();
-                    tried.insert(name.clone());
-
-                    let start = Instant::now();
-                    match proxy.connect_stream(sess, resolver.clone()).await {
-                        Ok(stream) => {
-                            let delay = start.elapsed().as_secs_f64() * 1000.0;
-
-                            // Update success metrics
-                            self.record_success(
-                                &name,
-                                &site,
-                                dest_ip.as_deref(),
-                                delay,
-                                sess,
-                            )
-                            .await;
-
-                            debug!(
-                                "{} successfully connected to {} via {}, delay: \
-                                 {:.2}ms, attempts: {}",
-                                self.name(),
-                                site,
-                                &name,
-                                delay,
-                                retries + 1
-                            );
-
-                            sess.push_chain(self.name());
-
-                            return Ok(stream);
-                        }
-                        Err(e) => {
-                            debug!(
-                                "{} proxy {} connection failed: {}",
-                                self.name(),
-                                name,
-                                e
-                            );
-
-                            // Update failure metrics
-                            self.record_failure(
-                                &name,
-                                &site,
-                                dest_ip.as_deref(),
-                                sess,
-                            )
-                            .await;
-
-                            // Exponential backoff with jitter
-                            tokio::time::sleep(std::time::Duration::from_millis(
-                                retry_delay,
-                            ))
-                            .await;
-                            retry_delay = (retry_delay * 2).min(5000); // Cap at 5 seconds
-                            retries += 1;
-
-                            debug!(
-                                "{} retry {} of {} for {}, next delay: {}ms",
-                                self.name(),
-                                retries,
-                                max_retries,
-                                site,
-                                if retries < max_retries {
-                                    retry_delay
-                                } else {
-                                    0
-                                }
-                            );
-                            continue;
-                        }
-                    }
-                }
-                None => {
-                    break; // Exit loop immediately if no proxy available
-                }
-            }
-        }
-
-        if tried.is_empty() {
-            let error = SmartError::NoProxy;
-            error.log_error();
-            Err(io::Error::other("no available proxy in smart group"))
-        } else {
-            let error = SmartError::AllProxiesFailed(tried.into_iter().collect());
-            error.log_error();
-            Err(io::Error::other(format!(
-                "smart proxy selection failed after {retries} retries"
-            )))
-        }
-    }
-
     /// Calculate optimal retry count based on site history
     async fn calculate_max_retries(&self, site: &str) -> u32 {
         let state_guard = self.smart_state.lock().await;
@@ -620,9 +446,7 @@ impl Handler {
         state_guard.record_request(sess);
     }
 }
-impl DialWithConnector for Handler {}
-#[async_trait]
-impl OutboundHandler for Handler {
+impl GroupHandler for Handler {
     fn name(&self) -> &str {
         &self.opts.name
     }
@@ -631,87 +455,59 @@ impl OutboundHandler for Handler {
         OutboundType::Smart
     }
 
-    async fn support_udp(&self) -> bool {
-        self.opts.udp
+    fn udp_policy(&self) -> UdpPolicy {
+        if self.opts.udp { UdpPolicy::Enabled } else { UdpPolicy::Disabled }
     }
 
-    async fn connect_stream(
+    async fn select(
         &self,
         sess: &Session,
-        resolver: ThreadSafeDNSResolver,
-    ) -> io::Result<AnyStream> {
-        debug!("{} starting smart proxy selection", self.name());
-        match self.adaptive_retry(sess, &resolver).await {
-            Ok(stream) => {
-                debug!(
-                    "{} successfully connected using smart selection",
-                    self.name()
-                );
-                Ok(stream)
-            }
-            Err(e) => {
-                debug!(
-                    "{} failed to connect with all available proxies: {:?}",
-                    self.name(),
-                    e
-                );
-                Err(e)
-            }
-        }
+        excluded: &HashSet<String>,
+    ) -> io::Result<Option<OutboundNode>> {
+        Ok(self.pick_smart(sess, Some(excluded)).await)
     }
 
-    async fn connect_datagram(
+    async fn attempts(&self, sess: &Session) -> u32 {
+        let mut state = self.smart_state.lock().await;
+        state.start_traffic_tracking(sess);
+        state.record_request(sess);
+        drop(state);
+        self.calculate_max_retries(sess.destination.host_cow().as_ref())
+            .await
+    }
+
+    fn retry_delay(&self, attempt: u32) -> Duration {
+        let delay = 100u64 << attempt.saturating_sub(1).min(6);
+        Duration::from_millis(delay.min(5000))
+    }
+
+    async fn record_result(
         &self,
         sess: &Session,
-        resolver: ThreadSafeDNSResolver,
-    ) -> io::Result<AnyOutboundDatagram> {
-        // For UDP we use the best proxy without retries for simplicity
-        if let Some(proxy) = self.pick_smart(sess, None).await {
-            debug!("{} use proxy {} (smart)", self.name(), proxy.name());
-            let s = proxy.connect_datagram(sess, resolver).await?;
-
-            sess.push_chain(self.name());
-
-            Ok(s)
+        proxy: &str,
+        elapsed: Duration,
+        success: bool,
+    ) {
+        let site = sess.destination.host_cow();
+        let ip = sess.destination.ip().map(|ip| ip.to_string());
+        if success {
+            self.record_success(
+                proxy, &site, ip.as_deref(),
+                elapsed.as_secs_f64() * 1000.0, sess,
+            ).await;
         } else {
-            Err(io::Error::other("no available proxy in smart group"))
+            self.record_failure(proxy, &site, ip.as_deref(), sess)
+                .await;
         }
-    }
-
-    async fn support_connector(&self) -> ConnectorType {
-        ConnectorType::Tcp
-    }
-
-    async fn connect_stream_with_connector(
-        &self,
-        sess: &Session,
-        resolver: ThreadSafeDNSResolver,
-        connector: &dyn RemoteConnector,
-    ) -> io::Result<AnyStream> {
-        if let Some(proxy) = self.pick_smart(sess, None).await {
-            debug!("{} use proxy {} (smart)", self.name(), proxy.name());
-            let stream = proxy
-                .connect_stream_with_connector(sess, resolver, connector)
-                .await?;
-            sess.push_chain(self.name());
-            Ok(stream)
-        } else {
-            Err(io::Error::other("no available proxy in smart group"))
-        }
-    }
-
-    fn try_as_group_handler(&self) -> Option<&dyn GroupProxyAPIResponse> {
-        Some(self as _)
     }
 }
 
-#[async_trait]
 impl GroupProxyAPIResponse for Handler {
-    async fn get_proxies(&self) -> Vec<AnyOutboundHandler> {
+    async fn get_proxies(&self) -> Vec<OutboundNode> {
         Handler::get_proxies(self, false).to_vec()
     }
 
-    async fn get_active_proxy(&self) -> Option<AnyOutboundHandler> {
+    async fn get_active_proxy(&self) -> Option<OutboundNode> {
         None
     }
 
@@ -726,6 +522,7 @@ impl GroupProxyAPIResponse for Handler {
 
 #[cfg(test)]
 mod unit_tests {
+    use crate::proxy::AnyStream;
     use super::*;
     use crate::proxy::{
         mocks::{MockDummyOutboundHandler, MockDummyProxyProvider},
@@ -747,9 +544,9 @@ mod unit_tests {
             Ok(AnyStream::new(stream))
         });
 
-        let proxies: Arc<Vec<AnyOutboundHandler>> = Arc::new(vec![
-            Arc::new(failing),
-            Arc::new(working),
+        let proxies: Arc<Vec<OutboundNode>> = Arc::new(vec![
+            OutboundNode::protocol(Arc::new(failing)),
+            OutboundNode::protocol(Arc::new(working)),
         ]);
         let mut provider = MockDummyProxyProvider::new();
         provider.expect_proxies().returning(move || proxies.clone());
@@ -774,7 +571,7 @@ mod unit_tests {
             smart_state: Arc::new(tokio::sync::Mutex::new(SmartState::new())),
         };
         let sess = Session::default();
-        handler.connect_stream(&sess, resolver).await.unwrap();
+        OutboundNode::group(Arc::new(handler)).connect_stream(&sess, resolver).await.unwrap();
         assert!(sess.proxy_chain.snapshot().contains(&"smart".to_owned()));
     }
 }
@@ -836,9 +633,8 @@ mod tests {
             plugin: Default::default(),
             udp: true,
         };
-        let ss_handler: AnyOutboundHandler =
-            Arc::new(crate::proxy::shadowsocks::outbound::Handler::new(ss_opts, None))
-                as _;
+        let ss_handler: OutboundNode =
+            OutboundNode::protocol(Arc::new(crate::proxy::shadowsocks::outbound::Handler::new(ss_opts, None)));
 
         let mut provider = MockDummyProxyProvider::new();
         provider.expect_touch().returning(|| ());
@@ -878,7 +674,7 @@ mod tests {
             cache_store,
         )
         .await;
-        let any_smart_handler: AnyOutboundHandler = Arc::new(smart_handler_instance);
+        let any_smart_handler: OutboundNode = OutboundNode::group(Arc::new(smart_handler_instance));
 
         run_test_suites_and_cleanup(any_smart_handler, docker_runner, Suite::all())
             .await
