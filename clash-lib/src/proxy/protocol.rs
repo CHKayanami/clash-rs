@@ -2,6 +2,7 @@
 use super::{AnyOutboundDatagram, AnyStream, OutboundHandler, OutboundType, OutboundNode, DialWithConnector, PlainProxyAPIResponse};
 use crate::{app::dns::ThreadSafeDNSResolver, session::Session};
 use erased_serde::Serialize;
+use futures::future::BoxFuture;
 use std::{collections::HashMap, io};
 
 use std::sync::{Arc, Weak};
@@ -82,11 +83,13 @@ impl ProtocolOutbound {
     pub fn support_dialer(&self) -> Option<&str> { dispatch!(self, h, DialWithConnector::support_dialer(h.as_ref())) }
     pub fn dialer_dependency(&self) -> Option<OutboundNode> { dispatch!(self, h, DialWithConnector::dialer_dependency(h.as_ref())) }
 
-    pub async fn connect_stream(&self, sess: &Session, resolver: ThreadSafeDNSResolver) -> io::Result<AnyStream> {
-        dispatch!(self, h, OutboundHandler::connect_stream(h.as_ref(), sess, resolver).await)
+    // Box each concrete protocol future, rather than an async match that would
+    // reserve the largest protocol state in every connection and its callers.
+    pub fn connect_stream<'a>(&'a self, sess: &'a Session, resolver: ThreadSafeDNSResolver) -> BoxFuture<'a, io::Result<AnyStream>> {
+        dispatch!(self, h, Box::pin(OutboundHandler::connect_stream(h.as_ref(), sess, resolver)))
     }
-    pub async fn connect_datagram(&self, sess: &Session, resolver: ThreadSafeDNSResolver) -> io::Result<AnyOutboundDatagram> {
-        dispatch!(self, h, OutboundHandler::connect_datagram(h.as_ref(), sess, resolver).await)
+    pub fn connect_datagram<'a>(&'a self, sess: &'a Session, resolver: ThreadSafeDNSResolver) -> BoxFuture<'a, io::Result<AnyOutboundDatagram>> {
+        dispatch!(self, h, Box::pin(OutboundHandler::connect_datagram(h.as_ref(), sess, resolver)))
     }
 
     pub async fn as_map(&self) -> HashMap<String, Box<dyn Serialize + Send>> {

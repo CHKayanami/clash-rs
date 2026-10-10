@@ -2,6 +2,7 @@
 
 use std::{collections::{HashMap, HashSet}, future::Future, mem::size_of_val, sync::Arc};
 use arc_swap::ArcSwap;
+use futures::future::BoxFuture;
 use crate::{
     app::{dns::{SystemResolver, ThreadSafeDNSResolver}, remote_content_manager::{ProxyManager, healthcheck::HealthCheck, providers::proxy_provider::PlainProvider}},
     config::internal::proxy::LoadBalanceStrategy,
@@ -18,6 +19,14 @@ impl<S: Fn(), F: Fn(&str, usize, Option<usize>) -> usize> Measurement<S, F> {
         (self.start)();
         let future = create();
         (self.finish)(name, size_of_val(&future), Some(expected));
+    }
+
+    fn measure_boxed<'a, T>(&self, name: &str, create: impl FnOnce() -> BoxFuture<'a, T>) {
+        (self.start)();
+        let future = create();
+        assert_eq!(size_of_val(&future), 2 * size_of::<usize>());
+        // Report the actual heap state as well as the pointer measured below.
+        (self.finish)(name, size_of_val(future.as_ref().get_ref()), Some(1));
     }
 }
 
@@ -61,6 +70,17 @@ pub async fn measure_dispatch_futures(start: impl Fn(), finish: impl Fn(&str, us
 
     measurement.measure("direct", || direct.connect_stream(&sess, resolver.clone()), 0);
     measurement.measure("socks", || socks.connect_stream(&sess, resolver.clone()), 0);
+    let concrete = protocol.as_protocol().unwrap();
+    measurement.measure("boxed protocol TCP handle", || concrete.connect_stream(&sess, resolver.clone()), 1);
+    measurement.measure("boxed protocol UDP handle", || concrete.connect_datagram(&sess, resolver.clone()), 1);
+    measurement.measure_boxed("Direct TCP heap state", || concrete.connect_stream(&sess, resolver.clone()));
+    measurement.measure_boxed("Direct UDP heap state", || concrete.connect_datagram(&sess, resolver.clone()));
+    let socks_protocol = OutboundNode::protocol(Arc::new(socks::outbound::Handler::new(
+        socks::outbound::HandlerOptions { name: "boxed-socks".to_owned(), server: "127.0.0.1".to_owned(), port: 9, ..Default::default() }, None,
+    )));
+    let concrete = socks_protocol.as_protocol().unwrap();
+    measurement.measure_boxed("SOCKS5 TCP heap state", || concrete.connect_stream(&sess, resolver.clone()));
+    measurement.measure_boxed("SOCKS5 UDP heap state", || concrete.connect_datagram(&sess, resolver.clone()));
     measurement.measure("protocol enum", || protocol.connect_stream(&sess, resolver.clone()), 0);
     measurement.measure("protocol UDP enum", || protocol.connect_datagram(&sess, resolver.clone()), 0);
     measurement.measure("group enum", || group.connect_stream(&sess, resolver.clone()), 0);
