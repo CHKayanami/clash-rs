@@ -3,11 +3,11 @@ use std::{
     future::Future,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     pin::Pin,
-    sync::Arc,
     time::Duration,
 };
 
 use bytes::{Bytes, BytesMut};
+use parking_lot::Mutex;
 use futures::{SinkExt, StreamExt, stream::FuturesUnordered};
 
 use rand::seq::IndexedRandom;
@@ -21,10 +21,7 @@ use smoltcp::{
     time::Instant,
     wire::IpCidr,
 };
-use tokio::sync::{
-    Mutex,
-    mpsc::{Receiver, Sender},
-};
+use tokio::sync::mpsc::{Receiver, Sender};
 use tracing::{Instrument, debug, error, trace, trace_span, warn};
 
 use crate::{
@@ -61,22 +58,23 @@ enum SenderType {
     Udp(Sender<UdpPacket>),
 }
 
+struct DeviceReceivers {
+    packet_notifier: Receiver<()>,
+    socket_notifier_receiver: Receiver<Socket>,
+}
+
 pub struct DeviceManager {
     addr: Ipv4Addr,
     addr_v6: Option<Ipv6Addr>,
     resolver: ThreadSafeDNSResolver,
     dns_servers: Vec<SocketAddr>,
 
-    socket_set: Arc<Mutex<SocketSet<'static>>>,
-    socket_pairs: Arc<Mutex<HashMap<SocketHandle, SenderType>>>,
-
     tcp_port_pool: PortPool,
     udp_port_pool: PortPool,
 
-    packet_notifier: Arc<Mutex<Receiver<()>>>,
+    receivers: Mutex<Option<DeviceReceivers>>,
 
     socket_notifier: Sender<Socket>,
-    socket_notifier_receiver: Arc<Mutex<Receiver<Socket>>>,
 }
 
 impl DeviceManager {
@@ -87,9 +85,6 @@ impl DeviceManager {
         dns_servers: Vec<SocketAddr>,
         packet_notifier: Receiver<()>,
     ) -> Self {
-        let socket_set = Arc::new(Mutex::new(SocketSet::new(Vec::new())));
-        let socket_pairs = Arc::new(Mutex::new(HashMap::new()));
-
         let tcp_port_pool = PortPool::new();
         let udp_port_pool = PortPool::new();
 
@@ -103,16 +98,13 @@ impl DeviceManager {
             resolver,
             dns_servers,
 
-            socket_set,
-            socket_pairs,
-
             tcp_port_pool,
             udp_port_pool,
 
-            packet_notifier: Arc::new(Mutex::new(packet_notifier)),
-
+            receivers: Mutex::new(Some(DeviceReceivers {
+                packet_notifier, socket_notifier_receiver,
+            })),
             socket_notifier,
-            socket_notifier_receiver: Arc::new(Mutex::new(socket_notifier_receiver)),
         }
     }
 
@@ -220,6 +212,15 @@ impl DeviceManager {
             >,
         >;
 
+        let Some(DeviceReceivers {
+            mut packet_notifier, mut socket_notifier_receiver,
+        }) = self.receivers.lock().take() else {
+            error!("wireguard device polling already started");
+            return;
+        };
+        let mut sockets = SocketSet::new(Vec::new());
+        let mut socket_pairs = HashMap::new();
+
         let mut config = Config::new(smoltcp::wire::HardwareAddress::Ip);
         config.random_seed = rand::random();
 
@@ -243,13 +244,6 @@ impl DeviceManager {
         let mut next_poll = None;
 
         loop {
-            let mut sockets = self.socket_set.lock().await;
-            let mut socket_pairs = self.socket_pairs.lock().await;
-
-            let mut packet_notifier = self.packet_notifier.lock().await;
-            let mut socket_notifier_receiver =
-                self.socket_notifier_receiver.lock().await;
-
             tokio::select! {
                 Some(socket) = socket_notifier_receiver.recv() => {
                     trace!("got new socket, notifying to poll sockets");
@@ -772,3 +766,7 @@ impl smoltcp::phy::TxToken for TxToken {
         result
     }
 }
+
+#[cfg(test)]
+#[path = "device_tests.rs"]
+mod tests;

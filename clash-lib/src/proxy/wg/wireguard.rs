@@ -12,6 +12,7 @@ use boringtun::{
 };
 
 use bytes::Bytes;
+use parking_lot::Mutex;
 use futures::{
     SinkExt, StreamExt,
     stream::{SplitSink, SplitStream},
@@ -19,7 +20,7 @@ use futures::{
 use ipnet::IpNet;
 use smoltcp::wire::{IpProtocol, IpVersion, Ipv4Packet, Ipv6Packet};
 use tokio::sync::{
-    Mutex,
+    Mutex as AsyncMutex,
     mpsc::{Receiver, Sender},
 };
 use tracing::{Instrument, enabled, error, trace, trace_span, warn};
@@ -37,22 +38,32 @@ use crate::{
 
 use super::events::PortProtocol;
 
+struct TunnelReceivers {
+    rx: SplitStream<AnyOutboundDatagram>,
+    packet_reader: Receiver<Bytes>,
+}
+
+enum TunnelOutput {
+    Network(Vec<u8>),
+    Tunnel(Bytes, IpAddr),
+    Error(WireGuardError),
+}
+
 pub struct WireguardTunnel {
     pub(crate) source_peer_ip: Ipv4Addr,
     pub(crate) source_peer_ipv6: Option<Ipv6Addr>,
-    peer: Arc<Mutex<Tunn>>,
+    peer: Mutex<Tunn>,
     pub(crate) endpoint: SocketAddr,
     allowed_ips: Vec<IpNet>,
     reserved_bits: [u8; 3],
 
     // UDP socket to the remote WireGuard endpoint
-    tx: tokio::sync::Mutex<SplitSink<AnyOutboundDatagram, UdpPacket>>,
-    rx: tokio::sync::Mutex<SplitStream<AnyOutboundDatagram>>,
+    tx: AsyncMutex<SplitSink<AnyOutboundDatagram, UdpPacket>>,
 
     // send side packet going out of the tunnel
     packet_writer: Sender<(PortProtocol, Bytes)>,
     // receive side packet coming into the tunnel
-    packet_reader: Arc<Mutex<Receiver<Bytes>>>,
+    receivers: Mutex<Option<TunnelReceivers>>,
 }
 
 impl Debug for WireguardTunnel {
@@ -113,16 +124,14 @@ impl WireguardTunnel {
         Ok(Self {
             source_peer_ip: config.source_peer_ip,
             source_peer_ipv6: config.source_peer_ipv6,
-            peer: Arc::new(Mutex::new(peer)),
+            peer: Mutex::new(peer),
             endpoint: remote_endpoint,
             allowed_ips: config.allowed_ips,
             reserved_bits: config.reserved_bits,
 
-            tx: tokio::sync::Mutex::new(tx),
-            rx: tokio::sync::Mutex::new(rx),
-
+            tx: AsyncMutex::new(tx),
             packet_writer,
-            packet_reader: Arc::new(Mutex::new(packet_reader)),
+            receivers: Mutex::new(Some(TunnelReceivers { rx, packet_reader })),
         })
     }
 
@@ -148,8 +157,8 @@ impl WireguardTunnel {
         trace_ip_packet("Sending IP packet", packet);
 
         let mut send_buf = vec![0u8; 65535];
-        let mut peer = self.peer.lock().await;
-        match peer.encapsulate(packet, &mut send_buf) {
+        let result = self.peer.lock().encapsulate(packet, &mut send_buf);
+        match result {
             boringtun::noise::TunnResult::Done => {}
             boringtun::noise::TunnResult::Err(e) => {
                 error!("failed to encapsulate packet: {e:?}");
@@ -165,21 +174,26 @@ impl WireguardTunnel {
     }
 
     pub async fn start_polling(&self) {
+        let Some(TunnelReceivers { rx, packet_reader }) =
+            self.receivers.lock().take()
+        else {
+            error!("wireguard tunnel polling already started");
+            return;
+        };
         tokio::select! {
-            _ = self.start_forwarding() => {
+            _ = self.start_forwarding(packet_reader) => {
                 trace!("forwarding stopped")
             }
             _ = self.start_heartbeat() => {
                 trace!("heartbeat stopped")
             }
-            _ = self.start_receiving() => {
+            _ = self.start_receiving(rx) => {
                 trace!("receiving stopped")
             }
         }
     }
 
-    pub async fn start_forwarding(&self) {
-        let mut packet_reader = self.packet_reader.lock().await;
+    async fn start_forwarding(&self, mut packet_reader: Receiver<Bytes>) {
         loop {
             match packet_reader.recv().await {
                 Some(packet) => {
@@ -199,143 +213,101 @@ impl WireguardTunnel {
         let mut send_buf = vec![0u8; 65535];
 
         loop {
-            let mut peer = self.peer.lock().await;
-            let tun_result = peer.update_timers(&mut send_buf);
-            drop(peer);
+            let tun_result = self.peer.lock().update_timers(&mut send_buf);
 
             self.handle_routine_result(tun_result).await;
         }
     }
 
-    #[tracing::instrument]
-    pub async fn start_receiving(&self) {
+    #[tracing::instrument(skip(rx))]
+    async fn start_receiving(&self, mut rx: SplitStream<AnyOutboundDatagram>) {
         let mut send_buf = vec![0u8; 65535];
-
-        loop {
-            let item = match self
-                .rx
-                .lock()
-                .await
-                .next()
-                .instrument(trace_span!(
-                    "wg_receive",
-                    endpoint = %self.endpoint,
-                ))
-                .await
-            {
-                Some(item) => item,
-                None => {
-                    continue;
-                }
-            };
-
-            let mut peer = self.peer.lock().await;
+        let mut output = Vec::new();
+        while let Some(item) = rx.next().instrument(trace_span!(
+            "wg_receive", endpoint = %self.endpoint,
+        )).await {
             let mut data = item.data;
             if data.len() > 3 {
                 let mut data_mut = bytes::BytesMut::from(data);
-                data_mut[1] = 0;
-                data_mut[2] = 0;
-                data_mut[3] = 0;
+                data_mut[1..4].fill(0);
                 data = data_mut.freeze();
             }
-
-            let _ = trace_span!("wg_decapsulate", endpoint = %self.endpoint, size = data.len())
-                .entered();
-
-            match peer.decapsulate(None, &data, &mut send_buf) {
-                TunnResult::Done => {}
-                TunnResult::Err(e) => {
-                    error!("failed to decapsulate packet: {e:?}");
-                    continue;
-                }
-                TunnResult::WriteToNetwork(packet) => {
-                    let size = packet.len();
-                    match self
-                        .udp_send(packet)
-                        .instrument(trace_span!(
-                            "wg_send",
-                            endpoint = %self.endpoint,
-                            size = size,
-                        ))
-                        .await
-                    {
-                        Ok(_) => {}
-                        Err(e) => {
-                            error!("failed to send packet: {}", e);
+            // Drain pending protocol output under the state lock, then release
+            // it before waiting on UDP or virtual-device backpressure.
+            self.decapsulate(&data, &mut send_buf, &mut output);
+            for packet in output.drain(..) {
+                match packet {
+                    TunnelOutput::Network(mut packet) => {
+                        let size = packet.len();
+                        if let Err(e) = self.udp_send(&mut packet)
+                            .instrument(trace_span!(
+                                "wg_send", endpoint = %self.endpoint, size,
+                            ))
+                            .await
+                        {
+                            error!("failed to send WireGuard packet: {e}");
+                        }
+                    }
+                    TunnelOutput::Tunnel(packet, addr) => {
+                        if !self.is_ip_allowed(addr) {
+                            trace!(
+                                "received packet from {} which is not in allowed_ips",
+                                addr
+                            );
                             continue;
                         }
-                    }
-
-                    let mut send_buf = vec![0u8; 65535];
-                    while let TunnResult::WriteToNetwork(packet) =
-                        peer.decapsulate(None, &[], &mut send_buf)
-                    {
-                        match self.udp_send(packet).await {
-                            Ok(_) => {}
-                            Err(e) => {
-                                error!(
-                                    "Failed to send decapsulation-instructed \
-                                     packet to WireGuard endpoint: {:?}",
-                                    e
-                                );
-                                break;
+                        trace_ip_packet("Received IP packet", &packet);
+                        if let Some(proto) = self.route_protocol(&packet) {
+                            if let Err(e) =
+                                self.packet_writer.send((proto, packet)).await
+                            {
+                                error!("failed to send packet to virtual device: {e}");
                             }
-                        };
+                        } else {
+                            warn!("wg stack received unknown data");
+                        }
+                    }
+                    TunnelOutput::Error(e) => {
+                        error!("failed to decapsulate packet: {e:?}");
                     }
                 }
+            }
+        }
+    }
 
+    fn decapsulate(
+        &self,
+        data: &[u8],
+        buffer: &mut [u8],
+        output: &mut Vec<TunnelOutput>,
+    ) {
+        let _span = trace_span!(
+            "wg_decapsulate", endpoint = %self.endpoint, size = data.len(),
+        ).entered();
+        let mut peer = self.peer.lock();
+        let mut input = data;
+        loop {
+            match peer.decapsulate(None, input, buffer) {
+                TunnResult::Done => break,
+                TunnResult::Err(e) => {
+                    output.push(TunnelOutput::Error(e));
+                    break;
+                }
+                TunnResult::WriteToNetwork(packet) => {
+                    output.push(TunnelOutput::Network(packet.to_vec()));
+                    input = &[];
+                }
                 TunnResult::WriteToTunnelV4(packet, addr) => {
-                    trace_ip_packet("Received IP packet", packet);
-
-                    if !self.is_ip_allowed(addr.into()) {
-                        trace!(
-                            "received packet from {} which is not in allowed_ips",
-                            addr.to_string()
-                        );
-                        continue;
-                    }
-
-                    let _ =
-                        trace_span!("wg_write_stack", endpoint = %self.endpoint, size = packet.len())
-                            .entered();
-
-                    if let Some(proto) = self.route_protocol(packet) {
-                        if let Err(e) = self
-                            .packet_writer
-                            .send((proto, packet.to_owned().into())) // TODO: avoid copy
-                            .await
-                        {
-                            error!("failed to send packet to virtual device: {}", e);
-                        }
-                    } else {
-                        warn!("wg stack received unknown data");
-                    }
+                    output.push(TunnelOutput::Tunnel(
+                        Bytes::copy_from_slice(packet), addr.into(),
+                    ));
+                    break;
                 }
                 TunnResult::WriteToTunnelV6(packet, addr) => {
-                    trace_ip_packet("Received IP packet", packet);
-
-                    if !self.is_ip_allowed(addr.into()) {
-                        trace!(
-                            "received packet from {} which is not in allowed_ips",
-                            addr.to_string()
-                        );
-                        continue;
-                    }
-
-                    let _ =
-                        trace_span!("wg_write_stack", endpoint = %self.endpoint, size = packet.len())
-                            .entered();
-                    if let Some(proto) = self.route_protocol(packet) {
-                        if let Err(e) = self
-                            .packet_writer
-                            .send((proto, packet.to_owned().into())) // TODO: avoid copy
-                            .await
-                        {
-                            error!("failed to send packet to virtual device: {}", e);
-                        }
-                    } else {
-                        warn!("wg stack received unknown data");
-                    }
+                    output.push(TunnelOutput::Tunnel(
+                        Bytes::copy_from_slice(packet), addr.into(),
+                    ));
+                    break;
                 }
             }
         }
@@ -353,10 +325,8 @@ impl WireguardTunnel {
             TunnResult::Err(WireGuardError::ConnectionExpired) => {
                 warn!("wireguard connection expired");
                 let mut buf = vec![0u8; 65535];
-                let mut peer = self.peer.lock().await;
-                let tun_result =
-                    peer.format_handshake_initiation(&mut buf[..], false);
-                drop(peer);
+                let tun_result = self.peer.lock()
+                    .format_handshake_initiation(&mut buf[..], false);
 
                 self.handle_routine_result(tun_result).await;
             }
@@ -435,3 +405,7 @@ fn trace_ip_packet(message: &str, packet: &[u8]) {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "wireguard_tests.rs"]
+mod tests;

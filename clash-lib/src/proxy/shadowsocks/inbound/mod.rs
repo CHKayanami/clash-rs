@@ -16,6 +16,7 @@ use crate::{
     session::{Network, Session, SocksAddr, Type},
 };
 use async_trait::async_trait;
+use parking_lot::Mutex;
 use shadowsocks::{
     ProxySocket,
     config::ServerConfig,
@@ -46,7 +47,7 @@ pub struct ShadowsocksInbound {
     /// and UDP restarts its socket gracefully.
     users_rx: tokio::sync::watch::Receiver<Vec<InboundUser>>,
 
-    udp_closer: Arc<tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<u8>>>>,
+    udp_closer: Arc<Mutex<Option<tokio::sync::oneshot::Sender<u8>>>>,
 }
 
 impl Drop for ShadowsocksInbound {
@@ -285,7 +286,7 @@ impl InboundHandlerTrait for ShadowsocksInbound {
 
             let closer = dispatcher.dispatch_datagram(sess, wrapped_socket).await;
             {
-                let mut g = self.udp_closer.lock().await;
+                let mut g = self.udp_closer.lock();
                 *g = Some(closer);
             }
 
@@ -306,7 +307,7 @@ impl InboundHandlerTrait for ShadowsocksInbound {
                              socket",
                             self.addr
                         );
-                        if let Some(c) = self.udp_closer.lock().await.take() {
+                        if let Some(c) = self.udp_closer.lock().take() {
                             let _ = c.send(0);
                         }
                         // Brief yield so the dispatcher can drop the old socket;

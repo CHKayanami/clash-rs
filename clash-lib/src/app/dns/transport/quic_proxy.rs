@@ -145,16 +145,24 @@ impl ProxyQuicSocket {
         self.state.check().is_err()
     }
 
+    pub(super) fn abort(&self) {
+        drop(self.stop_tasks());
+    }
+
     pub(super) async fn close(&self) {
+        for task in self.stop_tasks() {
+            task.shutdown(Duration::ZERO).await;
+        }
+    }
+
+    fn stop_tasks(&self) -> Vec<OwnedTask> {
         self.state.fail(io::Error::new(
             io::ErrorKind::ConnectionAborted,
             "proxy QUIC socket closed",
         ));
-        let tasks = std::mem::take(&mut *self.tasks.lock());
-        for task in tasks {
-            task.shutdown(Duration::ZERO).await;
-        }
+        std::mem::take(&mut *self.tasks.lock())
     }
+
 }
 
 impl AsyncUdpSocket for ProxyQuicSocket {

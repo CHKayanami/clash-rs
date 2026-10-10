@@ -1,6 +1,6 @@
 use bytes::{Bytes, BytesMut};
 use futures::{Sink, Stream};
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use std::{
     collections::HashMap,
     future::Future,
@@ -471,7 +471,7 @@ impl Drop for XudpChildDatagram {
 }
 
 pub struct XudpPool {
-    carriers: tokio::sync::Mutex<Vec<Arc<XudpCarrier>>>,
+    carriers: Mutex<Vec<Arc<XudpCarrier>>>,
     max_carriers: usize,
     max_streams_per_carrier: usize,
     next_carrier_id: AtomicU64,
@@ -493,7 +493,7 @@ impl<'a> Drop for DialGuard<'a> {
 impl XudpPool {
     pub fn new(max_carriers: usize, max_streams_per_carrier: usize) -> Arc<Self> {
         Arc::new(Self {
-            carriers: tokio::sync::Mutex::new(Vec::new()),
+            carriers: Mutex::new(Vec::new()),
             max_carriers: if max_carriers == 0 {
                 DEFAULT_MAX_CARRIERS
             } else {
@@ -522,7 +522,7 @@ impl XudpPool {
         loop {
             let notified = self.dial_notify.notified();
             let (carrier_candidate, can_dial) = {
-                let mut carriers = self.carriers.lock().await;
+                let mut carriers = self.carriers.lock();
                 // Retain active, non-expired carriers
                 carriers.retain(|c| !c.is_closed() && !c.is_idle_expired());
 
@@ -576,7 +576,7 @@ impl XudpPool {
                 let datagram = new_carrier.open_child(destination.clone())?;
 
                 {
-                    let mut carriers = self.carriers.lock().await;
+                    let mut carriers = self.carriers.lock();
                     carriers.retain(|c| !c.is_closed() && !c.is_idle_expired());
                     carriers.push(new_carrier);
                 }

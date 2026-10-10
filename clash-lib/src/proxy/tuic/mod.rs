@@ -10,6 +10,7 @@ use crate::{
     proxy::{tuic::types::SocketAdderTrans, utils::new_udp_socket},
 };
 use anyhow::Result;
+use arc_swap::ArcSwapOption;
 use async_trait::async_trait;
 
 use quinn::{
@@ -92,7 +93,8 @@ pub struct HandlerOptions {
 pub struct Handler {
     opts: HandlerOptions,
     ep: OnceCell<TuicEndpoint>,
-    conn: AsyncMutex<Option<Arc<TuicConnection>>>,
+    conn: ArcSwapOption<TuicConnection>,
+    reconnect: AsyncMutex<()>,
     next_assoc_id: AtomicU16,
 }
 
@@ -192,7 +194,8 @@ impl Handler {
         Self {
             opts,
             ep: OnceCell::new(),
-            conn: AsyncMutex::new(None),
+            conn: ArcSwapOption::empty(),
+            reconnect: AsyncMutex::new(()),
             next_assoc_id: AtomicU16::new(0),
         }
     }
@@ -313,24 +316,20 @@ impl Handler {
             .await?;
 
         let fut = async {
-            let mut guard = self.conn.lock().await;
-
-            let conn = match guard.as_ref() {
-                None => {
-                    // init
-                    let new_conn = endpoint.connect(resolver, false).await?;
-                    *guard = Some(new_conn.clone());
-                    new_conn
-                }
-                Some(existing) if existing.check_open().is_err() => {
-                    // reconnect
-                    let new_conn = endpoint.connect(resolver, true).await?;
-                    *guard = Some(new_conn.clone());
-                    new_conn
-                }
-                Some(existing) => existing.clone(),
-            };
-
+            if let Some(conn) = self.conn.load().as_ref()
+                && conn.check_open().is_ok()
+            {
+                return Ok(conn.clone());
+            }
+            let _reconnect = self.reconnect.lock().await;
+            let existing = self.conn.load_full();
+            if let Some(conn) = &existing
+                && conn.check_open().is_ok()
+            {
+                return Ok(conn.clone());
+            }
+            let conn = endpoint.connect(resolver, existing.is_some()).await?;
+            self.conn.store(Some(conn.clone()));
             Ok(conn)
         };
 
@@ -415,3 +414,7 @@ impl TuicDatagramOutbound {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "cache_tests.rs"]
+mod cache_tests;

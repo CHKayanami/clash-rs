@@ -239,26 +239,17 @@ impl ProxyManager {
         if alive { delay } else { None }
     }
 
-    pub async fn get_packet_loss(&self, name: &str) -> Option<f64> {
-        let history = self.delay_history(name).await;
+    /// Packet loss fraction and average RTT in milliseconds from one snapshot.
+    pub fn delay_metrics(&self, name: &str) -> Option<(f64, f64)> {
+        let state = self.proxy_state.get(name)?;
+        let history = state.delay_history.read();
         if history.is_empty() {
-            None
-        } else {
-            let failed_count = history.iter().filter(|x| x.delay.is_zero()).count();
-            Some(failed_count as f64 / history.len() as f64)
+            return None;
         }
-    }
-
-    pub async fn get_rtt(&self, name: &str) -> Option<f64> {
-        let history = self.delay_history(name).await;
-        if history.is_empty() {
-            None
-        } else {
-            let avg_rtt =
-                history.iter().map(|x| x.delay.as_millis_f64()).sum::<f64>()
-                    / history.len() as f64;
-            Some(avg_rtt)
-        }
+        let failed = history.iter().filter(|sample| sample.delay.is_zero()).count();
+        let rtt = history.iter().map(|sample| sample.delay.as_millis_f64())
+            .sum::<f64>() / history.len() as f64;
+        Some((failed as f64 / history.len() as f64, rtt))
     }
 
     /// This method analyzes traffic characteristics using multiple detection
@@ -1153,5 +1144,24 @@ mod tests {
         assert!(!manager.alive(PROXY_DIRECT).await);
         assert_eq!(manager.last_delay(PROXY_DIRECT).await, None);
         assert_eq!(manager.delay_history(PROXY_DIRECT).await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn delay_metrics_include_failed_samples_and_trim_old_history() {
+        use crate::proxy::utils::test_utils::noop::NoopResolver;
+
+        let manager = remote_content_manager::ProxyManager::new(
+            Arc::new(NoopResolver), None,
+        );
+        assert_eq!(manager.delay_metrics("test"), None);
+        manager.report_alive("test", true, None).await;
+        assert_eq!(manager.delay_metrics("test"), None);
+        manager.report_delay("test", true, Duration::from_millis(100)).await;
+        manager.report_delay("test", false, Duration::ZERO).await;
+        assert_eq!(manager.delay_metrics("test"), Some((0.5, 50.0)));
+        for _ in 0..10 {
+            manager.report_delay("test", true, Duration::from_millis(200)).await;
+        }
+        assert_eq!(manager.delay_metrics("test"), Some((0.0, 200.0)));
     }
 }

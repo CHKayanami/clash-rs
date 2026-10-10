@@ -14,7 +14,8 @@ use std::{
 use async_trait::async_trait;
 use erased_serde::Serialize as ErasedSerialize;
 use tailscale::config::{BadFormatBehavior, load_key_file};
-use tokio::sync::Mutex;
+use tailscale::Device as TailscaleDevice;
+use tokio::sync::OnceCell;
 
 use crate::{
     app::dns::ThreadSafeDNSResolver,
@@ -134,7 +135,7 @@ pub struct HandlerOptions {
 
 pub struct Handler {
     opts: HandlerOptions,
-    device: Mutex<Option<Arc<::tailscale::Device>>>,
+    device: OnceCell<Arc<TailscaleDevice>>,
     udp_ports: Arc<StdMutex<HashSet<u16>>>,
 }
 
@@ -150,7 +151,7 @@ impl Handler {
     pub fn new(opts: HandlerOptions) -> Self {
         Self {
             opts,
-            device: Mutex::new(None),
+            device: OnceCell::new(),
             udp_ports: Arc::new(StdMutex::new(HashSet::new())),
         }
     }
@@ -162,12 +163,14 @@ impl Handler {
     /// `state_dir` is `None` the identity is
     /// held in memory only; the device will register a fresh node on every
     /// startup unless `ephemeral: true` is also set.
-    async fn get_device(&self) -> io::Result<Arc<::tailscale::Device>> {
-        let mut guard = self.device.lock().await;
-        if let Some(device) = guard.as_ref() {
-            return Ok(Arc::clone(device));
-        }
+    async fn get_device(&self) -> io::Result<Arc<TailscaleDevice>> {
+        self.device
+            .get_or_try_init(|| self.initialize_device())
+            .await
+            .cloned()
+    }
 
+    async fn initialize_device(&self) -> io::Result<Arc<TailscaleDevice>> {
         let key_state = if self.opts.ephemeral {
             Default::default()
         } else if let Some(state_dir) = self.opts.state_dir.as_ref() {
@@ -230,7 +233,6 @@ impl Handler {
                     ))
                 })?,
         );
-        *guard = Some(Arc::clone(&device));
         Ok(device)
     }
 }

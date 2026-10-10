@@ -1,6 +1,9 @@
 use std::{
     io::Cursor,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -14,7 +17,7 @@ use crate::{
 };
 
 pub type StrategyFn = Box<
-    dyn FnMut(
+    dyn Fn(
             Arc<Vec<AnyOutboundHandler>>,
             &Session,
         ) -> BoxFuture<'static, std::io::Result<AnyOutboundHandler>>
@@ -54,7 +57,7 @@ fn jump_hash(key: u64, buckets: i32) -> i32 {
 }
 
 pub fn strategy_rr() -> StrategyFn {
-    let mut index = 0usize;
+    let index = AtomicUsize::new(0);
     Box::new(move |proxies: Arc<Vec<AnyOutboundHandler>>, _: &Session| {
         let len = proxies.len();
         // `% len` on an empty group panicked. A group whose provider fetched an
@@ -66,8 +69,12 @@ pub fn strategy_rr() -> StrategyFn {
         }
         // Read then advance, so the first call uses the first proxy rather
         // than skipping it.
-        let picked = index % len;
-        index = picked.wrapping_add(1);
+        let previous = index
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                Some((value % len).wrapping_add(1))
+            })
+            .expect("round-robin update always succeeds");
+        let picked = previous % len;
         Box::pin(futures::future::ok(proxies[picked].clone()))
     })
 }
@@ -220,7 +227,7 @@ mod tests {
         manager.report_alive("b", false, None).await;
         manager.report_alive("c", false, None).await;
 
-        let mut strategy_fn = strategy_sticky_session(manager.clone());
+        let strategy_fn = strategy_sticky_session(manager.clone());
 
         // all proxies is not alive since we have not setup the proxy manager
         let res = strategy_fn(proxies.clone(), &Session::default()).await;
@@ -284,7 +291,7 @@ mod tests {
     #[serial_test::serial]
     async fn test_sticky_session_survives_reorder_and_checks_all_members() {
         let manager = ProxyManager::new(Arc::new(NoopResolver), None);
-        let mut strategy = strategy_sticky_session(manager.clone());
+        let strategy = strategy_sticky_session(manager.clone());
         let make_proxy = |name: &str| -> AnyOutboundHandler {
             Arc::new(NoopOutboundHandler {
                 name: name.to_owned(),
@@ -319,4 +326,33 @@ mod tests {
         members.push(b);
         assert_eq!(strategy(Arc::new(members), &sess).await.unwrap().name(), "b");
     }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn round_robin_distributes_concurrent_picks_and_handles_resize() {
+        let strategy = Arc::new(strategy_rr());
+        let proxies = Arc::new((0..4).map(|index| {
+            Arc::new(NoopOutboundHandler { name: index.to_string() }) as AnyOutboundHandler
+        }).collect::<Vec<_>>());
+        let tasks = (0..400).map(|_| {
+            let strategy = strategy.clone();
+            let proxies = proxies.clone();
+            tokio::spawn(async move {
+                strategy(proxies, &Session::default()).await.unwrap()
+                    .name().parse::<usize>().unwrap()
+            })
+        });
+        let mut counts = [0; 4];
+        for result in futures::future::join_all(tasks).await {
+            counts[result.unwrap()] += 1;
+        }
+        assert_eq!(counts, [100; 4]);
+        let session = Session::default();
+        let small = Arc::new(vec![proxies[0].clone(), proxies[1].clone()]);
+        // The previous call left index=4: shrinking normalizes to index=0.
+        assert_eq!(strategy(small.clone(), &session).await.unwrap().name(), "0");
+        assert_eq!(strategy(small, &session).await.unwrap().name(), "1");
+        assert!(strategy(Arc::new(Vec::new()), &session).await.is_err());
+        assert_eq!(strategy(proxies, &session).await.unwrap().name(), "2");
+    }
+
 }

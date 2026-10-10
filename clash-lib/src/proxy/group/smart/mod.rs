@@ -33,6 +33,7 @@ pub mod stats;
 
 use crate::proxy::group::GroupProxyAPIResponse;
 pub use state::SmartState;
+use stats::SiteStats;
 
 /// Error type for smart group failures
 #[derive(Debug)]
@@ -227,14 +228,36 @@ impl Handler {
         // Drop the lock temporarily to call get_site_tuning
         drop(state_guard);
         let site_tuning = self.proxy_manager.get_site_tuning(&enhanced_sess).await;
-        let state_guard = self.smart_state.lock().await;
+        let histories = {
+            let state = self.smart_state.lock().await;
+            let summary = |stats: &SiteStats| {
+                (
+                    stats.get_delay_score(),
+                    stats.success_rate(),
+                    stats.get_trend(),
+                    stats.latency_stability(),
+                )
+            };
+            proxies.iter()
+                .filter(|proxy| {
+                    !excluded.is_some_and(|names| names.contains(proxy.name()))
+                })
+                .map(|proxy| {
+                    let name = proxy.name();
+                    let site_stats = state.get_site_stats(name, &site).map(summary);
+                    let ip_stats = dest_ip.as_ref()
+                        .and_then(|ip| state.get_site_stats(name, ip))
+                        .map(summary);
+                    let penalty = state.get_penalty(name)
+                        .map_or(0.0, |p| p.value());
+                    (proxy.clone(), site_stats, ip_stats, penalty)
+                })
+                .collect::<Vec<_>>()
+        };
 
         let mut candidates: Vec<(f64, AnyOutboundHandler, String)> = Vec::new();
 
-        for proxy in proxies.iter() {
-            if excluded.is_some_and(|names| names.contains(proxy.name())) {
-                continue;
-            }
+        for (proxy, site_stats, ip_stats, penalty_score) in histories {
             let name = proxy.name().to_string();
 
             // Get basic metrics from proxy manager
@@ -244,12 +267,8 @@ impl Handler {
                 .await
                 .map(|d| d.as_millis_f64())
                 .unwrap_or(9999.0);
-            let packet_loss = self
-                .proxy_manager
-                .get_packet_loss(&name)
-                .await
-                .unwrap_or(1.0);
-            let rtt = self.proxy_manager.get_rtt(&name).await.unwrap_or(9999.0);
+            let (packet_loss, rtt) = self.proxy_manager.delay_metrics(&name)
+                .unwrap_or((1.0, 9999.0));
             let alive = self.proxy_manager.alive(&name).await;
 
             debug!(
@@ -281,27 +300,6 @@ impl Handler {
                 alive_penalty,
                 bandwidth_weight
             );
-
-            // Get historical performance data
-            let site_stats = state_guard.get_site_stats(&name, &site).map(|s| {
-                (
-                    s.get_delay_score(),
-                    s.success_rate(),
-                    s.get_trend(),
-                    s.latency_stability(),
-                )
-            });
-
-            let ip_stats = dest_ip.as_ref().and_then(|ip| {
-                state_guard.get_site_stats(&name, ip).map(|s| {
-                    (
-                        s.get_delay_score(),
-                        s.success_rate(),
-                        s.get_trend(),
-                        s.latency_stability(),
-                    )
-                })
-            });
 
             if let Some((sd, sr, st, stability)) = site_stats {
                 debug!(
@@ -336,12 +334,6 @@ impl Handler {
                     stability
                 );
             }
-
-            // Apply penalty scores
-            let penalty_score = state_guard
-                .get_penalty(&name)
-                .map(|p| p.value())
-                .unwrap_or(0.0);
 
             debug!(
                 "{} proxy {} current penalty score: {:.1}",

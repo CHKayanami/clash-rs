@@ -3,7 +3,6 @@ mod helpers;
 use async_trait::async_trait;
 use helpers::strategy_sticky_session;
 use std::{io, sync::Arc};
-use tokio::sync::Mutex;
 use tracing::debug;
 
 use self::helpers::{StrategyFn, strategy_consistent_hashring, strategy_rr};
@@ -32,16 +31,12 @@ pub struct HandlerOptions {
     pub strategy: LoadBalanceStrategy,
 }
 
-struct HandlerInner {
-    strategy_fn: StrategyFn,
-}
-
 pub struct Handler {
     opts: HandlerOptions,
 
     providers: Providers,
 
-    inner: Arc<Mutex<HandlerInner>>,
+    strategy_fn: StrategyFn,
 }
 
 impl std::fmt::Debug for Handler {
@@ -69,7 +64,7 @@ impl Handler {
         Self {
             opts,
             providers: Providers::new(providers),
-            inner: Arc::new(Mutex::new(HandlerInner { strategy_fn })),
+            strategy_fn,
         }
     }
 
@@ -78,11 +73,6 @@ impl Handler {
     }
 
     /// Run the configured strategy over the group's current members.
-    ///
-    /// The strategy future is built under the lock and awaited *outside* it.
-    /// Awaiting while holding the guard serialized every concurrent connection
-    /// through this group, and the sticky-session strategy awaits liveness
-    /// checks and an LRU lock of its own.
     async fn pick(&self, sess: &Session) -> io::Result<AnyOutboundHandler> {
         let proxies = self.get_proxies(false);
         if proxies.is_empty() {
@@ -91,11 +81,7 @@ impl Handler {
                 self.name()
             )));
         }
-        let fut = {
-            let mut inner = self.inner.lock().await;
-            (inner.strategy_fn)(proxies, sess)
-        };
-        fut.await
+        (self.strategy_fn)(proxies, sess).await
     }
 }
 

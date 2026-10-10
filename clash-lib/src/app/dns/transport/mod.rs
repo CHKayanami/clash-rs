@@ -13,7 +13,7 @@ mod pipelined;
 mod quic;
 mod quic_proxy;
 #[cfg(test)]
-mod quic_test_support;
+pub(crate) mod quic_test_support;
 mod retry;
 mod tcp_pool;
 mod udp_pool;

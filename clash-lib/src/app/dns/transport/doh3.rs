@@ -9,7 +9,7 @@ use bytes::{Buf, Bytes};
 use h3::client::SendRequest;
 use h3_quinn::Connection as H3QuinnConnection;
 use quinn::ClientConfig;
-use tokio::sync::Mutex;
+use parking_lot::Mutex;
 
 use super::body::{DnsMessageBody, doh_content_length};
 use super::doh_message::{build_doh_request, finish_doh_response};
@@ -121,7 +121,6 @@ impl Doh3Client {
         let mut sender = session
             .sender
             .lock()
-            .await
             .as_ref()
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("DoH3 sender closed"))?;
@@ -237,7 +236,7 @@ impl Doh3Client {
     async fn close_session(&self) {
         self.session
             .close(|session| async move {
-                let _ = session.sender.lock().await.take();
+                let _ = session.sender.lock().take();
                 session.connection.close(0_u32.into(), b"closed");
                 session.driver.shutdown(Duration::from_millis(100)).await;
             })
