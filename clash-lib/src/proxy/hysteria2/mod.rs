@@ -33,7 +33,7 @@ use bytes::{Bytes, BytesMut};
 use codec::Fragments;
 use erased_serde::Serialize as ErasedSerialize;
 use futures::SinkExt;
-use parking_lot::RwLock;
+use arc_swap::ArcSwapOption;
 use quinn::{
     ClientConfig, Connection, TokioRuntime, crypto::rustls::QuicClientConfig,
 };
@@ -46,7 +46,7 @@ use std::{
     path::PathBuf,
     pin::Pin,
     str::FromStr,
-    sync::{Arc, atomic::AtomicU32},
+    sync::{Arc, atomic::{AtomicBool, AtomicU32, Ordering}},
     task::{Context, Poll},
 };
 use tokio::{
@@ -112,7 +112,6 @@ impl FromStr for CcRx {
 
 type H3Preface = (quinn::SendStream, quinn::SendStream, quinn::SendStream);
 
-#[derive(Clone)]
 struct CachedConn {
     conn: Arc<HysteriaConnection>,
     /// H3 client preface streams (control + QPACK encoder/decoder). Held
@@ -126,11 +125,11 @@ pub struct Handler {
     opts: HystOption,
     ep_config: quinn::EndpointConfig,
     client_config: quinn::ClientConfig,
-    conn: RwLock<Option<CachedConn>>,
+    conn: ArcSwapOption<CachedConn>,
     reconnect_lock: Mutex<()>,
     next_session_id: AtomicU32,
     // support udp is decided by server
-    support_udp: RwLock<bool>,
+    support_udp: AtomicBool,
 }
 
 impl Debug for Handler {
@@ -151,15 +150,17 @@ impl Handler {
     }
 
     pub fn evict_connection(&self, failed: &Arc<HysteriaConnection>) {
-        let mut conn_lock = self.conn.write();
-        if let Some(cached) = conn_lock.as_ref() {
-            if Arc::ptr_eq(&cached.conn, failed) {
-                tracing::warn!(
-                    "hysteria2 connection to {} failed, actively evicting from cache",
-                    self.opts.addr
-                );
-                *conn_lock = None;
-            }
+        // Retry against the current snapshot so a stale failure cannot evict
+        // a replacement connection. Keep side effects outside the retry loop.
+        let previous = self.conn.rcu(|current| match current {
+            Some(cached) if Arc::ptr_eq(&cached.conn, failed) => None,
+            _ => current.clone(),
+        });
+        if previous.as_ref().is_some_and(|cached| Arc::ptr_eq(&cached.conn, failed)) {
+            tracing::warn!(
+                "hysteria2 connection to {} failed, actively evicting from cache",
+                self.opts.addr
+            );
         }
     }
 
@@ -244,9 +245,9 @@ impl Handler {
             ep_config,
             client_config,
             next_session_id: AtomicU32::new(0),
-            conn: RwLock::new(None),
+            conn: ArcSwapOption::empty(),
             reconnect_lock: Mutex::new(()),
-            support_udp: RwLock::new(true),
+            support_udp: AtomicBool::new(true),
         })
     }
 
@@ -358,7 +359,7 @@ impl Handler {
             cc_rx,
             udp
         );
-        *self.support_udp.write() = udp;
+        self.support_udp.store(udp, Ordering::Relaxed);
 
         let up_bytes = self.opts.up_down.map(|(up, _)| up).unwrap_or(0);
         let effective_up_bytes = match (up_bytes, cc_rx) {
@@ -457,10 +458,10 @@ impl Handler {
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
     ) -> std::io::Result<Arc<HysteriaConnection>> {
-        // Fast path: synchronous read lock without async Mutex
+        // Fast path: read the cached connection snapshot without async Mutex
         if let Some(conn) = self
             .conn
-            .read()
+            .load()
             .as_ref()
             .filter(|s| s.conn.conn.close_reason().is_none())
             .map(|s| s.conn.clone())
@@ -478,7 +479,7 @@ impl Handler {
         // Double check after acquiring lock
         if let Some(conn) = self
             .conn
-            .read()
+            .load()
             .as_ref()
             .filter(|s| match s.conn.conn.close_reason() {
                 Some(reason) => {
@@ -505,10 +506,10 @@ impl Handler {
         let hyst_conn =
             HysteriaConnection::new_with_task_loop(session, self.opts.udp_mtu);
 
-        *self.conn.write() = Some(CachedConn {
+        self.conn.store(Some(Arc::new(CachedConn {
             conn: hyst_conn.clone(),
             _preface: Arc::new(preface),
-        });
+        })));
 
         Ok(hyst_conn)
     }
@@ -531,7 +532,7 @@ impl OutboundHandler for Handler {
     }
 
     async fn support_udp(&self) -> bool {
-        *self.support_udp.read()
+        self.support_udp.load(Ordering::Relaxed)
     }
 
     async fn support_connector(&self) -> ConnectorType {
@@ -936,6 +937,71 @@ impl AsyncWrite for HystStream {
 #[cfg(test)]
 mod unit_tests {
     use super::*;
+    use crate::config::internal::proxy::OutboundHysteria2;
+    use quinn::{Endpoint, ServerConfig};
+    use rcgen::{CertifiedKey, generate_simple_self_signed};
+    use rustls::RootCertStore;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn test_stale_failure_preserves_replacement_and_preface() {
+        crate::setup_default_crypto_provider();
+        let CertifiedKey { cert, signing_key } =
+            generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
+        let server_config = ServerConfig::with_single_cert(
+            vec![cert.der().clone()], signing_key.into(),
+        ).unwrap();
+        let server = Endpoint::server(
+            server_config, "127.0.0.1:0".parse().unwrap(),
+        ).unwrap();
+        let mut roots = RootCertStore::empty();
+        roots.add(cert.der().clone()).unwrap();
+        let mut client = Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        client.set_default_client_config(
+            ClientConfig::with_root_certificates(Arc::new(roots)).unwrap(),
+        );
+        let connecting = client.connect(server.local_addr().unwrap(), "localhost").unwrap();
+        let (connection, peer) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(connecting, async {
+                server.accept().await.unwrap().await.unwrap()
+            })
+        }).await.unwrap();
+        let connection = Arc::new(connection.unwrap());
+        let make_connection = || Arc::new(HysteriaConnection {
+            conn: connection.clone(),
+            udp_sessions: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            udp_mtu: None,
+        });
+        let failed = make_connection();
+        let replacement = make_connection();
+        let preface = Arc::new((
+            connection.open_uni().await.unwrap(),
+            connection.open_uni().await.unwrap(),
+            connection.open_uni().await.unwrap(),
+        ));
+        let weak_preface = Arc::downgrade(&preface);
+        let options: OutboundHysteria2 = yaml_serde::from_str(
+            "name: cache-test\nserver: localhost\nport: 443\npassword: test-only",
+        ).unwrap();
+        let handler = Handler::try_from(options).unwrap();
+        handler.conn.store(Some(Arc::new(CachedConn {
+            conn: replacement.clone(), _preface: preface,
+        })));
+        let snapshot = handler.conn.load_full();
+
+        handler.evict_connection(&failed);
+        assert!(Arc::ptr_eq(
+            &handler.conn.load().as_ref().unwrap().conn, &replacement,
+        ));
+        handler.evict_connection(&replacement);
+        assert!(handler.conn.load().is_none());
+        assert!(weak_preface.upgrade().is_some());
+        drop(snapshot);
+        assert!(weak_preface.upgrade().is_none());
+
+        connection.close(0u32.into(), b"test complete");
+        peer.close(0u32.into(), b"test complete");
+    }
 
     #[test]
     fn test_is_normal_write_closure() {

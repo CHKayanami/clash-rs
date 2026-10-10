@@ -1,5 +1,6 @@
 use std::{collections::HashMap, fmt::Display, sync::{Arc, Weak}, time::Duration};
 
+use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use erased_serde::Serialize as ESerialize;
 use futures::future::BoxFuture;
@@ -77,10 +78,6 @@ pub enum RuleContent {
     Classical(Vec<Rule>),
 }
 
-struct Inner {
-    content: RuleContent,
-}
-
 /// Invoked after a [`RuleProvider`]'s contents are replaced. See
 /// [`RuleProvider::on_change`]. `Arc` rather than `Box` so the subscriber list
 /// can be cloned out before dispatch, keeping the lock un-held while callbacks
@@ -121,7 +118,7 @@ pub trait RuleProvider: Provider {
     /// `FakeDns::should_skip`).
     ///
     /// Callbacks run synchronously on the updating task, so they must be cheap
-    /// and must not block. They are invoked after the content lock is released,
+    /// and must not block. They are invoked after the new content is published,
     /// so calling back into the provider is safe. Registrations are never
     /// removed — callbacks are expected to live as long as the process.
     fn on_change(&self, cb: RuleSetChangeCallback);
@@ -149,7 +146,7 @@ type RuleParser =
 pub struct RuleProviderImpl {
     name: String,
     fetcher: Option<Fetcher<RuleUpdater, RuleParser>>,
-    inner: Arc<std::sync::RwLock<Inner>>,
+    content: Arc<ArcSwap<RuleContent>>,
     behavior: RuleSetBehavior,
     format: RuleSetFormat,
     inline_rules: Option<Vec<String>>,
@@ -173,19 +170,17 @@ impl RuleProviderImpl {
         geodata: Option<GeoDataLookup>,
         inline_rules: Option<Vec<String>>,
     ) -> Self {
-        let inner = Arc::new(std::sync::RwLock::new(Inner {
-            content: match behavior {
-                RuleSetBehavior::Domain => {
-                    RuleContent::Domain(DomainSet::default())
-                }
-                RuleSetBehavior::Ipcidr => {
-                    RuleContent::Ipcidr(Box::new(CidrTrie::new()))
-                }
-                RuleSetBehavior::Classical => RuleContent::Classical(vec![]),
-            },
+        let content = Arc::new(ArcSwap::from_pointee(match behavior {
+            RuleSetBehavior::Domain => {
+                RuleContent::Domain(DomainSet::default())
+            }
+            RuleSetBehavior::Ipcidr => {
+                RuleContent::Ipcidr(Box::new(CidrTrie::new()))
+            }
+            RuleSetBehavior::Classical => RuleContent::Classical(vec![]),
         }));
 
-        let inner_clone = inner.clone();
+        let content_clone = content.clone();
         let subscribers: Arc<std::sync::RwLock<Vec<RuleSetChangeCallback>>> =
             Arc::new(std::sync::RwLock::new(Vec::new()));
         let subscribers_clone = subscribers.clone();
@@ -194,16 +189,12 @@ impl RuleProviderImpl {
         let updater: RuleUpdater =
             Box::new(move |input: RuleContent| -> BoxFuture<'static, ()> {
                 let n = n.clone(); // Clone name for the async block
-                let inner: Arc<std::sync::RwLock<Inner>> = inner_clone.clone();
+                let content = content_clone.clone();
                 let subscribers = subscribers_clone.clone();
                 Box::pin(async move {
-                    {
-                        let mut inner = inner.write().unwrap();
-                        trace!("updated rules for provider: {}", n);
-                        inner.content = input;
-                    }
-                    // Notify only after the content lock is released, so a
-                    // callback that reads the provider back cannot deadlock.
+                    trace!("updated rules for provider: {}", n);
+                    content.store(Arc::new(input));
+                    // Publish before notifying callbacks that read the provider.
                     notify_subscribers(&subscribers);
                 })
             });
@@ -317,7 +308,7 @@ impl RuleProviderImpl {
         Self {
             name,
             fetcher,
-            inner,
+            content,
             behavior,
             format,
             inline_rules,
@@ -332,8 +323,8 @@ impl RuleProviderImpl {
 #[async_trait]
 impl RuleProvider for RuleProviderImpl {
     fn search(&self, sess: &Session) -> bool {
-        let inner = self.inner.read().unwrap();
-        match &inner.content {
+        let content = self.content.load();
+        match &**content {
             RuleContent::Domain(set) => match sess.destination.domain() {
                 Some(domain) => set.has(domain),
                 None => false,
@@ -369,8 +360,8 @@ impl RuleProvider for RuleProviderImpl {
             RuleSetBehavior::Domain => false,
             RuleSetBehavior::Ipcidr => true,
             RuleSetBehavior::Classical => {
-                let inner = self.inner.read().unwrap();
-                match &inner.content {
+                let content = self.content.load();
+                match &**content {
                     RuleContent::Classical(rules) => {
                         rules.iter().any(|r| r.should_resolve_ip())
                     }
@@ -381,8 +372,8 @@ impl RuleProvider for RuleProviderImpl {
     }
 
     fn should_resolve_process(&self) -> bool {
-        let inner = self.inner.read().unwrap();
-        match &inner.content {
+        let content = self.content.load();
+        match &**content {
             RuleContent::Classical(rules) => {
                 rules.iter().any(|r| r.should_resolve_process())
             }
@@ -391,8 +382,8 @@ impl RuleProvider for RuleProviderImpl {
     }
 
     fn count(&self) -> usize {
-        let inner = self.inner.read().unwrap();
-        match &inner.content {
+        let content = self.content.load();
+        match &**content {
             RuleContent::Domain(set) => set.len(),
             RuleContent::Ipcidr(trie) => trie.len(),
             RuleContent::Classical(rules) => rules.len(),
@@ -406,8 +397,8 @@ impl RuleProvider for RuleProviderImpl {
     }
 
     async fn list_rules(&self, limit: usize) -> Vec<String> {
-        let inner = self.inner.read().unwrap();
-        match &inner.content {
+        let content = self.content.load();
+        match &**content {
             RuleContent::Classical(rules) => rules
                 .iter()
                 .take(limit)
@@ -418,8 +409,8 @@ impl RuleProvider for RuleProviderImpl {
     }
 
     fn get_ip_cidrs(&self) -> Vec<ipnet::IpNet> {
-        let inner = self.inner.read().unwrap();
-        match &inner.content {
+        let content = self.content.load();
+        match &**content {
             RuleContent::Ipcidr(trie) => trie.get_ip_cidrs(),
             _ => vec![],
         }
@@ -464,10 +455,7 @@ impl Provider for RuleProviderImpl {
 
             match rules {
                 Ok(content) => {
-                    {
-                        let mut inner = self.inner.write().unwrap();
-                        inner.content = content;
-                    }
+                    self.content.store(Arc::new(content));
                     notify_subscribers(&self.subscribers);
                 }
                 Err(e) => {
@@ -605,7 +593,7 @@ fn make_classical_rules(
 
 #[cfg(test)]
 mod tests {
-    use super::make_ip_cidr_rules;
+    use super::{RuleContent, make_ip_cidr_rules};
     use crate::{
         app::remote_content_manager::providers::{
             MockProviderVehicle, Provider, ProviderVehicleType,
@@ -617,7 +605,7 @@ mod tests {
         common::{geodata::MockGeoDataLookupTrait, mmdb::MockMmdbLookupTrait},
         session::{Session, SocksAddr},
     };
-    use std::{path::Path, sync::Arc, time::Duration};
+    use std::{path::Path, sync::{Arc, atomic::{AtomicBool, Ordering}}, time::Duration};
     use tokio_test::assert_ok;
 
     #[test]
@@ -626,6 +614,39 @@ mod tests {
             .into_iter().map(String::from).collect();
         let trie = make_ip_cidr_rules(rules).unwrap();
         assert_eq!(trie.get_ip_cidrs(), vec!["10.0.0.0/23".parse().unwrap()]);
+    }
+
+    #[tokio::test]
+    async fn test_publish_rules_before_notifying_with_old_snapshot_held() {
+        let provider = Arc::new(RuleProviderImpl::new(
+            "snapshot".to_owned(),
+            RuleSetBehavior::Classical,
+            RuleSetFormat::Text,
+            None, None, None, None,
+            Some(vec!["DOMAIN,example.test".to_owned()]),
+        ));
+        let old = provider.content.load();
+        let notified = Arc::new(AtomicBool::new(false));
+        let notified_callback = notified.clone();
+        let weak = Arc::downgrade(&provider);
+        provider.on_change(Arc::new(move || {
+            let provider = weak.upgrade().unwrap();
+            assert_eq!(provider.count(), 1);
+            assert!(provider.search(&Session {
+                destination: SocksAddr::Domain("example.test".into(), 443),
+                ..Default::default()
+            }));
+            // Registering during dispatch must also remain safe.
+            provider.on_change(Arc::new(|| {}));
+            notified_callback.store(true, Ordering::Relaxed);
+        }));
+
+        assert_ok!(provider.initialize().await);
+        assert!(notified.load(Ordering::Relaxed));
+        match &**old {
+            RuleContent::Classical(rules) => assert!(rules.is_empty()),
+            _ => panic!("expected the original classical rules snapshot"),
+        }
     }
 
     #[tokio::test]

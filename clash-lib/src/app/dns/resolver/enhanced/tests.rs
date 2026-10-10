@@ -5,7 +5,7 @@ use std::collections::HashSet;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Duration;
-use arc_swap::ArcSwapOption;
+use arc_swap::{ArcSwap, ArcSwapOption};
 
 use crate::app::dns::{ClashResolver, EnhancedResolver};
 use crate::app::dns::resolver::enhanced::EnhancedResolverInner;
@@ -20,7 +20,7 @@ impl EnhancedResolver {
                 hosts: None,
                 pool: UpstreamPool::new(
                     std::collections::HashMap::new(),
-                    Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
+                    Arc::new(ArcSwap::from_pointee(std::collections::HashMap::new())),
                     None,
                     None,
                     None,
@@ -175,7 +175,7 @@ async fn test_dns_resolution_hook_end_to_end_on_exchange() {
 
     let pool = UpstreamPool::new(
         entries,
-        Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
+        Arc::new(ArcSwap::from_pointee(std::collections::HashMap::new())),
         None,
         None,
         None,
@@ -249,7 +249,7 @@ async fn test_fake_ip_exchange() {
             hosts: None,
             pool: UpstreamPool::new(
                 std::collections::HashMap::new(),
-                Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
+                Arc::new(ArcSwap::from_pointee(std::collections::HashMap::new())),
                 None,
                 None,
                 None,
@@ -312,7 +312,7 @@ async fn test_udp_pool_outbound_resolution() {
     let entry = UpstreamEntry::from_nameserver(&ns, None).unwrap();
     let pool = UpstreamPool::new(
         std::collections::HashMap::new(),
-        Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
+        Arc::new(ArcSwap::from_pointee(std::collections::HashMap::new())),
         None,
         None,
         None,
@@ -345,7 +345,7 @@ async fn test_respect_rules_upstream_routing() {
 
     let pool = UpstreamPool::new(
         std::collections::HashMap::new(),
-        Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
+        Arc::new(ArcSwap::from_pointee(std::collections::HashMap::new())),
         None,
         None,
         None,
@@ -405,7 +405,7 @@ async fn test_optimistic_cache_ttl_and_never_cache() {
         cfg,
         store,
         None,
-        Arc::new(parking_lot::RwLock::new(HashMap::new())),
+        Arc::new(ArcSwap::from_pointee(HashMap::new())),
         None,
         None,
     )
@@ -446,7 +446,7 @@ async fn test_reverse_lookup_cache_integration_and_conflict() {
         cfg,
         store,
         None,
-        Arc::new(parking_lot::RwLock::new(HashMap::new())),
+        Arc::new(ArcSwap::from_pointee(HashMap::new())),
         None,
         None,
     )
@@ -501,7 +501,7 @@ async fn test_qtype_filter_exchange() {
             hosts: None,
             pool: UpstreamPool::new(
                 std::collections::HashMap::new(),
-                Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
+                Arc::new(ArcSwap::from_pointee(std::collections::HashMap::new())),
                 None,
                 None,
                 None,

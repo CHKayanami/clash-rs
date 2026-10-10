@@ -106,7 +106,7 @@ impl HttpClient {
         let outbound: AnyOutboundHandler = if let Some(name) = outbound_name {
             if let Some(registry) = &self.outbounds {
                 registry
-                    .read()
+                    .load()
                     .get(&name)
                     .cloned()
                     .unwrap_or_else(make_direct)

@@ -1,3 +1,4 @@
+use arc_swap::ArcSwap;
 use bytes::Bytes;
 use crate::app::dns::query::build_dns_query_wire;
 use super::*;
@@ -5,7 +6,6 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use futures::future::join_all;
-use parking_lot::RwLock;
 use tokio::net::UdpSocket;
 use tokio::sync::Notify;
 
@@ -78,7 +78,7 @@ async fn remote(socket: &UdpSocket, ttl: Option<u32>, policy: DnsCachePolicy) ->
     };
     let entry = UpstreamEntry::from_nameserver(&ns, None).unwrap();
     let mut pool = UpstreamPool::new(HashMap::from([("server".into(), entry)]),
-        Arc::new(RwLock::new(HashMap::new())), None, None, None, None);
+        Arc::new(ArcSwap::from_pointee(HashMap::new())), None, None, None, None);
     let mutable_pool = Arc::get_mut(&mut pool).unwrap();
     mutable_pool.dns_query_timeout = Duration::from_millis(200);
     mutable_pool.dns_dial_timeout = Duration::from_millis(200);

@@ -1,3 +1,5 @@
+#[cfg(test)]
+use arc_swap::ArcSwap;
 use crate::app::dns::query::QueryContext;
 use std::collections::HashMap;
 use std::future::Future;
@@ -175,7 +177,7 @@ impl UpstreamPool {
         let resolved =
             if let Some(name) = outbound_name.or(entry.outbound.as_deref()) {
                 let handler =
-                    self.outbounds.read().get(name).cloned().ok_or_else(|| {
+                    self.outbounds.load().get(name).cloned().ok_or_else(|| {
                         anyhow::anyhow!("unknown DNS outbound '{name}'")
                     })?;
                 (Some(handler), Some(name.to_string()))
@@ -256,7 +258,7 @@ mod tests {
             }
             let pool = UpstreamPool::new(
                 entries,
-                Arc::new(parking_lot::RwLock::new(outbounds)),
+                Arc::new(ArcSwap::from_pointee(outbounds)),
                 None,
                 None,
                 None,

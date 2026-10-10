@@ -1,3 +1,5 @@
+#[cfg(test)]
+use arc_swap::ArcSwap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
@@ -341,7 +343,7 @@ mod tests {
     fn pool() -> Arc<UpstreamPool> {
         UpstreamPool::new(
             HashMap::new(),
-            Arc::new(parking_lot::RwLock::new(HashMap::new())),
+            Arc::new(ArcSwap::from_pointee(HashMap::new())),
             None,
             None,
             None,

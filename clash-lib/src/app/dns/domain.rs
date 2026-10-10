@@ -52,11 +52,11 @@ pub(super) fn proxy_server_domain_matcher(
     outbounds: &OutboundHandlerRegistry,
 ) -> Option<DomainMatcher> {
     let names: Vec<_> = {
-        let handlers = outbounds.read();
+        let handlers = outbounds.load();
         handlers.values().filter_map(|handler| handler.server_name())
             .map(str::to_owned).collect()
     };
-    // Release the registry lock before building the compressed set.
+    // Release the registry snapshot before building the compressed set.
     let matcher = DomainMatcher::new(names);
     if matcher.is_empty() { None } else { Some(matcher) }
 }

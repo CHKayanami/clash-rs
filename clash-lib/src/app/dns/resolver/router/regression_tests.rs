@@ -1,3 +1,5 @@
+use arc_swap::ArcSwap;
+use crate::proxy::AnyOutboundHandler;
 use bytes::Bytes;
 use crate::app::dns::query::IngressProfile;
 use std::collections::{HashMap, HashSet};
@@ -5,7 +7,6 @@ use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use parking_lot::RwLock;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -177,7 +178,7 @@ fn response_rule(from: &str, action: ResponseAction) -> ResponseRule {
 }
 
 async fn resolver(cfg: RouterConfig) -> RouterResolver {
-    RouterResolver::new(cfg, None, None, Arc::new(RwLock::new(HashMap::new())), None).await.unwrap()
+    RouterResolver::new(cfg, None, None, Arc::new(ArcSwap::from_pointee(HashMap::new())), None).await.unwrap()
 }
 
 fn query(qtype: QType) -> Vec<u8> {
@@ -215,11 +216,13 @@ async fn independent_proxy_nameserver_resolves_node_domain() {
     let mut cfg = RouterConfig::default();
     cfg.proxy_server_nameserver.push(server.ns.clone());
     // No remote upstream contains this nameserver; fallback rejects everything.
-    let outbounds: OutboundHandlerRegistry = Arc::new(RwLock::new(HashMap::new()));
-    outbounds.write().insert("node".into(), Arc::new(Handler::new(HandlerOptions {
+    let outbounds: OutboundHandlerRegistry = Arc::new(ArcSwap::from_pointee(HashMap::new()));
+    let mut handlers: HashMap<String, AnyOutboundHandler> = HashMap::new();
+    handlers.insert("node".into(), Arc::new(Handler::new(HandlerOptions {
         name: "node".into(), server: "example.test".into(), port: 1080,
         ..Default::default()
     }, None)));
+    outbounds.store(Arc::new(handlers));
     let resolver = RouterResolver::new(cfg, None, None, outbounds, None).await.unwrap();
     assert_eq!(resolver.resolve("example.test", false).await.unwrap(), Some("192.0.2.2".parse().unwrap()));
     server.received().await;
@@ -358,11 +361,11 @@ async fn constructor_returns_error_for_invalid_fakeip_configuration() {
     let mut cfg = RouterConfig::default();
     cfg.upstreams = vec![upstream("first", None), upstream("second", None)];
     assert!(RouterResolver::new(cfg.clone(), None, None,
-        Arc::new(RwLock::new(HashMap::new())), None).await.is_err());
+        Arc::new(ArcSwap::from_pointee(HashMap::new())), None).await.is_err());
     cfg.upstreams.pop();
     cfg.upstreams[0].inet4_range = "198.18.0.1/32".parse().unwrap();
     assert!(RouterResolver::new(cfg, None, None,
-        Arc::new(RwLock::new(HashMap::new())), None).await.is_err());
+        Arc::new(ArcSwap::from_pointee(HashMap::new())), None).await.is_err());
 }
 
 #[tokio::test]

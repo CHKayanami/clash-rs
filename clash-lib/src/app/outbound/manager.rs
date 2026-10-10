@@ -1,3 +1,5 @@
+#[cfg(test)]
+use arc_swap::ArcSwap;
 use super::utils::proxy_groups_dag_sort;
 #[cfg(feature = "shadowquic")]
 use crate::proxy::shadowquic;
@@ -82,9 +84,9 @@ impl Drop for OutboundManager {
         // DNS and HTTP bootstrap clients share this generation's registry.
         // Groups in it hold health checks which refer back to DNS. Release
         // the owned entries when the manager goes away to break that cycle.
-        // Drop handlers outside the registry lock, since their cleanup may
-        // itself access shared runtime resources.
-        let handlers = std::mem::take(&mut *self.registry.write());
+        // Publish the empty registry before releasing the old snapshot, since
+        // cleanup may itself access shared runtime resources.
+        let handlers = self.registry.swap(Arc::new(HashMap::new()));
         drop(handlers);
     }
 }
@@ -148,27 +150,16 @@ impl OutboundManager {
         )
         .await?;
 
-        // Replace the shared registry with the freshly assembled handler map.
-        // Using `clone()` + `*reg = ...` ensures stale entries from previous
-        // initialisation rounds (e.g. across hot reloads) are removed.
-        {
-            let mut reg = m.registry.write();
-            *reg = handlers
-                .iter()
-                .map(|(k, v)| {
-                    debug!("registering outbound '{}' in bootstrap registry", k);
-                    (k.clone(), v.clone())
-                })
-                .collect();
-        }
+        // Publish the complete generation, removing stale bootstrap entries.
+        m.registry.store(Arc::new(handlers));
 
         Ok(m)
     }
 
     /// Look up a handler by name. Returns `None` when the name is not
-    /// registered.  The registry is read under a shared lock.
+    /// registered.  The registry is read from an immutable snapshot.
     pub fn get_outbound(&self, name: &str) -> Option<AnyOutboundHandler> {
-        self.registry.read().get(name).cloned()
+        self.registry.load().get(name).cloned()
     }
 
     /// this doesn't populate history/liveness information
@@ -188,15 +179,9 @@ impl OutboundManager {
     pub async fn get_proxies(&self) -> HashMap<String, Box<dyn Serialize + Send>> {
         let mut r = HashMap::new();
 
-        // Snapshot the registry without holding the lock across async calls.
-        let handlers: Vec<(String, AnyOutboundHandler)> = self
-            .registry
-            .read()
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
+        let handlers = self.registry.load_full();
 
-        for (k, v) in handlers {
+        for (k, v) in handlers.iter() {
             let mut m = if let Some(g) = v.try_as_group_handler() {
                 g.as_map().await
             } else if let Some(p) = v.try_as_plain_handler() {
@@ -205,7 +190,7 @@ impl OutboundManager {
                 HashMap::new()
             };
 
-            self.apply_common_proxy_fields(&mut m, &v, &k).await;
+            self.apply_common_proxy_fields(&mut m, v, k).await;
 
             r.insert(k.clone(), Box::new(m) as _);
         }
@@ -279,7 +264,7 @@ impl OutboundManager {
 
     #[cfg(test)]
     pub fn new_for_test(handlers: HashMap<String, AnyOutboundHandler>) -> Self {
-        let registry = Arc::new(parking_lot::RwLock::new(handlers));
+        let registry = Arc::new(ArcSwap::from_pointee(handlers));
         let proxy_manager = ProxyManager::new(Arc::new(crate::app::dns::MockClashResolver::new()), None);
         Self {
             registry,
@@ -1141,6 +1126,25 @@ mod tests {
         OutboundShadowsocks, OutboundGroupUrlTest,
     };
     use crate::proxy::utils::test_utils::noop::NoopResolver;
+
+    #[test]
+    fn test_drop_clears_registry_while_readers_keep_their_snapshot() {
+        let handler: AnyOutboundHandler = Arc::new(direct::Handler::new("node"));
+        let weak = Arc::downgrade(&handler);
+        let manager = OutboundManager::new_for_test(
+            HashMap::from([("node".to_owned(), handler)]),
+        );
+        let registry = manager.registry.clone();
+        let snapshot = registry.load_full();
+
+        drop(manager);
+        assert!(registry.load().is_empty());
+        assert!(snapshot.contains_key("node"));
+        assert!(weak.upgrade().is_some());
+
+        drop(snapshot);
+        assert!(weak.upgrade().is_none());
+    }
 
     #[test]
     fn test_unresolved_dialer_dependencies_are_rejected() {

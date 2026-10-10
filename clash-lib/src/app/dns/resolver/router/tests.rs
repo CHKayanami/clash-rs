@@ -1,3 +1,4 @@
+use arc_swap::ArcSwap;
 use bytes::Bytes;
 use crate::app::dns::query::IngressProfile;
 use std::collections::{HashMap, HashSet};
@@ -51,7 +52,7 @@ async fn test_cache_delete_prefers_configured_upstream_tag_over_fakeip_alias() {
         cfg,
         None,
         None,
-        Arc::new(parking_lot::RwLock::new(HashMap::new())),
+        Arc::new(ArcSwap::from_pointee(HashMap::new())),
         None,
     ).await.unwrap();
 
@@ -595,7 +596,7 @@ async fn test_router_resolver_fresh_vs_cache_hit_notification() {
         cfg,
         None,
         None,
-        Arc::new(parking_lot::RwLock::new(HashMap::new())),
+        Arc::new(ArcSwap::from_pointee(HashMap::new())),
         None,
     ).await.unwrap();
 
@@ -723,7 +724,7 @@ async fn test_router_resolver_polluted_requery_prevents_dirty_cache_and_hook() {
         cfg,
         None,
         None,
-        Arc::new(parking_lot::RwLock::new(HashMap::new())),
+        Arc::new(ArcSwap::from_pointee(HashMap::new())),
         None,
     ).await.unwrap();
 
@@ -822,7 +823,7 @@ async fn test_router_resolver_stale_refresh_notification_with_rule_filter() {
         cfg,
         None,
         None,
-        Arc::new(parking_lot::RwLock::new(HashMap::new())),
+        Arc::new(ArcSwap::from_pointee(HashMap::new())),
         None,
     ).await.unwrap();
 
@@ -884,7 +885,7 @@ async fn remote_failover_leaves_budget_for_second_server() {
         let ns = NameServer { net: DNSNetMode::Udp, host: url::Host::Ipv4("127.0.0.1".parse().unwrap()), port: socket.local_addr().unwrap().port(), path: None, proxy: None, interface: None };
         entries.insert(key.into(), UpstreamEntry::from_nameserver(&ns, None).unwrap());
     }
-    let mut pool = UpstreamPool::new(entries, Arc::new(parking_lot::RwLock::new(HashMap::new())), None, None, None, None);
+    let mut pool = UpstreamPool::new(entries, Arc::new(ArcSwap::from_pointee(HashMap::new())), None, None, None, None);
     let inner = Arc::get_mut(&mut pool).unwrap();
     inner.dns_query_timeout = Duration::from_millis(100);
     inner.dns_dial_timeout = Duration::from_millis(100);

@@ -229,6 +229,7 @@ impl ProviderVehicle for Vehicle {
 
 #[cfg(test)]
 mod tests {
+    use arc_swap::ArcSwap;
     use super::ProviderVehicle;
     use crate::{
         app::dns::{EnhancedResolver, ThreadSafeDNSResolver},
@@ -333,7 +334,7 @@ mod tests {
         let direct_handler = Arc::new(crate::proxy::direct::Handler::new("my-proxy"))
             as crate::proxy::AnyOutboundHandler;
         registry_map.insert("my-proxy".to_string(), direct_handler);
-        let registry = Arc::new(parking_lot::RwLock::new(registry_map));
+        let registry = Arc::new(ArcSwap::from_pointee(registry_map));
 
         let v = super::Vehicle::new(
             u,

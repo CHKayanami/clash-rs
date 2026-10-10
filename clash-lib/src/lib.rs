@@ -1,6 +1,8 @@
 #![feature(ip)]
 #![feature(duration_millis_float)]
 
+use arc_swap::ArcSwap;
+
 #[cfg(feature = "tun")]
 use crate::proxy::tun;
 use crate::{
@@ -638,7 +640,7 @@ async fn create_components(
             .collect(),
     )?;
 
-    let outbound_registry = Arc::new(parking_lot::RwLock::new(
+    let outbound_registry = Arc::new(ArcSwap::from_pointee(
         plain_outbounds
             .iter()
             .map(|x| (x.name().to_string(), x.clone()))
