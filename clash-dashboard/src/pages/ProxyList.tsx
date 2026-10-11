@@ -206,10 +206,10 @@ export function ProxyList() {
     setTestingProxies((s) => new Set(s).add(key));
     try {
       await getProxyDelay(proxy.name, TEST_URL, TEST_TIMEOUT);
-      await queryClient.refetchQueries({ queryKey: ['proxies'] });
     } catch {
-      // ignore, server will have recorded the timeout
+      // Failed tests also update history.
     } finally {
+      await queryClient.refetchQueries({ queryKey: ['proxies'] });
       setTestingProxies((s) => { const next = new Set(s); next.delete(key); return next; });
     }
   }
@@ -219,10 +219,10 @@ export function ProxyList() {
     setTestingProxies((s) => new Set(s).add(key));
     try {
       await getProviderProxyDelay(providerName, proxy.name, TEST_URL, TEST_TIMEOUT);
-      await queryClient.refetchQueries({ queryKey: ['providers'] });
     } catch {
-      // ignore
+      // Failed tests also update history.
     } finally {
+      await queryClient.refetchQueries({ queryKey: ['providers'] });
       setTestingProxies((s) => { const next = new Set(s); next.delete(key); return next; });
     }
   }
@@ -231,10 +231,10 @@ export function ProxyList() {
     setTestingProviders((s) => new Set(s).add(provider.name));
     try {
       await healthcheckProvider(provider.name);
-      await queryClient.refetchQueries({ queryKey: ['providers'] });
     } catch {
-      // ignore
+      // Failed tests also update history.
     } finally {
+      await queryClient.refetchQueries({ queryKey: ['providers'] });
       setTestingProviders((s) => { const next = new Set(s); next.delete(provider.name); return next; });
     }
   }

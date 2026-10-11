@@ -2145,7 +2145,24 @@ async fn test_group_delay_url_test() {
         then.status(200).body("ok");
     });
 
-    let (_clash, api_port) = start_client_clash();
+    let api_port = alloc_ports(CLIENT_PORT_BLOCK);
+    let config = make_client_config_str(api_port).replace(
+        "https://www.gstatic.com/generate_204", &mock_server.url("/"),
+    );
+    let wd = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/data/config/client");
+    let _clash = ClashInstance::start(
+        Options {
+            config: Config::Str(config),
+            cwd: Some(wd.to_string_lossy().to_string()),
+            rt: None,
+            log_file: None,
+            config_path: None,
+            dns_collect_file: None,
+        },
+        (api_port..api_port + CLIENT_PORT_BLOCK).collect(),
+    )
+    .expect("Failed to start client for local group test");
 
     let encoded_url = mock_server.url("/").replace(':', "%3A").replace('/', "%2F");
     let url = format!(
@@ -2168,5 +2185,21 @@ async fn test_group_delay_url_test() {
     assert!(
         json.get("url-test").and_then(|v| v.as_u64()).is_some(),
         "response should have a numeric 'url-test' delay field"
+    );
+
+    // The response must describe the same request as the group's history,
+    // rather than a separately measured member request.
+    let proxy_url = format!("http://127.0.0.1:{api_port}/proxies/url-test");
+    let response = send_http_request(
+        proxy_url.parse().unwrap(), auth_get(&proxy_url),
+    )
+        .await
+        .expect("Failed to get group history");
+    assert_eq!(response.status(), http::StatusCode::OK);
+    let proxy = parse_json(response).await;
+    let history = proxy["history"].as_array().expect("group history is an array");
+    assert_eq!(
+        history.last().expect("group test records history")["delay"],
+        json["url-test"],
     );
 }

@@ -6,7 +6,7 @@ import type { Proxy } from '../lib/api';
 
 const TEST_URL = 'http://www.gstatic.com/generate_204';
 const TEST_TIMEOUT = 5000;
-const GROUP_TYPES = ['Selector', 'URLTest', 'Fallback', 'LoadBalance'];
+const GROUP_TYPES = ['Selector', 'URLTest', 'Fallback', 'LoadBalance', 'Smart'];
 
 function getLatencyColor(delay: number | undefined): string {
   if (!delay || delay === 0) return '#8e8e93';
@@ -20,6 +20,7 @@ function getGroupAccentColor(type: string): string {
   if (type === 'URLTest') return '#34c759';
   if (type === 'Fallback') return '#ff9500';
   if (type === 'LoadBalance') return '#af52de';
+  if (type === 'Smart') return '#00c7be';
   return '#8e8e93';
 }
 
@@ -28,6 +29,7 @@ function getTypeBadgeStyle(type: string): { background: string; color: string } 
   if (type === 'URLTest') return { background: 'rgba(52,199,89,0.1)', color: '#34c759' };
   if (type === 'Fallback') return { background: 'rgba(255,149,0,0.1)', color: '#ff9500' };
   if (type === 'LoadBalance') return { background: 'rgba(175,82,222,0.1)', color: '#af52de' };
+  if (type === 'Smart') return { background: 'rgba(0,199,190,0.1)', color: '#00c7be' };
   return { background: 'var(--color-fill-medium)', color: 'var(--color-text-secondary)' };
 }
 
@@ -44,7 +46,6 @@ export function ProxyGroups({ mode }: ProxyGroupsProps) {
   const queryClient = useQueryClient();
   const [testingGroups, setTestingGroups] = useState<Set<string>>(new Set());
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
-  const [groupLatencyMap, setGroupLatencyMap] = useState<Record<string, number>>({});
 
   const { data, isLoading } = useQuery({
     queryKey: ['proxies'],
@@ -115,7 +116,8 @@ export function ProxyGroups({ mode }: ProxyGroupsProps) {
   function toggleExpanded(name: string) {
     setExpanded((prev) => {
       const next = new Set(prev);
-      next.has(name) ? next.delete(name) : next.add(name);
+      if (next.has(name)) next.delete(name);
+      else next.add(name);
       return next;
     });
   }
@@ -125,19 +127,14 @@ export function ProxyGroups({ mode }: ProxyGroupsProps) {
     setTestingGroups((s) => new Set(s).add(group.name));
     setExpanded((prev) => new Set(prev).add(group.name));
     try {
-      const result = await getGroupDelay(group.name, TEST_URL, TEST_TIMEOUT);
-      // result is { [groupName]: latencyMs } — store the group's own latency
-      const ms = result[group.name];
-      if (ms !== undefined) {
-        setGroupLatencyMap((prev) => ({ ...prev, [group.name]: ms }));
-      }
+      await getGroupDelay(group.name, TEST_URL, TEST_TIMEOUT);
+    } catch {
+      // Failed tests also update history; refresh it below.
+    } finally {
       await Promise.all([
         queryClient.refetchQueries({ queryKey: ['proxies'] }),
         queryClient.refetchQueries({ queryKey: ['providers'] }),
       ]);
-    } catch {
-      // leave existing latency values unchanged on error
-    } finally {
       setTestingGroups((s) => { const next = new Set(s); next.delete(group.name); return next; });
     }
   }
@@ -165,10 +162,9 @@ export function ProxyGroups({ mode }: ProxyGroupsProps) {
         const isSelector = group.type === 'Selector';
         const accentColor = getGroupAccentColor(group.type);
         const typeBadge = getTypeBadgeStyle(group.type);
-        // Group's own latency: from last test result, falling back to group history
-        const groupProxy = proxies[group.name];
-        const historyLatency = getLastDelay(groupProxy?.history);
-        const headerLatency = groupLatencyMap[group.name] ?? historyLatency;
+        const headerLatency = getLastDelay(
+          group.now ? mergedProxies[group.now]?.history : group.history
+        );
         const headerLatencyColor = getLatencyColor(headerLatency);
 
         return (
