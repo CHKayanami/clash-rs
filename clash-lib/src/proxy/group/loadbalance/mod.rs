@@ -70,7 +70,7 @@ impl Handler {
     }
 
     /// Run the configured strategy over the group's current members.
-    async fn pick(&self, sess: &Session) -> io::Result<OutboundNode> {
+    fn pick(&self, sess: &Session) -> io::Result<OutboundNode> {
         let proxies = self.get_proxies(false);
         if proxies.is_empty() {
             return Err(io::Error::other(format!(
@@ -78,7 +78,7 @@ impl Handler {
                 self.name()
             )));
         }
-        self.strategy_fn.pick(proxies, sess).await
+        self.strategy_fn.pick(proxies, sess)
     }
 }
 
@@ -101,7 +101,7 @@ impl GroupHandler for Handler {
         excluded: &HashSet<String>,
     ) -> io::Result<Option<OutboundNode>> {
         let _ = (sess, excluded);
-        self.pick(sess).await.map(Some)
+        self.pick(sess).map(Some)
     }
 }
 

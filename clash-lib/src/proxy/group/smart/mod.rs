@@ -9,10 +9,11 @@
 //! - [`state`] - Centralized state management
 
 use super::UdpPolicy;
-use std::{collections::HashSet, time::Duration};
+use std::{cmp::Ordering, collections::HashSet, time::Duration};
 use super::GroupHandler;
 use std::{io, sync::Arc};
 use tracing::{debug, info};
+use parking_lot::Mutex;
 
 use crate::{
     app::remote_content_manager::{
@@ -56,7 +57,7 @@ pub struct Handler {
     /// Proxy manager for health checks and metrics
     proxy_manager: ProxyManager,
     /// Centralized state management
-    smart_state: Arc<tokio::sync::Mutex<SmartState>>,
+    smart_state: Arc<Mutex<SmartState>>,
 }
 
 impl std::fmt::Debug for Handler {
@@ -70,6 +71,16 @@ impl std::fmt::Debug for Handler {
 }
 
 impl Handler {
+    #[cfg(feature = "allocation-tests")]
+    pub(crate) fn measurement_fixture(proxy_manager: ProxyManager) -> Self {
+        Self {
+            opts: HandlerOptions::default(),
+            providers: Providers::new(Vec::new()),
+            proxy_manager,
+            smart_state: Arc::new(Mutex::new(SmartState::new())),
+        }
+    }
+
     /// Create a new smart proxy group handler with persistence support
     /// Load persisted stats and build the handler.
     ///
@@ -102,7 +113,7 @@ impl Handler {
             opts,
             providers: Providers::new(providers),
             proxy_manager,
-            smart_state: Arc::new(tokio::sync::Mutex::new(smart_state)),
+            smart_state: Arc::new(Mutex::new(smart_state)),
         };
 
         // Set up periodic persistence for smart_stats
@@ -116,9 +127,7 @@ impl Handler {
             loop {
                 interval.tick().await;
                 let Some(state) = weak_state.upgrade() else { break; };
-                let state_guard = state.lock().await;
-                let data_to_save = state_guard.export_data();
-                drop(state_guard);
+                let data_to_save = { state.lock().export_data() };
 
                 cache_store_clone
                     .set_smart_stats(&group_name_clone, data_to_save);
@@ -175,25 +184,21 @@ impl Handler {
             dest_ip
         );
 
-        let mut state_guard = self.smart_state.lock().await;
-        state_guard.cleanup_stale();
-
-        // Create enhanced session with traffic stats for site tuning
         let mut enhanced_sess = sess.clone();
-        if let Some(traffic_stats) = state_guard.get_traffic_stats(sess) {
-            enhanced_sess.traffic_stats = Some(traffic_stats);
-            debug!(
-                "{} using traffic pattern analysis for session {}",
-                self.name(),
-                SmartState::generate_session_id(sess)
-            );
+        {
+            let mut state = self.smart_state.lock();
+            state.cleanup_stale();
+            if let Some(traffic_stats) = state.get_traffic_stats(sess) {
+                enhanced_sess.traffic_stats = Some(traffic_stats);
+                debug!(
+                    "{} using traffic pattern analysis for session {}",
+                    self.name(), SmartState::generate_session_id(sess)
+                );
+            }
         }
-
-        // Drop the lock temporarily to call get_site_tuning
-        drop(state_guard);
         let site_tuning = self.proxy_manager.get_site_tuning(&enhanced_sess).await;
         let histories = {
-            let state = self.smart_state.lock().await;
+            let state = self.smart_state.lock();
             let summary = |stats: &SiteStats| {
                 (
                     stats.get_delay_score(),
@@ -219,21 +224,18 @@ impl Handler {
                 .collect::<Vec<_>>()
         };
 
-        let mut candidates: Vec<(f64, OutboundNode, String)> = Vec::new();
+        let mut best: Option<(f64, OutboundNode)> = None;
 
         for (proxy, site_stats, ip_stats, penalty_score) in histories {
-            let name = proxy.name().to_string();
+            let name = proxy.name();
 
             // Get basic metrics from proxy manager
-            let delay = self
-                .proxy_manager
-                .last_delay(&name)
-                .await
+            let (alive, last_delay) = self.proxy_manager.alive_and_last_delay(name);
+            let delay = if alive { last_delay } else { None }
                 .map(|d| d.as_millis_f64())
                 .unwrap_or(9999.0);
-            let (packet_loss, rtt) = self.proxy_manager.delay_metrics(&name)
+            let (packet_loss, rtt) = self.proxy_manager.delay_metrics(name)
                 .unwrap_or((1.0, 9999.0));
-            let alive = self.proxy_manager.alive(&name).await;
 
             debug!(
                 "{} proxy {} metrics - delay: {:.1}ms, loss: {:.1}%, rtt: {:.1}ms, \
@@ -359,93 +361,37 @@ impl Handler {
                 final_score
             );
 
-            candidates.push((final_score, proxy.clone(), name));
+            // Strict comparison preserves provider order for equal scores.
+            // Incomparable scores do not displace the current candidate.
+            if best.as_ref().is_none_or(|(score, _)| {
+                final_score.partial_cmp(score) == Some(Ordering::Less)
+            }) {
+                best = Some((final_score, proxy));
+            }
         }
 
-        // Sort by score (lower is better)
-        candidates.sort_by(|a, b| {
-            a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal)
-        });
-
-        if candidates.is_empty() {
-            debug!("{} no candidates after filtering", self.name());
-            return None;
-        }
-
-        // Select the best candidate (lowest score)
-        let (_, selected_proxy, selected_name) = candidates[0].clone();
-
-        debug!("{} selected proxy: {}", self.name(), selected_name);
+        let (_, selected_proxy) = best?;
+        debug!("{} selected proxy: {}", self.name(), selected_proxy.name());
         Some(selected_proxy)
     }
 
     /// Calculate optimal retry count based on site history
-    async fn calculate_max_retries(&self, site: &str) -> u32 {
-        let state_guard = self.smart_state.lock().await;
-
-        // Collect site success rate data
-        let site_stats: Vec<_> = state_guard
-            .site_stats
-            .values()
-            .filter_map(|stats| stats.get(site))
-            .collect();
-
-        let avg_success_rate = if !site_stats.is_empty() {
-            site_stats.iter().map(|s| s.success_rate()).sum::<f64>()
-                / site_stats.len() as f64
-        } else {
-            0.5 // Default to middle ground
-        };
-
-        drop(state_guard);
-
-        // Use configured max retries or calculate based on site history
-        let configured_max = self.opts.max_retries.unwrap_or(0);
-        let calculated_max = (3.0 * (2.0 - avg_success_rate)).round() as u32;
-
-        if configured_max > 0 {
-            configured_max
-        } else {
-            calculated_max.clamp(2, 6) // Reasonable bounds
+    fn calculate_max_retries(&self, state: &SmartState, site: &str) -> u32 {
+        if let Some(max) = self.opts.max_retries.filter(|max| *max > 0) {
+            return max;
         }
-    }
 
-    /// Record successful connection metrics
-    async fn record_success(
-        &self,
-        proxy_name: &str,
-        site: &str,
-        dest_ip: Option<&str>,
-        delay: f64,
-        sess: &Session,
-    ) {
-        let mut state_guard = self.smart_state.lock().await;
+        let (total, count) = state.site_stats.values()
+            .filter_map(|stats| stats.get(site))
+            .fold((0.0, 0usize), |(total, count), stats| {
+                (total + stats.success_rate(), count + 1)
+            });
+        let avg_success_rate = if count > 0 { total / count as f64 } else { 0.5 };
 
-        // Record connection result
-        state_guard.record_connection_result(proxy_name, site, dest_ip, delay, true);
-
-        // Record traffic data (approximate handshake bytes)
-        state_guard.record_traffic(sess, 500, 500);
-    }
-
-    /// Record failed connection metrics
-    async fn record_failure(
-        &self,
-        proxy_name: &str,
-        site: &str,
-        dest_ip: Option<&str>,
-        sess: &Session,
-    ) {
-        let mut state_guard = self.smart_state.lock().await;
-
-        // Record connection result - this will apply penalty and update stats
-        state_guard
-            .record_connection_result(proxy_name, site, dest_ip, 9999.0, false);
-
-        // Record failed request
-        state_guard.record_request(sess);
+        (3.0 * (2.0 - avg_success_rate)).round().clamp(2.0, 6.0) as u32
     }
 }
+
 impl GroupHandler for Handler {
     fn name(&self) -> &str {
         &self.opts.name
@@ -468,12 +414,10 @@ impl GroupHandler for Handler {
     }
 
     async fn attempts(&self, sess: &Session) -> u32 {
-        let mut state = self.smart_state.lock().await;
+        let mut state = self.smart_state.lock();
         state.start_traffic_tracking(sess);
         state.record_request(sess);
-        drop(state);
-        self.calculate_max_retries(sess.destination.host_cow().as_ref())
-            .await
+        self.calculate_max_retries(&state, sess.destination.host_cow().as_ref())
     }
 
     fn retry_delay(&self, attempt: u32) -> Duration {
@@ -488,16 +432,15 @@ impl GroupHandler for Handler {
         elapsed: Duration,
         success: bool,
     ) {
+        let mut state = self.smart_state.lock();
         let site = sess.destination.host_cow();
         let ip = sess.destination.ip().map(|ip| ip.to_string());
+        let delay = if success { elapsed.as_secs_f64() * 1000.0 } else { 9999.0 };
+        state.record_connection_result(proxy, &site, ip.as_deref(), delay, success);
         if success {
-            self.record_success(
-                proxy, &site, ip.as_deref(),
-                elapsed.as_secs_f64() * 1000.0, sess,
-            ).await;
+            state.record_traffic(sess, 500, 500);
         } else {
-            self.record_failure(proxy, &site, ip.as_deref(), sess)
-                .await;
+            state.record_request(sess);
         }
     }
 }
@@ -528,6 +471,61 @@ mod unit_tests {
         mocks::{MockDummyOutboundHandler, MockDummyProxyProvider},
         utils::test_utils::noop::NoopResolver,
     };
+
+    #[tokio::test]
+    async fn selection_preserves_score_order_ties_and_exclusions() {
+        let proxies = Arc::new(["slow", "first-fast", "second-fast"].map(|name| {
+            let mut proxy = MockDummyOutboundHandler::new();
+            proxy.expect_name().return_const(name.to_owned());
+            OutboundNode::protocol(Arc::new(proxy))
+        }).to_vec());
+        let mut provider = MockDummyProxyProvider::new();
+        provider.expect_proxies().returning(move || proxies.clone());
+        let manager = ProxyManager::new(Arc::new(NoopResolver), None);
+        for (name, delay) in [("slow", 100), ("first-fast", 10), ("second-fast", 10)] {
+            manager.report_delay(name, true, Duration::from_millis(delay)).await;
+        }
+        let mut handler = Handler {
+            opts: HandlerOptions::default(),
+            providers: Providers::new(vec![Arc::new(provider)]),
+            proxy_manager: manager,
+            smart_state: Arc::new(Mutex::new(SmartState::new())),
+        };
+        let sess = Session::default();
+        let mut excluded = HashSet::new();
+        assert_eq!(handler.select(&sess, &excluded).await.unwrap().unwrap().name(), "first-fast");
+        excluded.insert("first-fast".to_owned());
+        assert_eq!(handler.select(&sess, &excluded).await.unwrap().unwrap().name(), "second-fast");
+        excluded.insert("second-fast".to_owned());
+        assert_eq!(handler.select(&sess, &excluded).await.unwrap().unwrap().name(), "slow");
+        excluded.insert("slow".to_owned());
+        assert!(handler.select(&sess, &excluded).await.unwrap().is_none());
+        excluded.clear();
+        // Equal infinite scores also preserve provider order.
+        handler.opts.bandwidth_weight = Some(f64::INFINITY);
+        assert_eq!(handler.select(&sess, &excluded).await.unwrap().unwrap().name(), "slow");
+    }
+
+    #[tokio::test]
+    async fn result_history_controls_adaptive_retry_budget() {
+        let handler = Handler {
+            opts: HandlerOptions::default(),
+            providers: Providers::new(Vec::new()),
+            proxy_manager: ProxyManager::new(Arc::new(NoopResolver), None),
+            smart_state: Arc::new(Mutex::new(SmartState::new())),
+        };
+        let sess = Session::default();
+        assert_eq!(handler.attempts(&sess).await, 5);
+        handler.record_result(&sess, "healthy", Duration::from_millis(10), true).await;
+        assert_eq!(handler.attempts(&sess).await, 3);
+        handler.record_result(&sess, "broken", Duration::ZERO, false).await;
+        assert_eq!(handler.attempts(&sess).await, 5);
+        let state = handler.smart_state.lock();
+        let site = sess.destination.host_cow();
+        assert_eq!(state.get_site_stats("healthy", &site).unwrap().success_rate(), 1.0);
+        assert_eq!(state.get_site_stats("broken", &site).unwrap().success_rate(), 0.0);
+        assert!(state.get_penalty("broken").unwrap().value() > 0.0);
+    }
 
     #[tokio::test]
     async fn retry_tries_another_member_after_a_connection_failure() {
@@ -568,7 +566,7 @@ mod unit_tests {
             },
             providers: Providers::new(vec![Arc::new(provider)]),
             proxy_manager: manager,
-            smart_state: Arc::new(tokio::sync::Mutex::new(SmartState::new())),
+            smart_state: Arc::new(Mutex::new(SmartState::new())),
         };
         let sess = Session::default();
         OutboundNode::group(Arc::new(handler)).connect_stream(&sess, resolver).await.unwrap();

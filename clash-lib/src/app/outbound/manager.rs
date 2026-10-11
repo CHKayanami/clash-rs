@@ -213,7 +213,7 @@ impl OutboundManager {
         proxy: &OutboundNode,
         name: &str,
     ) {
-        let alive = self.proxy_manager.alive(name).await;
+        let alive = self.proxy_manager.alive(name);
         let history = self.proxy_manager.delay_history(name).await;
         let support_udp = proxy.support_udp().await;
 

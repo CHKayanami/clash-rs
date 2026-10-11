@@ -70,7 +70,7 @@ impl Handler {
     /// (the API, capability probes) pass `false` — previously every one of them
     /// rewrote the sticky state, so merely polling `/proxies` could change
     /// which proxy the group routed through.
-    async fn fastest(
+    fn fastest(
         &self,
         touch: bool,
         commit: bool,
@@ -90,7 +90,7 @@ impl Handler {
         for (index, proxy) in proxies.iter().enumerate() {
             let is_current = current_name.as_deref() == Some(proxy.name());
             let (alive, delay) =
-                proxy_manager.alive_and_last_delay(proxy.name()).await;
+                proxy_manager.alive_and_last_delay(proxy.name());
             if is_current {
                 current_alive = alive;
             }
@@ -174,7 +174,7 @@ impl GroupHandler for Handler {
         excluded: &HashSet<String>,
     ) -> io::Result<Option<OutboundNode>> {
         let _ = (sess, excluded);
-        Ok(self.fastest(true, true).await)
+        Ok(self.fastest(true, true))
     }
 }
 
@@ -184,7 +184,7 @@ impl GroupProxyAPIResponse for Handler {
     }
 
     async fn get_active_proxy(&self) -> Option<OutboundNode> {
-        self.fastest(false, false).await
+        self.fastest(false, false)
     }
 
     fn get_latency_test_url(&self) -> Option<String> {
@@ -260,26 +260,26 @@ mod tests {
             proxy_manager.clone(),
         );
 
-        assert_eq!(handler.fastest(false, true).await.unwrap().name(), "b");
+        assert_eq!(handler.fastest(false, true).unwrap().name(), "b");
 
         proxy_manager
             .report_delay("a", true, Duration::from_millis(40))
             .await;
-        assert_eq!(handler.fastest(false, true).await.unwrap().name(), "b");
+        assert_eq!(handler.fastest(false, true).unwrap().name(), "b");
 
         proxy_manager
             .report_delay("a", true, Duration::from_millis(20))
             .await;
-        assert_eq!(handler.fastest(false, true).await.unwrap().name(), "a");
+        assert_eq!(handler.fastest(false, true).unwrap().name(), "a");
 
         proxy_manager
             .report_delay("a", false, Duration::from_millis(20))
             .await;
-        assert_eq!(handler.fastest(false, true).await.unwrap().name(), "b");
+        assert_eq!(handler.fastest(false, true).unwrap().name(), "b");
 
         proxy_manager
             .report_delay("b", false, Duration::from_millis(50))
             .await;
-        assert_eq!(handler.fastest(false, true).await.unwrap().name(), "a");
+        assert_eq!(handler.fastest(false, true).unwrap().name(), "a");
     }
 }

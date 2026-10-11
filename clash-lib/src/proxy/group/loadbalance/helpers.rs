@@ -77,7 +77,7 @@ pub fn strategy_sticky_session(manager: ProxyManager) -> Strategy {
 }
 
 impl Strategy {
-    pub async fn pick(&self, proxies: Arc<Vec<OutboundNode>>, sess: &Session) -> std::io::Result<OutboundNode> {
+    pub fn pick(&self, proxies: Arc<Vec<OutboundNode>>, sess: &Session) -> std::io::Result<OutboundNode> {
         if proxies.is_empty() { return Err(std::io::Error::other("no proxy found")); }
         match self {
             Self::RoundRobin(index) => {
@@ -93,13 +93,13 @@ impl Strategy {
             }
             Self::StickySession { manager, cache } => {
                 let key = murmur3_32(&mut Cursor::new(get_key_src_and_dst(sess)), 0).unwrap() as u64;
-                sticky_pick(proxies, key, manager, cache).await
+                sticky_pick(proxies, key, manager, cache)
             }
         }
     }
 }
 
-async fn sticky_pick(
+fn sticky_pick(
     proxies: Arc<Vec<OutboundNode>>, key: u64, manager: &ProxyManager,
     cache: &moka::sync::Cache<u64, String>,
 ) -> std::io::Result<OutboundNode> {
@@ -131,7 +131,7 @@ async fn sticky_pick(
     for offset in 0..proxies.len() {
         let index = (start_index + offset) % proxies.len();
         let proxy = &proxies[index];
-        if manager.alive(proxy.name()).await {
+        if manager.alive(proxy.name()) {
             // now it's a valid proxy
             // check if it's the same as the last one(likely)
             // update the cache if:
@@ -207,7 +207,7 @@ mod tests {
         let strategy_fn = strategy_sticky_session(manager.clone());
 
         // all proxies is not alive since we have not setup the proxy manager
-        let res = strategy_fn.pick(proxies.clone(), &Session::default()).await;
+        let res = strategy_fn.pick(proxies.clone(), &Session::default());
         assert!(res.is_err());
         assert_cache_state!(CACHE_MISS);
 
@@ -223,16 +223,16 @@ mod tests {
             SocksAddr::Ip(SocketAddr::V4(SocketAddrV4::new(dst1, 80)));
 
         // 1.1 first time, cache miss & update
-        let res = strategy_fn.pick(proxies.clone(), &session1).await;
+        let res = strategy_fn.pick(proxies.clone(), &session1);
         assert_cache_state!(CACHE_UPDATE);
         let session1_outbound_name_1 = res.unwrap().name().to_owned();
 
         // 1.2 second time, cache hit
-        let res = strategy_fn.pick(proxies.clone(), &session1).await;
+        let res = strategy_fn.pick(proxies.clone(), &session1);
         assert_eq!(res.unwrap().name(), session1_outbound_name_1);
         assert_cache_state!(CACHE_HIT);
         // 1.3 third time, cache hit
-        let res = strategy_fn.pick(proxies.clone(), &session1).await;
+        let res = strategy_fn.pick(proxies.clone(), &session1);
         assert_eq!(res.unwrap().name(), session1_outbound_name_1);
         assert_cache_state!(CACHE_HIT);
 
@@ -240,12 +240,12 @@ mod tests {
         let dst1_2 = Ipv4Addr::new(8, 8, 8, 8);
         session1.destination =
             SocksAddr::Ip(SocketAddr::V4(SocketAddrV4::new(dst1_2, 80)));
-        let res = strategy_fn.pick(proxies.clone(), &session1).await;
+        let res = strategy_fn.pick(proxies.clone(), &session1);
         assert_cache_state!(CACHE_UPDATE);
         let session1_outbound_name_2 = res.unwrap().name().to_owned();
 
         // 1.5 cache hit
-        let res = strategy_fn.pick(proxies.clone(), &session1).await;
+        let res = strategy_fn.pick(proxies.clone(), &session1);
         assert_eq!(res.unwrap().name(), session1_outbound_name_2);
         assert_cache_state!(CACHE_HIT);
 
@@ -253,12 +253,12 @@ mod tests {
             // 1.6 change the src address, cache miss & update
             let src1_new = Ipv4Addr::new(192, 168, 2, i);
             session1.source = SocketAddr::V4(SocketAddrV4::new(src1_new, 8964));
-            let res = strategy_fn.pick(proxies.clone(), &session1).await;
+            let res = strategy_fn.pick(proxies.clone(), &session1);
             assert_cache_state!(CACHE_UPDATE);
             let session1_outbound_name_new = res.unwrap().name().to_owned();
 
             // 1.6 cache hit
-            let res = strategy_fn.pick(proxies.clone(), &session1).await;
+            let res = strategy_fn.pick(proxies.clone(), &session1);
             assert_eq!(res.unwrap().name(), session1_outbound_name_new);
             assert_cache_state!(CACHE_HIT);
         }
@@ -280,14 +280,12 @@ mod tests {
 
         assert_eq!(
             strategy.pick(Arc::new(vec![a.clone()]), &sess)
-                .await
                 .unwrap()
                 .name(),
             "a"
         );
         assert_eq!(
             strategy.pick(Arc::new(vec![b.clone(), a.clone()]), &sess)
-                .await
                 .unwrap()
                 .name(),
             "a"
@@ -301,7 +299,7 @@ mod tests {
             members.push(make_proxy(&name));
         }
         members.push(b);
-        assert_eq!(strategy.pick(Arc::new(members), &sess).await.unwrap().name(), "b");
+        assert_eq!(strategy.pick(Arc::new(members), &sess).unwrap().name(), "b");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -314,7 +312,7 @@ mod tests {
             let strategy = strategy.clone();
             let proxies = proxies.clone();
             tokio::spawn(async move {
-                strategy.pick(proxies, &Session::default()).await.unwrap()
+                strategy.pick(proxies, &Session::default()).unwrap()
                     .name().parse::<usize>().unwrap()
             })
         });
@@ -326,10 +324,10 @@ mod tests {
         let session = Session::default();
         let small = Arc::new(vec![proxies[0].clone(), proxies[1].clone()]);
         // The previous call left index=4: shrinking normalizes to index=0.
-        assert_eq!(strategy.pick(small.clone(), &session).await.unwrap().name(), "0");
-        assert_eq!(strategy.pick(small, &session).await.unwrap().name(), "1");
-        assert!(strategy.pick(Arc::new(Vec::new()), &session).await.is_err());
-        assert_eq!(strategy.pick(proxies, &session).await.unwrap().name(), "2");
+        assert_eq!(strategy.pick(small.clone(), &session).unwrap().name(), "0");
+        assert_eq!(strategy.pick(small, &session).unwrap().name(), "1");
+        assert!(strategy.pick(Arc::new(Vec::new()), &session).is_err());
+        assert_eq!(strategy.pick(proxies, &session).unwrap().name(), "2");
     }
 
 }

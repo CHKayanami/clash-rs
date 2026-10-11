@@ -1,6 +1,6 @@
 //! Opt-in internal hook for the isolated dispatch allocation test.
 
-use std::{collections::{HashMap, HashSet}, future::Future, mem::size_of_val, sync::Arc};
+use std::{collections::{HashMap, HashSet}, future::Future, mem::size_of_val, sync::Arc, time::Duration};
 use arc_swap::ArcSwap;
 use futures::future::BoxFuture;
 use crate::{
@@ -8,7 +8,7 @@ use crate::{
     config::internal::proxy::LoadBalanceStrategy,
     proxy::{
         OutboundHandler, OutboundNode, direct, socks, selector, loadbalance, reject,
-        group::GroupHandler, utils::DialerProxyConnector,
+        group::{GroupHandler, fallback, urltest, smart}, utils::DialerProxyConnector,
     },
     session::Session,
 };
@@ -56,6 +56,49 @@ pub async fn measure_dispatch_futures(start: impl Fn(), finish: impl Fn(&str, us
             ..Default::default()
         }, Vec::new(), ProxyManager::new(resolver.clone(), None),
     );
+
+    let manager = ProxyManager::new(resolver.clone(), None);
+    let fallback = fallback::Handler::new(Default::default(), Vec::new(), manager.clone());
+    let urltest = urltest::Handler::new(Default::default(), 0, Vec::new(), manager.clone());
+    let smart = smart::Handler::measurement_fixture(manager);
+    macro_rules! measure_group {
+        ($name:literal, $handler:expr) => {{
+            let handler = $handler;
+            measurement.measure(concat!($name, " select"), || handler.select(&sess, &excluded), 0);
+            measurement.measure(concat!($name, " attempts"), || handler.attempts(&sess), 0);
+            measurement.measure(concat!($name, " record_result"), || handler.record_result(&sess, "member", Duration::ZERO, true), 0);
+        }};
+    }
+    for (name, bytes) in OutboundNode::executor_layout(group.as_group().unwrap(), &sess, resolver.clone()) {
+        (measurement.start)();
+        (measurement.finish)(name, bytes, Some(0));
+    }
+    measurement.measure("boxed retry sleep", || Box::pin(tokio::time::sleep(Duration::ZERO)), 1);
+    measure_group!("Group enum", group.as_group().unwrap());
+    // Measure concrete handlers as well as the unified group enum.
+    if let crate::proxy::group::ProxyGroup::Selector(handler) = group.as_group().unwrap() {
+        measure_group!("Selector", handler.as_ref());
+    }
+    measure_group!("Fallback", &fallback);
+    measure_group!("URLTest", &urltest);
+    measure_group!("LoadBalance", &round_robin);
+    measure_group!("Smart", &smart);
+
+    // Warm provider snapshot initialization before isolating the boxing cost.
+    assert!(smart.select(&sess, &excluded).await.unwrap().is_none());
+    let future = smart.select(&sess, &excluded);
+    let bytes = size_of_val(&future);
+    (measurement.start)();
+    let result = future.await;
+    let allocations = (measurement.finish)("Smart concrete selection execution", bytes, None);
+    assert!(result.unwrap().is_none());
+    let smart_group = OutboundNode::group(Arc::new(smart));
+    let future = smart_group.as_group().unwrap().select(&sess, &excluded);
+    let bytes = size_of_val(&future);
+    (measurement.start)();
+    let result = future.await;
+    (measurement.finish)("Smart enum selection execution", bytes, Some(allocations + 1));
+    assert!(result.unwrap().is_none());
 
     #[cfg(feature = "shadowsocks")]
     {

@@ -33,16 +33,18 @@ pub(super) async fn scoped<T>(route: Option<&WeakRoute>, future: impl Future<Out
     ROUTE.scope(route, future).await
 }
 
-pub(crate) fn selected(group: usize) -> Option<OutboundNode> {
-    ROUTE.try_with(|route| route.nodes.lock().get(&(true, group)).cloned()).ok().flatten()
-}
+impl Route {
+    pub(crate) fn selected(&self, group: usize) -> Option<OutboundNode> {
+        self.nodes.lock().get(&(true, group)).cloned()
+    }
 
-pub(crate) fn remember(group: usize, node: &OutboundNode) {
-    let _ = ROUTE.try_with(|route| { route.nodes.lock().insert((true, group), node.clone()); });
-}
+    pub(crate) fn remember(&self, group: usize, node: &OutboundNode) {
+        self.nodes.lock().insert((true, group), node.clone());
+    }
 
-pub(crate) fn forget(group: usize) {
-    let _ = ROUTE.try_with(|route| { route.nodes.lock().remove(&(true, group)); });
+    pub(crate) fn forget(&self, group: usize) {
+        self.nodes.lock().remove(&(true, group));
+    }
 }
 
 pub(super) fn target(id: usize, resolve: impl FnOnce() -> io::Result<OutboundNode>) -> io::Result<OutboundNode> {

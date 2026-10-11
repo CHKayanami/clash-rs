@@ -55,10 +55,10 @@ impl Handler {
         self.providers.get_proxies(touch)
     }
 
-    async fn find_alive_proxy(&self, touch: bool) -> Option<OutboundNode> {
+    fn find_alive_proxy(&self, touch: bool) -> Option<OutboundNode> {
         let proxies = self.get_proxies(touch);
         for proxy in proxies.iter() {
-            if self.proxy_manager.alive(proxy.name()).await {
+            if self.proxy_manager.alive(proxy.name()) {
                 debug!("`{}` fallback to `{}`", self.name(), proxy.name());
                 return Some(proxy.clone());
             }
@@ -86,7 +86,7 @@ impl GroupHandler for Handler {
         excluded: &HashSet<String>,
     ) -> io::Result<Option<OutboundNode>> {
         let _ = (sess, excluded);
-        Ok(self.find_alive_proxy(true).await)
+        Ok(self.find_alive_proxy(true))
     }
 }
 
@@ -96,7 +96,7 @@ impl GroupProxyAPIResponse for Handler {
     }
 
     async fn get_active_proxy(&self) -> Option<OutboundNode> {
-        Handler::find_alive_proxy(self, false).await
+        Handler::find_alive_proxy(self, false)
     }
 
     fn get_latency_test_url(&self) -> Option<String> {

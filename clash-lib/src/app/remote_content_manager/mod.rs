@@ -167,14 +167,14 @@ impl ProxyManager {
         results
     }
 
-    pub async fn alive(&self, name: &str) -> bool {
+    pub fn alive(&self, name: &str) -> bool {
         self.proxy_state
             .get(name)
             .map(|x| x.alive.load(Ordering::Relaxed))
             .unwrap_or(true) // if not found, assume it's alive
     }
 
-    pub(crate) async fn alive_and_last_delay(
+    pub(crate) fn alive_and_last_delay(
         &self,
         name: &str,
     ) -> (bool, Option<Duration>) {
@@ -235,8 +235,8 @@ impl ProxyManager {
             .unwrap_or_default()
     }
 
-    pub async fn last_delay(&self, name: &str) -> Option<Duration> {
-        let (alive, delay) = self.alive_and_last_delay(name).await;
+    pub fn last_delay(&self, name: &str) -> Option<Duration> {
+        let (alive, delay) = self.alive_and_last_delay(name);
         if alive { delay } else { None }
     }
 
@@ -1076,17 +1076,16 @@ mod tests {
             .await
             .expect("test failed");
 
-        assert!(manager.alive(PROXY_DIRECT).await);
+        assert!(manager.alive(PROXY_DIRECT));
         assert!(
             manager
                 .last_delay(PROXY_DIRECT)
-                .await
                 .is_some_and(|x| x.as_nanos() > 0)
         );
         assert!(!manager.delay_history(PROXY_DIRECT).await.is_empty());
 
         manager.report_alive(PROXY_DIRECT, false, None).await;
-        assert!(!manager.alive(PROXY_DIRECT).await);
+        assert!(!manager.alive(PROXY_DIRECT));
 
         for _ in 0..10 {
             manager
@@ -1095,11 +1094,10 @@ mod tests {
                 .expect("test failed");
         }
 
-        assert!(manager.alive(PROXY_DIRECT).await);
+        assert!(manager.alive(PROXY_DIRECT));
         assert!(
             manager
                 .last_delay(PROXY_DIRECT)
-                .await
                 .is_some_and(|x| x.as_nanos() > 0)
         );
         assert_eq!(manager.delay_history(PROXY_DIRECT).await.len(), 10);
@@ -1142,8 +1140,8 @@ mod tests {
             .await;
 
         assert!(result.is_err());
-        assert!(!manager.alive(PROXY_DIRECT).await);
-        assert_eq!(manager.last_delay(PROXY_DIRECT).await, None);
+        assert!(!manager.alive(PROXY_DIRECT));
+        assert_eq!(manager.last_delay(PROXY_DIRECT), None);
         assert_eq!(manager.delay_history(PROXY_DIRECT).await.len(), 1);
     }
 

@@ -207,63 +207,78 @@ async fn connect(
     resolver: ThreadSafeDNSResolver,
     udp: bool,
 ) -> io::Result<Connection> {
+    // Retain the association once; derived TCP connections share its UDP route.
+    let route = dialer_route::retain();
     let mut frames = Frames::new(Frame::new(Policy::Root(root), sess, udp).await);
     loop {
         let frame = frames.last_mut().expect("root frame");
         frame.attempts += 1;
         let group = frame.policy.group();
-        let selection = match dialer_route::selected(group.identity()) {
-            Some(node) => Ok(Some(node)),
-            None => group.select(sess, &frame.excluded).await,
-        };
-        let result = match selection {
-            Ok(Some(handler)) => {
-                dialer_route::remember(frame.policy.group().identity(), &handler);
-                if frame.limit > 1 {
-                    frame.excluded.insert(handler.name().to_owned());
-                }
-                frame.started = Instant::now();
-                frame.selected = Some(handler.clone());
-                if let Some(group) = handler.as_group() {
-                    if frames.len() >= 64 || frames.iter().any(|f| f.policy.group().name() == group.name()) {
-                        Err(io::Error::other(format!("cyclic or too deep proxy group: {}", group.name())))
-                    } else {
-                        frames.push(Frame::new(Policy::Nested(handler), sess, udp).await);
-                        continue;
+        let result = {
+            let selection = match route.as_ref().and_then(|route| route.selected(group.identity())) {
+                Some(node) => Ok(Some(node)),
+                None => group.select(sess, &frame.excluded).await,
+            };
+            match selection {
+                Ok(Some(handler)) => {
+                    if let Some(route) = &route {
+                        route.remember(frame.policy.group().identity(), &handler);
                     }
-                } else if udp {
-                    let handler = handler.as_protocol().expect("protocol leaf");
-                    handler.connect_datagram(sess, resolver.clone()).await.map(Connection::Datagram)
-                } else {
-                    let handler = handler.as_protocol().expect("protocol leaf");
-                    handler.connect_stream(sess, resolver.clone()).await.map(Connection::Stream)
+                    if frame.limit > 1 {
+                        frame.excluded.insert(handler.name().to_owned());
+                    }
+                    frame.started = Instant::now();
+                    frame.selected = Some(handler.clone());
+                    if let Some(group) = handler.as_group() {
+                        if frames.len() >= 64 || frames.iter().any(|f| f.policy.group().name() == group.name()) {
+                            Err(io::Error::other(format!("cyclic or too deep proxy group: {}", group.name())))
+                        } else {
+                            let nested = Frame::new(Policy::Nested(handler), sess, udp).await;
+                            frames.push(nested);
+                            continue;
+                        }
+                    } else if udp {
+                        let handler = handler.as_protocol().expect("protocol leaf");
+                        handler.connect_datagram(sess, resolver.clone()).await.map(Connection::Datagram)
+                    } else {
+                        let handler = handler.as_protocol().expect("protocol leaf");
+                        handler.connect_stream(sess, resolver.clone()).await.map(Connection::Stream)
+                    }
                 }
-            }
-            Ok(None) => {
-                frame.attempts = frame.limit;
-                Err(io::Error::other(format!(
-                    "no proxy available for {}", frame.policy.group().name()
-                )))
-            }
-            Err(err) => {
-                frame.attempts = frame.limit;
-                Err(err)
+                Ok(None) => {
+                    frame.attempts = frame.limit;
+                    Err(io::Error::other(format!(
+                        "no proxy available for {}", frame.policy.group().name()
+                    )))
+                }
+                Err(err) => {
+                    frame.attempts = frame.limit;
+                    Err(err)
+                }
             }
         };
         loop {
             let frame = frames.last_mut().expect("root frame");
-            if let Some(selected) = frame.selected.take() {
+            if let Some(selected) = frame.selected.as_ref() {
                 if !udp {
                     frame.policy.group().record_result(
                         sess, selected.name(), frame.started.elapsed(), result.is_ok(),
                     ).await;
                 }
             }
-            if result.is_err() { dialer_route::forget(frame.policy.group().identity()); }
+            frame.selected = None;
+            if result.is_err() {
+                if let Some(route) = &route { route.forget(frame.policy.group().identity()); }
+            }
             if result.is_ok() {
                 sess.push_chain(frame.policy.group().name());
             } else if frame.attempts < frame.limit {
-                tokio::time::sleep(frame.policy.group().retry_delay(frame.attempts)).await;
+                let delay = frame.policy.group().retry_delay(frame.attempts);
+                drop(result);
+                if !delay.is_zero() {
+                    // Only failed connections with a delay allocate a timer.
+                    Box::pin(tokio::time::sleep(delay)).await;
+                }
                 break;
             }
             frames.pop();
@@ -271,5 +286,26 @@ async fn connect(
             // Propagate the complete child outcome to its parent's policy.
             // Parents retry only after the child's retry budget is exhausted.
         }
+    }
+}
+
+#[cfg(feature = "allocation-tests")]
+impl OutboundNode {
+    pub(crate) fn executor_layout(
+        group: &ProxyGroup, sess: &Session, resolver: ThreadSafeDNSResolver,
+    ) -> [(&'static str, usize); 9] {
+        use std::{mem::{size_of, size_of_val}, time::Duration};
+
+        [
+            ("executor policy", size_of::<Policy<'_>>()),
+            ("executor frame", size_of::<Frame<'_>>()),
+            ("executor frames", size_of::<Frames<'_>>()),
+            ("executor connection result", size_of::<io::Result<Connection>>()),
+            ("root frame initialization", size_of_val(&Frame::new(Policy::Root(group), sess, false))),
+            ("nested frame initialization", size_of_val(&Frame::new(Policy::Nested(OutboundNode::Group(group.clone())), sess, false))),
+            ("group executor TCP", size_of_val(&connect(group, sess, resolver.clone(), false))),
+            ("group executor UDP", size_of_val(&connect(group, sess, resolver, true))),
+            ("retry sleep", size_of_val(&tokio::time::sleep(Duration::ZERO))),
+        ]
     }
 }

@@ -33,7 +33,16 @@ impl ProxyGroup {
     pub fn retry_delay(&self, attempt: u32) -> Duration { dispatch!(self, h, GroupHandler::retry_delay(h.as_ref(), attempt)) }
 
     pub async fn select(&self, sess: &Session, excluded: &HashSet<String>) -> io::Result<Option<OutboundNode>> {
-        dispatch!(self, h, GroupHandler::select(h.as_ref(), sess, excluded).await)
+        match self {
+            Self::Selector(h) => h.select(sess, excluded).await,
+            Self::Fallback(h) => h.select(sess, excluded).await,
+            Self::UrlTest(h) => h.select(sess, excluded).await,
+            Self::LoadBalance(h) => h.select(sess, excluded).await,
+            // Keep the large Smart state out of every group's selection future.
+            Self::Smart(h) => Box::pin(h.select(sess, excluded)).await,
+            #[cfg(test)]
+            Self::Retry(h) => h.select(sess, excluded).await,
+        }
     }
     pub async fn attempts(&self, sess: &Session) -> u32 {
         dispatch!(self, h, GroupHandler::attempts(h.as_ref(), sess).await)
