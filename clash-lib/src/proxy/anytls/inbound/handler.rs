@@ -3,10 +3,10 @@
 use super::{datagram::InboundDatagramAnytls, session::run_session};
 use crate::{
     Dispatcher,
-    proxy::{AnyStream, transport::uot::UDP_OVER_TCP_V2_MAGIC_HOST},
+    proxy::{AnyStream, transport::uot::{UDP_OVER_TCP_V2_MAGIC_HOST, read_uot_request}},
     session::{Network, Session, SocksAddr, Type},
 };
-use std::{collections::HashMap, io, net::SocketAddr, sync::Arc};
+use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 use tokio_rustls::TlsAcceptor;
 use tokio_util::sync::CancellationToken;
@@ -194,19 +194,9 @@ async fn dispatch_udp(
     mut sess: Session,
     cancel: CancellationToken,
 ) {
-    let request = async {
-        let is_connect = stream.read_u8().await?;
-        if is_connect > 1 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "invalid UoT isConnect flag",
-            ));
-        }
-        Ok((is_connect == 1, SocksAddr::read_from(&mut stream).await?))
-    };
     let (is_connect, dest) = tokio::select! {
         _ = cancel.cancelled() => return,
-        result = request => match result {
+        result = read_uot_request(&mut stream) => match result {
             Ok(dest) => dest,
             Err(err) => {
                 debug!("anytls inbound UoT request failed: {err}");

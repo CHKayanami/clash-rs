@@ -24,7 +24,7 @@ use tracing::warn;
 use super::dial::DialContext;
 use super::owned_task::OwnedTask;
 use crate::proxy::AnyOutboundDatagram;
-use crate::proxy::datagram::UdpPacket;
+use crate::proxy::datagram::{DatagramReadError, UdpPacket};
 
 pub(crate) const NETWORK_RETRY_DELAY: Duration = Duration::from_secs(1);
 
@@ -121,6 +121,7 @@ pub struct UdpPool {
     cursor: AtomicUsize,
     closed: AtomicBool,
     socket_failure: OnceLock<(TokioInstant, SocketFailure)>,
+    read_error: Option<DatagramReadError>,
     receive_error_log_after: AtomicUsize,
     cancelled: tokio_util::sync::CancellationToken,
     tasks: Mutex<Vec<OwnedTask>>,
@@ -183,6 +184,7 @@ impl UdpPool {
             cursor: AtomicUsize::new(0),
             closed: AtomicBool::new(false),
             socket_failure: OnceLock::new(),
+            read_error: None,
             receive_error_log_after: AtomicUsize::new(0),
             cancelled: tokio_util::sync::CancellationToken::new(),
             tasks: Mutex::new(Vec::new()),
@@ -220,6 +222,7 @@ impl UdpPool {
         timeout: Duration,
         active_tasks: Arc<AtomicUsize>,
     ) -> Arc<Self> {
+        let read_error = dgram.read_error_handle();
         let (sink, stream) = dgram.split();
         let (tx, mut rx) = tokio::sync::mpsc::channel::<UdpPacket>(1024);
 
@@ -236,6 +239,7 @@ impl UdpPool {
             cursor: AtomicUsize::new(0),
             closed: AtomicBool::new(false),
             socket_failure: OnceLock::new(),
+            read_error,
             receive_error_log_after: AtomicUsize::new(0),
             cancelled: tokio_util::sync::CancellationToken::new(),
             tasks: Mutex::new(Vec::new()),
@@ -306,6 +310,9 @@ impl UdpPool {
     }
 
     fn closed_error(&self) -> anyhow::Error {
+        if let Some(error) = self.read_error.as_ref().and_then(|error| error.get()) {
+            return io::Error::new(error.kind(), error.to_string()).into();
+        }
         match self.socket_failure.get() {
             Some((_, failure)) => failure.error().into(),
             None => anyhow::anyhow!("UDP DNS exchange pool is closed: receive loop stopped"),
@@ -602,6 +609,9 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use tokio::net::UdpSocket;
+    use tokio::io::{duplex, AsyncWriteExt};
+    use crate::proxy::{AnyOutboundDatagram, AnyStream};
+    use crate::proxy::transport::uot::OutboundDatagramUotV2;
 
     use std::io::{Error as IoError, ErrorKind};
     #[cfg(unix)]
@@ -615,6 +625,26 @@ mod tests {
     #[cfg(windows)]
     const ENETUNREACH: i32 = WSAENETUNREACH.0;
     use super::{SocketFailure, UdpPool};
+
+    #[tokio::test]
+    async fn uot_read_failure_reaches_dns_query() {
+        let (mut wire, stream) = duplex(1024);
+        let datagram = AnyOutboundDatagram::new(
+            OutboundDatagramUotV2::packet_mode(AnyStream::new(stream)),
+        );
+        let pool = UdpPool::from_datagram(
+            datagram, "192.0.2.1:53".parse().unwrap(),
+            Duration::from_secs(1), Arc::new(AtomicUsize::new(0)),
+        );
+        let query = build_test_query(1, "example.test");
+        let query = QueryContext::parse(
+            Bytes::copy_from_slice(&query), IngressProfile::Internal,
+        ).unwrap();
+        wire.write_all(&[255]).await.unwrap();
+        let error = pool.exchange(&query).await.unwrap_err();
+        assert!(error.to_string().contains("invalid UoT address type"), "{error:#}");
+        pool.close().await;
+    }
 
     fn build_test_query(id: u16, name: &str) -> Vec<u8> {
         let mut msg = Vec::new();

@@ -71,6 +71,12 @@ pub struct RouterResolver {
     real_transport: Option<Transport>,
 }
 
+fn nameserver_with_proxy(ns: &NameServer, proxy: Option<&str>) -> NameServer {
+    let mut effective = ns.clone();
+    effective.proxy = ns.proxy.as_deref().or(proxy).map(str::to_string);
+    effective
+}
+
 impl RouterResolver {
     pub async fn new(
         cfg: RouterConfig,
@@ -83,8 +89,7 @@ impl RouterResolver {
         let mut entries = HashMap::new();
 
         let make_key = |ns: &NameServer, proxy: Option<&str>, ecs: Option<&EdnsClientSubnet>| -> String {
-            let effective_proxy = ns.proxy.as_deref().or(proxy);
-            let mut key = format!("{}#proxy={:?}", ns, effective_proxy);
+            let mut key = nameserver_with_proxy(ns, proxy).to_string();
             if let Some(ecs) = ecs {
                 key.push_str(&format!("#ecs={:?},{:?}", ecs.ipv4, ecs.ipv6));
             }
@@ -98,12 +103,9 @@ impl RouterResolver {
          -> Option<String> {
             let key = make_key(ns, proxy, ecs);
             if !entries.contains_key(&key) {
-                if let Ok(mut entry) = UpstreamEntry::from_nameserver(ns, None) {
-                    let effective_proxy = ns.proxy.as_deref().or(proxy);
+                let effective_ns = nameserver_with_proxy(ns, proxy);
+                if let Ok(mut entry) = UpstreamEntry::from_nameserver(&effective_ns, None) {
                     entry.ecs = ecs.cloned();
-                    if let Some(p) = effective_proxy {
-                        entry.outbound = Some(p.to_string());
-                    }
                     entries.insert(key.clone(), entry);
                 }
             }

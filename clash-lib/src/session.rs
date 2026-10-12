@@ -353,7 +353,14 @@ impl TryFrom<&[u8]> for SocksAddr {
             return Err(insuff_bytes());
         }
 
-        match buf[0] {
+        Self::parse_wire_address(buf, buf[0])
+    }
+}
+
+impl SocksAddr {
+    /// Parse an address using the caller's normalized address type without copying.
+    pub(crate) fn parse_wire_address(buf: &[u8], atyp: u8) -> io::Result<Self> {
+        match atyp {
             SocksAddrType::V4 => {
                 if buf.len() < 1 + 4 + 2 {
                     // ATYP + DST.ADDR + DST.PORT

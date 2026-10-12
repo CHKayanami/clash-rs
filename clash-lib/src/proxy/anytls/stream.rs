@@ -3,8 +3,8 @@
 //! A Stream represents a single multiplexed connection within an AnyTLS Session.
 //! It implements AsyncRead and AsyncWrite for transparent integration into clash-rs.
 
-use bytes::Bytes;
-use std::io;
+use bytes::{Bytes, BytesMut};
+use std::io::{self, IoSlice};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -109,6 +109,71 @@ impl AnyTlsStream {
     #[allow(dead_code)]
     pub fn id(&self) -> u32 {
         self.id
+    }
+
+    fn poll_write_slices(
+        &mut self, cx: &mut Context<'_>, buffers: &[IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        if let Some(err) = self.check_stream_error() {
+            self.write_closed = true;
+            return Poll::Ready(Err(err));
+        }
+
+        if self.peer_closed.load(Ordering::Acquire) || self.eof {
+            self.write_closed = true;
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "stream closed by remote (received FIN)",
+            )));
+        }
+
+        if self.write_closed {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "stream write side closed",
+            )));
+        }
+
+        if self.shutdown_in_progress {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "stream is shutting down",
+            )));
+        }
+
+        if self.session_closed.load(Ordering::Relaxed) {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "session closed",
+            )));
+        }
+
+        let write_len = buffers.iter().fold(0usize, |len, buffer| {
+            len.saturating_add(buffer.len()).min(MAX_FRAME_DATA_SIZE)
+        });
+        if write_len == 0 { return Poll::Ready(Ok(0)); }
+        match self.outgoing_tx.poll_reserve(cx) {
+            Poll::Ready(Ok(())) => {
+                let mut data = BytesMut::with_capacity(write_len);
+                for buffer in buffers {
+                    let len = buffer.len().min(write_len - data.len());
+                    data.extend_from_slice(&buffer[..len]);
+                    if data.len() == write_len { break; }
+                }
+                match self.outgoing_tx.send_item(OutgoingMessage::Data {
+                    stream_id: self.id, data: data.freeze(),
+                }) {
+                    Ok(()) => Poll::Ready(Ok(write_len)),
+                    Err(_) => Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe, "session channel closed",
+                    ))),
+                }
+            }
+            Poll::Ready(Err(_)) => Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe, "session channel closed",
+            ))),
+            Poll::Pending => Poll::Pending,
+        }
     }
 
     /// Retrieve a cloned copy of the stream error, if any
@@ -232,67 +297,18 @@ impl AsyncRead for AnyTlsStream {
 
 impl AsyncWrite for AnyTlsStream {
     fn poll_write(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
+        self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        if let Some(err) = self.check_stream_error() {
-            self.write_closed = true;
-            return Poll::Ready(Err(err));
-        }
-
-        if self.peer_closed.load(Ordering::Acquire) || self.eof {
-            self.write_closed = true;
-            return Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "stream closed by remote (received FIN)",
-            )));
-        }
-
-        if self.write_closed {
-            return Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "stream write side closed",
-            )));
-        }
-
-        if self.shutdown_in_progress {
-            return Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "stream is shutting down",
-            )));
-        }
-
-        if self.session_closed.load(Ordering::Relaxed) {
-            return Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "session closed",
-            )));
-        }
-
-        match self.outgoing_tx.poll_reserve(cx) {
-            Poll::Ready(Ok(())) => {
-                let write_len = buf.len().min(MAX_FRAME_DATA_SIZE);
-                let data = Bytes::copy_from_slice(&buf[..write_len]);
-                let id = self.id;
-                match self.outgoing_tx.send_item(OutgoingMessage::Data {
-                    stream_id: id,
-                    data,
-                }) {
-                    Ok(()) => Poll::Ready(Ok(write_len)),
-                    Err(_) => Poll::Ready(Err(io::Error::new(
-                        io::ErrorKind::BrokenPipe,
-                        "session channel closed",
-                    ))),
-                }
-            }
-            Poll::Ready(Err(_)) => Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "session channel closed",
-            ))),
-            Poll::Pending => Poll::Pending,
-        }
+        self.get_mut().poll_write_slices(cx, &[IoSlice::new(buf)])
     }
+
+    fn poll_write_vectored(
+        self: Pin<&mut Self>, cx: &mut Context<'_>, buffers: &[IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        self.get_mut().poll_write_slices(cx, buffers)
+    }
+
+    fn is_write_vectored(&self) -> bool { true }
 
     /// Always ready.
     ///

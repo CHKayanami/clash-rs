@@ -849,6 +849,15 @@ impl AnyTlsClientSession {
         self: &Arc<Self>,
         destination: &SocksAddr,
     ) -> io::Result<AnyTlsStream> {
+        self.open_stream_with_initial_data(destination, &[]).await
+    }
+
+    /// Send protocol setup bytes before waiting for the target-dial acknowledgement.
+    pub(super) async fn open_stream_with_initial_data(
+        self: &Arc<Self>,
+        destination: &SocksAddr,
+        initial_data: &[u8],
+    ) -> io::Result<AnyTlsStream> {
         if self.is_closed.load(Ordering::Relaxed) {
             self.release_reserved_stream();
             return Err(io::Error::new(
@@ -918,6 +927,13 @@ impl AnyTlsClientSession {
 
         let mut dest_data = BytesMut::new();
         destination.write_buf(&mut dest_data);
+        dest_data.extend_from_slice(initial_data);
+        if dest_data.len() > MAX_FRAME_DATA_SIZE {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "AnyTLS opening data exceeds frame capacity",
+            ));
+        }
         let dest_bytes = dest_data.freeze();
 
         // 确保 SETTINGS 帧的发送绝对先于任何其他流的 SYN：

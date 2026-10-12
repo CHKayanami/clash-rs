@@ -3,6 +3,7 @@
 
 use super::{
     OutboundDatagram, ProxyStream,
+    datagram::DatagramReadError,
     anytls::stream::AnyTlsStream,
     datagram::UdpPacket,
     direct::{datagram::OutboundDatagramImpl, native::NativeDatagram, pool::PooledDirectDatagram},
@@ -274,6 +275,13 @@ define_transport!($, AnyOutboundDatagram, DynamicDatagram, [OutboundDatagram<Udp
 ]);
 
 impl AnyOutboundDatagram {
+    pub(crate) fn read_error_handle(&self) -> Option<DatagramReadError> {
+        match self {
+            Self::Uot(datagram) => Some(datagram.read_error_handle()),
+            _ => None,
+        }
+    }
+
     /// Whether writes can address different targets on the same transport.
     /// This controls mapping reuse, not reply filtering or server NAT behavior.
     /// Fixed-target VMess and UoT connect mode cannot be shared.

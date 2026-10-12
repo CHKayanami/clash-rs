@@ -1,23 +1,27 @@
 use super::{make_handler, read_frame_raw};
+use bytes::{Bytes, BytesMut};
 use crate::{
     app::{dns::{MockClashResolver, ThreadSafeDNSResolver}, net::OutboundInterface},
     proxy::{
-        AnyOutboundDatagram, AnyStream,
+        AnyOutboundDatagram, AnyStream, OutboundHandler,
+        datagram::UdpPacket,
         anytls::{
-            padding::PaddingFactory, session::AnyTlsClientSession, types::Command,
+            padding::PaddingFactory, session::AnyTlsClientSession,
+            types::{Command, Frame},
         },
+        transport::uot::{encode_uot_packet_request, UDP_OVER_TCP_V2_MAGIC_HOST},
         utils::RemoteConnector,
     },
     session::{Session, SocksAddr},
 };
-use futures::future::join_all;
+use futures::{SinkExt, StreamExt, future::join_all};
 use std::{
-    io,
+    io::{self, IoSlice},
     net::SocketAddr,
     sync::{Arc, atomic::{AtomicUsize, Ordering}},
 };
 use tokio::{
-    io::{AsyncReadExt, duplex},
+    io::{AsyncReadExt, AsyncWriteExt, duplex},
     spawn,
     sync::Barrier,
     time::{Duration, sleep, timeout},
@@ -117,5 +121,108 @@ async fn concurrent_broken_session_retries_share_one_dial() {
         assert_eq!(connector.dials.load(Ordering::Relaxed), 1);
         assert_eq!(streams.len(), 8);
         server.await.unwrap();
+    }).await.unwrap();
+}
+
+#[tokio::test]
+async fn udp_request_precedes_v2_stream_ack() {
+    timeout(Duration::from_secs(2), async {
+        let handler = make_handler(true, false);
+        let (client, mut server) = duplex(65536);
+        let session = AnyTlsClientSession::new(
+            AnyStream::new(client), "secret", PaddingFactory::default_factory(),
+        ).await.unwrap();
+        session.set_peer_version(2);
+        handler.session_pool.add_session(session).await;
+        let server = spawn(async move {
+            consume_auth(&mut server).await;
+            let dest = SocksAddr::domain_name(UDP_OVER_TCP_V2_MAGIC_HOST, 0);
+            let mut expected = BytesMut::new();
+            dest.write_buf(&mut expected);
+            expected.extend_from_slice(&encode_uot_packet_request());
+            let stream_id = loop {
+                let (command, id, data) = read_frame_raw(&mut server).await;
+                if command == Command::Psh as u8 {
+                    // Like sing-box, do not acknowledge until UoT setup is read.
+                    assert_eq!(data, expected.as_ref());
+                    break id;
+                }
+            };
+            let mut ack = BytesMut::new();
+            Frame::control(Command::SynAck, stream_id).encode_into(&mut ack);
+            server.write_all(&ack).await.unwrap();
+            let mut expected_packet = vec![0, 192, 0, 2, 1, 0, 53, 0, 8];
+            expected_packet.extend_from_slice(b"dns-test");
+            let mut packet = Vec::new();
+            let mut packet_frames = 0;
+            loop {
+                let (command, id, data) = read_frame_raw(&mut server).await;
+                if command == Command::Psh as u8 {
+                    assert_eq!(id, stream_id);
+                    packet_frames += 1;
+                    packet.extend_from_slice(&data);
+                    assert!(packet.len() <= expected_packet.len());
+                    assert_eq!(packet, expected_packet[..packet.len()]);
+                    if packet.len() < expected_packet.len() { continue; }
+                    assert_eq!(packet_frames, 1, "small UDP packet must use one PSH");
+                    let mut reply = BytesMut::new();
+                    Frame::with_data(Command::Psh, id, Bytes::from(packet))
+                        .encode_into(&mut reply);
+                    server.write_all(&reply).await.unwrap();
+                    break;
+                }
+            }
+        });
+        let sess = Session {
+            destination: "192.0.2.1:53".parse().unwrap(),
+            ..Default::default()
+        };
+        let resolver: ThreadSafeDNSResolver = Arc::new(MockClashResolver::new());
+        let datagram = handler.connect_datagram_with_connector(
+            &sess, resolver, &RemoteConnector::Counting(Arc::new(
+                CountingConnector::default(),
+            )),
+        ).await.unwrap();
+        let (mut sink, mut stream) = datagram.split();
+        sink.send(UdpPacket::new(
+            Bytes::from_static(b"dns-test"), SocksAddr::any_ipv4(),
+            sess.destination.clone(),
+        )).await.unwrap();
+        let reply = stream.next().await.unwrap();
+        assert_eq!(reply.data, Bytes::from_static(b"dns-test"));
+        server.await.unwrap();
+    }).await.unwrap();
+}
+
+#[tokio::test]
+async fn vectored_writes_preserve_frame_limit_and_unwritten_suffix() {
+    timeout(Duration::from_secs(2), async {
+        let (client, mut server) = duplex(131072);
+        let session = AnyTlsClientSession::new(
+            AnyStream::new(client), "secret", PaddingFactory::default_factory(),
+        ).await.unwrap();
+        let dest = SocksAddr::domain_name("example.test", 80);
+        let mut stream = session.open_stream(&dest).await.unwrap();
+        consume_auth(&mut server).await;
+        loop {
+            let (command, _, _) = read_frame_raw(&mut server).await;
+            if command == Command::Psh as u8 { break; }
+        }
+        let prefix = vec![42; 65530];
+        let suffix = b"remaining-bytes";
+        let written = stream.write_vectored(&[
+            IoSlice::new(&[]), IoSlice::new(&prefix), IoSlice::new(suffix),
+        ]).await.unwrap();
+        assert_eq!(written, 65535);
+        stream.write_all(&suffix[5..]).await.unwrap();
+        let mut frames = Vec::new();
+        while frames.len() < 2 {
+            let (command, _, data) = read_frame_raw(&mut server).await;
+            if command == Command::Psh as u8 { frames.push(data); }
+        }
+        assert_eq!(frames[0].len(), 65535);
+        assert_eq!(&frames[0][..65530], prefix);
+        assert_eq!(&frames[0][65530..], &suffix[..5]);
+        assert_eq!(frames[1], suffix[5..]);
     }).await.unwrap();
 }

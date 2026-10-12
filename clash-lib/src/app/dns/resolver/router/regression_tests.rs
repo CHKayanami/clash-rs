@@ -11,7 +11,7 @@ use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-use super::RouterResolver;
+use super::{RouterResolver, nameserver_with_proxy};
 use super::config::{
     RejectCode, RequestAction, RequestRule, ResponseAction, ResponseRule,
     RouterConfig, UpstreamConfig, UpstreamType,
@@ -25,12 +25,57 @@ use crate::app::dns::response::{
 use crate::app::dns::wire::{extract_ips_from_dns_response, skip_dns_name};
 use crate::config::def::{Dns2Config, Dns2StringOrList, Dns2UpstreamDef};
 use crate::proxy::socks::outbound::{Handler, HandlerOptions};
+use crate::app::dns::upstream_pool::UpstreamEntry;
 use crate::proxy::utils::OutboundNodeRegistry;
 
 struct TestServer {
     ns: NameServer,
     requests: mpsc::UnboundedReceiver<()>,
     task: JoinHandle<()>,
+}
+
+#[tokio::test]
+async fn configured_proxy_is_used_and_server_proxy_takes_precedence() {
+    for (server, expected) in [
+        ("udp://127.0.0.1:53", "bf-de-at"),
+        ("udp://127.0.0.1:53#proxy=server-proxy", "server-proxy"),
+    ] {
+        let mut def = Dns2Config::default();
+        def.upstreams.push(Dns2UpstreamDef {
+            tag: "proxy-dns".into(), r#type: "remote".into(),
+            servers: Some(Dns2StringOrList::Single(server.to_string())),
+            proxy: Some("bf-de-at".into()), ..Default::default()
+        });
+        let mut cfg = RouterConfig::from_def(&def, true).unwrap();
+        cfg.request_fallback = RequestAction::Route("proxy-dns".into());
+        let resolver = resolver(cfg).await;
+        let wire = query(QType::A);
+        let query = QueryContext::parse(
+            Bytes::copy_from_slice(&wire), IngressProfile::Internal,
+        ).unwrap();
+        // An absent named outbound must fail, rather than silently dial directly.
+        let error = resolver.exchange(&query, None).await.unwrap_err();
+        assert!(error.to_string().contains(&format!(
+            "unknown DNS outbound '{expected}'",
+        )), "{error:#}");
+    }
+}
+
+#[test]
+fn configured_proxy_is_reported_in_upstream_name() {
+    let mut def = Dns2Config::default();
+    def.upstreams.push(Dns2UpstreamDef {
+        tag: "proxy-dns".into(), r#type: "remote".into(),
+        servers: Some(Dns2StringOrList::Single("udp://127.0.0.1:53".into())),
+        proxy: Some("bf-de-at".into()), ..Default::default()
+    });
+    let cfg = RouterConfig::from_def(&def, true).unwrap();
+    let upstream = &cfg.upstreams[0];
+    let ns = nameserver_with_proxy(&upstream.servers[0], upstream.proxy.as_deref());
+    let entry = UpstreamEntry::from_nameserver(&ns, None).unwrap();
+    assert_eq!(entry.outbound.as_deref(), Some("bf-de-at"));
+    assert_eq!(entry.name, ns.to_string());
+    assert!(entry.name.contains("#proxy=Some(\"bf-de-at\")"));
 }
 
 #[tokio::test]

@@ -1,7 +1,6 @@
 use erased_serde::Serialize as ErasedSerialize;
 use std::{collections::HashMap, io, sync::Arc};
 
-use tokio::io::AsyncWriteExt;
 use tracing::debug;
 
 use crate::{
@@ -26,7 +25,9 @@ pub mod types;
 #[cfg(test)]
 mod tls_records_tests;
 
-use super::transport::uot::{encode_uot_packet_request, OutboundDatagramUotV2};
+use super::transport::uot::{
+    encode_uot_packet_request, OutboundDatagramUotV2, UDP_OVER_TCP_V2_MAGIC_HOST,
+};
 use padding::{PaddingFactory, SharedPaddingFactory};
 use pool::{SessionPool, SessionPoolConfig};
 use session::AnyTlsClientSession;
@@ -154,11 +155,24 @@ impl Handler {
         sess: &Session,
         dest: &SocksAddr,
     ) -> io::Result<AnyTlsStream> {
+        self.open_stream_with_initial_data_retry(
+            resolver, connector, sess, dest, &[],
+        ).await
+    }
+
+    async fn open_stream_with_initial_data_retry(
+        &self,
+        resolver: ThreadSafeDNSResolver,
+        connector: &RemoteConnector,
+        sess: &Session,
+        dest: &SocksAddr,
+        initial_data: &[u8],
+    ) -> io::Result<AnyTlsStream> {
         let session = self
             .get_or_create_session(resolver.clone(), connector, sess)
             .await?;
 
-        match session.open_stream(dest).await {
+        match session.open_stream_with_initial_data(dest, initial_data).await {
             Ok(stream) => Ok(stream),
             Err(err) if is_session_broken_err(&err) => {
                 debug!(
@@ -170,7 +184,7 @@ impl Handler {
 
                 let fresh_session =
                     self.get_or_create_session(resolver, connector, sess).await?;
-                fresh_session.open_stream(dest).await
+                fresh_session.open_stream_with_initial_data(dest, initial_data).await
             }
             Err(err) => Err(err),
         }
@@ -280,17 +294,17 @@ impl OutboundHandler for Handler {
         connector: &RemoteConnector,
     ) -> io::Result<AnyOutboundDatagram> {
         let uot_dest = SocksAddr::try_from((
-            crate::proxy::transport::uot::UDP_OVER_TCP_V2_MAGIC_HOST.to_owned(),
+            UDP_OVER_TCP_V2_MAGIC_HOST.to_owned(),
             0,
         ))?;
 
-        let mut stream = self
-            .open_stream_with_retry(resolver, connector, sess, &uot_dest)
-            .await?;
-
+        // UoT servers need the request header before they can acknowledge the stream.
         let request = encode_uot_packet_request();
-        stream.write_all(&request).await?;
-        stream.flush().await?;
+        let stream = self
+            .open_stream_with_initial_data_retry(
+                resolver, connector, sess, &uot_dest, &request,
+            )
+            .await?;
 
         let datagram = OutboundDatagramUotV2::packet_mode(AnyStream::new(stream));
         sess.push_chain(self.name());

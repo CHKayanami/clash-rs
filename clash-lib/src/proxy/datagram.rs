@@ -1,8 +1,12 @@
 use crate::session::SocksAddr;
 use std::{
     fmt::{Debug, Display, Formatter},
-    sync::Arc,
+    io,
+    sync::{Arc, OnceLock},
 };
+
+/// Terminal read failures remain available after Stream reports EOF or is split.
+pub(crate) type DatagramReadError = Arc<OnceLock<io::Error>>;
 
 #[derive(Clone)]
 pub struct UdpPacket {
