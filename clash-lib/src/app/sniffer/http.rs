@@ -1,4 +1,4 @@
-use std::str::from_utf8;
+use std::{net::Ipv6Addr, str::from_utf8};
 
 /// HTTP Host parser
 /// Efficiently inspects the initial bytes of an HTTP request and extracts the Host header.
@@ -75,17 +75,27 @@ fn sanitize_host(raw: &str) -> Option<String> {
         return None;
     }
 
-    // Handle IPv6 literal with port: [2001:db8::1]:80
-    if host_str.starts_with('[') {
-        if let Some(end_bracket) = host_str.find(']') {
-            let ip_part = &host_str[1..end_bracket];
-            return Some(ip_part.to_ascii_lowercase());
-        }
+    // Accept bare IPv6 literals without interpreting address segments as ports.
+    if host_str.parse::<Ipv6Addr>().is_ok() {
+        return Some(host_str.to_ascii_lowercase());
     }
 
-    // Handle host:port
+    // Bracketed IPv6 is the only unambiguous way to include a port.
+    if let Some(rest) = host_str.strip_prefix('[') {
+        let (ip_part, suffix) = rest.split_once(']')?;
+        ip_part.parse::<Ipv6Addr>().ok()?;
+        if !suffix.is_empty() {
+            suffix.strip_prefix(':')?.parse::<u16>().ok()?;
+        }
+        return Some(ip_part.to_ascii_lowercase());
+    }
+
+    // Reject malformed ports and IPv6 rather than sniffing a partial hostname.
     let host = match host_str.split_once(':') {
-        Some((domain, _port)) => domain.trim(),
+        Some((domain, port)) => {
+            port.parse::<u16>().ok()?;
+            domain.trim()
+        }
         None => host_str,
     };
 
@@ -118,6 +128,41 @@ mod tests {
     fn test_parse_http_connect() {
         let req = b"CONNECT www.cloudflare.com:443 HTTP/1.1\r\nHost: www.cloudflare.com:443\r\n\r\n";
         assert_eq!(parse_http_host(req), Some("www.cloudflare.com".to_string()));
+    }
+
+    #[test]
+    fn test_parse_http_ipv6_host() {
+        for host in [
+            "2402:abcd:1234:5678:0:abcd:1234:5678",
+            "2001:DB8::1",
+            "2001:db8::1:80",
+            "[2001:DB8::1]",
+            "[2001:DB8::1]:80",
+        ] {
+            let req = format!("GET / HTTP/1.1\r\nHost: {host}\r\n\r\n");
+            let expected = host.strip_prefix('[')
+                .map(|rest| rest.split_once(']').unwrap().0)
+                .unwrap_or(host)
+                .to_ascii_lowercase();
+            assert_eq!(parse_http_host(req.as_bytes()), Some(expected), "{host}");
+        }
+    }
+
+    #[test]
+    fn test_parse_http_invalid_host_authority() {
+        for host in [
+            "2402:invalid::1",
+            "2402:abcd:1234:5678:0:abcd:1234:5678:80",
+            "[2001:db8::1",
+            "[invalid]:80",
+            "[2001:db8::1]garbage",
+            "[2001:db8::1]:",
+            "[2001:db8::1]:65536",
+            "example.com:invalid",
+        ] {
+            let req = format!("GET / HTTP/1.1\r\nHost: {host}\r\n\r\n");
+            assert_eq!(parse_http_host(req.as_bytes()), None, "{host}");
+        }
     }
 
     #[test]

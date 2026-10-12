@@ -16,6 +16,7 @@ use crate::{
 };
 use std::{
     fmt::{Debug, Formatter},
+    net::IpAddr,
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicU8, Ordering},
@@ -28,7 +29,7 @@ use crate::app::dns::ThreadSafeDNSResolver;
 
 use super::statistics_manager::{Manager, TrackGuard, TrackerInfo, TrafficTracker};
 
-use crate::app::sniffer::ArcSniffer;
+use crate::app::sniffer::{ArcSniffer, tls::is_valid_hostname};
 
 // SS2022 (AEAD-2022) MAX_PACKET_SIZE is 0xFFFF (65535 bytes). Using a relay
 // buffer smaller than that forces the cipher to split every full packet into
@@ -142,10 +143,9 @@ impl Dispatcher {
                 sniffer.sniff_stream(&sess, lhs).await;
             lhs = new_lhs;
             if let Some(domain) = sniffed_domain {
-                let port = sess.destination.port();
-                sess.sniffed_domain = Some(domain.clone());
-                sess.destination = SocksAddr::Domain(domain.into(), port);
-                override_dest = should_override;
+                override_dest = apply_sniffed_domain(
+                    &mut sess, domain, should_override,
+                );
             }
         }
 
@@ -333,6 +333,64 @@ pub(super) async fn effective_outbound_type(handler: &OutboundNode) -> OutboundT
 pub(super) fn is_reject_error(err: &std::io::Error) -> bool {
     err.kind() == std::io::ErrorKind::Other
         && err.get_ref().is_some_and(|e| e.to_string() == "REJECT")
+}
+
+pub(super) fn apply_sniffed_domain(
+    sess: &mut Session,
+    domain: String,
+    should_override: bool,
+) -> bool {
+    // Keep IP literals as sniff metadata, without changing routing or dialing.
+    let valid_domain = is_valid_hostname(&domain)
+        && domain.parse::<IpAddr>().is_err()
+        && domain.bytes().any(|b| {
+            b.is_ascii_alphabetic() || b == b'-' || b == b'_'
+        });
+    if valid_domain {
+        sess.destination = SocksAddr::Domain(
+            domain.clone().into(), sess.destination.port(),
+        );
+    }
+    sess.sniffed_domain = Some(domain);
+    valid_domain && should_override
+}
+
+#[cfg(test)]
+mod sniffed_domain_tests {
+    use super::*;
+
+    #[test]
+    fn test_ip_and_invalid_host_preserve_destination() {
+        for host in [
+            "2001:db8::1", "192.0.2.1", "2402", "bad:host", "-bad.example",
+        ] {
+            let mut sess = Session {
+                destination: "[2001:db8::2]:80".parse().unwrap(),
+                ..Default::default()
+            };
+            let original = sess.destination.clone();
+            assert!(!apply_sniffed_domain(&mut sess, host.to_string(), true));
+            assert_eq!(sess.destination, original);
+            assert_eq!(sess.sniffed_domain.as_deref(), Some(host));
+        }
+    }
+
+    #[test]
+    fn test_domain_preserves_port_and_override_setting() {
+        for should_override in [false, true] {
+            let mut sess = Session {
+                destination: "[2001:db8::2]:8080".parse().unwrap(),
+                ..Default::default()
+            };
+            assert_eq!(
+                apply_sniffed_domain(
+                    &mut sess, "example.com".to_string(), should_override,
+                ),
+                should_override,
+            );
+            assert_eq!(sess.destination, "example.com:8080".parse().unwrap());
+        }
+    }
 }
 
 // helper function to resolve the destination address

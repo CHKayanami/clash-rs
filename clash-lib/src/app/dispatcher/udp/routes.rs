@@ -1,6 +1,11 @@
 //! Route caches own leases, never protocol I/O or forwarding tasks.
 use super::*;
-use crate::{app::dispatcher::udp::association::FlowClosed, app::sniffer::SniffUdpOutcome};
+use crate::{
+    app::dispatcher::{
+        dispatcher_impl::apply_sniffed_domain, udp::association::FlowClosed,
+    },
+    app::sniffer::SniffUdpOutcome,
+};
 use std::{pin::Pin as PacketPin, task::Poll};
 use futures::{Stream, future::poll_fn};
 use hashbrown::{Equivalent, HashMap as RouteMap};
@@ -342,8 +347,9 @@ impl UdpRoutes {
                 SniffUdpOutcome::Domain(domain, should_override) => {
                     let mut pending = self.pending_sniff_sessions.remove(&session_key).unwrap();
                     self.delay_queue.remove(&pending.delay_key);
-                    pending.sess.destination = SocksAddr::Domain(domain.clone().into(), orig_inbound_dst.port());
-                    pending.sess.sniffed_domain = Some(domain);
+                    let override_dest = apply_sniffed_domain(
+                        &mut pending.sess, domain, should_override,
+                    );
 
                     let mut packets = pending.packets;
                     packets.push(packet);
@@ -351,7 +357,7 @@ impl UdpRoutes {
                     start_connecting_session(
                         pending.sess,
                         packets,
-                        should_override,
+                        override_dest,
                         &self.ctx,
                         &self.session_established_tx,
                         self.sessions.len(),
@@ -451,9 +457,9 @@ impl UdpRoutes {
                     should_buffer = true;
                 }
                 SniffUdpOutcome::Domain(domain, should_override) => {
-                    flow_sess.sniffed_domain = Some(domain.clone());
-                    flow_sess.destination = SocksAddr::Domain(domain.into(), packet.dst_addr.port());
-                    override_dest = should_override;
+                    override_dest = apply_sniffed_domain(
+                        &mut flow_sess, domain, should_override,
+                    );
                 }
                 _ => {}
             }
@@ -493,6 +499,24 @@ impl UdpRoutes {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn udp_sniffed_ip_preserves_mapped_destination() {
+        let original: SocksAddr = "[2001:db8::2]:443".parse().unwrap();
+        let mapped: SocksAddr = "mapped.example:443".parse().unwrap();
+        for host in ["192.0.2.1", "2001:db8::1", "2402"] {
+            let mut sess = make_udp_flow_session(
+                &Session::default(),
+                SocketAddr::from(([192, 0, 2, 3], 12345)),
+                original.clone(), mapped.clone(),
+                Some("mapped.example".to_string()), None,
+            );
+            assert!(!apply_sniffed_domain(&mut sess, host.to_string(), true));
+            assert_eq!(sess.destination, mapped);
+            assert_eq!(sess.orig_destination.as_ref(), Some(&original));
+            assert_eq!(sess.sniffed_domain.as_deref(), Some(host));
+        }
+    }
 
     #[test]
     fn borrowed_route_keys_match_owned_addresses_and_user_identity() {
