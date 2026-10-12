@@ -196,15 +196,15 @@ async fn dispatch_udp(
 ) {
     let request = async {
         let is_connect = stream.read_u8().await?;
-        if is_connect != 1 {
+        if is_connect > 1 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "anytls UoT requires isConnect=1",
+                "invalid UoT isConnect flag",
             ));
         }
-        SocksAddr::read_from(&mut stream).await
+        Ok((is_connect == 1, SocksAddr::read_from(&mut stream).await?))
     };
-    let dest = tokio::select! {
+    let (is_connect, dest) = tokio::select! {
         _ = cancel.cancelled() => return,
         result = request => match result {
             Ok(dest) => dest,
@@ -216,7 +216,9 @@ async fn dispatch_udp(
     };
     sess.network = Network::Udp;
     sess.destination = dest.clone();
-    let datagram = InboundDatagramAnytls::new(AnyStream::new(stream), dest);
+    let datagram = InboundDatagramAnytls::with_mode(
+        AnyStream::new(stream), dest, SocksAddr::Ip(sess.source), is_connect,
+    );
     let closer = dispatcher
         .dispatch_datagram(sess, Box::new(datagram)).await;
     cancel.cancelled().await;

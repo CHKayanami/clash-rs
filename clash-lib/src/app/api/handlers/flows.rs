@@ -110,7 +110,6 @@ pub(crate) async fn build_flow_records(
     top: usize,
     include_closed: bool,
 ) -> Vec<FlowRecord> {
-    use std::sync::atomic::Ordering;
 
     let active = mgr.active_connections_snapshot();
     let closed = if include_closed {
@@ -153,8 +152,8 @@ pub(crate) async fn build_flow_records(
         let dst_port = info.session_holder.destination.port();
         let is_tcp = matches!(info.session_holder.network, Network::Tcp);
 
-        let upload = info.upload_total.load(Ordering::Relaxed);
-        let download = info.download_total.load(Ordering::Relaxed);
+        let upload = info.upload_total();
+        let download = info.download_total();
         let src_ip = info.session_holder.source.ip();
 
         let key = FlowKey {

@@ -242,7 +242,7 @@ impl OutboundHandler for Handler {
 
         let stream = self.inner_proxy_stream(stream, sess, true).await?;
 
-        let d = self::datagram::OutboundDatagramTrojan::new(stream, sess.destination.clone());
+        let d = OutboundDatagramTrojan::new(stream);
 
         sess.push_chain(self.name());
         Ok(AnyOutboundDatagram::new(d))

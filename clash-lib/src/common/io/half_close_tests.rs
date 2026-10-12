@@ -7,7 +7,7 @@ use super::splice::zero_copy_bidirectional;
 #[tokio::test]
 async fn buffered_statistics_include_writes_before_error() {
     use crate::app::dispatcher::{StatisticsManager, TrackerInfo};
-    use std::sync::{Arc, atomic::Ordering};
+    use std::sync::Arc;
 
     let mut a = tokio_test::io::Builder::new().read(b"abcdef").build();
     let mut b = tokio_test::io::Builder::new()
@@ -28,8 +28,8 @@ async fn buffered_statistics_include_writes_before_error() {
     assert!(
         matches!(result, Err(CopyBidirectionalError::LeftClosed(err)) if err.kind() == io::ErrorKind::BrokenPipe)
     );
-    assert_eq!(info.upload_total.load(Ordering::Relaxed), 3);
-    assert_eq!(info.download_total.load(Ordering::Relaxed), 0);
+    assert_eq!(info.upload_total(), 3);
+    assert_eq!(info.download_total(), 0);
 }
 
 async fn check_progress<S>(

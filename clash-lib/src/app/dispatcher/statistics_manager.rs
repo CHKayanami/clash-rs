@@ -5,16 +5,17 @@ use std::{
 };
 
 use chrono::Utc;
-use dashmap::DashMap;
+use dashmap::{DashMap, mapref::entry::Entry};
 use lru::LruCache;
 use memory_stats::memory_stats;
-use portable_atomic::AtomicU64;
+use portable_atomic::{AtomicU64, AtomicUsize};
 use serde::Serialize;
 use tokio::sync::oneshot::Sender;
 
 use crate::{
     app::router::{Rule, RuleMatcher},
     session::Session,
+    app::dispatcher::udp::association::{AssociationGuard, AssociationRegistry, UserTrafficCounters},
 };
 
 /// Per-user traffic since the last drain.  Both upload and download are in
@@ -41,9 +42,9 @@ pub struct TrackerInfo {
     #[serde(rename = "metadata")]
     pub session_holder: Session,
     #[serde(rename = "upload")]
-    pub upload_total: AtomicU64,
+    upload_total: AtomicU64,
     #[serde(rename = "download")]
-    pub download_total: AtomicU64,
+    download_total: AtomicU64,
     #[serde(skip)]
     pub start_time: chrono::DateTime<Utc>,
     #[serde(rename = "start")]
@@ -59,9 +60,9 @@ pub struct TrackerInfo {
     /// Only incremented when `session_holder.inbound_user` is set.
     /// Swapped to 0 on drain — never touched by `snapshot()`.
     #[serde(skip)]
-    pub user_upload: AtomicU64,
+    user_upload: AtomicU64,
     #[serde(skip)]
-    pub user_download: AtomicU64,
+    user_download: AtomicU64,
 }
 
 impl TrackerInfo {
@@ -81,6 +82,29 @@ impl TrackerInfo {
             ..Default::default()
         }
     }
+
+    /// Record bytes for this connection only, excluding global and user totals.
+    #[inline]
+    pub fn record_upload(&self, bytes: usize) {
+        self.upload_total.fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+
+    /// Record received bytes for this connection only.
+    #[inline]
+    pub fn record_download(&self, bytes: usize) {
+        self.download_total.fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub fn upload_total(&self) -> u64 {
+        self.upload_total.load(Ordering::Relaxed)
+    }
+
+    #[inline]
+    pub fn download_total(&self) -> u64 {
+        self.download_total.load(Ordering::Relaxed)
+    }
+
 }
 
 impl Clone for TrackerInfo {
@@ -88,10 +112,8 @@ impl Clone for TrackerInfo {
         Self {
             id: self.id,
             session_holder: self.session_holder.clone(),
-            upload_total: AtomicU64::new(self.upload_total.load(Ordering::Relaxed)),
-            download_total: AtomicU64::new(
-                self.download_total.load(Ordering::Relaxed),
-            ),
+            upload_total: AtomicU64::new(self.upload_total()),
+            download_total: AtomicU64::new(self.download_total()),
             start_time: self.start_time,
             start_time_str: self.start_time_str.clone(),
             rule: self.rule.clone(),
@@ -138,7 +160,7 @@ impl TrafficTracker {
             has_user,
         } = self
         {
-            tracker.upload_total.fetch_add(n as u64, Ordering::Relaxed);
+            tracker.record_upload(n);
             if *has_user {
                 tracker.user_upload.fetch_add(n as u64, Ordering::Relaxed);
             }
@@ -154,9 +176,7 @@ impl TrafficTracker {
             has_user,
         } = self
         {
-            tracker
-                .download_total
-                .fetch_add(n as u64, Ordering::Relaxed);
+            tracker.record_download(n);
             if *has_user {
                 tracker.user_download.fetch_add(n as u64, Ordering::Relaxed);
             }
@@ -243,6 +263,9 @@ enum StatsCommand {
 
 pub struct Manager {
     connections: ConnectionMap,
+    connection_count: AtomicUsize,
+    association_lifetimes: Arc<AssociationRegistry>,
+    udp_user_traffic: DashMap<Arc<str>, Arc<UserTrafficCounters>>,
     tx: tokio::sync::mpsc::UnboundedSender<StatsCommand>,
     upload_temp: AtomicU64,
     download_temp: AtomicU64,
@@ -259,6 +282,9 @@ impl Manager {
 
         let v = Arc::new(Self {
             connections: DashMap::new(),
+            connection_count: AtomicUsize::new(0),
+            association_lifetimes: Arc::new(AssociationRegistry::default()),
+            udp_user_traffic: DashMap::new(),
             tx,
             upload_temp: AtomicU64::new(0),
             download_temp: AtomicU64::new(0),
@@ -341,8 +367,8 @@ impl Manager {
         let dst_port = info.session_holder.destination.port();
         let is_tcp =
             matches!(info.session_holder.network, crate::session::Network::Tcp);
-        let conn_upload = info.upload_total.load(Ordering::Relaxed);
-        let conn_download = info.download_total.load(Ordering::Relaxed);
+        let conn_upload = info.upload_total();
+        let conn_download = info.download_total();
         let src_ip = info.session_holder.source.ip();
 
         let key = FlowKey {
@@ -403,16 +429,31 @@ impl Manager {
     }
 
     pub fn track(&self, id: u64, item: Arc<TrackerInfo>, close_notify: Sender<()>) {
-        self.connections.insert(id, (item, Some(close_notify)));
+        match self.connections.entry(id) {
+            Entry::Vacant(entry) => {
+                self.connection_count.fetch_add(1, Ordering::Relaxed);
+                entry.insert((item, Some(close_notify)));
+            }
+            Entry::Occupied(mut entry) => {
+                entry.insert((item, Some(close_notify)));
+            }
+        }
     }
 
     /// Untrack a connection.
     /// This method is not async because it is called in Drop.
     /// Non-blocking: pushes an event to the Actor channel.
     pub fn untrack(&self, id: u64) {
-        let removed = self.connections.remove(&id);
+        // Update the count before releasing the same entry lock used by track.
+        let removed = match self.connections.entry(id) {
+            Entry::Occupied(entry) => {
+                self.connection_count.fetch_sub(1, Ordering::Relaxed);
+                Some(entry.remove())
+            }
+            Entry::Vacant(_) => None,
+        };
 
-        if let Some((_, (info, _))) = removed {
+        if let Some((info, _)) = removed {
             let upload = info.user_upload.swap(0, Ordering::Relaxed);
             let download = info.user_download.swap(0, Ordering::Relaxed);
             let _ = self.tx.send(StatsCommand::ConnectionClosed {
@@ -466,19 +507,33 @@ impl Manager {
             if let Some(ref user) = info.session_holder.inbound_user {
                 let upload = info.user_upload.swap(0, Ordering::Relaxed);
                 let download = info.user_download.swap(0, Ordering::Relaxed);
-                if upload > 0 || download > 0 {
-                    let entry = if let Some(entry) = result.get_mut(user.as_ref()) {
-                        entry
-                    } else {
-                        result.entry(user.to_string()).or_default()
-                    };
-                    entry.upload += upload;
-                    entry.download += download;
-                }
+                Self::merge_user_traffic(&mut result, user, upload, download);
             }
         }
 
+        for r in self.udp_user_traffic.iter() {
+            let upload = r.value().upload.swap(0, Ordering::Relaxed);
+            let download = r.value().download.swap(0, Ordering::Relaxed);
+            Self::merge_user_traffic(&mut result, r.key(), upload, download);
+        }
+        // The entry lock excludes new handles during reclamation. An active
+        // worker holds an Arc, so its counters cannot be removed while writing.
+        self.udp_user_traffic.retain(|_, counters| Arc::strong_count(counters) > 1
+            || counters.upload.load(Ordering::Relaxed) != 0
+            || counters.download.load(Ordering::Relaxed) != 0);
         result
+    }
+
+    fn merge_user_traffic(result: &mut HashMap<String, UserTraffic>, user: &str,
+        upload: u64, download: u64,
+    ) {
+        if upload == 0 && download == 0 { return; }
+        let entry = match result.get_mut(user) {
+            Some(entry) => entry,
+            None => result.entry(user.to_owned()).or_default(),
+        };
+        entry.upload += upload;
+        entry.download += download;
     }
 
     /// Signal a connection to close.
@@ -498,10 +553,19 @@ impl Manager {
     }
 
     pub fn close_all(&self) {
+        self.association_lifetimes.close_all();
         let keys: Vec<u64> = self.connections.iter().map(|r| *r.key()).collect();
         for key in keys {
             self.close(key);
         }
+    }
+
+    pub(crate) fn register_udp_association(&self, id: u64, close: Sender<()>) -> AssociationGuard {
+        self.association_lifetimes.register(id, close)
+    }
+
+    pub(crate) fn udp_user_counters(&self, user: &Arc<str>) -> Arc<UserTrafficCounters> {
+        self.udp_user_traffic.entry(user.clone()).or_default().clone()
     }
 
     pub fn push_uploaded(&self, n: usize) {
@@ -534,16 +598,11 @@ impl Manager {
             self.upload_total.load(std::sync::atomic::Ordering::Relaxed),
             self.download_total
                 .load(std::sync::atomic::Ordering::Relaxed),
-            self.connections.len(),
+            self.connection_count.load(Ordering::Relaxed),
         )
     }
 
     pub fn snapshot(&self) -> Snapshot {
-        let mut connections = Vec::with_capacity(self.connections.len());
-        for r in self.connections.iter() {
-            connections.push(r.value().0.clone());
-        }
-
         Snapshot {
             download_total: self
                 .download_total
@@ -551,7 +610,7 @@ impl Manager {
             upload_total: self
                 .upload_total
                 .load(std::sync::atomic::Ordering::Relaxed),
-            connections,
+            connections: self.active_connections_snapshot(),
             memory: self.memory_usage(),
         }
     }
@@ -691,6 +750,50 @@ impl ShrinkController {
 mod tests {
     use super::*;
 
+    fn track_connection(manager: &Manager, id: u64) {
+        let info = Arc::new(TrackerInfo { id, ..Default::default() });
+        let (tx, _) = tokio::sync::oneshot::channel();
+        manager.track(id, info, tx);
+    }
+
+    #[tokio::test]
+    async fn connection_count_handles_replacements_and_close() {
+        let manager = Manager::new();
+        track_connection(&manager, 1);
+        track_connection(&manager, 1);
+        assert_eq!(manager.traffic_summary().4, 1);
+        track_connection(&manager, 2);
+        track_connection(&manager, 1);
+        manager.close(1);
+        assert_eq!(manager.traffic_summary().4, 2);
+        manager.untrack(1);
+        manager.untrack(1);
+        assert_eq!(manager.traffic_summary().4, 1);
+        manager.untrack(2);
+        assert_eq!(manager.traffic_summary().4, 0);
+        assert!(manager.active_connections_snapshot().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn connection_count_survives_concurrent_same_id_updates() {
+        let manager = Manager::new();
+        let mut tasks = Vec::new();
+        for worker in 0..8 {
+            let manager = manager.clone();
+            tasks.push(tokio::spawn(async move {
+                for step in 0..256 {
+                    let id = (worker + step) % 4;
+                    track_connection(&manager, id);
+                    tokio::task::yield_now().await;
+                    manager.untrack(id);
+                }
+            }));
+        }
+        for task in tasks { task.await.unwrap(); }
+        assert_eq!(manager.traffic_summary().4, 0);
+        assert!(manager.active_connections_snapshot().is_empty());
+    }
+
     #[tokio::test]
     async fn test_drain_user_stats_empty() {
         let mgr = Manager::new();
@@ -768,8 +871,8 @@ mod tests {
         sess1.asn = Some("Cloudflare".into());
 
         let tracker1 = Arc::new(TrackerInfo::new(&sess1, None));
-        tracker1.upload_total.store(100, Ordering::Relaxed);
-        tracker1.download_total.store(200, Ordering::Relaxed);
+        tracker1.record_upload(100);
+        tracker1.record_download(200);
 
         let (close_tx1, _) = tokio::sync::oneshot::channel();
         mgr.track(sess1.id, tracker1, close_tx1);
@@ -779,8 +882,8 @@ mod tests {
         sess2.source = "192.168.1.20:12346".parse::<SocketAddr>().unwrap();
 
         let tracker2 = Arc::new(TrackerInfo::new(&sess2, None));
-        tracker2.upload_total.store(300, Ordering::Relaxed);
-        tracker2.download_total.store(400, Ordering::Relaxed);
+        tracker2.record_upload(300);
+        tracker2.record_download(400);
 
         let (close_tx2, _) = tokio::sync::oneshot::channel();
         mgr.track(sess2.id, tracker2, close_tx2);

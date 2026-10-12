@@ -1,3 +1,4 @@
+use crate::proxy::transport::uot::{encode_uot_packet_request, OutboundDatagramUotV2};
 #[cfg(all(test, docker_test))]
 use crate::proxy::OutboundNode;
 
@@ -313,15 +314,12 @@ impl OutboundHandler for Handler {
 
             let mut stream = self.proxy_stream(stream, &uot_sess, resolver).await?;
 
-            let request = crate::proxy::transport::uot::encode_uot_connect_request(&sess.destination);
+            let request = encode_uot_packet_request();
 
             stream.write_all(&request).await?;
             stream.flush().await?;
 
-            let datagram = crate::proxy::transport::uot::OutboundDatagramUotV2::new(
-                stream,
-                sess.destination.clone(),
-            );
+            let datagram = OutboundDatagramUotV2::packet_mode(stream);
             sess.push_chain(self.name());
             return Ok(AnyOutboundDatagram::new(datagram));
         }

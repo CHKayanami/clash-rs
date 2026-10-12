@@ -5,7 +5,7 @@ use super::{
     OutboundDatagram, ProxyStream,
     anytls::stream::AnyTlsStream,
     datagram::UdpPacket,
-    direct::{datagram::OutboundDatagramImpl, pool::PooledDirectDatagram},
+    direct::{datagram::OutboundDatagramImpl, native::NativeDatagram, pool::PooledDirectDatagram},
     hysteria2::{HystStream, HysteriaDatagramOutbound},
     socks::outbound::Socks5Datagram,
     transport::{
@@ -251,7 +251,7 @@ impl ProxyStream for AnyStream {
 }
 
 define_transport!($, AnyOutboundDatagram, DynamicDatagram, [OutboundDatagram<UdpPacket>], dispatch_datagram,
-    [Direct(Box<PooledDirectDatagram>), Udp(Box<OutboundDatagramImpl>)], [
+    [Direct(Box<PooledDirectDatagram>), Udp(Box<OutboundDatagramImpl>), NativeUdp(Box<NativeDatagram>)], [
     Socks5(Socks5Datagram),
     Hysteria2(HysteriaDatagramOutbound),
     #[cfg(feature = "tuic")]
@@ -272,6 +272,31 @@ define_transport!($, AnyOutboundDatagram, DynamicDatagram, [OutboundDatagram<Udp
     H2Mux(H2MuxDatagram),
     Xudp(XudpChildDatagram),
 ]);
+
+impl AnyOutboundDatagram {
+    /// Whether writes can address different targets on the same transport.
+    /// This controls mapping reuse, not reply filtering or server NAT behavior.
+    /// Fixed-target VMess and UoT connect mode cannot be shared.
+    pub(crate) fn supports_multi_target(&self) -> bool {
+        match self {
+            Self::Uot(datagram) => datagram.supports_multi_target(),
+            Self::Udp(_) | Self::NativeUdp(_) | Self::Socks5(_) | Self::Hysteria2(_) | Self::Trojan(_)
+            | Self::H2Mux(_) | Self::Xudp(_) => true,
+            #[cfg(feature = "shadowsocks")]
+            Self::Shadowsocks(_) | Self::ShadowsocksUdp(_) => true,
+            #[cfg(feature = "tuic")]
+            Self::Tuic(_) => true,
+            _ => false,
+        }
+    }
+
+    /// Whether received packet addresses identify the remote peer.
+    /// Source projection is independent of accepting an unsolicited reply.
+    pub(crate) fn reports_peer_source(&self) -> bool {
+        // Dynamic extensions retain their existing per-target contract.
+        !matches!(self, Self::Dynamic(_))
+    }
+}
 
 macro_rules! datagram_io {
     ($self:expr, $method:ident $(, $arg:expr)*) => {

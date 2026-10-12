@@ -1489,6 +1489,7 @@ dependencies = [
  "h2",
  "h3",
  "h3-quinn",
+ "hashbrown 0.17.1",
  "hex",
  "hkdf 0.13.0",
  "hmac 0.13.0",

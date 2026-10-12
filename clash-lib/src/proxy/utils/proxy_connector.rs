@@ -156,7 +156,7 @@ impl DirectConnector {
                 .map(|ip| SocketAddr::new(ip, destination.port())),
         )
         .await
-        .map(|x| OutboundDatagramImpl::new(x, resolver))?;
+        .and_then(|x| OutboundDatagramImpl::new(x, resolver))?;
 
         Ok(AnyOutboundDatagram::Udp(Box::new(dgram)))
     }

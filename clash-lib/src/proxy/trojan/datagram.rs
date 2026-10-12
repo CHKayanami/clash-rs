@@ -19,7 +19,6 @@ use crate::{
 
 pub struct OutboundDatagramTrojan {
     inner: AnyStream,
-    remote_addr: SocksAddr,
     read_buf: BytesMut,
     read_done: bool,
     write_buf: BytesMut,
@@ -28,10 +27,9 @@ pub struct OutboundDatagramTrojan {
 }
 
 impl OutboundDatagramTrojan {
-    pub fn new(inner: AnyStream, remote_addr: SocksAddr) -> Self {
+    pub fn new(inner: AnyStream) -> Self {
         Self {
             inner,
-            remote_addr,
             read_buf: BytesMut::new(),
             read_done: false,
             write_buf: BytesMut::new(),
@@ -195,8 +193,8 @@ impl Stream for OutboundDatagramTrojan {
                     frame.advance(header_len);
                     return Poll::Ready(Some(UdpPacket {
                         data: frame.freeze(),
-                        src_addr: self.remote_addr.clone(),
-                        dst_addr: addr,
+                        src_addr: addr,
+                        dst_addr: SocksAddr::any_ipv4(),
                         inbound_user: None,
                     }));
                 }
@@ -262,7 +260,7 @@ mod tests {
         let expected = frame(&addr, b"hello world");
         let (client, mut server) = duplex(3);
         let mut datagram =
-            OutboundDatagramTrojan::new(AnyStream::new(client), addr.clone());
+            OutboundDatagramTrojan::new(AnyStream::new(client));
         Pin::new(&mut datagram)
             .start_send(packet(addr, b"hello world"))
             .unwrap();
@@ -281,12 +279,11 @@ mod tests {
     #[tokio::test]
     async fn fragmented_frames_preserve_read_progress() {
         let addr = SocksAddr::try_from(("example.org".to_owned(), 53)).unwrap();
-        let remote = SocksAddr::any_ipv4();
         let first = frame(&addr, b"hello");
         let second = frame(&addr, b"next");
         let (mut server, client) = duplex(128);
         let mut datagram =
-            OutboundDatagramTrojan::new(AnyStream::new(client), remote);
+            OutboundDatagramTrojan::new(AnyStream::new(client));
 
         server.write_all(&first[..3]).await.unwrap();
         assert!(matches!(poll!(datagram.next()), Poll::Pending));
@@ -296,7 +293,7 @@ mod tests {
         server.write_all(&second).await.unwrap();
 
         let received = datagram.next().await.unwrap();
-        assert_eq!(received.dst_addr, addr);
+        assert_eq!(received.src_addr, addr);
         assert_eq!(received.data.as_ref(), b"hello");
         assert_eq!(datagram.next().await.unwrap().data.as_ref(), b"next");
         drop(server);

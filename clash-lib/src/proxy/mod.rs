@@ -305,3 +305,5 @@ pub trait PlainProxyAPIResponse: Send + Sync {
     /// used in the API responses.
     fn as_map(&self) -> impl Future<Output = HashMap<String, Box<dyn ErasedSerialize + Send>>> + Send;
 }
+
+pub(crate) use outbound::DatagramConnector;

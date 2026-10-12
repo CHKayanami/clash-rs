@@ -107,6 +107,7 @@ tracing-opentelemetry = { version = "0.33", optional = true }
 opentelemetry-semantic-conventions = { version = "0.32", optional = true, features = ["semconv_experimental"] }
 
 # Data structures
+hashbrown = { version = "0.17.1", default-features = false, features = ["inline-more"] }
 url = "2"
 percent-encoding = "2"
 bytes = "1"

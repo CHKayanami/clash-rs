@@ -26,7 +26,7 @@ pub mod types;
 #[cfg(test)]
 mod tls_records_tests;
 
-use super::transport::uot::OutboundDatagramUotV2;
+use super::transport::uot::{encode_uot_packet_request, OutboundDatagramUotV2};
 use padding::{PaddingFactory, SharedPaddingFactory};
 use pool::{SessionPool, SessionPoolConfig};
 use session::AnyTlsClientSession;
@@ -288,16 +288,11 @@ impl OutboundHandler for Handler {
             .open_stream_with_retry(resolver, connector, sess, &uot_dest)
             .await?;
 
-        let request = crate::proxy::transport::uot::encode_uot_connect_request(
-            &sess.destination,
-        );
+        let request = encode_uot_packet_request();
         stream.write_all(&request).await?;
         stream.flush().await?;
 
-        let datagram = OutboundDatagramUotV2::new(
-            AnyStream::new(stream),
-            sess.destination.clone(),
-        );
+        let datagram = OutboundDatagramUotV2::packet_mode(AnyStream::new(stream));
         sess.push_chain(self.name());
         Ok(AnyOutboundDatagram::new(datagram))
     }

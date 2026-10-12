@@ -1,16 +1,19 @@
 //! Opt-in internal hook for the isolated dispatch allocation test.
 
-use std::{collections::{HashMap, HashSet}, future::Future, mem::size_of_val, sync::Arc, time::Duration};
+use std::{collections::{HashMap, HashSet}, future::Future, mem::{size_of, size_of_val}, sync::{Arc, atomic::AtomicBool}, time::Duration};
 use arc_swap::ArcSwap;
+use tokio::sync::{mpsc, Semaphore};
 use futures::future::BoxFuture;
 use crate::{
     app::{dns::{SystemResolver, ThreadSafeDNSResolver}, remote_content_manager::{ProxyManager, healthcheck::HealthCheck, providers::proxy_provider::PlainProvider}},
     config::internal::proxy::LoadBalanceStrategy,
     proxy::{
-        OutboundHandler, OutboundNode, direct, socks, selector, loadbalance, reject,
+        OutboundHandler, OutboundNode, direct::{self, datagram::OutboundDatagramImpl, native::NativeDatagram}, socks, selector, loadbalance, reject,
         group::{GroupHandler, fallback, urltest, smart}, utils::DialerProxyConnector,
     },
     session::Session,
+    app::dispatcher::{Manager as StatisticsManager, TrackerInfo},
+    app::dispatcher::udp::association::{UdpConnectContext, AssociationConfig, UdpAssociationPool},
 };
 
 struct Measurement<S, F> { start: S, finish: F }
@@ -35,6 +38,11 @@ impl<S: Fn(), F: Fn(&str, usize, Option<usize>) -> usize> Measurement<S, F> {
 /// installs no allocator and performs no network I/O in this fixture.
 pub async fn measure_dispatch_futures(start: impl Fn(), finish: impl Fn(&str, usize, Option<usize>) -> usize) {
     let measurement = Measurement { start, finish };
+    for (name, bytes) in [("native UDP I/O state", size_of::<NativeDatagram>()),
+        ("domain UDP I/O state", size_of::<OutboundDatagramImpl>())] {
+        (measurement.start)();
+        (measurement.finish)(name, bytes, Some(0));
+    }
     let sess = Session::default();
     let resolver: ThreadSafeDNSResolver = Arc::new(SystemResolver::new(false).unwrap());
     let direct = Arc::new(direct::Handler::new("direct"));
@@ -174,5 +182,17 @@ pub async fn measure_dispatch_futures(start: impl Fn(), finish: impl Fn(&str, us
     let result = future.await;
     (measurement.finish)("round robin execution", bytes, Some(0));
     assert!(result.unwrap().unwrap().ptr_eq(&rejected));
+
+    let manager = StatisticsManager::new();
+    let (replies, _reply_rx) = mpsc::channel(1);
+    let (closed_flows, _closed_rx) = mpsc::unbounded_channel();
+    let pool = UdpAssociationPool::new(AssociationConfig {
+        replies, closed_flows, manager, timeout: Duration::from_secs(60),
+        allow_quic: Arc::new(AtomicBool::new(true)),
+        capacity: Arc::new(Semaphore::new(1)),
+    });
+    let tracker = Arc::new(TrackerInfo::new(&sess, None));
+    let context = UdpConnectContext { pool: &pool, tracker: &tracker };
+    measurement.measure("pooled UDP enum", || group.connect_datagram_using(&sess, resolver.clone(), &context), 0);
 
 }

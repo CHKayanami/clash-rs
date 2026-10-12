@@ -1,242 +1,72 @@
-use std::{
-    fmt, io,
-    pin::Pin,
-    task::{Context, Poll},
-};
-
-use bytes::{Buf, BufMut, BytesMut};
-use futures::{Sink, Stream, ready};
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tracing::{debug, trace};
-
+use std::{fmt, io, pin::Pin, task::{Context, Poll}};
+use futures::{Sink, Stream};
 use crate::{
-    proxy::{AnyStream, datagram::UdpPacket},
+    proxy::{AnyStream, datagram::UdpPacket, transport::uot::OutboundDatagramUotV2},
     session::SocksAddr,
 };
 
-/// A length-prefixed packet cannot exceed what its `u16` header can express,
-/// so reads are inherently bounded; this caps the *write* side.
-pub(super) const MAX_PACKET_LENGTH: usize = u16::MAX as usize;
+#[cfg(test)]
+const MAX_PACKET_LENGTH: usize = u16::MAX as usize;
 
-/// Wraps the post-AnyTLS-handshake TLS stream for UDP-over-TCP v2.
-///
-/// Packet format: `u16(len) | payload`  (big-endian length prefix).
+/// Inbound direction of the common UoT v2 framing implementation.
 pub struct InboundDatagramAnytls {
-    inner: AnyStream,
-    peer_addr: SocksAddr,
-
-    // Write state
-    write_buf: BytesMut,
-    pending_packet: Option<UdpPacket>,
-    flushed: bool,
-
-    // Read state
-    header_read: usize,
-    packet_len: Option<usize>,
-    packet_buf: BytesMut,
-    length_buf: [u8; 2],
+    inner: OutboundDatagramUotV2,
+    source: Option<SocksAddr>,
 }
 
 impl fmt::Debug for InboundDatagramAnytls {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("InboundDatagramAnytls")
-            .field("peer_addr", &self.peer_addr)
-            .finish()
+        f.debug_struct("InboundDatagramAnytls").finish()
     }
 }
 
 impl InboundDatagramAnytls {
-    pub fn new(inner: AnyStream, peer_addr: SocksAddr) -> Self {
-        Self {
-            inner,
-            peer_addr,
-            write_buf: BytesMut::new(),
-            pending_packet: None,
-            flushed: true,
-            header_read: 0,
-            packet_len: None,
-            packet_buf: BytesMut::new(),
-            length_buf: [0; 2],
-        }
+    #[cfg(test)]
+    pub fn new(inner: AnyStream, target: SocksAddr) -> Self {
+        Self { inner: OutboundDatagramUotV2::new(inner, target), source: None }
     }
 
-    fn write_packet(&mut self, payload: &[u8]) -> io::Result<()> {
-        if payload.len() > MAX_PACKET_LENGTH {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "udp payload too large for anytls uot: {} > {}",
-                    payload.len(),
-                    MAX_PACKET_LENGTH
-                ),
-            ));
-        }
-        self.write_buf.clear();
-        self.write_buf.put_u16(payload.len() as u16);
-        self.write_buf.put_slice(payload);
-        Ok(())
+    pub fn with_mode(inner: AnyStream, target: SocksAddr,
+        source: SocksAddr, is_connect: bool) -> Self {
+        let inner = if is_connect {
+            OutboundDatagramUotV2::new(inner, target)
+        } else { OutboundDatagramUotV2::packet_mode(inner) };
+        Self { inner, source: Some(source) }
     }
 }
 
 impl Sink<UdpPacket> for InboundDatagramAnytls {
     type Error = io::Error;
-
-    fn poll_ready(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Result<(), Self::Error>> {
-        if !self.flushed {
-            match self.poll_flush(cx)? {
-                Poll::Ready(()) => {}
-                Poll::Pending => return Poll::Pending,
-            }
-        }
-        Poll::Ready(Ok(()))
+    fn poll_ready(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_ready(cx)
     }
-
-    fn start_send(self: Pin<&mut Self>, item: UdpPacket) -> Result<(), Self::Error> {
-        let this = self.get_mut();
-        if this.pending_packet.is_some() {
-            return Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "previous packet not yet sent",
-            ));
-        }
-        this.write_packet(&item.data)?;
-        this.pending_packet = Some(item);
-        this.flushed = false;
-        Ok(())
+    fn start_send(self: Pin<&mut Self>, mut packet: UdpPacket) -> io::Result<()> {
+        packet.dst_addr = packet.src_addr.clone();
+        Pin::new(&mut self.get_mut().inner).start_send(packet)
     }
-
-    fn poll_flush(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Result<(), Self::Error>> {
-        if self.flushed {
-            return Poll::Ready(Ok(()));
-        }
-        let this = self.get_mut();
-        let mut inner = Pin::new(&mut this.inner);
-        while !this.write_buf.is_empty() {
-            let n = ready!(inner.as_mut().poll_write(cx, &this.write_buf))?;
-            if n == 0 {
-                return Poll::Ready(Err(io::Error::new(
-                    io::ErrorKind::WriteZero,
-                    "failed to write udp packet",
-                )));
-            }
-            this.write_buf.advance(n);
-        }
-        ready!(inner.poll_flush(cx))?;
-        if let Some(packet) = &this.pending_packet {
-            trace!("sent anytls inbound udp packet, len={}", packet.data.len());
-        }
-        this.pending_packet = None;
-        this.flushed = true;
-        Poll::Ready(Ok(()))
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
     }
-
-    fn poll_close(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Result<(), Self::Error>> {
-        ready!(self.as_mut().poll_flush(cx))?;
-        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+    fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_close(cx)
     }
 }
 
 impl Stream for InboundDatagramAnytls {
     type Item = UdpPacket;
-
-    fn poll_next(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Option<Self::Item>> {
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<UdpPacket>> {
         let this = self.get_mut();
-        let mut inner = Pin::new(&mut this.inner);
-
-        loop {
-            if this.packet_len.is_none() {
-                let mut length_read_buf =
-                    ReadBuf::new(&mut this.length_buf[this.header_read..]);
-                match ready!(inner.as_mut().poll_read(cx, &mut length_read_buf)) {
-                    Ok(()) => {
-                        let read = length_read_buf.filled().len();
-                        if read == 0 {
-                            return Poll::Ready(None);
-                        }
-                        this.header_read += read;
-                        if this.header_read < this.length_buf.len() {
-                            continue;
-                        }
-                        let packet_len =
-                            u16::from_be_bytes(this.length_buf) as usize;
-                        this.header_read = 0;
-                        if packet_len == 0 {
-                            // Zero-length packet — valid empty datagram, return
-                            // immediately.
-                            return Poll::Ready(Some(UdpPacket {
-                                data: bytes::Bytes::new(),
-                                src_addr: this.peer_addr.clone(),
-                                dst_addr: this.peer_addr.clone(),
-                                inbound_user: None,
-                            }));
-                        }
-                        this.packet_len = Some(packet_len);
-                        this.packet_buf.clear();
-                        this.packet_buf.reserve(packet_len);
-                    }
-                    Err(err) => {
-                        debug!(
-                            "failed to read anytls inbound udp length header: {}",
-                            err
-                        );
-                        return Poll::Ready(None);
-                    }
-                }
-            }
-
-            if let Some(packet_len) = this.packet_len {
-                let remaining = packet_len - this.packet_buf.len();
-                let n = {
-                    let spare = this.packet_buf.spare_capacity_mut();
-                    let mut read_buf = ReadBuf::uninit(&mut spare[..remaining]);
-                    match inner.as_mut().poll_read(cx, &mut read_buf) {
-                        Poll::Pending => return Poll::Pending,
-                        Poll::Ready(Err(err)) => {
-                            debug!(
-                                "failed to read anytls inbound udp payload: {}",
-                                err
-                            );
-                            return Poll::Ready(None);
-                        }
-                        Poll::Ready(Ok(())) => read_buf.filled().len(),
-                    }
-                };
-                if n == 0 {
-                    return Poll::Ready(None);
-                }
-                // SAFETY: poll_read initialised exactly `n` bytes.
-                unsafe { this.packet_buf.advance_mut(n) };
-
-                if this.packet_buf.len() == packet_len {
-                    let data = this.packet_buf.split_to(packet_len).freeze();
-                    this.packet_len = None;
-                    return Poll::Ready(Some(UdpPacket {
-                        data,
-                        src_addr: this.peer_addr.clone(),
-                        dst_addr: this.peer_addr.clone(),
-                        inbound_user: None,
-                    }));
-                }
-            }
-        }
+        Pin::new(&mut this.inner).poll_next(cx).map(|packet| packet.map(|mut packet| {
+            if let Some(source) = &this.source { packet.src_addr = source.clone(); }
+            packet
+        }))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::SocketAddr;
     use futures::{SinkExt, StreamExt};
     use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
 
@@ -447,4 +277,31 @@ mod tests {
         );
         assert_eq!(&buf[2..], payload, "decoded payload must match");
     }
+    #[tokio::test]
+    async fn packet_mode_preserves_client_target_and_unsolicited_reply() {
+        let (client, server) = duplex(128);
+        let source: SocksAddr = "127.0.0.1:12345".parse::<SocketAddr>().unwrap().into();
+        let mut inbound = InboundDatagramAnytls::with_mode(
+            AnyStream::new(server), SocksAddr::any_ipv4(), source.clone(), false,
+        );
+        let mut outbound = OutboundDatagramUotV2::packet_mode(AnyStream::new(client));
+        for host in ["example.com", "192.0.2.1", "2001:db8::1"] {
+            let target = SocksAddr::try_from((host.to_owned(), 53)).unwrap();
+            let mut packet = make_packet(b"request".to_vec());
+            packet.dst_addr = target.clone();
+            outbound.send(packet).await.unwrap();
+            let packet = inbound.next().await.unwrap();
+            assert_eq!(packet.src_addr, source);
+            assert_eq!(packet.dst_addr, target);
+        }
+        let peer = SocksAddr::try_from(("192.0.2.3".to_owned(), 9000)).unwrap();
+        let mut reply = make_packet(b"unsolicited".to_vec());
+        reply.src_addr = peer.clone();
+        reply.dst_addr = source;
+        inbound.send(reply).await.unwrap();
+        let reply = outbound.next().await.unwrap();
+        assert_eq!(reply.src_addr, peer);
+        assert_eq!(&reply.data[..], b"unsolicited");
+    }
+
 }

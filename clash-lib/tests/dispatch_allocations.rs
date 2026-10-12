@@ -64,7 +64,7 @@ async fn native_dispatch_future_allocations_and_sizes() {
             TRACKING.set(false);
             let count = ALLOCATIONS.get();
             println!("{name}: future_bytes={bytes} allocations={count}");
-            if matches!(name, "protocol enum" | "protocol UDP enum" | "group enum") {
+            if matches!(name, "protocol enum" | "protocol UDP enum" | "group enum" | "pooled UDP enum") {
                 assert!(bytes <= 512, "{name} retained an oversized dispatch future: {bytes}");
             }
             if name.starts_with("boxed protocol") {

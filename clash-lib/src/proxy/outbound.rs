@@ -12,7 +12,25 @@ use crate::{
 };
 use erased_serde::Serialize;
 use super::utils::dialer_route;
+use futures::future::BoxFuture;
 use std::{collections::{HashMap, HashSet}, io, sync::Arc, time::Instant};
+
+pub(crate) trait DatagramConnector: Sync {
+    type Datagram: Send;
+    fn connect<'a>(&'a self, handler: &'a ProtocolOutbound, sess: &'a Session,
+        resolver: ThreadSafeDNSResolver,
+    ) -> BoxFuture<'a, io::Result<Self::Datagram>>;
+}
+
+struct PhysicalDatagramConnector;
+impl DatagramConnector for PhysicalDatagramConnector {
+    type Datagram = AnyOutboundDatagram;
+    fn connect<'a>(&'a self, handler: &'a ProtocolOutbound, sess: &'a Session,
+        resolver: ThreadSafeDNSResolver,
+    ) -> BoxFuture<'a, io::Result<Self::Datagram>> {
+        handler.connect_datagram(sess, resolver)
+    }
+}
 
 /// Registry node: selection policies and protocol dialers have separate contracts.
 /// Cloning a node only clones its existing Arc; no additional allocation is needed.
@@ -129,26 +147,38 @@ impl OutboundNode {
     pub async fn connect_stream(&self, sess: &Session, resolver: ThreadSafeDNSResolver) -> io::Result<AnyStream> {
         match self {
             Self::Protocol(handler) => handler.connect_stream(sess, resolver).await,
-            Self::Group(group) => match connect(group, sess, resolver, false).await? {
+            Self::Group(group) => match connect(group, sess, resolver, false, &PhysicalDatagramConnector).await? {
                 Connection::Stream(stream) => Ok(stream),
-                Connection::Datagram(_) => unreachable!(),
+                _ => unreachable!(),
             },
         }
     }
     pub async fn connect_datagram(&self, sess: &Session, resolver: ThreadSafeDNSResolver) -> io::Result<AnyOutboundDatagram> {
         match self {
             Self::Protocol(handler) => handler.connect_datagram(sess, resolver).await,
-            Self::Group(group) => match connect(group, sess, resolver, true).await? {
+            Self::Group(group) => match connect(group, sess, resolver, true, &PhysicalDatagramConnector).await? {
                 Connection::Datagram(datagram) => Ok(datagram),
-                Connection::Stream(_) => unreachable!(),
+                _ => unreachable!(),
+            },
+        }
+    }
+
+    pub(crate) async fn connect_datagram_using<C: DatagramConnector>(
+        &self, sess: &Session, resolver: ThreadSafeDNSResolver, connector: &C,
+    ) -> io::Result<C::Datagram> {
+        match self {
+            Self::Protocol(handler) => connector.connect(handler, sess, resolver).await,
+            Self::Group(group) => match connect(group, sess, resolver, true, connector).await? {
+                Connection::Datagram(datagram) => Ok(datagram),
+                _ => unreachable!(),
             },
         }
     }
 }
 
-enum Connection {
+enum Connection<D> {
     Stream(AnyStream),
-    Datagram(AnyOutboundDatagram),
+    Datagram(D),
 }
 
 enum Policy<'a> {
@@ -201,12 +231,13 @@ impl<'a> Frames<'a> {
     fn is_empty(&self) -> bool { self.root.is_none() }
 }
 
-async fn connect(
+async fn connect<C: DatagramConnector>(
     root: &ProxyGroup,
     sess: &Session,
     resolver: ThreadSafeDNSResolver,
     udp: bool,
-) -> io::Result<Connection> {
+    connector: &C,
+) -> io::Result<Connection<C::Datagram>> {
     // Retain the association once; derived TCP connections share its UDP route.
     let route = dialer_route::retain();
     let mut frames = Frames::new(Frame::new(Policy::Root(root), sess, udp).await);
@@ -239,7 +270,7 @@ async fn connect(
                         }
                     } else if udp {
                         let handler = handler.as_protocol().expect("protocol leaf");
-                        handler.connect_datagram(sess, resolver.clone()).await.map(Connection::Datagram)
+                        connector.connect(handler, sess, resolver.clone()).await.map(Connection::Datagram)
                     } else {
                         let handler = handler.as_protocol().expect("protocol leaf");
                         handler.connect_stream(sess, resolver.clone()).await.map(Connection::Stream)
@@ -293,18 +324,19 @@ async fn connect(
 impl OutboundNode {
     pub(crate) fn executor_layout(
         group: &ProxyGroup, sess: &Session, resolver: ThreadSafeDNSResolver,
-    ) -> [(&'static str, usize); 9] {
+    ) -> [(&'static str, usize); 10] {
         use std::{mem::{size_of, size_of_val}, time::Duration};
-
+        let node = OutboundNode::Group(group.clone());
         [
             ("executor policy", size_of::<Policy<'_>>()),
             ("executor frame", size_of::<Frame<'_>>()),
             ("executor frames", size_of::<Frames<'_>>()),
-            ("executor connection result", size_of::<io::Result<Connection>>()),
+            ("executor connection result", size_of::<io::Result<Connection<AnyOutboundDatagram>>>()),
             ("root frame initialization", size_of_val(&Frame::new(Policy::Root(group), sess, false))),
             ("nested frame initialization", size_of_val(&Frame::new(Policy::Nested(OutboundNode::Group(group.clone())), sess, false))),
-            ("group executor TCP", size_of_val(&connect(group, sess, resolver.clone(), false))),
-            ("group executor UDP", size_of_val(&connect(group, sess, resolver, true))),
+            ("group executor TCP", size_of_val(&connect(group, sess, resolver.clone(), false, &PhysicalDatagramConnector))),
+            ("group executor UDP", size_of_val(&connect(group, sess, resolver.clone(), true, &PhysicalDatagramConnector))),
+            ("node TCP connect", size_of_val(&node.connect_stream(sess, resolver.clone()))),
             ("retry sleep", size_of_val(&tokio::time::sleep(Duration::ZERO))),
         ]
     }

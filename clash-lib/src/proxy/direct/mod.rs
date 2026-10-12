@@ -1,7 +1,10 @@
-use std::fmt::Debug;
+use std::{fmt::Debug, io};
+use native::NativeDatagram;
+use super::utils::new_dual_stack_udp_socket;
 use std::sync::Arc;
 
 pub(crate) mod datagram;
+pub(crate) mod native;
 pub(crate) mod pool;
 mod recv;
 mod resolve;
@@ -36,6 +39,13 @@ impl Debug for Handler {
 }
 
 impl Handler {
+    pub(crate) fn connect_datagram_unpooled(&self, sess: &Session) -> io::Result<AnyOutboundDatagram> {
+        let socket = new_dual_stack_udp_socket(sess.iface.as_ref(),
+            #[cfg(target_os = "linux")] sess.so_mark)?;
+        sess.push_chain(self.name());
+        Ok(AnyOutboundDatagram::new(Box::new(NativeDatagram::new(socket)?)))
+    }
+
     pub fn new(name: &str) -> Self {
         Self {
             name: name.to_owned(),
