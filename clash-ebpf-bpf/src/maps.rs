@@ -5,7 +5,7 @@ use aya_ebpf::btf_maps::{
 use aya_ebpf::macros::btf_map;
 use clash_ebpf_common::{
     DaeEvent, DaeParam, DirectTrackEntry, PIDName, ParseTransportCtx, RedirectEntry,
-    RedirectTuple,
+    RedirectTuple, UdpReplyEntry, UdpReplyKey,
 };
 
 #[btf_map]
@@ -60,6 +60,11 @@ pub static DYNAMIC_BYPASS_DST_IP6S: LruHashMap<[u8; 16], u8, 16384> =
 
 #[btf_map]
 pub static REDIRECT_TRACK: LruHashMap<RedirectTuple, RedirectEntry, 32768> =
+    LruHashMap::new();
+
+/// Only populated by redirected UDP requests; shared by their target flows.
+#[btf_map]
+pub static UDP_REPLY_TRACK: LruHashMap<UdpReplyKey, UdpReplyEntry, 32768> =
     LruHashMap::new();
 
 /// Connection tracking map for dynamic bypass flows (TCP/UDP sessions).

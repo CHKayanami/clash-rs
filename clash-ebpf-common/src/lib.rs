@@ -76,6 +76,34 @@ pub struct RedirectEntry {
     pub _pad1: [u8; 4],
 }
 
+/// Client-only UDP return key. Address bytes and port retain RedirectTuple's
+/// wire representation. Explicit padding keeps all BPF key bytes initialized.
+#[repr(C, align(8))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct UdpReplyKey {
+    pub client_ip: [u8; 16],
+    pub client_port: u16,
+    pub ip_version: u8,
+    pub _pad: [u8; 5],
+}
+
+impl UdpReplyKey {
+    pub fn from_request(tuple: &RedirectTuple) -> Self {
+        Self { client_ip: tuple.src_ip, client_port: tuple.src_port,
+            ip_version: tuple.ip_version, _pad: [0; 5] }
+    }
+}
+
+/// Copy the complete value before updating its LRU map; map pointers must not
+/// survive replacement. Conflicting live interfaces disable client-only lookup.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct UdpReplyEntry {
+    pub route: RedirectEntry,
+    pub ambiguous: u8,
+    pub _pad: [u8; 7],
+}
+
 pub const DIRECT_TRACK_STATE_ACTIVE: u8 = 0;
 pub const DIRECT_TRACK_STATE_CLOSING: u8 = 1;
 
@@ -95,6 +123,12 @@ unsafe impl aya::Pod for RedirectTuple {}
 
 #[cfg(all(feature = "user", target_os = "linux"))]
 unsafe impl aya::Pod for RedirectEntry {}
+
+#[cfg(all(feature = "user", target_os = "linux"))]
+unsafe impl aya::Pod for UdpReplyKey {}
+
+#[cfg(all(feature = "user", target_os = "linux"))]
+unsafe impl aya::Pod for UdpReplyEntry {}
 
 #[cfg(all(feature = "user", target_os = "linux"))]
 unsafe impl aya::Pod for DirectTrackEntry {}

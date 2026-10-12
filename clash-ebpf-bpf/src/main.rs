@@ -8,6 +8,7 @@ fn panic(_: &core::panic::PanicInfo) -> ! {
 
 mod maps;
 mod transport;
+mod udp_reply;
 
 use aya_ebpf::bindings::{__sk_buff, TC_ACT_OK, bpf_sk_lookup};
 use aya_ebpf::btf_maps::lpm_trie::Key;
@@ -299,6 +300,7 @@ fn publish_redirect_track(
     is_udp: bool,
     now: u64,
 ) {
+    if is_udp { udp_reply::publish(tuple, entry, now); }
     if redirect_entry_needs_update(old, &entry, is_udp, now) {
         entry.last_seen_ns = if is_udp { now } else { 0 };
         let _ = REDIRECT_TRACK.insert(tuple, &entry, 0);
@@ -1225,7 +1227,14 @@ fn handle_dae0_ingress_impl(tc_ctx: &TcContext) -> i32 {
     };
     let mut reversed = RedirectTuple::default();
     packet_reverse_redirect_tuple(pkt, ip_version, &mut reversed);
-    if let Some(entry) = unsafe { REDIRECT_TRACK.get(&reversed) } {
+    let exact = unsafe { REDIRECT_TRACK.get(&reversed).copied() };
+    let entry = if pkt.l4proto == IPPROTO_UDP {
+        // Lookup is scoped to packets arriving from our isolated proxy veth.
+        // Refresh on replies too: flow expiry must not end a live association.
+        let client_route = udp_reply::lookup(&reversed);
+        exact.or(client_route)
+    } else { exact };
+    if let Some(entry) = entry {
         let dmac = entry.smac;
         let smac = entry.dmac;
         let from_wan = entry.from_wan;

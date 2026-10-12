@@ -1200,8 +1200,12 @@ impl BpfProgramManager {
             format!("Program '{prog_name}' is not a SchedClassifier: {e}")
         })?;
 
-        p.load()
-            .map_err(|e| format!("Failed to load TC program '{prog_name}': {e}"))?;
+        // One loaded program can own independent links on multiple interfaces.
+        // Aya's fd() returns NotLoaded until the first successful load.
+        if p.fd().is_err() {
+            p.load()
+                .map_err(|e| format!("Failed to load TC program '{prog_name}': {e}"))?;
+        }
 
         let link_id = p.attach(iface, attach_type).map_err(|e| {
             format!("Failed to attach TC program '{prog_name}' to {iface}: {e}")
