@@ -298,8 +298,8 @@ impl OutboundHandler for Handler {
             0,
         ))?;
 
-        // UoT servers need the request header before they can acknowledge the stream.
-        let request = encode_uot_packet_request();
+        // Send routing metadata early; UDP routing may also need the first packet.
+        let request = encode_uot_packet_request(&sess.destination);
         let stream = self
             .open_stream_with_initial_data_retry(
                 resolver, connector, sess, &uot_dest, &request,

@@ -3,6 +3,7 @@ use anyhow::anyhow;
 use bytes::{Buf, BufMut};
 use serde::{Serialize, Serializer};
 use std::{
+    borrow::Cow,
     fmt::{Debug, Display, Formatter},
     io,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
@@ -548,6 +549,14 @@ impl ProxyChain {
 }
 
 impl Session {
+    /// Host shown by connection metadata and flow statistics, independent of dialing.
+    pub(crate) fn display_host(&self) -> Cow<'_, str> {
+        match self.sniffed_domain.as_deref().or(self.mapped_domain.as_deref()) {
+            Some(host) => Cow::Borrowed(host),
+            None => self.destination.host_cow(),
+        }
+    }
+
     pub fn push_chain(&self, name: &str) {
         self.proxy_chain.push(name.to_owned());
     }
@@ -602,13 +611,7 @@ impl Serialize for Session {
         map.serialize_entry("destinationIP", &dest_ip_helper)?;
         map.serialize_entry("destinationPort", &self.destination.port())?;
 
-        let dest_host = self.destination.host_cow();
-        let display_host = self
-            .sniffed_domain
-            .as_deref()
-            .or(self.mapped_domain.as_deref())
-            .unwrap_or_else(|| dest_host.as_ref());
-        map.serialize_entry("host", display_host)?;
+        map.serialize_entry("host", self.display_host().as_ref())?;
         map.serialize_entry("asn", &self.asn)?;
         map.serialize_entry("country", &self.country)?;
         map.serialize_entry("traffic_stats", &self.traffic_stats)?;

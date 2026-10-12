@@ -314,7 +314,7 @@ impl OutboundHandler for Handler {
 
             let mut stream = self.proxy_stream(stream, &uot_sess, resolver).await?;
 
-            let request = encode_uot_packet_request();
+            let request = encode_uot_packet_request(&sess.destination);
 
             stream.write_all(&request).await?;
             stream.flush().await?;

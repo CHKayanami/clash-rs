@@ -43,10 +43,11 @@ pub fn encode_uot_connect_request(dst_addr: &SocksAddr) -> BytesMut {
 }
 
 /// Packet-address mode keeps one UDP association for all destinations.
-pub fn encode_uot_packet_request() -> BytesMut {
-    let mut request = BytesMut::with_capacity(8);
+/// The initial destination supplies server-side routing and dial metadata.
+pub fn encode_uot_packet_request(destination: &SocksAddr) -> BytesMut {
+    let mut request = BytesMut::with_capacity(1 + destination.size());
     request.put_u8(0);
-    SocksAddr::any_ipv4().write_buf(&mut request);
+    destination.write_buf(&mut request);
     request
 }
 
@@ -76,7 +77,7 @@ mod tests {
     #[tokio::test]
     async fn request_header_leaves_first_packet_unconsumed() {
         let (mut writer, mut reader) = duplex(32);
-        let mut wire = encode_uot_packet_request();
+        let mut wire = encode_uot_packet_request(&SocksAddr::any_ipv4());
         wire.extend_from_slice(b"packet");
         writer.write_all(&wire).await.unwrap();
         let (is_connect, target) = read_uot_request(&mut reader).await.unwrap();
@@ -87,8 +88,25 @@ mod tests {
         assert_eq!(&packet, b"packet");
     }
 
+    #[tokio::test]
+    async fn packet_request_preserves_initial_routing_destination() {
+        for target in [
+            "192.0.2.1:443".parse().unwrap(),
+            "[2001:db8::1]:443".parse().unwrap(),
+            SocksAddr::domain_name("example.org", 443),
+        ] {
+            let wire = encode_uot_packet_request(&target);
+            let mut reader = &wire[..];
+            let (is_connect, destination) = read_uot_request(&mut reader).await.unwrap();
+            assert!(!is_connect);
+            assert_eq!(destination, target);
+            assert!(reader.is_empty());
+        }
+    }
+
     #[test]
     fn packet_request_uses_socks_address_not_packet_address_type() {
-        assert_eq!(&encode_uot_packet_request()[..], &[0, 1, 0, 0, 0, 0, 0, 0]);
+        let wire = encode_uot_packet_request(&SocksAddr::any_ipv4());
+        assert_eq!(&wire[..], &[0, 1, 0, 0, 0, 0, 0, 0]);
     }
 }

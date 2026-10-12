@@ -14,7 +14,7 @@ use tokio::sync::oneshot::Sender;
 
 use crate::{
     app::router::{Rule, RuleMatcher},
-    session::Session,
+    session::{Network, Session},
     app::dispatcher::udp::association::{AssociationGuard, AssociationRegistry, UserTrafficCounters},
 };
 
@@ -226,6 +226,16 @@ pub struct FlowKey {
     pub is_tcp: bool,
 }
 
+impl From<&Session> for FlowKey {
+    fn from(session: &Session) -> Self {
+        Self {
+            dst_host: session.display_host().into_owned(),
+            dst_port: session.destination.port(),
+            is_tcp: matches!(session.network, Network::Tcp),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct ClosedFlowEntry {
     pub conn_count: usize,
@@ -366,19 +376,11 @@ impl Manager {
         closed_flows: &mut LruCache<FlowKey, ClosedFlowEntry>,
         info: &TrackerInfo,
     ) {
-        let dst_host = info.session_holder.destination.host();
-        let dst_port = info.session_holder.destination.port();
-        let is_tcp =
-            matches!(info.session_holder.network, crate::session::Network::Tcp);
         let conn_upload = info.upload_total();
         let conn_download = info.download_total();
         let src_ip = info.session_holder.source.ip();
 
-        let key = FlowKey {
-            dst_host,
-            dst_port,
-            is_tcp,
-        };
+        let key = FlowKey::from(&info.session_holder);
 
         const MAX_SRC_IPS: usize = 32;
 

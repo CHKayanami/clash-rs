@@ -15,7 +15,6 @@ use crate::{
         api::AppState,
         dispatcher::{FlowKey, StatisticsManager},
     },
-    session::Network,
 };
 
 // ---------------------------------------------------------------------------
@@ -148,19 +147,11 @@ pub(crate) async fn build_flow_records(
 
     // 2. Aggregate active connections
     for info in active.iter() {
-        let dst_host = info.session_holder.destination.host();
-        let dst_port = info.session_holder.destination.port();
-        let is_tcp = matches!(info.session_holder.network, Network::Tcp);
-
         let upload = info.upload_total();
         let download = info.download_total();
         let src_ip = info.session_holder.source.ip();
 
-        let key = FlowKey {
-            dst_host,
-            dst_port,
-            is_tcp,
-        };
+        let key = FlowKey::from(&info.session_holder);
 
         if let Some(acc) = map.get_mut(&key) {
             acc.conn_count += 1;
@@ -346,7 +337,74 @@ pub async fn ws_handle(
 mod tests {
     use super::*;
     use crate::app::api::StreamSamplers;
-    use crate::app::dispatcher::Manager;
+    use crate::app::dispatcher::{Manager, TrackerInfo};
+    use crate::session::{Network, Session};
+
+    #[tokio::test]
+    async fn test_real_ip_flows_use_connection_display_host() {
+        for network in [Network::Tcp, Network::Udp] {
+            let mgr = Manager::new();
+            let cases = [
+                (Some("sniffed.example"), Some("mapped.example"),
+                    "sniffed.example"),
+                (Some("sniffed.example"), None, "sniffed.example"),
+                (Some("other.example"), None, "other.example"),
+                (None, Some("mapped.example"), "mapped.example"),
+                (None, None, "192.0.2.1"),
+            ];
+            for (index, (sniffed, mapped, expected)) in
+                cases.into_iter().enumerate()
+            {
+                let sess = Session {
+                    id: index as u64 + 1,
+                    network,
+                    source: "192.0.2.2:12345".parse().unwrap(),
+                    destination: "192.0.2.1:443".parse().unwrap(),
+                    sniffed_domain: sniffed.map(str::to_string),
+                    mapped_domain: mapped.map(str::to_string),
+                    ..Default::default()
+                };
+                let metadata = serde_json::to_value(&sess).unwrap();
+                assert_eq!(metadata["host"], expected);
+                let tracker = Arc::new(TrackerInfo::new(&sess, None));
+                tracker.record_upload(10);
+                tracker.record_download(20);
+                let (close, _) = tokio::sync::oneshot::channel();
+                mgr.track(sess.id, tracker, close);
+            }
+            // Different sniffed domains sharing one real IP remain separate.
+            let active = build_flow_records(&mgr, 20, false).await;
+            assert_eq!(active.len(), 4);
+            let sniffed = active.iter()
+                .find(|flow| flow.dst_host == "sniffed.example").unwrap();
+            assert_eq!(sniffed.conn_count, 2);
+            assert_eq!(sniffed.active_count, 2);
+            assert_eq!(sniffed.bytes_total, 60);
+            for (_, _, host) in cases {
+                assert!(active.iter().any(|flow| flow.dst_host == host));
+            }
+
+            // Closing a connection must preserve its domain key and byte totals.
+            mgr.untrack(1);
+            let combined = build_flow_records(&mgr, 20, true).await;
+            assert_eq!(combined.len(), 4);
+            let sniffed = combined.iter()
+                .find(|flow| flow.dst_host == "sniffed.example").unwrap();
+            assert_eq!(sniffed.conn_count, 2);
+            assert_eq!(sniffed.active_count, 1);
+            assert_eq!(sniffed.closed_count, 1);
+            assert_eq!(sniffed.upload_total, 20);
+            assert_eq!(sniffed.download_total, 40);
+
+            mgr.untrack(2);
+            let closed = build_flow_records(&mgr, 20, true).await;
+            let sniffed = closed.iter()
+                .find(|flow| flow.dst_host == "sniffed.example").unwrap();
+            assert_eq!(sniffed.active_count, 0);
+            assert_eq!(sniffed.closed_count, 2);
+            assert_eq!(sniffed.bytes_total, 60);
+        }
+    }
 
     #[tokio::test]
     async fn test_subscribe_flows_broadcast() {

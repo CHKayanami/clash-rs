@@ -125,7 +125,16 @@ async fn concurrent_broken_session_retries_share_one_dial() {
 }
 
 #[tokio::test]
-async fn udp_request_precedes_v2_stream_ack() {
+async fn udp_first_packet_precedes_v2_stream_ack() {
+    udp_first_packet_ack(false).await;
+}
+
+#[tokio::test]
+async fn udp_late_stream_rejection_is_reported() {
+    udp_first_packet_ack(true).await;
+}
+
+async fn udp_first_packet_ack(reject: bool) {
     timeout(Duration::from_secs(2), async {
         let handler = make_handler(true, false);
         let (client, mut server) = duplex(65536);
@@ -139,18 +148,16 @@ async fn udp_request_precedes_v2_stream_ack() {
             let dest = SocksAddr::domain_name(UDP_OVER_TCP_V2_MAGIC_HOST, 0);
             let mut expected = BytesMut::new();
             dest.write_buf(&mut expected);
-            expected.extend_from_slice(&encode_uot_packet_request());
+            let target = "192.0.2.1:53".parse().unwrap();
+            expected.extend_from_slice(&encode_uot_packet_request(&target));
             let stream_id = loop {
                 let (command, id, data) = read_frame_raw(&mut server).await;
                 if command == Command::Psh as u8 {
-                    // Like sing-box, do not acknowledge until UoT setup is read.
+                    // Read UoT setup before routing the UDP connection.
                     assert_eq!(data, expected.as_ref());
                     break id;
                 }
             };
-            let mut ack = BytesMut::new();
-            Frame::control(Command::SynAck, stream_id).encode_into(&mut ack);
-            server.write_all(&ack).await.unwrap();
             let mut expected_packet = vec![0, 192, 0, 2, 1, 0, 53, 0, 8];
             expected_packet.extend_from_slice(b"dns-test");
             let mut packet = Vec::new();
@@ -165,9 +172,18 @@ async fn udp_request_precedes_v2_stream_ack() {
                     assert_eq!(packet, expected_packet[..packet.len()]);
                     if packet.len() < expected_packet.len() { continue; }
                     assert_eq!(packet_frames, 1, "small UDP packet must use one PSH");
+                    // sing-box can sniff the first datagram before opening its
+                    // outbound and reporting handshake success.
                     let mut reply = BytesMut::new();
-                    Frame::with_data(Command::Psh, id, Bytes::from(packet))
-                        .encode_into(&mut reply);
+                    if reject {
+                        Frame::with_data(Command::SynAck, id,
+                            Bytes::from_static(b"UDP route rejected"),
+                        ).encode_into(&mut reply);
+                    } else {
+                        Frame::control(Command::SynAck, stream_id).encode_into(&mut reply);
+                        Frame::with_data(Command::Psh, id, Bytes::from(packet))
+                            .encode_into(&mut reply);
+                    }
                     server.write_all(&reply).await.unwrap();
                     break;
                 }
@@ -183,13 +199,25 @@ async fn udp_request_precedes_v2_stream_ack() {
                 CountingConnector::default(),
             )),
         ).await.unwrap();
+        let read_error = datagram.read_error_handle().unwrap();
         let (mut sink, mut stream) = datagram.split();
         sink.send(UdpPacket::new(
             Bytes::from_static(b"dns-test"), SocksAddr::any_ipv4(),
             sess.destination.clone(),
         )).await.unwrap();
-        let reply = stream.next().await.unwrap();
-        assert_eq!(reply.data, Bytes::from_static(b"dns-test"));
+        if reject {
+            assert!(stream.next().await.is_none());
+            let error = read_error.get().unwrap();
+            assert_eq!(error.kind(), io::ErrorKind::ConnectionRefused);
+            assert!(error.to_string().contains("UDP route rejected"));
+            assert!(sink.send(UdpPacket::new(
+                Bytes::from_static(b"retry"), SocksAddr::any_ipv4(),
+                sess.destination.clone(),
+            )).await.is_err());
+        } else {
+            let reply = stream.next().await.unwrap();
+            assert_eq!(reply.data, Bytes::from_static(b"dns-test"));
+        }
         server.await.unwrap();
     }).await.unwrap();
 }

@@ -1037,8 +1037,13 @@ impl AnyTlsClientSession {
         }
 
         let mut ack_rx = ack_rx;
-        if self.peer_version.load(Ordering::Relaxed) >= PEER_VERSION_V2 {
-            // 确认是 v2 后，后续流再等待 SynAck
+        // UoT routing can read the first datagram before acknowledging the stream.
+        // Return after setup so the caller can send it; remote rejection still
+        // reaches the stream through err_rx and is checked on reads and writes.
+        if initial_data.is_empty()
+            && self.peer_version.load(Ordering::Relaxed) >= PEER_VERSION_V2
+        {
+            // 确认是 v2 后，普通 TCP 流等待 SynAck
             match tokio::time::timeout(std::time::Duration::from_secs(10), &mut ack_rx).await {
                 Ok(Ok(Ok(()))) => {}
                 Ok(Ok(Err(err_msg))) => {
