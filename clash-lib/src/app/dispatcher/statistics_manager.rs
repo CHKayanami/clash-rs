@@ -196,6 +196,9 @@ impl TrackGuard {
     pub fn new(id: u64, manager: Arc<Manager>) -> Self {
         Self { id, manager }
     }
+
+    /// Signal the owner without untracking bytes still retained by pending I/O.
+    pub(crate) fn request_close(&self) { self.manager.close(self.id); }
 }
 
 impl Drop for TrackGuard {

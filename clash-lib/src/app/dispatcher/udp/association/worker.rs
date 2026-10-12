@@ -5,23 +5,14 @@ use tokio::{sync::{mpsc, oneshot}, time::{Instant, Sleep, sleep}};
 use tracing::{debug, warn};
 
 use crate::{common::io::datagram_relay::RelayContext, proxy::datagram::UdpPacket, session::SocksAddr};
-use super::{AssociationConfig, Control, Outgoing, flow::FlowState, traffic::UdpTraffic};
+use super::{AssociationConfig, Registration, Outgoing, flow::FlowState, traffic::UdpTraffic, peer::PeerTable};
 
 const CONTROL_BUDGET: usize = 32;
-const MAX_PEERS: usize = 16384;
-
-struct Peer {
-    original: SocksAddr,
-    flow: Option<u64>,
-    // The current owner stays inline; only aliases shared by flows allocate.
-    other_flows: Vec<u64>,
-}
-
 pub(super) struct AssociationRelay {
     packets: mpsc::Receiver<Outgoing>,
-    commands: mpsc::Receiver<Control>,
+    commands: mpsc::Receiver<Registration>,
     flows: HashMap<u64, Arc<FlowState>>,
-    peers: HashMap<SocksAddr, Peer>,
+    peers: PeerTable,
     closing: FuturesUnordered<BoxFuture<'static, u64>>,
     sending: Option<Arc<FlowState>>,
     last_sender: Option<Arc<FlowState>>,
@@ -40,12 +31,12 @@ pub(super) struct AssociationRelay {
 }
 
 impl AssociationRelay {
-    pub(super) fn new(packets: mpsc::Receiver<Outgoing>, commands: mpsc::Receiver<Control>,
+    pub(super) fn new(packets: mpsc::Receiver<Outgoing>, commands: mpsc::Receiver<Registration>,
         config: &AssociationConfig, source: SocketAddr, user: Option<Arc<str>>,
         force_source: Option<SocksAddr>, native: bool,
     ) -> Self {
         Self {
-            packets, commands, flows: HashMap::new(), peers: HashMap::new(),
+            packets, commands, flows: HashMap::new(), peers: PeerTable::default(),
             closing: FuturesUnordered::new(), sending: None, last_sender: None, sender_cache_valid: false,
             replies: config.replies.clone(), source, allow_quic: config.allow_quic.clone(),
             traffic: UdpTraffic::new(config.manager.clone(), user.as_ref()), force_source, user, native,
@@ -58,40 +49,12 @@ impl AssociationRelay {
             flow.close();
             self.last_sender = None;
             self.sender_cache_valid = false;
-            for alias in &flow.aliases {
-                if let Some(peer) = self.peers.get_mut(alias) {
-                    peer.other_flows.retain(|owner| *owner != id
-                        && self.flows.get(owner).is_some_and(|flow| !flow.is_closed()));
-                    if peer.flow == Some(id)
-                        || peer.flow.is_some_and(|owner| !self.flows.get(&owner).is_some_and(|flow| !flow.is_closed())) {
-                        peer.flow = peer.other_flows.pop();
-                    }
-                }
-            }
+            self.peers.remove(&flow, &self.flows);
         }
     }
 
     fn register(&mut self, state: Arc<FlowState>, close_rx: oneshot::Receiver<()>) -> io::Result<()> {
-        if state.aliases.iter().any(|alias| self.peers.get(alias)
-            .is_some_and(|peer| peer.original != state.original)) {
-            return Err(io::Error::new(io::ErrorKind::AlreadyExists, "ambiguous UDP reply address"));
-        }
-        let additional = state.aliases.iter().filter(|alias| !self.peers.contains_key(*alias)).count();
-        if self.peers.len() + additional > MAX_PEERS {
-            return Err(io::Error::new(io::ErrorKind::OutOfMemory, "UDP reply mapping limit reached"));
-        }
-        for alias in &state.aliases {
-            match self.peers.get_mut(alias) {
-                Some(peer) => {
-                    if let Some(previous) = peer.flow.replace(state.id) {
-                        peer.other_flows.push(previous);
-                    }
-                },
-                None => { self.peers.insert(alias.clone(), Peer {
-                    original: state.original.clone(), flow: Some(state.id), other_flows: Vec::new(),
-                }); }
-            }
-        }
+        self.peers.register(&state)?;
         self.last_sender = None;
         self.sender_cache_valid = false;
         let id = state.id;
@@ -128,12 +91,14 @@ impl RelayContext for AssociationRelay {
         }
         for _ in 0..CONTROL_BUDGET {
             match self.commands.poll_recv(cx) {
-                Poll::Ready(Some(Control::Register { state, close_rx, reply })) => {
+                Poll::Ready(Some(Registration { state, close_rx, reply })) => {
                     let id = state.id;
                     let result = self.register(state, close_rx);
                     if reply.send(result).is_err() { self.remove(id); }
+                    // Newly pushed close futures must be polled to subscribe
+                    // their receivers before this relay becomes idle.
+                    cx.waker().wake_by_ref();
                 }
-                Poll::Ready(Some(Control::Remove(id))) => self.remove(id),
                 _ => return true,
             }
         }
@@ -151,22 +116,16 @@ impl RelayContext for AssociationRelay {
                     let Some(flow) = flow else { continue; };
                     if flow.is_closed() { self.remove(outgoing.id); continue; }
                     if !cached {
-                        for alias in &flow.aliases {
-                            if let Some(peer) = self.peers.get_mut(alias) && peer.flow != Some(outgoing.id)
-                                && let Some(index) = peer.other_flows.iter().position(|&owner| owner == outgoing.id) {
-                                match peer.flow.replace(outgoing.id) {
-                                    Some(previous) => peer.other_flows[index] = previous,
-                                    None => { peer.other_flows.swap_remove(index); },
-                                }
-                            }
-                        }
+                        self.peers.select_sender(&flow);
                     }
                     // Move the retained state between the send and cache. A
                     // Pending send still owns it, without per-packet Arc churn.
+                    let mut packet = outgoing.packet;
+                    if packet.dst_addr != flow.target { packet.dst_addr = flow.target.clone(); }
                     self.sending = Some(flow);
                     self.sender_cache_valid = true;
                     self.last_active = Instant::now();
-                    return Poll::Ready(Some(outgoing.packet));
+                    return Poll::Ready(Some(packet));
                 }
                 Poll::Ready(None) => return Poll::Ready(None),
                 Poll::Pending => return Poll::Pending,
@@ -206,13 +165,13 @@ impl RelayContext for AssociationRelay {
         if let SocksAddr::Ip(addr) = &mut packet.src_addr { addr.set_ip(addr.ip().to_canonical()); }
         // Endpoint-independent filtering: unknown peers are admitted too.
         // This table restores addresses and attributes bytes; it is not an allowlist.
-        let peer = self.peers.get(&packet.src_addr);
-        let flow = peer.and_then(|peer| peer.flow).and_then(|id| self.flows.get(&id))
+        let (owner, original) = self.peers.reply(&packet.src_addr);
+        let flow = owner.and_then(|id| self.flows.get(&id))
             .filter(|flow| !flow.is_closed());
         if let Some(flow) = flow {
             flow.tracker.record_download(packet.data.len());
         }
-        let original = self.force_source.as_ref().or_else(|| peer.map(|peer| &peer.original));
+        let original = self.force_source.as_ref().or(original);
         if let Some(original) = original && packet.src_addr != *original {
             packet.src_addr = original.clone();
         }

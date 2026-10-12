@@ -13,7 +13,7 @@ pub const REDIRECT_REFRESH_NS: u64 = 1_000_000_000;
 
 #[inline(always)]
 fn udp_reply_expired(entry: &UdpReplyEntry, now: u64) -> bool {
-    now.wrapping_sub(entry.route.last_seen_ns)
+    now.saturating_sub(entry.route.last_seen_ns)
         > UDP_CONN_TIMEOUT_NS + REDIRECT_REFRESH_NS
 }
 
@@ -22,7 +22,10 @@ fn udp_reply_expired(entry: &UdpReplyEntry, now: u64) -> bool {
 pub fn udp_reply_update(old: Option<&UdpReplyEntry>, route: RedirectEntry,
     now: u64,
 ) -> Option<UdpReplyEntry> {
-    let mut new = UdpReplyEntry { route, ambiguous: 0, _pad: [0; 7] };
+    if old.is_some_and(|old| old.retired != 0) { return None; }
+    // A packet may have sampled time before waiting for another CPU's update.
+    let now = old.map_or(now, |old| now.max(old.route.last_seen_ns));
+    let mut new = UdpReplyEntry { route, ambiguous: 0, retired: 0, _pad: [0; 6] };
     if let Some(old) = old.filter(|old| !udp_reply_expired(old, now)) {
         new.ambiguous = old.ambiguous;
         if old.route.ifindex != route.ifindex || old.route.from_wan != route.from_wan {
@@ -40,8 +43,18 @@ pub fn udp_reply_update(old: Option<&UdpReplyEntry>, route: RedirectEntry,
 
 #[inline(always)]
 pub fn udp_reply_route(entry: &UdpReplyEntry, now: u64) -> Option<RedirectEntry> {
-    if entry.ambiguous != 0 || udp_reply_expired(entry, now) { None }
+    if entry.retired != 0 || entry.ambiguous != 0 || udp_reply_expired(entry, now) { None }
     else { Some(entry.route) }
+}
+
+/// Only the first collector claims deletion. Other collectors and publishers
+/// must leave this tombstone alone until that collector removes it.
+#[inline(always)]
+pub fn udp_reply_retire(entry: &mut UdpReplyEntry, now: u64) -> bool {
+    if entry.retired == 0 && udp_reply_expired(entry, now) {
+        entry.retired = 1;
+        true
+    } else { false }
 }
 
 /// Update complete values atomically only when metadata or UDP age changes.
@@ -149,6 +162,31 @@ mod tests {
             let replacement = udp_reply_update(Some(&conflict), route, now).unwrap();
             assert_eq!(udp_reply_route(&replacement, now), Some(replacement.route));
         }
+    }
+
+    #[test]
+    fn stale_packet_timestamps_cannot_expire_or_rewind_a_newer_route() {
+        let route = RedirectEntry { ifindex: 3, from_wan: 1, ..Default::default() };
+        let current = udp_reply_update(None, route, 2 * REDIRECT_REFRESH_NS).unwrap();
+        assert!(udp_reply_route(&current, REDIRECT_REFRESH_NS).is_some());
+        assert!(udp_reply_update(Some(&current), route, REDIRECT_REFRESH_NS).is_none());
+        let conflict = udp_reply_update(Some(&current), RedirectEntry { ifindex: 4, ..route },
+            REDIRECT_REFRESH_NS).unwrap();
+        assert_eq!(conflict.ambiguous, 1);
+        assert_eq!(conflict.route.last_seen_ns, current.route.last_seen_ns);
+    }
+
+    #[test]
+    fn only_one_collector_can_claim_an_expired_entry_and_publishers_cannot_revive_it() {
+        let route = RedirectEntry { ifindex: 3, ..Default::default() };
+        let mut entry = udp_reply_update(None, route, 10).unwrap();
+        let now = 10 + UDP_CONN_TIMEOUT_NS + REDIRECT_REFRESH_NS + 1;
+        assert!(udp_reply_retire(&mut entry, now));
+        assert!(!udp_reply_retire(&mut entry, now));
+        assert!(udp_reply_update(Some(&entry), route, now).is_none());
+        assert!(udp_reply_route(&entry, now).is_none());
+        // A subsequent NOEXIST insertion creates a distinct, live value.
+        assert!(udp_reply_route(&udp_reply_update(None, route, now).unwrap(), now).is_some());
     }
 
     #[test]

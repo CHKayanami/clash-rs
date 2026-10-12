@@ -94,14 +94,15 @@ impl UdpReplyKey {
     }
 }
 
-/// Copy the complete value before updating its LRU map; map pointers must not
-/// survive replacement. Conflicting live interfaces disable client-only lookup.
+/// Snapshot of a client route, serialized by its kernel per-entry spin lock.
+/// A retired entry cannot be refreshed while its collector removes the key.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct UdpReplyEntry {
     pub route: RedirectEntry,
     pub ambiguous: u8,
-    pub _pad: [u8; 7],
+    pub retired: u8,
+    pub _pad: [u8; 6],
 }
 
 pub const DIRECT_TRACK_STATE_ACTIVE: u8 = 0;

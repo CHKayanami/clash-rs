@@ -1,5 +1,6 @@
 //! UDP routes are leases; one worker owns each physical client association.
 mod flow;
+mod peer;
 mod semantics;
 mod lifecycle;
 mod traffic;
@@ -147,33 +148,36 @@ impl UdpAssociationPool {
             mark: sess.so_mark,
             isolated: FlowIsolation::select(sess.id, isolation, unresolved_fake, sess.source.port()),
         };
-        let slot = self.slot(key, outbound);
-        let _empty = EmptySlotGuard(slot.clone());
-        let mut current = slot.association.lock().await;
-        let (association, reused) = match current.as_ref().filter(|a| !a.outgoing.is_closed()) {
-            Some(a) => (a.clone(), true),
-            None => {
-                let permit = self.config.capacity.clone().try_acquire_owned()
-                    .map_err(|_| io::Error::new(io::ErrorKind::OutOfMemory, "UDP association limit reached"))?;
-                let datagram = match outbound {
-                    ProtocolOutbound::Direct(handler) => handler.connect_datagram_unpooled(sess)?,
-                    _ => outbound.connect_datagram(sess, resolver.clone()).await?,
-                };
-                if !datagram.supports_multi_target() && slot.key.isolated.is_none() {
-                    drop(current);
-                    // Install fixed-target transports under a private key.
-                    let mut private_key = slot.key.clone();
-                    private_key.isolated = Some(FlowIsolation::new(sess.id, IsolationReason::FixedTarget));
-                    self.shard(&slot.key).lock().remove(&slot.key);
-                    let private_slot = self.slot(private_key, outbound);
-                    return self.install_private(private_slot, datagram, sess, tracker, resolved, unresolved_fake, permit).await;
-                }
-                let association = self.start(&slot, datagram, sess, unresolved_fake, permit)?;
-                *current = Some(association.clone());
-                (association, false)
+        let (association, reused) = loop {
+            let slot = self.slot(key.clone(), outbound);
+            let _empty = EmptySlotGuard(slot.clone());
+            let mut current = slot.association.lock().await;
+            // A waiter may hold a slot removed while it awaited the dial lock.
+            // Claim the generation under the same shard lock as worker cleanup.
+            let live = current.as_ref().filter(|a| !a.outgoing.is_closed());
+            let Some(generation) = self.claim(&slot, live.map(|a| a.id)) else { continue; };
+            if let Some(association) = live {
+                break (association.clone(), true);
             }
+            current.take();
+            let permit = self.config.capacity.clone().try_acquire_owned()
+                .map_err(|_| io::Error::new(io::ErrorKind::OutOfMemory, "UDP association limit reached"))?;
+            let datagram = match outbound {
+                ProtocolOutbound::Direct(handler) => handler.connect_datagram_unpooled(sess)?,
+                _ => outbound.connect_datagram(sess, resolver.clone()).await?,
+            };
+            if !datagram.supports_multi_target() && slot.key.isolated.is_none() {
+                let mut private_key = slot.key.clone();
+                private_key.isolated = Some(FlowIsolation::new(sess.id, IsolationReason::FixedTarget));
+                self.retire(&slot, generation);
+                drop(current);
+                let private_slot = self.slot(private_key, outbound);
+                return self.install_private(private_slot, datagram, sess, tracker, resolved, unresolved_fake, permit).await;
+            }
+            let association = self.start(&slot, generation, datagram, sess, unresolved_fake, permit)?;
+            *current = Some(association.clone());
+            break (association, false);
         };
-        drop(current);
         let result = self.register(&association, sess, tracker.clone(), resolved, fake || direct).await;
         match result {
             Ok(flow) => {
@@ -192,15 +196,43 @@ impl UdpAssociationPool {
         sess: &Session, tracker: Arc<TrackerInfo>, resolved: Option<IpAddr>,
         unresolved_fake: bool, permit: OwnedSemaphorePermit,
     ) -> io::Result<UdpFlow> {
-        let _empty = EmptySlotGuard(slot.clone());
-        let association = self.start(&slot, datagram, sess, unresolved_fake, permit)?;
-        *slot.association.lock().await = Some(association.clone());
-        self.register(&association, sess, tracker, resolved, false).await
+        let mut slot = slot;
+        loop {
+            let _empty = EmptySlotGuard(slot.clone());
+            let mut current = slot.association.lock().await;
+            let Some(generation) = self.claim(&slot, None) else {
+                drop(current);
+                let replacement = self.slot(slot.key.clone(), &slot._outbound);
+                drop(_empty);
+                slot = replacement;
+                continue;
+            };
+            current.take();
+            let association = self.start(&slot, generation, datagram, sess, unresolved_fake, permit)?;
+            *current = Some(association.clone());
+            drop(current);
+            return self.register(&association, sess, tracker, resolved, false).await;
+        }
     }
 
-    fn start(self: &Arc<Self>, slot: &Arc<Slot>, datagram: AnyOutboundDatagram,
+    fn claim(&self, slot: &Arc<Slot>, live_generation: Option<u64>) -> Option<u64> {
+        let slots = self.shard(&slot.key).lock();
+        if !slots.get(&slot.key).is_some_and(|current| Arc::ptr_eq(current, slot)) { return None; }
+        let generation = live_generation.unwrap_or_else(generate_session_id);
+        slot.generation.store(generation, Ordering::Relaxed);
+        Some(generation)
+    }
+
+    fn retire(&self, slot: &Arc<Slot>, generation: u64) {
+        let mut slots = self.shard(&slot.key).lock();
+        if slot.generation.load(Ordering::Relaxed) == generation
+            && slots.get(&slot.key).is_some_and(|current| Arc::ptr_eq(current, slot)) {
+            slots.remove(&slot.key);
+        }
+    }
+
+    fn start(self: &Arc<Self>, slot: &Arc<Slot>, id: u64, datagram: AnyOutboundDatagram,
         sess: &Session, unresolved_fake: bool, permit: OwnedSemaphorePermit) -> io::Result<Arc<Association>> {
-        let id = generate_session_id();
         let (close_tx, close_rx) = oneshot::channel();
         let guard = self.config.manager.register_udp_association(id, close_tx);
         let (outgoing, packets) = mpsc::channel(QUEUE_CAPACITY);
@@ -209,13 +241,12 @@ impl UdpAssociationPool {
             sess.orig_destination.clone().unwrap_or_else(|| sess.destination.clone()));
         let context = AssociationRelay::new(packets, commands, &self.config,
             sess.source, sess.inbound_user.clone(), force_source, matches!(datagram, AnyOutboundDatagram::Udp(_) | AnyOutboundDatagram::NativeUdp(_)));
-        slot.generation.store(id, Ordering::Relaxed);
         let cleanup = WorkerGuard(Arc::downgrade(slot), id);
         let task = dispatch_datagram!(datagram, |inner| tokio::spawn(async move {
             let (_permit, _guard, _cleanup) = (permit, guard, cleanup);
             tokio::select! { _ = relay(inner, context) => {}, _ = close_rx => {} }
         }));
-        Ok(Arc::new(Association { outgoing, control, chain: sess.proxy_chain.snapshot(), task }))
+        Ok(Arc::new(Association { id, outgoing, control, chain: sess.proxy_chain.snapshot(), task }))
     }
 
     async fn register(&self, association: &Arc<Association>, sess: &Session,
@@ -241,7 +272,7 @@ impl UdpAssociationPool {
         let (close_tx, close_rx) = oneshot::channel();
         self.config.manager.track(sess.id, tracker, close_tx);
         let (tx, rx) = oneshot::channel();
-        association.control.send(Control::Register { state: state.clone(), close_rx, reply: tx })
+        association.control.send(Registration { state: state.clone(), close_rx, reply: tx })
             .await.map_err(|_| closed())?;
         rx.await.map_err(|_| closed())??;
         Ok(UdpFlow { state, association: association.clone() })
@@ -249,14 +280,14 @@ impl UdpAssociationPool {
 }
 
 struct Association {
-    outgoing: mpsc::Sender<Outgoing>, control: mpsc::Sender<Control>,
+    id: u64,
+    outgoing: mpsc::Sender<Outgoing>, control: mpsc::Sender<Registration>,
     chain: Vec<String>, task: JoinHandle<()>,
 }
 impl Drop for Association { fn drop(&mut self) { self.task.abort(); } }
 struct Outgoing { id: u64, packet: UdpPacket }
-enum Control {
-    Register { state: Arc<FlowState>, close_rx: oneshot::Receiver<()>, reply: oneshot::Sender<io::Result<()>> },
-    Remove(u64),
+struct Registration {
+    state: Arc<FlowState>, close_rx: oneshot::Receiver<()>, reply: oneshot::Sender<io::Result<()>>,
 }
 fn closed() -> io::Error { io::Error::new(io::ErrorKind::BrokenPipe, "UDP association closed") }
 

@@ -2,7 +2,7 @@ use std::{net::SocketAddr, sync::{Arc, atomic::{AtomicBool, AtomicU64, Ordering}
 use tokio::{sync::mpsc, time::Instant};
 
 use crate::{app::dispatcher::{TrackGuard, TrackerInfo}, proxy::datagram::UdpPacket, session::SocksAddr};
-use super::{Association, Control, Outgoing};
+use super::{Association, Outgoing};
 
 pub(crate) struct ReplyActivity {
     epoch: Instant,
@@ -49,6 +49,10 @@ pub(super) struct FlowState {
 
 impl FlowState {
     pub fn is_closed(&self) -> bool { self.closed.load(Ordering::Relaxed) }
+    fn request_close(&self) {
+        self.closed.store(true, Ordering::Relaxed);
+        self._guard.request_close();
+    }
     pub fn close(&self) {
         if !self.closed.swap(true, Ordering::Relaxed) {
             let _ = self.events.send(FlowClosed {
@@ -71,11 +75,12 @@ impl UdpFlow {
     pub(crate) fn reply_activity(&self) -> Arc<ReplyActivity> {
         self.state.activity.clone()
     }
-    pub(crate) fn try_send(&self, mut packet: UdpPacket) -> Result<(), mpsc::error::TrySendError<UdpPacket>> {
+    pub(crate) fn try_send(&self, packet: UdpPacket) -> Result<(), mpsc::error::TrySendError<UdpPacket>> {
         if self.is_closed() {
             return Err(mpsc::error::TrySendError::Closed(packet));
         }
-        if packet.dst_addr != self.state.target { packet.dst_addr = self.state.target.clone(); }
+        // Preserve the inbound address on admission failure. The worker applies
+        // the physical target only after accepting this logical-flow packet.
         self.association.outgoing.try_send(Outgoing {
             id: self.state.id, packet,
         }).map_err(|err| match err {
@@ -87,8 +92,7 @@ impl UdpFlow {
 
 impl Drop for UdpFlow {
     fn drop(&mut self) {
-        self.state.closed.store(true, Ordering::Relaxed);
-        let _ = self.association.control.try_send(Control::Remove(self.state.id));
+        self.state.request_close();
     }
 }
 

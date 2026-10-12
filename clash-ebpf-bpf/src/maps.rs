@@ -1,11 +1,12 @@
 use crate::transport::ParsedPacket;
+use crate::udp_reply::ReplyValue;
 use aya_ebpf::btf_maps::{
     Array, HashMap, LpmTrie, LruHashMap, PerCpuArray, RingBuf, SkStorage, SockMap,
 };
 use aya_ebpf::macros::btf_map;
 use clash_ebpf_common::{
     DaeEvent, DaeParam, DirectTrackEntry, PIDName, ParseTransportCtx, RedirectEntry,
-    RedirectTuple, UdpReplyEntry, UdpReplyKey,
+    RedirectTuple, UdpReplyKey,
 };
 
 #[btf_map]
@@ -62,10 +63,14 @@ pub static DYNAMIC_BYPASS_DST_IP6S: LruHashMap<[u8; 16], u8, 16384> =
 pub static REDIRECT_TRACK: LruHashMap<RedirectTuple, RedirectEntry, 32768> =
     LruHashMap::new();
 
-/// Only populated by redirected UDP requests; shared by their target flows.
+/// Per-client locks require a hash map: kernel LRU maps cannot hold spin locks.
+/// Only redirected requests create entries; expired entries are collected on pressure.
 #[btf_map]
-pub static UDP_REPLY_TRACK: LruHashMap<UdpReplyKey, UdpReplyEntry, 32768> =
-    LruHashMap::new();
+pub static UDP_REPLY_TRACK: HashMap<UdpReplyKey, ReplyValue, 32768> =
+    HashMap::new();
+
+#[btf_map]
+pub static UDP_REPLY_GC_NS: PerCpuArray<u64, 1> = PerCpuArray::new();
 
 /// Connection tracking map for dynamic bypass flows (TCP/UDP sessions).
 #[btf_map]

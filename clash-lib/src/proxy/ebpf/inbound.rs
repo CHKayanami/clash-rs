@@ -7,6 +7,7 @@ use std::time::Duration;
 use tracing::{error, info, warn};
 
 use super::offloader::{DirectOffloader, RoutingAction};
+use super::reply::relay as relay_replies;
 use super::utils::resolve_and_aggregate_ip_cidrs;
 use crate::app::dispatcher::Dispatcher;
 use crate::app::dns::{DnsResolutionHook, ThreadSafeDNSResolver};
@@ -264,7 +265,7 @@ impl InboundHandlerTrait for EbpfInbound {
         info!("clash-ebpf UDP inbound worker running");
 
         const UDP_CHANNEL_CAPACITY: usize = 1024;
-        let (l_tx, mut l_rx) = tokio::sync::mpsc::channel::<UdpPacket>(UDP_CHANNEL_CAPACITY);
+        let (l_tx, l_rx) = tokio::sync::mpsc::channel::<UdpPacket>(UDP_CHANNEL_CAPACITY);
         let (d_tx, d_rx) = tokio::sync::mpsc::channel::<UdpPacket>(UDP_CHANNEL_CAPACITY);
 
         let udp_stream = ChannelDatagram::new(l_tx, d_rx);
@@ -283,75 +284,9 @@ impl InboundHandlerTrait for EbpfInbound {
                 .dispatch_datagram(sess, Box::new(udp_stream))
                 .await;
 
-            let listener_for_send = listener.clone();
             let mut tasks = tokio::task::JoinSet::new();
-            // Dispatcher -> client outbound reply task
-            tasks.spawn(async move {
-                let mut reply_sockets: std::collections::HashMap<
-                    std::net::SocketAddr,
-                    (std::sync::Arc<tokio::net::UdpSocket>, std::time::Instant),
-                > = std::collections::HashMap::with_capacity(128);
-                let mut reply_batch = Vec::with_capacity(32);
+            tasks.spawn(relay_replies(listener.clone(), l_rx));
 
-                while l_rx.recv_many(&mut reply_batch, 32).await > 0 {
-                    for packet in reply_batch.drain(..) {
-                        if let Some(client_target) = packet.dst_addr.try_into_socket_addr() {
-                            if let Some(orig_dst) = packet.src_addr.try_into_socket_addr() {
-                                let now = std::time::Instant::now();
-                                let reply_sock = if let Some((sock, exp)) = reply_sockets.get_mut(&orig_dst) {
-                                    if now < *exp {
-                                        *exp = now + std::time::Duration::from_secs(60);
-                                        Some(std::sync::Arc::clone(sock))
-                                    } else {
-                                        None
-                                    }
-                                } else {
-                                    None
-                                };
-
-                                let reply_sock = match reply_sock {
-                                    Some(s) => Some(s),
-                                    None => {
-                                        if reply_sockets.len() > 1024 {
-                                            reply_sockets.retain(|_, (_, exp)| now < *exp);
-                                        }
-                                        match listener_for_send.create_reply_socket(orig_dst) {
-                                            Ok(new_sock) => {
-                                                let sock_arc = std::sync::Arc::new(new_sock);
-                                                reply_sockets.insert(
-                                                    orig_dst,
-                                                    (
-                                                        std::sync::Arc::clone(&sock_arc),
-                                                        now + std::time::Duration::from_secs(60),
-                                                    ),
-                                                );
-                                                Some(sock_arc)
-                                            }
-                                            Err(e) => {
-                                                tracing::warn!("failed to create transparent reply socket for {orig_dst}: {e}");
-                                                None
-                                            }
-                                        }
-                                    }
-                                };
-
-                                if let Some(sock) = reply_sock {
-                                    let _ = sock.send_to(&packet.data, client_target).await;
-                                    continue;
-                                }
-                            }
-                            let socket = if client_target.is_ipv6() {
-                                listener_for_send.udp_socket_v6().unwrap_or_else(|| listener_for_send.udp_socket())
-                            } else {
-                                listener_for_send.udp_socket()
-                            };
-                            let _ = socket.send_to(&packet.data, client_target).await;
-                        }
-                    }
-                }
-            });
-
-            // Client inbound receive tasks -> Dispatcher / DNS
             let v4_socket = listener.udp_socket_v4();
             tasks.spawn(udp_listener_loop(
                 v4_socket,

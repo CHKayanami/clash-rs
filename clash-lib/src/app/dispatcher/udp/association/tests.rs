@@ -10,6 +10,8 @@ use crate::{
     session::Network,
 };
 
+mod regressions;
+
 fn resolver() -> ThreadSafeDNSResolver {
     let mut dns = MockClashResolver::new();
     dns.expect_is_fake_ip().returning(|_| false);
@@ -64,7 +66,7 @@ pub(crate) fn inert_flow() -> UdpFlow {
             original: sess.destination.clone(), aliases: vec![], tracker: Arc::new(TrackerInfo::new(&sess, None)),
             activity: Arc::new(ReplyActivity::new()), closed: AtomicBool::new(false), events,
             _guard: TrackGuard::new(sess.id, manager), }),
-        association: Arc::new(Association { outgoing, control, chain: vec![], task: tokio::spawn(std::future::pending()) }),
+        association: Arc::new(Association { id: 0, outgoing, control, chain: vec![], task: tokio::spawn(std::future::pending()) }),
     }
 }
 
@@ -506,23 +508,21 @@ async fn shared_routes_can_register_before_an_earlier_registration_is_acknowledg
     let (outgoing, _packets) = mpsc::channel(64);
     let (control, mut commands) = mpsc::channel(64);
     *slot.association.lock().await = Some(Arc::new(Association {
-        outgoing, control, chain: vec!["test-proxy".to_owned()], task: tokio::spawn(std::future::pending()),
+        id: 0, outgoing, control, chain: vec!["test-proxy".to_owned()], task: tokio::spawn(std::future::pending()),
     }));
     let pool = fixture.pool.clone();
     let leaf = outbound.clone();
     let pending = tokio::spawn(async move {
         pool.connect(&leaf, &first, resolver(), Arc::new(TrackerInfo::new(&first, None))).await
     });
-    let Control::Register { reply: first_ack, .. } = timeout(Duration::from_secs(2), commands.recv()).await.unwrap().unwrap()
-        else { panic!("expected registration"); };
+    let Registration { reply: first_ack, .. } = timeout(Duration::from_secs(2), commands.recv()).await.unwrap().unwrap();
     let pool = fixture.pool.clone();
     let second = tokio::spawn(async move {
         let sess = session(30002);
         pool.connect(&outbound, &sess, resolver(), Arc::new(TrackerInfo::new(&sess, None))).await
     });
-    let Control::Register { reply: second_ack, .. } = timeout(Duration::from_secs(2), commands.recv()).await
-        .expect("registration must not hold the slot lock while waiting for acknowledgment").unwrap()
-        else { panic!("expected registration"); };
+    let Registration { reply: second_ack, .. } = timeout(Duration::from_secs(2), commands.recv()).await
+        .expect("registration must not hold the slot lock while waiting for acknowledgment").unwrap();
     assert!(second_ack.send(Ok(())).is_ok());
     let second = timeout(Duration::from_secs(2), second).await.unwrap().unwrap().unwrap();
     assert!(first_ack.send(Ok(())).is_ok());
