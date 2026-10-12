@@ -24,6 +24,7 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use tracing::{debug, error, info, warn};
 
 mod static_bypass;
+mod tracking_gc;
 use static_bypass::StaticBypass;
 
 /// Keep inactive process tracking maps minimal; their BPF references still
@@ -273,6 +274,7 @@ pub struct BpfProgramManager {
     cgroup_sock_addr_links: Vec<CgroupSockAddrLink>,
     sk_lookup_link: Option<SkLookupLink>,
     event_abort: Option<tokio::task::AbortHandle>,
+    tracking_abort: Option<tokio::task::AbortHandle>,
     cap_batch_update: BatchCapability,
     cap_batch_delete: BatchCapability,
 }
@@ -289,6 +291,7 @@ impl BpfProgramManager {
             cgroup_sock_addr_links: Vec::new(),
             sk_lookup_link: None,
             event_abort: None,
+            tracking_abort: None,
             cap_batch_update: BatchCapability::new(),
             cap_batch_delete: BatchCapability::new(),
         }
@@ -760,6 +763,7 @@ impl BpfProgramManager {
             info!("Attached TC egress ({}) on {}", prog_name, wan);
         }
 
+        self.tracking_abort = Some(tracking_gc::start(self.bpf.as_ref().unwrap())?);
         info!("eBPF programs and TC/cgroup hooks successfully attached");
         Ok(())
     }
@@ -1275,6 +1279,8 @@ impl BpfProgramManager {
         if let Some(handle) = self.event_abort.take() {
             handle.abort();
         }
+
+        if let Some(handle) = self.tracking_abort.take() { handle.abort(); }
 
         // 1. In kernels < 6.6, Aya detaches TC filters via netlink.
         // dae0peer's TC filter was attached inside daens, so it must be detached inside daens.

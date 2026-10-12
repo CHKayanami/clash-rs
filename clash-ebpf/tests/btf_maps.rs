@@ -5,7 +5,7 @@
 use aya::programs::Program;
 use aya_obj::{Map, Object, generated::bpf_map_type::*};
 use clash_ebpf_common::{
-    DaeParam, DirectTrackEntry, PIDName, ParseTransportCtx, RedirectEntry,
+    DaeParam, PIDName, ParseTransportCtx,
     RedirectTuple,
 };
 use std::mem::size_of;
@@ -94,20 +94,9 @@ fn btf_map_definitions_match_userspace_abi() {
             16,
             Some(1),
         ),
-        (
-            "REDIRECT_TRACK",
-            BPF_MAP_TYPE_LRU_HASH,
-            32768,
-            size_of::<RedirectTuple>(),
-            Some(size_of::<RedirectEntry>()),
-        ),
-        (
-            "DIRECT_TRACK",
-            BPF_MAP_TYPE_LRU_HASH,
-            65536,
-            size_of::<RedirectTuple>(),
-            Some(size_of::<DirectTrackEntry>()),
-        ),
+        ("FLOW_TRACK", BPF_MAP_TYPE_HASH, 98304, size_of::<RedirectTuple>(), Some(28)),
+        ("FLOW_SCRATCH", BPF_MAP_TYPE_PERCPU_ARRAY, 1, 4, Some(64)),
+        ("UDP_REPLY_TRACK", BPF_MAP_TYPE_HASH, 32768, 24, Some(32)),
         ("TCP_SOCKET_POLICY", BPF_MAP_TYPE_SK_STORAGE, 0, 4, Some(4)),
         ("LISTEN_SOCKET_MAP", BPF_MAP_TYPE_SOCKMAP, 4, 4, Some(4)),
         (
@@ -156,6 +145,7 @@ fn btf_map_definitions_match_userspace_abi() {
         }
         let flags = if map_type == BPF_MAP_TYPE_LPM_TRIE
             || map_type == BPF_MAP_TYPE_SK_STORAGE
+            || matches!(name, "FLOW_TRACK" | "UDP_REPLY_TRACK")
         {
             1
         } else {

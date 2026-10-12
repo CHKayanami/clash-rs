@@ -9,8 +9,9 @@ fn panic(_: &core::panic::PanicInfo) -> ! {
 mod maps;
 mod transport;
 mod udp_reply;
+mod tracking;
 
-use aya_ebpf::bindings::{__sk_buff, TC_ACT_OK, bpf_sk_lookup};
+use aya_ebpf::bindings::{__sk_buff, TC_ACT_OK, TC_ACT_SHOT, bpf_sk_lookup};
 use aya_ebpf::btf_maps::lpm_trie::Key;
 use aya_ebpf::helpers::{bpf_get_current_pid_tgid, bpf_redirect};
 use aya_ebpf::macros::{cgroup_sock, cgroup_sock_addr};
@@ -19,13 +20,9 @@ use aya_ebpf_bindings::helpers::{
     bpf_get_current_comm, bpf_get_socket_cookie, bpf_ktime_get_ns, bpf_sk_fullsock,
     bpf_sk_storage_get, bpf_skb_change_head, bpf_skb_store_bytes,
 };
-use clash_ebpf_bpf::policy::{
-    REDIRECT_REFRESH_NS, RedirectTrackingAction, UDP_CONN_TIMEOUT_NS,
-    redirect_entry_needs_update, redirect_tracking_action,
-};
 use clash_ebpf_common::{
-    DAE_BYPASS_MARK, DAE_TPROXY_MARK, DIRECT_TRACK_STATE_ACTIVE, DaeEventType,
-    DaeParam, DirectTrackEntry, PIDName, RedirectEntry, RedirectTuple,
+    DAE_BYPASS_MARK, DAE_TPROXY_MARK, DaeEventType,
+    DaeParam, PIDName, RedirectEntry, RedirectTuple,
 };
 use core::mem;
 use maps::*;
@@ -37,9 +34,6 @@ const AF_INET6: u8 = 10;
 
 const SK_DROP: u32 = 0;
 const SK_PASS: u32 = 1;
-
-// ── Conntrack timeout constants ──
-const CONN_TRACK_UPDATE_INTERVAL_NS: u64 = REDIRECT_REFRESH_NS;
 
 // ── SOCKMAP key constants ──
 const SK_TCP4: u32 = 0;
@@ -215,98 +209,6 @@ fn is_dst_ip6_proxied(ip: &[u8; 16]) -> bool {
     PROXY_DST_IP6S.get(&key).is_some()
 }
 
-#[inline(always)]
-fn check_direct_track(
-    tuple: &RedirectTuple,
-    is_tcp: bool,
-    is_udp: bool,
-    is_fin_rst: bool,
-    is_pure_syn: bool,
-) -> bool {
-    if is_pure_syn {
-        return false;
-    }
-    if let Some(entry) = unsafe { DIRECT_TRACK.get(tuple) } {
-        if is_tcp {
-            if is_fin_rst {
-                let _ = DIRECT_TRACK.remove(tuple);
-            }
-            return true;
-        }
-        if is_udp {
-            let now = unsafe { bpf_ktime_get_ns() };
-            if now.wrapping_sub(entry.last_seen_ns) > UDP_CONN_TIMEOUT_NS {
-                let _ = DIRECT_TRACK.remove(tuple);
-                return false;
-            }
-            if now.wrapping_sub(entry.last_seen_ns) > CONN_TRACK_UPDATE_INTERVAL_NS {
-                let updated = DirectTrackEntry {
-                    last_seen_ns: now,
-                    state: DIRECT_TRACK_STATE_ACTIVE,
-                    _pad: [0; 7],
-                };
-                let _ = DIRECT_TRACK.insert(tuple, &updated, 0);
-            }
-            return true;
-        }
-    }
-    false
-}
-
-#[inline(always)]
-fn register_direct_track(tuple: &RedirectTuple) {
-    let now = unsafe { bpf_ktime_get_ns() };
-    let direct_entry = DirectTrackEntry {
-        last_seen_ns: now,
-        state: DIRECT_TRACK_STATE_ACTIVE,
-        _pad: [0; 7],
-    };
-    let _ = DIRECT_TRACK.insert(tuple, &direct_entry, 0);
-}
-
-/// A new TCP SYN starts a fresh decision for a reused tuple. UDP redirect
-/// entries expire like direct entries so they do not pin later datagrams forever.
-#[inline(always)]
-fn check_redirect_track(
-    tuple: &RedirectTuple,
-    is_udp: bool,
-    is_pure_syn: bool,
-) -> (Option<&'static RedirectEntry>, u64) {
-    if is_pure_syn {
-        let _ = DIRECT_TRACK.remove(tuple);
-        let _ = REDIRECT_TRACK.remove(tuple);
-        return (None, 0);
-    }
-    let entry = unsafe { REDIRECT_TRACK.get(tuple) };
-    let now = if is_udp {
-        unsafe { bpf_ktime_get_ns() }
-    } else {
-        0
-    };
-    if redirect_tracking_action(entry, is_udp, false, now)
-        == RedirectTrackingAction::Expired
-    {
-        let _ = REDIRECT_TRACK.remove(tuple);
-        return (None, now);
-    }
-    (entry, now)
-}
-
-#[inline(always)]
-fn publish_redirect_track(
-    tuple: &RedirectTuple,
-    old: Option<&RedirectEntry>,
-    mut entry: RedirectEntry,
-    is_udp: bool,
-    now: u64,
-) {
-    if is_udp { udp_reply::publish(tuple, entry, now); }
-    if redirect_entry_needs_update(old, &entry, is_udp, now) {
-        entry.last_seen_ns = if is_udp { now } else { 0 };
-        let _ = REDIRECT_TRACK.insert(tuple, &entry, 0);
-    }
-}
-
 /// Copy addresses as four aligned words in a separate subprogram. Keeping
 /// this out of the WAN control flow avoids spilling individual IPv6 bytes.
 #[inline(never)]
@@ -460,12 +362,6 @@ fn handle_lan_ipv4(
         pkt.tuples.five.src_ip[15],
     ];
 
-    let mut tuple = RedirectTuple::default();
-    packet_redirect_tuple(pkt, 4, &mut tuple);
-
-    let (tracked, track_now) = check_redirect_track(&tuple, is_udp, is_pure_syn);
-    let is_redirected = tracked.is_some();
-
     // 1. 源 IP / 源端口 静态 Bypass 与白名单判定
     if is_src_ip4_bypassed(src_ip_be) {
         return TC_ACT_OK;
@@ -495,18 +391,30 @@ fn handle_lan_ipv4(
         {
             return TC_ACT_OK;
         }
+    }
 
+    let mut tuple = RedirectTuple::default();
+    packet_redirect_tuple(pkt, 4, &mut tuple);
+
+    let Some(scratch) = FLOW_SCRATCH.get_ptr_mut(0) else { return TC_ACT_SHOT; };
+    let scratch = unsafe { &mut *scratch };
+    tracking::lookup_into(&tuple, is_pure_syn, is_fin_rst, &mut scratch.observed);
+    let tracked = &scratch.observed;
+    let is_redirected = tracked.is_redirect();
+
+    if dst_port != 53 {
         // 动态直连流表 Fast-Path 查询 (针对非纯 SYN 报文)
         if !is_redirected
-            && check_direct_track(&tuple, is_tcp, is_udp, is_fin_rst, is_pure_syn)
+            && tracked.is_direct()
         {
             return TC_ACT_OK;
         }
 
-        // 动态下发直连判定 (直连状态变化时更新，命中则建立 DIRECT_TRACK 连接追踪)
+        // 动态下发直连判定 (直连状态变化时更新，命中则建立统一五元组决策)
         if !is_redirected && is_dynamic_dst_ip4_bypassed(ip_be) {
-            register_direct_track(&tuple);
-            return TC_ACT_OK;
+            if tracking::publish_into(&tuple, tracked, None, &mut scratch.result) {
+                if scratch.result.is_direct() { return TC_ACT_OK; }
+            } else { return TC_ACT_SHOT; }
         }
 
         // 目标白名单过滤
@@ -527,17 +435,21 @@ fn handle_lan_ipv4(
         ([0u8; 6], [0u8; 6])
     };
     let entry = RedirectEntry {
-        last_seen_ns: 0,
         ifindex,
         from_wan: 0,
         _pad0: [0; 3],
         smac,
         dmac,
-        _pad1: [0; 4],
     };
     unsafe {
-        let is_new_flow = tracked.is_none();
-        publish_redirect_track(&tuple, tracked, entry, is_udp, track_now);
+        let is_new_flow = tracked.activity == 0;
+        if !tracked.matches_route(&entry) {
+            if !tracking::publish_into(&tuple, tracked, Some(&entry), &mut scratch.result) {
+                return TC_ACT_SHOT;
+            }
+            if scratch.result.is_direct() { return TC_ACT_OK; }
+        }
+        if is_udp { udp_reply::publish(&tuple, entry, bpf_ktime_get_ns()); }
         let l4proto = if pkt.l4proto == IPPROTO_TCP {
             pkt.listener_l4proto
         } else {
@@ -580,12 +492,6 @@ fn handle_lan_ipv6(
     let is_fin_rst = is_tcp && (pkt.tcph.fin() != 0 || pkt.tcph.rst() != 0);
 
     let dst_ip = pkt.tuples.five.dst_ip.as_bytes();
-    let mut tuple = RedirectTuple::default();
-    packet_redirect_tuple(pkt, 6, &mut tuple);
-
-    let (tracked, track_now) = check_redirect_track(&tuple, is_udp, is_pure_syn);
-    let is_redirected = tracked.is_some();
-
     // 1. 源 IP / 源端口 静态 Bypass 与白名单判定
     if is_src_ip6_bypassed(pkt.tuples.five.src_ip.as_bytes()) {
         return TC_ACT_OK;
@@ -612,18 +518,30 @@ fn handle_lan_ipv6(
         {
             return TC_ACT_OK;
         }
+    }
 
+    let mut tuple = RedirectTuple::default();
+    packet_redirect_tuple(pkt, 6, &mut tuple);
+
+    let Some(scratch) = FLOW_SCRATCH.get_ptr_mut(0) else { return TC_ACT_SHOT; };
+    let scratch = unsafe { &mut *scratch };
+    tracking::lookup_into(&tuple, is_pure_syn, is_fin_rst, &mut scratch.observed);
+    let tracked = &scratch.observed;
+    let is_redirected = tracked.is_redirect();
+
+    if dst_port != 53 {
         // 动态直连流表 Fast-Path 查询 (针对非纯 SYN 报文)
         if !is_redirected
-            && check_direct_track(&tuple, is_tcp, is_udp, is_fin_rst, is_pure_syn)
+            && tracked.is_direct()
         {
             return TC_ACT_OK;
         }
 
-        // 动态下发直连判定 (直连状态变化时更新，命中则建立 DIRECT_TRACK 连接追踪)
+        // 动态下发直连判定 (直连状态变化时更新，命中则建立统一五元组决策)
         if !is_redirected && is_dynamic_dst_ip6_bypassed(dst_ip) {
-            register_direct_track(&tuple);
-            return TC_ACT_OK;
+            if tracking::publish_into(&tuple, tracked, None, &mut scratch.result) {
+                if scratch.result.is_direct() { return TC_ACT_OK; }
+            } else { return TC_ACT_SHOT; }
         }
 
         // 目标白名单过滤
@@ -644,17 +562,21 @@ fn handle_lan_ipv6(
         ([0u8; 6], [0u8; 6])
     };
     let entry = RedirectEntry {
-        last_seen_ns: 0,
         ifindex,
         from_wan: 0,
         _pad0: [0; 3],
         smac,
         dmac,
-        _pad1: [0; 4],
     };
     unsafe {
-        let is_new_flow = tracked.is_none();
-        publish_redirect_track(&tuple, tracked, entry, is_udp, track_now);
+        let is_new_flow = tracked.activity == 0;
+        if !tracked.matches_route(&entry) {
+            if !tracking::publish_into(&tuple, tracked, Some(&entry), &mut scratch.result) {
+                return TC_ACT_SHOT;
+            }
+            if scratch.result.is_direct() { return TC_ACT_OK; }
+        }
+        if is_udp { udp_reply::publish(&tuple, entry, bpf_ktime_get_ns()); }
         let l4proto = if pkt.l4proto == IPPROTO_TCP {
             pkt.listener_l4proto
         } else {
@@ -766,12 +688,6 @@ fn handle_wan_ipv4(
         pkt.tuples.five.src_ip[15],
     ];
 
-    let mut tuple = RedirectTuple::default();
-    packet_redirect_tuple(pkt, 4, &mut tuple);
-
-    let (tracked, track_now) = check_redirect_track(&tuple, is_udp, is_pure_syn);
-    let is_redirected = tracked.is_some() || socket_was_proxied;
-
     // 1. 常规业务流量目标过滤 (DNS 53 强制劫持到代理)
     if dst_port != 53 {
         // 本机直连流量放行
@@ -785,18 +701,30 @@ fn handle_wan_ipv4(
         {
             return TC_ACT_OK;
         }
+    }
 
+    let mut tuple = RedirectTuple::default();
+    packet_redirect_tuple(pkt, 4, &mut tuple);
+
+    let Some(scratch) = FLOW_SCRATCH.get_ptr_mut(0) else { return TC_ACT_SHOT; };
+    let scratch = unsafe { &mut *scratch };
+    tracking::lookup_into(&tuple, is_pure_syn, is_fin_rst, &mut scratch.observed);
+    let tracked = &scratch.observed;
+    let is_redirected = tracked.is_redirect() || socket_was_proxied;
+
+    if dst_port != 53 {
         // 动态直连流表 Fast-Path 查询 (针对非纯 SYN 报文)
         if !is_redirected
-            && check_direct_track(&tuple, is_tcp, is_udp, is_fin_rst, is_pure_syn)
+            && tracked.is_direct()
         {
             return TC_ACT_OK;
         }
 
-        // 动态下发直连判定 (直连状态变化时更新，命中则建立 DIRECT_TRACK 连接追踪)
+        // 动态下发直连判定 (直连状态变化时更新，命中则建立统一五元组决策)
         if !is_redirected && is_dynamic_dst_ip4_bypassed(ip_be) {
-            register_direct_track(&tuple);
-            return TC_ACT_OK;
+            if tracking::publish_into(&tuple, tracked, None, &mut scratch.result) {
+                if scratch.result.is_direct() { return TC_ACT_OK; }
+            } else { return TC_ACT_SHOT; }
         }
 
         // 目标白名单过滤
@@ -817,17 +745,21 @@ fn handle_wan_ipv4(
         ([0u8; 6], [0u8; 6])
     };
     let entry = RedirectEntry {
-        last_seen_ns: 0,
         ifindex,
         from_wan: 1,
         _pad0: [0; 3],
         smac,
         dmac,
-        _pad1: [0; 4],
     };
     unsafe {
-        let is_new_flow = tracked.is_none();
-        publish_redirect_track(&tuple, tracked, entry, is_udp, track_now);
+        let is_new_flow = tracked.activity == 0;
+        if !tracked.matches_route(&entry) {
+            if !tracking::publish_into(&tuple, tracked, Some(&entry), &mut scratch.result) {
+                return TC_ACT_SHOT;
+            }
+            if scratch.result.is_direct() { return TC_ACT_OK; }
+        }
+        if is_udp { udp_reply::publish(&tuple, entry, bpf_ktime_get_ns()); }
         let l4proto = if pkt.l4proto == IPPROTO_TCP {
             pkt.listener_l4proto
         } else {
@@ -874,12 +806,6 @@ fn handle_wan_ipv6(
     let is_fin_rst = is_tcp && (pkt.tcph.fin() != 0 || pkt.tcph.rst() != 0);
 
     let dst_ip = pkt.tuples.five.dst_ip.as_bytes();
-    let mut tuple = RedirectTuple::default();
-    packet_redirect_tuple(pkt, 6, &mut tuple);
-
-    let (tracked, track_now) = check_redirect_track(&tuple, is_udp, is_pure_syn);
-    let is_redirected = tracked.is_some() || socket_was_proxied;
-
     // 1. 常规业务流量目标过滤 (DNS 53 强制劫持到代理)
     if dst_port != 53 {
         // 静态目标 IP / 目标端口 Bypass 判定 (无需入表)
@@ -888,18 +814,30 @@ fn handle_wan_ipv6(
         {
             return TC_ACT_OK;
         }
+    }
 
+    let mut tuple = RedirectTuple::default();
+    packet_redirect_tuple(pkt, 6, &mut tuple);
+
+    let Some(scratch) = FLOW_SCRATCH.get_ptr_mut(0) else { return TC_ACT_SHOT; };
+    let scratch = unsafe { &mut *scratch };
+    tracking::lookup_into(&tuple, is_pure_syn, is_fin_rst, &mut scratch.observed);
+    let tracked = &scratch.observed;
+    let is_redirected = tracked.is_redirect() || socket_was_proxied;
+
+    if dst_port != 53 {
         // 动态直连流表 Fast-Path 查询 (针对非纯 SYN 报文)
         if !is_redirected
-            && check_direct_track(&tuple, is_tcp, is_udp, is_fin_rst, is_pure_syn)
+            && tracked.is_direct()
         {
             return TC_ACT_OK;
         }
 
-        // 动态下发直连判定 (直连状态变化时更新，命中则建立 DIRECT_TRACK 连接追踪)
+        // 动态下发直连判定 (直连状态变化时更新，命中则建立统一五元组决策)
         if !is_redirected && is_dynamic_dst_ip6_bypassed(dst_ip) {
-            register_direct_track(&tuple);
-            return TC_ACT_OK;
+            if tracking::publish_into(&tuple, tracked, None, &mut scratch.result) {
+                if scratch.result.is_direct() { return TC_ACT_OK; }
+            } else { return TC_ACT_SHOT; }
         }
 
         // 目标白名单过滤
@@ -920,17 +858,21 @@ fn handle_wan_ipv6(
         ([0u8; 6], [0u8; 6])
     };
     let entry = RedirectEntry {
-        last_seen_ns: 0,
         ifindex,
         from_wan: 1,
         _pad0: [0; 3],
         smac,
         dmac,
-        _pad1: [0; 4],
     };
     unsafe {
-        let is_new_flow = tracked.is_none();
-        publish_redirect_track(&tuple, tracked, entry, is_udp, track_now);
+        let is_new_flow = tracked.activity == 0;
+        if !tracked.matches_route(&entry) {
+            if !tracking::publish_into(&tuple, tracked, Some(&entry), &mut scratch.result) {
+                return TC_ACT_SHOT;
+            }
+            if scratch.result.is_direct() { return TC_ACT_OK; }
+        }
+        if is_udp { udp_reply::publish(&tuple, entry, bpf_ktime_get_ns()); }
         let l4proto = if pkt.l4proto == IPPROTO_TCP {
             pkt.listener_l4proto
         } else {
@@ -1227,12 +1169,16 @@ fn handle_dae0_ingress_impl(tc_ctx: &TcContext) -> i32 {
     };
     let mut reversed = RedirectTuple::default();
     packet_reverse_redirect_tuple(pkt, ip_version, &mut reversed);
-    let exact = unsafe { REDIRECT_TRACK.get(&reversed).copied() };
+    let Some(scratch) = FLOW_SCRATCH.get_ptr_mut(0) else { return TC_ACT_SHOT; };
+    let scratch = unsafe { &mut *scratch };
+    let flags = tracking::lookup_into(&reversed, false, false, &mut scratch.observed);
+    let exact = scratch.observed.route();
     let entry = if pkt.l4proto == IPPROTO_UDP {
-        // Lookup is scoped to packets arriving from our isolated proxy veth.
-        // Refresh on replies too: flow expiry must not end a live association.
-        let client_route = udp_reply::lookup(&reversed);
-        exact.or(client_route)
+        if let Some(route) = exact {
+            // Coalesce client-record touches with the exact flow's activity.
+            if flags & tracking::REFRESH_DUE != 0 { udp_reply::touch(&reversed); }
+            Some(route)
+        } else { udp_reply::lookup(&reversed) }
     } else { exact };
     if let Some(entry) = entry {
         let dmac = entry.smac;

@@ -1,12 +1,12 @@
 use crate::transport::ParsedPacket;
-use crate::udp_reply::ReplyValue;
+use crate::tracking::{Scratch};
 use aya_ebpf::btf_maps::{
     Array, HashMap, LpmTrie, LruHashMap, PerCpuArray, RingBuf, SkStorage, SockMap,
 };
 use aya_ebpf::macros::btf_map;
 use clash_ebpf_common::{
-    DaeEvent, DaeParam, DirectTrackEntry, PIDName, ParseTransportCtx, RedirectEntry,
-    RedirectTuple, UdpReplyKey,
+    DaeEvent, DaeParam, FlowTrackEntry, PIDName, ParseTransportCtx,
+    RedirectTuple, UdpReplyKey, UdpReplyEntry,
 };
 
 #[btf_map]
@@ -59,26 +59,21 @@ pub static DYNAMIC_BYPASS_DST_IPS: LruHashMap<u32, u8, 16384> = LruHashMap::new(
 pub static DYNAMIC_BYPASS_DST_IP6S: LruHashMap<[u8; 16], u8, 16384> =
     LruHashMap::new();
 
+// NO_PREALLOC publishes whole records without reserving the full capacity.
+// Kernel recycling is allowed; no live LRU eviction.
 #[btf_map]
-pub static REDIRECT_TRACK: LruHashMap<RedirectTuple, RedirectEntry, 32768> =
-    LruHashMap::new();
+pub static FLOW_TRACK: HashMap<RedirectTuple, FlowTrackEntry, 98304, 1> = HashMap::new();
 
-/// Per-client locks require a hash map: kernel LRU maps cannot hold spin locks.
-/// Only redirected requests create entries; expired entries are collected on pressure.
 #[btf_map]
-pub static UDP_REPLY_TRACK: HashMap<UdpReplyKey, ReplyValue, 32768> =
+pub static FLOW_SCRATCH: PerCpuArray<Scratch, 1> = PerCpuArray::new();
+
+/// Non-preallocated client routes, without per-packet locks or live LRU eviction.
+/// Only redirected requests create entries; userspace collects expired entries.
+#[btf_map]
+pub static UDP_REPLY_TRACK: HashMap<UdpReplyKey, UdpReplyEntry, 32768, 1> =
     HashMap::new();
 
-#[btf_map]
-pub static UDP_REPLY_GC_NS: PerCpuArray<u64, 1> = PerCpuArray::new();
-
-/// Connection tracking map for dynamic bypass flows (TCP/UDP sessions).
-#[btf_map]
-pub static DIRECT_TRACK: LruHashMap<RedirectTuple, DirectTrackEntry, 65536> =
-    LruHashMap::new();
-
-/// SOCKMAP for transparent proxy listener sockets.
-/// Keys: 0=TCP4, 1=TCP6, 2=UDP4, 3=UDP6
+/// Transparent proxy listeners: TCP4, TCP6, UDP4, UDP6.
 #[btf_map]
 pub static LISTEN_SOCKET_MAP: SockMap<4> = SockMap::new();
 

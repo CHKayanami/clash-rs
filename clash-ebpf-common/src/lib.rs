@@ -67,13 +67,11 @@ impl RedirectTuple {
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct RedirectEntry {
-    pub last_seen_ns: u64,
     pub ifindex: u32,
     pub from_wan: u8,
     pub _pad0: [u8; 3],
     pub smac: [u8; 6],
     pub dmac: [u8; 6],
-    pub _pad1: [u8; 4],
 }
 
 /// Client-only UDP return key. Address bytes and port retain RedirectTuple's
@@ -94,26 +92,14 @@ impl UdpReplyKey {
     }
 }
 
-/// Snapshot of a client route, serialized by its kernel per-entry spin lock.
-/// A retired entry cannot be refreshed while its collector removes the key.
+/// Client route and ambiguity state, published as a complete map value.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct UdpReplyEntry {
+    pub last_seen_ns: u64,
     pub route: RedirectEntry,
     pub ambiguous: u8,
-    pub retired: u8,
-    pub _pad: [u8; 6],
-}
-
-pub const DIRECT_TRACK_STATE_ACTIVE: u8 = 0;
-pub const DIRECT_TRACK_STATE_CLOSING: u8 = 1;
-
-#[repr(C)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct DirectTrackEntry {
-    pub last_seen_ns: u64,
-    pub state: u8,
-    pub _pad: [u8; 7],
+    pub _pad: [u8; 3],
 }
 
 #[cfg(all(feature = "user", target_os = "linux"))]
@@ -131,5 +117,33 @@ unsafe impl aya::Pod for UdpReplyKey {}
 #[cfg(all(feature = "user", target_os = "linux"))]
 unsafe impl aya::Pod for UdpReplyEntry {}
 
+/// FLOW_TRACK ABI: 32-bit activity fields and compact routing metadata.
+/// This layout has no implicit padding; route padding is explicitly initialized.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct FlowTrackEntry {
+    pub last_seen_seconds: u32,
+    pub state: u32,
+    pub route: RedirectEntry,
+}
+
+impl FlowTrackEntry {
+    pub fn activity(&self) -> u64 { tracking::word(self.state, self.last_seen_seconds) }
+    pub fn set_activity(&mut self, activity: u64) {
+        self.last_seen_seconds = tracking::seconds(activity);
+        self.state = tracking::token(activity);
+    }
+}
+
 #[cfg(all(feature = "user", target_os = "linux"))]
-unsafe impl aya::Pod for DirectTrackEntry {}
+unsafe impl aya::Pod for FlowTrackEntry {}
+
+pub mod tracking;
+
+const _: () = {
+    assert!(core::mem::size_of::<RedirectEntry>() == 20);
+    assert!(core::mem::size_of::<FlowTrackEntry>() == 28);
+    assert!(core::mem::size_of::<UdpReplyEntry>() == 32);
+    assert!(core::mem::offset_of!(FlowTrackEntry, route) == 8);
+    assert!(core::mem::offset_of!(UdpReplyEntry, route) == 8);
+};
