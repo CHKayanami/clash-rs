@@ -13,13 +13,43 @@ use crate::{
 use erased_serde::Serialize;
 use super::utils::dialer_route;
 use futures::future::BoxFuture;
-use std::{collections::{HashMap, HashSet}, io, sync::Arc, time::Instant};
+use std::{collections::{HashMap, HashSet}, future::Future, io, sync::Arc, time::Instant};
 
 pub(crate) trait DatagramConnector: Sync {
     type Datagram: Send;
     fn connect<'a>(&'a self, handler: &'a ProtocolOutbound, sess: &'a Session,
         resolver: ThreadSafeDNSResolver,
     ) -> BoxFuture<'a, io::Result<Self::Datagram>>;
+}
+
+/// Execute a leaf operation using the common nested group and retry policy.
+pub(crate) trait ProtocolOperation: Sync {
+    type Output: Send;
+    fn execute<'a>(&'a self, handler: &'a ProtocolOutbound, sess: &'a Session)
+        -> impl Future<Output = io::Result<Self::Output>> + Send + 'a;
+}
+
+struct PhysicalOperation<'a, C> {
+    connector: &'a C,
+    resolver: ThreadSafeDNSResolver,
+    udp: bool,
+}
+
+impl<C: DatagramConnector> ProtocolOperation for PhysicalOperation<'_, C> {
+    type Output = Connection<C::Datagram>;
+    fn execute<'a>(&'a self, handler: &'a ProtocolOutbound, sess: &'a Session)
+        -> impl Future<Output = io::Result<Self::Output>> + Send + 'a
+    {
+        async move {
+            if self.udp {
+                self.connector.connect(handler, sess, self.resolver.clone()).await
+                    .map(Connection::Datagram)
+            } else {
+                handler.connect_stream(sess, self.resolver.clone()).await
+                    .map(Connection::Stream)
+            }
+        }
+    }
 }
 
 struct PhysicalDatagramConnector;
@@ -163,6 +193,15 @@ impl OutboundNode {
         }
     }
 
+    pub(crate) async fn execute_protocol<O: ProtocolOperation>(
+        &self, sess: &Session, operation: O,
+    ) -> io::Result<O::Output> {
+        match self {
+            Self::Protocol(handler) => operation.execute(handler, sess).await,
+            Self::Group(group) => execute(group, sess, false, operation).await,
+        }
+    }
+
     pub(crate) async fn connect_datagram_using<C: DatagramConnector>(
         &self, sess: &Session, resolver: ThreadSafeDNSResolver, connector: &C,
     ) -> io::Result<C::Datagram> {
@@ -205,8 +244,8 @@ struct Frame<'a> {
 }
 
 impl<'a> Frame<'a> {
-    async fn new(policy: Policy<'a>, sess: &Session, udp: bool) -> Self {
-        let limit = if udp { 1 } else { policy.group().attempts(sess).await.max(1) };
+    async fn new(policy: Policy<'a>, sess: &Session, single_attempt: bool) -> Self {
+        let limit = if single_attempt { 1 } else { policy.group().attempts(sess).await.max(1) };
         Self { policy, excluded: HashSet::new(), attempts: 0, limit, selected: None, started: Instant::now() }
     }
 }
@@ -231,16 +270,22 @@ impl<'a> Frames<'a> {
     fn is_empty(&self) -> bool { self.root.is_none() }
 }
 
-async fn connect<C: DatagramConnector>(
-    root: &ProxyGroup,
-    sess: &Session,
+fn connect<'a, C: DatagramConnector>(
+    root: &'a ProxyGroup,
+    sess: &'a Session,
     resolver: ThreadSafeDNSResolver,
     udp: bool,
-    connector: &C,
-) -> io::Result<Connection<C::Datagram>> {
+    connector: &'a C,
+) -> impl Future<Output = io::Result<Connection<C::Datagram>>> + Send + 'a {
+    execute(root, sess, udp, PhysicalOperation { connector, resolver, udp })
+}
+
+async fn execute<O: ProtocolOperation>(
+    root: &ProxyGroup, sess: &Session, single_attempt: bool, operation: O,
+) -> io::Result<O::Output> {
     // Retain the association once; derived TCP connections share its UDP route.
     let route = dialer_route::retain();
-    let mut frames = Frames::new(Frame::new(Policy::Root(root), sess, udp).await);
+    let mut frames = Frames::new(Frame::new(Policy::Root(root), sess, single_attempt).await);
     loop {
         let frame = frames.last_mut().expect("root frame");
         frame.attempts += 1;
@@ -264,16 +309,13 @@ async fn connect<C: DatagramConnector>(
                         if frames.len() >= 64 || frames.iter().any(|f| f.policy.group().name() == group.name()) {
                             Err(io::Error::other(format!("cyclic or too deep proxy group: {}", group.name())))
                         } else {
-                            let nested = Frame::new(Policy::Nested(handler), sess, udp).await;
+                            let nested = Frame::new(Policy::Nested(handler), sess, single_attempt).await;
                             frames.push(nested);
                             continue;
                         }
-                    } else if udp {
-                        let handler = handler.as_protocol().expect("protocol leaf");
-                        connector.connect(handler, sess, resolver.clone()).await.map(Connection::Datagram)
                     } else {
                         let handler = handler.as_protocol().expect("protocol leaf");
-                        handler.connect_stream(sess, resolver.clone()).await.map(Connection::Stream)
+                        operation.execute(handler, sess).await
                     }
                 }
                 Ok(None) => {
@@ -291,7 +333,7 @@ async fn connect<C: DatagramConnector>(
         loop {
             let frame = frames.last_mut().expect("root frame");
             if let Some(selected) = frame.selected.as_ref() {
-                if !udp {
+                if !single_attempt {
                     frame.policy.group().record_result(
                         sess, selected.name(), frame.started.elapsed(), result.is_ok(),
                     ).await;

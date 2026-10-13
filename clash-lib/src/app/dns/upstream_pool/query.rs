@@ -11,29 +11,28 @@ use super::UpstreamPool;
 use super::admission::AdmissionPermit;
 use super::entries::{UpstreamEntry, UpstreamState};
 use super::udp::UdpUpstream;
-use super::transports::ResolvedOutbound;
+use super::routes::ResolvedOutbound;
 use crate::app::dns::transport::UdpPool;
 use crate::app::dns::ecs::EcsQuery;
 use crate::app::dns::query::QueryContext;
 
 impl UpstreamPool {
-    pub async fn udp_pool(
+    pub(super) async fn udp_pool_selected(
         &self,
         entry: &UpstreamEntry,
         address: SocketAddr,
-        outbound_name: Option<&str>,
+        outbound: &ResolvedOutbound,
     ) -> anyhow::Result<Arc<UdpPool>> {
         let udp = entry.udp_state()?;
-        let outbound = self.resolve_outbound(entry, outbound_name).await?;
-        if udp.fixed_address(&entry.endpoint, &outbound.name) == Some(address) {
+        if udp.fixed_address(&entry.endpoint, &outbound.key) == Some(address) {
             return udp
                 .acquire_fixed(address, || {
-                    self.build_udp_pool(entry, address, &outbound)
+                    self.build_udp_pool(entry, address, outbound)
                 })
                 .await;
         }
-        udp.for_address(address, &outbound.name)
-            .acquire(|| self.build_udp_pool(entry, address, &outbound))
+        udp.for_address(address, &outbound.key, outbound.managed)
+            .acquire(|| self.build_udp_pool(entry, address, outbound))
             .await
     }
 
@@ -63,7 +62,7 @@ impl UpstreamPool {
                     debug!(
                         upstream = %entry.name,
                         %address,
-                        outbound = ?outbound.name,
+                        outbound = ?outbound.name(),
                         %domain,
                         %qtype,
                         attempt,
@@ -75,7 +74,7 @@ impl UpstreamPool {
                     warn!(
                         upstream = %entry.name,
                         %address,
-                        outbound = ?outbound.name,
+                        outbound = ?outbound.name(),
                         %domain,
                         %qtype,
                         attempt,
@@ -95,8 +94,8 @@ impl UpstreamPool {
         address: SocketAddr,
         outbound: &ResolvedOutbound,
     ) -> anyhow::Result<Arc<UdpPool>> {
-        let effective_outbound = &outbound.name;
-        let dial = self.dial_context(entry, outbound.handler.clone());
+        let effective_outbound = outbound.name();
+        let dial = self.dial_context(entry, outbound.handler().cloned());
         if dial.outbound.is_some() {
             debug!(
                 upstream = %entry.name,
@@ -158,15 +157,14 @@ impl UpstreamPool {
         })?
     }
 
-    async fn query_entry_inner(
+    pub(super) async fn query_selected(
         &self,
         entry: &UpstreamEntry,
         query: &QueryContext,
-        outbound_name: Option<&str>,
+        outbound: &ResolvedOutbound,
     ) -> anyhow::Result<Vec<u8>> {
         let start = Instant::now();
-        let outbound = self.resolve_outbound(entry, outbound_name).await?;
-        let effective_outbound = &outbound.name;
+        let effective_outbound = outbound.name();
 
         let ecs_query = if let Some(ref ecs) = entry.ecs
             && let Some(subnet) = ecs.ipv4.map(IpNet::V4).or_else(|| ecs.ipv6.map(IpNet::V6))
@@ -200,26 +198,26 @@ impl UpstreamPool {
             UpstreamState::Transport(_) => None,
         };
         let fixed_address =
-            udp.and_then(|udp| udp.fixed_address(&entry.endpoint, &outbound.name));
+            udp.and_then(|udp| udp.fixed_address(&entry.endpoint, &outbound.key));
         let response = if let (Some(udp), Some(address)) = (udp, fixed_address) {
             self.query_fixed_udp(
                 entry,
                 udp,
                 address,
-                &outbound,
+                outbound,
                 outgoing_query,
             )
             .await?
         } else if let Some(udp) = udp {
             let addresses = entry.endpoint.resolve_addrs().await?;
-            let snapshot = udp.snapshot(&addresses, &outbound.name)?;
+            let snapshot = udp.snapshot(&addresses, &outbound.key, outbound.managed)?;
 
             let mut last_error = None;
             let mut successful_resp = None;
             for (index, attempt) in snapshot.attempts.into_iter().enumerate() {
                 let address = attempt.address;
                 let pool = match attempt
-                    .acquire(|| self.build_udp_pool(entry, address, &outbound))
+                    .acquire(|| self.build_udp_pool(entry, address, outbound))
                     .await
                 {
                     Ok(pool) => pool,
@@ -251,7 +249,7 @@ impl UpstreamPool {
                             "DNS upstream query succeeded"
                         );
                         if snapshot.current != Some(address) {
-                            udp.mark_current(address, &outbound.name);
+                            udp.mark_current(address, &outbound.key, outbound.managed);
                         }
                         successful_resp = Some(response);
                         break;
@@ -280,7 +278,7 @@ impl UpstreamPool {
                 }
             }
         } else {
-            let transport = self.get_pooled_transport(entry, &outbound).await?;
+            let transport = self.get_pooled_transport(entry, outbound).await?;
             match transport.exchange(outgoing_query).await {
                 Ok(response) => {
                     let elapsed = start.elapsed();
@@ -415,7 +413,7 @@ mod tests {
             entry
                 .udp_state()
                 .unwrap()
-                .fixed_address(&entry.endpoint, &resolved.name),
+                .fixed_address(&entry.endpoint, &resolved.key),
             Some(address)
         );
         let routed = pool.udp_pool(&entry, address, None).await.unwrap();

@@ -1,3 +1,4 @@
+use crate::proxy::RouteChange;
 use std::{collections::HashMap, io};
 
 use erased_serde::Serialize;
@@ -37,6 +38,7 @@ mock! {
     impl ProxyProvider for DummyProxyProvider {
         fn proxies(&self) -> std::sync::Arc<Vec<OutboundNode>>;
         fn touch(&self);
+        fn route_changes(&self) -> Option<RouteChange>;
         async fn healthcheck(&self);
     }
 }

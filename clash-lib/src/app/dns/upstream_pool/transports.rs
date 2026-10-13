@@ -1,6 +1,7 @@
 #[cfg(test)]
 use arc_swap::ArcSwap;
 use crate::app::dns::query::QueryContext;
+#[cfg(test)]
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
@@ -13,71 +14,31 @@ use crate::app::dns::transport::{
 };
 use crate::proxy::OutboundNode;
 
-pub(crate) struct ResolvedOutbound {
-    pub handler: Option<OutboundNode>,
-    pub name: Option<String>,
-}
+use super::routes::{ResolvedOutbound, RouteCache, TransportKey};
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub struct TransportKey {
-    pub resolved_outbound: Option<String>,
-}
-
-/// A dedicated slot for the configured outbound, plus slots for other routes.
 pub struct TransportPool {
-    fixed_outbound: Option<String>,
-    fixed: LifecycleSlot<PooledTransport>,
-    dynamic: parking_lot::RwLock<
-        HashMap<TransportKey, Arc<LifecycleSlot<PooledTransport>>>,
-    >,
+    routes: RouteCache<LifecycleSlot<PooledTransport>>,
 }
 
 impl TransportPool {
-    pub(super) fn new(fixed_outbound: Option<String>) -> Self {
-        Self {
-            fixed_outbound,
-            fixed: LifecycleSlot::new(),
-            dynamic: parking_lot::RwLock::new(HashMap::new()),
-        }
-    }
+    pub(super) fn new() -> Self { Self { routes: RouteCache::default() } }
 
     async fn acquire<F, Fut>(
-        &self,
-        outbound: &Option<String>,
-        build: F,
+        &self, outbound: &ResolvedOutbound, build: F,
     ) -> anyhow::Result<Arc<PooledTransport>>
-    where
-        F: FnOnce() -> Fut,
+    where F: FnOnce() -> Fut,
         Fut: Future<Output = anyhow::Result<PooledTransport>>,
     {
-        if outbound == &self.fixed_outbound {
-            return self.fixed.acquire(build).await;
-        }
-        let key = TransportKey {
-            resolved_outbound: outbound.clone(),
-        };
-        let cached = self.dynamic.read().get(&key).cloned();
-        let slot = match cached {
-            Some(slot) => slot,
-            None => {
-                let mut dynamic = self.dynamic.write();
-                dynamic
-                    .entry(key)
-                    .or_insert_with(|| Arc::new(LifecycleSlot::new()))
-                    .clone()
-            }
-        };
-        slot.acquire(build).await
+        self.routes.get_routed(&outbound.key, outbound.managed, LifecycleSlot::new).acquire(build).await
+    }
+
+    pub(super) fn rebind(&self, previous: Option<&TransportKey>, next: Option<&TransportKey>) {
+        self.routes.rebind(previous, next, LifecycleSlot::new);
     }
 
     pub(super) async fn close(&self) {
-        self.fixed
-            .close(|transport| async move { transport.close().await })
-            .await;
-        let dynamic = std::mem::take(&mut *self.dynamic.write());
-        for slot in dynamic.into_values() {
-            slot.close(|transport| async move { transport.close().await })
-                .await;
+        for slot in self.routes.take() {
+            slot.close(|transport| async move { transport.close().await }).await;
         }
     }
 }
@@ -169,7 +130,7 @@ impl UpstreamPool {
         })
     }
 
-    pub(crate) async fn resolve_outbound(
+    pub(super) async fn resolve_outbound(
         &self,
         entry: &UpstreamEntry,
         outbound_name: Option<&str>,
@@ -180,7 +141,7 @@ impl UpstreamPool {
                     self.outbounds.load().get(name).cloned().ok_or_else(|| {
                         anyhow::anyhow!("unknown DNS outbound '{name}'")
                     })?;
-                (Some(handler), Some(name.to_string()))
+                Some(handler)
             } else if let Some(ref rd) = self.rule_dispatch {
                 let network = match entry.protocol {
                     DnsProtocol::Udp | DnsProtocol::Quic | DnsProtocol::H3 => {
@@ -191,22 +152,18 @@ impl UpstreamPool {
                 if let Some(handler) =
                     rd.resolve_outbound(&entry.endpoint, network).await
                 {
-                    let name = handler.name().to_string();
-                    (Some(handler), Some(name))
+                    Some(handler)
                 } else {
-                    (None, None)
+                    None
                 }
             } else {
-                (None, None)
+                None
             };
 
-        Ok(ResolvedOutbound {
-            handler: resolved.0,
-            name: resolved.1,
-        })
+        Ok(ResolvedOutbound::new(resolved))
     }
 
-    pub(crate) async fn get_pooled_transport(
+    pub(super) async fn get_pooled_transport(
         &self,
         entry: &UpstreamEntry,
         outbound: &ResolvedOutbound,
@@ -214,8 +171,8 @@ impl UpstreamPool {
         let UpstreamState::Transport(pool) = entry.state.as_ref() else {
             anyhow::bail!("upstream '{}' uses UDP connection state", entry.name);
         };
-        pool.acquire(&outbound.name, || {
-            self.build_transport(entry, outbound.handler.clone())
+        pool.acquire(outbound, || {
+            self.build_transport(entry, outbound.handler().cloned())
         })
         .await
     }
@@ -316,12 +273,11 @@ mod tests {
             else {
                 panic!("TCP upstream must have transport state");
             };
-            assert_eq!(state.fixed.init_count(), 1);
-            assert_eq!(state.dynamic.read().len(), 1);
+            assert_eq!(state.routes.len(), 2);
+            assert!(state.routes.values().iter().all(|slot| slot.init_count() == 1));
             assert_eq!(pool.active_transport_tasks.load(Ordering::SeqCst), 2);
             pool.close().await;
-            assert_eq!(state.fixed.close_count(), 1);
-            assert!(state.dynamic.read().is_empty());
+            assert_eq!(state.routes.len(), 0);
             assert_eq!(pool.active_transport_tasks.load(Ordering::SeqCst), 0);
             let counts = tokio::time::timeout(Duration::from_secs(1), server)
                 .await

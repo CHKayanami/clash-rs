@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use super::transports::TransportPool;
 use super::udp::UdpUpstream;
+use super::routes::{TransportKey};
 use crate::app::dns::ClashResolver;
 use crate::app::dns::config::{EdnsClientSubnet, NameServer};
 use crate::app::dns::endpoint::{DnsEndpoint, DnsProtocol, DnsStrategy};
@@ -13,6 +14,13 @@ pub enum UpstreamState {
 }
 
 impl UpstreamState {
+    pub(super) fn rebind(&self, previous: Option<&TransportKey>, next: Option<&TransportKey>) {
+        match self {
+            Self::Udp(pool) => pool.rebind(previous, next),
+            Self::Transport(pool) => pool.rebind(previous, next),
+        }
+    }
+
     pub(crate) async fn close(&self) {
         match self {
             Self::Udp(udp) => udp.close().await,
@@ -81,7 +89,7 @@ impl UpstreamEntry {
             DnsProtocol::Udp => {
                 UpstreamState::Udp(UdpUpstream::new(&endpoint, ns.proxy.clone()))
             }
-            _ => UpstreamState::Transport(TransportPool::new(ns.proxy.clone())),
+            _ => UpstreamState::Transport(TransportPool::new()),
         });
         Ok(Self {
             name: ns.to_string(),

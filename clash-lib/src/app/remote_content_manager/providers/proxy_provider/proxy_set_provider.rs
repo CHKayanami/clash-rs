@@ -1,3 +1,4 @@
+
 use super::ProxyProvider;
 use crate::{
     Error,
@@ -13,7 +14,7 @@ use crate::{
     },
     common::errors::map_io_error,
     config::internal::proxy::OutboundProxyProtocol,
-    proxy::{OutboundNode, utils::{OutboundNodeRegistry, ProviderRegistry, ProviderSnapshot}},
+    proxy::{OutboundNode, RouteChange, utils::{OutboundNodeRegistry, ProviderRegistry, ProviderSnapshot}},
 };
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
@@ -48,6 +49,7 @@ pub struct ProxySetProvider {
     fetcher: Fetcher<ProxyUpdater, ProxyParser>,
     hc: Arc<HealthCheck>,
     proxies: ProviderRegistry,
+    changes: RouteChange,
 }
 
 impl ProxySetProvider {
@@ -70,6 +72,8 @@ impl ProxySetProvider {
 
         let proxies = Arc::new(ArcSwap::from_pointee(ProviderSnapshot::default()));
         let proxies_clone = proxies.clone();
+        let changes = RouteChange::default();
+        let change_updater = changes.clone();
 
         let n = name.clone();
         let hc_updater = hc.clone();
@@ -78,9 +82,11 @@ impl ProxySetProvider {
                 let hc = hc_updater.clone();
                 let n = n.clone();
                 let proxies = proxies_clone.clone();
+                let changes = change_updater.clone();
                 Box::pin(async move {
                     debug!("updating {} proxies for: {}", n, input.len());
                     proxies.store(Arc::new(ProviderSnapshot::new(input.clone())));
+                    changes.notify();
                     hc.update(input).await;
                     tokio::spawn(async move {
                         hc.check().await;
@@ -160,6 +166,7 @@ impl ProxySetProvider {
             fetcher,
             hc,
             proxies,
+            changes,
         })
     }
 }
@@ -222,6 +229,10 @@ impl Provider for ProxySetProvider {
 
 #[async_trait]
 impl ProxyProvider for ProxySetProvider {
+    fn route_changes(&self) -> Option<RouteChange> {
+        Some(self.changes.clone())
+    }
+
     fn proxies(&self) -> Arc<Vec<OutboundNode>> {
         self.proxies.load().proxies.clone()
     }
@@ -275,12 +286,14 @@ mod tests {
         let hc = HealthCheck::new(vec![], "invalid-url".to_owned(), 0, true, manager);
         let provider = ProxySetProvider::new("snapshot".to_owned(), Duration::ZERO, Arc::new(vehicle), hc, None).unwrap();
         provider.initialize().await.unwrap();
+        let mut changes = provider.route_changes().unwrap().subscribe();
         let original = provider.proxies();
         let entry = original[0].clone();
         let exit = original[1].clone();
         assert!(exit.dialer_dependency().unwrap().ptr_eq(&entry));
 
         provider.update().await.unwrap();
+        assert!(!changes.has_changed().unwrap());
         assert!(Arc::ptr_eq(&original, &provider.proxies()));
         assert!(exit.dialer_dependency().unwrap().ptr_eq(&entry));
 
@@ -288,11 +301,14 @@ mod tests {
         fs::remove_file(&path).unwrap();
         fs::create_dir(&path).unwrap();
         assert!(provider.update().await.is_err());
+        assert!(!changes.has_changed().unwrap());
         assert!(Arc::ptr_eq(&original, &provider.proxies()));
         assert!(exit.dialer_dependency().unwrap().ptr_eq(&entry));
 
         fs::remove_dir(&path).unwrap();
         provider.update().await.unwrap();
+        assert!(changes.has_changed().unwrap());
+        changes.borrow_and_update();
         let committed = provider.proxies();
         assert!(!Arc::ptr_eq(&original, &committed));
         assert!(!committed[0].ptr_eq(&entry));

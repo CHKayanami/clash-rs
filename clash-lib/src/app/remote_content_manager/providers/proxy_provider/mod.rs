@@ -1,3 +1,4 @@
+use crate::proxy::RouteChange;
 pub mod filtered_provider;
 pub mod plain_provider;
 pub mod proxy_set_provider;
@@ -20,6 +21,7 @@ pub type ArcProxyProvider = Arc<dyn ProxyProvider + Send + Sync>;
 pub trait ProxyProvider: Provider {
     fn proxies(&self) -> Arc<Vec<OutboundNode>>;
     fn touch(&self);
+    fn route_changes(&self) -> Option<RouteChange> { None }
     /// this is a blocking call, you may want to spawn a new task to run this
     async fn healthcheck(&self);
 }

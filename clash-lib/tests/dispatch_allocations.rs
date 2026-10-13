@@ -76,3 +76,34 @@ async fn native_dispatch_future_allocations_and_sizes() {
     ).await;
     drop(tracking);
 }
+
+// Type-only measurements: no dispatcher or DNS query is constructed or polled.
+#[test]
+fn top_level_dispatch_future_sizes() {
+    use std::{future::Future, mem::size_of};
+    use clash_lib::{
+        app::{dispatcher::Dispatcher, dns::{query::QueryContext,
+            upstream_pool::{UpstreamEntry, UpstreamPool}}},
+    };
+    fn dispatch_size<A, B, F: Future>(_: impl FnOnce(&'static Dispatcher, A, B) -> F) -> usize {
+        size_of::<F>()
+    }
+    fn query_size<F: Future>(_: impl FnOnce(&'static UpstreamPool, &'static UpstreamEntry,
+        &'static QueryContext, Option<&'static str>) -> F,
+    ) -> usize { size_of::<F>() }
+    fn udp_size<F: Future>(_: impl FnOnce(&'static UpstreamPool, &'static UpstreamEntry,
+        std::net::SocketAddr, Option<&'static str>) -> F,
+    ) -> usize { size_of::<F>() }
+    let sizes = [
+        ("TCP dispatch_stream", dispatch_size(Dispatcher::dispatch_stream)),
+        ("UDP dispatch_datagram", dispatch_size(Dispatcher::dispatch_datagram)),
+        ("DNS query_entry", query_size(UpstreamPool::query_entry)),
+        ("DNS udp_pool", udp_size(UpstreamPool::udp_pool)),
+    ];
+    for (name, size) in sizes {
+        println!("{name}: future_bytes={size}");
+    }
+    // Bound DNS entry futures independently of the boxed dynamic-group branch.
+    assert!(sizes[2].1 <= 6400, "DNS query future grew: {}", sizes[2].1);
+    assert!(sizes[3].1 <= 2560, "DNS UDP future grew: {}", sizes[3].1);
+}

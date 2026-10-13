@@ -60,6 +60,8 @@ pub use group::{fallback, loadbalance, selector, urltest};
 
 mod common;
 mod outbound;
+mod route_change;
+pub use route_change::RouteChange;
 mod protocol;
 pub use protocol::{ProtocolOutbound, WeakProtocolOutbound};
 pub mod inbound;
@@ -306,4 +308,4 @@ pub trait PlainProxyAPIResponse: Send + Sync {
     fn as_map(&self) -> impl Future<Output = HashMap<String, Box<dyn ErasedSerialize + Send>>> + Send;
 }
 
-pub(crate) use outbound::DatagramConnector;
+pub(crate) use outbound::{DatagramConnector, ProtocolOperation};

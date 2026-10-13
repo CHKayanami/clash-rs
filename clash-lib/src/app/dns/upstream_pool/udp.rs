@@ -1,19 +1,18 @@
 //! Per-outbound UDP state with independent pool initialization for each address family.
 
-use std::collections::HashMap;
 use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
 use arc_swap::ArcSwapOption;
-use parking_lot::Mutex;
 
 use crate::app::dns::endpoint::{DnsEndpoint, DnsStrategy};
 use crate::app::dns::transport::{
     UdpPool, NETWORK_RETRY_DELAY, SocketFailure, network_error,
 };
 use tokio::time::Instant;
+use super::routes::{RouteCache, TransportKey};
 
 struct CachedPool {
     address: SocketAddr,
@@ -101,14 +100,14 @@ impl UdpSlot {
 }
 
 struct OutboundUdp {
-    current: Option<SocketAddr>,
+    current: ArcSwapOption<SocketAddr>,
     slots: [Arc<UdpSlot>; 2],
 }
 
 impl Default for OutboundUdp {
     fn default() -> Self {
         Self {
-            current: None,
+            current: ArcSwapOption::empty(),
             slots: std::array::from_fn(|_| Arc::new(UdpSlot::default())),
         }
     }
@@ -118,7 +117,6 @@ struct FixedUdp {
     host: String,
     address: SocketAddr,
     strategy: DnsStrategy,
-    outbound: Option<String>,
     slot: UdpSlot,
 }
 
@@ -126,7 +124,7 @@ struct FixedUdp {
 #[derive(Default)]
 pub struct UdpUpstream {
     fixed: Option<FixedUdp>,
-    outbounds: Mutex<HashMap<Option<String>, OutboundUdp>>,
+    outbounds: RouteCache<OutboundUdp>,
 }
 
 pub(super) struct UdpSnapshot {
@@ -155,23 +153,25 @@ impl UdpAttempt {
 
 impl UdpUpstream {
     pub(super) fn new(endpoint: &DnsEndpoint, outbound: Option<String>) -> Self {
-        let fixed = endpoint.host.parse().ok().map(|ip| FixedUdp {
-            host: endpoint.host.clone(),
-            address: SocketAddr::new(ip, endpoint.port),
-            strategy: endpoint.strategy,
-            outbound,
-            slot: UdpSlot::default(),
-        });
+        // Proxied routes always use the selected protocol node's cache entry.
+        let fixed = if outbound.is_none() {
+            endpoint.host.parse().ok().map(|ip| FixedUdp {
+                host: endpoint.host.clone(),
+                address: SocketAddr::new(ip, endpoint.port),
+                strategy: endpoint.strategy,
+                slot: UdpSlot::default(),
+            })
+        } else { None };
         Self {
             fixed,
-            outbounds: Mutex::new(HashMap::new()),
+            outbounds: RouteCache::default(),
         }
     }
 
     pub(super) fn fixed_address(
         &self,
         endpoint: &DnsEndpoint,
-        outbound: &Option<String>,
+        outbound: &TransportKey,
     ) -> Option<SocketAddr> {
         self.fixed
             .as_ref()
@@ -179,7 +179,7 @@ impl UdpUpstream {
                 fixed.host == endpoint.host
                     && fixed.address.port() == endpoint.port
                     && fixed.strategy == endpoint.strategy
-                    && &fixed.outbound == outbound
+                    && outbound.is_direct()
                     && match endpoint.strategy {
                         DnsStrategy::Ipv4Only => fixed.address.is_ipv4(),
                         DnsStrategy::Ipv6Only => fixed.address.is_ipv6(),
@@ -206,16 +206,6 @@ impl UdpUpstream {
             .await
     }
 
-    fn route<'a>(
-        outbounds: &'a mut HashMap<Option<String>, OutboundUdp>,
-        outbound: &Option<String>,
-    ) -> &'a mut OutboundUdp {
-        if !outbounds.contains_key(outbound) {
-            outbounds.insert(outbound.clone(), OutboundUdp::default());
-        }
-        outbounds.get_mut(outbound).unwrap()
-    }
-
     fn attempt(route: &OutboundUdp, address: SocketAddr) -> UdpAttempt {
         let slot = Arc::clone(&route.slots[usize::from(address.is_ipv6())]);
         UdpAttempt {
@@ -228,12 +218,12 @@ impl UdpUpstream {
     pub(super) fn snapshot(
         &self,
         addresses: &[SocketAddr],
-        outbound: &Option<String>,
+        outbound: &TransportKey,
+        managed: bool,
     ) -> anyhow::Result<UdpSnapshot> {
-        let mut outbounds = self.outbounds.lock();
-        let route = Self::route(&mut outbounds, outbound);
-        let first = route
-            .current
+        let route = self.outbounds.get_routed(outbound, managed, OutboundUdp::default);
+        let current = route.current.load().as_deref().copied();
+        let first = current
             .filter(|address| addresses.contains(address))
             .or_else(|| addresses.first().copied())
             .ok_or_else(|| anyhow::anyhow!("UDP DNS resolved to no addresses"))?;
@@ -244,28 +234,29 @@ impl UdpUpstream {
             .or_else(|| addresses.iter().copied().find(|address| *address != first))
             .unwrap_or(first);
         Ok(UdpSnapshot {
-            current: route.current,
-            attempts: [Self::attempt(route, first), Self::attempt(route, retry)],
+            current,
+            attempts: [Self::attempt(&route, first), Self::attempt(&route, retry)],
         })
     }
 
     pub(super) fn for_address(
         &self,
         address: SocketAddr,
-        outbound: &Option<String>,
+        outbound: &TransportKey,
+        managed: bool,
     ) -> UdpAttempt {
-        let mut outbounds = self.outbounds.lock();
-        Self::attempt(Self::route(&mut outbounds, outbound), address)
+        let route = self.outbounds.get_routed(outbound, managed, OutboundUdp::default);
+        Self::attempt(&route, address)
     }
 
     pub(super) fn mark_current(
         &self,
         address: SocketAddr,
-        outbound: &Option<String>,
+        outbound: &TransportKey,
+        managed: bool,
     ) {
-        let mut outbounds = self.outbounds.lock();
-        if let Some(route) = outbounds.get_mut(outbound)
-            && route.slots[usize::from(address.is_ipv6())]
+        let route = self.outbounds.get_routed(outbound, managed, OutboundUdp::default);
+        if route.slots[usize::from(address.is_ipv6())]
                 .active
                 .load()
                 .as_ref()
@@ -273,8 +264,12 @@ impl UdpUpstream {
                     cached.address == address && !cached.pool.is_closed()
                 })
         {
-            route.current = Some(address);
+            route.current.store(Some(Arc::new(address)));
         }
+    }
+
+    pub(super) fn rebind(&self, previous: Option<&TransportKey>, next: Option<&TransportKey>) {
+        self.outbounds.rebind(previous, next, OutboundUdp::default);
     }
 
     pub(crate) async fn close(&self) {
@@ -283,9 +278,9 @@ impl UdpUpstream {
         {
             cached.pool.close().await;
         }
-        let outbounds = std::mem::take(&mut *self.outbounds.lock());
-        for route in outbounds.into_values() {
-            for slot in route.slots {
+        for route in self.outbounds.take() {
+            let slots = route.slots.clone();
+            for slot in slots {
                 if let Some(cached) = slot.active.swap(None) {
                     cached.pool.close().await;
                 }
@@ -398,8 +393,8 @@ mod tests {
             DnsStrategy::PreferIpv4,
         )
         .unwrap();
-        let outbound = Some("fixed".to_string());
-        let udp = UdpUpstream::new(&endpoint, outbound.clone());
+        let outbound = TransportKey::default();
+        let udp = UdpUpstream::new(&endpoint, None);
         let address = udp.fixed_address(&endpoint, &outbound).unwrap();
         let old = pool().await;
         udp.acquire_fixed(address, || async { Ok(old.clone()) })
@@ -419,9 +414,9 @@ mod tests {
             .await
             .unwrap();
         assert!(Arc::ptr_eq(&rebuilt, &replacement));
-        assert!(udp.outbounds.lock().is_empty());
+        assert_eq!(udp.outbounds.len(), 0);
         assert!(
-            udp.fixed_address(&endpoint, &Some("other".into()))
+            udp.fixed_address(&endpoint, &TransportKey::named("other"))
                 .is_none()
         );
         let mut changed = endpoint.clone();
@@ -435,7 +430,7 @@ mod tests {
     }
 
     #[test]
-    fn fixed_route_supports_both_families_but_not_domain_names() {
+    fn fixed_slot_is_only_allocated_for_direct_ip_upstreams() {
         for host in ["127.0.0.1:53", "[::1]:53", "dns.example:53"] {
             let endpoint = DnsEndpoint::parse(
                 host,
@@ -445,11 +440,15 @@ mod tests {
                 DnsStrategy::PreferIpv4,
             )
             .unwrap();
-            let udp = UdpUpstream::new(&endpoint, None);
-            assert_eq!(
-                udp.fixed_address(&endpoint, &None).is_some(),
-                host != "dns.example:53"
-            );
+            for outbound in [None, Some("proxy-group".to_owned())] {
+                let expected = outbound.is_none() && host != "dns.example:53";
+                let udp = UdpUpstream::new(&endpoint, outbound);
+                assert_eq!(udp.fixed.is_some(), expected);
+                assert_eq!(
+                    udp.fixed_address(&endpoint, &TransportKey::default()).is_some(),
+                    expected,
+                );
+            }
         }
     }
 
@@ -458,11 +457,11 @@ mod tests {
         let udp = UdpUpstream::default();
         let address = "127.0.0.1:53".parse().unwrap();
         let old = pool().await;
-        udp.for_address(address, &None)
+        udp.for_address(address, &TransportKey::default(), false)
             .acquire(|| async { Ok(old.clone()) })
             .await
             .unwrap();
-        let snapshot = udp.snapshot(&[address], &None).unwrap();
+        let snapshot = udp.snapshot(&[address], &TransportKey::default(), false).unwrap();
         assert_eq!(snapshot.current, None);
         let attempts = snapshot.attempts;
         old.close().await;
@@ -480,7 +479,7 @@ mod tests {
         }
         assert_eq!(builds.load(Ordering::SeqCst), 1);
         assert!(Arc::ptr_eq(
-            udp.for_address(address, &None).pool.as_ref().unwrap(),
+            udp.for_address(address, &TransportKey::default(), false).pool.as_ref().unwrap(),
             &replacement,
         ));
         udp.close().await;
@@ -492,12 +491,12 @@ mod tests {
         let pool = pool().await;
         let v4 = "127.0.0.1:853".parse().unwrap();
         let v6 = "[::1]:853".parse().unwrap();
-        let first_outbound = Some("slow".to_string());
-        let second_outbound = Some("other".to_string());
+        let first_outbound = TransportKey::named("slow");
+        let second_outbound = TransportKey::named("other");
         let initializations = Arc::new(AtomicUsize::new(0));
         let (started, start) = tokio::sync::oneshot::channel();
         let (release, released) = tokio::sync::oneshot::channel();
-        let attempt = udp.for_address(v4, &first_outbound);
+        let attempt = udp.for_address(v4, &first_outbound, false);
         let candidate = Arc::clone(&pool);
         let count = Arc::clone(&initializations);
         let first = tokio::spawn(async move {
@@ -514,7 +513,7 @@ mod tests {
         start.await.unwrap();
         // One blocked initializer must not serialize another outbound or family.
         for (address, outbound) in [(v4, &second_outbound), (v6, &first_outbound)] {
-            let attempt = udp.for_address(address, outbound);
+            let attempt = udp.for_address(address, outbound, false);
             tokio::time::timeout(
                 Duration::from_secs(1),
                 attempt.acquire(|| async { Ok(Arc::clone(&pool)) }),
@@ -523,7 +522,7 @@ mod tests {
             .expect("different UDP keys must initialize independently")
             .unwrap();
         }
-        let attempt = udp.for_address(v4, &first_outbound);
+        let attempt = udp.for_address(v4, &first_outbound, false);
         let candidate = Arc::clone(&pool);
         let count = Arc::clone(&initializations);
         let second = tokio::spawn(async move {
@@ -551,30 +550,30 @@ mod tests {
         let pool = pool().await;
         let v4 = "127.0.0.1:853".parse().unwrap();
         let v6 = "[::1]:853".parse().unwrap();
-        let ipv6_route = Some("ipv6-route".to_string());
-        let ipv4_route = Some("ipv4-route".to_string());
+        let ipv6_route = TransportKey::named("ipv6-route");
+        let ipv4_route = TransportKey::named("ipv4-route");
         for (address, outbound) in [(v6, &ipv6_route), (v4, &ipv4_route)] {
-            udp.for_address(address, outbound)
+            udp.for_address(address, outbound, false)
                 .acquire(|| async { Ok(Arc::clone(&pool)) })
                 .await
                 .unwrap();
-            udp.mark_current(address, outbound);
+            udp.mark_current(address, outbound, false);
         }
         let addresses = [v4, v6];
-        let snapshot = udp.snapshot(&addresses, &ipv6_route).unwrap();
+        let snapshot = udp.snapshot(&addresses, &ipv6_route, false).unwrap();
         assert_eq!(snapshot.current, Some(v6));
         let [first, retry] = snapshot.attempts;
         assert_eq!([first.address, retry.address], [v6, v4]);
         assert!(Arc::ptr_eq(first.pool.as_ref().unwrap(), &pool));
         assert!(retry.pool.is_none());
-        let snapshot = udp.snapshot(&addresses, &ipv4_route).unwrap();
+        let snapshot = udp.snapshot(&addresses, &ipv4_route, false).unwrap();
         assert_eq!(snapshot.current, Some(v4));
         let [first, retry] = snapshot.attempts;
         assert_eq!([first.address, retry.address], [v4, v6]);
         assert!(Arc::ptr_eq(first.pool.as_ref().unwrap(), &pool));
         assert!(retry.pool.is_none());
         // A preferred address removed by a bootstrap refresh is not retried.
-        let snapshot = udp.snapshot(&[v4], &ipv6_route).unwrap();
+        let snapshot = udp.snapshot(&[v4], &ipv6_route, false).unwrap();
         assert_eq!(snapshot.current, Some(v6));
         assert_eq!(snapshot.attempts[0].address, v4);
         udp.close().await;

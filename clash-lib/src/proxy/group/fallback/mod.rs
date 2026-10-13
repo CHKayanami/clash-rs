@@ -1,3 +1,4 @@
+use crate::proxy::RouteChange;
 use super::UdpPolicy;
 use std::collections::HashSet;
 use super::GroupHandler;
@@ -39,6 +40,8 @@ impl Debug for Handler {
 }
 
 impl Handler {
+    pub(crate) fn select_cached(&self) -> Option<OutboundNode> { self.find_alive_proxy(false) }
+
     pub fn new(
         opts: HandlerOptions,
         providers: Vec<ArcProxyProvider>,
@@ -68,6 +71,13 @@ impl Handler {
 }
 
 impl GroupHandler for Handler {
+    fn route_changes(&self, sources: &mut Vec<RouteChange>) {
+        self.providers.route_changes(sources);
+        sources.extend(self.providers.get_proxies(false).iter().map(|node|
+            self.proxy_manager.route_changes(node.name(), false),
+        ));
+    }
+
     fn name(&self) -> &str {
         &self.opts.name
     }

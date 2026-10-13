@@ -1,3 +1,5 @@
+use crate::proxy::RouteChange;
+
 use super::UdpPolicy;
 use std::collections::HashSet;
 use super::GroupHandler;
@@ -43,6 +45,7 @@ pub struct Handler {
     opts: HandlerOptions,
     providers: Providers,
     cached_active: Arc<ArcSwapOption<ActiveSelection>>,
+    changes: RouteChange,
 }
 
 impl std::fmt::Debug for Handler {
@@ -54,6 +57,8 @@ impl std::fmt::Debug for Handler {
 }
 
 impl Handler {
+    pub(crate) fn select_cached(&self) -> Option<OutboundNode> { self.selected_proxy(false) }
+
     pub async fn new(
         opts: HandlerOptions,
         providers: Vec<ArcProxyProvider>,
@@ -83,6 +88,7 @@ impl Handler {
             opts,
             providers,
             cached_active: Arc::new(ArcSwapOption::new(cached_active)),
+            changes: RouteChange::default(),
         }
     }
 
@@ -138,6 +144,7 @@ impl SelectorControl for Handler {
                 snapshot: proxies.clone(),
                 handler: proxy.clone(),
             })));
+            self.changes.notify();
             Ok(())
         } else {
             Err(Error::Operation(format!("proxy {name} not found")))
@@ -153,6 +160,11 @@ impl SelectorControl for Handler {
 }
 
 impl GroupHandler for Handler {
+    fn route_changes(&self, sources: &mut Vec<RouteChange>) {
+        self.providers.route_changes(sources);
+        sources.push(self.changes.clone());
+    }
+
     fn name(&self) -> &str {
         &self.opts.name
     }

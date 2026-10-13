@@ -1,3 +1,4 @@
+use crate::proxy::RouteChange;
 use std::{collections::HashMap, io, sync::Arc};
 
 use arc_swap::ArcSwapOption;
@@ -101,6 +102,10 @@ impl ProxyProvider for FilteredProxyProvider {
         })));
 
         filtered_arc
+    }
+
+    fn route_changes(&self) -> Option<RouteChange> {
+        self.inner.route_changes()
     }
 
     fn touch(&self) {

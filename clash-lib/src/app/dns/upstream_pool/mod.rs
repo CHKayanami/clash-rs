@@ -1,19 +1,26 @@
 //! Per-upstream DNS query management with connection reuse and graceful shutdown.
 
 mod admission;
+mod bindings;
 mod entries;
 mod query;
+mod routing;
+mod routes;
+mod selection;
 mod transports;
 mod udp;
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use routes::RouteCache;
+use selection::SelectionCache;
 use std::sync::atomic::AtomicUsize;
 use std::time::Duration;
 
 pub use admission::{AdmissionGate, AdmissionPermit, ClosePermit};
 pub use entries::{UpstreamEntry, UpstreamState};
-pub use transports::{PooledTransport, TransportKey, TransportPool};
+pub use routes::TransportKey;
+pub use transports::{PooledTransport, TransportPool};
 pub use udp::UdpUpstream;
 
 use crate::app::dns::ClashResolver;
@@ -21,6 +28,7 @@ use crate::app::dns::query::QueryContext;
 use crate::proxy::utils::OutboundNodeRegistry;
 
 pub struct UpstreamPool {
+    selections: Arc<RouteCache<SelectionCache>>,
     pub entries: HashMap<String, UpstreamEntry>,
     pub admission: AdmissionGate,
     pub outbounds: OutboundNodeRegistry,
@@ -44,6 +52,7 @@ impl UpstreamPool {
     ) -> Arc<Self> {
         Arc::new(Self {
             entries,
+            selections: Arc::new(RouteCache::default()),
             admission: AdmissionGate::new(),
             outbounds,
             bootstrap_resolver,
@@ -72,6 +81,7 @@ impl UpstreamPool {
     pub async fn close(&self) {
         if let Some(close_permit) = self.admission.acquire_close().await {
             self.admission.wait_for_idle().await;
+            drop(self.selections.take());
             for entry in self.entries.values() {
                 entry.state.close().await;
             }
@@ -79,3 +89,6 @@ impl UpstreamPool {
         }
     }
 }
+
+#[cfg(test)]
+mod routing_tests;

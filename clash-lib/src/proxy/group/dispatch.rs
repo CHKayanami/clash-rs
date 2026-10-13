@@ -1,4 +1,5 @@
 //! Static dispatch for group selection policies and API inspection.
+use crate::proxy::RouteChange;
 use super::{GroupHandler, GroupProxyAPIResponse, UdpPolicy};
 use crate::{proxy::{OutboundNode, OutboundType}, session::Session};
 use erased_serde::Serialize;
@@ -27,6 +28,21 @@ handler_enum!(ProxyGroup, WeakProxyGroup, $;
 );
 
 impl ProxyGroup {
+    pub(crate) fn route_changes(&self, sources: &mut Vec<RouteChange>) {
+        dispatch!(self, h, GroupHandler::route_changes(h.as_ref(), sources))
+    }
+    pub(crate) fn select_cached(&self) -> Option<OutboundNode> {
+        match self {
+            Self::Selector(h) => h.select_cached(),
+            Self::Fallback(h) => h.select_cached(),
+            Self::UrlTest(h) => h.select_cached(),
+            _ => None,
+        }
+    }
+    pub(crate) fn stable_selection(&self) -> bool {
+        matches!(self, Self::Selector(_) | Self::UrlTest(_) | Self::Fallback(_))
+    }
+
     pub fn name(&self) -> &str { dispatch!(self, h, GroupHandler::name(h.as_ref())) }
     pub fn proto(&self) -> OutboundType { dispatch!(self, h, GroupHandler::proto(h.as_ref())) }
     pub fn udp_policy(&self) -> UdpPolicy { dispatch!(self, h, GroupHandler::udp_policy(h.as_ref())) }

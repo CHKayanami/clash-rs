@@ -1,3 +1,4 @@
+use crate::proxy::RouteChange;
 use crate::proxy::{OutboundNode, OutboundType};
 use crate::session::Session;
 use std::{collections::HashSet, fmt::Debug, future::Future, io, time::Duration};
@@ -32,6 +33,8 @@ pub trait GroupHandler: Send + Sync + Unpin + Debug {
         sess: &Session,
         excluded: &HashSet<String>,
     ) -> impl Future<Output = io::Result<Option<OutboundNode>>> + Send;
+
+    fn route_changes(&self, sources: &mut Vec<RouteChange>) { let _ = sources; }
 
     fn attempts(&self, _sess: &Session) -> impl Future<Output = u32> + Send {
         async { 1 }

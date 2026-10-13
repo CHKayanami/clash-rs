@@ -1,3 +1,4 @@
+use crate::proxy::RouteChange;
 use std::{collections::HashSet, sync::Arc};
 
 use arc_swap::ArcSwapOption;
@@ -26,16 +27,20 @@ impl Providers {
         }
     }
 
+    pub(crate) fn route_changes(&self, sources: &mut Vec<RouteChange>) {
+        sources.extend(self.providers.iter().filter_map(|provider| provider.route_changes()));
+    }
+
+    pub(crate) fn touch(&self) {
+        for provider in &self.providers { provider.touch(); }
+    }
+
     pub fn get_proxies(&self, touch: bool) -> Arc<Vec<OutboundNode>> {
         if self.providers.is_empty() {
             return Arc::new(Vec::new());
         }
 
-        if touch {
-            for provider in &self.providers {
-                provider.touch();
-            }
-        }
+        if touch { self.touch(); }
 
         if self.providers.len() == 1 {
             return self.providers[0].proxies();

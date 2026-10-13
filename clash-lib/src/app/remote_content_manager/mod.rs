@@ -1,3 +1,4 @@
+use crate::proxy::RouteChange;
 use std::pin::pin;
 use super::dns::ThreadSafeDNSResolver;
 use crate::{
@@ -92,6 +93,8 @@ pub struct DelayHistory {
 
 struct ProxyState {
     alive: AtomicBool,
+    alive_changes: RouteChange,
+    delay_changes: RouteChange,
     delay_history: parking_lot::RwLock<VecDeque<DelayHistory>>,
 }
 
@@ -99,6 +102,8 @@ impl ProxyState {
     fn new() -> Self {
         Self {
             alive: AtomicBool::new(true),
+            alive_changes: RouteChange::default(),
+            delay_changes: RouteChange::default(),
             delay_history: parking_lot::RwLock::new(VecDeque::new()),
         }
     }
@@ -167,6 +172,12 @@ impl ProxyManager {
         results
     }
 
+    pub(crate) fn route_changes(&self, name: &str, delay: bool) -> RouteChange {
+        let state = self.proxy_state.entry(name.to_owned())
+            .or_insert_with(|| Arc::new(ProxyState::new()));
+        if delay { state.delay_changes.clone() } else { state.alive_changes.clone() }
+    }
+
     pub fn alive(&self, name: &str) -> bool {
         self.proxy_state
             .get(name)
@@ -200,14 +211,18 @@ impl ProxyManager {
             .entry(name.to_owned())
             .or_insert_with(|| Arc::new(ProxyState::new()));
         let state = entry.value();
-        state.alive.store(alive, Ordering::Relaxed);
+        let alive_changed = state.alive.swap(alive, Ordering::Relaxed) != alive;
+        let mut delay_changed = false;
         if let Some(ins) = history {
             let mut history_lock = state.delay_history.write();
+            delay_changed = history_lock.back().map(|previous| previous.delay) != Some(ins.delay);
             history_lock.push_back(ins);
             if history_lock.len() > 10 {
                 history_lock.pop_front();
             }
         }
+        if alive_changed { state.alive_changes.notify(); }
+        if alive_changed || delay_changed { state.delay_changes.notify(); }
     }
 
     #[cfg(test)]
@@ -1163,4 +1178,32 @@ mod tests {
         }
         assert_eq!(manager.delay_metrics("test"), Some((0.0, 200.0)));
     }
+
+    #[tokio::test]
+    async fn route_notifications_filter_members_and_health_metrics() {
+        use crate::proxy::utils::test_utils::noop::NoopResolver;
+
+        let manager = remote_content_manager::ProxyManager::new(Arc::new(NoopResolver), None);
+        let mut alive = manager.route_changes("a", false).subscribe();
+        let mut delay = manager.route_changes("a", true).subscribe();
+        manager.report_alive("other", false, None).await;
+        manager.report_alive("a", true, None).await;
+        assert!(!alive.has_changed().unwrap());
+        assert!(!delay.has_changed().unwrap());
+        manager.report_delay("a", true, Duration::from_millis(20)).await;
+        assert!(!alive.has_changed().unwrap());
+        assert!(delay.has_changed().unwrap());
+        delay.borrow_and_update();
+        manager.report_delay("a", true, Duration::from_millis(20)).await;
+        assert!(!delay.has_changed().unwrap());
+        manager.report_alive("a", false, None).await;
+        assert!(alive.has_changed().unwrap());
+        assert!(delay.has_changed().unwrap());
+        alive.borrow_and_update();
+        delay.borrow_and_update();
+        manager.report_alive("a", false, None).await;
+        assert!(!alive.has_changed().unwrap());
+        assert!(!delay.has_changed().unwrap());
+    }
+
 }

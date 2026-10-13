@@ -43,6 +43,12 @@ pub struct RetryGroup {
     selections: AtomicUsize,
     results: AtomicUsize,
 }
+impl RetryGroup {
+    pub(crate) fn new(name: &'static str, members: Vec<OutboundNode>) -> Self {
+        Self { name, members, selections: AtomicUsize::new(0), results: AtomicUsize::new(0) }
+    }
+}
+
 impl GroupHandler for RetryGroup {
     fn name(&self) -> &str { self.name }
     fn proto(&self) -> OutboundType { OutboundType::Smart }
