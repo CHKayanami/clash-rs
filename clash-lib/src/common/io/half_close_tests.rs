@@ -1,5 +1,4 @@
 use super::*;
-use futures::future::poll_fn;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[cfg(all(target_os = "linux", feature = "zero_copy"))]
@@ -81,6 +80,31 @@ async fn buffered_half_close_progress() {
         let copy = copy_buf_bidirectional_with_timeout(
             &mut a,
             &mut b,
+            1024,
+            timeout,
+            timeout,
+            TrafficTracker::noop(),
+        );
+        let (source, sink) = if reverse {
+            (server, client)
+        } else {
+            (client, server)
+        };
+        check_progress(copy, source, sink, timeout, reverse).await;
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn owned_copy_half_close_progress() {
+    use crate::proxy::AnyStream;
+
+    for reverse in [false, true] {
+        let (client, a) = tokio::io::duplex(64);
+        let (b, server) = tokio::io::duplex(64);
+        let timeout = Duration::from_secs(10);
+        let copy = copy_bidirectional(
+            AnyStream::dynamic(a),
+            AnyStream::dynamic(b),
             1024,
             timeout,
             timeout,
@@ -183,8 +207,7 @@ async fn zero_copy_half_close_progress() {
         let copy = zero_copy_bidirectional(
             &mut a,
             &mut b,
-            DownloadTracker::new(TrafficTracker::noop()).into(),
-            UploadTracker::new(TrafficTracker::noop()).into(),
+            TrafficTracker::noop(),
             timeout,
             timeout,
         );
@@ -214,8 +237,7 @@ async fn zero_copy_half_close_idle_timeout() {
             zero_copy_bidirectional(
                 &mut a,
                 &mut b,
-                DownloadTracker::new(TrafficTracker::noop()).into(),
-                UploadTracker::new(TrafficTracker::noop()).into(),
+                TrafficTracker::noop(),
                 duration,
                 duration,
             ),
@@ -230,6 +252,8 @@ async fn zero_copy_half_close_idle_timeout() {
 #[cfg(all(target_os = "linux", feature = "zero_copy"))]
 #[tokio::test]
 async fn zero_copy_forwards_nested_prefixes_and_counts_them() {
+    use std::sync::Arc;
+    use crate::app::dispatcher::{StatisticsManager, TrackerInfo};
     use crate::app::sniffer::PrefixedStream;
     use crate::proxy::{AnyStream, ProxyStream};
     let (mut client, a) = tcp_pair().await;
@@ -242,13 +266,15 @@ async fn zero_copy_forwards_nested_prefixes_and_counts_them() {
         PrefixedStream::new(outer_prefix, PrefixedStream::new(inner_prefix, a));
     assert!(a.underlying_socket().is_none());
     assert!(a.zero_copy_socket().is_some());
+    let info = Arc::new(TrackerInfo::default());
+    let tracker = TrafficTracker::new(info.clone(), StatisticsManager::new());
     let copy = copy_bidirectional(
         AnyStream::Dynamic(Box::new(a)),
         AnyStream::Tcp(b),
         1024,
         Duration::from_secs(10),
         Duration::from_secs(10),
-        TrafficTracker::noop(),
+        tracker,
     );
     let peers = async {
         client.write_all(b"tail").await.unwrap();
@@ -269,6 +295,8 @@ async fn zero_copy_forwards_nested_prefixes_and_counts_them() {
     .await
     .unwrap();
     assert_eq!(counts.unwrap(), (14, 5));
+    assert_eq!(info.upload_total(), 14);
+    assert_eq!(info.download_total(), 5);
 }
 
 #[cfg(all(target_os = "linux", feature = "zero_copy"))]
@@ -316,29 +344,4 @@ async fn zero_copy_prefix_backpressure_does_not_block_replies() {
     .await
     .unwrap();
     assert_eq!(counts.unwrap(), (1024 * 1024, 5));
-}
-
-#[tokio::test]
-async fn completed_shutdown_retains_counts_without_unused_timers() {
-    let (_client, mut a) = tokio::io::duplex(64);
-    let (mut b, _server) = tokio::io::duplex(64);
-    // Both directions have reached EOF before either shutdown completes.
-    let mut copy = CopyBidirectional {
-        a: &mut a,
-        b: &mut b,
-        a_to_b: TransferState::ShuttingDown(7),
-        b_to_a: TransferState::ShuttingDown(9),
-        a_to_b_delay: None,
-        b_to_a_delay: None,
-        a_to_b_timeout_duration: Duration::from_secs(10),
-        b_to_a_timeout_duration: Duration::from_secs(10),
-        idle_timeout: Box::pin(tokio::time::sleep(COPY_IDLE_TIMEOUT)),
-        last_active: tokio::time::Instant::now(),
-        tracker: TrafficTracker::noop(),
-    };
-    let counts = poll_fn(|cx| Pin::new(&mut copy).poll(cx))
-        .await.unwrap();
-    assert_eq!(counts, (7, 9));
-    assert!(copy.a_to_b_delay.is_none());
-    assert!(copy.b_to_a_delay.is_none());
 }

@@ -1,8 +1,6 @@
 /// ref: https://github.com/Hanaasagi/tokio-splice & clash_lib/src/common/io/mod.rs
 use std::{
-    future::Future,
     io::{Error, ErrorKind},
-    marker::PhantomData,
     os::unix::io::{AsRawFd, RawFd},
     pin::Pin,
     task::{Context, Poll, ready},
@@ -10,54 +8,16 @@ use std::{
 };
 
 use libc;
+#[cfg(test)]
+use futures::future::poll_fn;
 use tokio::io::{AsyncRead, AsyncWrite, Interest};
 
-use enum_dispatch::enum_dispatch;
 use tokio::net::{TcpStream, UnixStream};
 
 use super::{CopyBidirectionalError, SlideBuffer, TrafficTracker};
 
-#[enum_dispatch]
-pub trait TrackCopy: Send + Sync {
-    fn track(&self, total: usize);
-}
-
-#[derive(Clone)]
-pub struct UploadTracker(TrafficTracker);
-
-impl UploadTracker {
-    pub fn new(tracker: TrafficTracker) -> Self {
-        Self(tracker)
-    }
-}
-
-impl TrackCopy for UploadTracker {
-    fn track(&self, total: usize) {
-        self.0.push_upload(total);
-    }
-}
-
-#[derive(Clone)]
-pub struct DownloadTracker(TrafficTracker);
-
-impl DownloadTracker {
-    pub fn new(tracker: TrafficTracker) -> Self {
-        Self(tracker)
-    }
-}
-
-impl TrackCopy for DownloadTracker {
-    fn track(&self, total: usize) {
-        self.0.push_download(total);
-    }
-}
-
-#[derive(Clone)]
-#[enum_dispatch(TrackCopy)]
-pub enum CopyTracker {
-    Upload(UploadTracker),
-    Download(DownloadTracker),
-}
+use super::transfer::{Buffer, CopyState as TransferCopyState, Direction};
+use tokio::time::Instant;
 
 /// the size of PIPE_BUF
 const PIPE_SIZE: usize = 65536;
@@ -184,7 +144,7 @@ impl Drop for Pipe {
     }
 }
 
-struct CopyBuffer<R, W> {
+pub(super) struct CopyBuffer {
     read_done: bool,
     need_flush: bool,
     pos: usize,
@@ -192,15 +152,9 @@ struct CopyBuffer<R, W> {
     amt: u64,
     buf: Pipe,
     prefix: Option<SlideBuffer>,
-    _marker_r: PhantomData<R>,
-    _marker_w: PhantomData<W>,
 }
 
-impl<R, W> CopyBuffer<R, W>
-where
-    R: Stream + Unpin,
-    W: Stream + Unpin,
-{
+impl CopyBuffer {
     fn new(buf: Pipe) -> Self {
         Self {
             read_done: false,
@@ -210,8 +164,6 @@ where
             amt: 0,
             buf,
             prefix: None,
-            _marker_r: PhantomData,
-            _marker_w: PhantomData,
         }
     }
 
@@ -219,7 +171,7 @@ where
         self.amt
     }
 
-    fn poll_fill_buf(
+    fn poll_fill_buf<R: Stream + Unpin>(
         &mut self,
         cx: &mut Context<'_>,
         stream: &mut R,
@@ -269,7 +221,7 @@ where
         }
     }
 
-    fn poll_write_buf(
+    fn poll_write_buf<W: Stream + Unpin>(
         &mut self,
         cx: &mut Context<'_>,
         stream: &mut W,
@@ -311,7 +263,7 @@ where
         }
     }
 
-    fn poll_flush_buf(
+    fn poll_flush_buf<W: AsyncWrite + Unpin>(
         &mut self,
         cx: &mut Context<'_>,
         stream: &mut W,
@@ -320,12 +272,8 @@ where
     }
 }
 
-impl<R, W> CopyBuffer<R, W>
-where
-    R: Stream + Unpin,
-    W: Stream + Unpin,
-{
-    fn poll_copy(
+impl CopyBuffer {
+    fn poll_copy<R: Stream + Unpin, W: Stream + Unpin>(
         &mut self,
         cx: &mut Context<'_>,
         r: &mut R,
@@ -411,12 +359,6 @@ where
     }
 }
 
-enum TransferState<SR, SW> {
-    Running(CopyBuffer<SR, SW>),
-    ShuttingDown(u64),
-    Done,
-}
-
 /// `AsyncRead` + `AsyncWrite` + `AsRawFd` Wrapper for stream.
 /// This trait is auto implemented for `TcpStream` and `UnixStream`.
 pub trait Stream: AsyncRead + AsyncWrite + AsRawFd {
@@ -437,63 +379,12 @@ pub trait Stream: AsyncRead + AsyncWrite + AsRawFd {
 /// After one direction finishes, the remaining direction's timeout is reset
 /// whenever it successfully writes data. Reads alone do not extend the timeout.
 #[cfg(test)]
-pub(super) async fn zero_copy_bidirectional<A, B>(
-    a: &mut A,
-    b: &mut B,
-    read_tracker: CopyTracker,
-    write_tracker: CopyTracker,
-    a_to_b_timeout_duration: Duration,
-    b_to_a_timeout_duration: Duration,
-) -> Result<(u64, u64)>
-where
-    A: Stream + Unpin,
-    B: Stream + Unpin,
-{
-    zero_copy_bidirectional_with_prefix(
-        a,
-        b,
-        None,
-        None,
-        read_tracker,
-        write_tracker,
-        a_to_b_timeout_duration,
-        b_to_a_timeout_duration,
-    )
-    .await
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(super) async fn zero_copy_bidirectional_with_prefix<A, B>(
-    a: &mut A,
-    b: &mut B,
-    a_prefix: Option<SlideBuffer>,
-    b_prefix: Option<SlideBuffer>,
-    read_tracker: CopyTracker,
-    write_tracker: CopyTracker,
-    a_to_b_timeout_duration: Duration,
-    b_to_a_timeout_duration: Duration,
-) -> Result<(u64, u64)>
-where
-    A: Stream + Unpin,
-    B: Stream + Unpin,
-{
-    let idle_timeout_duration = Duration::from_secs(180);
-    let mut a_to_b = CopyBuffer::new(Pipe::new()?);
-    let mut b_to_a = CopyBuffer::new(Pipe::new()?);
-    a_to_b.prefix = a_prefix.filter(|prefix| !prefix.is_empty());
-    b_to_a.prefix = b_prefix.filter(|prefix| !prefix.is_empty());
-    CopyBidirectional::new(
-        a,
-        b,
-        a_to_b,
-        b_to_a,
-        a_to_b_timeout_duration,
-        b_to_a_timeout_duration,
-        idle_timeout_duration,
-        write_tracker,
-        read_tracker,
-    )
-    .await
+pub(super) async fn zero_copy_bidirectional<A: Stream + Unpin, B: Stream + Unpin>(
+    a: &mut A, b: &mut B, tracker: TrafficTracker,
+    upload_timeout: Duration, download_timeout: Duration,
+) -> Result<(u64, u64)> {
+    let mut state = new(None, None, tracker, upload_timeout, download_timeout)?;
+    poll_fn(|cx| state.poll(a, b, cx)).await
 }
 
 macro_rules! impl_stream_for {
@@ -524,232 +415,26 @@ macro_rules! impl_stream_for {
 impl_stream_for!(TcpStream);
 impl_stream_for!(UnixStream);
 
-struct CopyBidirectional<'a, A, B> {
-    a: &'a mut A,
-    b: &'a mut B,
-    a_to_b: TransferState<A, B>,
-    b_to_a: TransferState<B, A>,
-    a_to_b_count: u64,
-    b_to_a_count: u64,
-    a_to_b_delay: Option<Pin<Box<tokio::time::Sleep>>>,
-    b_to_a_delay: Option<Pin<Box<tokio::time::Sleep>>>,
-    a_to_b_timeout_duration: Duration,
-    b_to_a_timeout_duration: Duration,
-    idle_timeout: Pin<Box<tokio::time::Sleep>>,
-    idle_timeout_duration: Duration,
-    last_active: tokio::time::Instant,
-    write_tracker: CopyTracker,
-    read_tracker: CopyTracker,
+pub(super) type CopyState = TransferCopyState<CopyBuffer>;
+
+pub(super) fn new(
+    upload_prefix: Option<SlideBuffer>, download_prefix: Option<SlideBuffer>,
+    tracker: TrafficTracker, upload_timeout: Duration, download_timeout: Duration,
+) -> Result<CopyState> {
+    let mut upload = CopyBuffer::new(Pipe::new()?);
+    let mut download = CopyBuffer::new(Pipe::new()?);
+    upload.prefix = upload_prefix.filter(|prefix| !prefix.is_empty());
+    download.prefix = download_prefix.filter(|prefix| !prefix.is_empty());
+    Ok(CopyState::new(upload, download, upload_timeout, download_timeout, tracker))
 }
 
-impl<'a, A, B> CopyBidirectional<'a, A, B> {
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        a: &'a mut A,
-        b: &'a mut B,
-        a_to_b_buffer: CopyBuffer<A, B>,
-        b_to_a_buffer: CopyBuffer<B, A>,
-        a_to_b_timeout_duration: Duration,
-        b_to_a_timeout_duration: Duration,
-        idle_timeout_duration: Duration,
-        write_tracker: CopyTracker,
-        read_tracker: CopyTracker,
-    ) -> Self
-    where
-        A: Stream + Unpin,
-        B: Stream + Unpin,
-    {
-        Self {
-            a,
-            b,
-            a_to_b: TransferState::Running(a_to_b_buffer),
-            b_to_a: TransferState::Running(b_to_a_buffer),
-            a_to_b_count: 0,
-            b_to_a_count: 0,
-            a_to_b_delay: None,
-            b_to_a_delay: None,
-            a_to_b_timeout_duration,
-            b_to_a_timeout_duration,
-            idle_timeout: Box::pin(tokio::time::sleep(idle_timeout_duration)),
-            idle_timeout_duration,
-            last_active: tokio::time::Instant::now(),
-            write_tracker,
-            read_tracker,
-        }
-    }
-}
+impl<R: Stream + Unpin, W: Stream + Unpin> Buffer<R, W> for CopyBuffer {
+    fn amount_transferred(&self) -> u64 { self.amount_transferred() }
 
-impl<A, B> Future for CopyBidirectional<'_, A, B>
-where
-    A: Stream + Unpin + Sized,
-    B: Stream + Unpin + Sized,
-{
-    type Output = std::result::Result<(u64, u64), CopyBidirectionalError>;
-
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let CopyBidirectional {
-            a,
-            b,
-            a_to_b,
-            b_to_a,
-            a_to_b_count,
-            b_to_a_count,
-            a_to_b_delay,
-            b_to_a_delay,
-            a_to_b_timeout_duration,
-            b_to_a_timeout_duration,
-            idle_timeout,
-            idle_timeout_duration,
-            last_active,
-            write_tracker,
-            read_tracker,
-        } = &mut *self;
-
-        // Check idle timeout
-        let deadline = *last_active + *idle_timeout_duration;
-        if tokio::time::Instant::now() >= deadline {
-            return Poll::Ready(Err(CopyBidirectionalError::Other(Error::new(
-                ErrorKind::TimedOut,
-                "connection idle timeout",
-            ))));
-        }
-
-        if idle_timeout.deadline() != deadline {
-            idle_timeout.as_mut().reset(deadline);
-        }
-        let _ = idle_timeout.as_mut().poll(cx);
-
-        loop {
-            match a_to_b {
-                TransferState::Running(buf) => {
-                    let prev_amt = buf.amount_transferred();
-                    let res = buf.poll_copy(cx, *a, *b, last_active);
-                    // Only successful writes extend the remaining direction's
-                    // timeout after the opposite direction has half-closed.
-                    if buf.amount_transferred() > prev_amt
-                        && let Some(delay) = a_to_b_delay.as_mut()
-                    {
-                        delay.as_mut().reset(
-                            tokio::time::Instant::now() + *a_to_b_timeout_duration,
-                        );
-                    }
-                    let delta = buf.amount_transferred() - prev_amt;
-                    if delta > 0 {
-                        write_tracker.track(delta as _);
-                    }
-                    match res {
-                        Poll::Ready(Ok(count)) => {
-                            *a_to_b = TransferState::ShuttingDown(count);
-                            continue;
-                        }
-                        Poll::Ready(Err(err)) => {
-                            return Poll::Ready(Err(err));
-                        }
-                        Poll::Pending => {
-                            if let Some(delay) = a_to_b_delay {
-                                match delay.as_mut().poll(cx) {
-                                    Poll::Ready(()) => {
-                                        *a_to_b = TransferState::ShuttingDown(
-                                            buf.amount_transferred(),
-                                        );
-                                        continue;
-                                    }
-                                    Poll::Pending => (),
-                                }
-                            }
-                        }
-                    }
-                }
-                TransferState::ShuttingDown(count) => {
-                    let res = Pin::new(&mut *b).poll_shutdown(cx);
-                    match res {
-                        Poll::Ready(Ok(())) => {
-                            *a_to_b_count += *count;
-                            *a_to_b = TransferState::Done;
-                            b_to_a_delay.replace(Box::pin(tokio::time::sleep(
-                                *b_to_a_timeout_duration,
-                            )));
-                            continue;
-                        }
-                        Poll::Ready(Err(err)) => {
-                            return Poll::Ready(Err(
-                                CopyBidirectionalError::LeftClosed(err),
-                            ));
-                        }
-                        Poll::Pending => (),
-                    }
-                }
-                TransferState::Done => (),
-            }
-
-            match b_to_a {
-                TransferState::Running(buf) => {
-                    let prev_amt = buf.amount_transferred();
-                    let res = buf.poll_copy(cx, *b, *a, last_active);
-                    // Only successful writes extend the remaining direction's
-                    // timeout after the opposite direction has half-closed.
-                    if buf.amount_transferred() > prev_amt
-                        && let Some(delay) = b_to_a_delay.as_mut()
-                    {
-                        delay.as_mut().reset(
-                            tokio::time::Instant::now() + *b_to_a_timeout_duration,
-                        );
-                    }
-                    let delta = buf.amount_transferred() - prev_amt;
-                    if delta > 0 {
-                        read_tracker.track(delta as _);
-                    }
-                    match res {
-                        Poll::Ready(Ok(count)) => {
-                            *b_to_a = TransferState::ShuttingDown(count);
-                            continue;
-                        }
-                        Poll::Ready(Err(err)) => {
-                            return Poll::Ready(Err(err));
-                        }
-                        Poll::Pending => {
-                            if let Some(delay) = b_to_a_delay {
-                                match delay.as_mut().poll(cx) {
-                                    Poll::Ready(()) => {
-                                        *b_to_a = TransferState::ShuttingDown(
-                                            buf.amount_transferred(),
-                                        );
-                                        continue;
-                                    }
-                                    Poll::Pending => (),
-                                }
-                            }
-                        }
-                    }
-                }
-                TransferState::ShuttingDown(count) => {
-                    let res = Pin::new(&mut *a).poll_shutdown(cx);
-                    match res {
-                        Poll::Ready(Ok(())) => {
-                            *b_to_a_count += *count;
-                            *b_to_a = TransferState::Done;
-                            a_to_b_delay.replace(Box::pin(tokio::time::sleep(
-                                *a_to_b_timeout_duration,
-                            )));
-                            continue;
-                        }
-                        Poll::Ready(Err(err)) => {
-                            return Poll::Ready(Err(
-                                CopyBidirectionalError::RightClosed(err),
-                            ));
-                        }
-                        Poll::Pending => (),
-                    }
-                }
-                TransferState::Done => (),
-            }
-
-            match (&a_to_b, &b_to_a) {
-                (TransferState::Done, TransferState::Done) => break,
-                _ => return Poll::Pending,
-            }
-        }
-
-        Poll::Ready(Ok((*a_to_b_count, *b_to_a_count)))
+    fn poll_copy(
+        &mut self, cx: &mut Context<'_>, reader: &mut R, writer: &mut W,
+        last_active: &mut Instant, _direction: Direction,
+    ) -> Poll<Result<u64>> {
+        self.poll_copy(cx, reader, writer, last_active)
     }
 }

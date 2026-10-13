@@ -7,18 +7,21 @@ use std::{
     alloc::{GlobalAlloc, Layout, System},
     cell::Cell,
 };
-use clash_lib::dispatch_measurement::measure_dispatch_futures;
+use clash_lib::dispatch_measurement::{measure_copy_runtime, measure_dispatch_futures};
 
 thread_local! {
     static TRACKING: Cell<bool> = const { Cell::new(false) };
     static ALLOCATIONS: Cell<usize> = const { Cell::new(0) };
+    static ALLOCATED_BYTES: Cell<usize> = const { Cell::new(0) };
+    static FREED_BYTES: Cell<usize> = const { Cell::new(0) };
 }
 
 struct DispatchAllocator;
 
-fn record_allocation() {
+fn record_allocation(bytes: usize) {
     if TRACKING.try_with(Cell::get).unwrap_or(false) {
         let _ = ALLOCATIONS.try_with(|count| count.set(count.get().saturating_add(1)));
+        let _ = ALLOCATED_BYTES.try_with(|count| count.set(count.get().saturating_add(bytes)));
     }
 }
 
@@ -27,20 +30,58 @@ fn record_allocation() {
 // access the allocated memory, including during thread-local teardown.
 unsafe impl GlobalAlloc for DispatchAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        record_allocation();
+        record_allocation(layout.size());
         unsafe { System.alloc(layout) }
     }
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        record_allocation();
+        record_allocation(layout.size());
         unsafe { System.alloc_zeroed(layout) }
     }
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        if TRACKING.try_with(Cell::get).unwrap_or(false) {
+            let _ = FREED_BYTES.try_with(|count| count.set(count.get().saturating_add(layout.size())));
+        }
         unsafe { System.dealloc(ptr, layout) }
     }
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, size: usize) -> *mut u8 {
-        record_allocation();
+        record_allocation(size);
         unsafe { System.realloc(ptr, layout, size) }
     }
+}
+
+#[tokio::test]
+async fn forwarding_runtime_allocations() {
+    let tracking = Tracking;
+    measure_copy_runtime(
+        || {
+            assert!(!TRACKING.get());
+            ALLOCATIONS.set(0);
+            ALLOCATED_BYTES.set(0);
+            FREED_BYTES.set(0);
+            TRACKING.set(true);
+        },
+        |name, _, expected| {
+            TRACKING.set(false);
+            let count = ALLOCATIONS.get();
+            let bytes = ALLOCATED_BYTES.get();
+            let freed = FREED_BYTES.get();
+            println!("{name}: allocations={count} allocated_bytes={bytes} freed_bytes={freed}");
+            assert_eq!(count, expected.unwrap(), "{name}");
+            match name {
+                "TCP copy initialization" => assert_eq!(bytes, 2048 + size_of::<tokio::time::Sleep>()),
+                "splice copy initialization" => assert_eq!(bytes, size_of::<tokio::time::Sleep>()),
+                _ => assert_eq!(bytes, 0, "{name} allocated during forwarding"),
+            }
+            match name {
+                "TCP copy half-close" => assert_eq!(freed, 1024),
+                "TCP copy completion" => assert_eq!(freed, 1024 + size_of::<tokio::time::Sleep>()),
+                "splice copy completion" => assert_eq!(freed, size_of::<tokio::time::Sleep>()),
+                _ => (),
+            }
+            count
+        },
+    ).await;
+    drop(tracking);
 }
 
 #[global_allocator]

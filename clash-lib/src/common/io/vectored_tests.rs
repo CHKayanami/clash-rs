@@ -73,7 +73,7 @@ async fn wrapped_buffer_handles_partial_vectored_writes_and_pending() {
     let expected = b"tail!!head1234";
     for vectored in [false, true] {
         for limit in [1, 6, 7, 14] {
-            let mut buffer = CopyBuffer::new_with_capacity(1024).unwrap();
+            let mut buffer = CopyBuffer::new_with_capacity(1024);
             buffer.start_index = 1018;
             buffer.cache_length = expected.len();
             buffer.read_done = true;
@@ -88,21 +88,18 @@ async fn wrapped_buffer_handles_partial_vectored_writes_and_pending() {
                 pending_flush: true,
                 vectored_calls: 0,
             };
-            let mut reported = 0;
             let count = futures::future::poll_fn(|cx| {
                 buffer.poll_copy(
                     cx,
                     Pin::new(&mut reader),
                     Pin::new(&mut writer),
                     None,
-                    Some(&mut |n| reported += n),
                 )
             })
             .await
             .unwrap();
             assert_eq!(writer.data, expected);
             assert_eq!(count, expected.len() as u64);
-            assert_eq!(reported, expected.len());
             assert_eq!(buffer.cache_length, 0);
             assert_eq!(buffer.start_index, 0);
             assert_eq!(writer.vectored_calls > 0, vectored);
@@ -115,7 +112,7 @@ async fn wrapped_buffer_handles_partial_vectored_writes_and_pending() {
 
 #[tokio::test]
 async fn wrapped_buffer_rejects_zero_vectored_write() {
-    let mut buffer = CopyBuffer::new_with_capacity(1024).unwrap();
+    let mut buffer = CopyBuffer::new_with_capacity(1024);
     buffer.start_index = 1023;
     buffer.cache_length = 2;
     buffer.read_done = true;
@@ -133,7 +130,6 @@ async fn wrapped_buffer_rejects_zero_vectored_write() {
             cx,
             Pin::new(&mut reader),
             Pin::new(&mut writer),
-            None,
             None,
         )
     })

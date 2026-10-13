@@ -1,5 +1,7 @@
 //! Opt-in internal hook for the isolated dispatch allocation test.
 
+pub use crate::common::io::measurement::measure_copy_runtime;
+
 use std::{collections::{HashMap, HashSet}, future::Future, mem::{size_of, size_of_val}, sync::{Arc, atomic::AtomicBool}, time::Duration};
 use arc_swap::ArcSwap;
 use tokio::sync::{mpsc, Semaphore};
