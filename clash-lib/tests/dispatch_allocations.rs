@@ -67,6 +67,9 @@ async fn native_dispatch_future_allocations_and_sizes() {
             if matches!(name, "protocol enum" | "protocol UDP enum" | "group enum" | "pooled UDP enum") {
                 assert!(bytes <= 512, "{name} retained an oversized dispatch future: {bytes}");
             }
+            if name == "TCP bidirectional copy" {
+                assert!(bytes <= 896, "TCP copy future grew: {bytes}");
+            }
             if name.starts_with("boxed protocol") {
                 assert_eq!(bytes, 2 * size_of::<usize>(), "{name} handle size");
             }
@@ -103,6 +106,9 @@ fn top_level_dispatch_future_sizes() {
     for (name, size) in sizes {
         println!("{name}: future_bytes={size}");
     }
+    // Keep dispatch entry futures free of an outer async instrumentation layer.
+    assert!(sizes[0].1 <= 2048, "TCP dispatch future grew: {}", sizes[0].1);
+    assert!(sizes[1].1 <= 768, "UDP dispatch future grew: {}", sizes[1].1);
     // Bound DNS entry futures independently of the boxed dynamic-group branch.
     assert!(sizes[2].1 <= 6400, "DNS query future grew: {}", sizes[2].1);
     assert!(sizes[3].1 <= 2560, "DNS UDP future grew: {}", sizes[3].1);

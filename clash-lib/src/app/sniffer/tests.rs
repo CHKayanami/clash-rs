@@ -1,4 +1,5 @@
 use crate::proxy::AnyStream;
+use std::task::Context;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use super::*;
@@ -550,4 +551,85 @@ async fn test_tcp_neg_cache_concurrent_hard_capacity_limit() {
 
     // Must never exceed 4096 under multi-threaded concurrency
     assert!(cache.len() <= 4096);
+}
+
+#[tokio::test(start_paused = true)]
+async fn empty_prefetch_keeps_stream_and_updates_negative_cache() {
+    let sniffer = Sniffer::new(SnifferConfig { enable: true, ..Default::default() });
+    let target: SocketAddr = "192.0.2.1:443".parse().unwrap();
+    let sess = Session { destination: target.into(), ..Default::default() };
+    for eof in [true, false, true] {
+        let (client, server) = tokio::io::duplex(64);
+        let server = if eof { drop(server); None } else { Some(server) };
+        let (domain, stream, override_dest) = sniffer.sniff_stream(&sess, client.into()).await;
+        assert!(domain.is_none());
+        assert!(!override_dest);
+        assert!(matches!(stream, AnyStream::Duplex(_)));
+        drop(server);
+    }
+    assert!(sniffer.tcp_neg_cache.should_skip(&target, Instant::now()));
+}
+
+#[tokio::test(start_paused = true)]
+async fn shared_sniff_deadline_preserves_partial_prefetch() {
+    let sniffer = Sniffer::new(SnifferConfig { enable: true, ..Default::default() });
+    let sess = Session { destination: "192.0.2.2:443".parse().unwrap(), ..Default::default() };
+    let (client, mut server) = tokio::io::duplex(64);
+    server.write_all(&[0x16]).await.unwrap();
+    let started = tokio::time::Instant::now();
+    let (domain, mut stream, _) = sniffer.sniff_stream(&sess, client.into()).await;
+    assert!(domain.is_none());
+    let elapsed = tokio::time::Instant::now() - started;
+    assert!(elapsed >= DEFAULT_SNIFF_TIMEOUT);
+    assert!(elapsed <= DEFAULT_SNIFF_TIMEOUT + Duration::from_millis(1));
+    let mut byte = [0];
+    stream.read_exact(&mut byte).await.unwrap();
+    assert_eq!(byte, [0x16]);
+    server.write_all(b"x").await.unwrap();
+    stream.read_exact(&mut byte).await.unwrap();
+    assert_eq!(byte, *b"x");
+}
+
+#[tokio::test]
+async fn deadline_keeps_read_ready_priority() {
+    let (mut client, mut server) = tokio::io::duplex(64);
+    server.write_all(b"x").await.unwrap();
+    let timer = tokio::time::sleep(Duration::ZERO);
+    tokio::pin!(timer);
+    timer.as_mut().await;
+    let mut byte = [0];
+    assert_eq!(read_until_deadline(&mut client, &mut byte, timer.as_mut()).await.unwrap().unwrap(), 1);
+    assert_eq!(byte, *b"x");
+}
+
+struct BudgetExhaustingReader { polls: u8 }
+impl AsyncRead for BudgetExhaustingReader {
+    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, _buf: &mut ReadBuf<'_>)
+        -> Poll<io::Result<()>>
+    {
+        self.polls += 1;
+        if self.polls > 2 {
+            // Fail deterministically rather than hang if the timeout is starved.
+            return Poll::Ready(Err(io::Error::other("deadline was not polled")));
+        }
+        loop {
+            match tokio::task::coop::poll_proceed(cx) {
+                Poll::Ready(permit) => permit.made_progress(),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn exhausted_read_budget_does_not_starve_deadline() {
+    tokio::spawn(async {
+        let timer = tokio::time::sleep(Duration::ZERO);
+        tokio::pin!(timer);
+        timer.as_mut().await;
+        let mut reader = BudgetExhaustingReader { polls: 0 };
+        let mut byte = [0];
+        assert!(read_until_deadline(&mut reader, &mut byte, timer.as_mut()).await.is_none());
+        assert_eq!(reader.polls, 1);
+    }).await.unwrap();
 }

@@ -1,3 +1,4 @@
+use crate::app::net::OutboundInterface;
 use std::sync::Arc;
 
 use super::transports::TransportPool;
@@ -35,7 +36,7 @@ pub struct UpstreamEntry {
     pub protocol: DnsProtocol,
     pub endpoint: DnsEndpoint,
     pub outbound: Option<String>,
-    pub interface: Option<crate::app::net::OutboundInterface>,
+    pub interface: Option<Arc<OutboundInterface>>,
     pub ecs: Option<EdnsClientSubnet>,
     /// Protocol-specific connection state, shared across entry clones.
     pub state: Arc<UpstreamState>,

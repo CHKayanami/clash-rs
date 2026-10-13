@@ -244,7 +244,7 @@ impl Handler {
             if resolver.ipv6() {
                 new_udp_socket(
                     Some((Ipv6Addr::UNSPECIFIED, 0).into()),
-                    sess.iface.as_ref(),
+                    sess.iface.as_deref(),
                     #[cfg(target_os = "linux")]
                     sess.so_mark,
                     None,

@@ -47,7 +47,7 @@ impl CountingConnector {
         _address: &str,
         _port: u16,
         _tfo: bool,
-        _iface: Option<&OutboundInterface>,
+        _iface: Option<&Arc<OutboundInterface>>,
         #[cfg(target_os = "linux")] _packet_mark: Option<u32>,
     ) -> io::Result<AnyStream> {
         self.dials.fetch_add(1, Ordering::Relaxed);
@@ -67,7 +67,7 @@ impl CountingConnector {
         _resolver: ThreadSafeDNSResolver,
         _src: Option<SocketAddr>,
         _destination: SocksAddr,
-        _iface: Option<&OutboundInterface>,
+        _iface: Option<&Arc<OutboundInterface>>,
         #[cfg(target_os = "linux")] _packet_mark: Option<u32>,
     ) -> io::Result<AnyOutboundDatagram> {
         Err(io::Error::new(

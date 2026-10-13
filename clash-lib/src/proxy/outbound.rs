@@ -23,32 +23,36 @@ pub(crate) trait DatagramConnector: Sync {
 }
 
 /// Execute a leaf operation using the common nested group and retry policy.
-pub(crate) trait ProtocolOperation: Sync {
+pub(crate) trait ProtocolOperation: Send + Sync {
     type Output: Send;
     fn execute<'a>(&'a self, handler: &'a ProtocolOutbound, sess: &'a Session)
         -> impl Future<Output = io::Result<Self::Output>> + Send + 'a;
 }
 
-struct PhysicalOperation<'a, C> {
-    connector: &'a C,
+struct StreamOperation {
     resolver: ThreadSafeDNSResolver,
-    udp: bool,
 }
 
-impl<C: DatagramConnector> ProtocolOperation for PhysicalOperation<'_, C> {
-    type Output = Connection<C::Datagram>;
+impl ProtocolOperation for StreamOperation {
+    type Output = AnyStream;
     fn execute<'a>(&'a self, handler: &'a ProtocolOutbound, sess: &'a Session)
         -> impl Future<Output = io::Result<Self::Output>> + Send + 'a
     {
-        async move {
-            if self.udp {
-                self.connector.connect(handler, sess, self.resolver.clone()).await
-                    .map(Connection::Datagram)
-            } else {
-                handler.connect_stream(sess, self.resolver.clone()).await
-                    .map(Connection::Stream)
-            }
-        }
+        handler.connect_stream(sess, self.resolver.clone())
+    }
+}
+
+struct DatagramOperation<'a, C> {
+    connector: &'a C,
+    resolver: ThreadSafeDNSResolver,
+}
+
+impl<C: DatagramConnector> ProtocolOperation for DatagramOperation<'_, C> {
+    type Output = C::Datagram;
+    fn execute<'a>(&'a self, handler: &'a ProtocolOutbound, sess: &'a Session)
+        -> impl Future<Output = io::Result<Self::Output>> + Send + 'a
+    {
+        self.connector.connect(handler, sess, self.resolver.clone())
     }
 }
 
@@ -174,50 +178,44 @@ impl OutboundNode {
         }
         false
     }
-    pub async fn connect_stream(&self, sess: &Session, resolver: ThreadSafeDNSResolver) -> io::Result<AnyStream> {
-        match self {
-            Self::Protocol(handler) => handler.connect_stream(sess, resolver).await,
-            Self::Group(group) => match connect(group, sess, resolver, false, &PhysicalDatagramConnector).await? {
-                Connection::Stream(stream) => Ok(stream),
-                _ => unreachable!(),
-            },
-        }
-    }
-    pub async fn connect_datagram(&self, sess: &Session, resolver: ThreadSafeDNSResolver) -> io::Result<AnyOutboundDatagram> {
-        match self {
-            Self::Protocol(handler) => handler.connect_datagram(sess, resolver).await,
-            Self::Group(group) => match connect(group, sess, resolver, true, &PhysicalDatagramConnector).await? {
-                Connection::Datagram(datagram) => Ok(datagram),
-                _ => unreachable!(),
-            },
+    pub fn connect_stream<'a>(
+        &'a self, sess: &'a Session, resolver: ThreadSafeDNSResolver,
+    ) -> impl Future<Output = io::Result<AnyStream>> + Send + 'a {
+        async move {
+            match self {
+                Self::Protocol(handler) => handler.connect_stream(sess, resolver).await,
+                Self::Group(group) => execute(group, sess, false, StreamOperation { resolver }).await,
+            }
         }
     }
 
-    pub(crate) async fn execute_protocol<O: ProtocolOperation>(
-        &self, sess: &Session, operation: O,
-    ) -> io::Result<O::Output> {
-        match self {
-            Self::Protocol(handler) => operation.execute(handler, sess).await,
-            Self::Group(group) => execute(group, sess, false, operation).await,
+    pub fn connect_datagram<'a>(
+        &'a self, sess: &'a Session, resolver: ThreadSafeDNSResolver,
+    ) -> impl Future<Output = io::Result<AnyOutboundDatagram>> + Send + 'a {
+        self.connect_datagram_using(sess, resolver, &PhysicalDatagramConnector)
+    }
+
+    pub(crate) fn execute_protocol<'a, O: ProtocolOperation + 'a>(
+        &'a self, sess: &'a Session, operation: O,
+    ) -> impl Future<Output = io::Result<O::Output>> + Send + 'a {
+        async move {
+            match self {
+                Self::Protocol(handler) => operation.execute(handler, sess).await,
+                Self::Group(group) => execute(group, sess, false, operation).await,
+            }
         }
     }
 
-    pub(crate) async fn connect_datagram_using<C: DatagramConnector>(
-        &self, sess: &Session, resolver: ThreadSafeDNSResolver, connector: &C,
-    ) -> io::Result<C::Datagram> {
-        match self {
-            Self::Protocol(handler) => connector.connect(handler, sess, resolver).await,
-            Self::Group(group) => match connect(group, sess, resolver, true, connector).await? {
-                Connection::Datagram(datagram) => Ok(datagram),
-                _ => unreachable!(),
-            },
+    pub(crate) fn connect_datagram_using<'a, C: DatagramConnector>(
+        &'a self, sess: &'a Session, resolver: ThreadSafeDNSResolver, connector: &'a C,
+    ) -> impl Future<Output = io::Result<C::Datagram>> + Send + 'a {
+        async move {
+            match self {
+                Self::Protocol(handler) => connector.connect(handler, sess, resolver).await,
+                Self::Group(group) => execute(group, sess, true, DatagramOperation { connector, resolver }).await,
+            }
         }
     }
-}
-
-enum Connection<D> {
-    Stream(AnyStream),
-    Datagram(D),
 }
 
 enum Policy<'a> {
@@ -244,9 +242,13 @@ struct Frame<'a> {
 }
 
 impl<'a> Frame<'a> {
-    async fn new(policy: Policy<'a>, sess: &Session, single_attempt: bool) -> Self {
-        let limit = if single_attempt { 1 } else { policy.group().attempts(sess).await.max(1) };
-        Self { policy, excluded: HashSet::new(), attempts: 0, limit, selected: None, started: Instant::now() }
+    fn new(policy: Policy<'a>, sess: &'a Session, single_attempt: bool)
+        -> impl Future<Output = Self> + Send + 'a
+    {
+        async move {
+            let limit = if single_attempt { 1 } else { policy.group().attempts(sess).await.max(1) };
+            Self { policy, excluded: HashSet::new(), attempts: 0, limit, selected: None, started: Instant::now() }
+        }
     }
 }
 
@@ -270,94 +272,88 @@ impl<'a> Frames<'a> {
     fn is_empty(&self) -> bool { self.root.is_none() }
 }
 
-fn connect<'a, C: DatagramConnector>(
-    root: &'a ProxyGroup,
-    sess: &'a Session,
-    resolver: ThreadSafeDNSResolver,
-    udp: bool,
-    connector: &'a C,
-) -> impl Future<Output = io::Result<Connection<C::Datagram>>> + Send + 'a {
-    execute(root, sess, udp, PhysicalOperation { connector, resolver, udp })
-}
-
-async fn execute<O: ProtocolOperation>(
-    root: &ProxyGroup, sess: &Session, single_attempt: bool, operation: O,
-) -> io::Result<O::Output> {
-    // Retain the association once; derived TCP connections share its UDP route.
-    let route = dialer_route::retain();
-    let mut frames = Frames::new(Frame::new(Policy::Root(root), sess, single_attempt).await);
-    loop {
-        let frame = frames.last_mut().expect("root frame");
-        frame.attempts += 1;
-        let group = frame.policy.group();
-        let result = {
-            let selection = match route.as_ref().and_then(|route| route.selected(group.identity())) {
-                Some(node) => Ok(Some(node)),
-                None => group.select(sess, &frame.excluded).await,
-            };
-            match selection {
-                Ok(Some(handler)) => {
-                    if let Some(route) = &route {
-                        route.remember(frame.policy.group().identity(), &handler);
-                    }
-                    if frame.limit > 1 {
-                        frame.excluded.insert(handler.name().to_owned());
-                    }
-                    frame.started = Instant::now();
-                    frame.selected = Some(handler.clone());
-                    if let Some(group) = handler.as_group() {
-                        if frames.len() >= 64 || frames.iter().any(|f| f.policy.group().name() == group.name()) {
-                            Err(io::Error::other(format!("cyclic or too deep proxy group: {}", group.name())))
-                        } else {
-                            let nested = Frame::new(Policy::Nested(handler), sess, single_attempt).await;
-                            frames.push(nested);
-                            continue;
-                        }
-                    } else {
-                        let handler = handler.as_protocol().expect("protocol leaf");
-                        operation.execute(handler, sess).await
-                    }
-                }
-                Ok(None) => {
-                    frame.attempts = frame.limit;
-                    Err(io::Error::other(format!(
-                        "no proxy available for {}", frame.policy.group().name()
-                    )))
-                }
-                Err(err) => {
-                    frame.attempts = frame.limit;
-                    Err(err)
-                }
-            }
-        };
+fn execute<'a, O: ProtocolOperation + 'a>(
+    root: &'a ProxyGroup, sess: &'a Session, single_attempt: bool, operation: O,
+) -> impl Future<Output = io::Result<O::Output>> + Send + 'a {
+    async move {
+        // Retain the association once; derived TCP connections share its UDP route.
+        let route = dialer_route::retain();
+        let mut frames = Frames::new(Frame::new(Policy::Root(root), sess, single_attempt).await);
         loop {
             let frame = frames.last_mut().expect("root frame");
-            if let Some(selected) = frame.selected.as_ref() {
-                if !single_attempt {
-                    frame.policy.group().record_result(
-                        sess, selected.name(), frame.started.elapsed(), result.is_ok(),
-                    ).await;
+            frame.attempts += 1;
+            let group = frame.policy.group();
+            let result = {
+                let selection = match route.as_ref().and_then(|route| route.selected(group.identity())) {
+                    Some(node) => Ok(Some(node)),
+                    None => group.select(sess, &frame.excluded).await,
+                };
+                match selection {
+                    Ok(Some(handler)) => {
+                        if let Some(route) = &route {
+                            route.remember(frame.policy.group().identity(), &handler);
+                        }
+                        if frame.limit > 1 {
+                            frame.excluded.insert(handler.name().to_owned());
+                        }
+                        frame.started = Instant::now();
+                        if let Some(group) = handler.as_group() {
+                            frame.selected = Some(handler.clone());
+                            if frames.len() >= 64 || frames.iter().any(|f| f.policy.group().name() == group.name()) {
+                                Err(io::Error::other(format!("cyclic or too deep proxy group: {}", group.name())))
+                            } else {
+                                let nested = Frame::new(Policy::Nested(handler), sess, single_attempt).await;
+                                frames.push(nested);
+                                continue;
+                            }
+                        } else {
+                            frame.selected = Some(handler);
+                            let handler = frame.selected.as_ref().expect("selected leaf")
+                                .as_protocol().expect("protocol leaf");
+                            operation.execute(handler, sess).await
+                        }
+                    }
+                    Ok(None) => {
+                        frame.attempts = frame.limit;
+                        Err(io::Error::other(format!(
+                            "no proxy available for {}", frame.policy.group().name()
+                        )))
+                    }
+                    Err(err) => {
+                        frame.attempts = frame.limit;
+                        Err(err)
+                    }
                 }
-            }
-            frame.selected = None;
-            if result.is_err() {
-                if let Some(route) = &route { route.forget(frame.policy.group().identity()); }
-            }
-            if result.is_ok() {
-                sess.push_chain(frame.policy.group().name());
-            } else if frame.attempts < frame.limit {
-                let delay = frame.policy.group().retry_delay(frame.attempts);
-                drop(result);
-                if !delay.is_zero() {
-                    // Only failed connections with a delay allocate a timer.
-                    Box::pin(tokio::time::sleep(delay)).await;
+            };
+            loop {
+                let frame = frames.last_mut().expect("root frame");
+                if let Some(selected) = frame.selected.as_ref() {
+                    if !single_attempt {
+                        frame.policy.group().record_result(
+                            sess, selected.name(), frame.started.elapsed(), result.is_ok(),
+                        ).await;
+                    }
                 }
-                break;
+                frame.selected = None;
+                if result.is_err() {
+                    if let Some(route) = &route { route.forget(frame.policy.group().identity()); }
+                }
+                if result.is_ok() {
+                    sess.push_chain(frame.policy.group().name());
+                } else if frame.attempts < frame.limit {
+                    let delay = frame.policy.group().retry_delay(frame.attempts);
+                    drop(result);
+                    if !delay.is_zero() {
+                        // Only failed connections with a delay allocate a timer.
+                        Box::pin(tokio::time::sleep(delay)).await;
+                    }
+                    break;
+                }
+                frames.pop();
+                if frames.is_empty() { return result; }
+                // Propagate the complete child outcome to its parent's policy.
+                // Parents retry only after the child's retry budget is exhausted.
             }
-            frames.pop();
-            if frames.is_empty() { return result; }
-            // Propagate the complete child outcome to its parent's policy.
-            // Parents retry only after the child's retry budget is exhausted.
         }
     }
 }
@@ -373,11 +369,11 @@ impl OutboundNode {
             ("executor policy", size_of::<Policy<'_>>()),
             ("executor frame", size_of::<Frame<'_>>()),
             ("executor frames", size_of::<Frames<'_>>()),
-            ("executor connection result", size_of::<io::Result<Connection<AnyOutboundDatagram>>>()),
+            ("executor connection result", size_of::<io::Result<AnyStream>>()),
             ("root frame initialization", size_of_val(&Frame::new(Policy::Root(group), sess, false))),
             ("nested frame initialization", size_of_val(&Frame::new(Policy::Nested(OutboundNode::Group(group.clone())), sess, false))),
-            ("group executor TCP", size_of_val(&connect(group, sess, resolver.clone(), false, &PhysicalDatagramConnector))),
-            ("group executor UDP", size_of_val(&connect(group, sess, resolver.clone(), true, &PhysicalDatagramConnector))),
+            ("group executor TCP", size_of_val(&execute(group, sess, false, StreamOperation { resolver: resolver.clone() }))),
+            ("group executor UDP", size_of_val(&execute(group, sess, true, DatagramOperation { connector: &PhysicalDatagramConnector, resolver: resolver.clone() }))),
             ("node TCP connect", size_of_val(&node.connect_stream(sess, resolver.clone()))),
             ("retry sleep", size_of_val(&tokio::time::sleep(Duration::ZERO))),
         ]

@@ -11,7 +11,7 @@ use super::reply::relay as relay_replies;
 use super::utils::resolve_and_aggregate_ip_cidrs;
 use crate::app::dispatcher::Dispatcher;
 use crate::app::dns::{DnsResolutionHook, ThreadSafeDNSResolver};
-use crate::app::net::get_default_outbound_interface_cloned;
+use crate::app::net::get_default_outbound_interface;
 use crate::app::remote_content_manager::providers::rule_provider::CidrTrie;
 use crate::config::def::EbpfConfig;
 use crate::proxy::AnyStream;
@@ -270,7 +270,7 @@ impl InboundHandlerTrait for EbpfInbound {
 
         let udp_stream = ChannelDatagram::new(l_tx, d_rx);
 
-        let default_outbound = get_default_outbound_interface_cloned();
+        let default_outbound = get_default_outbound_interface();
         let sess = Session {
             network: Network::Udp,
             typ: Type::Ebpf,

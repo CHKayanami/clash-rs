@@ -40,7 +40,7 @@ impl Debug for Handler {
 
 impl Handler {
     pub(crate) fn connect_datagram_unpooled(&self, sess: &Session) -> io::Result<AnyOutboundDatagram> {
-        let socket = new_dual_stack_udp_socket(sess.iface.as_ref(),
+        let socket = new_dual_stack_udp_socket(sess.iface.as_deref(),
             #[cfg(target_os = "linux")] sess.so_mark)?;
         sess.push_chain(self.name());
         Ok(AnyOutboundDatagram::new(Box::new(NativeDatagram::new(socket)?)))
@@ -84,7 +84,7 @@ impl OutboundHandler for Handler {
             sess.destination.host_cow().as_ref(),
             sess.destination.port(),
             &resolver,
-            sess.iface.as_ref(),
+            sess.iface.as_deref(),
             false,
             #[cfg(target_os = "linux")]
             sess.so_mark,

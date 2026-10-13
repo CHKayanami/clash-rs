@@ -52,10 +52,6 @@ pub fn get_default_outbound_interface() -> Option<Arc<OutboundInterface>> {
     DEFAULT_OUTBOUND_INTERFACE.load_full()
 }
 
-pub fn get_default_outbound_interface_cloned() -> Option<OutboundInterface> {
-    DEFAULT_OUTBOUND_INTERFACE.load().as_deref().cloned()
-}
-
 
 /// Atomically compare and update the default outbound interface if it has changed.
 /// Returns true if updated, false if unchanged or if an explicit interface is configured.

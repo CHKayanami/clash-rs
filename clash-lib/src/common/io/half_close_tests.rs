@@ -1,4 +1,5 @@
 use super::*;
+use futures::future::poll_fn;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[cfg(all(target_os = "linux", feature = "zero_copy"))]
@@ -315,4 +316,29 @@ async fn zero_copy_prefix_backpressure_does_not_block_replies() {
     .await
     .unwrap();
     assert_eq!(counts.unwrap(), (1024 * 1024, 5));
+}
+
+#[tokio::test]
+async fn completed_shutdown_retains_counts_without_unused_timers() {
+    let (_client, mut a) = tokio::io::duplex(64);
+    let (mut b, _server) = tokio::io::duplex(64);
+    // Both directions have reached EOF before either shutdown completes.
+    let mut copy = CopyBidirectional {
+        a: &mut a,
+        b: &mut b,
+        a_to_b: TransferState::ShuttingDown(7),
+        b_to_a: TransferState::ShuttingDown(9),
+        a_to_b_delay: None,
+        b_to_a_delay: None,
+        a_to_b_timeout_duration: Duration::from_secs(10),
+        b_to_a_timeout_duration: Duration::from_secs(10),
+        idle_timeout: Box::pin(tokio::time::sleep(COPY_IDLE_TIMEOUT)),
+        last_active: tokio::time::Instant::now(),
+        tracker: TrafficTracker::noop(),
+    };
+    let counts = poll_fn(|cx| Pin::new(&mut copy).poll(cx))
+        .await.unwrap();
+    assert_eq!(counts, (7, 9));
+    assert!(copy.a_to_b_delay.is_none());
+    assert!(copy.b_to_a_delay.is_none());
 }

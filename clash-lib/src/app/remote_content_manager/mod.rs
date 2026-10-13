@@ -2,7 +2,7 @@ use crate::proxy::RouteChange;
 use std::pin::pin;
 use super::dns::ThreadSafeDNSResolver;
 use crate::{
-    app::net::get_default_outbound_interface_cloned,
+    app::net::get_default_outbound_interface,
     common::{
         errors::{IntoIoResultExt as _, new_io_error},
         timed_future::TimedFuture,
@@ -775,7 +775,7 @@ impl ProxyManager {
                 destination: (host.to_owned(), port)
                     .try_into()
                     .expect("must be valid destination"),
-                iface: get_default_outbound_interface_cloned(),
+                iface: get_default_outbound_interface(),
                 so_mark: self.fw_mark,
                 ..Default::default()
             };
@@ -926,9 +926,9 @@ impl ProxyManager {
     }
 
     /// Based on session characteristics and traffic statistics.
-    pub async fn get_site_tuning(&self, sess: &Session) -> SiteTuning {
-        // Extract traffic statistics from the session if available
-        let traffic_stats = sess.traffic_stats.as_ref();
+    pub async fn get_site_tuning(
+        &self, sess: &Session, traffic_stats: Option<&TrafficStats>,
+    ) -> SiteTuning {
 
         // Attempt intelligent pattern detection if traffic statistics are available
         if let Some(stats) = traffic_stats {

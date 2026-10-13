@@ -14,14 +14,14 @@ use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::{TcpListener, UdpSocket}};
 #[derive(Debug)]
 pub struct RecordingConnector(Arc<AtomicUsize>);
 impl RecordingConnector {
-    pub async fn connect_stream(&self, resolver: ThreadSafeDNSResolver, address: &str, port: u16, tfo: bool, iface: Option<&OutboundInterface>,
+    pub async fn connect_stream(&self, resolver: ThreadSafeDNSResolver, address: &str, port: u16, tfo: bool, iface: Option<&Arc<OutboundInterface>>,
         #[cfg(target_os = "linux")] packet_mark: Option<u32>,
     ) -> io::Result<AnyStream> {
         DirectConnector.connect_stream(resolver, address, port, tfo, iface,
             #[cfg(target_os = "linux")] packet_mark,
         ).await
     }
-    pub async fn connect_datagram(&self, resolver: ThreadSafeDNSResolver, src: Option<SocketAddr>, destination: SocksAddr, iface: Option<&OutboundInterface>,
+    pub async fn connect_datagram(&self, resolver: ThreadSafeDNSResolver, src: Option<SocketAddr>, destination: SocksAddr, iface: Option<&Arc<OutboundInterface>>,
         #[cfg(target_os = "linux")] packet_mark: Option<u32>,
     ) -> io::Result<AnyOutboundDatagram> {
         self.0.fetch_add(1, Ordering::Relaxed);

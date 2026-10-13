@@ -122,7 +122,7 @@ impl UpstreamPool {
             UdpPool::new_direct(
                 address,
                 dial.so_mark,
-                dial.iface.as_ref(),
+                dial.iface.as_deref(),
                 dial.query_timeout,
                 Arc::clone(&self.active_transport_tasks),
             )

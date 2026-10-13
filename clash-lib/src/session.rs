@@ -495,7 +495,7 @@ pub struct Session {
     /// The packet mark SO_MARK
     pub so_mark: Option<u32>,
     /// The bind interface
-    pub iface: Option<OutboundInterface>,
+    pub iface: Option<Arc<OutboundInterface>>,
     /// ISO 3166-1 alpha-2 country code from country mmdb. Only for display.
     pub country: Option<String>,
     /// ASN org name from ASN mmdb. Only for display.
@@ -504,8 +504,6 @@ pub struct Session {
     /// `Router::match_route` and only when a PROCESS-NAME/PROCESS-PATH rule is
     /// actually reached. `None` means "not looked up yet or lookup failed".
     pub process_name: Option<String>,
-    /// Traffic statistics for intelligent proxy selection
-    pub traffic_stats: Option<crate::app::remote_content_manager::TrafficStats>,
     /// Authenticated user name from SS2022 EIH (FAC user_id as string).
     /// Set by the Shadowsocks inbound before dispatch; used for per-user
     /// traffic attribution.
@@ -614,7 +612,6 @@ impl Serialize for Session {
         map.serialize_entry("host", self.display_host().as_ref())?;
         map.serialize_entry("asn", &self.asn)?;
         map.serialize_entry("country", &self.country)?;
-        map.serialize_entry("traffic_stats", &self.traffic_stats)?;
 
         if let Some(ref user) = self.inbound_user {
             map.serialize_entry("inboundUser", user)?;
@@ -644,7 +641,6 @@ impl Default for Session {
             country: None,
             asn: None,
             process_name: None,
-            traffic_stats: None,
             inbound_user: None,
             sniffed_domain: None,
             mapped_domain: None,
@@ -703,7 +699,6 @@ impl Clone for Session {
             country: self.country.clone(),
             asn: self.asn.clone(),
             process_name: self.process_name.clone(),
-            traffic_stats: self.traffic_stats.clone(),
             inbound_user: self.inbound_user.clone(),
             sniffed_domain: self.sniffed_domain.clone(),
             mapped_domain: self.mapped_domain.clone(),
@@ -753,6 +748,7 @@ fn test_session_serialize() {
     assert_eq!(val["destinationIP"], "1.1.1.1(Cloudflare)");
     assert_eq!(val["inboundUser"], "alice");
     assert_eq!(val["sniffedDomain"], "example.com");
+    assert!(val.get("traffic_stats").is_none());
 
     s.asn = None;
     let val2: serde_json::Value = serde_json::to_value(&s).unwrap();
@@ -779,4 +775,17 @@ fn test_session_serialize() {
     assert_eq!(v3["host"], "sniffed.apple.com");
     assert_eq!(v3["sniffedDomain"], "sniffed.apple.com");
     assert_eq!(v3["mappedDomain"], "mapped.apple.com");
+}
+
+#[test]
+fn test_session_clone_shares_outbound_interface() {
+    let iface = Arc::new(OutboundInterface {
+        name: "test-interface".to_owned(),
+        index: 7,
+        ..Default::default()
+    });
+    let sess = Session { iface: Some(iface.clone()), ..Default::default() };
+    let cloned = sess.clone();
+    assert!(Arc::ptr_eq(cloned.iface.as_ref().unwrap(), &iface));
+    assert_eq!(cloned.iface.as_ref().unwrap().name, "test-interface");
 }

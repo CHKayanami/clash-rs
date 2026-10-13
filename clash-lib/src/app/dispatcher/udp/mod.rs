@@ -13,12 +13,12 @@ mod routes;
 #[cfg(test)]
 mod tests;
 
-use std::{collections::HashMap, net::{IpAddr, SocketAddr}, sync::{Arc,
+use std::{collections::HashMap, future::Future, net::{IpAddr, SocketAddr}, sync::{Arc,
     atomic::{AtomicBool, AtomicU8, Ordering}}, time::Duration};
 use futures::{SinkExt, StreamExt, stream::poll_fn};
 use tokio::{sync::mpsc::error::TrySendError, task::JoinHandle, time::Instant};
 use tokio_util::{task::AbortOnDropHandle, time::DelayQueue};
-use tracing::{Instrument, debug, error, info, info_span, instrument};
+use tracing::{Instrument, debug, error, info, info_span};
 use crate::{
     app::{dns::ThreadSafeDNSResolver, outbound::manager::ThreadSafeOutboundManager,
         router::ArcRouter, sniffer::ArcSniffer},
@@ -169,8 +169,14 @@ fn make_udp_flow_session(
 }
 
 impl Dispatcher {
-    #[instrument(level = "info", skip(self, sess, udp_inbound), fields(trace_id = sess.id))]
-    pub async fn dispatch_datagram(
+    pub fn dispatch_datagram(
+        &self, sess: Session, udp_inbound: AnyInboundDatagram,
+    ) -> impl Future<Output = tokio::sync::oneshot::Sender<u8>> + Send + '_ {
+        let span = info_span!("dispatch_datagram", trace_id = sess.id);
+        self.dispatch_datagram_inner(sess, udp_inbound).instrument(span)
+    }
+
+    async fn dispatch_datagram_inner(
         &self, sess: Session, udp_inbound: AnyInboundDatagram,
     ) -> tokio::sync::oneshot::Sender<u8> {
         let (mut local_w, mut local_r) = udp_inbound.split();

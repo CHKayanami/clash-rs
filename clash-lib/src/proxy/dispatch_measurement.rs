@@ -5,14 +5,16 @@ use arc_swap::ArcSwap;
 use tokio::sync::{mpsc, Semaphore};
 use futures::future::BoxFuture;
 use crate::{
-    app::{dns::{SystemResolver, ThreadSafeDNSResolver}, remote_content_manager::{ProxyManager, healthcheck::HealthCheck, providers::proxy_provider::PlainProvider}},
+    common::io::{copy_bidirectional, copy_buf_bidirectional_with_timeout, copy_state_layout},
+    app::{net::OutboundInterface, dns::{SystemResolver, ThreadSafeDNSResolver}, remote_content_manager::{ProxyManager, healthcheck::HealthCheck, providers::proxy_provider::PlainProvider}},
     config::internal::proxy::LoadBalanceStrategy,
     proxy::{
-        OutboundHandler, OutboundNode, direct::{self, datagram::OutboundDatagramImpl, native::NativeDatagram}, socks, selector, loadbalance, reject,
+        AnyStream, OutboundHandler, OutboundNode, direct::{self, datagram::OutboundDatagramImpl, native::NativeDatagram}, socks, selector, loadbalance, reject,
         group::{GroupHandler, fallback, urltest, smart}, utils::DialerProxyConnector,
     },
     session::Session,
-    app::dispatcher::{Manager as StatisticsManager, TrackerInfo},
+    app::sniffer::{Sniffer, SnifferConfig},
+    app::dispatcher::{Manager as StatisticsManager, TrackerInfo, TrafficTracker},
     app::dispatcher::udp::association::{UdpConnectContext, AssociationConfig, UdpAssociationPool},
 };
 
@@ -43,7 +45,36 @@ pub async fn measure_dispatch_futures(start: impl Fn(), finish: impl Fn(&str, us
         (measurement.start)();
         (measurement.finish)(name, bytes, Some(0));
     }
+    for (name, bytes) in copy_state_layout() {
+        (measurement.start)();
+        (measurement.finish)(name, bytes, Some(0));
+    }
+    let shared_iface = Arc::new(OutboundInterface {
+        name: "test-interface".to_owned(), ..Default::default()
+    });
+    let interface_session = Session {
+        iface: Some(shared_iface.clone()), ..Default::default()
+    };
+    (measurement.start)();
+    let cloned_session = interface_session.clone();
+    (measurement.finish)("Session shared interface clone", size_of_val(&cloned_session), Some(0));
+    assert!(Arc::ptr_eq(cloned_session.iface.as_ref().unwrap(), &shared_iface));
     let sess = Session::default();
+    let sniffer = Sniffer::new(SnifferConfig { enable: true, ..Default::default() });
+    let sniff_session = Session { destination: "192.0.2.1:443".parse().unwrap(), ..Default::default() };
+    let (stream, _) = tokio::io::duplex(64);
+    measurement.measure("TCP sniff", || sniffer.sniff_stream(&sniff_session, stream.into()), 0);
+    // Warm the failure-cache entry before counting an empty prefetch.
+    let (stream, _) = tokio::io::duplex(64);
+    sniffer.sniff_stream(&sniff_session, stream.into()).await;
+    let (stream, _) = tokio::io::duplex(64);
+    let future = sniffer.sniff_stream(&sniff_session, stream.into());
+    let bytes = size_of_val(&future);
+    (measurement.start)();
+    let (domain, stream, _) = future.await;
+    (measurement.finish)("empty TCP sniff execution", bytes, Some(1));
+    assert!(domain.is_none());
+    assert!(matches!(stream, AnyStream::Duplex(_)));
     let resolver: ThreadSafeDNSResolver = Arc::new(SystemResolver::new(false).unwrap());
     let direct = Arc::new(direct::Handler::new("direct"));
     let protocol = OutboundNode::protocol(direct.clone());
@@ -118,6 +149,24 @@ pub async fn measure_dispatch_futures(start: impl Fn(), finish: impl Fn(&str, us
         let (stream, _) = tokio::io::duplex(64);
         measurement.measure("transport enum", || layer.wrap(stream.into()), 0);
     }
+
+    let (lhs, _) = tokio::io::duplex(64);
+    let (rhs, _) = tokio::io::duplex(64);
+    let tracker = TrafficTracker::new(
+        Arc::new(TrackerInfo::new(&sess, None)), StatisticsManager::new(),
+    );
+    measurement.measure("TCP bidirectional copy", || copy_bidirectional(
+        lhs.into(), rhs.into(), 1024, Duration::from_secs(10), Duration::from_secs(10), tracker,
+    ), 0);
+
+    let (mut lhs, _) = tokio::io::duplex(64);
+    let (mut rhs, _) = tokio::io::duplex(64);
+    let tracker = TrafficTracker::new(
+        Arc::new(TrackerInfo::new(&sess, None)), StatisticsManager::new(),
+    );
+    measurement.measure("TCP buffered copy", || copy_buf_bidirectional_with_timeout(
+        &mut lhs, &mut rhs, 1024, Duration::from_secs(10), Duration::from_secs(10), tracker,
+    ), 0);
 
     measurement.measure("direct", || direct.connect_stream(&sess, resolver.clone()), 0);
     measurement.measure("socks", || socks.connect_stream(&sess, resolver.clone()), 0);

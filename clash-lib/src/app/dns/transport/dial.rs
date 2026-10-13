@@ -17,7 +17,7 @@ pub struct DialContext {
     pub query_timeout: Duration,
     pub dial_timeout: Duration,
     pub outbound: Option<OutboundNode>,
-    pub iface: Option<OutboundInterface>,
+    pub iface: Option<Arc<OutboundInterface>>,
     pub so_mark: Option<u32>,
     pub resolver: Option<Arc<dyn ClashResolver>>,
 }

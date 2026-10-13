@@ -134,7 +134,7 @@ impl DialerProxyConnector {
 
     pub fn connect_stream<'a>(
         &'a self, resolver: ThreadSafeDNSResolver, address: &'a str, port: u16,
-        _tfo: bool, iface: Option<&'a OutboundInterface>,
+        _tfo: bool, iface: Option<&'a Arc<OutboundInterface>>,
         #[cfg(target_os = "linux")] packet_mark: Option<u32>,
     ) -> BoxFuture<'a, io::Result<AnyStream>> {
         Box::pin(dialer_route::scoped(self.route.as_ref(), async move {
@@ -156,7 +156,7 @@ impl DialerProxyConnector {
 
     pub fn connect_datagram<'a>(
         &'a self, resolver: ThreadSafeDNSResolver, src: Option<SocketAddr>,
-        destination: SocksAddr, iface: Option<&'a OutboundInterface>,
+        destination: SocksAddr, iface: Option<&'a Arc<OutboundInterface>>,
         #[cfg(target_os = "linux")] packet_mark: Option<u32>,
     ) -> BoxFuture<'a, io::Result<AnyOutboundDatagram>> {
         Box::pin(dialer_route::scoped(self.route.as_ref(), async move {

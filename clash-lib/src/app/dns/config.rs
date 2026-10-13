@@ -74,7 +74,7 @@ pub struct NameServer {
     pub host: url::Host<String>,
     pub port: u16,
     pub path: Option<String>,
-    pub interface: Option<OutboundInterface>,
+    pub interface: Option<Arc<OutboundInterface>>,
     pub proxy: Option<String>,
 }
 impl Display for NameServer {
@@ -258,7 +258,7 @@ impl Config {
                             )),
                         ),
                     })
-                    .transpose()?,
+                    .transpose()?.map(Arc::new),
                 proxy,
             });
         }

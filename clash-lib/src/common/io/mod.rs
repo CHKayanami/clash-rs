@@ -3,6 +3,7 @@ pub(crate) mod datagram_relay;
 use std::future::Future;
 use std::{
     io,
+    mem::replace,
     pin::Pin,
     task::{Context, Poll},
     time::Duration,
@@ -64,6 +65,7 @@ impl From<std::io::Error> for CopyBidirectionalError {
 }
 
 pub const DEFAULT_BUF_SIZE: usize = 16 * 1024;
+const COPY_IDLE_TIMEOUT: Duration = Duration::from_secs(180);
 
 #[derive(Debug)]
 pub struct CopyBuffer {
@@ -72,7 +74,6 @@ pub struct CopyBuffer {
     amt: u64,
     start_index: usize,
     cache_length: usize,
-    size: usize,
     buf: Box<[u8]>,
 }
 
@@ -97,7 +98,6 @@ impl CopyBuffer {
             amt: 0,
             start_index: 0,
             cache_length: 0,
-            size,
             buf,
         })
     }
@@ -108,7 +108,7 @@ impl CopyBuffer {
 
     #[allow(unused)]
     pub fn capacity(&self) -> usize {
-        self.size
+        self.buf.len()
     }
 
     pub fn poll_copy<R, W>(
@@ -123,19 +123,20 @@ impl CopyBuffer {
         R: AsyncRead + ?Sized,
         W: AsyncWrite + ?Sized,
     {
+        let capacity = self.buf.len();
         loop {
             let mut read_pending = false;
             let mut write_pending = false;
 
             // 1. Read as much as possible into the circular buffer.
-            while !self.read_done && self.cache_length < self.size {
+            while !self.read_done && self.cache_length < capacity {
                 let unused_start_index =
-                    (self.start_index + self.cache_length) % self.size;
+                    (self.start_index + self.cache_length) % capacity;
                 let unused_end_index_exclusive =
                     if unused_start_index < self.start_index {
                         self.start_index
                     } else {
-                        self.size
+                        self.buf.len()
                     };
 
                 let me = &mut *self;
@@ -166,7 +167,7 @@ impl CopyBuffer {
             while self.cache_length > 0 {
                 let used_start_index = self.start_index;
                 let used_end_index_exclusive =
-                    std::cmp::min(self.start_index + self.cache_length, self.size);
+                    std::cmp::min(self.start_index + self.cache_length, capacity);
 
                 let me = &mut *self;
                 let head_length = me.cache_length
@@ -198,7 +199,7 @@ impl CopyBuffer {
                                 self.start_index = 0;
                             } else {
                                 self.start_index =
-                                    (self.start_index + written) % self.size;
+                                    (self.start_index + written) % capacity;
                             }
                             self.amt += written as u64;
                             self.need_flush = true;
@@ -240,7 +241,7 @@ impl CopyBuffer {
 enum TransferState {
     Running(CopyBuffer),
     ShuttingDown(u64),
-    Done,
+    Done(u64),
 }
 
 struct CopyBidirectional<'a, A: ?Sized, B: ?Sized> {
@@ -248,14 +249,11 @@ struct CopyBidirectional<'a, A: ?Sized, B: ?Sized> {
     b: &'a mut B,
     a_to_b: TransferState,
     b_to_a: TransferState,
-    a_to_b_count: u64,
-    b_to_a_count: u64,
     a_to_b_delay: Option<Pin<Box<tokio::time::Sleep>>>,
     b_to_a_delay: Option<Pin<Box<tokio::time::Sleep>>>,
     a_to_b_timeout_duration: Duration,
     b_to_a_timeout_duration: Duration,
     idle_timeout: Pin<Box<tokio::time::Sleep>>,
-    idle_timeout_duration: Duration,
     last_active: tokio::time::Instant,
     tracker: TrafficTracker,
 }
@@ -273,14 +271,11 @@ where
             b,
             a_to_b,
             b_to_a,
-            a_to_b_count,
-            b_to_a_count,
             a_to_b_delay,
             b_to_a_delay,
             a_to_b_timeout_duration,
             b_to_a_timeout_duration,
             idle_timeout,
-            idle_timeout_duration,
             last_active,
             tracker,
         } = &mut *self;
@@ -289,7 +284,7 @@ where
         let mut b = Pin::new(b);
 
         // Check idle timeout
-        let deadline = *last_active + *idle_timeout_duration;
+        let deadline = *last_active + COPY_IDLE_TIMEOUT;
         if tokio::time::Instant::now() >= deadline {
             return Poll::Ready(Err(CopyBidirectionalError::Other(
                 std::io::Error::new(
@@ -358,11 +353,12 @@ where
                     let res = b.as_mut().poll_shutdown(cx);
                     match res {
                         Poll::Ready(Ok(())) => {
-                            *a_to_b_count += *count;
-                            *a_to_b = TransferState::Done;
-                            b_to_a_delay.replace(Box::pin(tokio::time::sleep(
-                                *b_to_a_timeout_duration,
-                            )));
+                            *a_to_b = TransferState::Done(*count);
+                            if matches!(b_to_a, TransferState::Running(_)) {
+                                b_to_a_delay.replace(Box::pin(tokio::time::sleep(
+                                    *b_to_a_timeout_duration,
+                                )));
+                            }
                             continue;
                         }
                         Poll::Ready(Err(err)) => {
@@ -373,7 +369,7 @@ where
                         Poll::Pending => (),
                     }
                 }
-                TransferState::Done => (),
+                TransferState::Done(_) => (),
             }
 
             match b_to_a {
@@ -428,11 +424,12 @@ where
                     let res = a.as_mut().poll_shutdown(cx);
                     match res {
                         Poll::Ready(Ok(())) => {
-                            *b_to_a_count += *count;
-                            *b_to_a = TransferState::Done;
-                            a_to_b_delay.replace(Box::pin(tokio::time::sleep(
-                                *a_to_b_timeout_duration,
-                            )));
+                            *b_to_a = TransferState::Done(*count);
+                            if matches!(a_to_b, TransferState::Running(_)) {
+                                a_to_b_delay.replace(Box::pin(tokio::time::sleep(
+                                    *a_to_b_timeout_duration,
+                                )));
+                            }
                             continue;
                         }
                         Poll::Ready(Err(err)) => {
@@ -443,104 +440,131 @@ where
                         Poll::Pending => (),
                     }
                 }
-                TransferState::Done => (),
+                TransferState::Done(_) => (),
             }
 
             match (&a_to_b, &b_to_a) {
-                (TransferState::Done, TransferState::Done) => break,
+                (TransferState::Done(up), TransferState::Done(down)) => {
+                    return Poll::Ready(Ok((*up, *down)));
+                }
                 _ => return Poll::Pending,
             }
         }
-
-        Poll::Ready(Ok((*a_to_b_count, *b_to_a_count)))
     }
+}
+
+#[cfg(feature = "allocation-tests")]
+pub(crate) fn copy_state_layout() -> [(&'static str, usize); 3] {
+    [
+        ("TCP copy buffer state", size_of::<CopyBuffer>()),
+        ("TCP transfer state", size_of::<TransferState>()),
+        ("TCP bidirectional core state", size_of::<CopyBidirectional<'_, AnyStream, AnyStream>>()),
+    ]
 }
 
 /// Select the outbound copy loop once. Specialize plain TCP inputs while
 /// keeping other inputs as enums to avoid a specialization for every pair.
-pub async fn copy_bidirectional(
+pub fn copy_bidirectional(
     a: AnyStream,
     b: AnyStream,
     size: usize,
     upload_timeout: Duration,
     download_timeout: Duration,
     tracker: TrafficTracker,
-) -> Result<(u64, u64), CopyBidirectionalError> {
-    match a {
-        AnyStream::Tcp(stream) => {
-            copy_to_outbound(
-                stream,
-                b,
-                size,
-                upload_timeout,
-                download_timeout,
-                tracker,
-            )
-            .await
-        }
-        stream => {
-            copy_to_outbound(
-                stream,
-                b,
-                size,
-                upload_timeout,
-                download_timeout,
-                tracker,
-            )
-            .await
+) -> impl Future<Output = Result<(u64, u64), CopyBidirectionalError>> + Send {
+    async move {
+        match a {
+            AnyStream::Tcp(stream) => {
+                copy_to_outbound(
+                    stream,
+                    b,
+                    size,
+                    upload_timeout,
+                    download_timeout,
+                    tracker,
+                )
+                .await
+            }
+            stream => {
+                copy_to_outbound(
+                    stream,
+                    b,
+                    size,
+                    upload_timeout,
+                    download_timeout,
+                    tracker,
+                )
+                .await
+            }
         }
     }
 }
 
-async fn copy_to_outbound<A: ProxyStream>(
+fn copy_to_outbound<A: ProxyStream>(
     a: A,
     b: AnyStream,
     size: usize,
     upload_timeout: Duration,
     download_timeout: Duration,
     tracker: TrafficTracker,
-) -> Result<(u64, u64), CopyBidirectionalError> {
-    dispatch_stream!(b, |stream| {
-        copy_stream(a, stream, size, upload_timeout, download_timeout, tracker)
-            .await
-    })
+) -> impl Future<Output = Result<(u64, u64), CopyBidirectionalError>> + Send {
+    async move {
+        dispatch_stream!(b, |stream| {
+            copy_stream(a, stream, size, upload_timeout, download_timeout, tracker)
+                .await
+        })
+    }
 }
 
-async fn copy_stream<A: ProxyStream, B: ProxyStream>(
+fn copy_stream<A: ProxyStream, B: ProxyStream>(
     mut a: A,
     mut b: B,
     size: usize,
     a_to_b_timeout_duration: Duration,
     b_to_a_timeout_duration: Duration,
     tracker: TrafficTracker,
-) -> Result<(u64, u64), CopyBidirectionalError> {
-    use tokio::io::AsyncWriteExt;
+) -> impl Future<Output = Result<(u64, u64), CopyBidirectionalError>> + Send {
+    async move {
+        use tokio::io::AsyncWriteExt;
 
-    // zero copy is only available on linux
-    #[cfg(all(target_os = "linux", feature = "zero_copy"))]
-    let res = {
-        if a.zero_copy_socket().is_some() && b.zero_copy_socket().is_some() {
-            // Drain prefixes inside the bidirectional copier, so replies can
-            // progress even when forwarding the request is backpressured.
-            let a_prefix = a.take_read_prefix();
-            let b_prefix = b.take_read_prefix();
-            let a_stream = a.zero_copy_socket().unwrap();
-            let b_stream = b.zero_copy_socket().unwrap();
-            tracing::trace!("using zero copy for bidirectional copy");
-            let w_tracker = CopyTracker::from(UploadTracker::new(tracker.clone()));
-            let r_tracker = CopyTracker::from(DownloadTracker::new(tracker));
-            splice::zero_copy_bidirectional_with_prefix(
-                a_stream,
-                b_stream,
-                a_prefix,
-                b_prefix,
-                r_tracker,
-                w_tracker,
-                a_to_b_timeout_duration,
-                b_to_a_timeout_duration,
-            )
-            .await
-        } else {
+        // zero copy is only available on linux
+        #[cfg(all(target_os = "linux", feature = "zero_copy"))]
+        let res = {
+            if a.zero_copy_socket().is_some() && b.zero_copy_socket().is_some() {
+                // Drain prefixes inside the bidirectional copier, so replies can
+                // progress even when forwarding the request is backpressured.
+                let a_prefix = a.take_read_prefix();
+                let b_prefix = b.take_read_prefix();
+                let a_stream = a.zero_copy_socket().unwrap();
+                let b_stream = b.zero_copy_socket().unwrap();
+                tracing::trace!("using zero copy for bidirectional copy");
+                let w_tracker = CopyTracker::from(UploadTracker::new(tracker.clone()));
+                let r_tracker = CopyTracker::from(DownloadTracker::new(tracker));
+                splice::zero_copy_bidirectional_with_prefix(
+                    a_stream,
+                    b_stream,
+                    a_prefix,
+                    b_prefix,
+                    r_tracker,
+                    w_tracker,
+                    a_to_b_timeout_duration,
+                    b_to_a_timeout_duration,
+                )
+                .await
+            } else {
+                copy_buf_bidirectional_with_timeout(
+                    &mut a,
+                    &mut b,
+                    size,
+                    a_to_b_timeout_duration,
+                    b_to_a_timeout_duration,
+                    tracker,
+                )
+                .await
+            }
+        };
+        #[cfg(not(all(target_os = "linux", feature = "zero_copy")))]
+        let res = {
             copy_buf_bidirectional_with_timeout(
                 &mut a,
                 &mut b,
@@ -550,60 +574,85 @@ async fn copy_stream<A: ProxyStream, B: ProxyStream>(
                 tracker,
             )
             .await
+        };
+
+        let _ = a.shutdown().await;
+        let _ = b.shutdown().await;
+
+        res
+    }
+}
+
+enum BufferedCopy<'a, A: ?Sized, B: ?Sized> {
+    Initializing {
+        a: &'a mut A,
+        b: &'a mut B,
+        size: usize,
+        upload_timeout: Duration,
+        download_timeout: Duration,
+        tracker: TrafficTracker,
+    },
+    Running(CopyBidirectional<'a, A, B>),
+    Failed,
+}
+
+impl<A, B> Future for BufferedCopy<'_, A, B>
+where
+    A: AsyncRead + AsyncWrite + Unpin + ?Sized,
+    B: AsyncRead + AsyncWrite + Unpin + ?Sized,
+{
+    type Output = Result<(u64, u64), CopyBidirectionalError>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let state = self.get_mut();
+        if matches!(state, Self::Initializing { .. }) {
+            let Self::Initializing { a, b, size, upload_timeout, download_timeout, tracker } =
+                replace(state, Self::Failed)
+            else { unreachable!(); };
+            *state = Self::Running(CopyBidirectional {
+                a,
+                b,
+                a_to_b: TransferState::Running(CopyBuffer::new_with_capacity(size)?),
+                b_to_a: TransferState::Running(CopyBuffer::new_with_capacity(size)?),
+                a_to_b_delay: None,
+                b_to_a_delay: None,
+                a_to_b_timeout_duration: upload_timeout,
+                b_to_a_timeout_duration: download_timeout,
+                idle_timeout: Box::pin(tokio::time::sleep(COPY_IDLE_TIMEOUT)),
+                last_active: tokio::time::Instant::now(),
+                tracker,
+            });
         }
-    };
-    #[cfg(not(all(target_os = "linux", feature = "zero_copy")))]
-    let res = {
-        copy_buf_bidirectional_with_timeout(
-            &mut a,
-            &mut b,
-            size,
-            a_to_b_timeout_duration,
-            b_to_a_timeout_duration,
-            tracker,
-        )
-        .await
-    };
-
-    let _ = a.shutdown().await;
-    let _ = b.shutdown().await;
-
-    res
+        match state {
+            Self::Running(copy) => Pin::new(copy).poll(cx),
+            _ => panic!("buffered copy polled after initialization failed"),
+        }
+    }
 }
 
 /// Copies both directions, shutting down the opposing writer on EOF.
 /// After one direction finishes, the remaining direction's timeout is reset
 /// whenever it successfully writes data. Reads alone do not extend the timeout.
-pub async fn copy_buf_bidirectional_with_timeout<A, B>(
-    a: &mut A,
-    b: &mut B,
+pub fn copy_buf_bidirectional_with_timeout<'a, A, B>(
+    a: &'a mut A,
+    b: &'a mut B,
     size: usize,
     a_to_b_timeout_duration: Duration,
     b_to_a_timeout_duration: Duration,
     tracker: TrafficTracker,
-) -> Result<(u64, u64), CopyBidirectionalError>
+) -> impl Future<Output = Result<(u64, u64), CopyBidirectionalError>> + 'a
 where
     A: AsyncRead + AsyncWrite + Unpin + ?Sized,
     B: AsyncRead + AsyncWrite + Unpin + ?Sized,
 {
-    let idle_timeout_duration = Duration::from_secs(180);
-    CopyBidirectional {
+    BufferedCopy::Initializing {
         a,
         b,
-        a_to_b: TransferState::Running(CopyBuffer::new_with_capacity(size)?),
-        b_to_a: TransferState::Running(CopyBuffer::new_with_capacity(size)?),
-        a_to_b_count: 0,
-        b_to_a_count: 0,
-        a_to_b_delay: None,
-        b_to_a_delay: None,
-        a_to_b_timeout_duration,
-        b_to_a_timeout_duration,
-        idle_timeout: Box::pin(tokio::time::sleep(idle_timeout_duration)),
-        idle_timeout_duration,
-        last_active: tokio::time::Instant::now(),
+        size,
+        upload_timeout: a_to_b_timeout_duration,
+        download_timeout: b_to_a_timeout_duration,
         tracker,
     }
-    .await
 }
 
 pub trait ReadExactBase {

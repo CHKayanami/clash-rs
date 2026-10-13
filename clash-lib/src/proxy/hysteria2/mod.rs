@@ -282,7 +282,7 @@ impl Handler {
         let create_socket = || async {
             new_udp_socket(
                 None,
-                sess.iface.as_ref(),
+                sess.iface.as_deref(),
                 #[cfg(target_os = "linux")]
                 sess.so_mark,
                 Some(server_socket_addr),

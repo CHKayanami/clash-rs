@@ -23,6 +23,7 @@ pub use routes::TransportKey;
 pub use transports::{PooledTransport, TransportPool};
 pub use udp::UdpUpstream;
 
+use crate::app::net::OutboundInterface;
 use crate::app::dns::ClashResolver;
 use crate::app::dns::query::QueryContext;
 use crate::proxy::utils::OutboundNodeRegistry;
@@ -37,7 +38,7 @@ pub struct UpstreamPool {
     pub dns_query_timeout: Duration,
     pub dns_dial_timeout: Duration,
     pub fw_mark: Option<u32>,
-    pub default_interface: Option<crate::app::net::OutboundInterface>,
+    pub default_interface: Option<Arc<OutboundInterface>>,
     pub rule_dispatch: Option<Arc<crate::app::dns::RuleDispatch>>,
 }
 
@@ -47,7 +48,7 @@ impl UpstreamPool {
         outbounds: OutboundNodeRegistry,
         bootstrap_resolver: Option<Arc<dyn ClashResolver>>,
         fw_mark: Option<u32>,
-        default_interface: Option<crate::app::net::OutboundInterface>,
+        default_interface: Option<Arc<OutboundInterface>>,
         rule_dispatch: Option<Arc<crate::app::dns::RuleDispatch>>,
     ) -> Arc<Self> {
         Arc::new(Self {

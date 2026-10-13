@@ -16,6 +16,7 @@ use crate::{
 };
 use std::{
     fmt::{Debug, Formatter},
+    future::Future,
     net::IpAddr,
     sync::{
         Arc,
@@ -23,7 +24,7 @@ use std::{
     },
     time::Duration,
 };
-use tracing::{Instrument, debug, error, info, info_span, instrument, trace, warn};
+use tracing::{Instrument, debug, error, info, info_span, trace, warn};
 
 use crate::app::dns::ThreadSafeDNSResolver;
 
@@ -107,200 +108,208 @@ impl Dispatcher {
         &self.router
     }
 
-    #[instrument(level = "info", skip(self, sess, lhs), fields(trace_id = sess.id))]
-    pub async fn dispatch_stream(&self, mut sess: Session, mut lhs: AnyStream) {
-        let orig_dest = sess.destination.clone();
-        sess.orig_destination = Some(orig_dest.clone());
+    pub fn dispatch_stream(
+        &self, sess: Session, lhs: AnyStream,
+    ) -> impl Future<Output = ()> + Send + '_ {
+        let span = info_span!("dispatch_stream", trace_id = sess.id);
+        self.dispatch_stream_inner(sess, lhs).instrument(span)
+    }
 
-        let force_dns_mapping = self
-            .sniffer
-            .as_ref()
-            .map_or(false, |s| s.config.force_dns_mapping);
-        let dest: SocksAddr = match reverse_lookup(
-            &self.resolver,
-            &sess.destination,
-            force_dns_mapping,
-        ) {
-            Some(dest) => dest,
-            None => {
-                warn!("failed to resolve destination {}", sess);
-                return;
-            }
-        };
+    fn dispatch_stream_inner(
+        &self, mut sess: Session, mut lhs: AnyStream,
+    ) -> impl Future<Output = ()> + Send + '_ {
+        async move {
+            let (rhs, tracker_info, copy_span) = {
+                let orig_dest = sess.destination.clone();
+                sess.orig_destination = Some(orig_dest.clone());
 
-        if !orig_dest.is_domain() {
-            if let Some(domain) = dest.domain() {
-                sess.mapped_domain = Some(domain.to_string());
-            }
-        }
-
-        sess.destination = dest.clone();
-
-        // Perform domain sniffing if sniffer is configured
-        let mut override_dest = false;
-        if let Some(sniffer) = &self.sniffer {
-            let (sniffed_domain, new_lhs, should_override) =
-                sniffer.sniff_stream(&sess, lhs).await;
-            lhs = new_lhs;
-            if let Some(domain) = sniffed_domain {
-                override_dest = apply_sniffed_domain(
-                    &mut sess, domain, should_override,
-                );
-            }
-        }
-
-        // Set resolved_ip if original destination was a real IP (not a Fake-IP)
-        let is_real_ip = match orig_dest.ip() {
-            Some(ip) => !self.resolver.is_fake_ip(ip),
-            None => false,
-        };
-        if is_real_ip {
-            sess.resolved_ip = orig_dest.ip();
-        }
-
-        let mode = self.get_mode();
-        let (outbound_name, rule) = match mode {
-            RunMode::Global => (PROXY_GLOBAL, None),
-            RunMode::Rule => self.router.match_route(&mut sess).await,
-            RunMode::Direct => (PROXY_DIRECT, None),
-        };
-
-        // If override_destination is not requested and original destination was a real IP,
-        // restore original destination for outbound connection
-        if !override_dest && is_real_ip {
-            sess.destination = orig_dest.clone();
-        }
-
-        debug!("dispatching {} to {}[{}]", sess, outbound_name, mode);
-
-        let mgr = self.outbound_manager.clone();
-        let handler = match mgr.get_outbound(outbound_name) {
-            Some(h) => h,
-            None => {
-                debug!("unknown rule: {}, fallback to direct", outbound_name);
-                mgr.get_outbound(PROXY_DIRECT).unwrap()
-            }
-        };
-
-        if matches!(effective_outbound_type(&handler).await, OutboundType::Reject) {
-            info!("[TCP Short-Circuit] Reject connection for sess: {}", sess);
-            return;
-        }
-
-        match handler
-            .connect_stream(&sess, self.resolver.clone())
-            .instrument(info_span!("connect_stream", outbound_name = outbound_name,))
-            .await
-        {
-            Ok(rhs) => {
-                debug!("remote connection established {}", sess);
-                let tracker_info = Arc::new(TrackerInfo::new(&sess, rule));
-                let (close_tx, close_rx) = tokio::sync::oneshot::channel();
-                self.manager.track(sess.id, tracker_info.clone(), close_tx);
-                let _track_guard = TrackGuard::new(sess.id, self.manager.clone());
-
-                let tracker =
-                    TrafficTracker::new(tracker_info, self.manager.clone());
-
-                let copy_fut = copy_bidirectional(
-                    lhs,
-                    rhs,
-                    self.tcp_buffer_size,
-                    Duration::from_secs(10),
-                    Duration::from_secs(10),
-                    tracker,
-                )
-                .instrument(info_span!(
-                    "copy_bidirectional",
-                    outbound_name = outbound_name,
-                ));
-
-                tokio::select! {
-                    res = copy_fut => {
-                        match res {
-                            Ok((up, down)) => {
-                                debug!(
-                                    "connection {} closed with {} bytes up, {} bytes down",
-                                    sess, up, down
-                                );
-                            }
-                            Err(err) => match err {
-                                crate::common::io::CopyBidirectionalError::LeftClosed(
-                                    err,
-                                ) => match err.kind() {
-                                    std::io::ErrorKind::UnexpectedEof
-                                    | std::io::ErrorKind::ConnectionReset
-                                    | std::io::ErrorKind::BrokenPipe
-                                    | std::io::ErrorKind::TimedOut
-                                    | std::io::ErrorKind::NotConnected => {
-                                        debug!(
-                                            "connection {} closed with error {} by local",
-                                            sess, err
-                                        );
-                                    }
-                                    _ => {
-                                        warn!(
-                                            "connection {} closed with error {} by local",
-                                            sess, err
-                                        );
-                                    }
-                                },
-                                crate::common::io::CopyBidirectionalError::RightClosed(
-                                    err,
-                                ) => match err.kind() {
-                                    std::io::ErrorKind::UnexpectedEof
-                                    | std::io::ErrorKind::ConnectionReset
-                                    | std::io::ErrorKind::BrokenPipe
-                                    | std::io::ErrorKind::TimedOut
-                                    | std::io::ErrorKind::NotConnected => {
-                                        debug!(
-                                            "connection {} closed with error {} by remote",
-                                            sess, err
-                                        );
-                                    }
-                                    _ => {
-                                        warn!(
-                                            "connection {} closed with error {} by remote",
-                                            sess, err
-                                        );
-                                    }
-                                },
-                                crate::common::io::CopyBidirectionalError::Other(err) => {
-                                    match err.kind() {
-                                        std::io::ErrorKind::UnexpectedEof
-                                        | std::io::ErrorKind::ConnectionReset
-                                        | std::io::ErrorKind::BrokenPipe
-                                        | std::io::ErrorKind::TimedOut
-                                        | std::io::ErrorKind::NotConnected => {
-                                            debug!(
-                                                "connection {} closed with error {} by unknown",
-                                                sess, err
-                                            );
-                                        }
-                                        _ => {
-                                            warn!(
-                                                "connection {} closed with error {} by unknown",
-                                                sess, err
-                                            );
-                                        }
-                                    }
-                                }
-                            },
-                        }
+                let force_dns_mapping = self
+                    .sniffer
+                    .as_ref()
+                    .map_or(false, |s| s.config.force_dns_mapping);
+                let dest: SocksAddr = match reverse_lookup(
+                    &self.resolver,
+                    &sess.destination,
+                    force_dns_mapping,
+                ) {
+                    Some(dest) => dest,
+                    None => {
+                        warn!("failed to resolve destination {}", sess);
+                        return;
                     }
-                    _ = close_rx => {
-                        debug!("connection {} closed by manager signal", sess);
+                };
+
+                if !orig_dest.is_domain() {
+                    if let Some(domain) = dest.domain() {
+                        sess.mapped_domain = Some(domain.to_string());
                     }
                 }
-            }
-            Err(err) => {
-                if is_reject_error(&err) {
+
+                sess.destination = dest;
+
+                // Perform domain sniffing if sniffer is configured
+                let mut override_dest = false;
+                if let Some(sniffer) = &self.sniffer {
+                    let (sniffed_domain, new_lhs, should_override) =
+                        sniffer.sniff_stream(&sess, lhs).await;
+                    lhs = new_lhs;
+                    if let Some(domain) = sniffed_domain {
+                        override_dest = apply_sniffed_domain(
+                            &mut sess, domain, should_override,
+                        );
+                    }
+                }
+
+                // Set resolved_ip if original destination was a real IP (not a Fake-IP)
+                let is_real_ip = match orig_dest.ip() {
+                    Some(ip) => !self.resolver.is_fake_ip(ip),
+                    None => false,
+                };
+                if is_real_ip {
+                    sess.resolved_ip = orig_dest.ip();
+                }
+
+                let mode = self.get_mode();
+                let (outbound_name, rule) = match mode {
+                    RunMode::Global => (PROXY_GLOBAL, None),
+                    RunMode::Rule => self.router.match_route(&mut sess).await,
+                    RunMode::Direct => (PROXY_DIRECT, None),
+                };
+
+                // If override_destination is not requested and original destination was a real IP,
+                // restore original destination for outbound connection
+                if !override_dest && is_real_ip {
+                    sess.destination = orig_dest.clone();
+                }
+
+                debug!("dispatching {} to {}[{}]", sess, outbound_name, mode);
+
+                let handler = match self.outbound_manager.get_outbound(outbound_name) {
+                    Some(h) => h,
+                    None => {
+                        debug!("unknown rule: {}, fallback to direct", outbound_name);
+                        self.outbound_manager.get_outbound(PROXY_DIRECT).unwrap()
+                    }
+                };
+
+                if matches!(effective_outbound_type(&handler).await, OutboundType::Reject) {
                     info!("[TCP Short-Circuit] Reject connection for sess: {}", sess);
-                } else {
-                    warn!(
-                        "failed to establish remote connection for {}: {}",
-                        sess, err
-                    );
+                    return;
+                }
+
+                let rhs = match handler
+                    .connect_stream(&sess, self.resolver.clone())
+                    .instrument(info_span!("connect_stream", outbound_name = outbound_name,))
+                    .await
+                {
+                    Ok(rhs) => rhs,
+                    Err(err) => {
+                        if is_reject_error(&err) {
+                            info!("[TCP Short-Circuit] Reject connection for sess: {}", sess);
+                        } else {
+                            warn!("failed to establish remote connection for {}: {}", sess, err);
+                        }
+                        return;
+                    }
+                };
+                debug!("remote connection established {}", sess);
+                let tracker_info = Arc::new(TrackerInfo::new(&sess, rule));
+                let copy_span = info_span!("copy_bidirectional", outbound_name = outbound_name);
+                (rhs, tracker_info, copy_span)
+            };
+
+            let (close_tx, close_rx) = tokio::sync::oneshot::channel();
+            self.manager.track(sess.id, tracker_info.clone(), close_tx);
+            let _track_guard = TrackGuard::new(sess.id, self.manager.clone());
+
+            let tracker =
+                TrafficTracker::new(tracker_info, self.manager.clone());
+
+            let copy_fut = copy_bidirectional(
+                lhs,
+                rhs,
+                self.tcp_buffer_size,
+                Duration::from_secs(10),
+                Duration::from_secs(10),
+                tracker,
+            )
+            .instrument(copy_span);
+
+            tokio::select! {
+                res = copy_fut => {
+                    match res {
+                        Ok((up, down)) => {
+                            debug!(
+                                "connection {} closed with {} bytes up, {} bytes down",
+                                sess, up, down
+                            );
+                        }
+                        Err(err) => match err {
+                            crate::common::io::CopyBidirectionalError::LeftClosed(
+                                err,
+                            ) => match err.kind() {
+                                std::io::ErrorKind::UnexpectedEof
+                                | std::io::ErrorKind::ConnectionReset
+                                | std::io::ErrorKind::BrokenPipe
+                                | std::io::ErrorKind::TimedOut
+                                | std::io::ErrorKind::NotConnected => {
+                                    debug!(
+                                        "connection {} closed with error {} by local",
+                                        sess, err
+                                    );
+                                }
+                                _ => {
+                                    warn!(
+                                        "connection {} closed with error {} by local",
+                                        sess, err
+                                    );
+                                }
+                            },
+                            crate::common::io::CopyBidirectionalError::RightClosed(
+                                err,
+                            ) => match err.kind() {
+                                std::io::ErrorKind::UnexpectedEof
+                                | std::io::ErrorKind::ConnectionReset
+                                | std::io::ErrorKind::BrokenPipe
+                                | std::io::ErrorKind::TimedOut
+                                | std::io::ErrorKind::NotConnected => {
+                                    debug!(
+                                        "connection {} closed with error {} by remote",
+                                        sess, err
+                                    );
+                                }
+                                _ => {
+                                    warn!(
+                                        "connection {} closed with error {} by remote",
+                                        sess, err
+                                    );
+                                }
+                            },
+                            crate::common::io::CopyBidirectionalError::Other(err) => {
+                                match err.kind() {
+                                    std::io::ErrorKind::UnexpectedEof
+                                    | std::io::ErrorKind::ConnectionReset
+                                    | std::io::ErrorKind::BrokenPipe
+                                    | std::io::ErrorKind::TimedOut
+                                    | std::io::ErrorKind::NotConnected => {
+                                        debug!(
+                                            "connection {} closed with error {} by unknown",
+                                            sess, err
+                                        );
+                                    }
+                                    _ => {
+                                        warn!(
+                                            "connection {} closed with error {} by unknown",
+                                            sess, err
+                                        );
+                                    }
+                                }
+                            }
+                        },
+                    }
+                }
+                _ = close_rx => {
+                    debug!("connection {} closed by manager signal", sess);
                 }
             }
         }

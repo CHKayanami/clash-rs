@@ -3,7 +3,7 @@ use crate::{
     app::{
         dispatcher::Dispatcher,
         dns::{ThreadSafeDNSResolver, exchange_with_resolver},
-        net::get_default_outbound_interface_cloned,
+        net::get_default_outbound_interface,
     },
     // common::errors::new_io_error,
     proxy::datagram::UdpPacket,
@@ -42,7 +42,7 @@ pub(crate) async fn handle_inbound_datagram(
     // is to the tun
     let udp_stream = TunDatagram::new(l_tx, d_rx);
 
-    let default_outbound = get_default_outbound_interface_cloned();
+    let default_outbound = get_default_outbound_interface();
     let sess = Session {
         network: Network::Udp,
         typ: Type::Tun,

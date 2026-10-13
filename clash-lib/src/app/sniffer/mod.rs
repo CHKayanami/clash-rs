@@ -5,10 +5,11 @@ pub mod tls;
 
 use dashmap::DashMap;
 use parking_lot::Mutex;
-use std::net::SocketAddr;
+use std::{future::Future, io, net::SocketAddr, pin::Pin, task::Poll};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::io::AsyncReadExt;
+use futures::future::poll_fn;
+use tokio::{io::{AsyncRead, ReadBuf}, task::coop::{has_budget_remaining, unconstrained}, time::Sleep};
 use tracing::{debug, trace};
 
 use crate::common::io::SlideBuffer;
@@ -16,6 +17,27 @@ use crate::proxy::AnyStream;
 use crate::session::{Session, SocksAddr};
 
 pub use stream::PrefixedStream;
+
+// Reuse one timer across prefetch reads, retaining Timeout's read-first and
+// cooperative-budget behavior without allocating a pinned timer on the heap.
+fn read_until_deadline<'a, S: AsyncRead + Unpin + Send>(
+    stream: &'a mut S, buffer: &'a mut [u8], mut timer: Pin<&'a mut Sleep>,
+) -> impl Future<Output = Option<io::Result<usize>>> + Send + 'a {
+    poll_fn(move |cx| {
+        let had_budget = has_budget_remaining();
+        let mut read = ReadBuf::new(buffer);
+        if let Poll::Ready(result) = Pin::new(&mut *stream).poll_read(cx, &mut read) {
+            return Poll::Ready(Some(result.map(|()| read.filled().len())));
+        }
+        let timeout = if had_budget && !has_budget_remaining() {
+            // A read that exhausted its budget must not starve the deadline.
+            Pin::new(&mut unconstrained(timer.as_mut())).poll(cx)
+        } else {
+            timer.as_mut().poll(cx)
+        };
+        timeout.map(|()| None)
+    })
+}
 
 const DEFAULT_SNIFF_TIMEOUT: Duration = Duration::from_millis(200);
 const MAX_SNIFF_BUFFER_SIZE: usize = 4096;
@@ -284,138 +306,144 @@ impl Sniffer {
 
     /// Sniff a TCP client stream.
     /// Returns: `(Option<sniffed_domain>, AnyStream, override_destination)`
-    pub async fn sniff_stream(
-        &self,
-        sess: &Session,
+    pub fn sniff_stream<'a>(
+        &'a self,
+        sess: &'a Session,
         mut stream: AnyStream,
-    ) -> (Option<String>, AnyStream, bool) {
-        if !self.config.enable {
-            return (None, stream, false);
-        }
-
-        let port = sess.destination.port();
-        let orig_dest = sess.orig_destination.as_ref().unwrap_or(&sess.destination);
-        // If sess.destination is already a domain (from reverse lookup or domain inbound),
-        // it is not treated as a pure IP. Reverse lookup takes precedence over sniffing
-        // unless explicitly forced via force_domains.
-        let is_pure_ip = !sess.destination.is_domain();
-        let force = self.should_force_sniff(&sess.destination)
-            || self.should_force_sniff(orig_dest);
-
-        if is_pure_ip {
-            if !self.config.parse_pure_ip && !force {
+    ) -> impl Future<Output = (Option<String>, AnyStream, bool)> + Send + 'a {
+        async move {
+            if !self.config.enable {
                 return (None, stream, false);
             }
-        } else if !force {
-            return (None, stream, false);
-        }
 
-        let tls_enabled = self
-            .config
-            .tls
-            .as_ref()
-            .map_or(false, |cfg| cfg.ports.contains(port));
-        let http_enabled = self
-            .config
-            .http
-            .as_ref()
-            .map_or(false, |cfg| cfg.ports.contains(port));
+            let port = sess.destination.port();
+            let orig_dest = sess.orig_destination.as_ref().unwrap_or(&sess.destination);
+            // If sess.destination is already a domain (from reverse lookup or domain inbound),
+            // it is not treated as a pure IP. Reverse lookup takes precedence over sniffing
+            // unless explicitly forced via force_domains.
+            let is_pure_ip = !sess.destination.is_domain();
+            let force = self.should_force_sniff(&sess.destination)
+                || self.should_force_sniff(orig_dest);
 
-        if !tls_enabled && !http_enabled {
-            return (None, stream, false);
-        }
-
-        let now = Instant::now();
-        let ip_target = match orig_dest {
-            SocksAddr::Ip(addr) => Some(*addr),
-            _ => match sess.destination {
-                SocksAddr::Ip(addr) => Some(addr),
-                _ => None,
-            },
-        };
-
-        if let Some(addr) = ip_target {
-            if !force && self.tcp_neg_cache.should_skip(&addr, now) {
-                trace!("skip sniffing for {} by negative cache", addr);
+            if is_pure_ip {
+                if !self.config.parse_pure_ip && !force {
+                    return (None, stream, false);
+                }
+            } else if !force {
                 return (None, stream, false);
             }
-        }
 
-        // Bounded prefetch with smart length requirement
-        let mut buf = SlideBuffer::new(MAX_SNIFF_BUFFER_SIZE);
-        let deadline = tokio::time::Instant::now() + DEFAULT_SNIFF_TIMEOUT;
+            let tls_enabled = self
+                .config
+                .tls
+                .as_ref()
+                .map_or(false, |cfg| cfg.ports.contains(port));
+            let http_enabled = self
+                .config
+                .http
+                .as_ref()
+                .map_or(false, |cfg| cfg.ports.contains(port));
 
-        loop {
-            let required = sniff_required_len(buf.as_slice());
-            if required <= buf.len() || buf.len() >= MAX_SNIFF_BUFFER_SIZE {
-                break;
+            if !tls_enabled && !http_enabled {
+                return (None, stream, false);
             }
 
-            let want = (required - buf.len()).min(buf.remaining_capacity());
-            let write_slice = &mut buf.write_slice()[..want];
-            match tokio::time::timeout_at(deadline, stream.read(write_slice))
-                .await
-            {
-                Ok(Ok(0)) => break,
-                Ok(Ok(n)) => buf.advance_write(n),
-                Ok(Err(e)) => {
-                    trace!("sniff stream read error for {}: {}", sess, e);
+            let now = Instant::now();
+            let ip_target = match orig_dest {
+                SocksAddr::Ip(addr) => Some(*addr),
+                _ => match sess.destination {
+                    SocksAddr::Ip(addr) => Some(addr),
+                    _ => None,
+                },
+            };
+
+            if let Some(addr) = ip_target {
+                if !force && self.tcp_neg_cache.should_skip(&addr, now) {
+                    trace!("skip sniffing for {} by negative cache", addr);
+                    return (None, stream, false);
+                }
+            }
+
+            // Bounded prefetch with smart length requirement
+            let mut buf = SlideBuffer::new(MAX_SNIFF_BUFFER_SIZE);
+            let deadline = tokio::time::Instant::now() + DEFAULT_SNIFF_TIMEOUT;
+            let timer = tokio::time::sleep_until(deadline);
+            tokio::pin!(timer);
+
+            loop {
+                let required = sniff_required_len(buf.as_slice());
+                if required <= buf.len() || buf.len() >= MAX_SNIFF_BUFFER_SIZE {
                     break;
                 }
-                Err(_) => {
-                    trace!("sniff stream timeout for {}", sess);
-                    break;
-                }
-            }
-        }
 
-        // 1. Try TLS SNI
-        if tls_enabled {
-            if let Some(domain) = tls::parse_tls_sni(buf.as_slice()) {
-                if !self.is_domain_skipped(&domain) {
-                    debug!("sniffed TLS SNI domain `{}` for {}", domain, sess);
-                    if let Some(addr) = ip_target {
-                        self.tcp_neg_cache.note_success(&addr);
+                let want = (required - buf.len()).min(buf.remaining_capacity());
+                let write_slice = &mut buf.write_slice()[..want];
+                match read_until_deadline(&mut stream, write_slice, timer.as_mut()).await
+                {
+                    Some(Ok(0)) => break,
+                    Some(Ok(n)) => buf.advance_write(n),
+                    Some(Err(e)) => {
+                        trace!("sniff stream read error for {}: {}", sess, e);
+                        break;
                     }
-                    let override_dest = self
-                        .config
-                        .tls
-                        .as_ref()
-                        .and_then(|c| c.override_destination)
-                        .unwrap_or(self.config.override_destination);
-                    let wrapped = AnyStream::new(PrefixedStream::new(buf, stream));
-                    return (Some(domain), wrapped, override_dest);
-                }
-            }
-        }
-
-        // 2. Try HTTP Host
-        if http_enabled {
-            if let Some(domain) = http::parse_http_host(buf.as_slice()) {
-                if !self.is_domain_skipped(&domain) {
-                    debug!("sniffed HTTP Host domain `{}` for {}", domain, sess);
-                    if let Some(addr) = ip_target {
-                        self.tcp_neg_cache.note_success(&addr);
+                    None => {
+                        trace!("sniff stream timeout for {}", sess);
+                        break;
                     }
-                    let override_dest = self
-                        .config
-                        .http
-                        .as_ref()
-                        .and_then(|c| c.override_destination)
-                        .unwrap_or(self.config.override_destination);
-                    let wrapped = AnyStream::new(PrefixedStream::new(buf, stream));
-                    return (Some(domain), wrapped, override_dest);
                 }
             }
-        }
 
-        // Sniffing yielded no usable domain: record failure in negative cache if target is an IP
-        if let Some(addr) = ip_target {
-            self.tcp_neg_cache.note_failure(addr, now);
-        }
+            // 1. Try TLS SNI
+            if tls_enabled {
+                if let Some(domain) = tls::parse_tls_sni(buf.as_slice()) {
+                    if !self.is_domain_skipped(&domain) {
+                        debug!("sniffed TLS SNI domain `{}` for {}", domain, sess);
+                        if let Some(addr) = ip_target {
+                            self.tcp_neg_cache.note_success(&addr);
+                        }
+                        let override_dest = self
+                            .config
+                            .tls
+                            .as_ref()
+                            .and_then(|c| c.override_destination)
+                            .unwrap_or(self.config.override_destination);
+                        let wrapped = AnyStream::new(PrefixedStream::new(buf, stream));
+                        return (Some(domain), wrapped, override_dest);
+                    }
+                }
+            }
 
-        let wrapped = AnyStream::new(PrefixedStream::new(buf, stream));
-        (None, wrapped, false)
+            // 2. Try HTTP Host
+            if http_enabled {
+                if let Some(domain) = http::parse_http_host(buf.as_slice()) {
+                    if !self.is_domain_skipped(&domain) {
+                        debug!("sniffed HTTP Host domain `{}` for {}", domain, sess);
+                        if let Some(addr) = ip_target {
+                            self.tcp_neg_cache.note_success(&addr);
+                        }
+                        let override_dest = self
+                            .config
+                            .http
+                            .as_ref()
+                            .and_then(|c| c.override_destination)
+                            .unwrap_or(self.config.override_destination);
+                        let wrapped = AnyStream::new(PrefixedStream::new(buf, stream));
+                        return (Some(domain), wrapped, override_dest);
+                    }
+                }
+            }
+
+            // Sniffing yielded no usable domain: record failure in negative cache if target is an IP
+            if let Some(addr) = ip_target {
+                self.tcp_neg_cache.note_failure(addr, now);
+            }
+
+            if buf.is_empty() {
+                return (None, stream, false);
+            }
+            let wrapped = AnyStream::new(PrefixedStream::new(buf, stream));
+            (None, wrapped, false)
+        }
     }
 
     /// Sniff a UDP packet (QUIC) with flow session and DCID negative cache, returning full outcome.

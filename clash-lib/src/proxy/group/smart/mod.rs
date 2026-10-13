@@ -184,19 +184,18 @@ impl Handler {
             dest_ip
         );
 
-        let mut enhanced_sess = sess.clone();
-        {
+        let traffic_stats = {
             let mut state = self.smart_state.lock();
             state.cleanup_stale();
-            if let Some(traffic_stats) = state.get_traffic_stats(sess) {
-                enhanced_sess.traffic_stats = Some(traffic_stats);
-                debug!(
-                    "{} using traffic pattern analysis for session {}",
-                    self.name(), SmartState::generate_session_id(sess)
-                );
-            }
+            state.get_traffic_stats(sess)
+        };
+        if traffic_stats.is_some() {
+            debug!(
+                "{} using traffic pattern analysis for session {}",
+                self.name(), SmartState::generate_session_id(sess)
+            );
         }
-        let site_tuning = self.proxy_manager.get_site_tuning(&enhanced_sess).await;
+        let site_tuning = self.proxy_manager.get_site_tuning(sess, traffic_stats.as_ref()).await;
         let histories = {
             let state = self.smart_state.lock();
             let summary = |stats: &SiteStats| {

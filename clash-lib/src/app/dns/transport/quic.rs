@@ -78,7 +78,7 @@ pub struct SharedQuicEndpoint {
     endpoints: Mutex<HashMap<(bool, Option<SocketAddr>), Arc<EndpointSlot>>>,
     retired: Mutex<Vec<RetiredEndpoint>>,
     admission: AdmissionGate,
-    iface: Option<OutboundInterface>,
+    iface: Option<Arc<OutboundInterface>>,
     so_mark: Option<u32>,
     dial: Option<DialContext>,
     active_tasks: Arc<AtomicUsize>,
@@ -90,7 +90,7 @@ impl SharedQuicEndpoint {
     }
 
     pub fn with_options(
-        iface: Option<OutboundInterface>,
+        iface: Option<Arc<OutboundInterface>>,
         so_mark: Option<u32>,
     ) -> Self {
         Self {
@@ -182,7 +182,7 @@ impl SharedQuicEndpoint {
         } else {
             let socket = direct_udp_socket(
                 address,
-                self.iface.as_ref(),
+                self.iface.as_deref(),
                 self.so_mark,
             )?;
             let endpoint = quinn::Endpoint::new(

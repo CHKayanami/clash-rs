@@ -214,11 +214,11 @@ impl DirectDatagramPool {
 
     fn create_entry(
         key: &DirectSocketKey,
-        iface: Option<&OutboundInterface>,
+        iface: Option<&Arc<OutboundInterface>>,
         pool_weak: Option<Weak<DirectDatagramPool>>,
     ) -> io::Result<DirectSocketEntry> {
         let socket = new_dual_stack_udp_socket(
-            iface,
+            iface.map(Arc::as_ref),
             #[cfg(target_os = "linux")]
             key.so_mark,
         )?;
@@ -318,7 +318,7 @@ impl DirectDatagramPool {
     pub fn connect(
         self: &Arc<Self>,
         mut key: DirectSocketKey,
-        iface: Option<&OutboundInterface>,
+        iface: Option<&Arc<OutboundInterface>>,
         destination: SocksAddr,
         resolver: ThreadSafeDNSResolver,
     ) -> io::Result<PooledDirectDatagram> {
@@ -424,7 +424,7 @@ impl DirectDatagramPool {
         session_id: SessionId,
         tx: SessionSender,
         dst: SocketAddr,
-        iface: Option<&OutboundInterface>,
+        iface: Option<&Arc<OutboundInterface>>,
     ) -> io::Result<Arc<DirectSocketEntry>> {
         let mut chosen_entry = None;
         {
@@ -523,7 +523,7 @@ pub struct PooledDirectDatagram {
     pool: Arc<DirectDatagramPool>,
     base_key: DirectSocketKey,
     resolver: ThreadSafeDNSResolver,
-    iface: Option<OutboundInterface>,
+    iface: Option<Arc<OutboundInterface>>,
     tx: SessionSender,
     registered_dsts: HashSet<SocketAddr>,
     retained_entries: Vec<(Arc<DirectSocketEntry>, HashSet<SocketAddr>)>,

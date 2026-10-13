@@ -61,7 +61,7 @@ impl RemoteConnector {
 
     pub async fn connect_stream(
         &self, resolver: ThreadSafeDNSResolver, address: &str, port: u16,
-        tfo: bool, iface: Option<&OutboundInterface>,
+        tfo: bool, iface: Option<&Arc<OutboundInterface>>,
         #[cfg(target_os = "linux")] packet_mark: Option<u32>,
     ) -> io::Result<AnyStream> {
         match self {
@@ -84,7 +84,7 @@ impl RemoteConnector {
 
     pub async fn connect_datagram(
         &self, resolver: ThreadSafeDNSResolver, src: Option<SocketAddr>,
-        destination: SocksAddr, iface: Option<&OutboundInterface>,
+        destination: SocksAddr, iface: Option<&Arc<OutboundInterface>>,
         #[cfg(target_os = "linux")] packet_mark: Option<u32>,
     ) -> io::Result<AnyOutboundDatagram> {
         match self {
@@ -123,14 +123,14 @@ impl DirectConnector {
         address: &str,
         port: u16,
         tfo: bool,
-        iface: Option<&OutboundInterface>,
+        iface: Option<&Arc<OutboundInterface>>,
         #[cfg(target_os = "linux")] so_mark: Option<u32>,
     ) -> std::io::Result<AnyStream> {
         dial_tcp_with_happy_eyeballs(
             address,
             port,
             &resolver,
-            iface,
+            iface.map(Arc::as_ref),
             tfo,
             #[cfg(target_os = "linux")]
             so_mark,
@@ -143,12 +143,12 @@ impl DirectConnector {
         resolver: ThreadSafeDNSResolver,
         src: Option<SocketAddr>,
         destination: SocksAddr,
-        iface: Option<&OutboundInterface>,
+        iface: Option<&Arc<OutboundInterface>>,
         #[cfg(target_os = "linux")] so_mark: Option<u32>,
     ) -> std::io::Result<AnyOutboundDatagram> {
         let dgram = new_udp_socket(
             src,
-            iface,
+            iface.map(Arc::as_ref),
             #[cfg(target_os = "linux")]
             so_mark,
             destination
