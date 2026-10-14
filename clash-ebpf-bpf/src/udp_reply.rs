@@ -14,7 +14,9 @@ unsafe fn refresh(ptr: *mut UdpReplyEntry, observed: u64, now: u64) {
     }
 }
 
-#[inline(never)]
+// Keep the unit-returning update in its caller: LLVM may leave a temporary
+// stack address in R0 on an early return, which BPF subprogram exits reject.
+#[inline(always)]
 pub fn publish(tuple: &RedirectTuple, route: RedirectEntry, now: u64) {
     let key = UdpReplyKey::from_request(tuple);
     let ptr = UDP_REPLY_TRACK.get_ptr_mut(&key);
