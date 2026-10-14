@@ -12,8 +12,6 @@
 
 [English](README.md) · **简体中文**
 
-[![CI](https://github.com/Watfaq/clash-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/Watfaq/clash-rs/actions/workflows/ci.yml)
-[![codecov](https://codecov.io/gh/Watfaq/clash-rs/graph/badge.svg?token=ZQK5WB63KR)](https://codecov.io/gh/Watfaq/clash-rs)
 
 </div>
 
@@ -22,6 +20,7 @@
 > - ⚡ **性能与稳定性优化**：针对核心路径进行了大量重构与性能调优，重写了部分协议栈实现。
 > - 🚀 **新功能特性**：支持基于 BoringSSL 实现的浏览器 TLS 指纹、VLESS Encryption、VLESS XHTTP、Shadowsocks UOT (UDP-over-TCP)、域名嗅探（TLS SNI / HTTP Host / QUIC SNI）、H2MUX 和 TUN system stack。
 > - ⚡ **eBPF 内核透明代理**：新增基于 eBPF 的高性能透明代理入站，支持内核态直连快路径决策（Direct Fast-Path）（仅限 Linux）。
+> - 🌐 **FullCone NAT 支持**：重构 UDP NAT 机制，代理出站支持 FullCone。
 > - 🌐 **灵活的 DNS2 路由引擎**：新增两阶段 DNS 路由子系统，支持对上游 DNS 服务器池（直连 / 代理 Detour / Fake-IP）与分流规则进行更灵活精细的配置。
 > - 🪶 **Minimal 轻量版本**：`minimal` feature 在核心协议之外启用 Shadowsocks 和 TUIC；`standard` 进一步启用 SSH、WireGuard、Tailscale 和 Shadowquic；`plus` 再启用 Tor。默认 feature 仍会保留，除非显式指定 `--no-default-features`。
 > - 📖 **配置说明文档**：请参阅 [clash-rs-alpha-docs](https://chkayanami.github.io/clash-rs-alpha-docs)。
@@ -74,6 +73,26 @@
 | `ssh` | SSH 隧道 | `ssh` 特性（`standard` / `plus` 构建） |
 | `tor` | 洋葱路由 (Onion) | `onion` 特性 (`plus` 构建) |
 | `tailscale` | Mesh VPN | `tailscale` 特性（`standard` / `plus` 构建） |
+
+### UDP FullCone 支持
+
+**前置条件**：入站目标为真实 IP，且未启用域名目标覆写。
+
+**支持入站**：TUN、TProxy、eBPF、SOCKS5
+
+**支持的出站协议**：
+
+- Direct
+- Shadowsocks UDP / UOT
+- Trojan UDP
+- SOCKS5 UDP
+- Hysteria2 UDP
+- TUIC UDP
+- AnyTLS UDP
+- H2MUX UDP
+- VLESS XUDP
+
+> **说明**：以上仅说明客户端支持能力，实际达成 FullCone 还需代理节点服务端本身提供支持。
 
 ### VLESS 与 XHTTP
 

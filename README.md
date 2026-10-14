@@ -12,8 +12,6 @@ A custom protocol, rule based network proxy software.
 
 **English** · [简体中文](README_zh.md)
 
-[![CI](https://github.com/Watfaq/clash-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/Watfaq/clash-rs/actions/workflows/ci.yml)
-[![codecov](https://codecov.io/gh/Watfaq/clash-rs/graph/badge.svg?token=ZQK5WB63KR)](https://codecov.io/gh/Watfaq/clash-rs)
 
 </div>
 
@@ -22,6 +20,7 @@ A custom protocol, rule based network proxy software.
 > - ⚡ **Performance & Stability**: Extensively refactored and performance-tuned with rewritten core protocol stacks.
 > - 🚀 **New Features**: BoringSSL-based browser TLS fingerprints, VLESS Encryption, VLESS XHTTP, Shadowsocks UOT (UDP-over-TCP), Domain Sniffing (TLS SNI / HTTP Host / QUIC SNI), H2MUX, and TUN System Stack.
 > - ⚡ **eBPF Kernel Transparent Proxy**: High-performance in-kernel transparent proxy inbound powered by eBPF with direct fast-path offload (Linux only).
+> - 🌐 **Full-Cone NAT Support**: Refactored UDP NAT mechanism with full-cone support for proxy outbounds.
 > - 🌐 **Flexible DNS2 Routing Engine**: Introduces a two-stage DNS routing subsystem, allowing flexible upstream steering (direct, proxy detour, Fake-IP) and fine-grained rule-based dispatching.
 > - 🪶 **Minimal Build**: The `minimal` feature adds Shadowsocks and TUIC to the core protocols; `standard` also adds SSH, WireGuard, Tailscale, and Shadowquic; `plus` adds Tor. Default features remain enabled unless `--no-default-features` is specified.
 > - 📖 **Configuration Documentation**: See [clash-rs-alpha-docs](https://chkayanami.github.io/clash-rs-alpha-docs).
@@ -74,6 +73,26 @@ A custom protocol, rule based network proxy software.
 | `ssh` | SSH tunnel | `ssh` feature (`standard` / `plus` builds) |
 | `tor` | Onion routing | `onion` feature (`plus` build) |
 | `tailscale` | Mesh VPN | `tailscale` feature (`standard` / `plus` builds) |
+
+### UDP Full-Cone Support
+
+**Prerequisites**: The inbound destination must be a real IP, and domain destination override must be disabled.
+
+**Supported Inbounds**: TUN, TProxy, eBPF, and SOCKS5.
+
+**Supported Outbound Protocols**:
+
+- Direct
+- Shadowsocks UDP / UOT
+- Trojan UDP
+- SOCKS5 UDP
+- Hysteria2 UDP
+- TUIC UDP
+- AnyTLS UDP
+- H2MUX UDP
+- VLESS XUDP
+
+> **Note**: The above only denotes client-side capabilities; achieving Full-Cone NAT also requires support from the upstream proxy server.
 
 ### VLESS and XHTTP
 
