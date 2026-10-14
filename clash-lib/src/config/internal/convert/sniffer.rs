@@ -1,6 +1,7 @@
 use crate::Error;
 use crate::app::sniffer::{
     PortMatcher, PortRange, SniffProtocolConfig, SnifferConfig,
+    validate_domain_patterns,
 };
 use crate::config::def::{self, PortOrRange, SniffItemConfig};
 
@@ -19,6 +20,9 @@ pub fn convert(
         http: None,
         quic: None,
     };
+
+    validate_domain_patterns("skip-domain", &config.skip_domains)?;
+    validate_domain_patterns("force-domain", &config.force_domains)?;
 
     if let Some(sniff) = def.sniff {
         if let Some(tls) = sniff.tls {
@@ -139,6 +143,41 @@ fn convert_proto(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::sniffer::Sniffer;
+
+    #[test]
+    fn invalid_domain_patterns_are_rejected_with_field_context() {
+        for name in ["skip-domain", "force-domain"] {
+            for pattern in ["", " ", ".", "a..example.com", "*.a..example.com"]
+            {
+                let yaml = format!("enable: true\n{name}: ['{pattern}']\n");
+                let def = yaml_serde::from_str(&yaml).unwrap();
+                let error = convert(Some(def)).unwrap_err().to_string();
+                assert!(error.contains(&format!("sniffer.{name}")), "{error}");
+            }
+        }
+    }
+
+    #[test]
+    fn domain_and_keyword_patterns_are_accepted() {
+        let yaml = "enable: true\nskip-domain: ['*.example.com', '*Cloud*', 'Mijia Cloud']\nforce-domain: ['+.example.com', '.example.org', 'api.*.example.net']\n";
+        let def = yaml_serde::from_str(yaml).unwrap();
+        assert!(convert(Some(def)).is_ok());
+    }
+
+    #[test]
+    fn domain_patterns_with_root_dot_and_spaces_are_normalized() {
+        let yaml = "enable: true\nskip-domain: [' *.EXAMPLE.COM. ', ' *CLOUD* ']\nforce-domain: [' +.EXAMPLE.ORG. ']\n";
+        let def = yaml_serde::from_str(yaml).unwrap();
+        let config = convert(Some(def)).unwrap().unwrap();
+        let sniffer = Sniffer::new(config);
+        assert!(sniffer.is_domain_skipped(" WWW.EXAMPLE.COM. "));
+        assert!(sniffer.is_domain_skipped("my.cloud.example."));
+        assert!(!sniffer.is_domain_skipped("example.com."));
+        assert!(sniffer.should_force_sniff(
+            &"www.EXAMPLE.ORG.:443".parse().unwrap(),
+        ));
+    }
 
     #[test]
     fn invalid_sniffer_ports_and_protocols_are_rejected() {

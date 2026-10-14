@@ -5,7 +5,7 @@ use crate::{
     proxy::utils::OutboundNodeRegistry,
 };
 
-pub(super) fn normalize_domain(domain: &str) -> Cow<'_, str> {
+pub(crate) fn normalize_domain(domain: &str) -> Cow<'_, str> {
     let domain = domain.trim().trim_end_matches('.');
     if domain.bytes().any(|byte| byte.is_ascii_uppercase()) {
         Cow::Owned(domain.to_ascii_lowercase())

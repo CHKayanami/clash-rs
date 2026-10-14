@@ -3,7 +3,7 @@ use std::{net::Ipv6Addr, str::from_utf8};
 /// HTTP Host parser
 /// Efficiently inspects the initial bytes of an HTTP request and extracts the Host header.
 
-const HTTP_METHODS: &[&[u8]] = &[
+pub(super) const HTTP_METHODS: &[&[u8]] = &[
     b"GET ",
     b"POST ",
     b"CONNECT ",

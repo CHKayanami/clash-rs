@@ -1,19 +1,13 @@
 /// QUIC Initial packet decryptor and TLS 1.3 ClientHello SNI extractor.
 /// Supports RFC 9000/9001 (QUIC v1), RFC 9369 (QUIC v2), and draft-29.
-use std::collections::BTreeMap;
-use std::net::SocketAddr;
+use std::{
+    net::SocketAddr,
+    sync::{Arc, atomic::{AtomicU64, Ordering}},
+};
 use std::time::{Duration, Instant};
 
-use aes::Aes128;
-use aes::cipher::{BlockCipherEncrypt, KeyInit as AesKeyInit};
-use aes_gcm::{
-    Aes128Gcm,
-    aead::{Aead, Payload},
-};
 use dashmap::DashMap;
-use hmac::{Hmac, Mac};
 use parking_lot::Mutex;
-use sha2::Sha256;
 
 use super::tls::parse_client_hello_handshake;
 
@@ -40,364 +34,14 @@ const QUIC_DRAFT29_SALT: [u8; 20] = [
     0x3f, 0xe1, 0xce, 0x46, 0xb1, 0x35, 0xd4,
 ];
 
-/// Upper bound on the reassembled CRYPTO stream (ClientHello is typically < 4 KiB).
-const MAX_CRYPTO_STREAM: usize = 64 * 1024;
+mod reassembly;
+mod keys;
+mod decrypt;
 
-/// Stream reassembly for QUIC CRYPTO frames.
-#[derive(Debug, Clone, Default)]
-pub struct CryptoReassembly {
-    fragments: BTreeMap<u64, Vec<u8>>,
-    assembled: Vec<u8>,
-    overflowed: bool,
-}
-
-impl CryptoReassembly {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn insert(&mut self, offset: u64, data: &[u8]) {
-        if self.overflowed || data.is_empty() {
-            return;
-        }
-
-        let assembled_len = self.assembled.len() as u64;
-
-        if offset < assembled_len {
-            let skip = (assembled_len - offset) as usize;
-            if skip >= data.len() {
-                return;
-            }
-            self.insert(assembled_len, &data[skip..]);
-            return;
-        }
-
-        self.fragments.insert(offset, data.to_vec());
-
-        while let Some((&frag_offset, _)) = self.fragments.iter().next() {
-            let cur_len = self.assembled.len() as u64;
-            if frag_offset > cur_len {
-                break;
-            }
-
-            let (_, frag_data) = self.fragments.remove_entry(&frag_offset).unwrap();
-            let overlap = (cur_len - frag_offset) as usize;
-            if overlap < frag_data.len() {
-                let to_append = &frag_data[overlap..];
-                if self.assembled.len() + to_append.len() > MAX_CRYPTO_STREAM {
-                    self.overflowed = true;
-                    self.assembled.clear();
-                    self.fragments.clear();
-                    return;
-                }
-                self.assembled.extend_from_slice(to_append);
-            }
-        }
-    }
-
-    pub fn assembled(&self) -> &[u8] {
-        &self.assembled
-    }
-
-    pub fn is_overflowed(&self) -> bool {
-        self.overflowed
-    }
-}
-
-/// Decrypts all Initial packets in a UDP datagram and extracts all CRYPTO frame fragments as `(offset, data)`.
-pub fn decrypt_initial_datagram(data: &[u8]) -> Option<Vec<(u64, Vec<u8>)>> {
-    let mut fragments = Vec::new();
-    let mut offset = 0;
-
-    while offset < data.len() {
-        let remaining = &data[offset..];
-        if remaining.len() < 7 {
-            break;
-        }
-
-        let first_byte = remaining[0];
-        // Long Header bit (0x80) and Fixed bit (0x40)
-        if (first_byte & 0x80) == 0 || (first_byte & 0x40) == 0 {
-            break;
-        }
-
-        let version = u32::from_be_bytes([
-            remaining[1],
-            remaining[2],
-            remaining[3],
-            remaining[4],
-        ]);
-        if version == 0 {
-            // Version negotiation packet
-            break;
-        }
-
-        let (salt, is_v2) = match version {
-            QUIC_VERSION_1 => (&QUIC_V1_SALT[..], false),
-            QUIC_VERSION_2 | QUIC_VERSION_2_DRAFT => (&QUIC_V2_SALT[..], true),
-            QUIC_VERSION_DRAFT29 => (&QUIC_DRAFT29_SALT[..], false),
-            _ => break,
-        };
-
-        // Packet type check
-        let packet_type = (first_byte & 0x30) >> 4;
-        if is_v2 {
-            if packet_type != 0x01 {
-                break;
-            }
-        } else if packet_type != 0x00 {
-            break;
-        }
-
-        let mut pos = 5;
-        if pos >= remaining.len() {
-            break;
-        }
-
-        // DCID
-        let dcil = remaining[pos] as usize;
-        pos += 1;
-        if pos + dcil > remaining.len() {
-            break;
-        }
-        let dcid = &remaining[pos..pos + dcil];
-        pos += dcil;
-
-        // SCID
-        if pos >= remaining.len() {
-            break;
-        }
-        let scil = remaining[pos] as usize;
-        pos += 1;
-        if pos + scil > remaining.len() {
-            break;
-        }
-        pos += scil;
-
-        // Token
-        let (token_len, varint_len) = read_varint(&remaining[pos..])?;
-        pos += varint_len;
-        if pos + (token_len as usize) > remaining.len() {
-            break;
-        }
-        pos += token_len as usize;
-
-        // Payload Length (Packet Number + AEAD payload + Tag)
-        let (payload_len, varint_len) = read_varint(&remaining[pos..])?;
-        pos += varint_len;
-        let pn_offset = pos;
-        let total_len = pn_offset + (payload_len as usize);
-
-        if remaining.len() < total_len || pn_offset + 4 + 16 > total_len {
-            break;
-        }
-
-        // Derive Initial Secrets
-        let initial_secret = hkdf_extract(salt, dcid);
-        let (client_label, key_label, iv_label, hp_label) = if is_v2 {
-            (
-                b"quicv2 client in".as_slice(),
-                b"quicv2 key".as_slice(),
-                b"quicv2 iv".as_slice(),
-                b"quicv2 hp".as_slice(),
-            )
-        } else {
-            (
-                b"client in".as_slice(),
-                b"quic key".as_slice(),
-                b"quic iv".as_slice(),
-                b"quic hp".as_slice(),
-            )
-        };
-
-        let client_initial_secret =
-            hkdf_expand_label(&initial_secret, client_label, &[], 32);
-        let key = hkdf_expand_label(&client_initial_secret, key_label, &[], 16);
-        let iv = hkdf_expand_label(&client_initial_secret, iv_label, &[], 12);
-        let hp_key = hkdf_expand_label(&client_initial_secret, hp_label, &[], 16);
-
-        // Header Protection Removal
-        let sample_offset = pn_offset + 4;
-        if sample_offset + 16 > total_len {
-            break;
-        }
-        let sample = &remaining[sample_offset..sample_offset + 16];
-
-        let cipher = match Aes128::new_from_slice(&hp_key) {
-            Ok(c) => c,
-            Err(_) => break,
-        };
-        let mut mask = [0u8; 16];
-        mask.copy_from_slice(sample);
-        cipher.encrypt_block((&mut mask).into());
-
-        let unmasked_first_byte = first_byte ^ (mask[0] & 0x0f);
-        let pn_len = ((unmasked_first_byte & 0x03) + 1) as usize;
-        if pn_offset + pn_len > total_len {
-            break;
-        }
-
-        let mut pn_bytes = [0u8; 4];
-        for i in 0..pn_len {
-            pn_bytes[i] = remaining[pn_offset + i] ^ mask[1 + i];
-        }
-
-        // Prepare AAD & Nonce
-        let mut aad = remaining[..pn_offset + pn_len].to_vec();
-        aad[0] = unmasked_first_byte;
-        for i in 0..pn_len {
-            aad[pn_offset + i] = pn_bytes[i];
-        }
-
-        let mut nonce_bytes = [0u8; 12];
-        nonce_bytes.copy_from_slice(&iv);
-        for i in 0..pn_len {
-            nonce_bytes[12 - pn_len + i] ^= pn_bytes[i];
-        }
-
-        // Decrypt AES-128-GCM payload
-        let ciphertext = &remaining[pn_offset + pn_len..total_len];
-        let gcm = match Aes128Gcm::new_from_slice(&key) {
-            Ok(g) => g,
-            Err(_) => break,
-        };
-        let nonce =
-            match aes_gcm::aead::Nonce::<Aes128Gcm>::try_from(&nonce_bytes[..]) {
-                Ok(n) => n,
-                Err(_) => break,
-            };
-
-        if let Ok(plaintext) = gcm.decrypt(
-            &nonce,
-            Payload {
-                msg: ciphertext,
-                aad: &aad,
-            },
-        ) {
-            collect_crypto_frames(&plaintext, &mut fragments);
-        }
-
-        offset += total_len;
-    }
-
-    if fragments.is_empty() {
-        None
-    } else {
-        Some(fragments)
-    }
-}
-
-/// Collect CRYPTO frames from decrypted QUIC payload.
-fn collect_crypto_frames(data: &[u8], out: &mut Vec<(u64, Vec<u8>)>) {
-    let mut pos = 0;
-    while pos < data.len() {
-        let Some((frame_type, varint_len)) = read_varint(&data[pos..]) else {
-            break;
-        };
-        pos += varint_len;
-
-        match frame_type {
-            0x00 => {
-                // PADDING
-                while pos < data.len() && data[pos] == 0 {
-                    pos += 1;
-                }
-            }
-            0x01 => {
-                // PING
-            }
-            0x02 | 0x03 => {
-                // ACK frame
-                let Some((_, l1)) = read_varint(&data[pos..]) else {
-                    break;
-                };
-                pos += l1;
-                let Some((_, l2)) = read_varint(&data[pos..]) else {
-                    break;
-                };
-                pos += l2;
-                let Some((range_count, l3)) = read_varint(&data[pos..]) else {
-                    break;
-                };
-                pos += l3;
-                let Some((_, l4)) = read_varint(&data[pos..]) else {
-                    break;
-                };
-                pos += l4;
-                for _ in 0..range_count {
-                    let Some((_, l5)) = read_varint(&data[pos..]) else {
-                        return;
-                    };
-                    pos += l5;
-                    let Some((_, l6)) = read_varint(&data[pos..]) else {
-                        return;
-                    };
-                    pos += l6;
-                }
-                if frame_type == 0x03 {
-                    // ECN
-                    for _ in 0..3 {
-                        let Some((_, l)) = read_varint(&data[pos..]) else {
-                            return;
-                        };
-                        pos += l;
-                    }
-                }
-            }
-            0x06 => {
-                // CRYPTO frame: offset (varint), length (varint), data
-                let Some((offset, var_len1)) = read_varint(&data[pos..]) else {
-                    break;
-                };
-                pos += var_len1;
-                let Some((crypto_len, var_len2)) = read_varint(&data[pos..]) else {
-                    break;
-                };
-                pos += var_len2;
-
-                let crypto_len = crypto_len as usize;
-                if pos + crypto_len > data.len() {
-                    break;
-                }
-
-                let crypto_data = &data[pos..pos + crypto_len];
-                out.push((offset, crypto_data.to_vec()));
-                pos += crypto_len;
-            }
-            0x1c | 0x1d => {
-                // CONNECTION_CLOSE
-                let Some((_, l1)) = read_varint(&data[pos..]) else {
-                    break;
-                };
-                pos += l1;
-                if frame_type == 0x1c {
-                    let Some((_, l2)) = read_varint(&data[pos..]) else {
-                        break;
-                    };
-                    pos += l2;
-                }
-                let Some((reason_len, l3)) = read_varint(&data[pos..]) else {
-                    break;
-                };
-                pos += l3 + (reason_len as usize);
-            }
-            _ => {
-                // Unknown frame in Initial packet
-                break;
-            }
-        }
-    }
-}
-
-/// Extract TLS SNI from a single QUIC datagram.
-pub fn parse_quic_sni(data: &[u8]) -> Option<String> {
-    let fragments = decrypt_initial_datagram(data)?;
-    let mut reassembly = CryptoReassembly::new();
-    for (offset, chunk) in fragments {
-        reassembly.insert(offset, &chunk);
-    }
-    parse_client_hello_handshake(reassembly.assembled())
-}
+pub use reassembly::CryptoReassembly;
+pub use decrypt::parse_quic_sni;
+use decrypt::decrypt_initial_datagram;
+use keys::{InitialId, InitialKeys};
 
 /// Outcome of feeding one datagram to the QUIC sniffer.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -451,6 +95,8 @@ struct SnifferSession {
     packets_seen: u32,
     error_count: u32,
     crypto: CryptoReassembly,
+    identity: Option<InitialId>,
+    keys: Option<InitialKeys>,
     done: bool,
     expires_at: std::time::Instant,
 }
@@ -462,9 +108,17 @@ impl SnifferSession {
             packets_seen: 0,
             error_count: 0,
             crypto: CryptoReassembly::new(),
+            identity: None,
+            keys: None,
             done: false,
             expires_at: std::time::Instant::now() + SNIFFER_TTL,
         }
+    }
+
+    fn finish(&mut self) {
+        self.done = true;
+        self.crypto = CryptoReassembly::new();
+        self.keys = None;
     }
 
     fn is_expired(&self, now: std::time::Instant) -> bool {
@@ -474,10 +128,12 @@ impl SnifferSession {
 
 /// Pool of packet sniffers with DCID negative caching and multi-packet ClientHello reassembly.
 pub struct PacketSnifferPool {
-    sessions: DashMap<UdpFlowKey, SnifferSession>,
+    sessions: DashMap<UdpFlowKey, Arc<Mutex<SnifferSession>>>,
     failed_dcids: DashMap<UdpFlowKey, Instant>,
     sessions_eviction_lock: Mutex<()>,
     failed_dcids_eviction_lock: Mutex<()>,
+    cleanup_epoch: Instant,
+    next_cleanup_ms: AtomicU64,
 }
 
 impl Default for PacketSnifferPool {
@@ -493,6 +149,8 @@ impl PacketSnifferPool {
             failed_dcids: DashMap::new(),
             sessions_eviction_lock: Mutex::new(()),
             failed_dcids_eviction_lock: Mutex::new(()),
+            cleanup_epoch: Instant::now(),
+            next_cleanup_ms: AtomicU64::new(SNIFFER_TTL.as_millis() as u64),
         }
     }
 
@@ -553,6 +211,29 @@ impl PacketSnifferPool {
         self.failed_dcids.insert(key, now + ttl);
     }
 
+    fn claim_cleanup(&self, now: Instant) -> bool {
+        let elapsed = now.saturating_duration_since(self.cleanup_epoch)
+            .as_millis().try_into().unwrap_or(u64::MAX);
+        // This atomic only schedules scans. The maps and flow locks protect data,
+        // so publishing the next deadline needs no acquire/release ordering.
+        let next = self.next_cleanup_ms.load(Ordering::Relaxed);
+        elapsed >= next && self.next_cleanup_ms.compare_exchange(
+            next,
+            elapsed.saturating_add(SNIFFER_TTL.as_millis() as u64),
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ).is_ok()
+    }
+
+    fn prune_expired(&self, now: Instant) {
+        if !self.claim_cleanup(now) { return; }
+        self.sessions.retain(|_, session| {
+            // Busy flows are retained for the next cleanup pass.
+            session.try_lock().is_none_or(|s| !s.is_expired(now))
+        });
+        self.failed_dcids.retain(|_, expires_at| now < *expires_at);
+    }
+
     /// Feed a UDP datagram to the QUIC sniffer for the flow.
     pub fn feed_quic_datagram(
         &self,
@@ -563,22 +244,29 @@ impl PacketSnifferPool {
         let key = UdpFlowKey { src, dst };
         let now = Instant::now();
 
+        self.prune_expired(now);
+        let identity = InitialId::from_packet(data);
         if self.is_dcid_failed(&key, now) {
-            return QuicSniffOutcome::NotQuic;
+            let existing = self.sessions.get(&key)
+                .map(|entry| Arc::clone(entry.value()));
+            let changed = existing.is_some_and(|entry| {
+                identity.is_some() && entry.lock().identity != identity
+            });
+            if !changed { return QuicSniffOutcome::NotQuic; }
+            self.failed_dcids.remove(&key);
         }
 
-        // Decrypt fragments from datagram
-        let fragments = decrypt_initial_datagram(data);
-
-        let mut session = if let Some(s) = self.sessions.get_mut(&key) {
-            s
+        let session = if let Some(s) = self.sessions.get(&key) {
+            Arc::clone(s.value())
         } else {
             let _guard = self.sessions_eviction_lock.lock();
-            let s = if let Some(s) = self.sessions.get_mut(&key) {
-                s
+            let s = if let Some(s) = self.sessions.get(&key) {
+                Arc::clone(s.value())
             } else {
                 if self.sessions.len() >= MAX_SESSIONS {
-                    self.sessions.retain(|_, s| !s.is_expired(now));
+                    self.sessions.retain(|_, s| {
+                        s.try_lock().is_none_or(|s| !s.is_expired(now))
+                    });
                     if self.sessions.len() >= MAX_SESSIONS {
                         let to_evict =
                             (self.sessions.len() + 1).saturating_sub(TARGET_SESSIONS);
@@ -593,17 +281,25 @@ impl PacketSnifferPool {
                         });
                     }
                 }
-                self.sessions.entry(key).or_insert_with(SnifferSession::new)
+                let entry = self.sessions.entry(key).or_insert_with(|| {
+                    Arc::new(Mutex::new(SnifferSession::new()))
+                });
+                Arc::clone(entry.value())
             };
             drop(_guard);
             s
         };
 
-        if session.is_expired(now) {
+        // Crypto work holds only the flow lock, never a DashMap shard lock.
+        let mut session = session.lock();
+        if session.is_expired(now)
+            || identity.is_some() && session.identity != identity
+        {
             *session = SnifferSession::new();
+            session.identity = identity;
         }
 
-        if session.done {
+        if session.done && session.identity == identity {
             return session
                 .domain
                 .clone()
@@ -613,33 +309,27 @@ impl PacketSnifferPool {
 
         session.packets_seen += 1;
         if session.packets_seen > MAX_INITIAL_SNIFF_PACKETS {
+            session.finish();
             drop(session);
             self.mark_dcid_failed(key, now, FAILED_DCID_TTL);
             return QuicSniffOutcome::NotQuic;
         }
 
-        let fragments = match fragments {
-            Some(f) => f,
-            None => {
-                session.error_count += 1;
-                let failed = session.error_count >= NO_SNI_THRESHOLD;
-                if failed {
-                    session.done = true;
-                }
-                drop(session);
-                if failed {
-                    self.mark_dcid_failed(key, now, FAILED_DCID_TTL);
-                }
-                return QuicSniffOutcome::NotQuic;
-            }
-        };
-
-        for (offset, chunk) in fragments {
-            session.crypto.insert(offset, &chunk);
+        let SnifferSession { crypto, keys, .. } = &mut *session;
+        let decrypted = decrypt_initial_datagram(data, keys, |offset, chunk| {
+            crypto.insert(offset, chunk);
+        });
+        if !decrypted {
+            session.error_count += 1;
+            let failed = session.error_count >= NO_SNI_THRESHOLD;
+            if failed { session.finish(); }
+            drop(session);
+            if failed { self.mark_dcid_failed(key, now, FAILED_DCID_TTL); }
+            return QuicSniffOutcome::NotQuic;
         }
 
         if session.crypto.is_overflowed() {
-            session.done = true;
+            session.finish();
             drop(session);
             self.mark_dcid_failed(key, now, FAILED_DCID_TTL);
             return QuicSniffOutcome::CompleteNoDomain;
@@ -648,12 +338,17 @@ impl PacketSnifferPool {
         let assembled = session.crypto.assembled();
         if let Some(domain) = parse_client_hello_handshake(assembled) {
             session.domain = Some(domain.clone());
-            session.done = true;
+            session.finish();
             return QuicSniffOutcome::Domain(domain);
         }
 
+        // Out-of-order CRYPTO frames or a split handshake header need more data.
+        if assembled.len() < 4 {
+            return QuicSniffOutcome::Incomplete;
+        }
+
         // If we have received the ClientHello header, check if we need more bytes
-        if assembled.len() >= 4 && assembled[0] == 0x01 {
+        if assembled[0] == 0x01 {
             let handshake_len = ((assembled[1] as usize) << 16)
                 | ((assembled[2] as usize) << 8)
                 | (assembled[3] as usize);
@@ -664,100 +359,212 @@ impl PacketSnifferPool {
         }
 
         // Handshake body was complete or invalid, but no SNI was found
-        session.done = true;
+        session.finish();
         drop(session);
         self.mark_dcid_failed(key, now, Duration::from_secs(10));
         QuicSniffOutcome::CompleteNoDomain
     }
 }
 
-fn read_varint(data: &[u8]) -> Option<(u64, usize)> {
-    if data.is_empty() {
-        return None;
-    }
-    let first = data[0];
-    let prefix = (first & 0xc0) >> 6;
-    match prefix {
-        0 => Some((first as u64, 1)),
-        1 => {
-            if data.len() < 2 {
-                return None;
-            }
-            let val = (((first & 0x3f) as u64) << 8) | (data[1] as u64);
-            Some((val, 2))
-        }
-        2 => {
-            if data.len() < 4 {
-                return None;
-            }
-            let val = (((first & 0x3f) as u64) << 24)
-                | ((data[1] as u64) << 16)
-                | ((data[2] as u64) << 8)
-                | (data[3] as u64);
-            Some((val, 4))
-        }
-        3 => {
-            if data.len() < 8 {
-                return None;
-            }
-            let val = (((first & 0x3f) as u64) << 56)
-                | ((data[1] as u64) << 48)
-                | ((data[2] as u64) << 40)
-                | ((data[3] as u64) << 32)
-                | ((data[4] as u64) << 24)
-                | ((data[5] as u64) << 16)
-                | ((data[6] as u64) << 8)
-                | (data[7] as u64);
-            Some((val, 8))
-        }
-        _ => unreachable!(),
-    }
-}
-
-fn hkdf_extract(salt: &[u8], ikm: &[u8]) -> [u8; 32] {
-    let mut mac = Hmac::<Sha256>::new_from_slice(salt).expect("HMAC salt");
-    mac.update(ikm);
-    mac.finalize().into_bytes().into()
-}
-
-fn hkdf_expand(prk: &[u8], info: &[u8], okm_len: usize) -> Vec<u8> {
-    let mut okm = Vec::with_capacity(okm_len);
-    let mut t = Vec::new();
-    let mut counter = 1u8;
-    while okm.len() < okm_len {
-        let mut mac = Hmac::<Sha256>::new_from_slice(prk).expect("HMAC prk");
-        if !t.is_empty() {
-            mac.update(&t);
-        }
-        mac.update(info);
-        mac.update(&[counter]);
-        t = mac.finalize().into_bytes().to_vec();
-        let take = std::cmp::min(t.len(), okm_len - okm.len());
-        okm.extend_from_slice(&t[..take]);
-        counter += 1;
-    }
-    okm
-}
-
-fn hkdf_expand_label(
-    secret: &[u8],
-    label: &[u8],
-    context: &[u8],
-    length: usize,
-) -> Vec<u8> {
-    let mut info = Vec::new();
-    info.extend_from_slice(&(length as u16).to_be_bytes());
-    let full_label = [b"tls13 ", label].concat();
-    info.push(full_label.len() as u8);
-    info.extend_from_slice(&full_label);
-    info.push(context.len() as u8);
-    info.extend_from_slice(context);
-    hkdf_expand(secret, &info, length)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use aes::Aes128;
+    use aes::cipher::{BlockCipherEncrypt, KeyInit};
+    use aes_gcm::{Aes128Gcm, aead::{Aead, Nonce, Payload}};
+    use super::decrypt::read_varint;
+
+    use crate::app::sniffer::tests::build_tls_client_hello;
+
+    // Encrypt with the independently published RFC 9369 Appendix A.1 keys.
+    // This exercises v2 decryption without deriving the test keys with production code.
+    fn v2_initial(offset: u16, crypto: &[u8]) -> Vec<u8> {
+        let key = [
+            0x8b, 0x1a, 0x0b, 0xc1, 0x21, 0x28, 0x42, 0x90,
+            0xa2, 0x9e, 0x09, 0x71, 0xb5, 0xcd, 0x04, 0x5d,
+        ];
+        let iv = [
+            0x91, 0xf7, 0x3e, 0x23, 0x51, 0xd8,
+            0xfa, 0x91, 0x66, 0x0e, 0x90, 0x9f,
+        ];
+        let hp_key = [
+            0x45, 0xb9, 0x5e, 0x15, 0x23, 0x5d, 0x6f, 0x45,
+            0xa6, 0xb1, 0x9c, 0xbc, 0xb0, 0x29, 0x4b, 0xa9,
+        ];
+        let mut plaintext = vec![0x06];
+        plaintext.extend_from_slice(&(offset | 0x4000).to_be_bytes());
+        plaintext.extend_from_slice(&((crypto.len() as u16) | 0x4000).to_be_bytes());
+        plaintext.extend_from_slice(crypto);
+        plaintext.resize(1162, 0);
+
+        // DCID and packet number match the RFC keys and nonce.
+        let mut packet = vec![
+            0xd3, 0x6b, 0x33, 0x43, 0xcf, 0x08,
+            0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08,
+            0x00, 0x00, 0x44, 0x9e, 0x00, 0x00, 0x00, 0x02,
+        ];
+        let mut nonce = iv;
+        nonce[11] ^= 2;
+        let gcm = Aes128Gcm::new_from_slice(&key).unwrap();
+        let nonce = Nonce::<Aes128Gcm>::try_from(&nonce[..]).unwrap();
+        let ciphertext = gcm.encrypt(
+            &nonce, Payload { msg: &plaintext, aad: &packet },
+        ).unwrap();
+        packet.extend_from_slice(&ciphertext);
+        let mut mask = [0; 16];
+        mask.copy_from_slice(&packet[22..38]);
+        let cipher = Aes128::new_from_slice(&hp_key).unwrap();
+        cipher.encrypt_block((&mut mask).into());
+        packet[0] ^= mask[0] & 0x0f;
+        for i in 0..4 {
+            packet[18 + i] ^= mask[1 + i];
+        }
+        packet
+    }
+
+    #[test]
+    fn test_v2_initial_with_rfc9369_keys() {
+        let hello = build_tls_client_hello("example.com");
+        let packet = v2_initial(0, &hello[5..]);
+        assert_eq!(parse_quic_sni(&packet), Some("example.com".to_string()));
+    }
+
+    #[test]
+    fn test_quic_pool_incomplete_handshake_header() {
+        let hello = build_tls_client_hello("example.com");
+        let hello = &hello[5..];
+        let src = "192.0.2.1:12345".parse().unwrap();
+        let dst = "192.0.2.2:443".parse().unwrap();
+        for split in 1..=3 {
+            for tail_first in [false, true] {
+                let pool = PacketSnifferPool::new();
+                let head = v2_initial(0, &hello[..split]);
+                let tail = v2_initial(split as u16, &hello[split..]);
+                let (first, second) = if tail_first {
+                    (tail, head)
+                } else {
+                    (head, tail)
+                };
+                assert_eq!(
+                    pool.feed_quic_datagram(src, dst, &first),
+                    QuicSniffOutcome::Incomplete,
+                );
+                assert!(!pool.is_dcid_failed(
+                    &UdpFlowKey { src, dst }, Instant::now(),
+                ));
+                assert_eq!(
+                    pool.feed_quic_datagram(src, dst, &second),
+                    QuicSniffOutcome::Domain("example.com".to_string()),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_crypto_reassembly_shorter_retransmission() {
+        let mut reassembly = CryptoReassembly::new();
+        reassembly.insert(4, b"efghijkl");
+        reassembly.insert(4, b"efgh");
+        reassembly.insert(0, b"abcd");
+        assert_eq!(reassembly.assembled(), b"abcdefghijkl");
+
+        // A longer retransmission must still extend the buffered fragment.
+        let mut reassembly = CryptoReassembly::new();
+        reassembly.insert(4, b"efgh");
+        reassembly.insert(4, b"efghijkl");
+        reassembly.insert(0, b"abcd");
+        assert_eq!(reassembly.assembled(), b"abcdefghijkl");
+    }
+
+    #[test]
+    fn terminal_flow_releases_crypto_and_checks_connection_identity() {
+        let pool = PacketSnifferPool::new();
+        let src = "192.0.2.1:12345".parse().unwrap();
+        let dst = "192.0.2.2:443".parse().unwrap();
+        let key = UdpFlowKey { src, dst };
+        let hello = build_tls_client_hello("example.com");
+        let packet = v2_initial(0, &hello[5..]);
+        let expected = QuicSniffOutcome::Domain("example.com".to_string());
+        assert_eq!(pool.feed_quic_datagram(src, dst, &packet), expected);
+        {
+            let entry = pool.sessions.get(&key).unwrap();
+            let session = entry.lock();
+            assert!(session.done);
+            assert!(session.crypto.assembled().is_empty());
+            assert!(session.keys.is_none());
+        }
+        // A terminal flow can reuse its result without decrypting the payload.
+        let mut corrupt = packet.clone();
+        *corrupt.last_mut().unwrap() ^= 1;
+        assert_eq!(pool.feed_quic_datagram(src, dst, &corrupt), expected);
+        corrupt[6] ^= 1;
+        assert_eq!(pool.feed_quic_datagram(src, dst, &corrupt), QuicSniffOutcome::NotQuic);
+        {
+            let entry = pool.sessions.get(&key).unwrap();
+            let session = entry.lock();
+            assert!(!session.done);
+            assert!(session.domain.is_none());
+        }
+        assert_eq!(pool.feed_quic_datagram(src, dst, &packet), expected);
+    }
+
+    #[test]
+    fn incomplete_flow_reuses_keys_and_prunes_expired_state() {
+        let pool = PacketSnifferPool::new();
+        let src = "192.0.2.1:12345".parse().unwrap();
+        let dst = "192.0.2.2:443".parse().unwrap();
+        let key = UdpFlowKey { src, dst };
+        let hello = build_tls_client_hello("example.com");
+        let head = v2_initial(0, &hello[5..7]);
+        assert_eq!(pool.feed_quic_datagram(src, dst, &head), QuicSniffOutcome::Incomplete);
+        {
+            let entry = pool.sessions.get(&key).unwrap();
+            let session = entry.lock();
+            assert!(session.keys.is_some());
+            assert_eq!(session.crypto.assembled(), &hello[5..7]);
+        }
+        let tail = v2_initial(2, &hello[7..]);
+        assert_eq!(pool.feed_quic_datagram(src, dst, &tail),
+            QuicSniffOutcome::Domain("example.com".to_string()));
+        let now = Instant::now() + SNIFFER_TTL + Duration::from_secs(1);
+        pool.mark_dcid_failed(key, Instant::now(), FAILED_DCID_TTL);
+        pool.prune_expired(now);
+        assert!(pool.sessions.is_empty());
+        assert!(pool.failed_dcids.is_empty());
+    }
+
+    #[test]
+    fn cleanup_deadline_preserves_scan_interval() {
+        let pool = PacketSnifferPool::new();
+        let start = pool.cleanup_epoch;
+        assert!(!pool.claim_cleanup(start + SNIFFER_TTL - Duration::from_millis(1)));
+        assert!(pool.claim_cleanup(start + SNIFFER_TTL));
+        assert!(!pool.claim_cleanup(start + SNIFFER_TTL));
+        assert!(!pool.claim_cleanup(start + SNIFFER_TTL * 2 - Duration::from_millis(1)));
+        assert!(pool.claim_cleanup(start + SNIFFER_TTL * 2));
+    }
+
+    #[test]
+    fn concurrent_cleanup_claims_have_one_winner() {
+        use std::{sync::Barrier, thread};
+
+        let pool = Arc::new(PacketSnifferPool::new());
+        let barrier = Arc::new(Barrier::new(8));
+        let now = pool.cleanup_epoch + SNIFFER_TTL;
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let pool = Arc::clone(&pool);
+            let barrier = Arc::clone(&barrier);
+            handles.push(thread::spawn(move || {
+                barrier.wait();
+                usize::from(pool.claim_cleanup(now))
+            }));
+        }
+        let winners: usize = handles.into_iter()
+            .map(|handle| handle.join().unwrap()).sum();
+        assert_eq!(winners, 1);
+    }
 
     #[test]
     fn test_varint_parsing() {

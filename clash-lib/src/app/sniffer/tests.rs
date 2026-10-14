@@ -213,7 +213,7 @@ fn test_domain_matcher() {
     assert!(!sniffer.is_domain_skipped("google.com"));
 
     assert!(
-        sniffer.matches_domain_list("www.google.com", &sniffer.config.force_domains)
+        sniffer.should_force_sniff(&"www.google.com:443".parse().unwrap())
     );
 }
 
@@ -632,4 +632,91 @@ async fn exhausted_read_budget_does_not_starve_deadline() {
         assert!(read_until_deadline(&mut reader, &mut byte, timer.as_mut()).await.is_none());
         assert_eq!(reader.polls, 1);
     }).await.unwrap();
+}
+
+#[tokio::test]
+async fn skipped_domains_do_not_suppress_other_hosts_on_same_target() {
+    let sniffer = Sniffer::new(SnifferConfig {
+        enable: true,
+        skip_domains: vec!["skip.example".to_string()],
+        ..Default::default()
+    });
+    for port in [80, 443] {
+        let target = SocketAddr::from(([192, 0, 2, 1], port));
+        let sess = Session {
+            destination: target.into(),
+            ..Default::default()
+        };
+        // An identified but skipped host should also clear earlier failures.
+        sniffer.tcp_neg_cache.note_failure(target, Instant::now());
+        for host in [
+            "skip.example", "skip.example", "skip.example", "other.example",
+        ] {
+            let sample = if port == 443 {
+                build_tls_client_hello(host)
+            } else {
+                format!("GET / HTTP/1.1\r\nHost: {host}\r\n\r\n").into_bytes()
+            };
+            let (client, mut server) = tokio::io::duplex(1024);
+            server.write_all(&sample).await.unwrap();
+            let (domain, mut stream, _) =
+                sniffer.sniff_stream(&sess, client.into()).await;
+            let expected = (host == "other.example").then(|| host.to_string());
+            assert_eq!(domain, expected);
+            assert!(sniffer.tcp_neg_cache.is_empty());
+            let mut forwarded = vec![0; sample.len()];
+            stream.read_exact(&mut forwarded).await.unwrap();
+            assert_eq!(forwarded, sample);
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn unsupported_prefixes_do_not_wait_for_sniff_timeout() {
+    for (tls, http, sample) in [
+        (true, true, b"SSH-2.0-example".as_slice()),
+        (true, false, b"GET / HTTP/1.1\r\n".as_slice()),
+        (false, true, b"\x16\x03\x01\x00\x10".as_slice()),
+    ] {
+        let protocol = SniffProtocolConfig::default();
+        let sniffer = Sniffer::new(SnifferConfig {
+            enable: true,
+            tls: tls.then_some(protocol.clone()),
+            http: http.then_some(protocol),
+            quic: None,
+            ..Default::default()
+        });
+        let sess = Session {
+            destination: "192.0.2.10:443".parse().unwrap(),
+            ..Default::default()
+        };
+        let (client, mut server) = tokio::io::duplex(128);
+        server.write_all(sample).await.unwrap();
+        let start = tokio::time::Instant::now();
+        let (domain, mut stream, _) = sniffer.sniff_stream(&sess, client.into()).await;
+        assert!(domain.is_none());
+        assert_eq!(tokio::time::Instant::now(), start);
+        let mut forwarded = vec![0; sample.len()];
+        stream.read_exact(&mut forwarded).await.unwrap();
+        assert_eq!(forwarded, sample);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn lf_terminated_http_headers_do_not_wait_for_sniff_timeout() {
+    let sniffer = Sniffer::new(SnifferConfig { enable: true, ..Default::default() });
+    let sess = Session {
+        destination: "192.0.2.10:80".parse().unwrap(),
+        ..Default::default()
+    };
+    let sample = b"GET / HTTP/1.1\nHost: example.com\n\n";
+    let (client, mut server) = tokio::io::duplex(128);
+    server.write_all(sample).await.unwrap();
+    let start = tokio::time::Instant::now();
+    let (domain, mut stream, _) = sniffer.sniff_stream(&sess, client.into()).await;
+    assert_eq!(domain.as_deref(), Some("example.com"));
+    assert_eq!(tokio::time::Instant::now(), start);
+    let mut forwarded = vec![0; sample.len()];
+    stream.read_exact(&mut forwarded).await.unwrap();
+    assert_eq!(forwarded, sample);
 }

@@ -1,3 +1,5 @@
+mod domain_matcher;
+mod prefetch;
 pub mod http;
 pub mod quic;
 pub mod stream;
@@ -17,6 +19,10 @@ use crate::proxy::AnyStream;
 use crate::session::{Session, SocksAddr};
 
 pub use stream::PrefixedStream;
+
+use domain_matcher::DomainMatcher;
+use prefetch::Prefetch;
+pub(crate) use domain_matcher::validate_domain_patterns;
 
 // Reuse one timer across prefetch reads, retaining Timeout's read-first and
 // cooperative-budget behavior without allocating a pinned timer on the heap.
@@ -233,6 +239,8 @@ pub enum SniffUdpOutcome {
 
 pub struct Sniffer {
     pub config: SnifferConfig,
+    skip_domains: DomainMatcher,
+    force_domains: DomainMatcher,
     pub tcp_neg_cache: TcpSniffNegCache,
     pub quic_pool: quic::PacketSnifferPool,
 }
@@ -242,6 +250,8 @@ pub type ArcSniffer = Arc<Sniffer>;
 impl Sniffer {
     pub fn new(config: SnifferConfig) -> Self {
         Self {
+            skip_domains: DomainMatcher::new(&config.skip_domains),
+            force_domains: DomainMatcher::new(&config.force_domains),
             config,
             tcp_neg_cache: TcpSniffNegCache::new(),
             quic_pool: quic::PacketSnifferPool::new(),
@@ -262,46 +272,14 @@ impl Sniffer {
 
     pub fn should_force_sniff(&self, dest: &SocksAddr) -> bool {
         if let Some(domain) = dest.domain() {
-            self.matches_domain_list(domain, &self.config.force_domains)
+            self.force_domains.matches(domain)
         } else {
             false
         }
     }
 
     pub fn is_domain_skipped(&self, domain: &str) -> bool {
-        self.matches_domain_list(domain, &self.config.skip_domains)
-    }
-
-    fn matches_domain_list(&self, domain: &str, list: &[String]) -> bool {
-        let domain_lower = domain.to_ascii_lowercase();
-        for pattern in list {
-            let pattern_lower = pattern.to_ascii_lowercase();
-            let p = pattern_lower.as_str();
-
-            if p.starts_with("+.") {
-                let suffix = &p[2..];
-                if domain_lower == suffix
-                    || domain_lower.ends_with(&format!(".{suffix}"))
-                {
-                    return true;
-                }
-            } else if p.starts_with('.') {
-                let suffix = &p[1..];
-                if domain_lower == suffix
-                    || domain_lower.ends_with(&format!(".{suffix}"))
-                {
-                    return true;
-                }
-            } else if p.starts_with('*') && p.ends_with('*') && p.len() > 2 {
-                let keyword = &p[1..p.len() - 1];
-                if domain_lower.contains(keyword) {
-                    return true;
-                }
-            } else if domain_lower == p || domain_lower.ends_with(&format!(".{p}")) {
-                return true;
-            }
-        }
-        false
+        self.skip_domains.matches(domain)
     }
 
     /// Sniff a TCP client stream.
@@ -370,8 +348,9 @@ impl Sniffer {
             let timer = tokio::time::sleep_until(deadline);
             tokio::pin!(timer);
 
+            let mut prefetch = Prefetch::new(tls_enabled, http_enabled);
             loop {
-                let required = sniff_required_len(buf.as_slice());
+                let required = prefetch.required_len(buf.as_slice());
                 if required <= buf.len() || buf.len() >= MAX_SNIFF_BUFFER_SIZE {
                     break;
                 }
@@ -393,9 +372,11 @@ impl Sniffer {
                 }
             }
 
+            let mut recognized = false;
             // 1. Try TLS SNI
             if tls_enabled {
                 if let Some(domain) = tls::parse_tls_sni(buf.as_slice()) {
+                    recognized = true;
                     if !self.is_domain_skipped(&domain) {
                         debug!("sniffed TLS SNI domain `{}` for {}", domain, sess);
                         if let Some(addr) = ip_target {
@@ -416,6 +397,7 @@ impl Sniffer {
             // 2. Try HTTP Host
             if http_enabled {
                 if let Some(domain) = http::parse_http_host(buf.as_slice()) {
+                    recognized = true;
                     if !self.is_domain_skipped(&domain) {
                         debug!("sniffed HTTP Host domain `{}` for {}", domain, sess);
                         if let Some(addr) = ip_target {
@@ -433,9 +415,13 @@ impl Sniffer {
                 }
             }
 
-            // Sniffing yielded no usable domain: record failure in negative cache if target is an IP
+            // A skipped domain still proves that this target supports sniffing.
             if let Some(addr) = ip_target {
-                self.tcp_neg_cache.note_failure(addr, now);
+                if recognized {
+                    self.tcp_neg_cache.note_success(&addr);
+                } else {
+                    self.tcp_neg_cache.note_failure(addr, now);
+                }
             }
 
             if buf.is_empty() {
@@ -529,143 +515,6 @@ impl Sniffer {
 
         None
     }
-}
-
-/// Calculate the prefix length needed to make a bounded sniffing decision.
-fn sniff_required_len(data: &[u8]) -> usize {
-    if data.is_empty() {
-        return 1;
-    }
-    if data[0] == 0x16 {
-        // TLS Record
-        if data.len() < 5 {
-            return 5;
-        }
-
-        // Phase 1: We need at least the 4-byte Handshake header ([msg_type, len, len, len]).
-        // The Handshake header may be split across multiple TLS records (e.g. first record has 1..3 bytes).
-        let mut header = [0u8; 4];
-        let mut header_bytes_read = 0;
-        let mut offset = 0;
-
-        while header_bytes_read < 4 {
-            if offset + 5 > data.len() {
-                // Not enough bytes in buffer to read this record's 5-byte header.
-                // We need at least this record's header plus whatever handshake header bytes remain.
-                let needed = 4 - header_bytes_read;
-                return offset
-                    .saturating_add(5)
-                    .saturating_add(needed)
-                    .min(MAX_SNIFF_BUFFER_SIZE);
-            }
-            if data[offset] != 0x16 || data[offset + 1] != 0x03 {
-                // Not a TLS handshake record continuation
-                return offset.max(5).min(MAX_SNIFF_BUFFER_SIZE);
-            }
-            let r_len =
-                u16::from_be_bytes([data[offset + 3], data[offset + 4]]) as usize;
-            let needed = 4 - header_bytes_read;
-
-            let payload_available = if data.len() >= offset + 5 {
-                (data.len() - (offset + 5)).min(r_len)
-            } else {
-                0
-            };
-
-            let take = payload_available.min(needed);
-            for i in 0..take {
-                header[header_bytes_read + i] = data[offset + 5 + i];
-            }
-            header_bytes_read += take;
-
-            if header_bytes_read < 4 {
-                if r_len > payload_available {
-                    // This record has more payload to provide
-                    let remaining_in_this_record =
-                        (r_len - payload_available).min(4 - header_bytes_read);
-                    return (data.len() + remaining_in_this_record)
-                        .min(MAX_SNIFF_BUFFER_SIZE);
-                }
-                // Advance to the next record
-                offset += 5 + r_len;
-            }
-        }
-
-        // Handshake Type: 0x01 is ClientHello
-        if header[0] != 0x01 {
-            let first_record_len =
-                u16::from_be_bytes([data[3], data[4]]) as usize;
-            return (5 + first_record_len).min(MAX_SNIFF_BUFFER_SIZE);
-        }
-
-        let hello_len = ((header[1] as usize) << 16)
-            | ((header[2] as usize) << 8)
-            | (header[3] as usize);
-        let total_hello_len = 4 + hello_len;
-
-        // Phase 2: Traverse records to calculate total wire bytes needed for ClientHello
-        let mut remaining_hello = total_hello_len;
-        let mut offset = 0;
-        while remaining_hello > 0 && offset < MAX_SNIFF_BUFFER_SIZE {
-            if offset + 5 > data.len() {
-                // Next record header not fully read yet.
-                // We need at least the 5-byte header plus remaining handshake bytes.
-                offset =
-                    offset.saturating_add(5).saturating_add(remaining_hello);
-                break;
-            }
-            if data[offset] != 0x16 || data[offset + 1] != 0x03 {
-                break;
-            }
-            let r_len =
-                u16::from_be_bytes([data[offset + 3], data[offset + 4]]) as usize;
-            if r_len >= remaining_hello {
-                offset += 5 + remaining_hello;
-                break;
-            } else {
-                remaining_hello -= r_len;
-                offset += 5 + r_len;
-            }
-        }
-        return offset.min(MAX_SNIFF_BUFFER_SIZE);
-    }
-    if is_http_request_prefix(data) {
-        return if data.windows(4).any(|w| w == b"\r\n\r\n") {
-            data.len()
-        } else {
-            MAX_SNIFF_BUFFER_SIZE
-        };
-    }
-    // If the data starts with standard ASCII characters, allow reading up to MAX_SNIFF_BUFFER_SIZE
-    if data.iter().all(|b| {
-        b.is_ascii_graphic()
-            || *b == b'\r'
-            || *b == b'\n'
-            || *b == b'\t'
-            || *b == b' '
-    }) {
-        return MAX_SNIFF_BUFFER_SIZE;
-    }
-    // Unknown non-HTTP/TLS binary protocol: 5 bytes is enough to classify
-    5
-}
-
-fn is_http_request_prefix(data: &[u8]) -> bool {
-    const METHODS: &[&[u8]] = &[
-        b"GET ",
-        b"POST ",
-        b"CONNECT ",
-        b"HEAD ",
-        b"PUT ",
-        b"DELETE ",
-        b"OPTIONS ",
-        b"TRACE ",
-        b"PATCH ",
-        b"PRI * HTTP/2.0",
-    ];
-    METHODS
-        .iter()
-        .any(|m| m.starts_with(data) || data.starts_with(m))
 }
 
 #[cfg(test)]

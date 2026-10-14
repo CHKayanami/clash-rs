@@ -8,6 +8,7 @@ use mockall::automock;
 pub mod collector;
 pub mod config;
 mod domain;
+pub(crate) use domain::normalize_domain;
 pub mod ecs;
 pub mod endpoint;
 mod fakeip;
