@@ -9,7 +9,11 @@ impl Default for RouteChange {
 }
 impl RouteChange {
     pub(crate) fn identity(&self) -> usize { Arc::as_ptr(&self.0) as usize }
-    pub fn notify(&self) { self.0.send_replace(()); }
+    pub fn notify(&self) {
+        // Consumers subscribe before reading current state; changes without
+        // subscribers do not need a retained notification.
+        if self.0.receiver_count() != 0 { self.0.send_replace(()); }
+    }
     #[cfg(test)]
     pub(crate) fn subscribers(&self) -> usize { self.0.receiver_count() }
     pub fn subscribe(&self) -> watch::Receiver<()> { self.0.subscribe() }
