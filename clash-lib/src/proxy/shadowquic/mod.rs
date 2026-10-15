@@ -3,11 +3,13 @@ use crate::proxy::OutboundNode;
 
 use erased_serde::Serialize as ErasedSerialize;
 use std::{collections::HashMap, fmt::Debug, io, net::SocketAddr, str::FromStr};
+use std::sync::Arc;
 
 
 pub(crate) use compat::UdpSessionWrapper;
 use shadowquic::{
     config,
+    dns::ResolverManager,
     msgs::socks5::SocksAddr as SQAddr,
     quic::QuicClient,
     shadowquic::{EndClient, outbound::ShadowQuicClient},
@@ -91,13 +93,13 @@ impl Handler {
                     SocksAddr::Ip(socket_addr) => socket_addr,
                 };
                 let mut cfg = self.opts.clone();
+                cfg.addr = addr.to_string();
                 cfg.socket_opt.fw_mark = sess.so_mark;
                 cfg.socket_opt.bind_interface = sess
                     .iface
                     .as_ref()
                     .map(|iface| config::Interface::Device(iface.name.clone()));
-                let mut ep = ShadowQuicClient::new(cfg);
-                ep.config.addr = addr.to_string();
+                let ep = ShadowQuicClient::new(cfg, Arc::new(ResolverManager::new()));
                 Ok(ep) as io::Result<ShadowQuicClient>
             })
             .await

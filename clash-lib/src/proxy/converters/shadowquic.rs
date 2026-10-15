@@ -1,6 +1,7 @@
 use shadowquic::config::{
     default_alpn, default_blackhole_detection, default_congestion_control,
-    default_gso, default_initial_mtu, default_keep_alive_interval, default_min_mtu,
+    default_gso, default_half_close_timeout, default_initial_mtu,
+    default_keep_alive_interval, default_min_mtu,
     default_mtu_discovery, default_over_stream, default_zero_rtt,
 };
 
@@ -53,6 +54,7 @@ impl TryFrom<&OutboundShadowQuic> for Handler {
                 gso: s.gso.unwrap_or(default_gso()),
                 mtu_discovery: s.mtu_discovery.unwrap_or(default_mtu_discovery()),
                 cipher_suite_preference: None,
+                half_close_timeout: default_half_close_timeout(),
             },
         ))
     }
