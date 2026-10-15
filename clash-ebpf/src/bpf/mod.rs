@@ -21,6 +21,7 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 use std::os::fd::{AsFd, AsRawFd, RawFd};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU8, Ordering};
+use tokio::io::{Interest, unix::AsyncFd};
 use tracing::{debug, error, info, warn};
 
 mod static_bypass;
@@ -665,10 +666,12 @@ impl BpfProgramManager {
         // 14. Spawn RingBuf consumer for kernel events
         if let Some(map) = bpf.take_map("EVENT_RINGBUF") {
             if let Ok(ring_buf) = RingBuf::try_from(map) {
-                match tokio::io::unix::AsyncFd::with_interest(
-                    ring_buf,
-                    tokio::io::Interest::READABLE,
-                ) {
+                // SAFETY: RingBuf owns its map FD and keeps it open and stable.
+                // The consumer only drains events; it never replaces the ring buffer.
+                let registration = unsafe {
+                    AsyncFd::register_with_interest(ring_buf, Interest::READABLE)
+                };
+                match registration {
                     Ok(async_fd) => {
                         let task = tokio::spawn(consume_dae_events(async_fd));
                         self.event_abort = Some(task.abort_handle());
@@ -1327,7 +1330,7 @@ impl BpfProgramManager {
 
 /// Drain `EVENT_RINGBUF` into rate-limited structured logs.
 async fn consume_dae_events(
-    mut async_fd: tokio::io::unix::AsyncFd<RingBuf<MapData>>,
+    mut async_fd: AsyncFd<RingBuf<MapData>>,
 ) {
     use clash_ebpf_common::{DaeEvent, DaeEventType};
     let mut window = std::time::Instant::now();
