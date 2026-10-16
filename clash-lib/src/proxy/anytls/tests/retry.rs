@@ -129,6 +129,96 @@ async fn udp_first_packet_precedes_v2_stream_ack() {
     udp_first_packet_ack(false).await;
 }
 
+#[tokio::test(start_paused = true)]
+async fn unresponsive_session_is_replaced_after_syn_ack_timeout() {
+    let handler = make_handler(false, false);
+    // Keep the transport open without responding, as with a lost TCP path.
+    let (client, _server) = duplex(65536);
+    let stale = AnyTlsClientSession::new(
+        AnyStream::new(client), "secret", PaddingFactory::default_factory(),
+    ).await.unwrap();
+    stale.set_peer_version(2);
+    handler.session_pool.add_session(stale.clone()).await;
+    let resolver: ThreadSafeDNSResolver = Arc::new(MockClashResolver::new());
+    let connector = Arc::new(CountingConnector::default());
+    let sess = Session {
+        destination: SocksAddr::domain_name("example.test", 80),
+        ..Default::default()
+    };
+
+    let stream = timeout(Duration::from_secs(11), handler.open_stream_with_retry(
+        resolver.clone(), &RemoteConnector::Counting(connector.clone()),
+        &sess, &sess.destination,
+    )).await.unwrap().unwrap();
+    assert!(stale.is_closed());
+    assert_eq!(stale.total_streams_count(), 0);
+    assert_eq!(connector.dials.load(Ordering::Relaxed), 1);
+    drop(stream);
+
+    // Later requests must reuse the replacement rather than the stale session.
+    let _stream = handler.open_stream_with_retry(
+        resolver, &RemoteConnector::Counting(connector.clone()),
+        &sess, &sess.destination,
+    ).await.unwrap();
+    assert_eq!(connector.dials.load(Ordering::Relaxed), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn syn_ack_timeout_retires_session_without_handler_retry() {
+    let (client, _server) = duplex(65536);
+    let session = AnyTlsClientSession::new(
+        AnyStream::new(client), "secret", PaddingFactory::default_factory(),
+    ).await.unwrap();
+    session.set_peer_version(2);
+    let dest = SocksAddr::domain_name("example.test", 80);
+    let error = session.open_stream(&dest).await.unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    assert!(session.is_closed());
+    assert_eq!(session.total_streams_count(), 0);
+    let error = session.open_stream(&dest).await.unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::NotConnected);
+}
+
+#[tokio::test]
+async fn remote_rejection_does_not_replace_healthy_session() {
+    let handler = make_handler(false, false);
+    let (client, mut server) = duplex(65536);
+    let session = AnyTlsClientSession::new(
+        AnyStream::new(client), "secret", PaddingFactory::default_factory(),
+    ).await.unwrap();
+    session.set_peer_version(2);
+    handler.session_pool.add_session(session.clone()).await;
+    let server_task = spawn(async move {
+        consume_auth(&mut server).await;
+        loop {
+            let (command, id, _) = read_frame_raw(&mut server).await;
+            if command == Command::Psh as u8 {
+                let mut reply = BytesMut::new();
+                Frame::with_data(Command::SynAck, id,
+                    Bytes::from_static(b"target unreachable"),
+                ).encode_into(&mut reply);
+                server.write_all(&reply).await.unwrap();
+                return server;
+            }
+        }
+    });
+    let resolver: ThreadSafeDNSResolver = Arc::new(MockClashResolver::new());
+    let connector = Arc::new(CountingConnector::default());
+    let sess = Session {
+        destination: SocksAddr::domain_name("example.test", 80),
+        ..Default::default()
+    };
+    let error = timeout(Duration::from_secs(2), handler.open_stream_with_retry(
+        resolver, &RemoteConnector::Counting(connector.clone()),
+        &sess, &sess.destination,
+    )).await.unwrap().unwrap_err();
+    let _server = server_task.await.unwrap();
+    assert_eq!(error.kind(), io::ErrorKind::ConnectionRefused);
+    assert!(!session.is_closed());
+    assert_eq!(session.total_streams_count(), 0);
+    assert_eq!(connector.dials.load(Ordering::Relaxed), 0);
+}
+
 #[tokio::test]
 async fn udp_late_stream_rejection_is_reported() {
     udp_first_packet_ack(true).await;

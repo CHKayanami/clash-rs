@@ -174,7 +174,7 @@ impl Handler {
 
         match session.open_stream_with_initial_data(dest, initial_data).await {
             Ok(stream) => Ok(stream),
-            Err(err) if is_session_broken_err(&err) => {
+            Err(err) if session.is_closed() || is_session_broken_err(&err) => {
                 debug!(
                     "AnyTLS pooled session broken ({:?}), retrying with fresh connection",
                     err

@@ -190,7 +190,9 @@ impl AnyTlsClientSession {
     pub fn mark_closed(&self) {
         self.is_closed.store(true, Ordering::Relaxed);
         self.close_notify.notify_waiters();
-        self.streams.write().clear();
+        let mut streams = self.streams.write();
+        streams.clear();
+        self.release_stream_slot(|_, reserved| (0, reserved));
     }
 
     fn release_stream_slot(
@@ -1059,6 +1061,9 @@ impl AnyTlsClientSession {
                     ));
                 }
                 Err(_) => {
+                    // A blackholed transport can stay writable after a network
+                    // change. Retire it instead of reusing it for every request.
+                    self.mark_closed();
                     return Err(io::Error::new(
                         io::ErrorKind::TimedOut,
                         "Timeout waiting for AnyTLS stream SynAck",
