@@ -238,7 +238,7 @@ impl SocksAddr {
             }
             SocksAddrType::DOMAIN => {
                 let domain_len = cur.get_u8() as usize;
-                if cur.remaining() < domain_len {
+                if cur.remaining() < domain_len + 2 {
                     return Err(io::Error::other("invalid buf"));
                 }
                 let mut buf = vec![0u8; domain_len];

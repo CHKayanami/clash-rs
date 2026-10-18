@@ -37,6 +37,13 @@ impl OutboundDatagramImpl {
             resolved_dst: None, logical: None })
     }
 
+    // SOCKS relays have a physical IP target and need no logical DNS mapping.
+    pub(crate) fn poll_send_to_vectored(
+        &self, cx: &mut Context<'_>, header: &[u8], payload: &[u8], destination: SocketAddr,
+    ) -> Poll<io::Result<()>> {
+        self.native.poll_send_to_vectored(cx, header, payload, destination)
+    }
+
     fn clear_send(&mut self) {
         self.pkt = None;
         self.pending_dns = None;

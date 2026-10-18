@@ -3,7 +3,7 @@ use std::{collections::VecDeque, io, net::{SocketAddr, SocketAddrV6}, pin::Pin,
 use futures::{Sink, Stream, ready};
 use tokio::net::UdpSocket;
 use tracing::{trace, warn};
-use crate::{proxy::datagram::UdpPacket, session::SocksAddr};
+use crate::{proxy::{datagram::UdpPacket, utils::poll_send_to_vectored}, session::SocksAddr};
 
 const MAX_CONSECUTIVE_RECV_ERRORS: usize = 32;
 const MAX_BATCH_RECV_PACKETS: usize = 16;
@@ -28,6 +28,16 @@ impl NativeDatagram {
 
     #[cfg(test)]
     pub(super) fn local_addr(&self) -> io::Result<SocketAddr> { self.inner.local_addr() }
+
+    pub(crate) fn poll_send_to_vectored(
+        &self, cx: &mut Context<'_>, header: &[u8], payload: &[u8],
+        mut destination: SocketAddr,
+    ) -> Poll<io::Result<()>> {
+        if self.local_is_ipv6 && let SocketAddr::V4(address) = destination {
+            destination = SocketAddr::V6(SocketAddrV6::new(address.ip().to_ipv6_mapped(), address.port(), 0, 0));
+        }
+        poll_send_to_vectored(&self.inner, cx, header, payload, destination)
+    }
 
     // The domain wrapper applies its mapping when the batch is received,
     // preserving the source of already-buffered packets across later sends.

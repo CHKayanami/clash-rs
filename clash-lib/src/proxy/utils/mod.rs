@@ -11,6 +11,8 @@ pub(crate) mod dialer_route;
 pub use dialer_proxy::DialerProxyConnector;
 mod shared_handler;
 mod socket_helpers;
+mod udp_send;
+pub(crate) use udp_send::poll_send_to_vectored;
 
 pub use proxy_connector::*;
 pub use shared_handler::{OutboundNodeRegistry, ProviderRegistry, ProviderSnapshot};

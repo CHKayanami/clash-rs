@@ -1,4 +1,5 @@
 use std::{
+    io,
     net::SocketAddr,
     pin::Pin,
     sync::Arc,
@@ -8,8 +9,8 @@ use std::{
 use crate::proxy::utils::dialer_route::{self, Route};
 
 use futures::{Sink, SinkExt, Stream, StreamExt, ready};
-use bytes::BytesMut;
-use tokio_util::codec::{Decoder, Encoder};
+use bytes::{Bytes, BytesMut};
+use tokio_util::codec::Encoder;
 use tracing::trace;
 
 use crate::{
@@ -21,6 +22,8 @@ pub struct Socks5Datagram {
     _socket: AnyStream,
     remote: SocketAddr,
     inner: AnyOutboundDatagram,
+    header: BytesMut,
+    pending: Option<Bytes>,
     // Keep pinned routes alive for transport workers until the association closes.
     _route: Option<Arc<Route>>,
 }
@@ -35,6 +38,8 @@ impl Socks5Datagram {
             _socket: socket,
             remote,
             inner: datagram,
+            header: BytesMut::new(),
+            pending: None,
             _route: dialer_route::retain(),
         }
     }
@@ -57,11 +62,11 @@ impl Sink<UdpPacket> for Socks5Datagram {
     type Error = std::io::Error;
 
     fn poll_ready(
-        self: Pin<&mut Self>,
+        mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Result<(), Self::Error>> {
-        let pin = self.get_mut();
-        pin.inner.poll_ready_unpin(cx)
+        if self.pending.is_some() { ready!(self.as_mut().poll_flush(cx))?; }
+        self.get_mut().inner.poll_ready_unpin(cx)
     }
 
     fn start_send(self: Pin<&mut Self>, item: UdpPacket) -> Result<(), Self::Error> {
@@ -71,6 +76,15 @@ impl Sink<UdpPacket> for Socks5Datagram {
             remote, item.dst_addr
         );
         let pin = self.get_mut();
+        if pin.pending.is_some() {
+            return Err(io::Error::other("previous SOCKS UDP packet is pending"));
+        }
+        if matches!(pin.inner, AnyOutboundDatagram::Udp(_) | AnyOutboundDatagram::NativeUdp(_)) {
+            pin.header.clear();
+            Socks5UDPCodec::encode_header(&item.dst_addr, &mut pin.header);
+            pin.pending = Some(item.data);
+            return Ok(());
+        }
         let mut data = BytesMut::new();
         Socks5UDPCodec.encode((item.data, item.dst_addr), &mut data)?;
         pin.inner.start_send_unpin(UdpPacket {
@@ -83,15 +97,24 @@ impl Sink<UdpPacket> for Socks5Datagram {
         cx: &mut Context<'_>,
     ) -> Poll<Result<(), Self::Error>> {
         let pin = self.get_mut();
+        if let Some(data) = pin.pending.as_ref() {
+            let result = ready!(match &pin.inner {
+                AnyOutboundDatagram::Udp(inner) => inner.poll_send_to_vectored(cx, &pin.header, data, pin.remote),
+                AnyOutboundDatagram::NativeUdp(inner) => inner.poll_send_to_vectored(cx, &pin.header, data, pin.remote),
+                _ => unreachable!("vectored SOCKS send requires a native socket"),
+            });
+            pin.pending = None;
+            return Poll::Ready(result);
+        }
         pin.inner.poll_flush_unpin(cx)
     }
 
     fn poll_close(
-        self: Pin<&mut Self>,
+        mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Result<(), Self::Error>> {
-        let pin = self.get_mut();
-        pin.inner.poll_close_unpin(cx)
+        ready!(self.as_mut().poll_flush(cx))?;
+        self.get_mut().inner.poll_close_unpin(cx)
     }
 }
 
@@ -114,14 +137,17 @@ impl Stream for Socks5Datagram {
                 trace!("dropping socks5 UDP packet from unexpected relay {}", packet.src_addr);
                 continue;
             }
-            let mut data = BytesMut::from(packet.data.as_ref());
-            match Socks5UDPCodec.decode(&mut data) {
-                Ok(Some((src_addr, data))) => return Poll::Ready(Some(UdpPacket {
+            match Socks5UDPCodec::decode_header(&packet.data) {
+                Some((src_addr, header_len)) => return Poll::Ready(Some(UdpPacket {
                     src_addr, dst_addr: pin.remote.into(),
-                    data: data.freeze(), inbound_user: None,
+                    data: packet.data.slice(header_len..), inbound_user: None,
                 })),
                 _ => trace!("dropping malformed socks5 UDP packet"),
             }
         }
     }
 }
+
+#[cfg(test)]
+#[path = "datagram_tests.rs"]
+mod tests;

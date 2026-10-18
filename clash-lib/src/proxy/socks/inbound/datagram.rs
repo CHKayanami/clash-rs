@@ -1,21 +1,21 @@
 use crate::{proxy::datagram::UdpPacket, session::SocksAddr};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use futures::{Sink, SinkExt, Stream, StreamExt, ready};
-use socket2::{SockAddr, SockRef};
 use std::{
     fmt::{self, Debug},
-    io::{self, IoSlice},
+    io,
     mem::take,
     net::{IpAddr, SocketAddr},
     pin::Pin,
     task::{Context, Poll},
 };
-use tokio::{io::Interest, net::UdpSocket};
+use tokio::net::UdpSocket;
+use crate::proxy::utils::poll_send_to_vectored;
 use tokio_util::{
     codec::{Decoder, Encoder},
     udp::UdpFramed,
 };
-use tracing::{debug, trace};
+use tracing::debug;
 
 // +----+------+------+----------+----------+----------+
 // |RSV | FRAG | ATYP | DST.ADDR | DST.PORT |   DATA   |
@@ -36,6 +36,21 @@ use tracing::{debug, trace};
 // o  DATA     user data
 pub struct Socks5UDPCodec;
 
+impl Socks5UDPCodec {
+    pub(crate) fn encode_header(addr: &SocksAddr, dst: &mut BytesMut) {
+        dst.reserve(3 + addr.size());
+        dst.put_slice(&[0, 0, 0]);
+        addr.write_buf(dst);
+    }
+
+    pub(crate) fn decode_header(src: &[u8]) -> Option<(SocksAddr, usize)> {
+        if src.len() < 3 || src[2] != 0 { return None; }
+        let addr = SocksAddr::peek_read(&src[3..]).ok()?;
+        let header_len = 3 + addr.size();
+        Some((addr, header_len))
+    }
+}
+
 impl Encoder<(Bytes, SocksAddr)> for Socks5UDPCodec {
     type Error = io::Error;
 
@@ -45,8 +60,7 @@ impl Encoder<(Bytes, SocksAddr)> for Socks5UDPCodec {
         dst: &mut BytesMut,
     ) -> Result<(), Self::Error> {
         dst.reserve(3 + item.1.size() + item.0.len());
-        dst.put_slice(&[0x0, 0x0, 0x0]);
-        item.1.write_buf(dst);
+        Self::encode_header(&item.1, dst);
         dst.put_slice(item.0.as_ref());
 
         Ok(())
@@ -67,27 +81,10 @@ impl Decoder for Socks5UDPCodec {
         &mut self,
         src: &mut BytesMut,
     ) -> Result<Option<Self::Item>, Self::Error> {
-        if src.len() < 3 {
+        let Some((addr, header_len)) = Self::decode_header(src) else {
             return Ok(None);
-        }
-
-        if src[2] != 0 {
-            trace!(
-                "dropping socks5 udp packet with unsupported FRAG {}",
-                src[2]
-            );
-            return Ok(None);
-        }
-
-        src.advance(3);
-        let addr = match SocksAddr::peek_read(src) {
-            Ok(addr) => addr,
-            Err(e) => {
-                trace!("dropping socks5 udp packet with bad address: {e}");
-                return Ok(None);
-            }
         };
-        src.advance(addr.size());
+        src.advance(header_len);
         let packet = take(src);
         Ok(Some((addr, packet)))
     }
@@ -140,8 +137,7 @@ impl Sink<((Bytes, SocksAddr), SocketAddr)> for Socks5UdpFramed {
             return Err(io::Error::other("previous SOCKS UDP packet is pending"));
         }
         self.header.clear();
-        self.header.put_slice(&[0, 0, 0]);
-        addr.write_buf(&mut self.header);
+        Socks5UDPCodec::encode_header(&addr, &mut self.header);
         self.pending = Some((data, peer));
         Ok(())
     }
@@ -153,37 +149,11 @@ impl Sink<((Bytes, SocksAddr), SocketAddr)> for Socks5UdpFramed {
         let Some((data, peer)) = self.pending.as_ref() else {
             return Poll::Ready(Ok(()));
         };
-        let header = &self.header;
-        let socket = self.inner.get_ref();
-        loop {
-            ready!(socket.poll_send_ready(cx))?;
-            let result = socket.try_io(Interest::WRITABLE, || {
-                SockRef::from(socket).send_to_vectored(
-                    &[IoSlice::new(header), IoSlice::new(data)],
-                    &SockAddr::from(*peer),
-                )
-            });
-            match result {
-                Err(err) if err.kind() == io::ErrorKind::WouldBlock => continue,
-                Err(err) if err.kind() == io::ErrorKind::Interrupted => {
-                    continue;
-                }
-                result => {
-                    let expected = header.len() + data.len();
-                    self.pending = None;
-                    return Poll::Ready(result.and_then(|sent| {
-                        if sent == expected {
-                            Ok(())
-                        } else {
-                            Err(io::Error::new(
-                                io::ErrorKind::WriteZero,
-                                "partial SOCKS UDP datagram send",
-                            ))
-                        }
-                    }));
-                }
-            }
-        }
+        let result = ready!(poll_send_to_vectored(
+            self.inner.get_ref(), cx, &self.header, data, *peer,
+        ));
+        self.pending = None;
+        Poll::Ready(result)
     }
 
     fn poll_close(
