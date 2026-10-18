@@ -43,7 +43,10 @@ use crate::{
 };
 
 use crate::session::SocksAddr as ClashSocksAddr;
-use tokio::sync::{Mutex as AsyncMutex, OnceCell};
+use tokio::{
+    runtime::Handle,
+    sync::{Mutex as AsyncMutex, OnceCell},
+};
 
 use self::types::{CongestionControl, TuicConnection, UdpRelayMode, UdpSession};
 
@@ -353,9 +356,12 @@ impl Handler {
     }
 }
 
-#[derive(Debug)]
 pub struct TuicDatagramOutbound {
-    send_tx: tokio_util::sync::PollSender<UdpPacket>,
+    send_tx: Option<tokio_util::sync::PollSender<UdpPacket>>,
+    conn: Arc<TuicConnection>,
+    runtime: Handle,
+    assoc_id: u16,
+    closed: bool,
     recv_rx: tokio::sync::mpsc::Receiver<UdpPacket>,
 }
 
@@ -365,44 +371,46 @@ impl TuicDatagramOutbound {
         conn: Arc<TuicConnection>,
         local_addr: ClashSocksAddr,
     ) -> Self {
-        // TODO not sure about the size of buffer
-        let (send_tx, send_rx) = tokio::sync::mpsc::channel::<UdpPacket>(32);
         let (recv_tx, recv_rx) = tokio::sync::mpsc::channel::<UdpPacket>(32);
-        let udp_sessions = conn.udp_sessions.clone();
-        udp_sessions.write().insert(
+        conn.udp_sessions.write().insert(
             assoc_id,
             UdpSession {
                 incoming: recv_tx,
                 local_addr,
             },
         );
-        tokio::spawn(async move {
-            // capture vars
-            let mut send_rx = send_rx;
-            while let Some(next_send) = send_rx.recv().await {
-                let res = conn
-                    .outgoing_udp(
-                        next_send.data,
-                        next_send.dst_addr.into_tuic(),
-                        assoc_id,
-                    )
-                    .await;
-                if res.is_err() {
-                    break;
+        let send_tx = if conn.udp_relay_mode == UdpRelayMode::Quic {
+            let (send_tx, send_rx) = tokio::sync::mpsc::channel::<UdpPacket>(32);
+            let conn = conn.clone();
+            tokio::spawn(async move {
+                // capture vars
+                let mut send_rx = send_rx;
+                while let Some(next_send) = send_rx.recv().await {
+                    let res = conn
+                        .send_stream_packet(
+                            next_send.data,
+                            next_send.dst_addr.into_tuic(),
+                            assoc_id,
+                        )
+                        .await;
+                    if res.is_err() {
+                        break;
+                    }
                 }
-            }
-            // TuicDatagramOutbound dropped or outgoing_udp occurs error
-            tracing::info!(
-                "[udp] [dissociate] closing UDP session [{assoc_id:#06x}]"
-            );
-            _ = conn.dissociate(assoc_id).await;
-            udp_sessions.write().remove(&assoc_id);
-            anyhow::Ok(())
-        });
+                // TuicDatagramOutbound dropped or outgoing_udp occurs error
+                tracing::info!(
+                    "[udp] [dissociate] closing UDP session [{assoc_id:#06x}]"
+                );
+                _ = conn.dissociate(assoc_id).await;
+                anyhow::Ok(())
+            });
+
+            Some(tokio_util::sync::PollSender::new(send_tx))
+        } else { None };
 
         Self {
-            send_tx: tokio_util::sync::PollSender::new(send_tx),
-            recv_rx,
+            send_tx, conn, runtime: Handle::current(),
+            assoc_id, closed: false, recv_rx,
         }
     }
 }

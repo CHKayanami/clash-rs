@@ -380,9 +380,8 @@ macro_rules! single_packet_transport {
     };
 }
 single_packet_transport!(
-    PooledDirectDatagram, HysteriaDatagramOutbound,
+    PooledDirectDatagram,
     OutboundDatagramVmess,
-    #[cfg(feature = "tuic")] TuicDatagramOutbound,
     #[cfg(feature = "wireguard")] UdpPair,
     #[cfg(feature = "tailscale")] TailscaleDatagramOutbound,
     #[cfg(feature = "shadowquic")] UdpSessionWrapper,

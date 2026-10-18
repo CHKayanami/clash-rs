@@ -1,13 +1,19 @@
 use std::{
+    fmt::{Debug, Formatter, Result as FmtResult},
+    io::{self, ErrorKind},
     pin::Pin,
-    sync::{Arc, atomic::AtomicU32},
+    sync::Arc,
     task::{Context, Poll},
 };
 
-use futures::{Sink, SinkExt, Stream};
+use futures::{Sink, Stream};
 
 use crate::{
-    common::errors::new_io_error, proxy::datagram::UdpPacket, session::SocksAddr,
+    proxy::datagram::{
+        UdpPacket,
+        batch::{BatchResult, DatagramBatch, PacketBatch, poll_send_ready},
+    },
+    session::SocksAddr,
 };
 
 use super::{
@@ -27,14 +33,16 @@ impl UdpSession {
     }
 }
 
-#[derive(Debug)]
 pub struct HysteriaDatagramOutbound {
-    send_tx: tokio_util::sync::PollSender<UdpPacket>,
+    conn: Arc<HysteriaConnection>,
+    session_id: u32,
+    next_pkt_id: u16,
+    closed: bool,
     recv_rx: tokio::sync::mpsc::Receiver<UdpPacket>,
 }
 
 impl HysteriaDatagramOutbound {
-    pub async fn new(
+    pub fn new(
         session_id: u32,
         conn: Arc<HysteriaConnection>,
         local_addr: SocksAddr,
@@ -45,14 +53,12 @@ impl HysteriaDatagramOutbound {
             local_addr
         );
 
-        let (send_tx, send_rx) = tokio::sync::mpsc::channel::<UdpPacket>(32);
         let (recv_tx, recv_rx) = tokio::sync::mpsc::channel::<UdpPacket>(32);
-        let udp_sessions = conn.udp_sessions.clone();
-        udp_sessions.lock().insert(
+        conn.udp_sessions.lock().insert(
             session_id,
             UdpSession {
                 incoming: recv_tx,
-                local_addr: local_addr.clone(),
+                local_addr,
                 defragger: Defragger::default(),
             },
         );
@@ -61,90 +67,81 @@ impl HysteriaDatagramOutbound {
             session_id
         );
 
-        tokio::spawn(async move {
-            // capture vars
-            let mut send_rx = send_rx;
+        Self { conn, session_id, next_pkt_id: 0, closed: false, recv_rx }
+    }
+}
 
-            // use u32 to avoid overflow
-            let next_pkt_id = AtomicU32::new(0);
-            while let Some(next_send) = send_rx.recv().await {
-                let pkt_id =
-                    next_pkt_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                // wrap over the full 16-bit range; `% u16::MAX` skipped 65535
-                let pkt_id = pkt_id as u16;
-                tracing::trace!(
-                    "HysteriaDatagramOutbound: sending packet for session {}, \
-                     pkt_id={}, dst={:?}",
-                    session_id,
-                    pkt_id,
-                    next_send.dst_addr
-                );
-                if let Err(e) = conn.send_packet(
-                    next_send.data,
-                    next_send.dst_addr,
-                    session_id,
-                    pkt_id,
-                ) {
-                    tracing::warn!(
-                        "err in outgoing_udp of HysteriaDatagramOutbound, msg: {:?}",
-                        e
-                    );
-                    break;
-                }
-            }
-            // TuicDatagramOutbound dropped or outgoing_udp occurs error
-            tracing::info!(
-                "[udp] [dissociate] closing UDP session [{session_id:#06x}]"
-            );
-            let entry = udp_sessions.lock().remove(&session_id);
-            debug_assert!(entry.is_some());
-            anyhow::Ok(())
-        });
+impl Debug for HysteriaDatagramOutbound {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
+        f.debug_struct("HysteriaDatagramOutbound")
+            .field("session_id", &self.session_id).finish()
+    }
+}
 
-        Self {
-            send_tx: tokio_util::sync::PollSender::new(send_tx),
-            recv_rx,
+impl HysteriaDatagramOutbound {
+    fn close_session(&mut self) {
+        if !self.closed {
+            self.closed = true;
+            self.conn.udp_sessions.lock().remove(&self.session_id);
+            self.recv_rx.close();
         }
+    }
+
+    fn max_fragment_size(&self) -> io::Result<usize> {
+        if self.closed {
+            return Err(io::Error::new(ErrorKind::BrokenPipe, "UDP session closed"));
+        }
+        self.conn.max_fragment_size()
+    }
+
+    fn send(&mut self, item: &UdpPacket, max_frag_size: usize) -> io::Result<()> {
+        let pkt_id = self.next_pkt_id;
+        self.next_pkt_id = pkt_id.wrapping_add(1);
+        self.conn.send_packet(
+            &item.data, &item.dst_addr, self.session_id, pkt_id, max_frag_size,
+        )
+    }
+}
+
+impl Drop for HysteriaDatagramOutbound {
+    fn drop(&mut self) { self.close_session(); }
+}
+
+impl DatagramBatch for HysteriaDatagramOutbound {
+    fn poll_send_batch(
+        &mut self, _cx: &mut Context<'_>, batch: &mut PacketBatch,
+    ) -> Poll<BatchResult> {
+        let result = match self.max_fragment_size() {
+            Ok(limit) => poll_send_ready(batch, |packet| self.send(packet, limit)),
+            Err(error) => BatchResult::terminated(error),
+        };
+        if result.error.is_some() { self.close_session(); }
+        Poll::Ready(result)
     }
 }
 
 impl Sink<UdpPacket> for HysteriaDatagramOutbound {
-    type Error = std::io::Error;
+    type Error = io::Error;
 
-    fn poll_ready(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Result<(), Self::Error>> {
-        self.send_tx
-            .poll_ready_unpin(cx)
-            .map_err(|v| new_io_error(format!("{v:?}")))
+    fn poll_ready(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(if self.closed {
+            Err(io::Error::new(ErrorKind::BrokenPipe, "UDP session closed"))
+        } else { Ok(()) })
     }
 
-    fn start_send(
-        mut self: Pin<&mut Self>,
-        item: UdpPacket,
-    ) -> Result<(), Self::Error> {
-        self.send_tx
-            .start_send_unpin(item)
-            .map_err(|v| new_io_error(format!("{v:?}")))
+    fn start_send(mut self: Pin<&mut Self>, item: UdpPacket) -> Result<(), Self::Error> {
+        let result = self.max_fragment_size().and_then(|limit| self.send(&item, limit));
+        if result.is_err() { self.close_session(); }
+        result
     }
 
-    fn poll_flush(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Result<(), Self::Error>> {
-        self.send_tx
-            .poll_flush_unpin(cx)
-            .map_err(|v| new_io_error(format!("{v:?}")))
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
     }
 
-    fn poll_close(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Result<(), Self::Error>> {
-        self.send_tx
-            .poll_close_unpin(cx)
-            .map_err(|v| new_io_error(format!("{v:?}")))
+    fn poll_close(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.close_session();
+        Poll::Ready(Ok(()))
     }
 }
 

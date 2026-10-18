@@ -83,48 +83,43 @@ impl TuicConnection {
         Ok(TuicStream::new(send, recv))
     }
 
-    pub async fn outgoing_udp(
+    pub async fn send_stream_packet(
         &self,
         pkt: Bytes,
         addr: Address,
         assoc_id: u16,
     ) -> Result<()> {
         let pkt_id = self.get_next_pkt_id();
-        match self.udp_relay_mode {
-            UdpRelayMode::Native => {
-                tracing::debug!("[udp] [{assoc_id:#06x}] [to-native] to {addr}");
-                let max_size = self.conn.max_datagram_size().ok_or_else(|| {
-                    anyhow!("peer does not support QUIC datagrams")
-                })?;
-                let frames =
-                    packet_fragments(assoc_id, pkt_id, &addr, &pkt, max_size)?;
-                for frame in frames {
-                    let frame = frame?;
-                    self.conn.send_datagram(frame).map_err(|err| {
-                        tracing::warn!(
-                            "[udp] [{assoc_id:#06x}] [to-native] to {addr}: {err}"
-                        );
-                        anyhow!(err)
-                    })?;
-                }
-                Ok(())
-            }
-            UdpRelayMode::Quic => {
-                tracing::debug!("[udp] [{assoc_id:#06x}] [to-quic] {addr}");
-                let wire_pkt = encode_single_packet(assoc_id, pkt_id, &addr, &pkt)?;
-                let mut send = self.conn.open_uni().await.map_err(|err| {
-                    tracing::warn!(
-                        "[udp] [{assoc_id:#06x}] [to-quic] to {addr}: {err}"
-                    );
-                    anyhow!(err)
-                })?;
-                send.write_all(&wire_pkt)
-                    .await
-                    .map_err(|err| anyhow!(err))?;
-                let _ = send.finish();
-                Ok(())
-            }
+        tracing::debug!("[udp] [{assoc_id:#06x}] [to-quic] {addr}");
+        let wire_pkt = encode_single_packet(assoc_id, pkt_id, &addr, &pkt)?;
+        let mut send = self.conn.open_uni().await.map_err(|err| {
+            tracing::warn!(
+                "[udp] [{assoc_id:#06x}] [to-quic] to {addr}: {err}"
+            );
+            anyhow!(err)
+        })?;
+        send.write_all(&wire_pkt)
+            .await
+            .map_err(|err| anyhow!(err))?;
+        let _ = send.finish();
+        Ok(())
+    }
+
+    pub fn send_native_packet(
+        &self, pkt: &[u8], addr: Address, assoc_id: u16, max_size: usize,
+    ) -> Result<()> {
+        let pkt_id = self.get_next_pkt_id();
+        let frames = packet_fragments(assoc_id, pkt_id, &addr, pkt, max_size)?;
+        for frame in frames {
+            let frame = frame?;
+            self.conn.send_datagram(frame).map_err(|err| {
+                tracing::warn!(
+                    "[udp] [{assoc_id:#06x}] [to-native] to {addr}: {err}"
+                );
+                anyhow!(err)
+            })?;
         }
+        Ok(())
     }
 
     pub async fn dispatch_packet(&self, parsed: ParsedPacket, mode: &str) {
@@ -182,9 +177,19 @@ impl TuicConnection {
         }
     }
 
+    pub fn remove_udp_session(&self, assoc_id: u16) {
+        self.udp_sessions.write().remove(&assoc_id);
+        self.fragments.lock().remove_association(assoc_id);
+    }
+
     pub async fn dissociate(&self, assoc_id: u16) -> Result<()> {
         tracing::info!("[udp] [dissociate] [{assoc_id:#06x}]");
-        self.fragments.lock().remove_association(assoc_id);
+        self.remove_udp_session(assoc_id);
+        if self.conn.close_reason().is_some() { return Ok(()); }
+        self.send_dissociate(assoc_id).await
+    }
+
+    pub async fn send_dissociate(&self, assoc_id: u16) -> Result<()> {
         let buf = encode_dissociate(assoc_id);
         let mut send = self.conn.open_uni().await?;
         send.write_all(&buf).await?;

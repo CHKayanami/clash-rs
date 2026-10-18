@@ -8,6 +8,8 @@ mod datagram;
 mod h3;
 mod salamander;
 mod udp_hop;
+#[cfg(test)]
+mod quic_tests;
 
 use quinn_proto::congestion::{BbrConfig, ControllerFactory};
 
@@ -582,7 +584,7 @@ impl OutboundHandler for Handler {
         let next_session_id = self
             .next_session_id
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let hy_datagram = authed_conn.connect_udp(sess, next_session_id).await;
+        let hy_datagram = authed_conn.connect_udp(sess, next_session_id);
         sess.push_chain(self.name());
         Ok(AnyOutboundDatagram::new(hy_datagram))
     }
@@ -725,7 +727,7 @@ impl HysteriaConnection {
         Ok(HystStream { send: tx, recv: rx })
     }
 
-    pub async fn connect_udp(
+    pub fn connect_udp(
         self: Arc<Self>,
         sess: &Session,
         session_id: u32,
@@ -737,41 +739,25 @@ impl HysteriaConnection {
         );
         HysteriaDatagramOutbound::new(
             session_id,
-            self.clone(),
+            self,
             sess.destination.clone(),
         )
-        .await
+    }
+
+    pub fn max_fragment_size(&self) -> std::io::Result<usize> {
+        self.conn.max_datagram_size()
+            .map(|limit| self.udp_mtu.map_or(limit, |mtu| mtu.min(limit)))
+            .ok_or_else(|| std::io::Error::other("hysteria2 QUIC datagrams unavailable"))
     }
 
     pub fn send_packet(
         &self,
-        pkt: Bytes,
-        addr: SocksAddr,
+        pkt: &[u8],
+        addr: &SocksAddr,
         session_id: u32,
         pkt_id: u16,
+        max_frag_size: usize,
     ) -> std::io::Result<()> {
-        tracing::trace!(
-            "hysteria2 send_packet: session_id={}, pkt_id={}, addr={:?}, \
-             data_len={}",
-            session_id,
-            pkt_id,
-            addr,
-            pkt.len()
-        );
-
-        let max_frag_size = match self.udp_mtu.or(self.conn.max_datagram_size()) {
-            Some(x) => {
-                tracing::trace!("hysteria2 max_frag_size={}", x);
-                x
-            }
-            None => {
-                tracing::error!("hysteria2 udp mtu not set");
-                return Err(std::io::Error::other(
-                    "hysteria2 udp mtu not set, please check your \
-                     disable_mtu_discovery and udp_mtu option",
-                ));
-            }
-        };
         let fragments = Fragments::new(session_id, pkt_id, addr, max_frag_size, pkt)
             .map_err(|e| std::io::Error::other(e.to_string()))?;
         let mut frag_count = 0;

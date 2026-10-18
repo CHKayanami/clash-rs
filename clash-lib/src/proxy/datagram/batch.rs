@@ -88,6 +88,21 @@ pub trait DatagramBatch: Stream<Item = UdpPacket> + Sink<UdpPacket, Error = io::
     }
 }
 
+/// Submit independent datagrams synchronously without copying their payloads.
+/// Errors are terminal: a protocol may already have submitted some fragments.
+pub(crate) fn poll_send_ready(
+    batch: &PacketBatch, mut send: impl FnMut(&UdpPacket) -> io::Result<()>,
+) -> BatchResult {
+    let mut sent = 0;
+    for packet in batch.packets() {
+        if let Err(error) = send(packet) {
+            return BatchResult { sent, error: Some(error), fatal: true };
+        }
+        sent += 1;
+    }
+    BatchResult::sent(sent)
+}
+
 pub fn poll_send_single<D: Sink<UdpPacket, Error = io::Error> + Unpin + ?Sized>(
     datagram: &mut D, cx: &mut Context<'_>, batch: &mut PacketBatch,
 ) -> Poll<BatchResult> {
@@ -152,6 +167,23 @@ impl<T: DatagramBatch + ?Sized> DatagramBatch for Box<T> {
 mod tests {
     use super::*;
     use bytes::Bytes;
+
+    #[test]
+    fn synchronous_batch_failure_preserves_successful_prefix_and_suffix() {
+        let mut batch = PacketBatch::default();
+        for _ in 0..4 { batch.push(UdpPacket::default()).unwrap(); }
+        let mut attempts = 0;
+        let result = poll_send_ready(&batch, |_| {
+            attempts += 1;
+            if attempts == 3 { Err(io::Error::other("connection closed")) } else { Ok(()) }
+        });
+        assert_eq!(result.sent, 2);
+        assert!(result.fatal && result.error.is_some());
+        assert_eq!(attempts, 3);
+        // Completion belongs to the relay; submission leaves packet ownership intact.
+        assert_eq!(batch.len(), 4);
+        assert_eq!(batch.packets().count(), 4);
+    }
 
     #[test]
     fn outgoing_batches_bound_packet_count_and_payload_bytes() {

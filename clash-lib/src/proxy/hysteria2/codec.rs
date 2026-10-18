@@ -5,7 +5,7 @@ use quinn_proto::{VarInt, coding::Codec};
 use rand::distr::Distribution;
 use std::{
     collections::HashMap,
-    io::ErrorKind,
+    io::{self, ErrorKind},
     str::FromStr,
     time::{Duration, Instant},
 };
@@ -208,12 +208,15 @@ pub struct EncodedAddr {
 }
 
 impl EncodedAddr {
-    pub fn from_socksaddr(addr: &SocksAddr) -> Self {
+    pub fn from_socksaddr(addr: &SocksAddr) -> io::Result<Self> {
         let mut buf = [0u8; MAX_ADDR_LEN];
         let len = match addr {
             SocksAddr::Domain(domain, port) => {
                 let domain_bytes = domain.as_bytes();
                 let d_len = domain_bytes.len();
+                if d_len > 255 {
+                    return Err(io::Error::new(ErrorKind::InvalidInput, "hysteria2 domain too long"));
+                }
                 buf[..d_len].copy_from_slice(domain_bytes);
                 buf[d_len] = b':';
                 let mut itoa_buf = itoa::Buffer::new();
@@ -229,10 +232,10 @@ impl EncodedAddr {
                 cursor.position() as usize
             }
         };
-        Self {
+        Ok(Self {
             buf,
             len: len as u16,
-        }
+        })
     }
 
     #[inline]
@@ -268,7 +271,7 @@ impl Encoder<&'_ SocksAddr> for Hy2TcpCodec {
     ) -> Result<(), Self::Error> {
         const REQ_ID: VarInt = VarInt::from_u32(0x401);
 
-        let encoded_addr = EncodedAddr::from_socksaddr(item);
+        let encoded_addr = EncodedAddr::from_socksaddr(item)?;
         let addr_var = VarInt::from_u32(encoded_addr.len() as u32);
 
         let pad_len = rand::random_range(64..=512) as usize;
@@ -441,11 +444,11 @@ where
     pub fn new(
         session_id: u32,
         pkt_id: u16,
-        addr: SocksAddr,
+        addr: &SocksAddr,
         max_pkt_size: usize,
         payload: P,
     ) -> anyhow::Result<Self> {
-        let addr = EncodedAddr::from_socksaddr(&addr);
+        let addr = EncodedAddr::from_socksaddr(addr)?;
         let addr_var = VarInt::from_u32(addr.len() as u32);
 
         let fixed_size = 4 + 2 + 1 + 1 + addr.len() + var_size(addr_var);
@@ -465,7 +468,8 @@ where
         // oversized packet into either silence (256 fragments -> 0) or, worse,
         // one fragment claiming to be the whole packet (257 -> 1), which the
         // peer's defragmenter accepted as complete but truncated data.
-        let frag_total = payload.as_ref().len().div_ceil(max_data_size);
+        // Empty UDP payloads still need one frame carrying the destination.
+        let frag_total = payload.as_ref().len().div_ceil(max_data_size).max(1);
         if frag_total > u8::MAX as usize {
             return Err(anyhow!(
                 "hysteria2 udp packet needs {} fragments, exceeding the {} the \
@@ -496,6 +500,11 @@ where
     P: AsRef<[u8]> + 'a,
 {
     type Item = Bytes;
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = (self.frag_total - self.next_frag_id) as usize;
+        (remaining, Some(remaining))
+    }
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.next_frag_id < self.frag_total {
@@ -532,7 +541,7 @@ where
     P: AsRef<[u8]>,
 {
     fn len(&self) -> usize {
-        self.frag_total as usize
+        (self.frag_total - self.next_frag_id) as usize
     }
 }
 
@@ -665,15 +674,15 @@ fn test_decode_addr() {
 #[test]
 fn test_encoded_addr() {
     let addr1 = SocksAddr::Ip("1.2.3.4:443".parse().unwrap());
-    let encoded1 = EncodedAddr::from_socksaddr(&addr1);
+    let encoded1 = EncodedAddr::from_socksaddr(&addr1).unwrap();
     assert_eq!(encoded1.as_slice(), b"1.2.3.4:443");
 
     let addr2 = SocksAddr::Domain("test.example.com".into(), 8443);
-    let encoded2 = EncodedAddr::from_socksaddr(&addr2);
+    let encoded2 = EncodedAddr::from_socksaddr(&addr2).unwrap();
     assert_eq!(encoded2.as_slice(), b"test.example.com:8443");
 
     let addr3 = SocksAddr::Ip("[2001:db8::1]:8443".parse().unwrap());
-    let encoded3 = EncodedAddr::from_socksaddr(&addr3);
+    let encoded3 = EncodedAddr::from_socksaddr(&addr3).unwrap();
     assert_eq!(encoded3.as_slice(), b"[2001:db8::1]:8443");
 }
 
@@ -681,7 +690,7 @@ fn test_encoded_addr() {
 fn test_udp_roundtrip() {
     let addr = SocksAddr::Domain("example.com".into(), 1234);
     let payload = Bytes::from_static(b"hello world hysteria2");
-    let mut frags = Fragments::new(0x12345678, 42, addr.clone(), 1500, payload.clone()).unwrap();
+    let mut frags = Fragments::new(0x12345678, 42, &addr, 1500, payload.clone()).unwrap();
     let encoded = frags.next().unwrap();
     let mut buf = BytesMut::from(encoded.as_ref());
     let decoded = HysUdpPacket::decode(&mut buf).unwrap();
@@ -745,4 +754,28 @@ fn test_defragger_interleaved_packets() {
     let res200 = defrag.feed(p200_1).expect("p200 should reassemble");
     assert_eq!(res200.pkt_id, 200);
     assert_eq!(res200.data.as_ref(), b"foo bar");
+}
+
+#[test]
+fn oversized_destination_is_rejected_before_encoding() {
+    let addr = SocksAddr::Domain("x".repeat(300).into(), 443);
+    let error = Hy2TcpCodec.encode(&addr, &mut BytesMut::new()).unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::InvalidInput);
+    assert!(Fragments::new(1, 0, &addr, 1200, &[]).is_err());
+}
+
+#[test]
+fn fragment_iterator_reports_remaining_frames() {
+    let addr = SocksAddr::any_ipv4();
+    for size in [0, 4096] {
+        let mut fragments = Fragments::new(1, 0, &addr, 1200, vec![0; size]).unwrap();
+        let mut remaining = fragments.len();
+        assert!(remaining > 0);
+        while fragments.next().is_some() {
+            remaining -= 1;
+            assert_eq!(fragments.len(), remaining);
+            assert_eq!(fragments.size_hint(), (remaining, Some(remaining)));
+        }
+        assert_eq!(remaining, 0);
+    }
 }
