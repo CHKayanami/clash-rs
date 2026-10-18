@@ -30,16 +30,24 @@ pub(super) fn encode_header(
     buffer: &mut BytesMut, address: &SocksAddr, payload_len: usize,
     packet_mode: bool,
 ) -> io::Result<()> {
+    buffer.clear();
+    append_header(buffer, address, payload_len, packet_mode)
+}
+
+pub(super) fn append_header(
+    buffer: &mut BytesMut, address: &SocksAddr, payload_len: usize,
+    packet_mode: bool,
+) -> io::Result<()> {
     validate_address(address)?;
     if payload_len > MAX_PACKET_LENGTH {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput, "UDP payload exceeds UoT frame capacity",
         ));
     }
-    buffer.clear();
+    let start = buffer.len();
     if packet_mode {
         address.write_buf(buffer);
-        buffer[0] = match buffer[0] {
+        buffer[start] = match buffer[start] {
             SocksAddrType::V4 => IPV4,
             SocksAddrType::V6 => IPV6,
             SocksAddrType::DOMAIN => DOMAIN,

@@ -1,3 +1,4 @@
+use crate::proxy::datagram::batch::DatagramBatch;
 use crate::{
     common::errors::new_io_error,
     proxy::{datagram::UdpPacket, utils::ToCanonical},
@@ -470,3 +471,5 @@ impl futures::Sink<UdpPacket> for InboundShadowsocksDatagram {
 #[cfg(test)]
 #[path = "datagram_tests.rs"]
 mod tests;
+
+impl DatagramBatch for InboundShadowsocksDatagram {}

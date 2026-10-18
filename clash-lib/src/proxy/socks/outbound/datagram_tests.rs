@@ -110,3 +110,47 @@ async fn chained_transport_preserves_framing_and_slices_received_payload() {
     assert_eq!(reply.data, payload);
     assert_eq!(reply.data.as_ptr(), response[3 + address.size()..].as_ptr());
 }
+
+#[tokio::test]
+async fn batch_send_preserves_socks_headers_and_payloads() {
+    use crate::proxy::datagram::batch::{DatagramBatch, PacketBatch};
+    use futures::future::poll_fn;
+    timeout(Duration::from_secs(3), async {
+        let relay = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let remote = relay.local_addr().unwrap();
+        let socket = new_dual_stack_udp_socket(None,
+            #[cfg(target_os = "linux")] None).unwrap();
+        let inner = AnyOutboundDatagram::Udp(Box::new(OutboundDatagramImpl::new(socket, Arc::new(NoopResolver)).unwrap()));
+        let mut socks = datagram(remote, inner);
+        let mut batch = PacketBatch::default();
+        let mut expected = Vec::new();
+        for (address, data) in [("192.0.2.1:53", Bytes::new()), ("[2001:db8::1]:443", Bytes::from_static(b"ipv6")), ("example.test:123", Bytes::from_static(b"domain"))] {
+            let address: SocksAddr = address.parse().unwrap();
+            expected.push(wire(&address, data.clone()));
+            batch.push(UdpPacket::new(data, SocksAddr::any_ipv4(), address)).unwrap();
+        }
+        let result = poll_fn(|cx| socks.poll_send_batch(cx, &mut batch)).await;
+        #[cfg(target_os = "linux")]
+        assert_eq!(result.sent, 3);
+        assert!(result.error.is_none());
+        for _ in 0..result.sent { batch.complete(); }
+        while !batch.is_empty() {
+            let result = poll_fn(|cx| socks.poll_send_batch(cx, &mut batch)).await;
+            assert!(result.error.is_none());
+            for _ in 0..result.sent { batch.complete(); }
+        }
+        for packet in expected {
+            let mut data = [0; 512];
+            let (len, source) = relay.recv_from(&mut data).await.unwrap();
+            assert_eq!(&data[..len], packet.as_ref());
+            relay.send_to(&data[..len], source).await.unwrap();
+        }
+        let mut replies = Vec::new();
+        let mut count = 0;
+        while count < 3 {
+            assert!(poll_fn(|cx| socks.poll_recv_batch(cx, &mut replies)).await.is_some());
+            count += replies.len();
+            replies.clear();
+        }
+    }).await.unwrap();
+}

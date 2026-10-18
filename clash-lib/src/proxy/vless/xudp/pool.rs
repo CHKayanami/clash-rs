@@ -1,3 +1,5 @@
+use crate::proxy::datagram::batch::{MAX_BATCH_PACKETS, MAX_BATCH_BYTES};
+mod batch;
 use bytes::{Bytes, BytesMut};
 use futures::{Sink, Stream};
 use parking_lot::{Mutex, RwLock};
@@ -129,14 +131,28 @@ impl XudpCarrier {
         mut writer: WriteHalf<AnyStream>,
         mut rx: mpsc::Receiver<Bytes>,
     ) -> io::Result<()> {
-        while let Some(frame) = rx.recv().await {
-            writer.write_all(&frame).await?;
-
-            // Coalesce all queued pending frames into this write cycle to reduce syscalls
-            while let Ok(next) = rx.try_recv() {
-                writer.write_all(&next).await?;
+        let mut buffer = BytesMut::new();
+        let mut deferred = None;
+        loop {
+            let frame = match deferred.take() {
+                Some(frame) => frame,
+                None => match rx.recv().await { Some(frame) => frame, None => break },
+            };
+            buffer.clear();
+            for _ in 1..MAX_BATCH_PACKETS {
+                let size = if buffer.is_empty() { frame.len() } else { buffer.len() };
+                if size >= MAX_BATCH_BYTES { break; }
+                let Ok(next) = rx.try_recv() else { break; };
+                if size + next.len() > MAX_BATCH_BYTES {
+                    deferred = Some(next);
+                    break;
+                }
+                if buffer.is_empty() { buffer.extend_from_slice(&frame); }
+                buffer.extend_from_slice(&next);
             }
-
+            // Avoid a copy and buffer allocation on an idle carrier.
+            let data = if buffer.is_empty() { &frame[..] } else { &buffer[..] };
+            writer.write_all(data).await?;
             writer.flush().await?;
         }
         let _ = writer.shutdown().await;

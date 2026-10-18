@@ -1,3 +1,6 @@
+use crate::proxy::datagram::batch::{DatagramBatch, PacketBatch, BatchResult, MAX_BATCH_PACKETS};
+use shadowsocks::{net::UdpSocket as ShadowsocksUdpSocket, relay::Address};
+mod batch;
 use std::{
     io,
     net::SocketAddr,
@@ -6,7 +9,7 @@ use std::{
     time::Instant,
 };
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use futures::{Sink, SinkExt, Stream, StreamExt, ready};
 use parking_lot::Mutex;
 use shadowsocks::{
@@ -61,6 +64,10 @@ impl Drop for RecvBuffer {
 
 pub struct OutboundDatagramShadowsocks<S> {
     inner: ProxySocket<S>,
+    encrypted: PacketBatch,
+    deferred_encrypted: Option<UdpPacket>,
+    encrypted_recv: Vec<UdpPacket>,
+    preparation_error: Option<io::Error>,
     /// The SS server addr
     remote_addr: SocketAddr,
 
@@ -82,6 +89,10 @@ impl<S> OutboundDatagramShadowsocks<S> {
 
         Self {
             inner,
+            encrypted: PacketBatch::default(),
+            deferred_encrypted: None,
+            encrypted_recv: Vec::new(),
+            preparation_error: None,
             flushed: true,
             pkt: None,
             remote_addr,
@@ -219,26 +230,7 @@ where
             match rv {
                 Ok((n, src, _dst, ctrl)) => {
                     me.consecutive_recv_errors = 0;
-                    if let Some(control) = ctrl {
-                        if control.client_session_id != me.ss_control.client_session_id {
-                            debug!(
-                                "dropping packet with mismatched client_session_id: expected {}, got {}",
-                                me.ss_control.client_session_id, control.client_session_id
-                            );
-                            continue;
-                        }
-                        if me.server_sessions.check_and_set(
-                            control.server_session_id,
-                            control.packet_id,
-                            Instant::now(),
-                        ) {
-                            debug!(
-                                "shadowsocks outbound udp replay or session limit: server_session_id={}, packet_id={}",
-                                control.server_session_id, control.packet_id
-                            );
-                            continue;
-                        }
-                    }
+                    if !accept_response(ctrl, me.ss_control.client_session_id, &mut me.server_sessions) { continue; }
                     let data = Bytes::copy_from_slice(&recv_buf[..n]);
                     return Poll::Ready(Some(UdpPacket {
                         data,
@@ -284,6 +276,20 @@ where
             }
         }
     }
+}
+
+fn accept_response(control: Option<UdpSocketControlData>, client_session_id: u64,
+    sessions: &mut ServerSessions) -> bool {
+    let Some(control) = control else { return true; };
+    if control.client_session_id != client_session_id {
+        debug!("dropping shadowsocks UDP response with mismatched client session");
+        return false;
+    }
+    if sessions.check_and_set(control.server_session_id, control.packet_id, Instant::now()) {
+        debug!("dropping replayed shadowsocks UDP response or excess server session");
+        return false;
+    }
+    true
 }
 
 /// Shadowsocks UDP I/O that ProxySocket requires. The guard is held only

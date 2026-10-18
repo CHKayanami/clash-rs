@@ -1,3 +1,5 @@
+use crate::proxy::{datagram::batch::{DatagramBatch, PacketBatch, BatchResult, poll_send_single},
+    socks::batch::{BatchTarget, poll_send_socks_batch}};
 use std::{
     io,
     net::SocketAddr,
@@ -29,6 +31,8 @@ pub struct Socks5Datagram {
 }
 
 impl Socks5Datagram {
+    pub(crate) fn has_native_send(&self) -> bool { self.inner.physical_socket().is_some() }
+
     pub(crate) fn new(
         socket: AnyStream,
         remote: SocketAddr,
@@ -151,3 +155,26 @@ impl Stream for Socks5Datagram {
 #[cfg(test)]
 #[path = "datagram_tests.rs"]
 mod tests;
+
+impl DatagramBatch for Socks5Datagram {
+    fn poll_send_batch(&mut self, cx: &mut Context<'_>, batch: &mut PacketBatch) -> Poll<BatchResult> {
+        if let Some((socket, ipv6)) = self.inner.physical_socket() {
+            poll_send_socks_batch(socket, ipv6, cx, batch, BatchTarget::Relay(self.remote))
+        } else { poll_send_single(self, cx, batch) }
+    }
+    fn poll_recv_batch(&mut self, cx: &mut Context<'_>, packets: &mut Vec<UdpPacket>) -> Poll<Option<()>> {
+        if ready!(self.inner.poll_recv_batch(cx, packets)).is_none() { return Poll::Ready(None); }
+        packets.retain_mut(|packet| {
+            if packet.src_addr.ip().is_some_and(|ip| ip != self.remote.ip())
+                || packet.src_addr.port() != self.remote.port() { return false; }
+            let Some((source, len)) = Socks5UDPCodec::decode_header(&packet.data) else { return false; };
+            packet.src_addr = source;
+            packet.dst_addr = self.remote.into();
+            packet.data = packet.data.slice(len..);
+            packet.inbound_user = None;
+            true
+        });
+        if packets.is_empty() { cx.waker().wake_by_ref(); Poll::Pending }
+        else { Poll::Ready(Some(())) }
+    }
+}

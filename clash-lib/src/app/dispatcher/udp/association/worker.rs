@@ -1,10 +1,10 @@
-use std::{collections::HashMap, io, net::SocketAddr, pin::Pin,
+use std::{collections::{HashMap, VecDeque}, io, net::SocketAddr, pin::Pin,
     sync::{Arc, atomic::{AtomicBool, Ordering}}, task::{Context, Poll}, time::Duration};
 use futures::{Stream, stream::FuturesUnordered, future::BoxFuture};
 use tokio::{sync::{mpsc, oneshot}, time::{Instant, Sleep, sleep}};
 use tracing::{debug, warn};
 
-use crate::{common::io::datagram_relay::RelayContext, proxy::datagram::UdpPacket, session::SocksAddr};
+use crate::{common::io::datagram_relay::RelayContext, proxy::datagram::{UdpPacket, batch::MAX_BATCH_PACKETS}, session::SocksAddr};
 use super::{AssociationConfig, Registration, Outgoing, flow::FlowState, traffic::UdpTraffic, peer::PeerTable};
 
 const CONTROL_BUDGET: usize = 32;
@@ -14,9 +14,8 @@ pub(super) struct AssociationRelay {
     flows: HashMap<u64, Arc<FlowState>>,
     peers: PeerTable,
     closing: FuturesUnordered<BoxFuture<'static, u64>>,
-    sending: Option<Arc<FlowState>>,
+    sending: VecDeque<(Arc<FlowState>, usize)>,
     last_sender: Option<Arc<FlowState>>,
-    sender_cache_valid: bool,
     replies: mpsc::Sender<UdpPacket>,
     source: SocketAddr,
     allow_quic: Arc<AtomicBool>,
@@ -37,7 +36,7 @@ impl AssociationRelay {
     ) -> Self {
         Self {
             packets, commands, flows: HashMap::new(), peers: PeerTable::default(),
-            closing: FuturesUnordered::new(), sending: None, last_sender: None, sender_cache_valid: false,
+            closing: FuturesUnordered::new(), sending: VecDeque::with_capacity(MAX_BATCH_PACKETS + 1), last_sender: None,
             replies: config.replies.clone(), source, allow_quic: config.allow_quic.clone(),
             traffic: UdpTraffic::new(config.manager.clone(), user.as_ref()), force_source, user, native,
             timeout: config.timeout, last_active: Instant::now(), timer: Box::pin(sleep(config.timeout)),
@@ -48,7 +47,6 @@ impl AssociationRelay {
         if let Some(flow) = self.flows.remove(&id) {
             flow.close();
             self.last_sender = None;
-            self.sender_cache_valid = false;
             self.peers.remove(&flow, &self.flows);
         }
     }
@@ -56,7 +54,6 @@ impl AssociationRelay {
     fn register(&mut self, state: Arc<FlowState>, close_rx: oneshot::Receiver<()>) -> io::Result<()> {
         self.peers.register(&state)?;
         self.last_sender = None;
-        self.sender_cache_valid = false;
         let id = state.id;
         self.flows.insert(id, state);
         // One small control future per route, never a forwarding task. Dropped
@@ -69,7 +66,7 @@ impl AssociationRelay {
 impl Drop for AssociationRelay {
     fn drop(&mut self) {
         for flow in self.flows.values() { flow.close(); }
-        if let Some(flow) = &self.sending { flow.close(); }
+        for (flow, _) in &self.sending { flow.close(); }
     }
 }
 
@@ -110,20 +107,19 @@ impl RelayContext for AssociationRelay {
         for _ in 0..CONTROL_BUDGET {
             match self.packets.poll_recv(cx) {
                 Poll::Ready(Some(outgoing)) => {
-                    let cached = self.last_sender.as_ref().is_some_and(|flow| flow.id == outgoing.id);
                     let flow = self.last_sender.take().filter(|flow| flow.id == outgoing.id)
                         .or_else(|| self.flows.get(&outgoing.id).cloned());
                     let Some(flow) = flow else { continue; };
                     if flow.is_closed() { self.remove(outgoing.id); continue; }
-                    if !cached {
-                        self.peers.select_sender(&flow);
-                    }
-                    // Move the retained state between the send and cache. A
-                    // Pending send still owns it, without per-packet Arc churn.
                     let mut packet = outgoing.packet;
                     if packet.dst_addr != flow.target { packet.dst_addr = flow.target.clone(); }
-                    self.sending = Some(flow);
-                    self.sender_cache_valid = true;
+                    if let Some((previous, count)) = self.sending.back_mut()
+                        && previous.id == flow.id {
+                        *count += 1;
+                    } else {
+                        self.sending.push_back((flow.clone(), 1));
+                    }
+                    self.last_sender = Some(flow);
                     self.last_active = Instant::now();
                     return Poll::Ready(Some(packet));
                 }
@@ -136,14 +132,16 @@ impl RelayContext for AssociationRelay {
     }
 
     fn sent(&mut self, result: io::Result<usize>) -> bool {
-        let flow = self.sending.take();
+        let (flow, remaining) = self.sending.front_mut().expect("queued UDP flow completion");
+        *remaining -= 1;
         let keep_running = match result {
             Ok(len) => {
                 self.last_active = Instant::now();
                 self.traffic.push_upload(len);
-                if let Some(flow) = &flow {
-                    flow.tracker.record_upload(len);
-                }
+                // Commit ownership in actual send order, not when a later
+                // unsent packet was merely admitted to the batch.
+                if !flow.is_closed() { self.peers.select_sender(flow); }
+                flow.tracker.record_upload(len);
                 true
             }
             Err(err) => {
@@ -152,10 +150,7 @@ impl RelayContext for AssociationRelay {
                 self.native || matches!(err.kind(), io::ErrorKind::InvalidInput | io::ErrorKind::InvalidData)
             }
         };
-        // Registration/removal while flushing may have changed peer ownership.
-        if self.sender_cache_valid && let Some(flow) = flow && !flow.is_closed() {
-            self.last_sender = Some(flow);
-        }
+        if *remaining == 0 { self.sending.pop_front(); }
         keep_running
     }
 

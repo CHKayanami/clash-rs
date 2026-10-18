@@ -6,7 +6,7 @@ use std::sync::Arc;
 pub(crate) mod datagram;
 pub(crate) mod native;
 pub(crate) mod pool;
-mod recv;
+pub(crate) mod recv;
 mod resolve;
 
 use crate::{

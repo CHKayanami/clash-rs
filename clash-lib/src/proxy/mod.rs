@@ -1,8 +1,8 @@
 use crate::{
-    app::dns::ThreadSafeDNSResolver, proxy::datagram::UdpPacket, session::Session,
+    app::dns::ThreadSafeDNSResolver, session::Session,
 };
 use erased_serde::Serialize as ErasedSerialize;
-use futures::{Sink, Stream};
+use datagram::batch::DatagramBatch;
 use serde::{Deserialize, Serialize};
 
 use std::{
@@ -151,26 +151,13 @@ impl<S: AsyncRead + AsyncWrite + Send + Sync + Unpin> ProxyStream
 {
 }
 
-pub trait InboundDatagram<Item>:
-    Stream<Item = Item> + Sink<Item, Error = io::Error> + Send + Sync + Unpin + Debug
-{
-}
-impl<T, U> InboundDatagram<U> for T where
-    T: Stream<Item = U> + Sink<U, Error = io::Error> + Send + Sync + Unpin + Debug
-{
-}
+pub trait InboundDatagram: DatagramBatch + Send + Sync + Debug {}
+impl<T: DatagramBatch + Send + Sync + Debug> InboundDatagram for T {}
 pub type AnyInboundDatagram =
-    Box<dyn InboundDatagram<UdpPacket, Error = io::Error, Item = UdpPacket>>;
+    Box<dyn InboundDatagram>;
 
-pub trait OutboundDatagram<Item>:
-    Stream<Item = Item> + Sink<Item, Error = io::Error> + Send + Sync + Unpin + 'static
-{
-}
-
-impl<T, U> OutboundDatagram<U> for T where
-    T: Stream<Item = U> + Sink<U, Error = io::Error> + Send + Sync + Unpin + 'static
-{
-}
+pub trait OutboundDatagram: DatagramBatch + Send + Sync + 'static {}
+impl<T: DatagramBatch + Send + Sync + 'static> OutboundDatagram for T {}
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutboundType {

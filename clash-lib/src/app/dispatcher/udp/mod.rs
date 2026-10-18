@@ -8,14 +8,18 @@
 //! logical addresses and attribute traffic, independently of protocol policy.
 //! These local guarantees do not imply that an upstream server or outer NAT
 //! provides an endpoint-independent public mapping or filtering policy.
+use crate::proxy::datagram::batch::MAX_BATCH_PACKETS;
+use inbound::InboundIo;
+use futures::future::poll_fn as poll_batch;
 pub(crate) mod association;
 mod routes;
+mod inbound;
 #[cfg(test)]
 mod tests;
 
 use std::{collections::HashMap, future::Future, net::{IpAddr, SocketAddr}, sync::{Arc,
     atomic::{AtomicBool, AtomicU8, Ordering}}, time::Duration};
-use futures::{SinkExt, StreamExt, stream::poll_fn};
+use futures::{StreamExt, stream::poll_fn};
 use tokio::{sync::mpsc::error::TrySendError, task::JoinHandle, time::Instant};
 use tokio_util::{task::AbortOnDropHandle, time::DelayQueue};
 use tracing::{Instrument, debug, error, info, info_span};
@@ -179,8 +183,7 @@ impl Dispatcher {
     async fn dispatch_datagram_inner(
         &self, sess: Session, udp_inbound: AnyInboundDatagram,
     ) -> tokio::sync::oneshot::Sender<u8> {
-        let (mut local_w, mut local_r) = udp_inbound.split();
-        let (replies, mut reply_rx) = tokio::sync::mpsc::channel(UDP_CHANNEL_CAPACITY);
+        let (replies, reply_rx) = tokio::sync::mpsc::channel(UDP_CHANNEL_CAPACITY);
         let (closed_flows, mut closed_rx) = tokio::sync::mpsc::unbounded_channel();
         let (close_sender, mut close_receiver) = tokio::sync::oneshot::channel();
         let associations = UdpAssociationPool::new(AssociationConfig {
@@ -200,17 +203,11 @@ impl Dispatcher {
         // partition their route caches so different clients progress in parallel.
         let shard_count = if sess.source.port() == 0 { UDP_ROUTE_SHARDS } else { 1 };
         tokio::spawn(async move {
-            let _writer = AbortOnDropHandle::new(tokio::spawn(async move {
-                while let Some(packet) = reply_rx.recv().await {
-                    if let Err(err) = local_w.send(packet).await {
-                        error!("failed to send UDP packet to local: {err}");
-                    }
-                }
-            }.instrument(tracing::Span::current())));
+            let mut local = InboundIo::new(udp_inbound, reply_rx);
             if shard_count == 1 {
                 tokio::select! {
                     _ = &mut close_receiver => {},
-                    _ = routes::run(sess, ctx, sniffer, allow_quic, local_r, closed_rx) => {},
+                    _ = routes::run(sess, ctx, sniffer, allow_quic, local, closed_rx) => {},
                 }
                 return;
             }
@@ -223,25 +220,28 @@ impl Dispatcher {
                 ).instrument(tracing::Span::current())));
                 shards.push((packets, closed, task));
             }
-            loop {
+            let mut inbound_batch = Vec::with_capacity(MAX_BATCH_PACKETS);
+            'ingress: loop {
                 tokio::select! {
                     _ = &mut close_receiver => break,
-                    _ = ctx.reply_sender.closed() => break,
                     Some(closed) = closed_rx.recv() => {
                         let index = route_shard(closed.source, shard_count);
                         let _ = shards[index].1.send(closed);
                     }
-                    packet = local_r.next() => {
-                        let Some(mut packet) = packet else { break; };
-                        let source = match &mut packet.src_addr {
-                            SocksAddr::Ip(addr) => { addr.set_ip(addr.ip().to_canonical()); *addr }
-                            SocksAddr::Domain(..) => continue,
-                        };
-                        let index = route_shard(source, shard_count);
-                        match shards[index].0.try_send(packet) {
-                            Ok(()) => {},
-                            Err(TrySendError::Full(_)) => debug!("UDP route queue full, dropping packet"),
-                            Err(TrySendError::Closed(_)) => break,
+                    result = poll_batch(|cx| local.poll_recv_batch(cx, &mut inbound_batch)) => {
+                        let Some(()) = result else { break; };
+                        for mut packet in inbound_batch.drain(..) {
+                            tokio::task::consume_budget().await;
+                            let source = match &mut packet.src_addr {
+                                SocksAddr::Ip(addr) => { addr.set_ip(addr.ip().to_canonical()); *addr }
+                                SocksAddr::Domain(..) => continue,
+                            };
+                            let index = route_shard(source, shard_count);
+                            match shards[index].0.try_send(packet) {
+                                Ok(()) => {},
+                                Err(TrySendError::Full(_)) => debug!("UDP route queue full, dropping packet"),
+                                Err(TrySendError::Closed(_)) => break 'ingress,
+                            }
                         }
                     }
                 }

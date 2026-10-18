@@ -10,7 +10,7 @@ use super::Handler;
 use crate::{
     app::dns::{SystemResolver, ThreadSafeDNSResolver},
     config::internal::proxy::{CommonConfigOptions, OutboundVless, RealityOpt, XHttpOpt},
-    proxy::{AnyStream, OutboundHandler, UdpPacket,
+    proxy::{AnyStream, OutboundHandler, datagram::UdpPacket,
         transport::{TlsClient, TransportLayer}},
     session::{Session, SocksAddr},
 };

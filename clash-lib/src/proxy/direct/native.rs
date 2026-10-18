@@ -3,7 +3,8 @@ use std::{collections::VecDeque, io, net::{SocketAddr, SocketAddrV6}, pin::Pin,
 use futures::{Sink, Stream, ready};
 use tokio::net::UdpSocket;
 use tracing::{trace, warn};
-use crate::{proxy::{datagram::UdpPacket, utils::poll_send_to_vectored}, session::SocksAddr};
+use crate::{proxy::{datagram::{UdpPacket, batch::{DatagramBatch, PacketBatch, BatchResult, MAX_BATCH_PACKETS}},
+    utils::{poll_send_to_vectored, udp_batch::{self, DatagramSlice}}}, session::SocksAddr};
 
 const MAX_CONSECUTIVE_RECV_ERRORS: usize = 32;
 const MAX_BATCH_RECV_PACKETS: usize = 16;
@@ -28,6 +29,14 @@ impl NativeDatagram {
 
     #[cfg(test)]
     pub(super) fn local_addr(&self) -> io::Result<SocketAddr> { self.inner.local_addr() }
+
+    pub(crate) fn physical_socket(&self) -> (&UdpSocket, bool) { (&self.inner, self.local_is_ipv6) }
+
+    // A raw receive must not bypass packets cached by Stream::poll_next.
+    #[cfg(feature = "shadowsocks")]
+    pub(crate) fn physical_recv_socket(&self) -> Option<&UdpSocket> {
+        self.recv_queue.is_empty().then_some(&self.inner)
+    }
 
     pub(crate) fn poll_send_to_vectored(
         &self, cx: &mut Context<'_>, header: &[u8], payload: &[u8],
@@ -159,5 +168,131 @@ mod tests {
         let reply = timeout(Duration::from_secs(2), datagram.next()).await.unwrap().unwrap();
         assert_eq!(reply.src_addr, target);
         assert!(reply.data.is_empty());
+    }
+}
+
+impl DatagramBatch for NativeDatagram {
+    fn poll_send_batch(&mut self, cx: &mut Context<'_>, batch: &mut PacketBatch) -> Poll<BatchResult> {
+        let mut slices = std::array::from_fn::<_, MAX_BATCH_PACKETS, _>(|_| DatagramSlice {
+            header: &[], payload: &[], destination: SocketAddr::from(([0, 0, 0, 0], 0)),
+        });
+        let mut count = 0;
+        for packet in batch.packets() {
+            let SocksAddr::Ip(destination) = packet.dst_addr else {
+                if count > 0 { break; }
+                return Poll::Ready(BatchResult::failed(io::Error::new(
+                    io::ErrorKind::InvalidInput, "physical UDP target must be an IP address",
+                )));
+            };
+            slices[count] = DatagramSlice { header: &[], payload: &packet.data, destination };
+            count += 1;
+        }
+        udp_batch::poll_send_batch(&self.inner, self.local_is_ipv6, cx, &slices[..count])
+    }
+
+    fn poll_recv_batch(&mut self, cx: &mut Context<'_>, packets: &mut Vec<UdpPacket>) -> Poll<Option<()>> {
+        if !self.recv_queue.is_empty() {
+            packets.extend(self.recv_queue.drain(..));
+            return Poll::Ready(Some(()));
+        }
+        for _ in 0..MAX_CONSECUTIVE_RECV_ERRORS {
+            let result = ready!(self.inner.poll_recv_ready(cx)).and_then(|()| {
+                super::recv::recv_batch(&self.inner, MAX_BATCH_RECV_PACKETS, |data, mut peer| {
+                    peer.set_ip(peer.ip().to_canonical());
+                    packets.push(UdpPacket { data, src_addr: peer.into(), ..Default::default() });
+                })
+            });
+            match result {
+                Ok(_) => {
+                    self.consecutive_recv_errors = 0;
+                    if !packets.is_empty() { return Poll::Ready(Some(())); }
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => continue,
+                Err(error) => {
+                    self.consecutive_recv_errors += 1;
+                    if self.consecutive_recv_errors >= MAX_CONSECUTIVE_RECV_ERRORS {
+                        warn!("Direct UDP socket reached receive error limit: {error}");
+                        return Poll::Ready(None);
+                    }
+                }
+            }
+        }
+        cx.waker().wake_by_ref();
+        Poll::Pending
+    }
+}
+
+#[cfg(test)]
+mod batch_tests {
+    use super::*;
+    use bytes::Bytes;
+    use futures::future::poll_fn;
+    use tokio::time::{timeout, Duration};
+
+    #[tokio::test]
+    async fn batch_send_commits_prefix_and_recovers_after_bad_packet() {
+        timeout(Duration::from_secs(3), async {
+            let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let mut native = NativeDatagram::new(UdpSocket::bind("127.0.0.1:0").await.unwrap()).unwrap();
+            let target: SocksAddr = server.local_addr().unwrap().into();
+            let mut batch = PacketBatch::default();
+            batch.push(UdpPacket::new(Bytes::from_static(b"first"), SocksAddr::any_ipv4(), target.clone())).unwrap();
+            // Exceed the socket's UDP payload limit while remaining within the
+            // batch byte budget, then retain the following valid datagram.
+            batch.push(UdpPacket::new(Bytes::from(vec![0; 65508]), SocksAddr::any_ipv4(), target.clone())).unwrap();
+            batch.push(UdpPacket::new(Bytes::from_static(b"last"), SocksAddr::any_ipv4(), target)).unwrap();
+            let mut sent = 0;
+            let mut errors = 0;
+            while !batch.is_empty() {
+                let result = poll_fn(|cx| native.poll_send_batch(cx, &mut batch)).await;
+                for _ in 0..result.sent { batch.complete(); sent += 1; }
+                if result.error.is_some() { batch.complete(); errors += 1; }
+            }
+            assert_eq!((sent, errors), (2, 1));
+            let mut data = [0; 32];
+            let first = server.recv(&mut data).await.unwrap();
+            assert_eq!(&data[..first], b"first");
+            let last = server.recv(&mut data).await.unwrap();
+            assert_eq!(&data[..last], b"last");
+        }).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn batch_send_and_receive_preserve_empty_packets_and_multiple_peers() {
+        timeout(Duration::from_secs(3), async {
+            let first = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let second = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let source = socket.local_addr().unwrap();
+            let mut native = NativeDatagram::new(socket).unwrap();
+            let mut batch = PacketBatch::default();
+            for (peer, data) in [(&first, Bytes::new()), (&second, Bytes::from_static(b"second"))] {
+                batch.push(UdpPacket::new(data, SocksAddr::any_ipv4(), peer.local_addr().unwrap().into())).unwrap();
+            }
+            let result = poll_fn(|cx| native.poll_send_batch(cx, &mut batch)).await;
+            #[cfg(target_os = "linux")]
+            assert_eq!(result.sent, 2, "one syscall must send both datagrams");
+            assert!(result.error.is_none());
+            for _ in 0..result.sent { batch.complete(); }
+            while !batch.is_empty() {
+                let result = poll_fn(|cx| native.poll_send_batch(cx, &mut batch)).await;
+                assert!(result.error.is_none());
+                for _ in 0..result.sent { batch.complete(); }
+            }
+            let mut data = [0; 32];
+            assert_eq!(first.recv(&mut data).await.unwrap(), 0);
+            assert_eq!(second.recv(&mut data).await.unwrap(), 6);
+            first.send_to(b"", source).await.unwrap();
+            second.send_to(b"reply", source).await.unwrap();
+            let mut received = Vec::new();
+            let mut all = Vec::new();
+            while all.len() < 2 {
+                assert!(poll_fn(|cx| native.poll_recv_batch(cx, &mut received)).await.is_some());
+                all.append(&mut received);
+            }
+            assert_eq!(all[0].src_addr, first.local_addr().unwrap().into());
+            assert!(all[0].data.is_empty());
+            assert_eq!(all[1].data.as_ref(), b"reply");
+        }).await.unwrap();
     }
 }

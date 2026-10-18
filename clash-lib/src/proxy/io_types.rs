@@ -1,5 +1,6 @@
 //! Unified transports. Concrete common paths and dynamic protocol stacks share
 //! one connection API; dispatch belongs here, not in every outbound handler.
+use super::datagram::batch::{DatagramBatch, PacketBatch, BatchResult};
 
 use super::{
     OutboundDatagram, ProxyStream,
@@ -34,7 +35,7 @@ use std::{
 };
 use tokio::{
     io::{AsyncRead, AsyncWrite, DuplexStream, ReadBuf},
-    net::TcpStream,
+    net::{TcpStream, UdpSocket},
 };
 
 use crate::app::sniffer::PrefixedStream;
@@ -128,7 +129,7 @@ macro_rules! define_transport {
 
 type DynamicStream = dyn ProxyStream + Sync;
 type DynamicDatagram =
-    dyn OutboundDatagram<UdpPacket, Item = UdpPacket, Error = io::Error>;
+    dyn OutboundDatagram;
 
 define_transport!($, AnyStream, DynamicStream, [ProxyStream + Sync], dispatch_stream, [Tcp(TcpStream), Duplex(DuplexStream)], [
     Tfo(TfoStream),
@@ -251,7 +252,7 @@ impl ProxyStream for AnyStream {
     }
 }
 
-define_transport!($, AnyOutboundDatagram, DynamicDatagram, [OutboundDatagram<UdpPacket>], dispatch_datagram,
+define_transport!($, AnyOutboundDatagram, DynamicDatagram, [OutboundDatagram], dispatch_datagram,
     [Direct(Box<PooledDirectDatagram>), Udp(Box<OutboundDatagramImpl>), NativeUdp(Box<NativeDatagram>)], [
     Socks5(Socks5Datagram),
     Hysteria2(HysteriaDatagramOutbound),
@@ -275,6 +276,23 @@ define_transport!($, AnyOutboundDatagram, DynamicDatagram, [OutboundDatagram<Udp
 ]);
 
 impl AnyOutboundDatagram {
+    pub(crate) fn physical_socket(&self) -> Option<(&UdpSocket, bool)> {
+        match self {
+            Self::NativeUdp(inner) => Some(inner.physical_socket()),
+            Self::Udp(inner) => Some(inner.physical_socket()),
+            _ => None,
+        }
+    }
+
+    #[cfg(feature = "shadowsocks")]
+    pub(crate) fn physical_recv_socket(&self) -> Option<&UdpSocket> {
+        match self {
+            Self::NativeUdp(inner) => inner.physical_recv_socket(),
+            Self::Udp(inner) => inner.physical_recv_socket(),
+            _ => None,
+        }
+    }
+
     pub(crate) fn read_error_handle(&self) -> Option<DatagramReadError> {
         match self {
             Self::Uot(datagram) => Some(datagram.read_error_handle()),
@@ -346,6 +364,29 @@ impl Sink<UdpPacket> for AnyOutboundDatagram {
         datagram_io!(self.get_mut(), poll_close, cx)
     }
 }
+
+impl DatagramBatch for AnyOutboundDatagram {
+    fn poll_send_batch(&mut self, cx: &mut Context<'_>, batch: &mut PacketBatch) -> Poll<BatchResult> {
+        dispatch_datagram!(self, |inner| inner.poll_send_batch(cx, batch))
+    }
+    fn poll_recv_batch(&mut self, cx: &mut Context<'_>, packets: &mut Vec<UdpPacket>) -> Poll<Option<()>> {
+        dispatch_datagram!(self, |inner| inner.poll_recv_batch(cx, packets))
+    }
+}
+
+macro_rules! single_packet_transport {
+    ($($(#[$attr:meta])* $ty:ty),* $(,)?) => {
+        $($(#[$attr])* impl DatagramBatch for $ty {})*
+    };
+}
+single_packet_transport!(
+    PooledDirectDatagram, HysteriaDatagramOutbound,
+    OutboundDatagramVmess,
+    #[cfg(feature = "tuic")] TuicDatagramOutbound,
+    #[cfg(feature = "wireguard")] UdpPair,
+    #[cfg(feature = "tailscale")] TailscaleDatagramOutbound,
+    #[cfg(feature = "shadowquic")] UdpSessionWrapper,
+);
 
 #[cfg(test)]
 mod tests {

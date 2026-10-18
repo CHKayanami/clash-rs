@@ -1,3 +1,4 @@
+use crate::proxy::datagram::batch::{DatagramBatch, PacketBatch, BatchResult};
 use std::{fmt, io, pin::Pin, task::{Context, Poll}};
 use futures::{Sink, Stream};
 use crate::{
@@ -304,4 +305,48 @@ mod tests {
         assert_eq!(&reply.data[..], b"unsolicited");
     }
 
+}
+
+impl DatagramBatch for InboundDatagramAnytls {
+    fn poll_send_batch(&mut self, cx: &mut Context<'_>, batch: &mut PacketBatch) -> Poll<BatchResult> {
+        for packet in batch.packets_mut() { packet.dst_addr = packet.src_addr.clone(); }
+        self.inner.poll_send_batch(cx, batch)
+    }
+    fn poll_recv_batch(&mut self, cx: &mut Context<'_>, packets: &mut Vec<UdpPacket>) -> Poll<Option<()>> {
+        let start = packets.len();
+        let result = self.inner.poll_recv_batch(cx, packets);
+        if let Some(source) = &self.source {
+            for packet in &mut packets[start..] { packet.src_addr = source.clone(); }
+        }
+        result
+    }
+}
+
+#[cfg(test)]
+mod batch_tests {
+    use super::*;
+    use bytes::Bytes;
+    use futures::{future::poll_fn, task::noop_waker_ref};
+    use tokio::io::{duplex, AsyncReadExt};
+
+    #[tokio::test]
+    async fn pending_single_batch_maps_source_once() {
+        let source: SocksAddr = "1.1.1.1:53".parse().unwrap();
+        let (writer, mut reader) = duplex(1);
+        let mut datagram = InboundDatagramAnytls::new(AnyStream::new(writer), source.clone());
+        let mut batch = PacketBatch::default();
+        batch.push(UdpPacket { data: Bytes::from_static(b"reply"), src_addr: source, ..Default::default() }).unwrap();
+        let mut cx = Context::from_waker(noop_waker_ref());
+        assert!(datagram.poll_send_batch(&mut cx, &mut batch).is_pending());
+        assert!(datagram.poll_send_batch(&mut cx, &mut batch).is_pending());
+        let send = poll_fn(|cx| datagram.poll_send_batch(cx, &mut batch));
+        let receive = async {
+            let mut wire = [0; 7];
+            reader.read_exact(&mut wire).await.unwrap();
+            assert_eq!(&wire, b"\x00\x05reply");
+        };
+        let (result, ()) = tokio::join!(send, receive);
+        assert_eq!(result.sent, 1);
+        assert!(result.error.is_none());
+    }
 }

@@ -1,3 +1,5 @@
+pub mod batch;
+pub(crate) mod framed;
 use crate::session::SocksAddr;
 use std::{
     fmt::{Debug, Display, Formatter},
@@ -205,3 +207,5 @@ mod tests {
         assert!(Arc::ptr_eq(&domain, cloned_domain));
     }
 }
+
+impl batch::DatagramBatch for ChannelDatagram {}

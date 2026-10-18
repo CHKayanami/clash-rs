@@ -299,3 +299,55 @@ async fn truncated_payload_keeps_error_after_stream_is_dropped() {
     drop(datagram);
     assert_eq!(error.get().unwrap().kind(), io::ErrorKind::UnexpectedEof);
 }
+
+#[tokio::test]
+async fn batch_packet_mode_preserves_boundaries_after_partial_writes() {
+    use futures::future::poll_fn;
+    let (writer, reader) = duplex(3);
+    let mut sender = OutboundDatagramUotV2::packet_mode(AnyStream::new(writer));
+    let mut receiver = OutboundDatagramUotV2::packet_mode(AnyStream::new(reader));
+    let mut batch = PacketBatch::default();
+    for payload in [b"one".as_slice(), b"", b"three"] {
+        batch.push(make_packet(payload.to_vec())).unwrap();
+    }
+    let send = poll_fn(|cx| sender.poll_send_batch(cx, &mut batch));
+    let receive = async {
+        for payload in [b"one".as_slice(), b"", b"three"] {
+            let packet = receiver.next().await.unwrap();
+            assert_eq!(packet.data.as_ref(), payload);
+            assert_eq!(packet.src_addr, make_target_addr());
+        }
+    };
+    let (result, ()) = tokio::join!(send, receive);
+    assert_eq!(result.sent, 3);
+    assert!(result.error.is_none());
+}
+
+async fn tcp_packets_roundtrip(batched: bool) {
+    use futures::future::poll_fn;
+    use tokio::{net::{TcpListener, TcpStream}, time::{timeout, Duration}};
+    timeout(Duration::from_secs(3), async {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+        client.set_nodelay(true).unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        let mut sender = OutboundDatagramUotV2::new(AnyStream::new(client), make_target_addr());
+        let mut receiver = OutboundDatagramUotV2::new(AnyStream::new(server), make_target_addr());
+        if batched {
+            let mut batch = PacketBatch::default();
+            for _ in 0..16 { batch.push(make_packet(b"query".to_vec())).unwrap(); }
+            let result = poll_fn(|cx| sender.poll_send_batch(cx, &mut batch)).await;
+            assert_eq!(result.sent, 16);
+            assert!(result.error.is_none());
+        } else {
+            for _ in 0..16 { sender.send(make_packet(b"query".to_vec())).await.unwrap(); }
+        }
+        for _ in 0..16 { assert_eq!(receiver.next().await.unwrap().data, b"query"[..]); }
+    }).await.unwrap();
+}
+
+#[tokio::test]
+async fn tcp_batch_roundtrip() { tcp_packets_roundtrip(true).await; }
+
+#[tokio::test]
+async fn tcp_single_roundtrip() { tcp_packets_roundtrip(false).await; }

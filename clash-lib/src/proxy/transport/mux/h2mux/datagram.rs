@@ -1,10 +1,11 @@
+use crate::proxy::datagram::{batch::{DatagramBatch, PacketBatch, BatchResult, poll_send_stream}, framed::FramedBatch};
 use std::{io, pin::Pin, task::{Context, Poll}};
 
 use futures::{Sink, Stream, ready};
 use tokio_util::codec::Framed;
 use tracing::warn;
 
-use super::datagram_codec::PacketCodec;
+use super::datagram_codec::{PacketCodec, encode_header};
 use crate::proxy::{AnyStream, datagram::UdpPacket};
 
 // Most UDP frames fit in 2 KiB; grow on demand for larger packets. Keep the
@@ -15,13 +16,14 @@ const WRITE_BACKPRESSURE_BOUNDARY: usize = 8192;
 pub struct H2MuxDatagram {
     inner: Framed<AnyStream, PacketCodec>,
     read_closed: bool,
+    batch_writer: FramedBatch,
 }
 
 impl H2MuxDatagram {
     pub fn new(stream: AnyStream) -> Self {
         let mut inner = Framed::with_capacity(stream, PacketCodec, INITIAL_BUFFER_CAPACITY);
         inner.set_backpressure_boundary(WRITE_BACKPRESSURE_BOUNDARY);
-        Self { inner, read_closed: false }
+        Self { inner, read_closed: false, batch_writer: FramedBatch::default() }
     }
 }
 
@@ -71,3 +73,22 @@ impl Sink<UdpPacket> for H2MuxDatagram {
 #[cfg(test)]
 #[path = "datagram_tests.rs"]
 mod tests;
+
+impl DatagramBatch for H2MuxDatagram {
+    fn poll_send_batch(&mut self, cx: &mut Context<'_>, batch: &mut PacketBatch) -> Poll<BatchResult> {
+        if !self.batch_writer.is_active() && batch.len() == 1 {
+            return poll_send_stream(self, cx, batch);
+        }
+        if !self.batch_writer.is_active() {
+            if !self.inner.write_buffer().is_empty() {
+                if let Err(error) = ready!(Pin::new(&mut self.inner).poll_flush(cx)) {
+                    return Poll::Ready(BatchResult::terminated(error));
+                }
+            }
+            self.batch_writer.prepare(batch, |packet, header| {
+                encode_header(&packet.dst_addr, packet.data.len(), header)
+            });
+        }
+        self.batch_writer.poll_write(self.inner.get_mut(), cx)
+    }
+}

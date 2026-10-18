@@ -1,3 +1,5 @@
+use crate::proxy::{datagram::batch::{DatagramBatch, PacketBatch, BatchResult},
+    direct::native::NativeDatagram, socks::batch::{BatchTarget, poll_send_socks_batch}};
 use crate::{proxy::datagram::UdpPacket, session::SocksAddr};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use futures::{Sink, SinkExt, Stream, StreamExt, ready};
@@ -13,7 +15,6 @@ use tokio::net::UdpSocket;
 use crate::proxy::utils::poll_send_to_vectored;
 use tokio_util::{
     codec::{Decoder, Encoder},
-    udp::UdpFramed,
 };
 use tracing::debug;
 
@@ -93,7 +94,7 @@ impl Decoder for Socks5UDPCodec {
 /// Keep the decoder's receive buffering, but send header and payload separately.
 /// The pending packet owns its payload across writable-readiness waits.
 pub(crate) struct Socks5UdpFramed {
-    inner: UdpFramed<Socks5UDPCodec>,
+    inner: NativeDatagram,
     header: BytesMut,
     pending: Option<(Bytes, SocketAddr)>,
 }
@@ -101,7 +102,7 @@ pub(crate) struct Socks5UdpFramed {
 impl Socks5UdpFramed {
     pub(crate) fn new(socket: UdpSocket) -> Self {
         Self {
-            inner: UdpFramed::new(socket, Socks5UDPCodec),
+            inner: NativeDatagram::new(socket).expect("bound SOCKS UDP socket"),
             header: BytesMut::with_capacity(262),
             pending: None,
         }
@@ -109,13 +110,20 @@ impl Socks5UdpFramed {
 }
 
 impl Stream for Socks5UdpFramed {
-    type Item = Result<((SocksAddr, BytesMut), SocketAddr), io::Error>;
+    type Item = Result<((SocksAddr, Bytes), SocketAddr), io::Error>;
 
     fn poll_next(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Self::Item>> {
-        self.inner.poll_next_unpin(cx)
+        for _ in 0..16 {
+            let Some(packet) = ready!(self.inner.poll_next_unpin(cx)) else { return Poll::Ready(None); };
+            let Some((destination, len)) = Socks5UDPCodec::decode_header(&packet.data) else { continue; };
+            let source = packet.src_addr.must_into_socket_addr();
+            return Poll::Ready(Some(Ok(((destination, packet.data.slice(len..)), source))));
+        }
+        cx.waker().wake_by_ref();
+        Poll::Pending
     }
 }
 
@@ -150,7 +158,7 @@ impl Sink<((Bytes, SocksAddr), SocketAddr)> for Socks5UdpFramed {
             return Poll::Ready(Ok(()));
         };
         let result = ready!(poll_send_to_vectored(
-            self.inner.get_ref(), cx, &self.header, data, *peer,
+            self.inner.physical_socket().0, cx, &self.header, data, *peer,
         ));
         self.pending = None;
         Poll::Ready(result)
@@ -218,7 +226,7 @@ impl Stream for InboundUdp<Socks5UdpFramed> {
                         continue;
                     }
                     return Poll::Ready(Some(UdpPacket {
-                        data: pkt.freeze(),
+                        data: pkt,
                         src_addr: SocksAddr::Ip(src),
                         dst_addr: dst,
                         inbound_user: None,
@@ -329,5 +337,80 @@ mod tests {
         let n = receiver.recv(&mut wire).await.unwrap();
         assert_eq!(&wire[n - 1000..n], &[0x42; 1000]);
         assert!(framed.pending.is_none());
+    }
+}
+
+impl DatagramBatch for InboundUdp<Socks5UdpFramed> {
+    fn poll_send_batch(&mut self, cx: &mut Context<'_>, batch: &mut PacketBatch) -> Poll<BatchResult> {
+        if let Err(error) = ready!(self.inner.poll_flush_unpin(cx)) {
+            return Poll::Ready(BatchResult::failed(error));
+        }
+        let (socket, ipv6) = self.inner.inner.physical_socket();
+        poll_send_socks_batch(socket, ipv6, cx, batch, BatchTarget::Client)
+    }
+    fn poll_recv_batch(&mut self, cx: &mut Context<'_>, packets: &mut Vec<UdpPacket>) -> Poll<Option<()>> {
+        if ready!(self.inner.inner.poll_recv_batch(cx, packets)).is_none() { return Poll::Ready(None); }
+        packets.retain_mut(|packet| {
+            if packet.src_addr.ip().is_none_or(|ip| ip.to_canonical() != self.allowed_src) { return false; }
+            let Some((destination, len)) = Socks5UDPCodec::decode_header(&packet.data) else { return false; };
+            packet.dst_addr = destination;
+            packet.data = packet.data.slice(len..);
+            true
+        });
+        if packets.is_empty() { cx.waker().wake_by_ref(); Poll::Pending }
+        else { Poll::Ready(Some(())) }
+    }
+}
+
+#[cfg(test)]
+mod batch_tests {
+    use super::*;
+    use futures::future::poll_fn;
+    use tokio::time::{timeout, Duration};
+
+    #[tokio::test]
+    async fn inbound_preserves_batch_request_and_reply_addresses() {
+        timeout(Duration::from_secs(3), async {
+            let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let relay = socket.local_addr().unwrap();
+            let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let mut inbound = InboundUdp::new(Socks5UdpFramed::new(socket), client.local_addr().unwrap().ip());
+            let mut expected = Vec::new();
+            for (address, data) in [("192.0.2.1:53", b"".as_slice()), ("[2001:db8::1]:443", b"ipv6"), ("example.test:123", b"domain")] {
+                let address: SocksAddr = address.parse().unwrap();
+                let mut wire = BytesMut::new();
+                Socks5UDPCodec.encode((Bytes::copy_from_slice(data), address), &mut wire).unwrap();
+                client.send_to(&wire, relay).await.unwrap();
+                expected.push(wire.freeze());
+            }
+            let mut incoming = Vec::new();
+            let mut replies = PacketBatch::default();
+            let mut count = 0;
+            while count < 3 {
+                assert!(poll_fn(|cx| inbound.poll_recv_batch(cx, &mut incoming)).await.is_some());
+                count += incoming.len();
+                for mut packet in incoming.drain(..) {
+                    let source = packet.src_addr;
+                    packet.src_addr = packet.dst_addr;
+                    packet.dst_addr = source;
+                    replies.push(packet).unwrap();
+                }
+            }
+            let result = poll_fn(|cx| inbound.poll_send_batch(cx, &mut replies)).await;
+            #[cfg(target_os = "linux")]
+            assert_eq!(result.sent, 3);
+            assert!(result.error.is_none());
+            for _ in 0..result.sent { replies.complete(); }
+            while !replies.is_empty() {
+                let result = poll_fn(|cx| inbound.poll_send_batch(cx, &mut replies)).await;
+                assert!(result.error.is_none());
+                for _ in 0..result.sent { replies.complete(); }
+            }
+            for expected in expected {
+                let mut wire = [0; 512];
+                let len = client.recv(&mut wire).await.unwrap();
+                assert_eq!(&wire[..len], expected.as_ref());
+            }
+        }).await.unwrap();
     }
 }

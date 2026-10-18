@@ -4,7 +4,7 @@ use bytes::{Bytes, BytesMut};
 use futures::{SinkExt, StreamExt, future::poll_fn};
 use h2::{SendStream, server::Builder};
 use http::Response;
-use tokio::{io::{AsyncReadExt, AsyncWriteExt}, sync::Mutex, time::timeout};
+use tokio::{io::{AsyncReadExt, AsyncWriteExt, duplex}, sync::Mutex, time::timeout};
 use tokio_util::codec::{Decoder, Encoder};
 
 use super::{H2MuxDatagram, PacketCodec};
@@ -237,4 +237,26 @@ async fn only_tcp_rejects_udp_before_dial() {
     let config: MuxOption = yaml_serde::from_str("enabled: true\nonly-tcp: true").unwrap();
     assert!(config.only_tcp);
     assert!(!MuxOption::default().only_tcp);
+}
+
+#[tokio::test]
+async fn batch_preserves_addresses_and_empty_packets_under_backpressure() {
+    use crate::proxy::datagram::batch::{DatagramBatch, PacketBatch};
+    let (writer, reader) = duplex(3);
+    let mut sender = H2MuxDatagram::new(AnyStream::new(writer));
+    let mut receiver = H2MuxDatagram::new(AnyStream::new(reader));
+    let expected = [packet("1.2.3.4", b"one"), packet("dns", b""), packet("::1", b"three")];
+    let mut batch = PacketBatch::default();
+    for packet in &expected { batch.push(packet.clone()).unwrap(); }
+    let send = poll_fn(|cx| sender.poll_send_batch(cx, &mut batch));
+    let receive = async {
+        for expected in &expected {
+            let packet = receiver.next().await.unwrap();
+            assert_eq!(packet.data, expected.data);
+            assert_eq!(packet.src_addr, expected.dst_addr);
+        }
+    };
+    let (result, ()) = tokio::join!(send, receive);
+    assert_eq!(result.sent, 3);
+    assert!(result.error.is_none());
 }

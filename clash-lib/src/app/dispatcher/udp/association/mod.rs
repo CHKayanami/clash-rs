@@ -240,7 +240,7 @@ impl UdpAssociationPool {
         let force_source = (unresolved_fake || !datagram.reports_peer_source()).then(||
             sess.orig_destination.clone().unwrap_or_else(|| sess.destination.clone()));
         let context = AssociationRelay::new(packets, commands, &self.config,
-            sess.source, sess.inbound_user.clone(), force_source, matches!(datagram, AnyOutboundDatagram::Udp(_) | AnyOutboundDatagram::NativeUdp(_)));
+            sess.source, sess.inbound_user.clone(), force_source, datagram.physical_socket().is_some() || matches!(&datagram, AnyOutboundDatagram::Socks5(inner) if inner.has_native_send()));
         let cleanup = WorkerGuard(Arc::downgrade(slot), id);
         let task = dispatch_datagram!(datagram, |inner| tokio::spawn(async move {
             let (_permit, _guard, _cleanup) = (permit, guard, cleanup);

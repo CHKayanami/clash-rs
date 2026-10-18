@@ -569,3 +569,43 @@ async fn sender_cache_is_invalidated_by_registration_during_pending_flush() {
     assert_eq!(a.state.tracker.download_total(), 5);
     assert_eq!(b.state.tracker.download_total(), 0);
 }
+
+#[tokio::test]
+async fn native_batch_preserves_flow_statistics_after_a_failed_datagram() {
+    use crate::proxy::direct::Handler as DirectHandler;
+    use tokio::net::UdpSocket;
+    timeout(Duration::from_secs(5), async {
+        let mut fixture = Fixture::new(Duration::from_secs(60));
+        let first_peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let second_peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let outbound: ProtocolOutbound = Arc::new(DirectHandler::new("direct")).into();
+        let mut first = session(first_peer.local_addr().unwrap().port());
+        first.inbound_user = Some(Arc::from("batch-user"));
+        let mut second = session(second_peer.local_addr().unwrap().port());
+        second.inbound_user = first.inbound_user.clone();
+        let a = fixture.connect(&outbound, &first).await;
+        let b = fixture.connect(&outbound, &second).await;
+        assert!(Arc::ptr_eq(&a.association, &b.association));
+        send(&a, b"a1");
+        send(&b, b"b1");
+        a.try_send(UdpPacket::new(Bytes::from(vec![0; 65508]), SocksAddr::any_ipv4(), SocksAddr::any_ipv4())).unwrap();
+        send(&a, b"a2");
+        send(&b, b"b2");
+        for (peer, expected) in [(&first_peer, [b"a1", b"a2"]), (&second_peer, [b"b1", b"b2"])] {
+            for expected in expected {
+                let mut data = [0; 32];
+                let (len, source) = peer.recv_from(&mut data).await.unwrap();
+                assert_eq!(&data[..len], expected);
+                peer.send_to(&data[..len], source).await.unwrap();
+            }
+        }
+        for _ in 0..4 { fixture.receive().await; }
+        assert_eq!(a.state.tracker.upload_total(), 4);
+        assert_eq!(b.state.tracker.upload_total(), 4);
+        assert_eq!(a.state.tracker.download_total(), 4);
+        assert_eq!(b.state.tracker.download_total(), 4);
+        let stats = fixture.manager.drain_user_stats().await;
+        assert_eq!(stats["batch-user"].upload, 8);
+        assert_eq!(stats["batch-user"].download, 8);
+    }).await.unwrap();
+}

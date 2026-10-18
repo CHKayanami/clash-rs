@@ -1,3 +1,4 @@
+use crate::proxy::datagram::{batch::{DatagramBatch, PacketBatch, BatchResult, poll_send_stream}, framed::FramedBatch};
 use std::{
     io::{self, IoSlice},
     pin::Pin,
@@ -15,13 +16,14 @@ use crate::{
     proxy::{datagram::{DatagramReadError, UdpPacket}, AnyStream},
     session::SocksAddr,
 };
-use super::codec::{PacketHeader, decode_header, encode_header};
+use super::codec::{PacketHeader, decode_header, encode_header, append_header};
 
 const INITIAL_BUFFER_SIZE: usize = 2048;
 const COALESCE_PAYLOAD_LIMIT: usize = 2048;
 
 pub struct OutboundDatagramUotV2 {
     inner: AnyStream,
+    batch_writer: FramedBatch,
     target_addr: SocksAddr,
     packet_mode: bool,
 
@@ -40,7 +42,7 @@ pub struct OutboundDatagramUotV2 {
 impl OutboundDatagramUotV2 {
     pub fn new(inner: AnyStream, target_addr: SocksAddr) -> Self {
         Self {
-            inner, target_addr, packet_mode: false,
+            inner, batch_writer: FramedBatch::default(), target_addr, packet_mode: false,
             header_buf: BytesMut::new(), header_written: 0,
             payload_buf: None, payload_written: 0, flushed: true,
             read_buf: BytesMut::new(), read_header: None,
@@ -220,3 +222,25 @@ impl Stream for OutboundDatagramUotV2 {
 #[cfg(test)]
 #[path = "tests.rs"]
 mod tests;
+
+impl DatagramBatch for OutboundDatagramUotV2 {
+    fn poll_send_batch(&mut self, cx: &mut Context<'_>, batch: &mut PacketBatch) -> Poll<BatchResult> {
+        if !self.batch_writer.is_active() && batch.len() == 1 {
+            return poll_send_stream(self, cx, batch);
+        }
+        if !self.batch_writer.is_active() {
+            if let Err(error) = ready!(Pin::new(&mut *self).poll_ready(cx)) {
+                return Poll::Ready(BatchResult::terminated(error));
+            }
+            let packet_mode = self.packet_mode;
+            let target = &self.target_addr;
+            self.batch_writer.prepare(batch, |packet, header| {
+                if !packet_mode && packet.dst_addr != *target {
+                    return Err(io::Error::new(io::ErrorKind::InvalidInput, "UoT connect destination mismatch"));
+                }
+                append_header(header, &packet.dst_addr, packet.data.len(), packet_mode)
+            });
+        }
+        self.batch_writer.poll_write(&mut self.inner, cx)
+    }
+}

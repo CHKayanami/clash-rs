@@ -1,3 +1,4 @@
+use crate::proxy::datagram::batch::DatagramBatch;
 use crate::{common::io::datagram_relay::{relay, RelayContext},
     proxy::{AnyOutboundDatagram, OutboundDatagram}};
 use tracing::warn;
@@ -969,7 +970,7 @@ async fn relay_datagram<D, W, R>(
     on_sent: W,
     on_received: R,
 ) where
-    D: OutboundDatagram<UdpPacket>,
+    D: OutboundDatagram,
     W: FnMut(usize),
     R: FnMut(UdpPacket) -> bool,
 {
@@ -1069,3 +1070,7 @@ async fn check_busy_route_control(wide: bool) {
         }
     }).await.unwrap();
 }
+
+impl DatagramBatch for BackpressuredDatagram {}
+
+impl DatagramBatch for MockInboundDatagram {}

@@ -61,19 +61,24 @@ impl Encoder<UdpPacket> for PacketCodec {
     type Error = io::Error;
 
     fn encode(&mut self, packet: UdpPacket, dst: &mut BytesMut) -> io::Result<()> {
-        let len = u16::try_from(packet.data.len()).map_err(|_| {
-            io::Error::new(io::ErrorKind::InvalidInput, "h2mux UDP payload too large")
-        })?;
-        if let SocksAddr::Domain(host, _) = &packet.dst_addr {
-            if host.is_empty() || host.len() > 255 {
-                return Err(io::Error::new(io::ErrorKind::InvalidInput,
-                    "invalid h2mux UDP domain length"));
-            }
-        }
-        dst.reserve(packet.dst_addr.size() + 2 + packet.data.len());
-        packet.dst_addr.write_buf(dst);
-        dst.put_u16(len);
+        encode_header(&packet.dst_addr, packet.data.len(), dst)?;
         dst.extend_from_slice(&packet.data);
         Ok(())
     }
+}
+
+pub(super) fn encode_header(address: &SocksAddr, payload_len: usize, dst: &mut BytesMut) -> io::Result<()> {
+    let len = u16::try_from(payload_len).map_err(|_| {
+        io::Error::new(io::ErrorKind::InvalidInput, "h2mux UDP payload too large")
+    })?;
+    if let SocksAddr::Domain(host, _) = address {
+        if host.is_empty() || host.len() > 255 {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput,
+                "invalid h2mux UDP domain length"));
+        }
+    }
+    dst.reserve(address.size() + 2);
+    address.write_buf(dst);
+    dst.put_u16(len);
+    Ok(())
 }

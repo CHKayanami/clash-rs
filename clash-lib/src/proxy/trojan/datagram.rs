@@ -13,7 +13,11 @@ use tokio_util::io::poll_read_buf;
 use tracing::debug;
 
 use crate::{
-    proxy::{AnyStream, datagram::UdpPacket},
+    proxy::{AnyStream, datagram::{
+        UdpPacket,
+        batch::{BatchResult, DatagramBatch, PacketBatch, poll_send_stream},
+        framed::FramedBatch,
+    }},
     session::{SocksAddr, SocksAddrType},
 };
 
@@ -24,6 +28,7 @@ pub struct OutboundDatagramTrojan {
     write_buf: BytesMut,
     written: usize,
     flushed: bool,
+    batch_writer: FramedBatch,
 }
 
 impl OutboundDatagramTrojan {
@@ -35,6 +40,7 @@ impl OutboundDatagramTrojan {
             write_buf: BytesMut::new(),
             written: 0,
             flushed: true,
+            batch_writer: FramedBatch::default(),
         }
     }
 }
@@ -53,17 +59,8 @@ impl Sink<UdpPacket> for OutboundDatagramTrojan {
         if !self.flushed {
             return Err(io::Error::other("previous Trojan UDP packet is pending"));
         }
-        if item.data.len() > u16::MAX as usize {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "Trojan UDP packet exceeds u16 length",
-            ));
-        }
-
         self.write_buf.clear();
-        item.dst_addr.write_buf(&mut self.write_buf);
-        self.write_buf.put_u16(item.data.len() as u16);
-        self.write_buf.put_slice(b"\r\n");
+        encode_header(&item, &mut self.write_buf)?;
         self.write_buf.put_slice(&item.data);
         self.written = 0;
         self.flushed = false;
@@ -108,6 +105,40 @@ impl Sink<UdpPacket> for OutboundDatagramTrojan {
     ) -> Poll<io::Result<()>> {
         ready!(self.as_mut().poll_flush(cx))?;
         Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+fn encode_header(packet: &UdpPacket, buffer: &mut BytesMut) -> io::Result<()> {
+    let len = u16::try_from(packet.data.len()).map_err(|_| {
+        io::Error::new(io::ErrorKind::InvalidInput,
+            "Trojan UDP packet exceeds u16 length")
+    })?;
+    if let SocksAddr::Domain(host, _) = &packet.dst_addr {
+        if host.is_empty() || host.len() > u8::MAX as usize {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput,
+                "invalid Trojan UDP domain length"));
+        }
+    }
+    packet.dst_addr.write_buf(buffer);
+    buffer.put_u16(len);
+    buffer.put_slice(b"\r\n");
+    Ok(())
+}
+
+impl DatagramBatch for OutboundDatagramTrojan {
+    fn poll_send_batch(&mut self, cx: &mut Context<'_>, batch: &mut PacketBatch)
+        -> Poll<BatchResult>
+    {
+        if !self.batch_writer.is_active() && batch.len() == 1 {
+            return poll_send_stream(self, cx, batch);
+        }
+        if !self.batch_writer.is_active() {
+            if let Err(error) = ready!(Pin::new(&mut *self).poll_flush(cx)) {
+                return Poll::Ready(BatchResult::terminated(error));
+            }
+            self.batch_writer.prepare(batch, encode_header);
+        }
+        self.batch_writer.poll_write(&mut self.inner, cx)
     }
 }
 
@@ -300,3 +331,7 @@ mod tests {
         assert!(datagram.next().await.is_none());
     }
 }
+
+#[cfg(test)]
+#[path = "batch_tests.rs"]
+mod batch_tests;

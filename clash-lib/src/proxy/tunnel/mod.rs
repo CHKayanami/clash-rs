@@ -1,3 +1,4 @@
+use crate::proxy::datagram::batch::DatagramBatch;
 use crate::runner::ListenerReady;
 use crate::proxy::AnyStream;
 use crate::{
@@ -271,3 +272,5 @@ impl Stream for UdpSession {
         }
     }
 }
+
+impl DatagramBatch for UdpSession {}

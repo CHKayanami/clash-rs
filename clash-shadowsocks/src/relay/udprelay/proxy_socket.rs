@@ -133,6 +133,9 @@ impl<S> ProxySocket<S> {
         }
     }
 
+    /// Borrow the underlying packet transport.
+    pub fn get_ref(&self) -> &S { &self.io }
+
     /// Set `send` timeout, `None` will clear timeout
     pub fn set_send_timeout(&mut self, t: Option<Duration>) {
         self.send_timeout = t;
@@ -196,6 +199,24 @@ where
         }
 
         Ok(())
+    }
+
+    /// Encode exactly one independent encrypted datagram. Retain the returned
+    /// bytes across transport Pending; never reuse a control packet ID for a
+    /// different payload, even when the encoded packet is later discarded.
+    pub fn encode_packet(&self, addr: &Address, control: &UdpSocketControlData,
+        payload: &[u8]) -> ProxySocketResult<Bytes> {
+        if payload.len() > u16::MAX as usize {
+            return Err(io::Error::new(ErrorKind::InvalidInput, "UDP payload too large").into());
+        }
+        if let Address::DomainNameAddress(host, _) = addr {
+            if host.is_empty() || host.len() > u8::MAX as usize {
+                return Err(io::Error::new(ErrorKind::InvalidInput, "invalid UDP domain length").into());
+            }
+        }
+        let mut buffer = BytesMut::with_capacity(payload.len() + 256);
+        self.encrypt_send_buffer(addr, control, &self.identity_keys, payload, &mut buffer)?;
+        Ok(buffer.freeze())
     }
 
     /// Send a UDP packet to addr through proxy `target` with `ControlData`
@@ -280,6 +301,14 @@ where
                 decrypt_client_payload(&self.context, self.method, &self.key, recv_buf, user_manager)
             }
         }
+    }
+
+    /// Authenticate and decrypt one complete datagram in place using the same
+    /// user policy as the socket receive APIs. The plaintext starts at offset 0.
+    pub fn decode_packet(&self, packet: &mut [u8])
+        -> ProxySocketResult<(usize, Address, Option<UdpSocketControlData>)> {
+        self.decrypt_recv_buffer(packet, self.user_manager.as_deref())
+            .map_err(ProxySocketError::ProtocolError)
     }
 
     /// Poll family function to receive decrypted packet from Shadowsocks' UDP server with control

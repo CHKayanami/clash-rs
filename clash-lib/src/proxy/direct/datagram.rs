@@ -1,3 +1,4 @@
+use crate::proxy::datagram::batch::{DatagramBatch, PacketBatch, BatchResult, poll_send_single};
 use crate::{app::dns::ThreadSafeDNSResolver, proxy::datagram::UdpPacket, session::SocksAddr};
 use futures::{Sink, Stream, ready};
 use std::{collections::HashMap, io, net::SocketAddr, pin::Pin,
@@ -36,6 +37,11 @@ impl OutboundDatagramImpl {
             ip_to_logical: HashMap::new(), last_sweep: Instant::now(), pending_dns: None,
             resolved_dst: None, logical: None })
     }
+
+    pub(crate) fn physical_socket(&self) -> (&UdpSocket, bool) { self.native.physical_socket() }
+
+    #[cfg(feature = "shadowsocks")]
+    pub(crate) fn physical_recv_socket(&self) -> Option<&UdpSocket> { self.native.physical_recv_socket() }
 
     // SOCKS relays have a physical IP target and need no logical DNS mapping.
     pub(crate) fn poll_send_to_vectored(
@@ -473,5 +479,30 @@ mod tests {
         for i in 0..5 {
             assert!(received.contains(&format!("burst-{i}")));
         }
+    }
+}
+
+impl DatagramBatch for OutboundDatagramImpl {
+    fn poll_send_batch(&mut self, cx: &mut Context<'_>, batch: &mut PacketBatch) -> Poll<BatchResult> {
+        if !self.flushed || batch.packets().next().is_some_and(|packet| packet.dst_addr.is_domain()) {
+            return poll_send_single(self, cx, batch);
+        }
+        let result = ready!(DatagramBatch::poll_send_batch(&mut self.native, cx, batch));
+        for packet in batch.packets().take(result.sent) {
+            if let SocksAddr::Ip(address) = packet.dst_addr {
+                self.ip_to_logical.remove(&canonicalize_src(address));
+            }
+        }
+        Poll::Ready(result)
+    }
+    fn poll_recv_batch(&mut self, cx: &mut Context<'_>, packets: &mut Vec<UdpPacket>) -> Poll<Option<()>> {
+        if ready!(DatagramBatch::poll_recv_batch(&mut self.native, cx, packets)).is_none() { return Poll::Ready(None); }
+        for packet in packets {
+            if let SocksAddr::Ip(peer) = packet.src_addr
+                && let Some((logical, _)) = self.ip_to_logical.get(&peer) {
+                packet.src_addr = logical.clone();
+            }
+        }
+        Poll::Ready(Some(()))
     }
 }

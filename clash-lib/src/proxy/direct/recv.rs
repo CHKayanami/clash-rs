@@ -23,10 +23,23 @@ thread_local! {
 /// Drain a bounded batch into one compact allocation shared by its payloads.
 /// A retained packet keeps its batch alive, but never retains the thread-local
 /// maximum-size receive scratch. Empty payloads do not retain batch storage.
-pub(super) fn recv_batch(
+pub(crate) fn recv_batch(
     socket: &UdpSocket,
     limit: usize,
     mut on_packet: impl FnMut(Bytes, SocketAddr),
+) -> io::Result<usize> {
+    recv_batch_map(socket, limit, |data, _| Some((data.len(), ())),
+        |data, address, ()| on_packet(data, address))
+}
+
+/// Transform initialized packets before compacting their accepted output. The
+/// callback runs synchronously, cannot retain the scratch borrow, and must not
+/// re-enter this receive helper. A returned length must fit the received packet.
+pub(crate) fn recv_batch_map<M>(
+    socket: &UdpSocket,
+    limit: usize,
+    mut transform: impl FnMut(&mut [u8], SocketAddr) -> Option<(usize, M)>,
+    mut on_packet: impl FnMut(Bytes, SocketAddr, M),
 ) -> io::Result<usize> {
     let limit = limit.min(MAX_RECV_BATCH);
     if limit == 0 {
@@ -102,7 +115,6 @@ pub(super) fn recv_batch(
                 let len = messages[i].msg_len as usize;
                 let len = len.min(MAX_DATAGRAM_SIZE);
                 packets[i] = Some((i * MAX_DATAGRAM_SIZE, len, address));
-                total_len += len;
             }
         }
         #[cfg(not(target_os = "linux"))]
@@ -116,7 +128,6 @@ pub(super) fn recv_batch(
                     Ok((len, address)) => {
                         packets[received] =
                             Some((received * MAX_DATAGRAM_SIZE, len, address));
-                        total_len += len;
                         received += 1;
                     }
                     Err(err) if received > 0 => {
@@ -133,6 +144,24 @@ pub(super) fn recv_batch(
             count = received;
         }
 
+        let mut metadata = std::array::from_fn::<_, MAX_RECV_BATCH, _>(|_| None);
+        for i in 0..count {
+            let Some((offset, len, address)) = packets[i] else { continue; };
+            #[cfg(target_os = "linux")]
+            // SAFETY: only initialized, non-truncated ranges are exposed. The
+            // exclusive scratch borrow remains held until all copies finish.
+            let data = unsafe {
+                std::slice::from_raw_parts_mut(buffer.as_mut_ptr().add(offset).cast::<u8>(), len)
+            };
+            #[cfg(not(target_os = "linux"))]
+            let data = &mut buffer[offset..offset + len];
+            if let Some((output_len, value)) = transform(data, address) {
+                assert!(output_len <= len, "packet transform exceeded its initialized range");
+                packets[i] = Some((offset, output_len, address));
+                metadata[i] = Some(value);
+                total_len += output_len;
+            } else { packets[i] = None; }
+        }
         let mut payloads = BytesMut::with_capacity(total_len);
         for &(offset, len, _) in packets[..count].iter().flatten() {
             #[cfg(target_os = "linux")]
@@ -150,9 +179,11 @@ pub(super) fn recv_batch(
         }
         let payloads = payloads.freeze();
         let mut offset = 0;
-        for &(_, len, address) in packets[..count].iter().flatten() {
-            on_packet(payloads.slice(offset..offset + len), address);
-            offset += len;
+        for (packet, value) in packets[..count].iter().zip(&mut metadata) {
+            if let Some((_, len, address)) = packet {
+                on_packet(payloads.slice(offset..offset + *len), *address, value.take().unwrap());
+                offset += len;
+            }
         }
         Ok(count)
     })
