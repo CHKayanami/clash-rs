@@ -120,7 +120,7 @@ impl CopyBuffer {
         cx: &mut Context<'_>,
         mut reader: Pin<&mut R>,
         mut writer: Pin<&mut W>,
-        mut last_active: Option<&mut tokio::time::Instant>,
+        active: &mut bool,
     ) -> Poll<io::Result<u64>>
     where
         R: AsyncRead + ?Sized,
@@ -153,9 +153,7 @@ impl CopyBuffer {
                             self.read_done = true;
                         } else {
                             self.cache_length += n;
-                            if let Some(last_active) = last_active.as_mut() {
-                                **last_active = tokio::time::Instant::now();
-                            }
+                            *active = true;
                         }
                     }
                     Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
@@ -206,9 +204,7 @@ impl CopyBuffer {
                             }
                             self.amt += written as u64;
                             self.need_flush = true;
-                            if let Some(last_active) = last_active.as_mut() {
-                                **last_active = tokio::time::Instant::now();
-                            }
+                            *active = true;
                         }
                     }
                     Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
@@ -219,8 +215,9 @@ impl CopyBuffer {
                 }
             }
 
-            // 3. Flush if needed
-            if self.need_flush {
+            // Flush before waiting for I/O or finishing, allowing ready input
+            // to batch writes without delaying request/response protocols.
+            if self.need_flush && (read_pending || write_pending || self.read_done) {
                 ready!(writer.as_mut().poll_flush(cx))?;
                 self.need_flush = false;
             }
@@ -386,7 +383,7 @@ mod tests {
                 cx,
                 Pin::new(&mut reader),
                 Pin::new(&mut writer),
-                None,
+                &mut false,
             )
         })
         .await;
@@ -412,7 +409,7 @@ mod tests {
                 cx,
                 Pin::new(&mut reader),
                 Pin::new(&mut writer),
-                None,
+                &mut false,
             )
         })
         .await;

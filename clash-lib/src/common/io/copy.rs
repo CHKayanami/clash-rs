@@ -1,6 +1,6 @@
 //! Owned TCP forwarding with no references into the future's own fields.
 use std::{future::Future, mem::replace, pin::Pin, task::{Context, Poll}, time::Duration};
-use tokio::{io::AsyncWrite, net::TcpStream};
+use tokio::net::TcpStream;
 use crate::proxy::{AnyStream, ProxyStream, dispatch_stream};
 use super::{buffered::{self, CopyState}, CopyBidirectionalError, TrafficTracker};
 #[cfg(all(target_os = "linux", feature = "zero_copy"))]
@@ -63,8 +63,6 @@ impl Mode {
 enum Phase {
     Initializing(Settings),
     Copying(Mode),
-    ShutdownLeft(CopyResult),
-    ShutdownRight(CopyResult),
     Done,
 }
 
@@ -92,29 +90,19 @@ impl<A: ProxyStream> Future for StreamCopy<A> {
                     else { unreachable!(); };
                     *phase = match Mode::initialize(a, b, settings) {
                         Ok(mode) => Phase::Copying(mode),
-                        Err(error) => Phase::ShutdownLeft(Err(error)),
+                        Err(error) => return Poll::Ready(Err(error)),
                     };
                 }
                 Phase::Copying(mode) => match mode.poll(a, b, cx) {
                     Poll::Pending => return Poll::Pending,
-                    Poll::Ready(result) => *phase = Phase::ShutdownLeft(result),
+                    Poll::Ready(result) => {
+                        // Successful transfers already shut down both writers.
+                        // Errors must release owners without waiting for another
+                        // protocol shutdown outside the copy timeout machinery.
+                        *phase = Phase::Done;
+                        return Poll::Ready(result);
+                    }
                 },
-                Phase::ShutdownLeft(_) => {
-                    if Pin::new(&mut *a).poll_shutdown(cx).is_pending() {
-                        return Poll::Pending;
-                    }
-                    let Phase::ShutdownLeft(result) = replace(phase, Phase::Done)
-                    else { unreachable!(); };
-                    *phase = Phase::ShutdownRight(result);
-                }
-                Phase::ShutdownRight(_) => {
-                    if Pin::new(&mut *b).poll_shutdown(cx).is_pending() {
-                        return Poll::Pending;
-                    }
-                    let Phase::ShutdownRight(result) = replace(phase, Phase::Done)
-                    else { unreachable!(); };
-                    return Poll::Ready(result);
-                }
                 Phase::Done => panic!("TCP copy polled after completion"),
             }
         }
@@ -146,5 +134,73 @@ pub fn copy_bidirectional(
     match a {
         AnyStream::Tcp(stream) => BidirectionalCopy::Tcp(StreamCopy::new(stream, b, settings)),
         stream => BidirectionalCopy::Other(StreamCopy::new(stream, b, settings)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{io, sync::{Arc, atomic::{AtomicUsize, Ordering}}};
+    use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+
+    struct TestStream {
+        shutdowns: Arc<AtomicUsize>,
+        fail: bool,
+    }
+
+    impl AsyncRead for TestStream {
+        fn poll_read(self: Pin<&mut Self>, _: &mut Context<'_>, _: &mut ReadBuf<'_>)
+            -> Poll<io::Result<()>>
+        {
+            if self.fail {
+                Poll::Ready(Err(io::ErrorKind::ConnectionReset.into()))
+            } else {
+                Poll::Ready(Ok(()))
+            }
+        }
+    }
+
+    impl AsyncWrite for TestStream {
+        fn poll_write(self: Pin<&mut Self>, _: &mut Context<'_>, _: &[u8])
+            -> Poll<io::Result<usize>>
+        { Poll::Pending }
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>>
+        { Poll::Pending }
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            self.shutdowns.fetch_add(1, Ordering::Relaxed);
+            if self.fail { Poll::Pending } else { Poll::Ready(Ok(())) }
+        }
+    }
+
+    impl ProxyStream for TestStream {}
+
+    #[tokio::test]
+    async fn copy_error_does_not_wait_for_protocol_shutdown() {
+        let shutdowns = Arc::new(AtomicUsize::new(0));
+        let stream = || AnyStream::Dynamic(Box::new(TestStream {
+            shutdowns: shutdowns.clone(), fail: true,
+        }));
+        let mut task = tokio_test::task::spawn(copy_bidirectional(
+            stream(), stream(), 1024, Duration::from_secs(10),
+            Duration::from_secs(10), TrafficTracker::noop(),
+        ));
+        assert!(matches!(
+            task.poll(), Poll::Ready(Err(CopyBidirectionalError::LeftClosed(_)))
+        ));
+        assert_eq!(shutdowns.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn successful_copy_shuts_down_each_writer_once() {
+        let shutdowns = Arc::new(AtomicUsize::new(0));
+        let stream = || AnyStream::Dynamic(Box::new(TestStream {
+            shutdowns: shutdowns.clone(), fail: false,
+        }));
+        let counts = copy_bidirectional(
+            stream(), stream(), 1024, Duration::from_secs(10),
+            Duration::from_secs(10), TrafficTracker::noop(),
+        ).await.unwrap();
+        assert_eq!(counts, (0, 0));
+        assert_eq!(shutdowns.load(Ordering::Relaxed), 2);
     }
 }

@@ -17,7 +17,6 @@ use tokio::net::{TcpStream, UnixStream};
 use super::{CopyBidirectionalError, SlideBuffer, TrafficTracker};
 
 use super::transfer::{Buffer, CopyState as TransferCopyState, Direction};
-use tokio::time::Instant;
 
 /// the size of PIPE_BUF
 const PIPE_SIZE: usize = 65536;
@@ -278,7 +277,7 @@ impl CopyBuffer {
         cx: &mut Context<'_>,
         r: &mut R,
         w: &mut W,
-        last_active: &mut tokio::time::Instant,
+        active: &mut bool,
     ) -> Poll<Result<u64>> {
         while let Some(prefix) = self.prefix.as_mut() {
             let size = ready!(Pin::new(&mut *w).poll_write(cx, prefix.as_slice()))?;
@@ -292,7 +291,7 @@ impl CopyBuffer {
             prefix.consume(size);
             self.amt += size as u64;
             self.need_flush = true;
-            *last_active = tokio::time::Instant::now();
+            *active = true;
             if prefix.is_empty() {
                 self.prefix = None;
             }
@@ -306,7 +305,7 @@ impl CopyBuffer {
 
                 match self.poll_fill_buf(cx, r) {
                     Poll::Ready(Ok(_)) => {
-                        *last_active = tokio::time::Instant::now();
+                        *active = true;
                     }
                     Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
                     Poll::Pending => {
@@ -337,7 +336,7 @@ impl CopyBuffer {
                     self.pos += size;
                     self.amt += size as u64;
                     self.need_flush = true;
-                    *last_active = tokio::time::Instant::now();
+                    *active = true;
                 }
             }
 
@@ -433,8 +432,8 @@ impl<R: Stream + Unpin, W: Stream + Unpin> Buffer<R, W> for CopyBuffer {
 
     fn poll_copy(
         &mut self, cx: &mut Context<'_>, reader: &mut R, writer: &mut W,
-        last_active: &mut Instant, _direction: Direction,
+        active: &mut bool, _direction: Direction,
     ) -> Poll<Result<u64>> {
-        self.poll_copy(cx, reader, writer, last_active)
+        self.poll_copy(cx, reader, writer, active)
     }
 }

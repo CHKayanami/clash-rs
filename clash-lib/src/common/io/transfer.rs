@@ -1,6 +1,6 @@
 //! Shared direction state, accounting and shutdown for buffered and splice I/O.
 use std::{io::{Error, ErrorKind}, pin::Pin, task::{Context, Poll}, time::Duration};
-use tokio::{io::{AsyncRead, AsyncWrite}, time::Instant};
+use tokio::io::{AsyncRead, AsyncWrite};
 use super::{CopyBidirectionalError, TrafficTracker, timeout::CopyTimeouts};
 
 #[derive(Clone, Copy)]
@@ -29,7 +29,7 @@ pub(super) trait Buffer<R: ?Sized, W: ?Sized> {
     fn amount_transferred(&self) -> u64;
     fn poll_copy(
         &mut self, cx: &mut Context<'_>, reader: &mut R, writer: &mut W,
-        last_active: &mut Instant, direction: Direction,
+        active: &mut bool, direction: Direction,
     ) -> Poll<Result<u64, CopyBidirectionalError>>;
 }
 
@@ -63,9 +63,9 @@ impl<C> TransferState<C> {
             match self {
                 Self::Running(buffer) => {
                     let before = buffer.amount_transferred();
-                    let result = buffer.poll_copy(
-                        cx, reader, writer, &mut timeouts.last_active, direction,
-                    );
+                    let mut active = false;
+                    let result = buffer.poll_copy(cx, reader, writer, &mut active, direction);
+                    timeouts.record_activity(active);
                     let written = buffer.amount_transferred() - before;
                     // Account successful writes even if a later I/O operation
                     // in the same poll fails. Reads never refresh half-close.

@@ -2,7 +2,7 @@
 use std::{pin::Pin, task::{Context, Poll}, time::Duration};
 #[cfg(any(test, feature = "allocation-tests"))]
 use std::{future::Future, mem::replace};
-use tokio::{io::{AsyncRead, AsyncWrite}, time::Instant};
+use tokio::io::{AsyncRead, AsyncWrite};
 use super::{CopyBuffer, CopyBidirectionalError, TrafficTracker};
 use super::transfer::{Buffer, CopyState as TransferCopyState, Direction};
 #[cfg(feature = "allocation-tests")]
@@ -28,9 +28,9 @@ where
 
     fn poll_copy(
         &mut self, cx: &mut Context<'_>, reader: &mut R, writer: &mut W,
-        last_active: &mut Instant, direction: Direction,
+        active: &mut bool, direction: Direction,
     ) -> Poll<Result<u64, CopyBidirectionalError>> {
-        self.poll_copy(cx, Pin::new(reader), Pin::new(writer), Some(last_active))
+        self.poll_copy(cx, Pin::new(reader), Pin::new(writer), active)
             .map_err(|error| direction.error(error))
     }
 }

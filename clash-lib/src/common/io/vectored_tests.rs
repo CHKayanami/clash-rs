@@ -8,6 +8,7 @@ struct PartialWriter {
     pending_write: bool,
     pending_flush: bool,
     vectored_calls: usize,
+    flush_calls: usize,
 }
 
 impl AsyncWrite for PartialWriter {
@@ -52,6 +53,7 @@ impl AsyncWrite for PartialWriter {
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<io::Result<()>> {
+        self.flush_calls += 1;
         if std::mem::take(&mut self.pending_flush) {
             cx.waker().wake_by_ref();
             Poll::Pending
@@ -87,13 +89,14 @@ async fn wrapped_buffer_handles_partial_vectored_writes_and_pending() {
                 pending_write: true,
                 pending_flush: true,
                 vectored_calls: 0,
+                flush_calls: 0,
             };
             let count = futures::future::poll_fn(|cx| {
                 buffer.poll_copy(
                     cx,
                     Pin::new(&mut reader),
                     Pin::new(&mut writer),
-                    None,
+                    &mut false,
                 )
             })
             .await
@@ -124,17 +127,56 @@ async fn wrapped_buffer_rejects_zero_vectored_write() {
         pending_write: false,
         pending_flush: false,
         vectored_calls: 0,
+        flush_calls: 0,
     };
     let error = futures::future::poll_fn(|cx| {
         buffer.poll_copy(
             cx,
             Pin::new(&mut reader),
             Pin::new(&mut writer),
-            None,
+            &mut false,
         )
     })
     .await
     .unwrap_err();
     assert_eq!(error.kind(), io::ErrorKind::WriteZero);
     assert_eq!(buffer.amount_transferred(), 0);
+}
+
+#[tokio::test]
+async fn ready_input_batches_flush_until_eof() {
+    let data = vec![42; 8192];
+    let mut reader = Cursor::new(data.clone());
+    let mut writer = PartialWriter {
+        data: Vec::new(), limit: 1024, vectored: false,
+        pending_write: false, pending_flush: false,
+        vectored_calls: 0, flush_calls: 0,
+    };
+    let mut buffer = CopyBuffer::new_with_capacity(1024);
+    let count = futures::future::poll_fn(|cx| {
+        buffer.poll_copy(cx, Pin::new(&mut reader), Pin::new(&mut writer), &mut false)
+    }).await.unwrap();
+    assert_eq!(count, data.len() as u64);
+    assert_eq!(writer.data, data);
+    assert_eq!(writer.flush_calls, 1);
+}
+
+#[tokio::test]
+async fn pending_reader_flushes_request_before_eof() {
+    use tokio::io::AsyncWriteExt;
+    let (mut source, mut reader) = tokio::io::duplex(64);
+    source.write_all(b"request").await.unwrap();
+    let mut writer = PartialWriter {
+        data: Vec::new(), limit: 1024, vectored: false,
+        pending_write: false, pending_flush: false,
+        vectored_calls: 0, flush_calls: 0,
+    };
+    let mut buffer = CopyBuffer::default();
+    let mut task = tokio_test::task::spawn(futures::future::poll_fn(|cx| {
+        buffer.poll_copy(cx, Pin::new(&mut reader), Pin::new(&mut writer), &mut false)
+    }));
+    assert!(task.poll().is_pending());
+    drop(task);
+    assert_eq!(writer.data, b"request");
+    assert_eq!(writer.flush_calls, 1);
 }
