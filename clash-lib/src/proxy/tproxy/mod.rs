@@ -11,7 +11,8 @@ use crate::{
 };
 
 use async_trait::async_trait;
-use bytes::Bytes;
+use clash_common::udp::{BatchReceiver, enable_gro, MAX_BATCH};
+use crate::proxy::utils::udp_batch::send_replies;
 use std::{
     io,
     net::SocketAddr,
@@ -19,7 +20,7 @@ use std::{
     sync::Arc,
     time::Duration,
 };
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, UdpSocket};
 use tracing::{debug, trace, warn};
 
 pub struct TproxyInbound {
@@ -182,7 +183,10 @@ impl InboundHandlerTrait for TproxyInbound {
         }
         socket.bind(&self.addr.into())?;
 
-        let listener = unix_udp_sock::UdpSocket::from_std(socket.into())?;
+        let listener = UdpSocket::from_std(socket.into())?;
+        if let Err(error) = enable_gro(&listener) {
+            debug!("TProxy UDP GRO unavailable; using ordinary datagrams: {error}");
+        }
 
         ready.notify();
 
@@ -260,22 +264,6 @@ fn get_or_create_transparent_socket(
     Ok(udp_socket)
 }
 
-/// Send `buf` to `dst` with the packet's source address set to `src`.
-///
-/// Uses a cached `IP_TRANSPARENT` DGRAM socket bound to `src` so the kernel
-/// handles all header construction, checksum computation, and fragmentation.
-async fn sendto_with_src(
-    cache: &moka::sync::Cache<SocketAddr, Arc<tokio::net::UdpSocket>>,
-    buf: &[u8],
-    dst: SocketAddr,
-    src: SocketAddr,
-    fw_mark: Option<u32>,
-) -> io::Result<()> {
-    let sock = get_or_create_transparent_socket(cache, src, fw_mark)?;
-    sock.send_to(buf, dst).await?;
-    Ok(())
-}
-
 /// How many consecutive receive failures to tolerate before concluding the
 /// socket is unusable. Guards against a hot loop on a permanent error while
 /// still riding out the transient ones (`ECONNREFUSED` from an inbound ICMP
@@ -284,7 +272,7 @@ const MAX_CONSECUTIVE_RECV_ERRORS: usize = 32;
 
 async fn handle_inbound_datagram(
     fw_mark: Option<u32>,
-    socket: Arc<unix_udp_sock::UdpSocket>,
+    socket: Arc<UdpSocket>,
     dispatcher: Arc<Dispatcher>,
 ) -> std::io::Result<()> {
     // dispatcher <-> tproxy communications
@@ -314,94 +302,32 @@ async fn handle_inbound_datagram(
 
     // tproxy -> dispatcher
     let fut2 = async move {
-        let mut buf = vec![0_u8; 1024 * 64];
+        let mut receiver = BatchReceiver::default();
+        let mut packets = Vec::with_capacity(MAX_BATCH);
         let mut consecutive_errors = 0usize;
         let mut dropped = 0u64;
 
         loop {
-            let meta = match socket.recv_msg(&mut buf).await {
-                Ok(meta) => {
-                    consecutive_errors = 0;
-                    meta
-                }
+            packets.clear();
+            match receiver.recv_batch(&socket, &mut packets, MAX_BATCH).await {
+                Ok(_) => consecutive_errors = 0,
                 Err(e) => {
-                    // A UDP socket surfaces plenty of transient errors — an
-                    // ICMP port-unreachable for an earlier packet arrives here
-                    // as ECONNREFUSED. Treating any of them as fatal used to
-                    // take down transparent UDP proxying until restart.
                     consecutive_errors += 1;
                     if consecutive_errors >= MAX_CONSECUTIVE_RECV_ERRORS {
-                        warn!(
-                            "tproxy udp recv failed {} times in a row, giving \
-                             up: {}",
-                            consecutive_errors, e
-                        );
+                        warn!("tproxy udp recv failed {} times in a row: {}", consecutive_errors, e);
                         break;
                     }
                     debug!("tproxy udp recv error (continuing): {}", e);
                     continue;
                 }
-            };
-
-            let Some(orig_dst) = meta.orig_dst else {
-                trace!("recv msg:{:?} local_addr:{:?}", meta, socket.local_addr());
-                warn!("failed to get orig_dst");
-                continue;
-            };
-
-            // drop multicast and broadcast destinations
-            if orig_dst.ip().is_multicast()
-                || match orig_dst.ip() {
-                    std::net::IpAddr::V4(ip) => ip.is_broadcast(),
-                    std::net::IpAddr::V6(_) => false,
+            }
+            for (data, source, destination) in packets.drain(..) {
+                if destination.ip().is_multicast()
+                    || matches!(destination.ip(), std::net::IpAddr::V4(ip) if ip.is_broadcast()) {
+                    continue;
                 }
-            {
-                continue;
-            }
-
-            trace!(
-                "recv msg:{:?} orig_dst:{:?}, local_addr:{:?}",
-                meta,
-                orig_dst,
-                socket.local_addr()
-            );
-
-            // never trust a length from outside to index our buffer
-            let len = meta.len.min(buf.len());
-            if len != meta.len {
-                warn!(
-                    "tproxy udp recv reported {} bytes into a {}-byte buffer, \
-                     truncating",
-                    meta.len,
-                    buf.len()
-                );
-            }
-
-            let chunk_size = gro_chunk_size(len, meta.stride);
-            if chunk_size == 0 {
-                continue;
-            }
-
-            let full_bytes = Bytes::copy_from_slice(&buf[0..len]);
-
-            let src_canonical = meta.addr.to_canonical();
-            let dst_canonical = orig_dst.to_canonical();
-
-            let num_chunks = len.div_ceil(chunk_size);
-            for chunk_idx in 0..num_chunks {
-                let chunk_data = if num_chunks == 1 {
-                    full_bytes.clone()
-                } else {
-                    let start = chunk_idx * chunk_size;
-                    let end = (start + chunk_size).min(len);
-                    full_bytes.slice(start..end)
-                };
-
                 let pkt = UdpPacket {
-                    data: chunk_data,
-                    src_addr: src_canonical.into(),
-                    dst_addr: dst_canonical.into(),
-                    inbound_user: None,
+                    data, src_addr: source.into(), dst_addr: destination.into(), inbound_user: None,
                 };
 
                 // Every client shares this channel, so awaiting a full one
@@ -444,10 +370,6 @@ async fn handle_inbound_datagram(
     Ok(())
 }
 
-fn gro_chunk_size(len: usize, stride: usize) -> usize {
-    if stride == 0 { len } else { stride }
-}
-
 fn set_ip_recv_orig_dstaddr(
     level: libc::c_int,
     socket: &socket2::Socket,
@@ -467,43 +389,12 @@ async fn handle_packet_from_dispatcher(
     fw_mark: Option<u32>,
 ) {
     let cache = new_transparent_socket_cache();
-    let mut reply_batch = Vec::with_capacity(32);
-
-    // `while` on recv_many() exits cleanly once the dispatcher drops its sender,
-    // with no busy-wait.
-    while l_rx.recv_many(&mut reply_batch, 32).await > 0 {
-        for pkt in reply_batch.drain(..) {
-            trace!("tproxy <- dispatcher: {:?}", pkt);
-
-            // an inbound that hands us a domain would otherwise panic here
-            let Some(src_addr) = pkt.src_addr.try_into_socket_addr() else {
-                tracing::warn!(
-                    "tproxy drop packet: src_addr is not a valid socket addr"
-                );
-                continue;
-            };
-
-            let Some(dst_addr) = pkt.dst_addr.try_into_socket_addr() else {
-                tracing::warn!(
-                    "tproxy drop packet: dst_addr is not a valid socket addr"
-                );
-                continue;
-            };
-
-            // Send the reply with the original destination as its source address.
-            // The cached IP_TRANSPARENT DGRAM socket handles all header
-            // construction, checksum computation, and fragmentation.
-            if let Err(e) =
-                sendto_with_src(&cache, &pkt.data, dst_addr, src_addr, fw_mark).await
-            {
-                tracing::error!(
-                    "failed to send packet to {} (src {}) through tproxy: {}",
-                    dst_addr,
-                    src_addr,
-                    e
-                );
-            }
-        }
+    let mut reply_batch = Vec::with_capacity(MAX_BATCH);
+    while l_rx.recv_many(&mut reply_batch, MAX_BATCH).await > 0 {
+        send_replies(&reply_batch, |source| {
+            get_or_create_transparent_socket(&cache, source, fw_mark)
+        }).await;
+        reply_batch.clear();
     }
 
     // reaching here means the dispatcher hung up; the outer `select!` tears the
@@ -511,21 +402,6 @@ async fn handle_packet_from_dispatcher(
     tracing::info!(
         "dispatcher channel to tproxy is closed, exiting outbound loop gracefully"
     );
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn gro_chunk_size_uses_len_when_stride_is_zero() {
-        assert_eq!(gro_chunk_size(1024, 0), 1024);
-    }
-
-    #[test]
-    fn gro_chunk_size_uses_stride_when_non_zero() {
-        assert_eq!(gro_chunk_size(1024, 128), 128);
-    }
 }
 
 // socket2 doesn't provide set_ip_transparent_v6

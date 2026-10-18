@@ -1,6 +1,5 @@
 use crate::Packet;
 use bytes::BytesMut;
-use log::trace;
 use std::net::SocketAddr;
 use tokio::sync::mpsc;
 
@@ -188,125 +187,161 @@ pub struct SplitWrite {
 
 impl SplitWrite {
     pub async fn send(&mut self, packet: UdpPacket) -> Result<(), std::io::Error> {
-        let payload = packet.data.data();
-        if payload.is_empty() {
-            return Ok(());
-        }
-
-        let is_v4 = match (&packet.local_addr, &packet.remote_addr) {
-            (SocketAddr::V4(_), SocketAddr::V4(_)) => true,
-            (SocketAddr::V6(_), SocketAddr::V6(_)) => false,
-            _ => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "UDP socket only supports homogeneous IPv4 and IPv6",
-                ));
-            }
-        };
-
-        let ip_hdr_len = if is_v4 { 20 } else { 40 };
-        let udp_hdr_len = 8;
-        let total_len = ip_hdr_len + udp_hdr_len + payload.len();
-
-        if total_len > 65535 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "packet exceeds max IP packet length",
-            ));
-        }
-
-        let mut buf = BytesMut::with_capacity(total_len);
-
-        if is_v4 {
-            let SocketAddr::V4(src) = packet.local_addr else {
-                unreachable!()
-            };
-            let SocketAddr::V4(dst) = packet.remote_addr else {
-                unreachable!()
-            };
-
-            // 1. Write IPv4 header (20 bytes)
-            let mut ip_hdr = [0u8; 20];
-            ip_hdr[0] = 0x45; // Version 4, IHL 5
-            ip_hdr[1] = 0; // DSCP / ECN
-            ip_hdr[2..4].copy_from_slice(&(total_len as u16).to_be_bytes());
-            ip_hdr[4..6].copy_from_slice(&0u16.to_be_bytes()); // Identification
-            ip_hdr[6..8].copy_from_slice(&0x4000u16.to_be_bytes()); // Flags (DF)
-            ip_hdr[8] = 64; // TTL
-            ip_hdr[9] = 17; // Protocol (UDP)
-            ip_hdr[12..16].copy_from_slice(&src.ip().octets());
-            ip_hdr[16..20].copy_from_slice(&dst.ip().octets());
-            let ip_csum = compute_ipv4_checksum(&ip_hdr);
-            ip_hdr[10..12].copy_from_slice(&ip_csum.to_be_bytes());
-
-            // 2. Write UDP header (8 bytes)
-            let udp_len = (udp_hdr_len + payload.len()) as u16;
-            let mut udp_hdr = [0u8; 8];
-            udp_hdr[0..2].copy_from_slice(&src.port().to_be_bytes());
-            udp_hdr[2..4].copy_from_slice(&dst.port().to_be_bytes());
-            udp_hdr[4..6].copy_from_slice(&udp_len.to_be_bytes());
-            let udp_csum = compute_udp_checksum_v4(
-                &src.ip().octets(),
-                &dst.ip().octets(),
-                &udp_hdr[..6],
-                payload,
-            );
-            udp_hdr[6..8].copy_from_slice(&udp_csum.to_be_bytes());
-
-            buf.extend_from_slice(&ip_hdr);
-            buf.extend_from_slice(&udp_hdr);
-            buf.extend_from_slice(payload);
-        } else {
-            let SocketAddr::V6(src) = packet.local_addr else {
-                unreachable!()
-            };
-            let SocketAddr::V6(dst) = packet.remote_addr else {
-                unreachable!()
-            };
-
-            // 1. Write IPv6 header (40 bytes)
-            let mut ip_hdr = [0u8; 40];
-            ip_hdr[0] = 0x60; // Version 6
-            let udp_len = (udp_hdr_len + payload.len()) as u16;
-            ip_hdr[4..6].copy_from_slice(&udp_len.to_be_bytes()); // Payload Length
-            ip_hdr[6] = 17; // Next Header (UDP)
-            ip_hdr[7] = 64; // Hop Limit
-            ip_hdr[8..24].copy_from_slice(&src.ip().octets());
-            ip_hdr[24..40].copy_from_slice(&dst.ip().octets());
-
-            // 2. Write UDP header (8 bytes)
-            let mut udp_hdr = [0u8; 8];
-            udp_hdr[0..2].copy_from_slice(&src.port().to_be_bytes());
-            udp_hdr[2..4].copy_from_slice(&dst.port().to_be_bytes());
-            udp_hdr[4..6].copy_from_slice(&udp_len.to_be_bytes());
-            let udp_csum = compute_udp_checksum_v6(
-                &src.ip().octets(),
-                &dst.ip().octets(),
-                &udp_hdr[..6],
-                payload,
-            );
-            udp_hdr[6..8].copy_from_slice(&udp_csum.to_be_bytes());
-
-            buf.extend_from_slice(&ip_hdr);
-            buf.extend_from_slice(&udp_hdr);
-            buf.extend_from_slice(payload);
-        }
-
-        trace!(
-            "SplitWrite::send: {total_len} bytes to {}",
-            packet.remote_addr
-        );
-
-        // UDP is inherently unreliable — drop the packet if the outbound
-        // channel is full rather than blocking the UDP handler task.
-        match self.send.try_send(Packet::new(buf.freeze())) {
-            Ok(()) => Ok(()),
-            Err(mpsc::error::TrySendError::Full(_)) => Ok(()),
+        let packet = encode_packet(&packet)?;
+        match self.send.try_send(packet) {
+            Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => Ok(()),
             Err(mpsc::error::TrySendError::Closed(_)) => {
                 Err(std::io::Error::other("packet outbound channel closed"))
             }
         }
     }
+
+    /// Reserve packet-based queue capacity once for the ready batch. Invalid
+    /// packets are reported after the independent valid packets are submitted;
+    /// excess packets are dropped, matching the single-packet UDP policy.
+    pub fn send_batch(&mut self, packets: &[UdpPacket]) -> Result<usize, std::io::Error> {
+        let count = packets.len();
+        if count == 0 {
+            return if self.send.is_closed() {
+                Err(std::io::Error::other("packet outbound channel closed"))
+            } else { Ok(0) };
+        }
+        let mut permits = match self.send.try_reserve_many(count) {
+            Ok(permits) => Some(permits),
+            // Partial capacity or competing senders must not lose the batch.
+            // Keep the bulk fast path, then reserve individually under pressure.
+            Err(mpsc::error::TrySendError::Full(_)) => None,
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                return Err(std::io::Error::other("packet outbound channel closed"));
+            }
+        };
+        let mut sent = 0;
+        let mut error = None;
+        let mut permit = None;
+        for packet in packets {
+            if permit.is_none() {
+                permit = permits.as_mut().and_then(Iterator::next);
+                if permit.is_none() {
+                    match self.send.try_reserve() {
+                        Ok(reserved) => permit = Some(reserved),
+                        Err(mpsc::error::TrySendError::Full(_)) => break,
+                        Err(mpsc::error::TrySendError::Closed(_)) => {
+                            return Err(std::io::Error::other("packet outbound channel closed"));
+                        }
+                    }
+                }
+            }
+            match encode_packet(packet) {
+                Ok(packet) => { permit.take().unwrap().send(packet); sent += 1; }
+                Err(err) => { error.get_or_insert(err); }
+            }
+        }
+        error.map_or(Ok(sent), Err)
+    }
+}
+
+fn encode_packet(packet: &UdpPacket) -> Result<Packet, std::io::Error> {
+    let payload = packet.data.data();
+    let is_v4 = match (&packet.local_addr, &packet.remote_addr) {
+        (SocketAddr::V4(_), SocketAddr::V4(_)) => true,
+        (SocketAddr::V6(_), SocketAddr::V6(_)) => false,
+        _ => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "UDP socket only supports homogeneous IPv4 and IPv6",
+            ));
+        }
+    };
+
+    let ip_hdr_len = if is_v4 { 20 } else { 40 };
+    let udp_hdr_len = 8;
+    let total_len = ip_hdr_len + udp_hdr_len + payload.len();
+
+    if total_len > 65535 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "packet exceeds max IP packet length",
+        ));
+    }
+
+    let mut buf = BytesMut::with_capacity(total_len);
+
+    if is_v4 {
+        let SocketAddr::V4(src) = packet.local_addr else {
+            unreachable!()
+        };
+        let SocketAddr::V4(dst) = packet.remote_addr else {
+            unreachable!()
+        };
+
+        // 1. Write IPv4 header (20 bytes)
+        let mut ip_hdr = [0u8; 20];
+        ip_hdr[0] = 0x45; // Version 4, IHL 5
+        ip_hdr[1] = 0; // DSCP / ECN
+        ip_hdr[2..4].copy_from_slice(&(total_len as u16).to_be_bytes());
+        ip_hdr[4..6].copy_from_slice(&0u16.to_be_bytes()); // Identification
+        ip_hdr[6..8].copy_from_slice(&0x4000u16.to_be_bytes()); // Flags (DF)
+        ip_hdr[8] = 64; // TTL
+        ip_hdr[9] = 17; // Protocol (UDP)
+        ip_hdr[12..16].copy_from_slice(&src.ip().octets());
+        ip_hdr[16..20].copy_from_slice(&dst.ip().octets());
+        let ip_csum = compute_ipv4_checksum(&ip_hdr);
+        ip_hdr[10..12].copy_from_slice(&ip_csum.to_be_bytes());
+
+        // 2. Write UDP header (8 bytes)
+        let udp_len = (udp_hdr_len + payload.len()) as u16;
+        let mut udp_hdr = [0u8; 8];
+        udp_hdr[0..2].copy_from_slice(&src.port().to_be_bytes());
+        udp_hdr[2..4].copy_from_slice(&dst.port().to_be_bytes());
+        udp_hdr[4..6].copy_from_slice(&udp_len.to_be_bytes());
+        let udp_csum = compute_udp_checksum_v4(
+            &src.ip().octets(),
+            &dst.ip().octets(),
+            &udp_hdr[..6],
+            payload,
+        );
+        udp_hdr[6..8].copy_from_slice(&udp_csum.to_be_bytes());
+
+        buf.extend_from_slice(&ip_hdr);
+        buf.extend_from_slice(&udp_hdr);
+        buf.extend_from_slice(payload);
+    } else {
+        let SocketAddr::V6(src) = packet.local_addr else {
+            unreachable!()
+        };
+        let SocketAddr::V6(dst) = packet.remote_addr else {
+            unreachable!()
+        };
+
+        // 1. Write IPv6 header (40 bytes)
+        let mut ip_hdr = [0u8; 40];
+        ip_hdr[0] = 0x60; // Version 6
+        let udp_len = (udp_hdr_len + payload.len()) as u16;
+        ip_hdr[4..6].copy_from_slice(&udp_len.to_be_bytes()); // Payload Length
+        ip_hdr[6] = 17; // Next Header (UDP)
+        ip_hdr[7] = 64; // Hop Limit
+        ip_hdr[8..24].copy_from_slice(&src.ip().octets());
+        ip_hdr[24..40].copy_from_slice(&dst.ip().octets());
+
+        // 2. Write UDP header (8 bytes)
+        let mut udp_hdr = [0u8; 8];
+        udp_hdr[0..2].copy_from_slice(&src.port().to_be_bytes());
+        udp_hdr[2..4].copy_from_slice(&dst.port().to_be_bytes());
+        udp_hdr[4..6].copy_from_slice(&udp_len.to_be_bytes());
+        let udp_csum = compute_udp_checksum_v6(
+            &src.ip().octets(),
+            &dst.ip().octets(),
+            &udp_hdr[..6],
+            payload,
+        );
+        udp_hdr[6..8].copy_from_slice(&udp_csum.to_be_bytes());
+
+        buf.extend_from_slice(&ip_hdr);
+        buf.extend_from_slice(&udp_hdr);
+        buf.extend_from_slice(payload);
+    }
+
+    Ok(Packet::new(buf.freeze()))
 }
 
 fn compute_ipv4_checksum(header: &[u8]) -> u16 {
@@ -395,4 +430,89 @@ fn compute_udp_checksum_v6(
     }
     let res = !(sum as u16);
     if res == 0 { 0xffff } else { res }
+}
+
+#[cfg(test)]
+mod batch_tests {
+    use super::*;
+    use bytes::Bytes;
+    use smoltcp::wire::{IpAddress, UdpPacket as WireUdpPacket};
+
+    #[tokio::test]
+    async fn batches_preserve_empty_packets_addresses_and_checksums() {
+        for (source, target, header_len) in [
+            ("127.0.0.1:1234", "127.0.0.2:5678", 20),
+            ("[::1]:1234", "[::2]:5678", 40),
+        ] {
+            let source: SocketAddr = source.parse().unwrap();
+            let target: SocketAddr = target.parse().unwrap();
+            let (send, mut receive) = mpsc::channel(4);
+            let mut writer = SplitWrite { send };
+            let packets = [
+                UdpPacket::from((Bytes::new(), source, target)),
+                UdpPacket::from((Bytes::from_static(b"odd"), source, target)),
+            ];
+            assert_eq!(writer.send_batch(&packets).unwrap(), 2);
+            for expected in &packets {
+                let packet = receive.recv().await.unwrap();
+                let raw = packet.data();
+                let (src, dst, payload) = parse_udp_packet(raw).unwrap();
+                assert_eq!((src, dst), (source, target));
+                assert_eq!(&raw[payload], expected.data());
+                let udp = WireUdpPacket::new_checked(&raw[header_len..]).unwrap();
+                assert!(udp.verify_checksum(&IpAddress::from(source.ip()), &IpAddress::from(target.ip())));
+                if header_len == 20 { assert_eq!(compute_ipv4_checksum(&raw[..20]), 0); }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn batches_keep_packet_capacity_and_do_not_block_on_full_queue() {
+        let (send, mut receive) = mpsc::channel(2);
+        let mut writer = SplitWrite { send };
+        let packets: Vec<_> = (0..4).map(|i| UdpPacket::from((
+            Bytes::from(vec![i]), "127.0.0.1:1".parse().unwrap(), "127.0.0.2:2".parse().unwrap(),
+        ))).collect();
+        assert_eq!(writer.send_batch(&packets).unwrap(), 2);
+        assert_eq!(writer.send_batch(&packets).unwrap(), 0);
+        for expected in &packets[..2] {
+            let packet = receive.recv().await.unwrap();
+            let (_, _, payload) = parse_udp_packet(packet.data()).unwrap();
+            assert_eq!(&packet.data()[payload], expected.data());
+        }
+        drop(receive);
+        assert!(writer.send_batch(&packets).is_err());
+    }
+
+    #[tokio::test]
+    async fn competing_reservations_keep_available_batch_prefix() {
+        let (send, mut receive) = mpsc::channel(4);
+        let competing = send.clone();
+        let _held = competing.try_reserve_many(2).unwrap();
+        let mut writer = SplitWrite { send };
+        let packets: Vec<_> = (0..4).map(|i| UdpPacket::from((
+            Bytes::from(vec![i]), "127.0.0.1:1".parse().unwrap(), "127.0.0.2:2".parse().unwrap(),
+        ))).collect();
+        assert_eq!(writer.send_batch(&packets).unwrap(), 2);
+        for expected in &packets[..2] {
+            let packet = receive.try_recv().unwrap();
+            let (_, _, payload) = parse_udp_packet(packet.data()).unwrap();
+            assert_eq!(&packet.data()[payload], expected.data());
+        }
+        assert!(receive.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn invalid_packet_does_not_discard_valid_batch_suffix() {
+        let (send, mut receive) = mpsc::channel(2);
+        let mut writer = SplitWrite { send };
+        let valid = || UdpPacket::from((Bytes::from_static(b"ok"),
+            "127.0.0.1:1".parse().unwrap(), "127.0.0.2:2".parse().unwrap()));
+        let invalid = UdpPacket::from((Bytes::new(),
+            "127.0.0.1:1".parse().unwrap(), "[::1]:2".parse().unwrap()));
+        assert!(writer.send_batch(&[valid(), invalid, valid()]).is_err());
+        assert!(receive.try_recv().is_ok());
+        assert!(receive.try_recv().is_ok());
+        assert!(receive.try_recv().is_err());
+    }
 }

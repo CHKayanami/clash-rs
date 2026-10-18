@@ -6,7 +6,9 @@ use tokio::net::UdpSocket;
 use tokio::io::Interest;
 use crate::proxy::datagram::batch::{BatchResult, MAX_BATCH_PACKETS};
 #[cfg(target_os = "linux")]
-use std::{io, mem::zeroed, os::fd::AsRawFd};
+use std::{io, mem::zeroed, os::fd::AsRawFd, sync::Arc};
+#[cfg(target_os = "linux")]
+use crate::{proxy::datagram::UdpPacket, session::SocksAddr};
 #[cfg(target_os = "linux")]
 use socket2::SockAddr;
 #[cfg(not(target_os = "linux"))]
@@ -90,4 +92,119 @@ fn map_destination(destination: SocketAddr, ipv6: bool) -> SocketAddr {
     if ipv6 && let SocketAddr::V4(address) = destination {
         SocketAddrV6::new(address.ip().to_ipv6_mapped(), address.port(), 0, 0).into()
     } else { destination }
+}
+
+/// Source-bound sockets may serve multiple clients. Group only within the
+/// current bounded batch; preserve each socket's packet order and never wait
+/// for another packet to fill it. Borrowed payloads remain owned by the caller.
+#[cfg(target_os = "linux")]
+pub(crate) async fn send_replies(
+    packets: &[UdpPacket],
+    mut get_socket: impl FnMut(SocketAddr) -> io::Result<Arc<UdpSocket>>,
+) {
+    use futures::future::poll_fn;
+    assert!(packets.len() <= MAX_BATCH_PACKETS);
+    let mut done = [false; MAX_BATCH_PACKETS];
+    for first in 0..packets.len() {
+        if done[first] { continue; }
+        let SocksAddr::Ip(source) = &packets[first].src_addr else {
+            tracing::warn!("transparent UDP reply contains a non-IP source");
+            done[first] = true;
+            continue;
+        };
+        let source = *source;
+        let mut slices = std::array::from_fn::<_, MAX_BATCH_PACKETS, _>(|_| DatagramSlice {
+            header: &[], payload: &[], destination: source,
+        });
+        let mut count = 0;
+        for i in first..packets.len() {
+            if done[i] || packets[i].src_addr != SocksAddr::Ip(source) { continue; }
+            done[i] = true;
+            let SocksAddr::Ip(destination) = &packets[i].dst_addr else {
+                tracing::warn!("transparent UDP reply contains a non-IP destination");
+                continue;
+            };
+            slices[count] = DatagramSlice { header: &[], payload: &packets[i].data, destination: *destination };
+            count += 1;
+        }
+        if count == 0 { continue; }
+        let socket = match get_socket(source) {
+            Ok(socket) => socket,
+            Err(error) => { tracing::warn!("failed to create UDP reply socket for {source}: {error}"); continue; }
+        };
+        let ipv6 = match socket.local_addr() {
+            Ok(address) => address.is_ipv6(),
+            Err(error) => { tracing::warn!("failed to inspect UDP reply socket: {error}"); continue; }
+        };
+        let mut offset = 0;
+        while offset < count {
+            let result = poll_fn(|cx| poll_send_batch(&socket, ipv6, cx, &slices[offset..count])).await;
+            offset += result.sent;
+            if let Some(error) = result.error {
+                // A datagram error rejects the next packet, not its suffix.
+                tracing::warn!("failed to send UDP reply from {source}: {error}");
+                offset += 1;
+            }
+        }
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+    use bytes::Bytes;
+    use tokio::time::{timeout, Duration};
+
+    #[tokio::test]
+    async fn datagram_error_keeps_successful_prefix_and_valid_suffix() {
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let source = socket.local_addr().unwrap();
+        let destination = client.local_addr().unwrap();
+        let packets = [
+            UdpPacket::new(Bytes::from_static(b"before"), source.into(), destination.into()),
+            UdpPacket::new(Bytes::from(vec![0; 70000]), source.into(), destination.into()),
+            UdpPacket::new(Bytes::from_static(b"after"), source.into(), destination.into()),
+        ];
+        send_replies(&packets, |_| Ok(socket.clone())).await;
+        timeout(Duration::from_secs(2), async {
+            let mut buffer = [0; 16];
+            for expected in [&b"before"[..], &b"after"[..]] {
+                let len = client.recv(&mut buffer).await.unwrap();
+                assert_eq!(&buffer[..len], expected);
+            }
+        }).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn source_grouped_replies_preserve_clients_empty_packets_and_order() {
+        let source_a = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let source_b = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let client_a = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_b = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let a = source_a.local_addr().unwrap();
+        let b = source_b.local_addr().unwrap();
+        let client = client_a.local_addr().unwrap();
+        let packets = [
+            UdpPacket::new(Bytes::from_static(b"a1"), a.into(), client.into()),
+            UdpPacket::new(Bytes::from_static(b"b1"), b.into(), client.into()),
+            UdpPacket::new(Bytes::new(), a.into(), client_b.local_addr().unwrap().into()),
+            UdpPacket::new(Bytes::from_static(b"a2"), a.into(), client.into()),
+        ];
+        let mut lookups = Vec::new();
+        send_replies(&packets, |source| {
+            lookups.push(source);
+            Ok(if source == a { source_a.clone() } else { source_b.clone() })
+        }).await;
+        assert_eq!(lookups, vec![a, b]);
+        timeout(Duration::from_secs(2), async {
+            let mut buffer = [0; 16];
+            for (payload, source) in [(&b"a1"[..], a), (&b"a2"[..], a), (&b"b1"[..], b)] {
+                let (len, actual) = client_a.recv_from(&mut buffer).await.unwrap();
+                assert_eq!((&buffer[..len], actual), (payload, source));
+            }
+            let (len, source) = client_b.recv_from(&mut buffer).await.unwrap();
+            assert_eq!((len, source), (0, a));
+        }).await.unwrap();
+    }
 }

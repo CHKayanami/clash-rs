@@ -1,6 +1,7 @@
 use crate::runner::ListenerReady;
 use crate::app::dns::query::IngressProfile;
 use async_trait::async_trait;
+use clash_common::udp::{BatchReceiver, MAX_BATCH};
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -320,12 +321,13 @@ async fn udp_listener_loop(
     resolver: ThreadSafeDNSResolver,
     listener_for_dns: Arc<clash_ebpf::EbpfListener>,
 ) {
-    let mut batch = Vec::with_capacity(32);
+    let mut receiver = BatchReceiver::default();
+    let mut batch = Vec::with_capacity(MAX_BATCH);
     let mut dns_tasks = tokio::task::JoinSet::new();
     loop {
         while dns_tasks.try_join_next().is_some() {}
         batch.clear();
-        match clash_ebpf::EbpfListener::recv_many_from_socket(&socket, &mut batch, 32).await {
+        match receiver.recv_batch(&socket, &mut batch, MAX_BATCH).await {
             Ok(count) => {
                 if count == 0 {
                     continue;

@@ -1,6 +1,5 @@
 use std::{sync::Arc, time::Duration};
 
-use bytes::BytesMut;
 use futures::{SinkExt, StreamExt};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
@@ -20,6 +19,7 @@ use crate::{
     runner::{AsyncService, ServiceContext},
 };
 use async_trait::async_trait;
+use super::device_io::{Reader, Writer, DEVICE_BATCH};
 
 /// Maximum number of attempts to wait for a newly created TUN interface to
 /// become visible via NetworkInterface::show().
@@ -374,46 +374,42 @@ impl AsyncService for TunRunner {
             let tun_tx_for_system_tcp = tun_tx.clone();
 
             let mut fut_tun_writer = async || {
-                while let Some(pkt) = tun_rx.recv().await {
-                    if let Err(e) = tun_for_writer.send(&pkt).await {
-                        if e.kind() == std::io::ErrorKind::TimedOut
-                            || e.kind() == std::io::ErrorKind::WouldBlock
-                            || e.kind() == std::io::ErrorKind::InvalidInput
-                            || e.raw_os_error() == Some(22)
-                        {
-                            warn!(
-                                "failed to send pkt to tun, dropping packet: {}",
-                                e
-                            );
+                let mut writer = Writer::new();
+                let mut batch = Vec::with_capacity(DEVICE_BATCH);
+                while tun_rx.recv_many(&mut batch, DEVICE_BATCH).await > 0 {
+                    let result = writer.send(&tun_for_writer, &batch).await;
+                    batch.clear();
+                    if let Err(e) = result {
+                        if matches!(e.kind(), std::io::ErrorKind::TimedOut
+                            | std::io::ErrorKind::WouldBlock | std::io::ErrorKind::InvalidInput) {
+                            warn!("failed to write TUN batch, dropping unsent packets: {e}");
                             continue;
                         }
-                        error!("failed to send pkt to tun: {}", e);
+                        error!("failed to send batch to tun: {e}");
                         break;
                     }
                 }
-
                 Err(Error::Operation("tun stopped unexpectedly 0".to_string()))
             };
 
             // dispatcher -> stack -> tun
             let mut fut_dispatcher_tun = async || {
-                while let Some(pkt) = stack_stream.next().await {
-                    match pkt {
-                        Ok(pkt) => {
-                            if let Err(e) =
-                                tun_tx_for_dispatcher.send(pkt.into_bytes()).await
-                            {
-                                error!("failed to send pkt to tun writer: {}", e);
-                                break;
-                            }
+                let mut batches = stack_stream.by_ref().ready_chunks(DEVICE_BATCH);
+                let mut packets = Vec::with_capacity(DEVICE_BATCH);
+                while let Some(batch) = batches.next().await {
+                    for packet in batch {
+                        packets.push(packet?.into_bytes());
+                    }
+                    match tun_tx_for_dispatcher.reserve_many(packets.len()).await {
+                        Ok(permits) => {
+                            for (permit, packet) in permits.zip(packets.drain(..)) { permit.send(packet); }
                         }
-                        Err(e) => {
-                            error!("tun stack error: {}", e);
+                        Err(error) => {
+                            error!("failed to send batch to tun writer: {error}");
                             break;
                         }
                     }
                 }
-
                 Err(Error::Operation("tun stopped unexpectedly 0".to_string()))
             };
 
@@ -496,9 +492,6 @@ impl AsyncService for TunRunner {
 
             let system_nat = Arc::new(super::system_stack::SystemTcpNat::new());
 
-            let gso_enabled = cfg.gso.unwrap_or(false);
-            let stack_mtu = cfg.mtu.unwrap_or(1500) as usize;
-
             // tun -> stack -> dispatcher
             let nat = system_nat.clone();
             let enable_tcp = cfg.enable_tcp;
@@ -539,7 +532,7 @@ impl AsyncService for TunRunner {
                                             "failed to write system TCP packet to tun channel: {}",
                                             e
                                         );
-                                        break;
+                                        return Err(Error::Operation("tun reply queue closed".to_string()));
                                     }
                                 } else if let Err(e) = stack_sink
                                     .send(watfaq_netstack::Packet::new(single_pkt.freeze()))
@@ -571,34 +564,15 @@ impl AsyncService for TunRunner {
                     }};
                 }
 
-                let read_cap = if gso_enabled { 65535 } else { stack_mtu.max(2048) };
-                // The device API requires initialized storage. Reuse one
-                // receive buffer, then retain only the received packet's bytes
-                // downstream (small packets must not pin a 64 KiB GSO buffer).
-                let mut read_buf = vec![0u8; read_cap];
+                let mut reader = Reader::new(&tun);
+                let mut batch = Vec::with_capacity(DEVICE_BATCH);
                 loop {
-                    match tun.recv(&mut read_buf).await {
-                        Ok(0) => {
-                            info!("tun reader reached EOF");
-                            break;
+                    match reader.recv(&tun, &mut batch).await {
+                        Ok(0) => { info!("tun reader reached EOF"); break; }
+                        Ok(_) => {
+                            for packet in batch.drain(..) { dispatch_bytes_mut!(packet); }
                         }
-                        Ok(n) => {
-                            let buf = BytesMut::from(&read_buf[..n]);
-                            if gso_enabled && buf.len() > stack_mtu {
-                                let pkt = buf.freeze();
-                                for single_pkt in
-                                    super::gso::split_gso_packet(pkt, stack_mtu)
-                                {
-                                    dispatch_bytes_mut!(single_pkt);
-                                }
-                            } else {
-                                dispatch_bytes_mut!(buf);
-                            }
-                        }
-                        Err(e) => {
-                            error!("tun stream recv error: {}", e);
-                            break;
-                        }
+                        Err(error) => { error!("tun stream recv error: {error}"); break; }
                     }
                 }
 

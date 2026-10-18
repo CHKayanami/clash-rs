@@ -1,5 +1,5 @@
 mod datagram;
-pub mod gso;
+mod device_io;
 mod routes;
 pub mod runner;
 pub use runner::TunRunner;

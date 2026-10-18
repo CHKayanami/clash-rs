@@ -61,36 +61,18 @@ pub(crate) async fn handle_inbound_datagram(
     // dispatcher -> tun
     let fut1 = tokio::spawn(async move {
         let mut reply_batch = Vec::with_capacity(32);
+        let mut packets = Vec::with_capacity(32);
         while l_rx.recv_many(&mut reply_batch, 32).await > 0 {
-            for UdpPacket {
-                data,
-                src_addr,
-                dst_addr,
-                ..
-            } in reply_batch.drain(..)
-            {
-                let Some(src_sock_addr) = src_addr.try_into_socket_addr() else {
-                    warn!("tun drop packet: src_addr is not a valid socket addr");
-                    continue;
-                };
-                let Some(dst_sock_addr) = dst_addr.try_into_socket_addr() else {
-                    warn!("tun drop packet: dst_addr is not a valid socket addr");
-                    continue;
-                };
-                if let Err(e) = ls
-                    .send(
-                        (
-                            data,
-                            src_sock_addr,
-                            dst_sock_addr,
-                        )
-                            .into(),
-                    )
-                    .await
-                {
-                    warn!("failed to send udp packet to netstack: {}", e);
-                }
+            for packet in reply_batch.drain(..) {
+                let (Some(source), Some(destination)) = (
+                    packet.src_addr.try_into_socket_addr(), packet.dst_addr.try_into_socket_addr(),
+                ) else { warn!("tun drop reply with non-IP address"); continue; };
+                packets.push((packet.data, source, destination).into());
             }
+            if let Err(error) = ls.send_batch(&packets) {
+                warn!("failed to send UDP batch to netstack: {error}");
+            }
+            packets.clear();
         }
     });
 

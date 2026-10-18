@@ -72,6 +72,7 @@ impl UdpPacket {
 }
 
 use futures::{Sink, Stream};
+use self::batch::{BatchResult, DatagramBatch, PacketBatch, poll_send_channel};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio_util::sync::PollSender;
@@ -208,4 +209,19 @@ mod tests {
     }
 }
 
-impl batch::DatagramBatch for ChannelDatagram {}
+impl DatagramBatch for ChannelDatagram {
+    fn poll_send_batch(
+        &mut self, cx: &mut Context<'_>, batch: &mut PacketBatch,
+    ) -> Poll<BatchResult> {
+        match Pin::new(&mut *self).poll_flush(cx) {
+            Poll::Pending => return Poll::Pending,
+            Poll::Ready(Err(error)) => return Poll::Ready(BatchResult::terminated(error)),
+            Poll::Ready(Ok(())) => {}
+        }
+        poll_send_channel(&mut self.tx, cx, batch)
+    }
+}
+
+#[cfg(test)]
+#[path = "datagram/channel_tests.rs"]
+mod channel_tests;

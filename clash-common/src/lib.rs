@@ -1,5 +1,7 @@
 pub mod ring_buffer;
 pub mod slide_buffer;
+#[cfg(target_os = "linux")]
+pub mod udp;
 
 pub use ring_buffer::{LockFreeRingBuffer, acquire_vec};
 pub use slide_buffer::SlideBuffer;

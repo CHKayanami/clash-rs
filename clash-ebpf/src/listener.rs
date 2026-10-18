@@ -2,6 +2,7 @@ use crate::config::EbpfConfig;
 use crate::netns::DaeNs;
 use crate::session::{EbpfSession, TransportProtocol, get_original_dst};
 use arc_swap::ArcSwap;
+use clash_common::udp::enable_gro;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::sync::Arc;
 use thiserror::Error;
@@ -97,11 +98,9 @@ impl EbpfListener {
             let _ = udp_sock_v4.set_recv_buffer_size(8 << 20);
             let _ = udp_sock_v4.set_reuse_port(true);
             udp_sock_v4.set_ip_transparent_v4(true)?;
-            let _ = nix::sys::socket::setsockopt(
-                &udp_sock_v4,
-                nix::sys::socket::sockopt::Ipv4OrigDstAddr,
-                &true,
-            );
+            nix::sys::socket::setsockopt(
+                &udp_sock_v4, nix::sys::socket::sockopt::Ipv4OrigDstAddr, &true,
+            )?;
             let _ = nix::sys::socket::setsockopt(
                 &udp_sock_v4,
                 nix::sys::socket::sockopt::Ipv4PacketInfo,
@@ -116,6 +115,9 @@ impl EbpfListener {
                 SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, config.tproxy_port));
             udp_sock_v4.bind(&udp_addr_v4.into())?;
             let udp_socket_v4 = UdpSocket::from_std(udp_sock_v4.into())?;
+            if let Err(error) = enable_gro(&udp_socket_v4) {
+                debug!("eBPF IPv4 UDP GRO unavailable: {error}");
+            }
 
             // 4. UDP IPv6 Transparent Listener (Optional)
             let udp_socket_v6 = match (|| -> std::io::Result<UdpSocket> {
@@ -127,11 +129,9 @@ impl EbpfListener {
                 let _ = udp_sock_v6.set_recv_buffer_size(8 << 20);
                 let _ = udp_sock_v6.set_reuse_port(true);
                 udp_sock_v6.set_ip_transparent_v6(true)?;
-                let _ = nix::sys::socket::setsockopt(
-                    &udp_sock_v6,
-                    nix::sys::socket::sockopt::Ipv6OrigDstAddr,
-                    &true,
-                );
+                nix::sys::socket::setsockopt(
+                    &udp_sock_v6, nix::sys::socket::sockopt::Ipv6OrigDstAddr, &true,
+                )?;
                 let _ = nix::sys::socket::setsockopt(
                     &udp_sock_v6,
                     nix::sys::socket::sockopt::Ipv6RecvPacketInfo,
@@ -149,7 +149,11 @@ impl EbpfListener {
                     0,
                 ));
                 udp_sock_v6.bind(&udp_addr_v6.into())?;
-                UdpSocket::from_std(udp_sock_v6.into())
+                let socket = UdpSocket::from_std(udp_sock_v6.into())?;
+                if let Err(error) = enable_gro(&socket) {
+                    debug!("eBPF IPv6 UDP GRO unavailable: {error}");
+                }
+                Ok(socket)
             })() {
                 Ok(s) => {
                     tracing::info!(
@@ -452,109 +456,6 @@ impl EbpfListener {
 
             let dst_addr = dst_addr.or(local_addr).unwrap_or(src_addr);
             Ok((n as usize, src_addr, dst_addr))
-        })
-        .await
-    }
-
-    /// Receives multiple transparent UDP packets in a batch using Tokio `async_io`.
-    pub async fn recv_many_from_socket(
-        sock: &UdpSocket,
-        packets: &mut Vec<(bytes::Bytes, SocketAddr, SocketAddr)>,
-        max_count: usize,
-    ) -> std::io::Result<usize> {
-        use std::os::fd::AsRawFd;
-        let fd = sock.as_raw_fd();
-        let local_addr = sock.local_addr().ok();
-
-        sock.async_io(tokio::io::Interest::READABLE, || {
-            let mut read_count = 0;
-            let mut buf = [0u8; 65535];
-            while read_count < max_count {
-                let mut iov = libc::iovec {
-                    iov_base: buf.as_mut_ptr() as *mut libc::c_void,
-                    iov_len: buf.len(),
-                };
-                let mut src_storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
-                let mut control_buf = [0u8; 512];
-                let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
-                msg.msg_name = &mut src_storage as *mut _ as *mut libc::c_void;
-                msg.msg_namelen = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
-                msg.msg_iov = &mut iov;
-                msg.msg_iovlen = 1;
-                msg.msg_control = control_buf.as_mut_ptr() as *mut libc::c_void;
-                msg.msg_controllen = control_buf.len() as _;
-
-                let n = unsafe { libc::recvmsg(fd, &mut msg, libc::MSG_DONTWAIT) };
-                if n < 0 {
-                    let err = std::io::Error::last_os_error();
-                    if err.kind() == std::io::ErrorKind::WouldBlock {
-                        if read_count > 0 {
-                            break;
-                        }
-                    }
-                    return Err(err);
-                }
-
-                let src_addr = match src_storage.ss_family as libc::c_int {
-                    libc::AF_INET => {
-                        let sin =
-                            unsafe { &*(&src_storage as *const _ as *const libc::sockaddr_in) };
-                        let ip = std::net::Ipv4Addr::from(sin.sin_addr.s_addr.to_ne_bytes());
-                        let port = u16::from_be(sin.sin_port);
-                        SocketAddr::V4(SocketAddrV4::new(ip, port))
-                    }
-                    libc::AF_INET6 => {
-                        let sin6 =
-                            unsafe { &*(&src_storage as *const _ as *const libc::sockaddr_in6) };
-                        let ip = std::net::Ipv6Addr::from(sin6.sin6_addr.s6_addr);
-                        let port = u16::from_be(sin6.sin6_port);
-                        SocketAddr::V6(std::net::SocketAddrV6::new(ip, port, 0, 0))
-                    }
-                    _ => {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            "unknown address family",
-                        ));
-                    }
-                };
-
-                let mut dst_addr = None;
-                let mut cmsg = unsafe { libc::CMSG_FIRSTHDR(&msg) };
-                while !cmsg.is_null() {
-                    let level = unsafe { (*cmsg).cmsg_level };
-                    let type_ = unsafe { (*cmsg).cmsg_type };
-                    if level == libc::SOL_IP
-                        && (type_ == libc::IP_ORIGDSTADDR || type_ == libc::IP_RECVORIGDSTADDR)
-                    {
-                        let sin = unsafe { &*(libc::CMSG_DATA(cmsg) as *const libc::sockaddr_in) };
-                        let ip = std::net::Ipv4Addr::from(sin.sin_addr.s_addr.to_ne_bytes());
-                        let port = u16::from_be(sin.sin_port);
-                        dst_addr = Some(SocketAddr::V4(SocketAddrV4::new(ip, port)));
-                        break;
-                    } else if level == libc::SOL_IPV6
-                        && (type_ == libc::IPV6_ORIGDSTADDR || type_ == libc::IPV6_RECVORIGDSTADDR)
-                    {
-                        let sin6 =
-                            unsafe { &*(libc::CMSG_DATA(cmsg) as *const libc::sockaddr_in6) };
-                        let ip = std::net::Ipv6Addr::from(sin6.sin6_addr.s6_addr);
-                        let port = u16::from_be(sin6.sin6_port);
-                        dst_addr =
-                            Some(SocketAddr::V6(std::net::SocketAddrV6::new(ip, port, 0, 0)));
-                        break;
-                    }
-                    cmsg = unsafe { libc::CMSG_NXTHDR(&msg, cmsg) };
-                }
-
-                let dst_addr = dst_addr.or(local_addr).unwrap_or(src_addr);
-                packets.push((
-                    bytes::Bytes::copy_from_slice(&buf[..n as usize]),
-                    src_addr,
-                    dst_addr,
-                ));
-                read_count += 1;
-            }
-
-            Ok(read_count)
         })
         .await
     }

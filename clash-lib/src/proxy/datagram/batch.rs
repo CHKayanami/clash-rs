@@ -1,6 +1,7 @@
 //! Bounded, opportunistic datagram batches. Queue capacity remains packet-based.
 use std::{collections::VecDeque, io, pin::Pin, task::{Context, Poll}};
 use futures::{Sink, Stream};
+use tokio_util::sync::PollSender;
 use super::UdpPacket;
 
 pub const MAX_BATCH_PACKETS: usize = 16;
@@ -101,6 +102,29 @@ pub(crate) fn poll_send_ready(
         sent += 1;
     }
     BatchResult::sent(sent)
+}
+
+/// Move ready packets into a packet-capacity channel without cloning payloads.
+/// The caller completes the returned prefix before polling the batch again.
+pub(crate) fn poll_send_channel(
+    sender: &mut PollSender<UdpPacket>, cx: &mut Context<'_>, batch: &mut PacketBatch,
+) -> Poll<BatchResult> {
+    let mut sent = 0;
+    for entry in &mut batch.entries {
+        match sender.poll_reserve(cx) {
+            Poll::Pending => break,
+            Poll::Ready(Err(_)) => return Poll::Ready(BatchResult { sent, fatal: true,
+                error: Some(io::Error::new(io::ErrorKind::BrokenPipe, "datagram channel closed")) }),
+            Poll::Ready(Ok(())) => {}
+        }
+        let packet = entry.packet.take().expect("unsubmitted channel batch packet");
+        if sender.send_item(packet).is_err() {
+            return Poll::Ready(BatchResult { sent, fatal: true,
+                error: Some(io::Error::new(io::ErrorKind::BrokenPipe, "datagram channel closed")) });
+        }
+        sent += 1;
+    }
+    if sent == 0 { Poll::Pending } else { Poll::Ready(BatchResult::sent(sent)) }
 }
 
 pub fn poll_send_single<D: Sink<UdpPacket, Error = io::Error> + Unpin + ?Sized>(
