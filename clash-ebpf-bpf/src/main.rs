@@ -8,8 +8,31 @@ fn panic(_: &core::panic::PanicInfo) -> ! {
 
 mod maps;
 mod transport;
+mod fast_path;
+mod routing;
 mod udp_reply;
 mod tracking;
+mod gate;
+
+// Invoked only through BPF_PROG_TEST_RUN by the collector, never attached.
+#[unsafe(no_mangle)]
+#[unsafe(link_section = "classifier")]
+pub fn tracking_gc(_ctx: *mut __sk_buff) -> i32 {
+    let Some(batch) = TRACKING_GC_REQUEST.get(0) else { return 0; };
+    if batch.count as usize > GC_BATCH_SIZE { return -1; }
+    let mut deleted = 0u32;
+    for index in 0..GC_BATCH_SIZE {
+        if index >= batch.count as usize { break; }
+        // Borrow map storage, never copy the batch onto the BPF stack. Each
+        // call releases its own gate before the next candidate is processed.
+        let request = &batch.requests[index];
+        let result = if request.kind == GC_FLOW { tracking::collect(request) }
+            else if request.kind == GC_UDP_REPLY { udp_reply::collect(request) }
+            else { 0 };
+        if result == 1 { deleted |= 1 << index; }
+    }
+    deleted as i32
+}
 
 use aya_ebpf::bindings::{__sk_buff, TC_ACT_OK, TC_ACT_SHOT, bpf_sk_lookup};
 use aya_ebpf::btf_maps::lpm_trie::Key;
@@ -21,7 +44,7 @@ use aya_ebpf_bindings::helpers::{
     bpf_sk_storage_get, bpf_skb_change_head, bpf_skb_store_bytes,
 };
 use clash_ebpf_common::{
-    DAE_BYPASS_MARK, DAE_TPROXY_MARK, DaeEventType,
+    DAE_BYPASS_MARK, DAE_TPROXY_MARK, DaeEventType, GC_BATCH_SIZE, GC_FLOW, GC_UDP_REPLY,
     DaeParam, PIDName, RedirectEntry, RedirectTuple,
 };
 use core::mem;
@@ -285,7 +308,7 @@ unsafe fn do_redirect(
             // L3 skb (本机发出的出站裸包): 补齐 14 字节以太网头
             let ret = bpf_skb_change_head(ctx, EthHdr::LEN as u32, 0);
             if ret != 0 {
-                return TC_ACT_OK;
+                return TC_ACT_SHOT;
             }
 
             let eth = EthHdr {
@@ -301,17 +324,18 @@ unsafe fn do_redirect(
                 0,
             );
             if ret != 0 {
-                return TC_ACT_OK;
+                return TC_ACT_SHOT;
             }
         } else {
             // L2 skb: 重写以太网目的 MAC 为 dae0peer_mac，确保跨 veth 到达 dae0peer 时目的 MAC 正确
-            let _ = bpf_skb_store_bytes(
+            let ret = bpf_skb_store_bytes(
                 ctx,
                 0,
                 param.dae0peer_mac.as_ptr() as *const _,
                 6,
                 0,
             );
+            if ret != 0 { return TC_ACT_SHOT; }
         }
 
         // 同时设置 skb->mark 与 cb[]，确保跨 veth 转移时标记不丢失
@@ -340,6 +364,7 @@ fn handle_lan_ipv4(
     param: &DaeParam,
     link_h_len: usize,
     pkt: &ParsedPacket,
+    observed: bool,
 ) -> i32 {
     let src_port = pkt.tuples.five.src_port;
     let dst_port = pkt.tuples.five.dst_port;
@@ -349,83 +374,19 @@ fn handle_lan_ipv4(
     let is_pure_syn = is_tcp && (pkt.tcph.syn() != 0 && pkt.tcph.ack() == 0);
     let is_fin_rst = is_tcp && (pkt.tcph.fin() != 0 || pkt.tcph.rst() != 0);
 
-    let ip_be: [u8; 4] = [
-        pkt.tuples.five.dst_ip[12],
-        pkt.tuples.five.dst_ip[13],
-        pkt.tuples.five.dst_ip[14],
-        pkt.tuples.five.dst_ip[15],
-    ];
-    let src_ip_be: [u8; 4] = [
-        pkt.tuples.five.src_ip[12],
-        pkt.tuples.five.src_ip[13],
-        pkt.tuples.five.src_ip[14],
-        pkt.tuples.five.src_ip[15],
-    ];
-
-    // 1. 源 IP / 源端口 静态 Bypass 与白名单判定
-    if is_src_ip4_bypassed(src_ip_be) {
-        return TC_ACT_OK;
-    }
-    if param.has_proxy_src_ips != 0 && !is_src_ip4_proxied(src_ip_be) {
-        return TC_ACT_OK;
-    }
-    if is_src_port_bypassed(src_port) {
-        return TC_ACT_OK;
-    }
-    if param.has_proxy_src_ports != 0
-        && unsafe { PROXY_SRC_PORTS.get(&src_port).is_none() }
-    {
-        return TC_ACT_OK;
-    }
-
-    // 2. 常规业务流量目标过滤 (DNS 53 强制劫持到代理)
-    if dst_port != 53 {
-        // 本机直连流量放行
-        if param.local_ip != 0 && ip_be == param.local_ip.to_ne_bytes() {
-            return TC_ACT_OK;
-        }
-
-        // 静态目标 IP / 目标端口 Bypass 判定 (无需入表)
-        if is_dst_ip4_bypassed(ip_be)
-            || is_dst_port_bypassed(dst_port, param.tproxy_port as u16)
-        {
-            return TC_ACT_OK;
-        }
-    }
-
     let mut tuple = RedirectTuple::default();
     packet_redirect_tuple(pkt, 4, &mut tuple);
-
     let Some(scratch) = FLOW_SCRATCH.get_ptr_mut(0) else { return TC_ACT_SHOT; };
     let scratch = unsafe { &mut *scratch };
-    tracking::lookup_into(&tuple, is_pure_syn, is_fin_rst, &mut scratch.observed);
+    let packet_now = if is_udp { unsafe { bpf_ktime_get_ns() } } else { 0 };
+    if !observed && tracking::lookup_into(&tuple, is_pure_syn, is_fin_rst, packet_now, &mut scratch.observed)
+        & tracking::BUSY != 0 { return TC_ACT_SHOT; }
     let tracked = &scratch.observed;
     let is_redirected = tracked.is_redirect();
-
-    if dst_port != 53 {
-        // 动态直连流表 Fast-Path 查询 (针对非纯 SYN 报文)
-        if !is_redirected
-            && tracked.is_direct()
-        {
-            return TC_ACT_OK;
-        }
-
-        // 动态下发直连判定 (直连状态变化时更新，命中则建立统一五元组决策)
-        if !is_redirected && is_dynamic_dst_ip4_bypassed(ip_be) {
-            if tracking::publish_into(&tuple, tracked, None, &mut scratch.result) {
-                if scratch.result.is_direct() { return TC_ACT_OK; }
-            } else { return TC_ACT_SHOT; }
-        }
-
-        // 目标白名单过滤
-        if param.has_proxy_dst_ips != 0 && !is_dst_ip4_proxied(ip_be) {
-            return TC_ACT_OK;
-        }
-        if param.has_proxy_dst_ports != 0
-            && unsafe { PROXY_DST_PORTS.get(&dst_port).is_none() }
-        {
-            return TC_ACT_OK;
-        }
+    if !is_redirected && tracked.is_direct() { return TC_ACT_OK; }
+    if !is_redirected && routing::direct(param, link_h_len, pkt, false, None) {
+        if !tracking::publish_into(&tuple, tracked, None, &mut scratch.result) { return TC_ACT_SHOT; }
+        if scratch.result.is_direct() { return TC_ACT_OK; }
     }
 
     let ifindex = unsafe { (*ctx).ifindex };
@@ -449,7 +410,9 @@ fn handle_lan_ipv4(
             }
             if scratch.result.is_direct() { return TC_ACT_OK; }
         }
-        if is_udp { udp_reply::publish(&tuple, entry, bpf_ktime_get_ns()); }
+        if is_udp && !udp_reply::publish(&tuple, entry, packet_now) {
+            return TC_ACT_SHOT;
+        }
         let l4proto = if pkt.l4proto == IPPROTO_TCP {
             pkt.listener_l4proto
         } else {
@@ -457,8 +420,8 @@ fn handle_lan_ipv4(
         };
 
         if is_new_flow {
-            let sip_u32 = [u32::from_be_bytes(src_ip_be), 0, 0, 0];
-            let dip_u32 = [u32::from_be_bytes(ip_be), 0, 0, 0];
+            let sip_u32 = [u32::from_be_bytes([tuple.src_ip[12], tuple.src_ip[13], tuple.src_ip[14], tuple.src_ip[15]]), 0, 0, 0];
+            let dip_u32 = [u32::from_be_bytes([tuple.dst_ip[12], tuple.dst_ip[13], tuple.dst_ip[14], tuple.dst_ip[15]]), 0, 0, 0];
             send_dae_event(
                 DaeEventType::Redirected as u32,
                 0,
@@ -482,6 +445,7 @@ fn handle_lan_ipv6(
     param: &DaeParam,
     link_h_len: usize,
     pkt: &ParsedPacket,
+    observed: bool,
 ) -> i32 {
     let src_port = pkt.tuples.five.src_port;
     let dst_port = pkt.tuples.five.dst_port;
@@ -491,68 +455,19 @@ fn handle_lan_ipv6(
     let is_pure_syn = is_tcp && (pkt.tcph.syn() != 0 && pkt.tcph.ack() == 0);
     let is_fin_rst = is_tcp && (pkt.tcph.fin() != 0 || pkt.tcph.rst() != 0);
 
-    let dst_ip = pkt.tuples.five.dst_ip.as_bytes();
-    // 1. 源 IP / 源端口 静态 Bypass 与白名单判定
-    if is_src_ip6_bypassed(pkt.tuples.five.src_ip.as_bytes()) {
-        return TC_ACT_OK;
-    }
-    if param.has_proxy_src_ips != 0
-        && !is_src_ip6_proxied(pkt.tuples.five.src_ip.as_bytes())
-    {
-        return TC_ACT_OK;
-    }
-    if is_src_port_bypassed(src_port) {
-        return TC_ACT_OK;
-    }
-    if param.has_proxy_src_ports != 0
-        && unsafe { PROXY_SRC_PORTS.get(&src_port).is_none() }
-    {
-        return TC_ACT_OK;
-    }
-
-    // 2. 常规业务流量目标过滤 (DNS 53 强制劫持到代理)
-    if dst_port != 53 {
-        // 静态目标 IP / 目标端口 Bypass 判定 (无需入表)
-        if is_dst_ip6_bypassed(dst_ip)
-            || is_dst_port_bypassed(dst_port, param.tproxy_port as u16)
-        {
-            return TC_ACT_OK;
-        }
-    }
-
     let mut tuple = RedirectTuple::default();
     packet_redirect_tuple(pkt, 6, &mut tuple);
-
     let Some(scratch) = FLOW_SCRATCH.get_ptr_mut(0) else { return TC_ACT_SHOT; };
     let scratch = unsafe { &mut *scratch };
-    tracking::lookup_into(&tuple, is_pure_syn, is_fin_rst, &mut scratch.observed);
+    let packet_now = if is_udp { unsafe { bpf_ktime_get_ns() } } else { 0 };
+    if !observed && tracking::lookup_into(&tuple, is_pure_syn, is_fin_rst, packet_now, &mut scratch.observed)
+        & tracking::BUSY != 0 { return TC_ACT_SHOT; }
     let tracked = &scratch.observed;
     let is_redirected = tracked.is_redirect();
-
-    if dst_port != 53 {
-        // 动态直连流表 Fast-Path 查询 (针对非纯 SYN 报文)
-        if !is_redirected
-            && tracked.is_direct()
-        {
-            return TC_ACT_OK;
-        }
-
-        // 动态下发直连判定 (直连状态变化时更新，命中则建立统一五元组决策)
-        if !is_redirected && is_dynamic_dst_ip6_bypassed(dst_ip) {
-            if tracking::publish_into(&tuple, tracked, None, &mut scratch.result) {
-                if scratch.result.is_direct() { return TC_ACT_OK; }
-            } else { return TC_ACT_SHOT; }
-        }
-
-        // 目标白名单过滤
-        if param.has_proxy_dst_ips != 0 && !is_dst_ip6_proxied(dst_ip) {
-            return TC_ACT_OK;
-        }
-        if param.has_proxy_dst_ports != 0
-            && unsafe { PROXY_DST_PORTS.get(&dst_port).is_none() }
-        {
-            return TC_ACT_OK;
-        }
+    if !is_redirected && tracked.is_direct() { return TC_ACT_OK; }
+    if !is_redirected && routing::direct(param, link_h_len, pkt, false, None) {
+        if !tracking::publish_into(&tuple, tracked, None, &mut scratch.result) { return TC_ACT_SHOT; }
+        if scratch.result.is_direct() { return TC_ACT_OK; }
     }
 
     let ifindex = unsafe { (*ctx).ifindex };
@@ -576,7 +491,9 @@ fn handle_lan_ipv6(
             }
             if scratch.result.is_direct() { return TC_ACT_OK; }
         }
-        if is_udp { udp_reply::publish(&tuple, entry, bpf_ktime_get_ns()); }
+        if is_udp && !udp_reply::publish(&tuple, entry, packet_now) {
+            return TC_ACT_SHOT;
+        }
         let l4proto = if pkt.l4proto == IPPROTO_TCP {
             pkt.listener_l4proto
         } else {
@@ -621,34 +538,34 @@ fn handle_lan_ingress_impl(tc_ctx: &TcContext, link_h_len: usize) -> i32 {
         return TC_ACT_OK;
     }
 
-    let pkt = match parse_packet(tc_ctx, link_h_len as u32) {
+    let verdict = fast_path::forward(tc_ctx, param, link_h_len, false, core::ptr::null_mut());
+    if verdict >= 0 { return verdict; }
+    let observed = verdict == fast_path::CACHE_MISS;
+
+    handle_lan_miss(tc_ctx, param, link_h_len, observed)
+}
+
+// Cache misses reuse FLOW_SCRATCH.observed from the dedicated parser. No
+// intervening parser writes that map, and lifecycle transitions run only once.
+#[inline(never)]
+fn handle_lan_miss(tc_ctx: &TcContext, param: &DaeParam, link_h_len: usize, observed: bool) -> i32 {
+    let ctx = tc_ctx.skb.skb;
+    let parsed = if observed {
+        PARSED_PKT_MAP.get_ptr(0).map(|ptr| unsafe { &*ptr }).ok_or(ERR_MALFORMED)
+    } else { parse_packet(tc_ctx, link_h_len as u32) };
+    let pkt = match parsed {
         Ok(p) => p,
         Err(_) => return TC_ACT_OK,
     };
-
-    if param.has_bypass_dscps != 0
-        && unsafe { BYPASS_DSCPS.get(&pkt.tuples.dscp).is_some() }
-    {
-        return TC_ACT_OK;
-    }
 
     if dst_is_special(pkt, link_h_len as u32) {
         return TC_ACT_OK;
     }
 
-    if param.has_proxy_src_macs != 0 {
-        if link_h_len < EthHdr::LEN {
-            return TC_ACT_OK;
-        }
-        if unsafe { PROXY_SRC_MACS.get(&pkt.ethh.src_addr).is_none() } {
-            return TC_ACT_OK;
-        }
-    }
-
     if pkt.ethh.ether_type == ETH_P_IP.to_be() {
-        handle_lan_ipv4(ctx, param, link_h_len, pkt)
+        handle_lan_ipv4(ctx, param, link_h_len, pkt, observed)
     } else if pkt.ethh.ether_type == ETH_P_IPV6.to_be() {
-        handle_lan_ipv6(ctx, param, link_h_len, pkt)
+        handle_lan_ipv6(ctx, param, link_h_len, pkt, observed)
     } else {
         TC_ACT_OK
     }
@@ -664,9 +581,9 @@ fn handle_wan_ipv4(
     param: &DaeParam,
     link_h_len: usize,
     pkt: &ParsedPacket,
-    pid_pname: Option<&PIDName>,
-    socket_was_proxied: bool,
+    process: &(Option<&PIDName>, bool, bool),
 ) -> i32 {
+    let (pid_pname, socket_was_proxied, observed) = *process;
     let src_port = pkt.tuples.five.src_port;
     let dst_port = pkt.tuples.five.dst_port;
 
@@ -688,54 +605,19 @@ fn handle_wan_ipv4(
         pkt.tuples.five.src_ip[15],
     ];
 
-    // 1. 常规业务流量目标过滤 (DNS 53 强制劫持到代理)
-    if dst_port != 53 {
-        // 本机直连流量放行
-        if param.local_ip != 0 && ip_be == param.local_ip.to_ne_bytes() {
-            return TC_ACT_OK;
-        }
-
-        // 静态目标 IP / 目标端口 Bypass 判定 (无需入表)
-        if is_dst_ip4_bypassed(ip_be)
-            || is_dst_port_bypassed(dst_port, param.tproxy_port as u16)
-        {
-            return TC_ACT_OK;
-        }
-    }
-
     let mut tuple = RedirectTuple::default();
     packet_redirect_tuple(pkt, 4, &mut tuple);
-
     let Some(scratch) = FLOW_SCRATCH.get_ptr_mut(0) else { return TC_ACT_SHOT; };
     let scratch = unsafe { &mut *scratch };
-    tracking::lookup_into(&tuple, is_pure_syn, is_fin_rst, &mut scratch.observed);
+    let packet_now = if is_udp { unsafe { bpf_ktime_get_ns() } } else { 0 };
+    if !observed && tracking::lookup_into(&tuple, is_pure_syn, is_fin_rst, packet_now, &mut scratch.observed)
+        & tracking::BUSY != 0 { return TC_ACT_SHOT; }
     let tracked = &scratch.observed;
     let is_redirected = tracked.is_redirect() || socket_was_proxied;
-
-    if dst_port != 53 {
-        // 动态直连流表 Fast-Path 查询 (针对非纯 SYN 报文)
-        if !is_redirected
-            && tracked.is_direct()
-        {
-            return TC_ACT_OK;
-        }
-
-        // 动态下发直连判定 (直连状态变化时更新，命中则建立统一五元组决策)
-        if !is_redirected && is_dynamic_dst_ip4_bypassed(ip_be) {
-            if tracking::publish_into(&tuple, tracked, None, &mut scratch.result) {
-                if scratch.result.is_direct() { return TC_ACT_OK; }
-            } else { return TC_ACT_SHOT; }
-        }
-
-        // 目标白名单过滤
-        if param.has_proxy_dst_ips != 0 && !is_dst_ip4_proxied(ip_be) {
-            return TC_ACT_OK;
-        }
-        if param.has_proxy_dst_ports != 0
-            && unsafe { PROXY_DST_PORTS.get(&dst_port).is_none() }
-        {
-            return TC_ACT_OK;
-        }
+    if !is_redirected && tracked.is_direct() { return TC_ACT_OK; }
+    if !is_redirected && routing::direct(param, link_h_len, pkt, true, pid_pname) {
+        if !tracking::publish_into(&tuple, tracked, None, &mut scratch.result) { return TC_ACT_SHOT; }
+        if scratch.result.is_direct() { return TC_ACT_OK; }
     }
 
     let ifindex = unsafe { (*ctx).ifindex };
@@ -759,7 +641,9 @@ fn handle_wan_ipv4(
             }
             if scratch.result.is_direct() { return TC_ACT_OK; }
         }
-        if is_udp { udp_reply::publish(&tuple, entry, bpf_ktime_get_ns()); }
+        if is_udp && !udp_reply::publish(&tuple, entry, packet_now) {
+            return TC_ACT_SHOT;
+        }
         let l4proto = if pkt.l4proto == IPPROTO_TCP {
             pkt.listener_l4proto
         } else {
@@ -794,9 +678,9 @@ fn handle_wan_ipv6(
     param: &DaeParam,
     link_h_len: usize,
     pkt: &ParsedPacket,
-    pid_pname: Option<&PIDName>,
-    socket_was_proxied: bool,
+    process: &(Option<&PIDName>, bool, bool),
 ) -> i32 {
+    let (pid_pname, socket_was_proxied, observed) = *process;
     let src_port = pkt.tuples.five.src_port;
     let dst_port = pkt.tuples.five.dst_port;
 
@@ -805,50 +689,19 @@ fn handle_wan_ipv6(
     let is_pure_syn = is_tcp && (pkt.tcph.syn() != 0 && pkt.tcph.ack() == 0);
     let is_fin_rst = is_tcp && (pkt.tcph.fin() != 0 || pkt.tcph.rst() != 0);
 
-    let dst_ip = pkt.tuples.five.dst_ip.as_bytes();
-    // 1. 常规业务流量目标过滤 (DNS 53 强制劫持到代理)
-    if dst_port != 53 {
-        // 静态目标 IP / 目标端口 Bypass 判定 (无需入表)
-        if is_dst_ip6_bypassed(dst_ip)
-            || is_dst_port_bypassed(dst_port, param.tproxy_port as u16)
-        {
-            return TC_ACT_OK;
-        }
-    }
-
     let mut tuple = RedirectTuple::default();
     packet_redirect_tuple(pkt, 6, &mut tuple);
-
     let Some(scratch) = FLOW_SCRATCH.get_ptr_mut(0) else { return TC_ACT_SHOT; };
     let scratch = unsafe { &mut *scratch };
-    tracking::lookup_into(&tuple, is_pure_syn, is_fin_rst, &mut scratch.observed);
+    let packet_now = if is_udp { unsafe { bpf_ktime_get_ns() } } else { 0 };
+    if !observed && tracking::lookup_into(&tuple, is_pure_syn, is_fin_rst, packet_now, &mut scratch.observed)
+        & tracking::BUSY != 0 { return TC_ACT_SHOT; }
     let tracked = &scratch.observed;
     let is_redirected = tracked.is_redirect() || socket_was_proxied;
-
-    if dst_port != 53 {
-        // 动态直连流表 Fast-Path 查询 (针对非纯 SYN 报文)
-        if !is_redirected
-            && tracked.is_direct()
-        {
-            return TC_ACT_OK;
-        }
-
-        // 动态下发直连判定 (直连状态变化时更新，命中则建立统一五元组决策)
-        if !is_redirected && is_dynamic_dst_ip6_bypassed(dst_ip) {
-            if tracking::publish_into(&tuple, tracked, None, &mut scratch.result) {
-                if scratch.result.is_direct() { return TC_ACT_OK; }
-            } else { return TC_ACT_SHOT; }
-        }
-
-        // 目标白名单过滤
-        if param.has_proxy_dst_ips != 0 && !is_dst_ip6_proxied(dst_ip) {
-            return TC_ACT_OK;
-        }
-        if param.has_proxy_dst_ports != 0
-            && unsafe { PROXY_DST_PORTS.get(&dst_port).is_none() }
-        {
-            return TC_ACT_OK;
-        }
+    if !is_redirected && tracked.is_direct() { return TC_ACT_OK; }
+    if !is_redirected && routing::direct(param, link_h_len, pkt, true, pid_pname) {
+        if !tracking::publish_into(&tuple, tracked, None, &mut scratch.result) { return TC_ACT_SHOT; }
+        if scratch.result.is_direct() { return TC_ACT_OK; }
     }
 
     let ifindex = unsafe { (*ctx).ifindex };
@@ -872,7 +725,9 @@ fn handle_wan_ipv6(
             }
             if scratch.result.is_direct() { return TC_ACT_OK; }
         }
-        if is_udp { udp_reply::publish(&tuple, entry, bpf_ktime_get_ns()); }
+        if is_udp && !udp_reply::publish(&tuple, entry, packet_now) {
+            return TC_ACT_SHOT;
+        }
         let l4proto = if pkt.l4proto == IPPROTO_TCP {
             pkt.listener_l4proto
         } else {
@@ -959,43 +814,34 @@ fn handle_wan_egress_impl(tc_ctx: &TcContext, link_h_len: usize) -> i32 {
     }
     let pid_pname = unsafe { COOKIE_PID_MAP.get(&cookie) };
 
-    // A configured allow-list must fail closed. Socket metadata can be absent
-    // when a socket predates the cgroup hook or when cookie tracking fails; in
-    // that case we cannot prove that this process was selected for proxying.
-    if param.has_proxy_processes != 0 && pid_pname.is_none() {
-        return TC_ACT_OK;
-    }
-
-    // 3. 进程过滤 (提前短路，避免不必要的数据包解析开销)
+    // Control-plane identity remains an unconditional loop guard. User process
+    // routing rules are evaluated and cached only on a connection miss.
     if let Some(pp) = pid_pname {
-        // 自身控制面进程防环路
         if param.control_plane_pid != 0 && pp.pid == param.control_plane_pid {
             return TC_ACT_OK;
         }
-        // 黑名单：匹配 bypass_processes 直接放行
-        if param.has_bypass_processes != 0
-            && unsafe { BYPASS_PROCESSES.get(&pp.pname).is_some() }
-        {
-            return TC_ACT_OK;
-        }
-        // 白名单：配置了 proxy_processes 且未命中白名单直接放行
-        if param.has_proxy_processes != 0 {
-            if unsafe { PROXY_PROCESSES.get(&pp.pname).is_none() } {
-                return TC_ACT_OK;
-            }
-        }
     }
 
-    let pkt = match parse_packet(tc_ctx, link_h_len as u32) {
+    let verdict = fast_path::forward(tc_ctx, param, link_h_len, true, tcp_policy);
+    if verdict >= 0 { return verdict; }
+    let observed = verdict == fast_path::CACHE_MISS;
+
+    handle_wan_miss(tc_ctx, param, link_h_len, &(pid_pname, tcp_policy, observed))
+}
+
+#[inline(never)]
+fn handle_wan_miss(tc_ctx: &TcContext, param: &DaeParam, link_h_len: usize,
+    state: &(Option<&PIDName>, *mut u32, bool),
+) -> i32 {
+    let ctx = tc_ctx.skb.skb;
+    let (pid_pname, tcp_policy, observed) = *state;
+    let parsed = if observed {
+        PARSED_PKT_MAP.get_ptr(0).map(|ptr| unsafe { &*ptr }).ok_or(ERR_MALFORMED)
+    } else { parse_packet(tc_ctx, link_h_len as u32) };
+    let pkt = match parsed {
         Ok(p) => p,
         Err(_) => return TC_ACT_OK,
     };
-
-    if param.has_bypass_dscps != 0
-        && unsafe { BYPASS_DSCPS.get(&pkt.tuples.dscp).is_some() }
-    {
-        return TC_ACT_OK;
-    }
 
     if dst_is_special(pkt, link_h_len as u32) {
         return TC_ACT_OK;
@@ -1008,13 +854,13 @@ fn handle_wan_egress_impl(tc_ctx: &TcContext, link_h_len: usize) -> i32 {
         }
         let decision = unsafe { *tcp_policy };
         let verdict =
-            dispatch_wan(ctx, param, link_h_len, pkt, &(pid_pname, decision == 2));
+            dispatch_wan(ctx, param, link_h_len, pkt, &(pid_pname, decision == 2, observed));
         unsafe {
             *tcp_policy = if verdict == TC_ACT_OK { 3 } else { 2 };
         }
         return verdict;
     }
-    dispatch_wan(ctx, param, link_h_len, pkt, &(pid_pname, false))
+    dispatch_wan(ctx, param, link_h_len, pkt, &(pid_pname, false, observed))
 }
 
 #[inline(always)]
@@ -1023,13 +869,12 @@ fn dispatch_wan(
     param: &DaeParam,
     link_h_len: usize,
     pkt: &ParsedPacket,
-    process: &(Option<&PIDName>, bool),
+    process: &(Option<&PIDName>, bool, bool),
 ) -> i32 {
-    let (pid_pname, socket_was_proxied) = *process;
     if pkt.ethh.ether_type == ETH_P_IP.to_be() {
-        handle_wan_ipv4(ctx, param, link_h_len, pkt, pid_pname, socket_was_proxied)
+        handle_wan_ipv4(ctx, param, link_h_len, pkt, process)
     } else if pkt.ethh.ether_type == ETH_P_IPV6.to_be() {
-        handle_wan_ipv6(ctx, param, link_h_len, pkt, pid_pname, socket_was_proxied)
+        handle_wan_ipv6(ctx, param, link_h_len, pkt, process)
     } else {
         TC_ACT_OK
     }
@@ -1085,7 +930,7 @@ pub fn dae0peer_ingress(ctx: *mut __sk_buff) -> i32 {
     let cb0 = unsafe { (*ctx).cb[0] };
     let mark = unsafe { (*ctx).mark };
     if cb0 != DAE_TPROXY_MARK && mark != DAE_TPROXY_MARK {
-        return TC_ACT_OK;
+        return TC_ACT_SHOT;
     }
 
     // Set mark for policy routing (mark → table 100 → local route)
@@ -1094,7 +939,7 @@ pub fn dae0peer_ingress(ctx: *mut __sk_buff) -> i32 {
     }
 
     // Force PACKET_HOST so the IP stack accepts this packet
-    let _ = tc_ctx.change_type(0);
+    if tc_ctx.change_type(0).is_err() { return TC_ACT_SHOT; }
 
     TC_ACT_OK
 }
@@ -1152,57 +997,31 @@ pub fn dae0_ingress_l2(ctx: *mut __sk_buff) -> i32 {
 #[inline(never)]
 fn handle_dae0_ingress_impl(tc_ctx: &TcContext) -> i32 {
     let ctx = tc_ctx.skb.skb;
-    let pkt = match parse_packet(tc_ctx, EthHdr::LEN as u32) {
-        Ok(p) => p,
-        Err(_) => return TC_ACT_OK,
-    };
+    let mut entry = RedirectEntry::default();
+    let status = fast_path::reply(tc_ctx, &mut entry);
+    if status < 0 { return TC_ACT_SHOT; }
+    if status == 0 { return TC_ACT_OK; }
+    let dmac = entry.smac;
+    let smac = entry.dmac;
+    let from_wan = entry.from_wan;
+    let ifindex = entry.ifindex;
 
-    let is_ipv4 = pkt.ethh.ether_type == ETH_P_IP.to_be();
-    let is_ipv6 = pkt.ethh.ether_type == ETH_P_IPV6.to_be();
-
-    let ip_version = if is_ipv4 {
-        4
-    } else if is_ipv6 {
-        6
-    } else {
-        return TC_ACT_OK;
-    };
-    let mut reversed = RedirectTuple::default();
-    packet_reverse_redirect_tuple(pkt, ip_version, &mut reversed);
-    let Some(scratch) = FLOW_SCRATCH.get_ptr_mut(0) else { return TC_ACT_SHOT; };
-    let scratch = unsafe { &mut *scratch };
-    let flags = tracking::lookup_into(&reversed, false, false, &mut scratch.observed);
-    let exact = scratch.observed.route();
-    let entry = if pkt.l4proto == IPPROTO_UDP {
-        if let Some(route) = exact {
-            // Coalesce client-record touches with the exact flow's activity.
-            if flags & tracking::REFRESH_DUE != 0 { udp_reply::touch(&reversed); }
-            Some(route)
-        } else { udp_reply::lookup(&reversed) }
-    } else { exact };
-    if let Some(entry) = entry {
-        let dmac = entry.smac;
-        let smac = entry.dmac;
-        let from_wan = entry.from_wan;
-        let ifindex = entry.ifindex;
-
-        unsafe {
-            if dmac != [0; 6] {
-                // Ethernet destination and source addresses occupy the first 12 bytes.
-                let mut macs = [0u8; 12];
-                macs[..6].copy_from_slice(&dmac);
-                macs[6..].copy_from_slice(&smac);
-                let _ = bpf_skb_store_bytes(ctx, 0, macs.as_ptr().cast(), 12, 0);
+    unsafe {
+        if dmac != [0; 6] {
+            // Ethernet destination and source addresses occupy the first 12 bytes.
+            let mut macs = [0u8; 12];
+            macs[..6].copy_from_slice(&dmac);
+            macs[6..].copy_from_slice(&smac);
+            if bpf_skb_store_bytes(ctx, 0, macs.as_ptr().cast(), 12, 0) != 0 {
+                return TC_ACT_SHOT;
             }
-
-            let flags: u64 = if from_wan != 0 { 1 } else { 0 }; // 1 = BPF_F_INGRESS
-            if from_wan != 0 {
-                let _ = tc_ctx.change_type(0); // PACKET_HOST
-            }
-            bpf_redirect(ifindex, flags) as i32
         }
-    } else {
-        TC_ACT_OK
+
+        let flags: u64 = if from_wan != 0 { 1 } else { 0 }; // 1 = BPF_F_INGRESS
+        if from_wan != 0 {
+            if tc_ctx.change_type(0).is_err() { return TC_ACT_SHOT; } // PACKET_HOST
+        }
+        bpf_redirect(ifindex, flags) as i32
     }
 }
 

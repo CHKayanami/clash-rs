@@ -2,9 +2,16 @@
 #![cfg(target_os = "linux")]
 use aya::{Ebpf, EbpfLoader, maps::{Array, HashMap},
     programs::{SchedClassifier, TestRun, TestRunOptions}};
-use clash_ebpf_common::{DaeParam, FlowTrackEntry, RedirectTuple, UdpReplyEntry, UdpReplyKey};
+use clash_ebpf_common::{DaeParam, FlowTrackEntry, RedirectTuple, UdpReplyEntry, UdpReplyKey,
+    tracking::gate::reply_bucket};
 
 const BYTECODE: &[u8] = include_bytes!(env!("CLASH_EBPF_OBJECT"));
+
+#[path = "tracking/cache.rs"]
+mod cache;
+
+#[path = "tracking/lifecycle.rs"]
+mod lifecycle;
 
 fn packet(source_mac: u8) -> [u8; 60] {
     let mut data = [0u8; 60];
@@ -86,7 +93,7 @@ fn direct_decision_expiration_and_redirect_metadata_are_consistent() {
     let (_, redirected) = state(&bpf);
     assert_eq!(redirected >> 63, 0);
     assert_ne!(redirected >> 32, direct >> 32);
-    assert_ne!(run(&mut bpf, &packet(11)), 2);
+    assert_eq!(run(&mut bpf, &packet(11)), 2, "active reply publisher cannot be replaced");
     let (_, changed) = state(&bpf);
     assert_ne!(changed >> 32, redirected >> 32, "changed MAC replaces the complete record");
     let states = HashMap::<_, RedirectTuple, FlowTrackEntry>::try_from(bpf.map("FLOW_TRACK").unwrap()).unwrap();
@@ -169,7 +176,7 @@ fn concurrent_metadata_publication_keeps_one_complete_route() {
 
 #[test]
 #[ignore = "requires freshly built BPF bytecode and root"]
-fn client_reply_route_refreshes_without_a_flow_and_rejects_ambiguity() {
+fn ip_pair_reply_route_refreshes_without_a_flow_and_expires() {
     let mut bpf = EbpfLoader::new().load(BYTECODE).unwrap();
     for name in ["lan_ingress_l2", "dae0_ingress_l2"] {
         let program: &mut SchedClassifier = bpf.program_mut(name).unwrap().try_into().unwrap();
@@ -191,26 +198,36 @@ fn client_reply_route_refreshes_without_a_flow_and_rejects_ambiguity() {
     HashMap::<_, RedirectTuple, FlowTrackEntry>::try_from(bpf.map_mut("FLOW_TRACK").unwrap()).unwrap()
         .remove(&tuple).unwrap();
 
-    let reply = reply_packet([203, 0, 113, 7], 9999);
+    let reply = reply_packet([198, 51, 100, 9], 9999);
     let program: &mut SchedClassifier = bpf.program_mut("dae0_ingress_l2").unwrap().try_into().unwrap();
     assert_eq!(program.test_run(TestRunOptions { data_in: Some(&reply), ..TestRunOptions::new() })
-        .unwrap().return_value, 7, "client-only fallback redirects the reply");
-    let mut routes = HashMap::<_, UdpReplyKey, UdpReplyEntry>::try_from(bpf.map_mut("UDP_REPLY_TRACK").unwrap()).unwrap();
+        .unwrap().return_value, 7, "IP-pair binding redirects the reply");
+    let routes = HashMap::<_, UdpReplyKey, UdpReplyEntry>::try_from(bpf.map_mut("UDP_REPLY_TRACK").unwrap()).unwrap();
     entry = routes.get(&key, 0).unwrap();
     assert!(entry.last_seen_ns > old_stamp, "reply keeps the client record alive");
-    entry.ambiguous = 1;
-    entry.last_seen_ns = old_stamp;
+    let bucket = reply_bucket(&key);
+    let gates = Array::<_, u64>::try_from(bpf.map("TRACKING_GATES").unwrap()).unwrap();
+    let version = gates.get(&bucket, 0).unwrap();
+    let program: &mut SchedClassifier = bpf.program_mut("dae0_ingress_l2").unwrap().try_into().unwrap();
+    assert_eq!(program.test_run(TestRunOptions { data_in: Some(&reply), ..TestRunOptions::new() })
+        .unwrap().return_value, 7);
+    let gates = Array::<_, u64>::try_from(bpf.map("TRACKING_GATES").unwrap()).unwrap();
+    assert_eq!(gates.get(&bucket, 0).unwrap(), version,
+        "fresh IP-pair reads do not acquire the writer gate");
+    let mut routes = HashMap::<_, UdpReplyKey, UdpReplyEntry>::try_from(bpf.map_mut("UDP_REPLY_TRACK").unwrap()).unwrap();
+    entry.last_seen_ns = now.saturating_sub(123_000_000_000);
+    let expired_stamp = entry.last_seen_ns;
     routes.insert(key, entry, 0).unwrap();
     let program: &mut SchedClassifier = bpf.program_mut("dae0_ingress_l2").unwrap().try_into().unwrap();
     assert_eq!(program.test_run(TestRunOptions { data_in: Some(&reply), ..TestRunOptions::new() })
-        .unwrap().return_value, 0, "ambiguous client route cannot restore the reply");
+        .unwrap().return_value, 0, "expired IP pair cannot restore the reply");
     let routes = HashMap::<_, UdpReplyKey, UdpReplyEntry>::try_from(bpf.map("UDP_REPLY_TRACK").unwrap()).unwrap();
-    assert_eq!(routes.get(&key, 0).unwrap().last_seen_ns, old_stamp);
+    assert_eq!(routes.get(&key, 0).unwrap().last_seen_ns, expired_stamp);
 }
 
 #[test]
 #[ignore = "requires freshly built BPF bytecode and root"]
-fn exact_udp_replies_coalesce_client_touches_and_preserve_route_metadata() {
+fn udp_replies_use_shared_pair_without_touching_flow_state() {
     let mut bpf = EbpfLoader::new().load(BYTECODE).unwrap();
     for name in ["lan_ingress_l2", "dae0_ingress_l2"] {
         let program: &mut SchedClassifier = bpf.program_mut(name).unwrap().try_into().unwrap();
@@ -238,7 +255,8 @@ fn exact_udp_replies_coalesce_client_touches_and_preserve_route_metadata() {
     assert_eq!(program.test_run(TestRunOptions { data_in: Some(&reply), ..TestRunOptions::new() })
         .unwrap().return_value, 7);
     let routes = HashMap::<_, UdpReplyKey, UdpReplyEntry>::try_from(bpf.map("UDP_REPLY_TRACK").unwrap()).unwrap();
-    assert_eq!(routes.get(&key, 0).unwrap().last_seen_ns, old_stamp, "fresh exact flow skips client touch");
+    assert!(routes.get(&key, 0).unwrap().last_seen_ns > old_stamp,
+        "reply refreshes the shared pair independently of flow activity");
     let mut states = HashMap::<_, RedirectTuple, FlowTrackEntry>::try_from(bpf.map_mut("FLOW_TRACK").unwrap()).unwrap();
     flow.last_seen_seconds = (clock.tv_sec as u32).wrapping_sub(2);
     states.insert(tuple, flow, 0).unwrap();
@@ -249,5 +267,65 @@ fn exact_udp_replies_coalesce_client_touches_and_preserve_route_metadata() {
     let refreshed = routes.get(&key, 0).unwrap();
     assert!(refreshed.last_seen_ns > old_stamp);
     assert_eq!(refreshed.route, client.route, "timestamp refresh preserves all route fields");
-    assert_eq!(refreshed.ambiguous, client.ambiguous);
+    let states = HashMap::<_, RedirectTuple, FlowTrackEntry>::try_from(bpf.map("FLOW_TRACK").unwrap()).unwrap();
+    assert_eq!(states.get(&tuple, 0).unwrap(), flow, "reply does not query or refresh flow state");
+}
+
+#[test]
+#[ignore = "requires freshly built BPF bytecode and root; attaches no hooks"]
+fn udp_ports_share_one_ip_pair_and_conflicts_never_extend_its_lifetime() {
+    for ipv6 in [false, true] {
+        let mut bpf = EbpfLoader::new().load(BYTECODE).unwrap();
+        for name in ["lan_ingress_l2", "dae0_ingress_l2"] {
+            let program: &mut SchedClassifier = bpf.program_mut(name).unwrap().try_into().unwrap();
+            program.load().unwrap();
+        }
+        Array::try_from(bpf.map_mut("DAE_PARAM").unwrap()).unwrap()
+            .set(0, DaeParam { dae0_ifindex: 1, tproxy_port: 12345, ..DaeParam::default() }, 0).unwrap();
+        let mut request = if ipv6 {
+            let mut data = vec![0u8; 62];
+            data[..12].copy_from_slice(&packet(10)[..12]);
+            data[12..14].copy_from_slice(&0x86ddu16.to_be_bytes());
+            data[14] = 0x60;
+            data[18..20].copy_from_slice(&8u16.to_be_bytes());
+            data[20] = 17; data[21] = 64;
+            data[22..26].copy_from_slice(&[0x20, 1, 0x0d, 0xb8]);
+            data[37] = 2;
+            data[38..42].copy_from_slice(&[0x20, 1, 0x0d, 0xb8]);
+            data[53] = 9;
+            data[54..62].copy_from_slice(&packet(10)[34..42]);
+            data
+        } else { packet(10).to_vec() };
+        let ports = if ipv6 { 54 } else { 34 };
+        assert_eq!(run(&mut bpf, &request), 7);
+        let (tuple, _) = state(&bpf);
+        let key = UdpReplyKey::from_request(&tuple);
+        request[ports..ports + 2].copy_from_slice(&40002u16.to_be_bytes());
+        request[ports + 2..ports + 4].copy_from_slice(&9999u16.to_be_bytes());
+        assert_eq!(run(&mut bpf, &request), 7);
+        let routes = HashMap::<_, UdpReplyKey, UdpReplyEntry>::try_from(bpf.map("UDP_REPLY_TRACK").unwrap()).unwrap();
+        assert_eq!(routes.keys().count(), 1, "ports share one return binding");
+        let binding = routes.get(&key, 0).unwrap();
+        let flows = HashMap::<_, RedirectTuple, FlowTrackEntry>::try_from(bpf.map("FLOW_TRACK").unwrap()).unwrap();
+        assert_eq!(flows.keys().count(), 2, "connection decisions retain five-tuples");
+        let keys: Vec<_> = flows.keys().collect::<Result<_, _>>().unwrap();
+        let mut flows = HashMap::<_, RedirectTuple, FlowTrackEntry>::try_from(bpf.map_mut("FLOW_TRACK").unwrap()).unwrap();
+        for flow in keys { flows.remove(&flow).unwrap(); }
+        let mut reply = request.clone();
+        if ipv6 {
+            reply[22..38].copy_from_slice(&request[38..54]);
+            reply[38..54].copy_from_slice(&request[22..38]);
+        } else { reply = reply_packet([198, 51, 100, 9], 7777).to_vec(); }
+        let program: &mut SchedClassifier = bpf.program_mut("dae0_ingress_l2").unwrap().try_into().unwrap();
+        assert_eq!(program.test_run(TestRunOptions { data_in: Some(&reply), ..TestRunOptions::new() })
+            .unwrap().return_value, 7, "ports and flow retirement do not affect the shared route");
+        reply[if ipv6 { 37 } else { 29 }] = 8;
+        let program: &mut SchedClassifier = bpf.program_mut("dae0_ingress_l2").unwrap().try_into().unwrap();
+        assert_eq!(program.test_run(TestRunOptions { data_in: Some(&reply), ..TestRunOptions::new() })
+            .unwrap().return_value, 0, "unknown peer does not match another IP pair");
+        request[11] = 11;
+        assert_eq!(run(&mut bpf, &request), 2, "conflicting publisher is rejected");
+        let routes = HashMap::<_, UdpReplyKey, UdpReplyEntry>::try_from(bpf.map("UDP_REPLY_TRACK").unwrap()).unwrap();
+        assert_eq!(routes.get(&key, 0).unwrap(), binding, "conflict does not replace or renew the binding");
+    }
 }

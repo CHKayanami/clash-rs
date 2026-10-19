@@ -1,4 +1,5 @@
 #![no_std]
+#![cfg_attr(target_arch = "bpf", feature(asm_experimental_arch))]
 
 pub mod conn;
 pub mod dae_ip;
@@ -74,32 +75,32 @@ pub struct RedirectEntry {
     pub dmac: [u8; 6],
 }
 
-/// Client-only UDP return key. Address bytes and port retain RedirectTuple's
-/// wire representation. Explicit padding keeps all BPF key bytes initialized.
+/// Shared UDP return route for an ordered client/peer IP pair. Ports do not
+/// affect the return interface. Explicit padding initializes every key byte.
 #[repr(C, align(8))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct UdpReplyKey {
     pub client_ip: [u8; 16],
-    pub client_port: u16,
+    pub peer_ip: [u8; 16],
     pub ip_version: u8,
-    pub _pad: [u8; 5],
+    pub _pad: [u8; 7],
 }
 
 impl UdpReplyKey {
     pub fn from_request(tuple: &RedirectTuple) -> Self {
-        Self { client_ip: tuple.src_ip, client_port: tuple.src_port,
-            ip_version: tuple.ip_version, _pad: [0; 5] }
+        Self { client_ip: tuple.src_ip, peer_ip: tuple.dst_ip,
+            ip_version: tuple.ip_version, _pad: [0; 7] }
     }
 }
 
-/// Client route and ambiguity state, published as a complete map value.
+/// Shared IP-pair route, published as a complete map value.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct UdpReplyEntry {
     pub last_seen_ns: u64,
     pub route: RedirectEntry,
-    pub ambiguous: u8,
-    pub _pad: [u8; 3],
+    pub _pad: [u8; 4],
+    pub generation: u64,
 }
 
 #[cfg(all(feature = "user", target_os = "linux"))]
@@ -117,7 +118,7 @@ unsafe impl aya::Pod for UdpReplyKey {}
 #[cfg(all(feature = "user", target_os = "linux"))]
 unsafe impl aya::Pod for UdpReplyEntry {}
 
-/// FLOW_TRACK ABI: 32-bit activity fields and compact routing metadata.
+/// FLOW_TRACK ABI: atomic 32-bit activity fields and a full bucket generation.
 /// This layout has no implicit padding; route padding is explicitly initialized.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -125,7 +126,43 @@ pub struct FlowTrackEntry {
     pub last_seen_seconds: u32,
     pub state: u32,
     pub route: RedirectEntry,
+    pub _pad: [u8; 4],
+    pub generation: u64,
 }
+
+/// Only the single collector writes this request slot. The BPF program checks
+/// the observed incarnation and activity under the same gate as packet writers.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct TrackingGcRequest {
+    pub tuple: RedirectTuple,
+    pub generation: u64,
+    pub activity: u64,
+    pub now_ns: u64,
+    pub kind: u32,
+    pub _pad: u32,
+}
+
+pub const GC_BATCH_SIZE: usize = 16;
+
+/// One collector owns this slot. Explicit padding and initialized requests
+/// make the complete batch safe to copy through the map syscall ABI.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct TrackingGcBatch {
+    pub count: u32,
+    pub _pad: u32,
+    pub requests: [TrackingGcRequest; GC_BATCH_SIZE],
+}
+
+#[cfg(all(feature = "user", target_os = "linux"))]
+unsafe impl aya::Pod for TrackingGcBatch {}
+
+pub const GC_FLOW: u32 = 0;
+pub const GC_UDP_REPLY: u32 = 1;
+
+#[cfg(all(feature = "user", target_os = "linux"))]
+unsafe impl aya::Pod for TrackingGcRequest {}
 
 impl FlowTrackEntry {
     pub fn activity(&self) -> u64 { tracking::word(self.state, self.last_seen_seconds) }
@@ -142,8 +179,17 @@ pub mod tracking;
 
 const _: () = {
     assert!(core::mem::size_of::<RedirectEntry>() == 20);
-    assert!(core::mem::size_of::<FlowTrackEntry>() == 28);
-    assert!(core::mem::size_of::<UdpReplyEntry>() == 32);
+    assert!(core::mem::size_of::<FlowTrackEntry>() == 40);
+    assert!(core::mem::align_of::<FlowTrackEntry>() >= 8);
+    assert!(core::mem::offset_of!(FlowTrackEntry, last_seen_seconds) == 0);
+    assert!(core::mem::offset_of!(FlowTrackEntry, state) == 4);
+    assert!(core::mem::size_of::<UdpReplyKey>() == 40);
+    assert!(core::mem::size_of::<UdpReplyEntry>() == 40);
     assert!(core::mem::offset_of!(FlowTrackEntry, route) == 8);
+    assert!(core::mem::offset_of!(FlowTrackEntry, generation) == 32);
+    assert!(core::mem::size_of::<TrackingGcRequest>() == 72);
+    assert!(GC_BATCH_SIZE < 32);
+    assert!(core::mem::offset_of!(TrackingGcBatch, requests) == 8);
+    assert!(core::mem::size_of::<TrackingGcBatch>() == 1160);
     assert!(core::mem::offset_of!(UdpReplyEntry, route) == 8);
 };

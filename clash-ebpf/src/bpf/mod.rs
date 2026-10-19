@@ -26,6 +26,7 @@ use tracing::{debug, error, info, warn};
 
 mod static_bypass;
 mod tracking_gc;
+mod tracking_gc_program;
 use static_bypass::StaticBypass;
 
 /// Keep inactive process tracking maps minimal; their BPF references still
@@ -766,7 +767,7 @@ impl BpfProgramManager {
             info!("Attached TC egress ({}) on {}", prog_name, wan);
         }
 
-        self.tracking_abort = Some(tracking_gc::start(self.bpf.as_ref().unwrap())?);
+        self.tracking_abort = Some(tracking_gc::start(self.bpf.as_mut().unwrap())?);
         info!("eBPF programs and TC/cgroup hooks successfully attached");
         Ok(())
     }

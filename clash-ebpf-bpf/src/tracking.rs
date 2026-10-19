@@ -1,14 +1,15 @@
-//! Single-table decisions with whole-record routes and sparse plain activity writes.
-use core::ptr::{addr_of, addr_of_mut, read_volatile, write_volatile};
-use aya_ebpf_bindings::{bindings::BPF_NOEXIST,
-    helpers::{bpf_get_prandom_u32, bpf_ktime_get_ns}};
+//! Atomic activity reads and serialized lifecycle changes, including collection.
+use core::ptr::{addr_of, null, read_volatile};
+use aya_ebpf_bindings::{bindings::BPF_NOEXIST, helpers::bpf_ktime_get_ns};
 use clash_ebpf_common::{DaeEventType, FlowTrackEntry, RedirectEntry, RedirectTuple,
-    tracking::{self, DIRECT, CLOSING, MAX_GENERATION, expired, incarnation, token, word}};
-use crate::{maps::FLOW_TRACK, send_dae_event};
+    TrackingGcRequest, tracking::{self, DIRECT, CLOSING, MAX_GENERATION, expired,
+        token, word, transition, Transition, load_activity, store_activity, gate::try_lock}};
+use crate::{gate, maps::FLOW_TRACK, send_dae_event};
 
 #[derive(Clone, Copy, Default)]
 pub struct Decision {
     pub activity: u64,
+    pub generation: u64,
     route: RedirectEntry,
     _pad: [u8; 4],
 }
@@ -16,130 +17,173 @@ impl Decision {
     pub fn is_direct(&self) -> bool { token(self.activity) & DIRECT != 0 }
     pub fn is_redirect(&self) -> bool { self.activity != 0 && !self.is_direct() }
     pub fn matches_route(&self, route: &RedirectEntry) -> bool { self.is_redirect() && self.route == *route }
-    pub fn route(&self) -> Option<RedirectEntry> { self.is_redirect().then_some(self.route) }
 }
 
-// Like packet parsing scratch, this is owned by the current non-sleepable TC
-// invocation on its CPU. It avoids nesting large stack-resident route copies.
 #[repr(C)]
 pub struct Scratch { pub observed: Decision, pub result: Decision }
 
 #[inline(always)]
 fn now() -> u32 { (unsafe { bpf_ktime_get_ns() } / 1_000_000_000) as u32 }
 
-/// The kernel guarantees map-pointer memory safety during TC execution, not
-/// immutable contents after element recycling. No pointer escapes this call.
-#[inline(always)]
-fn current(tuple: &RedirectTuple) -> Option<(*mut FlowTrackEntry, u64)> {
-    let ptr = FLOW_TRACK.get_ptr_mut(tuple)?;
-    let activity = unsafe { sample(ptr) };
-    Some((ptr, activity))
-}
-
-#[inline(always)]
-unsafe fn sample(ptr: *const FlowTrackEntry) -> u64 {
-    unsafe { word(read_volatile(addr_of!((*ptr).state)),
-        read_volatile(addr_of!((*ptr).last_seen_seconds))) }
-}
-
-#[inline(always)]
-unsafe fn refresh(ptr: *mut FlowTrackEntry, observed: u64, stamp: u32) {
-    if stamp.wrapping_sub(tracking::seconds(observed)) as i32 > 0
-        && unsafe { read_volatile(addr_of!((*ptr).state)) } == token(observed) {
-        // Best-effort recheck, not a conditional atomic store. A replacement
-        // may race with this write; timestamp error is accepted.
-        unsafe { write_volatile(addr_of_mut!((*ptr).last_seen_seconds), stamp); }
-    }
-}
-
 pub const FOUND: u32 = 1;
-pub const REFRESH_DUE: u32 = 2;
+pub const BUSY: u32 = 4;
+pub const DIRECT_HIT: u32 = DIRECT;
+const RESET: u32 = 1;
+const FINISH: u32 = 2;
+const UDP: u32 = 4;
 
-#[inline(never)]
-pub fn lookup_into(tuple: &RedirectTuple, reset: bool, finish: bool, out: &mut Decision) -> u32 {
-    *out = Decision::default();
-    let mut control_incarnation = 0;
-    for _ in 0..3 {
-        let Some((ptr, activity)) = current(tuple) else { return 0; };
-        let id = token(activity);
-        let needs_activity = tuple.proto == 17 || id & CLOSING != 0;
-        let stamp = if needs_activity || reset || finish { now() } else { 0 };
-        let due = needs_activity && stamp.wrapping_sub(tracking::seconds(activity)) as i32 > 0;
-        let flags = FOUND | if due { REFRESH_DUE } else { 0 };
-        if control_incarnation == 0 { control_incarnation = incarnation(activity); }
-        else if (reset || finish) && incarnation(activity) != control_incarnation {
-            // Retry a concurrent refresh or close, never a replacement SYN or
-            // metadata incarnation. The caller can follow its current decision.
-            return 0;
-        }
-        if reset || expired(activity, stamp, tuple.proto == 17) {
-            if retire(tuple, ptr, activity) { return 0; }
-            continue;
-        }
-        if id & DIRECT != 0 {
-            if finish {
-                if !retire(tuple, ptr, activity) { continue; }
-            } else if needs_activity { unsafe { refresh(ptr, activity, stamp); } }
-            out.activity = activity;
-            return flags;
-        }
-        let route = unsafe { read_volatile(addr_of!((*ptr).route)) };
-        // Catch ordinary replacement/recycling without reader registration.
-        // This is best-effort validation, not a leased snapshot protocol.
-        if unsafe { read_volatile(addr_of!((*ptr).state)) } != id { continue; }
-        if finish && id & CLOSING == 0 {
-            let latest = if stamp.wrapping_sub(tracking::seconds(activity)) as i32 > 0 {
-                stamp
-            } else { tracking::seconds(activity) };
-            let closing = word(id | CLOSING, latest);
-            if unsafe { read_volatile(addr_of!((*ptr).state)) } != id { continue; }
-            unsafe {
-                write_volatile(addr_of_mut!((*ptr).last_seen_seconds), latest);
-                write_volatile(addr_of_mut!((*ptr).state), id | CLOSING);
-            }
-            out.activity = closing;
-        } else {
-            if needs_activity { unsafe { refresh(ptr, activity, stamp); } }
-            out.activity = activity;
-        }
-        out.route = route;
-        return flags;
+/// Copy only when a caller needs an owned decision for publication. The
+/// allocation is RCU protected for this invocation; route/generation never
+/// change in place, and activity must be read with one aligned atomic load.
+///
+/// # Safety
+/// `ptr` must be a non-null FLOW_TRACK allocation borrowed by this invocation.
+#[inline(always)]
+pub unsafe fn read_into(ptr: *const FlowTrackEntry, out: &mut Decision) {
+    unsafe {
+        out.activity = load_activity(ptr);
+        out.generation = read_volatile(addr_of!((*ptr).generation));
+        out.route = if token(out.activity) & DIRECT != 0 { RedirectEntry::default() }
+            else { read_volatile(addr_of!((*ptr).route)) };
+        out._pad = [0; 4];
     }
-    0
 }
 
-/// Recheck before deleting, accepting the remaining check/delete race.
+/// # Safety
+/// `ptr` must be a non-null FLOW_TRACK allocation borrowed by this invocation.
+#[inline(always)]
+pub unsafe fn route_matches(ptr: *const FlowTrackEntry, route: &RedirectEntry) -> bool {
+    unsafe { read_volatile(addr_of!((*ptr).route)) == *route }
+}
+
+/// # Safety
+/// Same invocation-scoped RCU lifetime as route_matches. No pointer is retained.
+#[inline(always)]
+pub unsafe fn route(ptr: *const FlowTrackEntry) -> RedirectEntry {
+    unsafe { read_volatile(addr_of!((*ptr).route)) }
+}
+
+/// Return only a borrowed map pointer and compact status on the hot path.
+/// No pointer may escape this BPF invocation or be written through by a caller.
+/// Misses and BUSY both return null; callers must check status before treating
+/// null as permission to classify a new flow. DIRECT_HIT belongs to this
+/// allocation, whose decision is immutable even if the map key is replaced.
 #[inline(never)]
-fn retire(tuple: &RedirectTuple, ptr: *mut FlowTrackEntry, observed: u64) -> bool {
-    if unsafe { sample(ptr) } != observed { return false; }
-    FLOW_TRACK.remove(tuple).is_ok()
+pub fn lookup_ref(tuple: &RedirectTuple, reset: bool, finish: bool, packet_now: u64,
+    status: &mut u32,
+) -> *const FlowTrackEntry {
+    *status = 0;
+    let Some(ptr) = FLOW_TRACK.get_ptr_mut(tuple) else { return null(); };
+    let activity = unsafe { load_activity(ptr) };
+    let id = token(activity);
+    let udp = tuple.proto == 17;
+    let needs_activity = udp || id & CLOSING != 0;
+    let stamp = if packet_now != 0 { (packet_now / 1_000_000_000) as u32 }
+        else if needs_activity || reset || finish { now() } else { 0 };
+    let due = needs_activity && stamp.wrapping_sub(tracking::seconds(activity)) as i32 > 0;
+    if !reset && !finish && !due && !expired(activity, stamp, udp) {
+        *status = FOUND | (id & DIRECT);
+        return ptr;
+    }
+    let options = if reset { RESET } else { 0 } | if finish { FINISH } else { 0 }
+        | if udp { UDP } else { 0 };
+    lookup_slow(tuple, ptr, options, stamp, status)
 }
 
-/// New flows arbitrate with NOEXIST. Metadata changes replace the complete
-/// allocation; concurrent publishers may win in either order. Readers accept
-/// rare replacement/recycling windows rather than registering on every packet.
+#[inline(never)]
+fn lookup_slow(tuple: &RedirectTuple, observed: *const FlowTrackEntry, options: u32,
+    stamp: u32, status: &mut u32,
+) -> *const FlowTrackEntry {
+    let expected = unsafe { read_volatile(addr_of!((*observed).generation)) };
+    let activity = unsafe { load_activity(observed) };
+    *status = BUSY;
+    let Some(epoch) = gate::word(gate::bucket(tuple)) else { return null(); };
+    let Some(_guard) = try_lock(epoch) else {
+        // Optional activity refresh may defer; identity changes fail closed.
+        if options & (RESET | FINISH) == 0 && !expired(activity, stamp, options & UDP != 0) {
+            *status = FOUND | (token(activity) & DIRECT);
+            return observed;
+        }
+        return null();
+    };
+    let Some(ptr) = FLOW_TRACK.get_ptr_mut(tuple) else {
+        *status = 0;
+        return null();
+    };
+    let generation = unsafe { read_volatile(addr_of!((*ptr).generation)) };
+    let mut activity = unsafe { load_activity(ptr) };
+    match transition(activity, generation, expected, stamp, options & UDP != 0,
+        options & RESET != 0, options & FINISH != 0) {
+        Transition::Keep => {}
+        Transition::Retire => {
+            if FLOW_TRACK.remove(tuple).is_err() { return null(); }
+            *status = 0;
+            return null();
+        }
+        Transition::Activity(next) => {
+            unsafe { store_activity(ptr, next); }
+            activity = next;
+        }
+    }
+    *status = FOUND | (token(activity) & DIRECT);
+    ptr
+}
+
+/// Cold/full-parser callers still need an owned snapshot for publication.
+#[inline(never)]
+pub fn lookup_into(tuple: &RedirectTuple, reset: bool, finish: bool, packet_now: u64, out: &mut Decision) -> u32 {
+    let mut status = 0;
+    let ptr = lookup_ref(tuple, reset, finish, packet_now, &mut status);
+    if ptr.is_null() { *out = Decision::default(); }
+    else { unsafe { read_into(ptr, out); } }
+    status
+}
+
 #[inline(never)]
 pub fn publish_into(tuple: &RedirectTuple, observed: &Decision, route: Option<&RedirectEntry>, out: &mut Decision) -> bool {
     *out = Decision::default();
+    let Some(epoch) = gate::word(gate::bucket(tuple)) else { return false; };
+    let Some(guard) = try_lock(epoch) else { return false; };
+    let current = FLOW_TRACK.get_ptr_mut(tuple);
+    if let Some(ptr) = current {
+        unsafe { read_into(ptr, out); }
+        // NOEXIST losers and delayed publishers adopt the winner; they cannot
+        // replace a newer incarnation with a decision made from an old one.
+        if observed.generation == 0 || out.generation != observed.generation { return true; }
+    }
     let stamp = now();
-    // Best-effort incarnation discrimination, not a globally leased identity.
-    let generation = (unsafe { bpf_get_prandom_u32() } & MAX_GENERATION as u32).max(1);
-    let id = generation | if route.is_none() { DIRECT } else { 0 }
-        | (token(observed.activity) & CLOSING);
-    let new = word(id, stamp);
+    let generation = guard.generation();
+    let id = ((generation as u32) & MAX_GENERATION as u32).max(1)
+        | if route.is_none() { DIRECT } else { 0 }
+        | (token(out.activity) & CLOSING);
     let initial = FlowTrackEntry { last_seen_seconds: stamp, state: id,
-        route: route.copied().unwrap_or_default() };
-    let flags = if observed.activity == 0 { BPF_NOEXIST as u64 } else { 0 };
-    let accepted = FLOW_TRACK.insert(tuple, &initial, flags).is_ok();
-    if accepted {
-        out.activity = new;
-        if let Some(route) = route { out.route = *route; }
+        route: route.copied().unwrap_or_default(), _pad: [0; 4], generation };
+    let flags = if current.is_none() { BPF_NOEXIST as u64 } else { 0 };
+    if FLOW_TRACK.insert(tuple, &initial, flags).is_ok() {
+        out.activity = word(id, stamp);
+        out.generation = generation;
+        out.route = initial.route;
         true
-    } else if lookup_into(tuple, false, false, out) & FOUND != 0 { true }
-    else {
+    } else {
         send_dae_event(if tuple.proto == 6 { DaeEventType::TcpConnOverflow as u32 }
             else { DaeEventType::UdpConnOverflow as u32 }, 0, None, 0, tuple.proto,
             None, None, 0, 0);
         false
     }
+}
+
+#[inline(never)]
+pub fn collect(request: &TrackingGcRequest) -> i32 {
+    let Some(epoch) = gate::word(gate::bucket(&request.tuple)) else { return 0; };
+    let Some(_guard) = try_lock(epoch) else { return 0; };
+    let Some(ptr) = FLOW_TRACK.get_ptr_mut(&request.tuple) else { return 0; };
+    let generation = unsafe { read_volatile(addr_of!((*ptr).generation)) };
+    let activity = unsafe { load_activity(ptr) };
+    if generation != request.generation || activity != request.activity
+        || !expired(activity, (request.now_ns / 1_000_000_000) as u32, request.tuple.proto == 17) {
+        return 0;
+    }
+    // No packet writer can refresh or republish this bucket until deletion
+    // completes and the guard publishes its next version.
+    FLOW_TRACK.remove(&request.tuple).is_ok() as i32
 }

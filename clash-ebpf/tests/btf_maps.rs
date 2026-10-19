@@ -6,7 +6,7 @@ use aya::programs::Program;
 use aya_obj::{Map, Object, generated::bpf_map_type::*};
 use clash_ebpf_common::{
     DaeParam, PIDName, ParseTransportCtx,
-    RedirectTuple,
+    RedirectTuple, FlowTrackEntry, UdpReplyEntry, TrackingGcBatch, tracking::gate::BUCKETS,
 };
 use std::mem::size_of;
 
@@ -94,9 +94,11 @@ fn btf_map_definitions_match_userspace_abi() {
             16,
             Some(1),
         ),
-        ("FLOW_TRACK", BPF_MAP_TYPE_HASH, 98304, size_of::<RedirectTuple>(), Some(28)),
-        ("FLOW_SCRATCH", BPF_MAP_TYPE_PERCPU_ARRAY, 1, 4, Some(64)),
-        ("UDP_REPLY_TRACK", BPF_MAP_TYPE_HASH, 32768, 24, Some(32)),
+        ("FLOW_TRACK", BPF_MAP_TYPE_HASH, 98304, size_of::<RedirectTuple>(), Some(size_of::<FlowTrackEntry>())),
+        ("FLOW_SCRATCH", BPF_MAP_TYPE_PERCPU_ARRAY, 1, 4, Some(80)),
+        ("UDP_REPLY_TRACK", BPF_MAP_TYPE_HASH, 32768, 40, Some(size_of::<UdpReplyEntry>())),
+        ("TRACKING_GATES", BPF_MAP_TYPE_ARRAY, BUCKETS, 4, Some(8)),
+        ("TRACKING_GC_REQUEST", BPF_MAP_TYPE_ARRAY, 1, 4, Some(size_of::<TrackingGcBatch>())),
         ("TCP_SOCKET_POLICY", BPF_MAP_TYPE_SK_STORAGE, 0, 4, Some(4)),
         ("LISTEN_SOCKET_MAP", BPF_MAP_TYPE_SOCKMAP, 4, 4, Some(4)),
         (

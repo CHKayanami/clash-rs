@@ -1,3 +1,5 @@
+pub mod fast;
+
 use crate::maps::{PARSE_CTX_MAP, PARSED_PKT_MAP};
 use aya_ebpf::programs::TcContext;
 use aya_ebpf_bindings::helpers::bpf_skb_load_bytes;
@@ -98,9 +100,13 @@ pub fn dst_is_special(pkt: &ParsedPacket, link_h_len: u32) -> bool {
     if link_h_len == ETH_HLEN && pkt.ethh.dst_addr[0] & 1 != 0 {
         return true;
     }
-    let dst = &pkt.tuples.five.dst_ip;
-    if dst.is_v4_mapped() {
-        let ip = u32::from_be(unsafe { dst.u6_addr32[3] });
+    dst_ip_is_special(pkt.tuples.five.dst_ip.as_bytes())
+}
+
+#[inline(always)]
+pub fn dst_ip_is_special(dst: &[u8; 16]) -> bool {
+    if dst[..12] == [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff] {
+        let ip = u32::from_be_bytes([dst[12], dst[13], dst[14], dst[15]]);
         // 0.0.0.0/8, 127.0.0.0/8, 169.254.0.0/16, 224.0.0.0/4, 255.255.255.255
         (ip & 0xFF000000) == 0
             || (ip & 0xFF000000) == 0x7F000000
@@ -108,7 +114,7 @@ pub fn dst_is_special(pkt: &ParsedPacket, link_h_len: u32) -> bool {
             || (ip & 0xF0000000) == 0xE0000000
             || ip == 0xFFFFFFFF
     } else {
-        let ip_be = unsafe { dst.u6_addr8 };
+        let ip_be = *dst;
         // Loopback (::1/128) & Unspecified (::/128)
         // Link-local unicast (fe80::/10) & Multicast (ff00::/8)
         ip_be == [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]

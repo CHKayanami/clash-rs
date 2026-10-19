@@ -6,7 +6,7 @@ use aya_ebpf::btf_maps::{
 use aya_ebpf::macros::btf_map;
 use clash_ebpf_common::{
     DaeEvent, DaeParam, FlowTrackEntry, PIDName, ParseTransportCtx,
-    RedirectTuple, UdpReplyKey, UdpReplyEntry,
+    RedirectTuple, UdpReplyKey, UdpReplyEntry, TrackingGcBatch, tracking::gate::BUCKETS,
 };
 
 #[btf_map]
@@ -59,16 +59,22 @@ pub static DYNAMIC_BYPASS_DST_IPS: LruHashMap<u32, u8, 16384> = LruHashMap::new(
 pub static DYNAMIC_BYPASS_DST_IP6S: LruHashMap<[u8; 16], u8, 16384> =
     LruHashMap::new();
 
-// NO_PREALLOC publishes whole records without reserving the full capacity.
-// Kernel recycling is allowed; no live LRU eviction.
+// NO_PREALLOC publishes route/generation as immutable replacement allocations.
+// Mutable activity and every lifecycle change follow the bucket protocol.
 #[btf_map]
 pub static FLOW_TRACK: HashMap<RedirectTuple, FlowTrackEntry, 98304, 1> = HashMap::new();
 
 #[btf_map]
 pub static FLOW_SCRATCH: PerCpuArray<Scratch, 1> = PerCpuArray::new();
 
-/// Non-preallocated client routes, without per-packet locks or live LRU eviction.
-/// Only redirected requests create entries; userspace collects expired entries.
+#[btf_map]
+pub static TRACKING_GATES: Array<u64, { BUCKETS as usize }> = Array::new();
+
+#[btf_map]
+pub static TRACKING_GC_REQUEST: Array<TrackingGcBatch, 1> = Array::new();
+
+/// Non-preallocated client routes. Requests, reply refreshes and BPF collection
+/// share the client bucket; userspace only supplies conditional GC candidates.
 #[btf_map]
 pub static UDP_REPLY_TRACK: HashMap<UdpReplyKey, UdpReplyEntry, 32768, 1> =
     HashMap::new();
