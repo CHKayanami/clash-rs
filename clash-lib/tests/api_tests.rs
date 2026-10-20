@@ -1178,6 +1178,30 @@ async fn test_memory_endpoint() {
         Some(0),
         "'oslimit' field should be 0"
     );
+
+    let url = format!("http://127.0.0.1:{api_port}/memory/details");
+    let req = hyper::Request::builder()
+        .uri(&url)
+        .header(hyper::header::AUTHORIZATION, "Bearer clash-rs")
+        .body(http_body_util::Empty::<Bytes>::new())
+        .unwrap();
+    let response = send_http_request(url.parse().unwrap(), req).await.unwrap();
+    assert_eq!(response.status(), http::StatusCode::OK);
+    let body = response.collect().await.unwrap().to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(json["timestamp"].as_str().is_some());
+    assert!(json["process"]["rss"].as_u64().is_some_and(|rss| rss > 0));
+    // Library tests do not install an allocator provider. Never report the
+    // linked allocator's counters as if they belonged to the active allocator.
+    assert!(json["jemalloc"].is_null());
+    assert!(json["errors"].as_array().unwrap().iter().any(|error| {
+        error.as_str().is_some_and(|error| error.contains("no active provider"))
+    }));
+    #[cfg(target_os = "linux")]
+    {
+        assert!(json["process"]["rss_anon"].is_u64());
+        assert!(json["process"]["threads"].as_u64().is_some_and(|n| n > 0));
+    }
 }
 
 #[tokio::test(flavor = "current_thread")]

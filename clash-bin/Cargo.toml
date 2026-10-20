@@ -36,7 +36,7 @@ dhat-heap = ["dep:dhat"]
 telemetry = ["clash-lib/telemetry"]
 jemallocator = ["dep:tikv-jemallocator"]
 jemalloc-prof = ["jemallocator", "tikv-jemallocator/profiling"]
-jemallocator-prof = ["jemalloc-prof"]
+jemallocator-prof = ["jemalloc-prof", "dep:tikv-jemalloc-ctl"]
 mimalloc = ["dep:mimalloc"]
 
 aws-lc-rs = ["dep:aws-lc-rs", "clash-lib/aws-lc-rs"]
@@ -50,6 +50,7 @@ clash-lib = { path = "../clash-lib", default-features = false }
 
 dhat = { version = "0.3", optional = true }
 tikv-jemallocator = { version = "0.7", features = ["unprefixed_malloc_on_supported_platforms"], optional = true }
+tikv-jemalloc-ctl = { version = "0.7", features = ["stats", "use_std"], optional = true }
 mimalloc = { version = "0.1", optional = true }
 
 sentry = { version = "0.49", default-features = false, features = ["backtrace", "contexts", "panic", "reqwest", "rustls"] }

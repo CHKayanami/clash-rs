@@ -1,10 +1,12 @@
 use std::sync::Arc;
 
-use axum::{Json, extract::State, response::IntoResponse};
+use axum::{Json, extract::State, http::StatusCode, response::IntoResponse};
 
 use serde::{Deserialize, Serialize};
+use serde_json::json;
+use tokio::task::spawn_blocking;
 
-use crate::app::api::AppState;
+use crate::app::{api::AppState, memory::memory_details};
 
 #[derive(Deserialize)]
 pub struct GetMemoryQuery {
@@ -24,4 +26,15 @@ pub async fn handle(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         oslimit: 0,
     };
     Json(snapshot).into_response()
+}
+
+pub async fn details() -> impl IntoResponse {
+    // /proc reads and allocator epoch refreshes must not block Tokio workers.
+    match spawn_blocking(memory_details).await {
+        Ok(snapshot) => Json(snapshot).into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": error.to_string() })),
+        ).into_response(),
+    }
 }

@@ -11,6 +11,9 @@ use tikv_jemallocator::Jemalloc;
 #[global_allocator]
 static GLOBAL: Jemalloc = Jemalloc;
 
+#[cfg(all(feature = "jemallocator-prof", not(feature = "dhat-heap"), not(feature = "mimalloc")))]
+mod jemalloc_stats;
+
 #[cfg(all(feature = "jemallocator", not(feature = "dhat-heap"), not(feature = "mimalloc")))]
 #[repr(transparent)]
 pub struct MallocConfPtr(pub *const std::ffi::c_char);
@@ -130,6 +133,9 @@ fn env_truthy(name: &str) -> bool {
 }
 
 fn main() -> anyhow::Result<()> {
+    #[cfg(all(feature = "jemallocator-prof", not(feature = "dhat-heap"), not(feature = "mimalloc")))]
+    jemalloc_stats::register()?;
+
     #[cfg(feature = "tailscale")]
     // SAFETY: main runs before clash-rs starts its Tokio runtime or worker threads.
     // Library embedders must set this variable before starting their threads.

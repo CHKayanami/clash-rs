@@ -168,6 +168,7 @@ impl AsyncService for ApiRunner {
             .route("/user-stats", get(handlers::user_stats::handle))
             .route("/version", get(handlers::version::handle))
             .route("/memory", get(handlers::memory::handle))
+            .route("/memory/details", get(handlers::memory::details))
             .route("/restart", post(handlers::restart::handle))
             .nest("/ws", websocket::routes(app_state.clone()))
             .nest(
