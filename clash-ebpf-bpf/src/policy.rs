@@ -34,7 +34,7 @@ pub fn udp_reply_update_into(old: Option<&UdpReplyEntry>, route: RedirectEntry,
     let now = old.map_or(now, |old| now.max(old.last_seen_ns));
     let new = UdpReplyEntry { last_seen_ns: now, route, _pad: [0; 4], generation: 0 };
     if let Some(old) = old.filter(|old| !udp_reply_expired(old, now)) {
-        // An active IP pair has one publisher. Conflicts never replace its
+        // An active client socket has one publisher. Conflicts never replace its
         // route or extend its lifetime; publication reports rejection upstream.
         if old.route != route || now.saturating_sub(old.last_seen_ns) < REDIRECT_REFRESH_NS {
             return false;
@@ -56,20 +56,22 @@ mod tests {
     use clash_ebpf_common::{RedirectTuple, UdpReplyKey};
 
     #[test]
-    fn udp_return_key_shares_ports_but_preserves_both_ips_and_family() {
+    fn udp_return_key_ignores_remote_but_preserves_client_socket_and_family() {
         let mut first = RedirectTuple { src_ip: [1; 16], src_port: 1234,
             dst_ip: [2; 16], dst_port: 3478, proto: 17, ip_version: 4,
             ..Default::default() };
         let key = UdpReplyKey::from_request(&first);
-        first.src_port += 1; first.dst_port += 1;
+        first.dst_port += 1;
         assert_eq!(key, UdpReplyKey::from_request(&first));
         first.dst_ip = [3; 16];
+        assert_eq!(key, UdpReplyKey::from_request(&first));
+        first.src_port += 1;
         assert_ne!(key, UdpReplyKey::from_request(&first));
-        first.dst_ip = [2; 16]; first.ip_version = 6;
+        first.src_port -= 1; first.ip_version = 6;
         assert_ne!(key, UdpReplyKey::from_request(&first));
         first.ip_version = 4; first.src_ip = [4; 16];
         assert_ne!(key, UdpReplyKey::from_request(&first));
-        assert_eq!(core::mem::size_of::<UdpReplyKey>(), 40);
+        assert_eq!(core::mem::size_of::<UdpReplyKey>(), 24);
         assert_eq!(core::mem::size_of::<UdpReplyEntry>(), 40);
     }
 

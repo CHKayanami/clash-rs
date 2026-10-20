@@ -118,7 +118,7 @@ fn full_flow_table_drops_new_proxy_packets_without_overwriting_existing_flow() {
 #[ignore = "requires freshly built BPF bytecode and root; attaches no hooks"]
 fn full_client_reply_table_drops_packets_without_a_return_route() {
     let mut bpf = load(1);
-    let key = UdpReplyKey { peer_ip: [1; 16], ..UdpReplyKey::default() };
+    let key = UdpReplyKey { client_port: 1 as u16, ..UdpReplyKey::default() };
     HashMap::<_, UdpReplyKey, UdpReplyEntry>::try_from(bpf.map_mut("UDP_REPLY_TRACK").unwrap())
         .unwrap().insert(key, UdpReplyEntry::default(), 0).unwrap();
     assert_eq!(run(&mut bpf, &packet(10)), 2, "missing return state cannot be ignored");

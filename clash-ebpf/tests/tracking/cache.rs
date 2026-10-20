@@ -18,6 +18,19 @@ fn params(bpf: &mut Ebpf, mut param: DaeParam) {
     Array::try_from(bpf.map_mut("DAE_PARAM").unwrap()).unwrap().set(0, param, 0).unwrap();
 }
 
+// Validate packet output as well as the action: client MAC restoration must
+// preserve the unsolicited peer's complete IP/UDP packet, including its port.
+fn assert_full_cone_reply(bpf: &mut Ebpf, reply: &[u8]) {
+    let mut output = vec![0u8; reply.len()];
+    let program: &mut SchedClassifier = bpf.program_mut("dae0_ingress_l2").unwrap().try_into().unwrap();
+    assert_eq!(program.test_run(TestRunOptions { data_in: Some(reply),
+        data_out: Some(&mut output), ..TestRunOptions::new() }).unwrap().return_value, 7);
+    let request = packet(10);
+    assert_eq!(&output[..6], &request[6..12]);
+    assert_eq!(&output[6..12], &request[..6]);
+    assert_eq!(&output[12..], &reply[12..], "reply source, client endpoint and payload remain unchanged");
+}
+
 #[test]
 #[ignore = "requires freshly built BPF bytecode and root; attaches no hooks"]
 fn every_packet_routing_rule_publishes_a_sticky_direct_decision() {
@@ -107,12 +120,12 @@ fn ipv4_options_reuse_the_same_cached_tuple_and_reply_binding() {
     assert_eq!(run(&mut bpf, &options), 7, "IPv4 options use the full parser");
     assert_eq!(state(&bpf).1 >> 32, first >> 32);
     assert_eq!(state(&bpf).0, tuple);
-    let mut reply = reply_packet([198, 51, 100, 9], 3478).to_vec();
+    let mut reply = reply_packet([203, 0, 113, 77], 7777).to_vec();
     reply.splice(34..34, [1, 1, 1, 1]); reply[14] = 0x46;
     reply[16..18].copy_from_slice(&32u16.to_be_bytes());
-    let program: &mut SchedClassifier = bpf.program_mut("dae0_ingress_l2").unwrap().try_into().unwrap();
-    assert_eq!(program.test_run(TestRunOptions { data_in: Some(&reply), ..TestRunOptions::new() })
-        .unwrap().return_value, 7, "reply options use the same shared binding");
+    HashMap::<_, RedirectTuple, FlowTrackEntry>::try_from(bpf.map_mut("FLOW_TRACK").unwrap()).unwrap()
+        .remove(&tuple).unwrap();
+    assert_full_cone_reply(&mut bpf, &reply);
 }
 
 #[test]
@@ -161,10 +174,13 @@ fn ipv6_extension_fallback_preserves_cached_rules_and_udp_reply_routes() {
     assert_eq!(run(&mut bpf, &data), 7, "new connection evaluates current rules through the fallback");
     let mut reply = data.clone();
     reply[22..38].copy_from_slice(&data[38..54]); reply[38..54].copy_from_slice(&data[22..38]);
-    reply[62..64].copy_from_slice(&3478u16.to_be_bytes()); reply[64..66].copy_from_slice(&40000u16.to_be_bytes());
-    let program: &mut SchedClassifier = bpf.program_mut("dae0_ingress_l2").unwrap().try_into().unwrap();
-    assert_eq!(program.test_run(TestRunOptions { data_in: Some(&reply), ..TestRunOptions::new() })
-        .unwrap().return_value, 7);
+    reply[62..64].copy_from_slice(&7777u16.to_be_bytes()); reply[64..66].copy_from_slice(&40000u16.to_be_bytes());
+    reply[37] = 77;
+    let keys: Vec<_> = HashMap::<_, RedirectTuple, FlowTrackEntry>::try_from(bpf.map("FLOW_TRACK").unwrap()).unwrap()
+        .keys().collect::<Result<_, _>>().unwrap();
+    let mut flows = HashMap::<_, RedirectTuple, FlowTrackEntry>::try_from(bpf.map_mut("FLOW_TRACK").unwrap()).unwrap();
+    for key in keys { flows.remove(&key).unwrap(); }
+    assert_full_cone_reply(&mut bpf, &reply);
 }
 
 #[test]

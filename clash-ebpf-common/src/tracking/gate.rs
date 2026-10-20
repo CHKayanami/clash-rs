@@ -38,7 +38,8 @@ pub fn bucket(tuple: &RedirectTuple) -> u32 {
 
 #[inline(always)]
 pub fn reply_bucket(key: &UdpReplyKey) -> u32 {
-    finish(hash(&key.peer_ip, hash(&key.client_ip, key.ip_version as u32 ^ 0x9e3779b9)))
+    finish(hash(&key.client_ip, key.client_port as u32
+        ^ ((key.ip_version as u32) << 16) ^ 0x9e3779b9))
 }
 
 pub struct Guard<'a> {

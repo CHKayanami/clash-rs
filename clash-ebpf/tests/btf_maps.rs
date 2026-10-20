@@ -96,7 +96,7 @@ fn btf_map_definitions_match_userspace_abi() {
         ),
         ("FLOW_TRACK", BPF_MAP_TYPE_HASH, 98304, size_of::<RedirectTuple>(), Some(size_of::<FlowTrackEntry>())),
         ("FLOW_SCRATCH", BPF_MAP_TYPE_PERCPU_ARRAY, 1, 4, Some(80)),
-        ("UDP_REPLY_TRACK", BPF_MAP_TYPE_HASH, 32768, 40, Some(size_of::<UdpReplyEntry>())),
+        ("UDP_REPLY_TRACK", BPF_MAP_TYPE_HASH, 32768, 24, Some(size_of::<UdpReplyEntry>())),
         ("TRACKING_GATES", BPF_MAP_TYPE_ARRAY, BUCKETS, 4, Some(8)),
         ("TRACKING_GC_REQUEST", BPF_MAP_TYPE_ARRAY, 1, 4, Some(size_of::<TrackingGcBatch>())),
         ("TCP_SOCKET_POLICY", BPF_MAP_TYPE_SK_STORAGE, 0, 4, Some(4)),

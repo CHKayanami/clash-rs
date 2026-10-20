@@ -73,7 +73,7 @@ pub static TRACKING_GATES: Array<u64, { BUCKETS as usize }> = Array::new();
 #[btf_map]
 pub static TRACKING_GC_REQUEST: Array<TrackingGcBatch, 1> = Array::new();
 
-/// Non-preallocated client routes. Requests, reply refreshes and BPF collection
+/// Non-preallocated client-socket routes. Requests, reply refreshes and BPF collection
 /// share the client bucket; userspace only supplies conditional GC candidates.
 #[btf_map]
 pub static UDP_REPLY_TRACK: HashMap<UdpReplyKey, UdpReplyEntry, 32768, 1> =

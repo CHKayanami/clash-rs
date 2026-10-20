@@ -5,7 +5,7 @@ use aya_ebpf_bindings::helpers::bpf_ktime_get_ns;
 use clash_ebpf_common::{DaeParam, RedirectEntry, RedirectTuple, UdpReplyKey};
 use network_types::eth::EthHdr;
 use crate::{maps::FLOW_SCRATCH, tracking, udp_reply, do_redirect, packet_reverse_redirect_tuple,
-    transport::{fast::{Packet, parse_forward, parse_ip, parse_ports, read_macs, group_destination, prepare_miss, udp_header_present}, parse_packet, dst_ip_is_special, ETH_P_IP, ETH_P_IPV6, IPPROTO_TCP, IPPROTO_UDP}};
+    transport::{fast::{Packet, parse_forward, parse_reply_ip, parse_tcp_ports, read_macs, group_destination, prepare_miss, udp_destination_port}, parse_packet, dst_ip_is_special, ETH_P_IP, ETH_P_IPV6, IPPROTO_TCP, IPPROTO_UDP}};
 
 pub const CACHE_MISS: i32 = -1;
 pub const FULL_PARSE: i32 = -2;
@@ -62,28 +62,34 @@ pub fn forward(ctx: &TcContext, param: &DaeParam, link: usize, wan: bool, tcp_po
 
 #[inline(never)]
 pub fn reply(ctx: &TcContext, out: &mut RedirectEntry) -> i32 {
-    let mut packet = Packet::default();
-    let mut parsed = false;
-    if let Some(offset) = parse_ip(ctx, EthHdr::LEN, &mut packet.tuple) {
-        if packet.tuple.proto == IPPROTO_UDP && udp_header_present(ctx, offset) {
-            let key = UdpReplyKey { client_ip: packet.tuple.dst_ip, peer_ip: packet.tuple.src_ip,
-                ip_version: packet.tuple.ip_version, _pad: [0; 7] };
-            return udp_reply::lookup_into(&key, unsafe { bpf_ktime_get_ns() }, out);
-        }
-        parsed = parse_ports(ctx, offset, &mut packet);
-    }
     let mut tuple = RedirectTuple::default();
-    if parsed { tuple = packet.tuple.reverse(); }
+    let mut parsed = false;
+    if let Some(offset) = parse_reply_ip(ctx, EthHdr::LEN, &mut tuple) {
+        if tuple.proto == IPPROTO_UDP {
+            if let Some(port) = udp_destination_port(ctx, offset) {
+                let key = UdpReplyKey { client_ip: tuple.dst_ip, client_port: port,
+                    ip_version: tuple.ip_version, _pad: [0; 5] };
+                return udp_reply::lookup_into(&key, unsafe { bpf_ktime_get_ns() }, out);
+            }
+        } else if tuple.proto == IPPROTO_TCP {
+            parsed = parse_tcp_ports(ctx, offset, &mut tuple);
+        }
+    }
+    if parsed { tuple = tuple.reverse(); }
     else {
         let pkt = match parse_packet(ctx, EthHdr::LEN as u32) {
             Ok(pkt) => pkt,
             Err(_) => return 0,
         };
         let version = if pkt.ethh.ether_type == ETH_P_IP.to_be() { 4 } else { 6 };
+        if pkt.l4proto == IPPROTO_UDP {
+            // Complex-header fallback already has the client endpoint. Avoid
+            // constructing a reverse five-tuple or copying the remote address.
+            let key = UdpReplyKey { client_ip: *pkt.tuples.five.dst_ip.as_bytes(),
+                client_port: pkt.tuples.five.dst_port, ip_version: version, _pad: [0; 5] };
+            return udp_reply::lookup_into(&key, unsafe { bpf_ktime_get_ns() }, out);
+        }
         packet_reverse_redirect_tuple(pkt, version, &mut tuple);
-    }
-    if tuple.proto == IPPROTO_UDP {
-        return udp_reply::lookup_into(&UdpReplyKey::from_request(&tuple), unsafe { bpf_ktime_get_ns() }, out);
     }
     let mut flags = 0;
     let ptr = tracking::lookup_ref(&tuple, false, false, 0, &mut flags);

@@ -30,7 +30,7 @@ impl GcValue<RedirectTuple> for FlowTrackEntry {
 impl GcValue<UdpReplyKey> for UdpReplyEntry {
     fn request(&self, key: &UdpReplyKey, now_ns: u64) -> TrackingGcRequest {
         TrackingGcRequest { tuple: RedirectTuple { src_ip: key.client_ip,
-            dst_ip: key.peer_ip, ip_version: key.ip_version,
+            src_port: key.client_port, ip_version: key.ip_version,
             ..RedirectTuple::default() }, generation: self.generation,
             activity: self.last_seen_ns, now_ns, kind: GC_UDP_REPLY, _pad: 0 }
     }

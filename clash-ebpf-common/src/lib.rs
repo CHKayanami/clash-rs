@@ -75,25 +75,25 @@ pub struct RedirectEntry {
     pub dmac: [u8; 6],
 }
 
-/// Shared UDP return route for an ordered client/peer IP pair. Ports do not
-/// affect the return interface. Explicit padding initializes every key byte.
+/// Endpoint-independent UDP return route for one client socket. Remote IP
+/// and port never restrict Full-Cone replies. Every key byte is initialized.
 #[repr(C, align(8))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct UdpReplyKey {
     pub client_ip: [u8; 16],
-    pub peer_ip: [u8; 16],
+    pub client_port: u16,
     pub ip_version: u8,
-    pub _pad: [u8; 7],
+    pub _pad: [u8; 5],
 }
 
 impl UdpReplyKey {
     pub fn from_request(tuple: &RedirectTuple) -> Self {
-        Self { client_ip: tuple.src_ip, peer_ip: tuple.dst_ip,
-            ip_version: tuple.ip_version, _pad: [0; 7] }
+        Self { client_ip: tuple.src_ip, client_port: tuple.src_port,
+            ip_version: tuple.ip_version, _pad: [0; 5] }
     }
 }
 
-/// Shared IP-pair route, published as a complete map value.
+/// Shared client-socket route, published as a complete map value.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct UdpReplyEntry {
@@ -183,7 +183,7 @@ const _: () = {
     assert!(core::mem::align_of::<FlowTrackEntry>() >= 8);
     assert!(core::mem::offset_of!(FlowTrackEntry, last_seen_seconds) == 0);
     assert!(core::mem::offset_of!(FlowTrackEntry, state) == 4);
-    assert!(core::mem::size_of::<UdpReplyKey>() == 40);
+    assert!(core::mem::size_of::<UdpReplyKey>() == 24);
     assert!(core::mem::size_of::<UdpReplyEntry>() == 40);
     assert!(core::mem::offset_of!(FlowTrackEntry, route) == 8);
     assert!(core::mem::offset_of!(FlowTrackEntry, generation) == 32);

@@ -25,8 +25,8 @@ fn bounded_batches_reclaim_expired_records_and_preserve_active_tcp() {
     let live_udp = tuple(u16::MAX, 17);
     collector.flows.map.insert(live_udp, FlowTrackEntry { last_seen_seconds: 1000, state: 2,
         ..FlowTrackEntry::default() }, 0).unwrap();
-    let expired_reply = UdpReplyKey { peer_ip: [1; 16], ..UdpReplyKey::default() };
-    let live_reply = UdpReplyKey { peer_ip: [2; 16], ..UdpReplyKey::default() };
+    let expired_reply = UdpReplyKey { client_port: 1 as u16, ..UdpReplyKey::default() };
+    let live_reply = UdpReplyKey { client_port: 2 as u16, ..UdpReplyKey::default() };
     collector.replies.map.insert(expired_reply, UdpReplyEntry { last_seen_ns: 1,
         ..UdpReplyEntry::default() }, 0).unwrap();
     collector.replies.map.insert(live_reply, UdpReplyEntry { last_seen_ns: now,
@@ -138,7 +138,7 @@ fn sweep_cadence_uses_both_capacities_and_only_backs_off_when_both_are_empty() {
         }, 0).unwrap();
     }
     for peer in 0..6 {
-        collector.replies.map.insert(UdpReplyKey { peer_ip: [peer; 16], ..UdpReplyKey::default() },
+        collector.replies.map.insert(UdpReplyKey { client_port: peer as u16, ..UdpReplyKey::default() },
             UdpReplyEntry { last_seen_ns: now, ..UdpReplyEntry::default() }, 0).unwrap();
     }
     collector.step(now).unwrap();
@@ -152,7 +152,7 @@ fn sweep_cadence_uses_both_capacities_and_only_backs_off_when_both_are_empty() {
     }
     assert_eq!(collector.pause(), Duration::from_secs(1), "reply map alone is 75% full");
     for peer in 0..6 {
-        collector.replies.map.remove(&UdpReplyKey { peer_ip: [peer; 16], ..UdpReplyKey::default() }).unwrap();
+        collector.replies.map.remove(&UdpReplyKey { client_port: peer as u16, ..UdpReplyKey::default() }).unwrap();
     }
     for _ in 0..2 {
         finish_sweep(&mut collector, now);
@@ -187,8 +187,8 @@ fn batch_results_distinguish_deleted_refreshed_replaced_and_busy_candidates() {
     flows.map.insert(tuple(2, 17), fresh, 0).unwrap();
     let replacement = FlowTrackEntry { generation: 4, ..old };
     flows.map.insert(tuple(3, 17), replacement, 0).unwrap();
-    let expired_key = UdpReplyKey { peer_ip: [5; 16], ip_version: 4, ..UdpReplyKey::default() };
-    let fresh_key = UdpReplyKey { peer_ip: [6; 16], ..expired_key };
+    let expired_key = UdpReplyKey { client_port: 5 as u16, ip_version: 4, ..UdpReplyKey::default() };
+    let fresh_key = UdpReplyKey { client_port: 6 as u16, ..expired_key };
     let reply = UdpReplyEntry { last_seen_ns: 1, generation: 2, ..UdpReplyEntry::default() };
     replies.map.insert(expired_key, reply, 0).unwrap();
     replies.map.insert(fresh_key, UdpReplyEntry { last_seen_ns: now, ..reply }, 0).unwrap();

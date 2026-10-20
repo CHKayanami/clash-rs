@@ -26,6 +26,18 @@ fn bytes<const N: usize>(ctx: &TcContext, offset: usize) -> Option<&[u8; N]> {
 
 #[inline(always)]
 pub fn parse_ip(ctx: &TcContext, link: usize, tuple: &mut RedirectTuple) -> Option<usize> {
+    parse_ip_fields(ctx, link, tuple, false)
+}
+
+/// UDP replies only need the client destination. The constant reply mode is
+/// inlined so the unused remote address is never materialized on that path.
+#[inline(always)]
+pub fn parse_reply_ip(ctx: &TcContext, link: usize, tuple: &mut RedirectTuple) -> Option<usize> {
+    parse_ip_fields(ctx, link, tuple, true)
+}
+
+#[inline(always)]
+fn parse_ip_fields(ctx: &TcContext, link: usize, tuple: &mut RedirectTuple, reply: bool) -> Option<usize> {
     let protocol = if link == ETH_HLEN as usize {
         let eth = bytes::<14>(ctx, 0)?;
         u16::from_be_bytes([eth[12], eth[13]])
@@ -36,17 +48,20 @@ pub fn parse_ip(ctx: &TcContext, link: usize, tuple: &mut RedirectTuple) -> Opti
         if ip[0] != 0x45 || u16::from_be_bytes([ip[6], ip[7]]) & 0x3fff != 0 {
             return None;
         }
-        tuple.src_ip = [0; 16]; tuple.dst_ip = [0; 16];
-        tuple.src_ip[10] = 0xff; tuple.src_ip[11] = 0xff;
+        if !reply || ip[9] != IPPROTO_UDP {
+            tuple.src_ip = [0; 16];
+            tuple.src_ip[10] = 0xff; tuple.src_ip[11] = 0xff;
+            tuple.src_ip[12..].copy_from_slice(&ip[12..16]);
+        }
+        tuple.dst_ip = [0; 16];
         tuple.dst_ip[10] = 0xff; tuple.dst_ip[11] = 0xff;
-        tuple.src_ip[12..].copy_from_slice(&ip[12..16]);
         tuple.dst_ip[12..].copy_from_slice(&ip[16..20]);
         tuple.proto = ip[9]; tuple.ip_version = 4;
         Some(link + 20)
     } else if protocol == ETH_P_IPV6 {
         let ip = bytes::<40>(ctx, link)?;
         if ip[0] >> 4 != 6 { return None; }
-        tuple.src_ip.copy_from_slice(&ip[8..24]);
+        if !reply || ip[6] != IPPROTO_UDP { tuple.src_ip.copy_from_slice(&ip[8..24]); }
         tuple.dst_ip.copy_from_slice(&ip[24..40]);
         tuple.proto = ip[6]; tuple.ip_version = 6;
         if tuple.proto != IPPROTO_TCP && tuple.proto != IPPROTO_UDP { return None; }
@@ -75,6 +90,15 @@ pub fn parse_ports(ctx: &TcContext, offset: usize, packet: &mut Packet) -> bool 
     true
 }
 
+/// Reply tracking needs TCP ports, but no TCP flags or Ethernet metadata.
+#[inline(always)]
+pub fn parse_tcp_ports(ctx: &TcContext, offset: usize, tuple: &mut RedirectTuple) -> bool {
+    let Some(tcp) = bytes::<20>(ctx, offset) else { return false; };
+    tuple.src_port = u16::from_be_bytes([tcp[0], tcp[1]]);
+    tuple.dst_port = u16::from_be_bytes([tcp[2], tcp[3]]);
+    true
+}
+
 #[inline(always)]
 pub fn read_macs(ctx: &TcContext, link: usize, packet: &mut Packet) -> bool {
     if link == ETH_HLEN as usize {
@@ -86,8 +110,9 @@ pub fn read_macs(ctx: &TcContext, link: usize, packet: &mut Packet) -> bool {
 }
 
 #[inline(always)]
-pub fn udp_header_present(ctx: &TcContext, offset: usize) -> bool {
-    bytes::<8>(ctx, offset).is_some()
+pub fn udp_destination_port(ctx: &TcContext, offset: usize) -> Option<u16> {
+    let udp = bytes::<8>(ctx, offset)?;
+    Some(u16::from_be_bytes([udp[2], udp[3]]))
 }
 
 /// Read only the group bit before the cached direct decision.
