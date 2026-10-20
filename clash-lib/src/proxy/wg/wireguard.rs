@@ -153,11 +153,14 @@ impl WireguardTunnel {
             .await
     }
 
-    pub async fn send_ip_packet(&self, packet: &[u8]) -> Result<(), Error> {
+    async fn send_ip_packet(
+        &self,
+        packet: &[u8],
+        send_buf: &mut [u8],
+    ) -> Result<(), Error> {
         trace_ip_packet("Sending IP packet", packet);
 
-        let mut send_buf = vec![0u8; 65535];
-        let result = self.peer.lock().encapsulate(packet, &mut send_buf);
+        let result = self.peer.lock().encapsulate(packet, send_buf);
         match result {
             boringtun::noise::TunnResult::Done => {}
             boringtun::noise::TunnResult::Err(e) => {
@@ -194,10 +197,12 @@ impl WireguardTunnel {
     }
 
     async fn start_forwarding(&self, mut packet_reader: Receiver<Bytes>) {
+        // Owned by this loop; protocol output is copied before the next packet.
+        let mut send_buf = vec![0u8; 65535];
         loop {
             match packet_reader.recv().await {
                 Some(packet) => {
-                    if let Err(e) = self.send_ip_packet(&packet).await {
+                    if let Err(e) = self.send_ip_packet(&packet, &mut send_buf).await {
                         error!("failed to send packet: {}", e);
                     }
                 }

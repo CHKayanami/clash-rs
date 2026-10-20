@@ -27,7 +27,7 @@ async fn handshake_drains_queued_packets_and_backpressure_releases_peer() {
     let udp = AnyOutboundDatagram::dynamic(ChannelDatagram::new(outbound, received));
     let (tx, rx) = udp.split();
     let (packet_writer, mut stack) = mpsc::channel(1);
-    let (_packet_sender, packet_reader) = mpsc::channel(1);
+    let (packet_sender, packet_reader) = mpsc::channel(1);
     let tunnel = Arc::new(WireguardTunnel {
         source_peer_ip: Ipv4Addr::new(10, 0, 0, 1),
         source_peer_ipv6: None,
@@ -39,10 +39,15 @@ async fn handshake_drains_queued_packets_and_backpressure_releases_peer() {
         packet_writer,
         receivers: Mutex::new(Some(TunnelReceivers { rx, packet_reader })),
     });
+    let TunnelReceivers { rx, packet_reader } = tunnel.receivers.lock().take().unwrap();
+    let forwarding = tokio::spawn({
+        let tunnel = tunnel.clone();
+        async move { tunnel.start_forwarding(packet_reader).await }
+    });
     let packet = ipv4_packet([10, 0, 0, 1], [10, 0, 0, 2]);
-    tunnel.send_ip_packet(&packet).await.unwrap();
-    let initiation = sent.recv().await.unwrap();
     let mut buffer = vec![0; 65535];
+    packet_sender.send(Bytes::copy_from_slice(&packet)).await.unwrap();
+    let initiation = sent.recv().await.unwrap();
     let TunnResult::WriteToNetwork(response) =
         remote.decapsulate(None, &initiation.data, &mut buffer)
     else {
@@ -56,7 +61,6 @@ async fn handshake_drains_queued_packets_and_backpressure_releases_peer() {
     }).await.unwrap();
     let receiving = tokio::spawn({
         let tunnel = tunnel.clone();
-        let TunnelReceivers { rx, .. } = tunnel.receivers.lock().take().unwrap();
         async move { tunnel.start_receiving(rx).await }
     });
     tokio::time::timeout(Duration::from_secs(1), async {
@@ -70,6 +74,25 @@ async fn handshake_drains_queued_packets_and_backpressure_releases_peer() {
             }
         }
     }).await.unwrap();
+
+    // Reuse the forwarding scratch after the handshake for different payloads.
+    for destination in [[10, 0, 0, 3], [10, 0, 0, 4]] {
+        let packet = ipv4_packet([10, 0, 0, 1], destination);
+        packet_sender.send(Bytes::copy_from_slice(&packet)).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let output = sent.recv().await.unwrap();
+                if let TunnResult::WriteToTunnelV4(decoded, _) =
+                    remote.decapsulate(None, &output.data, &mut buffer)
+                {
+                    assert_eq!(decoded, packet);
+                    break;
+                }
+            }
+        }).await.unwrap();
+    }
+    drop(packet_sender);
+    tokio::time::timeout(Duration::from_secs(1), forwarding).await.unwrap().unwrap();
 
     // Fill the virtual-device queue before delivering an authenticated packet.
     tunnel.packet_writer.send((PortProtocol::Udp, Bytes::new())).await.unwrap();
