@@ -61,12 +61,6 @@ use super::{
     },
     transport::{HTTPObfs, TLSObfs, VerifiedStream},
 };
-#[cfg(feature = "shadowquic")]
-use shadowquic::{
-    quic::{QuicClient, QuicConnection},
-    shadowquic::EndClient,
-    squic::inbound::Unsplit,
-};
 #[cfg(feature = "shadowsocks")]
 use shadowsocks::{
     net::UdpSocket as ShadowsocksUdpSocket,
@@ -78,10 +72,7 @@ use tokio_tfo::TfoStream;
 #[cfg(feature = "tun")]
 use watfaq_netstack::TcpStream as TunTcpStream;
 #[cfg(feature = "shadowquic")]
-type ShadowQuicStream = Unsplit<
-    <<EndClient as QuicClient>::C as QuicConnection>::SendStream,
-    <<EndClient as QuicClient>::C as QuicConnection>::RecvStream,
->;
+use super::shadowquic::stream::ShadowQuicStream;
 
 // Keep the variant list, conversions and dispatch together. Registered types
 // select their concrete variant at compile time through Into.
@@ -312,6 +303,8 @@ impl AnyOutboundDatagram {
             Self::Shadowsocks(_) | Self::ShadowsocksUdp(_) => true,
             #[cfg(feature = "tuic")]
             Self::Tuic(_) => true,
+            #[cfg(feature = "shadowquic")]
+            Self::ShadowQuic(_) => true,
             _ => false,
         }
     }
@@ -384,7 +377,6 @@ single_packet_transport!(
     OutboundDatagramVmess,
     #[cfg(feature = "wireguard")] UdpPair,
     #[cfg(feature = "tailscale")] TailscaleDatagramOutbound,
-    #[cfg(feature = "shadowquic")] UdpSessionWrapper,
 );
 
 #[cfg(test)]

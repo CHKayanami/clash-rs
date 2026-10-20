@@ -17,7 +17,7 @@ aws-lc-rs = [
     "boringtun/aws-lc-rs",
     "watfaq-dns/aws-lc-rs",
     "rcgen/aws_lc_rs",
-    "shadowquic?/aws-lc-rs",
+    "quinn-jls?/rustls-aws-lc-rs",
 ]
 ring = [
     "rustls/ring",
@@ -27,7 +27,7 @@ ring = [
     "boringtun/ring",
     "watfaq-dns/ring",
     "rcgen/ring",
-    "shadowquic?/ring",
+    "quinn-jls?/rustls-ring",
 ]
 
 # Protos
@@ -35,7 +35,7 @@ shadowsocks = ["dep:shadowsocks"]
 tuic = []
 ssh = ["dep:russh", "dep:dirs", "dep:totp-rs"]
 onion = ["dep:arti-client", "dep:tor-rtcompat", "arti-client/onion-service-client"]
-shadowquic = ["dep:shadowquic", "shadowquic?/shadowquic-quinn"]
+shadowquic = ["dep:quinn-jls", "dep:quinn-proto-jls", "dep:brutal-core"]
 wireguard = ["dep:boringtun", "dep:smoltcp"]
 tailscale = ["dep:tailscale"]
 tproxy = []
@@ -220,7 +220,9 @@ dirs = { version = "7.0", optional = true }
 totp-rs = { version = "6.0", features = ["serde"], optional = true }
 
 # shadowquic
-shadowquic = { version = "0.4", optional = true, default-features = false}
+quinn-jls = { version = "0.3.8", optional = true, default-features = false, features = ["runtime-tokio"] }
+quinn-proto-jls = { version = "0.3.8", optional = true, default-features = false }
+brutal-core = { version = "0.1", optional = true }
 
 # experimental
 tailscale = { version = "0.6", optional = true }

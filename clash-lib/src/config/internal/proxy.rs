@@ -6,7 +6,7 @@ use crate::{
 use serde::{Deserialize, de::value::MapDeserializer};
 use yaml_serde::{Error as YamlError, Value};
 #[cfg(feature = "shadowquic")]
-use shadowquic::config::CongestionControl as SQCongestionControl;
+use crate::proxy::shadowquic::config::CongestionControl as SQCongestionControl;
 use std::{
     collections::HashMap,
     fmt::{Display, Formatter},

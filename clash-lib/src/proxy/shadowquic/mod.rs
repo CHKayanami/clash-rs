@@ -3,20 +3,26 @@ use crate::proxy::OutboundNode;
 
 use erased_serde::Serialize as ErasedSerialize;
 use std::{collections::HashMap, fmt::Debug, io, net::SocketAddr, str::FromStr};
-use std::sync::Arc;
-
-
-pub(crate) use compat::UdpSessionWrapper;
-use shadowquic::{
-    config,
-    dns::ResolverManager,
-    msgs::socks5::SocksAddr as SQAddr,
-    quic::QuicClient,
-    shadowquic::{EndClient, outbound::ShadowQuicClient},
-};
-use tokio::sync::{OnceCell, RwLock};
+use tokio::{io::join, sync::RwLock};
 use tokio_util::sync::PollSender;
+
+pub mod config;
+mod brutal;
 mod compat;
+mod endpoint;
+mod ids;
+mod protocol;
+mod registry;
+pub(crate) mod stream;
+mod udp;
+#[cfg(test)]
+mod client_tests;
+
+pub use config::HandlerOptions;
+pub(crate) use compat::UdpSessionWrapper;
+use endpoint::ClientEndpoint;
+use udp::ClientConnection;
+
 use crate::{
     app::dns::ThreadSafeDNSResolver,
     common::errors::new_io_error,
@@ -28,22 +34,16 @@ use super::{
     DialWithConnector, OutboundHandler, OutboundType,
     PlainProxyAPIResponse,
 };
-// This is ugly, it may be exposed better by shadowquic in the future
-type SQConn = shadowquic::squic::SQConn<<EndClient as QuicClient>::C>;
-pub type HandlerOptions = config::ShadowQuicClientCfg;
-
-impl<S, R> crate::proxy::ProxyStream for shadowquic::squic::inbound::Unsplit<S, R>
-where
-    S: tokio::io::AsyncWrite + Send + Unpin,
-    R: tokio::io::AsyncRead + Send + Unpin,
-{}
-
 pub struct Handler {
     name: String,
     opts: HandlerOptions,
-    ep: OnceCell<ShadowQuicClient>, /* Must be created after session since server
-                                     * addr needs to be resolved */
-    conn: RwLock<Option<SQConn>>,
+    state: RwLock<ClientState>,
+}
+
+#[derive(Default)]
+struct ClientState {
+    endpoint: Option<ClientEndpoint>,
+    connection: Option<ClientConnection>,
 }
 impl Debug for Handler {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -55,73 +55,54 @@ impl Handler {
         Self {
             name,
             opts,
-            ep: Default::default(),
-            conn: Default::default(),
+            state: Default::default(),
         }
     }
 
-    /// Resolve quic server DNS with clash DNS resolver
-    pub async fn prepare_endpoint(
-        &self,
-        sess: &Session,
-        resolver: ThreadSafeDNSResolver,
-    ) -> io::Result<&ShadowQuicClient> {
-        self.ep
-            .get_or_try_init(|| async {
-                let addr = self.opts.addr.clone();
-                let sock_addr = SocksAddr::from_str(&format!("{addr}:443"))
-                    .or(SocksAddr::from_str(&addr))
-                    .map_err(new_io_error)?;
-                tracing::info!("resolving host:{:?}", sock_addr);
-                let addr = match sock_addr {
-                    SocksAddr::Domain(host, port) => {
-                        let addr = resolver
-                            .resolve(&host, false)
-                            .await
-                            .map_err(|x| {
-                                io::Error::new(
-                                    io::ErrorKind::AddrNotAvailable,
-                                    format!(
-                                        "failed to resolve shadowquic domain \
-                                         name:{x:?}"
-                                    ),
-                                )
-                            })?
-                            .ok_or(io::ErrorKind::AddrNotAvailable)?;
-                        SocketAddr::new(addr, port)
-                    }
-                    SocksAddr::Ip(socket_addr) => socket_addr,
-                };
-                let mut cfg = self.opts.clone();
-                cfg.addr = addr.to_string();
-                cfg.socket_opt.fw_mark = sess.so_mark;
-                cfg.socket_opt.bind_interface = sess
-                    .iface
-                    .as_ref()
-                    .map(|iface| config::Interface::Device(iface.name.clone()));
-                let ep = ShadowQuicClient::new(cfg, Arc::new(ResolverManager::new()));
-                Ok(ep) as io::Result<ShadowQuicClient>
-            })
-            .await
+    async fn resolve_server(
+        &self, resolver: ThreadSafeDNSResolver,
+    ) -> io::Result<SocketAddr> {
+        let addr = SocksAddr::from_str(&self.opts.addr).map_err(new_io_error)?;
+        match addr {
+            SocksAddr::Domain(host, port) => {
+                let ip = resolver.resolve(&host, false).await
+                    .map_err(new_io_error)?
+                    .ok_or_else(|| io::Error::new(
+                        io::ErrorKind::AddrNotAvailable,
+                        "shadowquic server DNS returned no address",
+                    ))?;
+                Ok(SocketAddr::new(ip, port))
+            }
+            SocksAddr::Ip(addr) => Ok(addr),
+        }
     }
 
     async fn prepare_conn(
         &self,
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
-    ) -> io::Result<SQConn> {
-        let ep = self.prepare_endpoint(sess, resolver).await?;
-        if let Some(x) = &*self.conn.read().await
-            && x.close_reason().is_none()
+    ) -> io::Result<ClientConnection> {
+        if let Some(conn) = &self.state.read().await.connection
+            && conn.connection().close_reason().is_none()
         {
-            return Ok(x.clone());
+            return Ok(conn.clone());
         }
-        let mut conn = self.conn.write().await;
-        let newconn = ep.get_conn().await.map_err(|x| {
-            io::Error::other(format!("can't open shadowquic connection due to:{x}"))
-        })?;
-        conn.replace(newconn.clone());
-        Ok(newconn)
+        let mut state = self.state.write().await;
+        if let Some(conn) = &state.connection
+            && conn.connection().close_reason().is_none()
+        {
+            return Ok(conn.clone());
+        }
+        // Resolve again after disconnects, retaining TLS tickets when the socket
+        // family is unchanged. A changed family needs a new bound endpoint.
+        let addr = self.resolve_server(resolver).await?;
+        if state.endpoint.as_ref().is_none_or(|ep| ep.is_ipv4() != addr.is_ipv4()) {
+            state.endpoint = Some(ClientEndpoint::new(&self.opts, addr, sess).await?);
+        }
+        let endpoint = state.endpoint.as_ref().unwrap();
+        let conn = ClientConnection::new(endpoint.connect(&self.opts, addr).await?);
+        state.connection = Some(conn.clone());
+        Ok(conn)
     }
 }
 
@@ -155,14 +136,10 @@ impl OutboundHandler for Handler {
         resolver: ThreadSafeDNSResolver,
     ) -> io::Result<AnyStream> {
         let conn = self.prepare_conn(sess, resolver).await?;
-        let conn = shadowquic::squic::outbound::connect_tcp(
-            &conn,
-            to_sq_socks_addr(sess.destination.clone()),
-        )
-        .await
-        .map_err(|x| {
-            io::Error::other(format!("can't open shadowquic stream due to:{x}"))
-        })?;
+        let (mut send, recv) = conn.connection().open_bi().await
+            .map_err(new_io_error)?;
+        protocol::write_request(&mut send, protocol::CONNECT, &sess.destination).await?;
+        let conn = join(recv, send);
         sess.push_chain(self.name());
         Ok(AnyStream::new(conn))
     }
@@ -181,15 +158,9 @@ impl OutboundHandler for Handler {
         } else {
             "[::]:0"
         };
-        let socket = shadowquic::squic::outbound::associate_udp(
-            &conn,
-            addr.parse::<SocketAddr>().unwrap().into(),
-            self.opts.over_stream,
-        )
-        .await
-        .map_err(|x| {
-            io::Error::other(format!("can't open shadowquic stream due to:{x}"))
-        })?;
+        let socket = conn.associate(
+            addr.parse::<SocketAddr>().unwrap().into(), self.opts.over_stream,
+        ).await?;
         let chain = UdpSessionWrapper {
             s: PollSender::new(socket.0),
             r: socket.1,
@@ -198,9 +169,6 @@ impl OutboundHandler for Handler {
         sess.push_chain(self.name());
         Ok(AnyOutboundDatagram::new(chain))
     }
-
-
-
 }
 
 impl PlainProxyAPIResponse for Handler {
@@ -223,26 +191,6 @@ impl PlainProxyAPIResponse for Handler {
             m.insert("alpn".to_owned(), Box::new(self.opts.alpn.clone()) as _);
         }
         m
-    }
-}
-
-fn to_sq_socks_addr(x: SocksAddr) -> SQAddr {
-    match x {
-        SocksAddr::Ip(socket_addr) => SQAddr::from(socket_addr),
-        SocksAddr::Domain(host, port) => SQAddr::from_domain(host.to_string(), port),
-    }
-}
-fn to_clash_socks_addr(x: SQAddr) -> SocksAddr {
-    match x.addr {
-        shadowquic::msgs::socks5::AddrOrDomain::V4(ip) => {
-            SocksAddr::Ip(SocketAddr::new(ip.into(), x.port))
-        }
-        shadowquic::msgs::socks5::AddrOrDomain::V6(ip) => {
-            SocksAddr::Ip(SocketAddr::new(ip.into(), x.port))
-        }
-        shadowquic::msgs::socks5::AddrOrDomain::Domain(domain) => {
-            SocksAddr::Domain(String::from_utf8(domain.contents).unwrap().into(), x.port)
-        }
     }
 }
 
