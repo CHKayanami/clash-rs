@@ -23,6 +23,7 @@ async fn test_cache_delete_prefers_configured_upstream_tag_over_fakeip_alias() {
     use crate::app::dns::response::{ResponseTemplate, build_dns_ip_response};
     use crate::app::dns::ClashResolver;
     use super::config::{UpstreamConfig, UpstreamType};
+    use crate::app::dns::config::Config as DnsConfig;
     use super::RouterResolver;
 
     let mut cfg = RouterConfig::default();
@@ -30,7 +31,9 @@ async fn test_cache_delete_prefers_configured_upstream_tag_over_fakeip_alias() {
         UpstreamConfig {
             tag: "fakeip".to_string(),
             upstream_type: UpstreamType::Remote,
-            servers: vec![],
+            servers: DnsConfig::parse_nameserver(
+                &["192.0.2.53".into()],
+            ).unwrap(),
             proxy: None,
             client_subnet: None,
             inet4_range: "198.18.0.0/16".parse().unwrap(),

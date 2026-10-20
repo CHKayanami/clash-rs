@@ -1,53 +1,98 @@
 use futures::stream::{FuturesUnordered, StreamExt};
-use std::{io::ErrorKind, net::SocketAddr, sync::Arc, time::Duration};
+use std::{future::Future, net::SocketAddr, pin::Pin, sync::Arc, task::{Context, Poll}, time::Duration};
 use bytes::Bytes;
 use thiserror::Error;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream, UdpSocket};
+
+use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio::task::JoinSet;
-use tokio::time::timeout;
+use quinn::Endpoint;
+use crate::framing::serve_stream;
+use crate::encrypted::{EncryptedListeners, runtime::OwnedRuntime};
 use tracing::{debug, error, info};
 
-use crate::{DNSListenAddr, DnsIngress, DnsMessageExchanger};
+use crate::{DNSListenAddr, DnsIngress, DnsMessageExchanger, PreparedDnsListener};
 
 #[derive(Error, Debug)]
 pub enum DNSError {
     #[error(transparent)]
     Io(#[from] std::io::Error),
+    #[error("invalid DNS listener configuration: {0}")]
+    Configuration(String),
     #[error("invalid OP code: {0}")]
     InvalidOpQuery(String),
     #[error("query failed: {0}")]
     QueryFailed(String),
 }
 
-const MAX_CONCURRENT_UDP_QUERIES: usize = 4096;
-const MAX_TCP_CONNECTIONS: usize = 256;
-const TCP_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) const MAX_CONCURRENT_UDP_QUERIES: usize = 4096;
+pub(crate) const MAX_TCP_CONNECTIONS: usize = 256;
+pub(crate) const TCP_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+pub struct DnsListener {
+    tasks: JoinSet<()>,
+    endpoint: Option<Endpoint>,
+    runtime: Option<Arc<OwnedRuntime>>,
+}
+
+impl DnsListener {
+    pub async fn shutdown(&mut self) {
+        if let Some(endpoint) = &self.endpoint {
+            endpoint.close(0_u32.into(), b"DNS listener shutdown");
+        }
+        self.tasks.shutdown().await;
+        drop(self.endpoint.take());
+        if let Some(runtime) = self.runtime.take() { runtime.shutdown().await; }
+    }
+}
+
+impl Future for DnsListener {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        match self.get_mut().tasks.poll_join_next(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(result) => {
+                if let Some(Err(error)) = result {
+                    error!("DNS listener task failed: {error}");
+                }
+                Poll::Ready(())
+            }
+        }
+    }
+}
+
+impl Drop for DnsListener {
+    fn drop(&mut self) {
+        if let Some(endpoint) = &self.endpoint {
+            endpoint.close(0_u32.into(), b"DNS listener dropped");
+        }
+        self.tasks.abort_all();
+        if let Some(runtime) = &self.runtime { runtime.abort(); }
+    }
+}
 
 pub async fn get_dns_listener<X>(
     listen: DNSListenAddr,
     exchanger: X,
-) -> Result<impl std::future::Future<Output = ()>, DNSError>
+) -> Result<DnsListener, DNSError>
 where
     X: DnsMessageExchanger + Clone,
 {
-    start_listener(
-        listen, exchanger, MAX_CONCURRENT_UDP_QUERIES,
-        MAX_TCP_CONNECTIONS, TCP_REQUEST_TIMEOUT,
-    ).await
+    PreparedDnsListener::new(listen)?.bind(exchanger).await
 }
 
-async fn start_listener<X>(
-    listen: DNSListenAddr,
+pub(crate) async fn start_listener<X>(
+    prepared: PreparedDnsListener,
     exchanger: X,
     udp_limit: usize,
     tcp_limit: usize,
     tcp_timeout: Duration,
-) -> Result<impl std::future::Future<Output = ()>, DNSError>
+) -> Result<DnsListener, DNSError>
 where
     X: DnsMessageExchanger + Clone,
 {
+    let listen = &prepared.listen;
     // Bind everything before spawning so a partial startup cannot leave tasks.
     let udp = match listen.udp {
         Some(addr) => Some(Arc::new(UdpSocket::bind(addr).await?)),
@@ -57,6 +102,7 @@ where
         Some(addr) => Some(TcpListener::bind(addr).await?),
         None => None,
     };
+    let encrypted = EncryptedListeners::bind(&prepared).await?;
     // Dropping the returned future aborts listeners and workers. The TCP
     // listener owns its connection tasks in another JoinSet for the same reason.
     let mut tasks = JoinSet::new();
@@ -138,6 +184,7 @@ where
     }
 
     if let Some(listener) = tcp {
+        let exchanger = exchanger.clone();
         info!("DNS TCP server listening on {}", listener.local_addr()?);
         tasks.spawn(async move {
             let mut connections = JoinSet::new();
@@ -152,8 +199,8 @@ where
                                     debug!("DNS TCP connection rejected due to concurrency saturation");
                                     continue;
                                 }
-                                connections.spawn(serve_tcp(
-                                    stream, peer, exchanger.clone(), tcp_timeout,
+                                connections.spawn(serve_stream(
+                                    stream, peer, exchanger.clone(), tcp_timeout, DnsIngress::Tcp,
                                 ));
                             }
                             Err(e) => {
@@ -167,73 +214,16 @@ where
         });
     }
 
-    Ok(async move {
-        while let Some(result) = tasks.join_next().await {
-            if let Err(e) = result {
-                error!("DNS listener task failed: {}", e);
-                break;
-            }
-        }
-    })
-}
-
-async fn serve_tcp<X>(
-    mut stream: TcpStream,
-    peer: SocketAddr,
-    exchanger: X,
-    request_timeout: Duration,
-) where
-    X: DnsMessageExchanger,
-{
-    let mut out_buf = Vec::with_capacity(512);
-    loop {
-        // A whole request deadline also bounds partial frames, stalled
-        // exchanges and peers that stop reading responses.
-        let result = timeout(request_timeout, async {
-            let mut len_buf = [0u8; 2];
-            if let Err(e) = stream.read_exact(&mut len_buf).await {
-                if e.kind() == ErrorKind::UnexpectedEof {
-                    return Ok::<bool, DNSError>(false);
-                }
-                return Err(e.into());
-            }
-            let msg_len = u16::from_be_bytes(len_buf) as usize;
-            if msg_len == 0 {
-                return Ok::<bool, DNSError>(false);
-            }
-            let mut req = vec![0; msg_len];
-            stream.read_exact(&mut req).await?;
-            let resp = exchanger.exchange(
-                Bytes::from(req), Some(peer.ip()), DnsIngress::Tcp,
-            ).await?;
-            let resp_len = u16::try_from(resp.len()).map_err(|_| {
-                DNSError::QueryFailed("DNS TCP response exceeds frame size".into())
-            })?;
-            out_buf.clear();
-            out_buf.extend_from_slice(&resp_len.to_be_bytes());
-            out_buf.extend_from_slice(&resp);
-            stream.write_all(&out_buf).await?;
-            stream.flush().await?;
-            Ok(true)
-        }).await;
-        match result {
-            Ok(Ok(true)) => {}
-            Ok(Ok(false)) => break,
-            Ok(Err(e)) => {
-                debug!("DNS TCP query from {} failed: {}", peer, e);
-                break;
-            }
-            Err(_) => {
-                debug!("DNS TCP request from {} timed out", peer);
-                break;
-            }
-        }
-    }
+    let (endpoint, runtime) = encrypted.spawn(&mut tasks, exchanger);
+    Ok(DnsListener { tasks, endpoint, runtime })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::net::TcpStream;
+    use tokio::time::timeout;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use std::net::IpAddr;
     use std::time::Duration;
     use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
@@ -363,7 +353,7 @@ mod tests {
         let release = Arc::new(Semaphore::new(0));
         let weak = Arc::downgrade(&release);
         let listener = start_listener(
-            listen.clone(), BlockingExchanger { entered, release: release.clone() },
+            PreparedDnsListener::new(listen.clone())?, BlockingExchanger { entered, release: release.clone() },
             2, 2, Duration::from_secs(1),
         ).await?;
         let client = UdpSocket::bind("127.0.0.1:0").await?;
@@ -400,7 +390,7 @@ mod tests {
         let listen = available_addresses().await?;
         let (sources, _events) = unbounded_channel();
         let listener = start_listener(
-            listen.clone(), EchoExchanger { sources }, 2, 1,
+            PreparedDnsListener::new(listen.clone())?, EchoExchanger { sources }, 2, 1,
             Duration::from_millis(300),
         ).await?;
         let mut first = TcpStream::connect(listen.tcp.unwrap()).await?;

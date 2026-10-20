@@ -3,7 +3,7 @@ use bytes::Bytes;
 
 use async_trait::async_trait;
 use tracing::{error, info};
-use watfaq_dns::{DNSListenAddr, DnsIngress};
+use clash_dns::{DNSError, DnsIngress, DnsMessageExchanger as ServerMessageExchanger, PreparedDnsListener};
 use super::query::IngressProfile;
 
 use super::ThreadSafeDNSResolver;
@@ -17,7 +17,7 @@ struct DnsMessageExchanger {
     resolver: ThreadSafeDNSResolver,
 }
 
-impl watfaq_dns::DnsMessageExchanger for DnsMessageExchanger {
+impl ServerMessageExchanger for DnsMessageExchanger {
     fn ipv6(&self) -> bool {
         self.resolver.ipv6()
     }
@@ -27,10 +27,10 @@ impl watfaq_dns::DnsMessageExchanger for DnsMessageExchanger {
         message: Bytes,
         source_ip: Option<IpAddr>,
         ingress: DnsIngress,
-    ) -> Result<Vec<u8>, watfaq_dns::DNSError> {
+    ) -> Result<Vec<u8>, DNSError> {
         let profile = match ingress {
             DnsIngress::Udp => IngressProfile::Udp { advertised_size: 512 },
-            DnsIngress::Tcp => IngressProfile::Tcp,
+            DnsIngress::Tcp | DnsIngress::Dot | DnsIngress::Doh | DnsIngress::Doh3 => IngressProfile::Tcp,
         };
         exchange_with_resolver(&self.resolver, message, profile, source_ip).await
     }
@@ -38,26 +38,22 @@ impl watfaq_dns::DnsMessageExchanger for DnsMessageExchanger {
 
 pub struct DnsRunner {
     enable: bool,
-    listener: DNSListenAddr,
+    listener: PreparedDnsListener,
     resolver: ThreadSafeDNSResolver,
-    #[allow(dead_code)]
-    cwd: std::path::PathBuf,
     cancellation_token: tokio_util::sync::CancellationToken,
 }
 
 impl DnsRunner {
     pub fn new(
         enable: bool,
-        listen: DNSListenAddr,
+        listen: PreparedDnsListener,
         resolver: ThreadSafeDNSResolver,
-        cwd: &std::path::Path,
         cancellation_token: Option<tokio_util::sync::CancellationToken>,
     ) -> Self {
         Self {
             enable,
             listener: listen,
             resolver,
-            cwd: cwd.to_path_buf(),
             cancellation_token: cancellation_token.unwrap_or_default(),
         }
     }
@@ -70,19 +66,18 @@ impl DnsRunner {
 #[async_trait]
 impl AsyncService for DnsRunner {
     async fn start(&self, ctx: &ServiceContext) -> Result<(), crate::Error> {
-        if !self.enable {
+        if !self.enable || self.listener.is_empty() {
             return Ok(());
         }
 
         let exchanger = DnsMessageExchanger {
             resolver: self.resolver.clone(),
         };
-        let listener = self.listener.clone();
         let cancellation_token = self.cancellation_token.clone();
         let child_cancel = cancellation_token.child_token();
 
-        let listener_fut =
-            match watfaq_dns::get_dns_listener(listener, exchanger).await {
+        let mut listener_fut =
+            match self.listener.bind(exchanger).await {
                 Ok(fut) => fut,
                 Err(e) => {
                     error!("failed to start DNS server: {}", e);
@@ -96,11 +91,12 @@ impl AsyncService for DnsRunner {
             cancellation_token,
             async move {
                 tokio::select! {
-                    _ = listener_fut => {},
+                    _ = &mut listener_fut => {},
                     _ = child_cancel.cancelled() => {
                         info!("DNS server is cancelled");
                     }
                 }
+                listener_fut.shutdown().await;
             },
         );
 
@@ -110,5 +106,24 @@ impl AsyncService for DnsRunner {
     async fn stop(&self) -> Result<(), crate::Error> {
         self.shutdown();
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use tokio_util::sync::CancellationToken;
+    use crate::app::dns::MockClashResolver;
+
+    #[tokio::test]
+    async fn enabled_resolver_without_listeners_does_not_spawn_server() {
+        let ctx = ServiceContext::new(CancellationToken::new());
+        let runner = DnsRunner::new(
+            true, PreparedDnsListener::default(), Arc::new(MockClashResolver::new()), None,
+        );
+        runner.start(&ctx).await.unwrap();
+        assert_eq!(ctx.tracker().len(), 0);
+        runner.stop().await.unwrap();
     }
 }

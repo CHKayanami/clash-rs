@@ -19,7 +19,7 @@ use super::{Config, ThreadSafeDNSResolver};
 use crate::{
     app::profile::ThreadSafeCacheFile,
     dns::{RuleDispatch, filters::PendingMmdb},
-    print_and_exit,
+    Error,
     proxy::utils::OutboundNodeRegistry,
 };
 
@@ -30,11 +30,12 @@ pub async fn new(
     outbounds: OutboundNodeRegistry,
     rule_dispatch: Option<Arc<RuleDispatch>>,
     collector: Option<super::ThreadSafeDnsCollector>,
-) -> ThreadSafeDNSResolver {
+) -> Result<ThreadSafeDNSResolver, Error> {
     if let Some(ref d2) = cfg.dns2 {
         if d2.enable {
             let dns2_cfg = cfg.dns2.take().unwrap();
-            return Arc::new(
+            let store = store.filter(|_| cfg.store_fake_ip);
+            return Ok(Arc::new(
                 RouterResolver::new(
                     dns2_cfg,
                     cfg.fw_mark,
@@ -42,30 +43,24 @@ pub async fn new(
                     outbounds,
                     collector,
                 )
-                .await
-                .unwrap_or_else(|error| print_and_exit!("failed to initialize dns2: {error}")),
-            );
+                .await?,
+            ));
         }
     }
 
     if cfg.enable {
-        match store {
-            Some(store) => Arc::new(
-                EnhancedResolver::new(
-                    cfg,
-                    store,
-                    mmdb,
-                    outbounds,
-                    rule_dispatch,
-                    collector,
-                )
-                .await,
-            ),
-            _ => print_and_exit!("enhanced resolver requires cache store"),
-        }
+        let store = store.ok_or_else(|| Error::InvalidConfig(
+            "enhanced resolver requires cache store".into(),
+        ))?;
+        Ok(Arc::new(EnhancedResolver::new(
+            cfg, store, mmdb, outbounds, rule_dispatch, collector,
+        ).await))
     } else {
-        Arc::new(
-            SystemResolver::new(cfg.ipv6).expect("failed to create system resolver"),
-        )
+        let resolver = SystemResolver::new(cfg.ipv6)
+            .map_err(|error| Error::DNSError(error.to_string()))?;
+        Ok(Arc::new(resolver))
     }
 }
+
+#[cfg(test)]
+mod tests;

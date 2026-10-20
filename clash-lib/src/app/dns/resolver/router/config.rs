@@ -6,6 +6,7 @@ use ipnet::IpNet;
 
 use crate::Error;
 use crate::app::dns::config::{Config as LegacyDnsConfig, EdnsClientSubnet, NameServer};
+use url::Host;
 use crate::app::dns::query::QType;
 use crate::app::dns::fakeip::{compute_v4_range, compute_v6_range};
 use crate::config::def::{DNSListen, Dns2Config as DefDns2Config, Dns2StringOrList};
@@ -125,8 +126,26 @@ impl Default for RouterConfig {
 
 impl RouterConfig {
     pub fn validate(&self) -> Result<(), Error> {
+        for ns in &self.default_nameserver {
+            if matches!(ns.host, Host::Domain(_)) {
+                return Err(Error::InvalidConfig(format!(
+                    "dns2.default-nameserver must use an IP address: {ns}",
+                )));
+            }
+        }
+        let mut tags = HashSet::new();
         let mut fakeip_tag = None;
         for upstream in &self.upstreams {
+            if upstream.tag.trim().is_empty() || !tags.insert(upstream.tag.as_str()) {
+                return Err(Error::InvalidConfig(format!(
+                    "dns2.upstreams tag must be nonempty and unique: '{}'", upstream.tag,
+                )));
+            }
+            if upstream.upstream_type == UpstreamType::Remote && upstream.servers.is_empty() {
+                return Err(Error::InvalidConfig(format!(
+                    "dns2.upstreams['{}'].server has no usable nameservers", upstream.tag,
+                )));
+            }
             if upstream.upstream_type != UpstreamType::FakeIp {
                 continue;
             }
@@ -147,6 +166,33 @@ impl RouterConfig {
                     "dns2.upstreams['{}'].inet6-range: {error}", upstream.tag,
                 ))
             })?;
+        }
+        let check_tag = |tag: &str, field: &str| -> Result<(), Error> {
+            if !tags.contains(tag) {
+                return Err(Error::InvalidConfig(format!(
+                    "{field}: unknown dns2 upstream '{tag}'",
+                )));
+            }
+            Ok(())
+        };
+        for (index, rule) in self.request_rules.iter().enumerate() {
+            if let RequestAction::Route(tag) = &rule.action {
+                check_tag(tag, &format!("dns2.routing.request[{index}].upstream"))?;
+            }
+        }
+        if let RequestAction::Route(tag) = &self.request_fallback {
+            check_tag(tag, "dns2.routing.request.fallback")?;
+        }
+        for (index, rule) in self.response_rules.iter().enumerate() {
+            if let Some(tag) = &rule.from_upstream {
+                check_tag(tag, &format!("dns2.routing.response[{index}].from-upstream"))?;
+            }
+            if let ResponseAction::Requery(tag) = &rule.action {
+                check_tag(tag, &format!("dns2.routing.response[{index}].upstream"))?;
+            }
+        }
+        if let ResponseAction::Requery(tag) = &self.response_fallback {
+            check_tag(tag, "dns2.routing.response.fallback")?;
         }
         Ok(())
     }
@@ -184,6 +230,12 @@ impl RouterConfig {
             LegacyDnsConfig::parse_nameserver(&["114.114.114.114".to_string(), "8.8.8.8".to_string()])?
         };
 
+        if default_nameserver.is_empty() {
+            return Err(Error::InvalidConfig(
+                "dns2.default-nameserver has no usable nameservers".into(),
+            ));
+        }
+
         let proxy_server_nameserver = if !def.proxy_server_nameserver.is_empty() {
             LegacyDnsConfig::parse_nameserver(&def.proxy_server_nameserver)?
         } else {
@@ -195,7 +247,10 @@ impl RouterConfig {
             let upstream_type = match u.r#type.to_ascii_lowercase().as_str() {
                 "local" => UpstreamType::Local,
                 "fakeip" => UpstreamType::FakeIp,
-                _ => UpstreamType::Remote,
+                "remote" => UpstreamType::Remote,
+                _ => return Err(Error::InvalidConfig(format!(
+                    "dns2.upstreams['{}'].type: unsupported type '{}'", u.tag, u.r#type,
+                ))),
             };
 
             let servers = if let Some(ref s_def) = u.servers {
@@ -402,6 +457,7 @@ mod config_error_tests {
             let mut def = DefDns2Config::default();
             def.upstreams.push(Dns2UpstreamDef {
                 tag: "primary".into(), r#type: "remote".into(),
+                servers: Some(Dns2StringOrList::Single("192.0.2.53".into())),
                 client_subnet: Some(value.into()), ..Default::default()
             });
             let cfg = RouterConfig::from_def(&def, true).unwrap();
@@ -412,7 +468,7 @@ mod config_error_tests {
         for value in ["", "bad", "192.0.2.1/33", "2001:db8::1/129"] {
             let mut def = DefDns2Config::default();
             def.upstreams.push(Dns2UpstreamDef {
-                tag: "primary".into(), client_subnet: Some(value.into()), ..Default::default()
+                tag: "primary".into(), r#type: "remote".into(), client_subnet: Some(value.into()), ..Default::default()
             });
             let error = RouterConfig::from_def(&def, true).err().unwrap().to_string();
             assert!(error.contains("dns2.upstreams['primary'].client-subnet"));
@@ -423,7 +479,7 @@ mod config_error_tests {
     fn invalid_dns2_upstream_range_identifies_tag_and_value() {
         let mut def = DefDns2Config::default();
         def.upstreams.push(crate::config::def::Dns2UpstreamDef {
-            tag: "primary".into(),
+            tag: "primary".into(), r#type: "remote".into(),
             inet4_range: "bad".into(),
             ..Default::default()
         });
@@ -432,3 +488,7 @@ mod config_error_tests {
         assert!(error.contains("bad"));
     }
 }
+
+#[cfg(test)]
+#[path = "config_tests.rs"]
+mod validation_tests;

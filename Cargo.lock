@@ -1377,6 +1377,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "clash-dns"
+version = "0.20.22-alpha"
+dependencies = [
+ "anyhow",
+ "base64 0.23.1",
+ "bytes",
+ "env_logger",
+ "form_urlencoded",
+ "futures",
+ "h3",
+ "h3-quinn",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "mockall",
+ "quinn",
+ "rcgen",
+ "rustls",
+ "rustls-pemfile",
+ "serde",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-rustls",
+ "tracing",
+]
+
+[[package]]
 name = "clash-doc"
 version = "0.20.22-alpha"
 dependencies = [
@@ -1454,6 +1482,7 @@ dependencies = [
  "chacha20poly1305 0.11.0",
  "chrono",
  "clash-common",
+ "clash-dns",
  "clash-ebpf",
  "clash-shadowsocks",
  "console-subscriber",
@@ -1565,7 +1594,6 @@ dependencies = [
  "tun-rs",
  "url",
  "uuid",
- "watfaq-dns",
  "watfaq-netstack",
  "webpki-root-certs",
  "webpki-roots",
@@ -11363,26 +11391,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "23f0c9c52aa7cd7d77769a4cfe2a9adb1b331f489a41d912ce14513d5ab995c6"
 dependencies = [
  "unicode-ident",
-]
-
-[[package]]
-name = "watfaq-dns"
-version = "0.20.22-alpha"
-dependencies = [
- "anyhow",
- "async-trait",
- "bytes",
- "env_logger",
- "futures",
- "mockall",
- "rustls",
- "rustls-pemfile",
- "serde",
- "thiserror 2.0.21",
- "tokio",
- "tokio-rustls",
- "tracing",
- "webpki-roots",
 ]
 
 [[package]]

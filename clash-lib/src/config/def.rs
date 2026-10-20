@@ -996,7 +996,9 @@ impl Dns2StringOrList {
 #[serde(rename_all = "kebab-case", default)]
 #[educe(Default)]
 pub struct Dns2Config {
+    /// Select DNS2 for resolution and listeners, ignoring legacy DNS settings.
     pub enable: bool,
+    /// DNS2 listener addresses. When absent, only internal resolution is enabled.
     pub listen: Option<DNSListen>,
     pub ipv6: bool,
     #[educe(Default = true)]

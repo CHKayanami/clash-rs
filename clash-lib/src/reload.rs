@@ -108,6 +108,7 @@ impl RuntimeState {
             PathBuf::from(&self.components.cwd),
             self.active_config.clone(), Some(&self.components),
             self.dns_collect_file.clone(), Some(self.fatal_tx.clone()),
+            Some(self.components.dns_prepared.clone()),
         ).await?;
         if let Err(e) = restored.start_all().await {
             restored.stop_all().await;
@@ -142,7 +143,7 @@ impl RuntimeState {
         let next = create_components(
             PathBuf::from(&self.components.cwd), config.clone(),
             Some(&self.components), self.dns_collect_file.clone(),
-            Some(self.fatal_tx.clone()),
+            Some(self.fatal_tx.clone()), None,
         ).await?;
         let previous_network = NetworkConfig::capture();
         self.components.stop_all().await;
@@ -192,9 +193,14 @@ mod tests {
     use crate::{Config, setup_default_crypto_provider};
     use crate::app::net::{get_default_outbound_interface, get_tun_somark};
     use serial_test::serial;
-    use tokio::net::{TcpListener, TcpStream};
+    use tokio::net::{TcpListener, TcpStream, UdpSocket};
+    use tokio::time::{Duration, timeout};
+    use std::net::IpAddr;
+    use crate::app::dns::query::{DnsName, QType, QueryContext};
+    use crate::app::dns::response::ResponseTemplate;
+    use crate::app::dns::resolver::router::config::RequestAction;
     use std::{io::ErrorKind, path::Path};
-    use watfaq_dns::DNSError as ServerDNSError;
+    use clash_dns::DNSError as ServerDNSError;
 
     struct RestoreNetwork(NetworkConfig);
 
@@ -219,7 +225,7 @@ mod tests {
         setup_default_crypto_provider();
         let (fatal_tx, fatal_rx) = mpsc::channel(16);
         let components = create_components(
-            dir.to_path_buf(), config.clone(), None, None, Some(fatal_tx.clone()),
+            dir.to_path_buf(), config.clone(), None, None, Some(fatal_tx.clone()), None,
         ).await.unwrap();
         let (reload_tx, _) = mpsc::channel(1);
         let global_state = Arc::new(Mutex::new(GlobalState {
@@ -254,6 +260,153 @@ mod tests {
             active_config: config, global_state, log_tx, shutdown_token,
             fatal_tx, dns_collect_file: None,
         }, fatal_rx)
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn dns2_listener_starts_and_reloads_without_legacy_dns() {
+        let _restore = RestoreNetwork(NetworkConfig::capture());
+        let dir = tempfile::tempdir().unwrap();
+        let reservation = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = reservation.local_addr().unwrap();
+        drop(reservation);
+        let config = Config::Str(format!(r#"
+mode: direct
+tun:
+  enable: false
+dns2:
+  enable: true
+  listen:
+    udp: {address}
+    tcp: {address}
+  hosts:
+    dns2.example: 192.0.2.42
+"#)).try_parse().unwrap();
+        let (mut runtime, mut fatal_rx) = runtime_for_config(dir.path(), config).await;
+        let query = QueryContext::new(
+            DnsName::from_domain("dns2.example").unwrap(), QType::A,
+        );
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        for attempt in 0..2 {
+            if attempt != 0 {
+                runtime.reload(runtime.active_config.clone()).await.unwrap();
+            }
+            assert!(runtime.components.dns_enabled);
+            assert_eq!(runtime.components.dns_listen.udp, Some(address));
+            drop(TcpStream::connect(address).await.unwrap());
+            socket.send_to(query.wire(), address).await.unwrap();
+            let mut response = [0u8; 512];
+            let (length, _) = timeout(Duration::from_secs(2), socket.recv_from(&mut response))
+                .await.unwrap().unwrap();
+            let response = ResponseTemplate::validate(&query, &response[..length]).unwrap();
+            assert_eq!(response.answer_ips().as_ref(), &["192.0.2.42".parse::<IpAddr>().unwrap()]);
+            assert!(fatal_rx.try_recv().is_err());
+        }
+
+        let previous = runtime.components.dns_resolver.clone();
+        let mut invalid = runtime.active_config.clone();
+        invalid.dns.dns2.as_mut().unwrap().request_fallback =
+            RequestAction::Route("missing".into());
+        let error = runtime.reload(invalid).await.unwrap_err();
+        assert!(error.to_string().contains("unknown dns2 upstream 'missing'"));
+        assert!(Arc::ptr_eq(&previous, &runtime.components.dns_resolver));
+        drop(TcpStream::connect(address).await.unwrap());
+        assert!(fatal_rx.try_recv().is_err());
+        drop(previous);
+
+        let internal_only = Config::Str(
+            "mode: direct\ntun:\n  enable: false\ndns2:\n  enable: true\n".into(),
+        ).try_parse().unwrap();
+        runtime.reload(internal_only).await.unwrap();
+        tokio::task::yield_now().await;
+        assert!(runtime.components.dns_enabled);
+        assert!(runtime.components.dns_listen.udp.is_none());
+        assert!(fatal_rx.try_recv().is_err());
+        drop(TcpListener::bind(address).await.unwrap());
+        drop(UdpSocket::bind(address).await.unwrap());
+        runtime.stop().await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn encrypted_dns2_reload_resolves_relative_certificates_and_restores_on_failure() {
+        use rcgen::generate_simple_self_signed;
+        use std::fs;
+        use anyhow::anyhow;
+        use rustls::{ClientConfig, RootCertStore, pki_types::ServerName};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio_rustls::TlsConnector;
+
+        let _restore = RestoreNetwork(NetworkConfig::capture());
+        setup_default_crypto_provider();
+        let dir = tempfile::tempdir().unwrap();
+        let cert = generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        fs::write(dir.path().join("dns.crt"), cert.cert.pem()).unwrap();
+        fs::write(dir.path().join("dns.key"), cert.signing_key.serialize_pem()).unwrap();
+        let mut roots = RootCertStore::empty();
+        roots.add(cert.cert.der().clone()).unwrap();
+        let client = ClientConfig::builder().with_root_certificates(roots).with_no_client_auth();
+        let connector = TlsConnector::from(Arc::new(client));
+        let reservation = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = reservation.local_addr().unwrap();
+        drop(reservation);
+        let config = Config::Str(format!(r#"
+mode: direct
+tun:
+  enable: false
+dns2:
+  enable: true
+  listen:
+    dot:
+      addr: {address}
+      ca-cert: dns.crt
+      ca-key: dns.key
+  hosts:
+    dns2.example: 192.0.2.42
+"#)).try_parse().unwrap();
+        let (mut runtime, mut fatal_rx) = runtime_for_config(dir.path(), config).await;
+        let query = QueryContext::new(DnsName::from_domain("dns2.example").unwrap(), QType::A);
+        for attempt in 0..5 {
+            if attempt == 1 {
+                runtime.reload(runtime.active_config.clone()).await.unwrap();
+            } else if attempt == 2 {
+                let mut invalid = runtime.active_config.clone();
+                invalid.dns.listen.dot.as_mut().unwrap().ca_key = Some("missing.key".into());
+                assert!(runtime.reload(invalid).await.is_err());
+            } else if attempt == 3 {
+                // A failed in-place rotation must leave the active listener
+                // untouched, including existing TLS material.
+                fs::write(dir.path().join("dns.key"), b"invalid key").unwrap();
+                let resolver = runtime.components.dns_resolver.clone();
+                assert!(runtime.reload(runtime.active_config.clone()).await.is_err());
+                assert!(Arc::ptr_eq(&resolver, &runtime.components.dns_resolver));
+            } else if attempt == 4 {
+                // Fail after the new listeners have started and invalidate
+                // the file during publication: rollback must use the snapshot.
+                fs::write(dir.path().join("dns.key"), cert.signing_key.serialize_pem()).unwrap();
+                let mut fail_once = true;
+                let result = runtime.reload_with_log_level(runtime.active_config.clone(), |_| {
+                    if fail_once {
+                        fail_once = false;
+                        fs::write(dir.path().join("dns.key"), b"invalid key").unwrap();
+                        Err(anyhow!("publication failed after certificate preparation"))
+                    } else { Ok(()) }
+                }).await;
+                assert!(result.unwrap_err().to_string().contains("publication failed"));
+            }
+            let mut stream = connector.connect(ServerName::try_from("localhost").unwrap(),
+                TcpStream::connect(address).await.unwrap()).await.unwrap();
+            stream.write_u16(query.wire().len() as u16).await.unwrap();
+            stream.write_all(query.wire()).await.unwrap();
+            let length = timeout(Duration::from_secs(2), stream.read_u16()).await.unwrap().unwrap();
+            let mut answer = vec![0; length as usize];
+            stream.read_exact(&mut answer).await.unwrap();
+            let answer = ResponseTemplate::validate(&query, &answer).unwrap();
+            assert_eq!(answer.answer_ips().as_ref(), &["192.0.2.42".parse::<IpAddr>().unwrap()]);
+            assert!(fatal_rx.try_recv().is_err());
+        }
+        runtime.stop().await;
+        let _rebound = TcpListener::bind(address).await.unwrap();
     }
 
     #[tokio::test]

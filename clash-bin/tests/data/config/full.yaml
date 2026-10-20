@@ -109,12 +109,14 @@ dns:
   # DNS listen address — simple UDP-only form:
   #   listen: 127.0.0.1:53
   # Multi-protocol form (each key is optional):
+  # Encrypted listeners require both ca-cert and ca-key; no default certificate.
+  # DoH / DoH3 serve GET and POST at /dns-query.
   listen:
     udp: 127.0.0.1:53
     tcp: 127.0.0.1:53
     dot:
       addr: 127.0.0.1:853
-      ca-cert: dns.crt        # TLS certificate file (path relative to CWD)
+      ca-cert: dns.crt        # TLS certificate file (path relative to -d)
       ca-key: dns.key         # TLS private key file
       # Note: DoT does not support a virtual hostname — use addr for the listen address
     doh:
@@ -249,6 +251,11 @@ dns2:
     #   ca-cert: dns.crt
     #   ca-key: dns.key
     # doh:
+    #   addr: 127.0.0.1:443
+    #   ca-cert: dns.crt
+    #   ca-key: dns.key
+    #   hostname: dns.clash
+    # doh3:
     #   addr: 127.0.0.1:443
     #   ca-cert: dns.crt
     #   ca-key: dns.key

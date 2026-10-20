@@ -3,6 +3,8 @@
 #![feature(duration_millis_float)]
 
 use arc_swap::ArcSwap;
+use clash_dns::PreparedDnsListener;
+use tokio::task::spawn_blocking;
 
 #[cfg(feature = "tun")]
 use crate::proxy::tun;
@@ -75,7 +77,7 @@ pub enum Error {
     #[error("dns error: {0}")]
     DNSError(String),
     #[error(transparent)]
-    DNSServerError(#[from] watfaq_dns::DNSError),
+    DNSServerError(#[from] clash_dns::DNSError),
     #[error("crypto error: {0}")]
     Crypto(String),
     #[error("operation error: {0}")]
@@ -388,6 +390,7 @@ pub async fn start(
         None,
         dns_collect_file.clone(),
         Some(fatal_tx.clone()),
+        None,
     )
     .await?;
 
@@ -547,6 +550,7 @@ struct RuntimeComponents {
     dns_listener: ArcService,
     inbound_manager: Arc<InboundManager>,
     dns_listen: DNSListenAddr,
+    dns_prepared: PreparedDnsListener,
     dns_enabled: bool,
     service_context: ServiceContext,
     network_config: NetworkConfig,
@@ -597,7 +601,19 @@ async fn create_components(
     old_components: Option<&RuntimeComponents>,
     dns_collect_file: Option<String>,
     fatal_tx: Option<tokio::sync::mpsc::Sender<crate::Error>>,
+    dns_prepared: Option<PreparedDnsListener>,
 ) -> Result<RuntimeComponents> {
+    let dns_prepared = match dns_prepared {
+        Some(prepared) => prepared,
+        None => {
+            let mut listen = if config.dns.enable {
+                config.dns.listen.clone()
+            } else { DNSListenAddr::default() };
+            listen.resolve_certificate_paths(&cwd);
+            spawn_blocking(move || PreparedDnsListener::new(listen)).await
+                .map_err(|error| Error::Operation(format!("DNS listener preparation failed: {error}")))??
+        }
+    };
     let explicit_iface = config.tun.enable.then(|| {
         config.general.interface.as_ref()
             .and_then(|i| i.clone().into_iface_name())
@@ -718,7 +734,7 @@ async fn create_components(
         rule_dispatch.clone(),
         dns_collector,
     )
-    .await;
+    .await?;
 
     debug!("initializing outbound manager");
     let outbound_manager = Arc::new(
@@ -924,9 +940,8 @@ async fn create_components(
     debug!("initializing dns listener");
     let dns_listener: ArcRunner = Arc::new(dns::DnsRunner::new(
         dns_enable,
-        dns_listen.clone(),
+        dns_prepared.clone(),
         dns_resolver.clone(),
-        &cwd,
         Some(cancellation_token.child_token()),
     ));
 
@@ -950,6 +965,7 @@ async fn create_components(
         ebpf_runner,
         dns_listener,
         dns_listen,
+        dns_prepared,
         dns_enabled: dns_enable,
         service_context,
         network_config,

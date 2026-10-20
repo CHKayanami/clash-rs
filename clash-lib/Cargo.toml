@@ -15,7 +15,7 @@ aws-lc-rs = [
     "quinn/rustls-aws-lc-rs",
     "russh/aws-lc-rs",
     "boringtun/aws-lc-rs",
-    "watfaq-dns/aws-lc-rs",
+    "clash-dns/aws-lc-rs",
     "rcgen/aws_lc_rs",
     "quinn-jls?/rustls-aws-lc-rs",
 ]
@@ -25,7 +25,7 @@ ring = [
     "quinn/rustls-ring",
     "russh/ring",
     "boringtun/ring",
-    "watfaq-dns/ring",
+    "clash-dns/ring",
     "rcgen/ring",
     "quinn-jls?/rustls-ring",
 ]
@@ -185,7 +185,7 @@ erased-serde = "0.4"
 educe = "0.8"
 
 # DNS
-watfaq-dns = { path = "../clash-dns", default-features = false }
+clash-dns = { path = "../clash-dns", default-features = false }
 
 ssh-key = { version = "0.6", features = ["std"] }
 

@@ -10,7 +10,7 @@ pub async fn exchange_with_resolver(
     req: Bytes,
     ingress: IngressProfile,
     source_ip: Option<IpAddr>,
-) -> Result<Vec<u8>, watfaq_dns::DNSError> {
+) -> Result<Vec<u8>, clash_dns::DNSError> {
     let query = match QueryContext::parse(req.clone(), ingress) {
         Ok(query) => query,
         Err(_) => return Ok(build_dns_refused(&req)),
@@ -22,13 +22,13 @@ pub async fn exchange_with_resolver(
             {
                 return ResponseTemplate::validate(&query, &message)
                     .and_then(|template| template.render(&query))
-                    .map_err(|error| watfaq_dns::DNSError::QueryFailed(error.to_string()));
+                    .map_err(|error| clash_dns::DNSError::QueryFailed(error.to_string()));
             }
             Ok(message)
         },
         Err(e) => {
             debug!("dns resolve error: {}", e);
-            Err(watfaq_dns::DNSError::QueryFailed(e.to_string()))
+            Err(clash_dns::DNSError::QueryFailed(e.to_string()))
         }
     }
 }

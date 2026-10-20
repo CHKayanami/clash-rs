@@ -6,7 +6,7 @@ use crate::{
     },
     common::trie,
     config::def::{
-        DNSListen, DNSMode, EdnsClientSubnet as DefEdnsClientSubnet,
+        DNSListen, DNSMode, DohListenDef, EdnsClientSubnet as DefEdnsClientSubnet,
         FakeIpFilterMode,
     },
 };
@@ -66,7 +66,7 @@ use std::{
 };
 use tracing::warn;
 use url::Url;
-pub use watfaq_dns::{DNSListenAddr, DoH3Config, DoHConfig, DoTConfig};
+pub use clash_dns::{DNSListenAddr, DoH3Config, DoHConfig, DoTConfig};
 
 #[derive(Clone, Debug)]
 pub struct NameServer {
@@ -397,6 +397,23 @@ impl TryFrom<&crate::config::def::Config> for Config {
     type Error = Error;
 
     fn try_from(c: &crate::config::def::Config) -> Result<Self, Self::Error> {
+        if let Some(d2) = c.dns2.as_ref().filter(|d2| d2.enable) {
+            let dns2 = RouterConfig::from_def(d2, c.ipv6)?;
+            let listen = parse_dns_listen(dns2.listen.as_ref()).map_err(|error| {
+                Error::InvalidConfig(format!("dns2.listen: {error}"))
+            })?;
+            return Ok(Self {
+                enable: dns2.enable,
+                ipv6: dns2.ipv6,
+                listen,
+                fw_mark: c.routing_mark,
+                store_fake_ip: c.profile.store_fake_ip,
+                store_smart_stats: c.profile.store_smart_stats,
+                dns2: Some(dns2),
+                ..Default::default()
+            });
+        }
+
         let dc = &c.dns;
         if dc.enable && dc.nameserver.is_empty() {
             return Err(Error::InvalidConfig(String::from(
@@ -413,20 +430,13 @@ impl TryFrom<&crate::config::def::Config> for Config {
         let nameserver_policy =
             Config::parse_nameserver_policy(&dc.nameserver_policy)?;
 
-        let dns2_enabled = c.dns2.as_ref().map(|d| d.enable).unwrap_or(false);
-        let default_nameserver_raw = if dc.default_nameserver.is_empty() {
-            if dns2_enabled {
-                vec!["223.5.5.5".to_string()]
-            } else {
-                return Err(Error::InvalidConfig(String::from(
-                    "default nameserver empty",
-                )));
-            }
-        } else {
-            dc.default_nameserver.clone()
-        };
+        if dc.default_nameserver.is_empty() {
+            return Err(Error::InvalidConfig(String::from(
+                "default nameserver empty",
+            )));
+        }
 
-        let default_nameserver = Config::parse_nameserver(&default_nameserver_raw).map_err(|e| {
+        let default_nameserver = Config::parse_nameserver(&dc.default_nameserver).map_err(|e| {
             Error::InvalidConfig(format!("dns.default-nameserver: {e}"))
         })?;
 
@@ -468,89 +478,7 @@ impl TryFrom<&crate::config::def::Config> for Config {
             nameserver: nameservers,
             fallback,
             fallback_filter: dc.fallback_filter.clone().into(),
-            listen: dc
-                .listen
-                .clone()
-                .map(|l| -> Result<DNSListenAddr, Error> {
-                    match l {
-                        DNSListen::Udp(u) => {
-                            let addr = parse_listen_addr(&u)?;
-                            Ok(DNSListenAddr {
-                                udp: Some(addr),
-                                ..Default::default()
-                            })
-                        }
-                        DNSListen::Multiple(m) => {
-                            let udp = m
-                                .udp
-                                .as_deref()
-                                .map(parse_listen_addr)
-                                .transpose()?;
-                            let tcp = m
-                                .tcp
-                                .as_deref()
-                                .map(parse_listen_addr)
-                                .transpose()?;
-                            // DoHConfig and DoH3Config have identical fields; helper
-                            // avoids duplication.
-                            let map_doh_fields =
-                                |c: crate::config::def::DohListenDef| {
-                                    parse_listen_addr(&c.addr).map(|addr| {
-                                        (addr, c.ca_cert, c.ca_key, c.hostname)
-                                    })
-                                };
-                            let doh = m
-                                .doh
-                                .map(|c| {
-                                    map_doh_fields(c).map(
-                                        |(addr, ca_cert, ca_key, hostname)| {
-                                            DoHConfig {
-                                                addr,
-                                                ca_cert,
-                                                ca_key,
-                                                hostname,
-                                            }
-                                        },
-                                    )
-                                })
-                                .transpose()?;
-                            let dot = m
-                                .dot
-                                .map(|c| -> Result<DoTConfig, Error> {
-                                    Ok(DoTConfig {
-                                        addr: parse_listen_addr(&c.addr)?,
-                                        ca_cert: c.ca_cert,
-                                        ca_key: c.ca_key,
-                                    })
-                                })
-                                .transpose()?;
-                            let doh3 = m
-                                .doh3
-                                .map(|c| {
-                                    map_doh_fields(c).map(
-                                        |(addr, ca_cert, ca_key, hostname)| {
-                                            DoH3Config {
-                                                addr,
-                                                ca_cert,
-                                                ca_key,
-                                                hostname,
-                                            }
-                                        },
-                                    )
-                                })
-                                .transpose()?;
-                            Ok(DNSListenAddr {
-                                udp,
-                                tcp,
-                                doh,
-                                dot,
-                                doh3,
-                            })
-                        }
-                    }
-                })
-                .transpose()?
-                .unwrap_or_default(),
+            listen: parse_dns_listen(dc.listen.as_ref())?,
             enhance_mode: dc.enhanced_mode.clone(),
             default_nameserver,
             proxy_server_nameserver,
@@ -598,17 +526,94 @@ impl TryFrom<&crate::config::def::Config> for Config {
                 }
                 set
             },
-            dns2: if let Some(d2) = &c.dns2 {
-                if d2.enable {
-                    Some(RouterConfig::from_def(d2, c.ipv6)?)
-                } else {
-                    None
-                }
-            } else {
-                None
-            },
+            dns2: None,
         })
     }
+}
+
+fn parse_dns_listen(listen: Option<&DNSListen>) -> Result<DNSListenAddr, Error> {
+    let Some(listen) = listen.cloned() else {
+        return Ok(DNSListenAddr::default());
+    };
+    let parsed: Result<DNSListenAddr, Error> = match listen {
+        DNSListen::Udp(u) => {
+            let addr = parse_listen_addr(&u)?;
+            Ok(DNSListenAddr {
+                udp: Some(addr),
+                ..Default::default()
+            })
+        }
+        DNSListen::Multiple(m) => {
+            let udp = m
+                .udp
+                .as_deref()
+                .map(parse_listen_addr)
+                .transpose()?;
+            let tcp = m
+                .tcp
+                .as_deref()
+                .map(parse_listen_addr)
+                .transpose()?;
+            // DoHConfig and DoH3Config have identical fields; helper
+            // avoids duplication.
+            let map_doh_fields =
+                |c: DohListenDef| {
+                    parse_listen_addr(&c.addr).map(|addr| {
+                        (addr, c.ca_cert, c.ca_key, c.hostname)
+                    })
+                };
+            let doh = m
+                .doh
+                .map(|c| {
+                    map_doh_fields(c).map(
+                        |(addr, ca_cert, ca_key, hostname)| {
+                            DoHConfig {
+                                addr,
+                                ca_cert,
+                                ca_key,
+                                hostname,
+                            }
+                        },
+                    )
+                })
+                .transpose()?;
+            let dot = m
+                .dot
+                .map(|c| -> Result<DoTConfig, Error> {
+                    Ok(DoTConfig {
+                        addr: parse_listen_addr(&c.addr)?,
+                        ca_cert: c.ca_cert,
+                        ca_key: c.ca_key,
+                    })
+                })
+                .transpose()?;
+            let doh3 = m
+                .doh3
+                .map(|c| {
+                    map_doh_fields(c).map(
+                        |(addr, ca_cert, ca_key, hostname)| {
+                            DoH3Config {
+                                addr,
+                                ca_cert,
+                                ca_key,
+                                hostname,
+                            }
+                        },
+                    )
+                })
+                .transpose()?;
+            Ok(DNSListenAddr {
+                udp,
+                tcp,
+                doh,
+                dot,
+                doh3,
+            })
+        }
+    };
+    let parsed = parsed?;
+    parsed.validate().map_err(|error| Error::InvalidConfig(error.to_string()))?;
+    Ok(parsed)
 }
 
 fn parse_edns_client_subnet(
@@ -661,6 +666,112 @@ impl From<crate::config::def::FallbackFilter> for FallbackFilter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::def::Config as DefConfig;
+
+    #[test]
+    fn dns2_enables_listener_without_legacy_dns() {
+        let def: DefConfig = yaml_serde::from_str(r#"
+ipv6: true
+dns2:
+  enable: true
+  ipv6: true
+  listen: 127.0.0.1:15353
+  default-nameserver: [192.0.2.53]
+"#).unwrap();
+        assert!(!def.dns.enable);
+        let cfg = Config::try_from(&def).unwrap();
+        assert!(cfg.enable);
+        assert!(cfg.ipv6);
+        assert_eq!(cfg.listen.udp, Some("127.0.0.1:15353".parse().unwrap()));
+        let dns2 = cfg.dns2.unwrap();
+        assert_eq!(dns2.default_nameserver[0].host.to_string(), "192.0.2.53");
+    }
+
+    #[test]
+    fn dns2_ignores_legacy_dns_and_uses_its_own_listeners() {
+        let def: DefConfig = yaml_serde::from_str(r#"
+dns:
+  enable: true
+  listen: invalid-listen
+  nameserver: []
+  default-nameserver: []
+  fake-ip-range: invalid-range
+  qtype-filter: [invalid-type]
+dns2:
+  enable: true
+  listen:
+    udp: 127.0.0.1:15353
+    tcp: 127.0.0.1:15354
+"#).unwrap();
+        let cfg = Config::try_from(&def).unwrap();
+        assert!(cfg.enable);
+        assert_eq!(cfg.listen.udp, Some("127.0.0.1:15353".parse().unwrap()));
+        assert_eq!(cfg.listen.tcp, Some("127.0.0.1:15354".parse().unwrap()));
+
+    }
+
+    #[test]
+    fn dns2_without_listener_does_not_inherit_legacy_listener() {
+        let def: DefConfig = yaml_serde::from_str(r#"
+dns:
+  enable: false
+  listen: 127.0.0.1:15353
+dns2:
+  enable: true
+"#).unwrap();
+        let cfg = Config::try_from(&def).unwrap();
+        assert!(cfg.enable);
+        assert!(cfg.listen.udp.is_none());
+        assert!(cfg.listen.tcp.is_none());
+        assert!(cfg.listen.doh.is_none());
+        assert!(cfg.listen.dot.is_none());
+        assert!(cfg.listen.doh3.is_none());
+    }
+
+    #[test]
+    fn disabled_dns2_preserves_legacy_dns_settings_and_validation() {
+        let mut def: DefConfig = yaml_serde::from_str(r#"
+dns:
+  enable: true
+  listen: 127.0.0.1:15353
+  nameserver: [192.0.2.53]
+dns2:
+  enable: false
+  listen: invalid-listen
+"#).unwrap();
+        let cfg = Config::try_from(&def).unwrap();
+        assert!(cfg.enable);
+        assert!(cfg.dns2.is_none());
+        assert_eq!(cfg.listen.udp, Some("127.0.0.1:15353".parse().unwrap()));
+        def.dns.nameserver.clear();
+        let error = Config::try_from(&def).err().unwrap().to_string();
+        assert!(error.contains("dns enabled, no nameserver specified"));
+    }
+
+    #[test]
+    fn encrypted_listeners_require_certificates_for_both_resolvers() {
+        for section in ["dns", "dns2"] {
+            for (field, protocol) in [("doh", "DoH"), ("dot", "DoT"), ("doh3", "DoH3")] {
+                let def: DefConfig = yaml_serde::from_str(&format!(
+                    "{section}:\n  enable: true\n{legacy}  listen:\n    udp: 127.0.0.1:15353\n    {field}:\n      addr: 127.0.0.1:15853\n",
+                    legacy = if section == "dns" { "  nameserver: [192.0.2.53]\n" } else { "" },
+                )).unwrap();
+                let error = Config::try_from(&def).err().unwrap().to_string();
+                assert!(error.contains(protocol) && error.contains("requires both ca-cert and ca-key"), "{error}");
+            }
+        }
+    }
+
+    #[test]
+    fn dns2_invalid_listener_reports_dns2_field() {
+        let def: DefConfig = yaml_serde::from_str(r#"
+dns2:
+  enable: true
+  listen: invalid-listen
+"#).unwrap();
+        let error = Config::try_from(&def).err().unwrap().to_string();
+        assert!(error.contains("dns2.listen"), "{error}");
+    }
 
     #[test]
     fn parse_nameserver_ipv6_without_scheme() {
