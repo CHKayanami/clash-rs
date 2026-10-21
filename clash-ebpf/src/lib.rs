@@ -8,6 +8,7 @@ pub mod manager;
 
 pub mod netlink;
 pub mod netns;
+mod redirect_peer;
 pub mod session;
 
 pub use clash_ebpf_common::DAE_BYPASS_MARK;

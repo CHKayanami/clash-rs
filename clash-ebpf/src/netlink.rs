@@ -56,11 +56,40 @@ const IFLA_NETKIT_SCRUB: u16 = 6;
 const IFLA_NETKIT_PEER_SCRUB: u16 = 7;
 const NETKIT_PASS: u32 = 0;
 const NETKIT_L2: u32 = 0;
+const NETKIT_SCRUB_NONE: u32 = 0;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LinkPairKind {
     Netkit,
     Veth,
+}
+
+#[derive(Default)]
+struct LinkState {
+    ifindex: u32,
+    mac: [u8; 6],
+    scrub_none: bool,
+}
+
+// Nested netlink attributes carry native-endian headers, padded to four bytes.
+// Mask the nested/network-order flags before comparing attribute identifiers.
+fn attr_value(mut attrs: &[u8], kind: u16) -> Option<&[u8]> {
+    while attrs.len() >= 4 {
+        let len = u16::from_ne_bytes(attrs[..2].try_into().ok()?) as usize;
+        let ty = u16::from_ne_bytes(attrs[2..4].try_into().ok()?) & 0x3fff;
+        if len < 4 || len > attrs.len() { return None; }
+        if ty == kind { return Some(&attrs[4..len]); }
+        attrs = attrs.get(align(len)..)?;
+    }
+    None
+}
+
+fn netkit_scrub_none(info: &[u8]) -> bool {
+    if attr_value(info, IFLA_INFO_KIND) != Some(b"netkit\0".as_slice()) { return false; }
+    let Some(data) = attr_value(info, IFLA_INFO_DATA) else { return false; };
+    [IFLA_NETKIT_SCRUB, IFLA_NETKIT_PEER_SCRUB].into_iter().all(|kind| {
+        attr_value(data, kind) == Some(NETKIT_SCRUB_NONE.to_ne_bytes().as_slice())
+    })
 }
 
 fn netkit_unavailable(error: &io::Error) -> bool {
@@ -350,8 +379,9 @@ impl NlSock {
         &mut self,
         name: &str,
         peer: &str,
+        preserve_marks: bool,
     ) -> io::Result<LinkPairKind> {
-        match self.add_netkit_pair(name, peer) {
+        match self.add_netkit_pair(name, peer, preserve_marks) {
             Ok(()) => Ok(LinkPairKind::Netkit),
             Err(e) if netkit_unavailable(&e) => {
                 tracing::info!(
@@ -365,11 +395,19 @@ impl NlSock {
     }
 
     /// Create an L2 netkit pair (`name` <-> `peer_name`) with PASS policies.
-    pub fn add_netkit_pair(&mut self, name: &str, peer: &str) -> io::Result<()> {
+    pub fn add_netkit_pair(&mut self, name: &str, peer: &str, preserve_marks: bool) -> io::Result<()> {
         let header = ifinfo(0, 0, 0);
         let mut peer_payload = pod_bytes(&ifinfo(0, 0, 0)).to_vec();
         put_attr(&mut peer_payload, IFLA_IFNAME, &Attr::Str(peer.to_string()));
 
+        let mut data = vec![
+            (IFLA_NETKIT_MODE, Attr::U32(NETKIT_L2)),
+            (IFLA_NETKIT_PEER_INFO, Attr::Bytes(peer_payload)),
+        ];
+        if preserve_marks {
+            data.push((IFLA_NETKIT_SCRUB, Attr::U32(NETKIT_SCRUB_NONE)));
+            data.push((IFLA_NETKIT_PEER_SCRUB, Attr::U32(NETKIT_SCRUB_NONE)));
+        }
         let attrs = [
             (IFLA_IFNAME, Attr::Str(name.to_string())),
             (
@@ -378,20 +416,30 @@ impl NlSock {
                     (IFLA_INFO_KIND, Attr::Str("netkit".to_string())),
                     (
                         IFLA_INFO_DATA,
-                        Attr::Nested(vec![
-                            (IFLA_NETKIT_MODE, Attr::U32(NETKIT_L2)),
-                            (IFLA_NETKIT_PEER_INFO, Attr::Bytes(peer_payload)),
-                        ]),
+                        Attr::Nested(data),
                     ),
                 ]),
             ),
         ];
-        self.request(
+        let result = self.request(
             RTM_NEWLINK,
             NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL,
-            pod_bytes(&header),
-            &attrs,
-        )
+            pod_bytes(&header), &attrs,
+        );
+        if preserve_marks && result.as_ref().err().is_some_and(|error| {
+            matches!(error.raw_os_error(), Some(libc::EINVAL | libc::EOPNOTSUPP))
+        }) {
+            // Scrub attributes are immutable after creation. Retry legacy
+            // creation only on capability errors; readback keeps peer mode off.
+            return self.add_netkit_pair(name, peer, false);
+        }
+        result
+    }
+
+    /// Unknown attributes may be ignored on old kernels; require explicit
+    /// readback of both ends before enabling peer redirection.
+    pub fn netkit_redirect_peer_ready(&mut self, name: &str) -> io::Result<bool> {
+        Ok(self.get_link_state(name)?.scrub_none)
     }
 
     /// Create a veth pair (`name` <-> `peer_name`).
@@ -645,6 +693,11 @@ impl NlSock {
 
     /// Look up an interface by name via netlink (works inside isolated namespaces).
     pub fn get_link(&mut self, name: &str) -> io::Result<(u32, [u8; 6])> {
+        let state = self.get_link_state(name)?;
+        Ok((state.ifindex, state.mac))
+    }
+
+    fn get_link_state(&mut self, name: &str) -> io::Result<LinkState> {
         const RTM_GETLINK: u16 = 18;
         const NLM_F_DUMP: u16 = 0x300;
         const NLMSG_DONE: u16 = 3;
@@ -663,7 +716,7 @@ impl NlSock {
         self.send_datagram(&buf)?;
 
         let mut resp = vec![0u8; 8192];
-        let mut found: Option<(u32, [u8; 6])> = None;
+        let mut found: Option<LinkState> = None;
         loop {
             let n = self.recv_one(&mut resp)?;
             let mut done = false;
@@ -705,6 +758,7 @@ impl NlSock {
                     let ifindex = i32::from_ne_bytes(ifi[4..8].try_into().unwrap());
                     let mut ifname: Option<String> = None;
                     let mut mac: Option<[u8; 6]> = None;
+                    let mut scrub_none = false;
                     let mut aoff = 16;
                     while aoff + 4 <= ifi.len() {
                         let alen = u16::from_ne_bytes(
@@ -717,7 +771,7 @@ impl NlSock {
                             break;
                         }
                         let payload = &ifi[aoff + 4..aoff + alen];
-                        match atype {
+                        match atype & 0x3fff {
                             IFLA_IFNAME => {
                                 let end = payload
                                     .iter()
@@ -728,6 +782,7 @@ impl NlSock {
                                         .into_owned(),
                                 );
                             }
+                            IFLA_LINKINFO => { scrub_none = netkit_scrub_none(payload); }
                             IFLA_ADDRESS if payload.len() == 6 => {
                                 mac = Some(payload.try_into().unwrap());
                             }
@@ -737,7 +792,7 @@ impl NlSock {
                     }
                     if ifname.as_deref() == Some(name) {
                         let mac_addr = mac.unwrap_or([0u8; 6]);
-                        found = Some((ifindex as u32, mac_addr));
+                        found = Some(LinkState { ifindex: ifindex as u32, mac: mac_addr, scrub_none });
                     }
                 }
                 let next = align(hlen);
@@ -811,6 +866,24 @@ pub fn set_sysctl(path: &str, value: &str) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scrub_readback_requires_both_explicit_attributes() {
+        let info = |scrubs| {
+            let mut value = Vec::new();
+            put_attr(&mut value, IFLA_INFO_KIND, &Attr::Str("netkit".into()));
+            put_attr(&mut value, IFLA_INFO_DATA | 0x8000, &Attr::Nested(scrubs));
+            value
+        };
+        assert!(netkit_scrub_none(&info(vec![
+            (IFLA_NETKIT_SCRUB, Attr::U32(0)), (IFLA_NETKIT_PEER_SCRUB, Attr::U32(0)),
+        ])));
+        assert!(!netkit_scrub_none(&info(vec![(IFLA_NETKIT_SCRUB, Attr::U32(0))])));
+        assert!(!netkit_scrub_none(&info(vec![
+            (IFLA_NETKIT_SCRUB, Attr::U32(0)), (IFLA_NETKIT_PEER_SCRUB, Attr::U32(1)),
+        ])));
+        assert!(!netkit_scrub_none(&[3, 0, 1, 0]));
+    }
 
     #[test]
     fn netkit_fallback_is_only_for_missing_driver() {

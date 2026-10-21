@@ -1,4 +1,5 @@
 use crate::config::EbpfConfig;
+use crate::redirect_peer;
 use crate::listener::{EbpfListener, ListenerError};
 use crate::netns::{DaeNs, NetNsError};
 use network_interface::NetworkInterfaceConfig;
@@ -136,7 +137,7 @@ impl EbpfManager {
         let ns = Arc::new(DaeNs::new()?);
 
         // Create host <-> daens link pair (L2 netkit if supported, fallback to veth)
-        let link_kind = host_nl.add_link_pair("dae0", "dae0peer")?;
+        let link_kind = host_nl.add_link_pair("dae0", "dae0peer", redirect_peer::kernel_supported())?;
         info!("Created dae0/dae0peer link pair (kind: {:?})", link_kind);
         let dae0_idx = match host_nl.get_link("dae0") {
             Ok((index, _)) => index,
@@ -157,6 +158,8 @@ impl EbpfManager {
             }
         };
         let (peer_idx, _dae0peer_mac) = host_nl.get_link("dae0peer")?;
+
+        let use_redirect_peer = redirect_peer::detect(&mut host_nl, link_kind, "dae0");
 
         // Host side configuration
         let host_v4: Ipv4Addr = DAENS_HOST_IP.parse().unwrap();
@@ -377,7 +380,7 @@ impl EbpfManager {
             dae0_ifindex: dae0_idx,
             wan_ifindex: 0,
             dae0peer_mac,
-            use_redirect_peer: 0,
+            use_redirect_peer: use_redirect_peer as u8,
             proxy_local,
             dae_socket_mark: self
                 .config
