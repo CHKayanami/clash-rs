@@ -241,7 +241,11 @@ impl EnhancedResolver {
             None
         };
 
-        let reverse_lookup_cache = Some(ReverseLookupCache::new(4096));
+        let cache_capacity: usize = 4096;
+        let reverse_lookup_cache = Some(ReverseLookupCache::new(
+            cache_capacity.saturating_mul(4),
+            Duration::from_secs(cfg.stale_cache_retention as u64),
+        ));
 
         let fixed_domain_ttl = if !cfg.fixed_domain_ttl.is_empty() {
             let mut trie = trie::StringTrie::new();
@@ -264,7 +268,7 @@ impl EnhancedResolver {
                 Some(fallback_upstreams)
             },
             fallback_filter,
-            lru_cache: Some(DnsCache::new(4096)),
+            lru_cache: Some(DnsCache::new(cache_capacity)),
             policy: if policy_container.is_empty() {
                 None
             } else {

@@ -844,6 +844,12 @@ async fn test_router_resolver_stale_refresh_notification_with_rule_filter() {
     // 2. 睡眠等待 1.1 秒，使 TTL = 1 过期并进入 Stale 状态
     tokio::time::sleep(tokio::time::Duration::from_millis(1100)).await;
 
+    // The stale forward answer must still have a usable reverse mapping.
+    assert_eq!(
+        resolver.cached_for("1.1.1.1".parse::<IpAddr>().unwrap()),
+        Some("stale-domain.com".to_string())
+    );
+
     // 3. 第二次查询：前台极速命中 Stale 缓存，返回 1.1.1.1，同时后台发起异步刷新
     let resp2 = resolver.exchange(&QueryContext::parse(Bytes::copy_from_slice(&query_wire), IngressProfile::Internal).unwrap(), None).await.unwrap();
     assert_eq!(extract_ips_from_dns_response(&resp2), vec!["1.1.1.1".parse::<IpAddr>().unwrap()]);

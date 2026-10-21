@@ -145,14 +145,16 @@ impl RouterResolver {
             };
 
         let capacity = cfg.cache_capacity.max(1);
-        let reverse_lookup_cache = ReverseLookupCache::new(capacity);
+        let cache_policy = DnsCachePolicy::new(cfg.optimistic_cache_ttl, cfg.stale_cache_retention);
+        let reverse_lookup_cache = ReverseLookupCache::new(
+            capacity.saturating_mul(4), cache_policy.stale_cache_retention,
+        );
         let resolution_hook = Arc::new(ArcSwapOption::new(None));
         let notifier = DnsResolvedNotifier::new(
             reverse_lookup_cache.clone(),
             Arc::clone(&resolution_hook),
         );
         let cache = DnsCache::new(capacity);
-        let cache_policy = DnsCachePolicy::new(cfg.optimistic_cache_ttl, cfg.stale_cache_retention);
         let router = Arc::new(DnsRouter::new(&cfg));
 
         let mut transports: HashMap<String, Transport> = HashMap::new();
