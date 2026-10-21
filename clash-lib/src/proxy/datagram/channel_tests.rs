@@ -2,6 +2,7 @@ use super::*;
 use super::batch::{DatagramBatch, PacketBatch};
 use bytes::Bytes;
 use futures::task::noop_waker_ref;
+use std::task::{Context, Poll};
 use tokio::sync::mpsc;
 
 #[tokio::test]

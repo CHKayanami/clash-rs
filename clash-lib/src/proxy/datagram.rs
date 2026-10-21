@@ -1,5 +1,17 @@
 pub mod batch;
 pub(crate) mod framed;
+#[cfg(any(
+    test,
+    feature = "tun",
+    all(target_os = "linux", any(feature = "tproxy", feature = "ebpf")),
+))]
+mod channel;
+#[cfg(any(
+    test,
+    feature = "tun",
+    all(target_os = "linux", any(feature = "tproxy", feature = "ebpf")),
+))]
+pub use channel::ChannelDatagram;
 use crate::session::SocksAddr;
 use std::{
     fmt::{Debug, Display, Formatter},
@@ -71,107 +83,6 @@ impl UdpPacket {
     }
 }
 
-use futures::{Sink, Stream};
-use self::batch::{BatchResult, DatagramBatch, PacketBatch, poll_send_channel};
-use std::pin::Pin;
-use std::task::{Context, Poll};
-use tokio_util::sync::PollSender;
-
-#[allow(dead_code)]
-#[derive(Debug)]
-pub struct ChannelDatagram {
-    rx: tokio::sync::mpsc::Receiver<UdpPacket>,
-    tx: PollSender<UdpPacket>,
-    pkt: Option<UdpPacket>,
-}
-
-#[allow(dead_code)]
-pub type TunDatagram = ChannelDatagram;
-
-impl ChannelDatagram {
-    #[allow(dead_code)]
-    pub fn new(
-        tx: tokio::sync::mpsc::Sender<UdpPacket>,
-        rx: tokio::sync::mpsc::Receiver<UdpPacket>,
-    ) -> Self {
-        Self {
-            rx,
-            tx: PollSender::new(tx),
-            pkt: None,
-        }
-    }
-}
-
-impl Stream for ChannelDatagram {
-    type Item = UdpPacket;
-
-    fn poll_next(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Option<Self::Item>> {
-        self.rx.poll_recv(cx)
-    }
-}
-
-impl Sink<UdpPacket> for ChannelDatagram {
-    type Error = std::io::Error;
-
-    fn poll_ready(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Result<(), Self::Error>> {
-        if self.pkt.is_some() {
-            if let Poll::Pending = self.as_mut().poll_flush(cx)? {
-                return Poll::Pending;
-            }
-        }
-
-        match Pin::new(&mut self.get_mut().tx).poll_reserve(cx) {
-            Poll::Ready(Ok(())) => Poll::Ready(Ok(())),
-            Poll::Ready(Err(_)) => Poll::Ready(Err(std::io::Error::new(
-                std::io::ErrorKind::BrokenPipe,
-                "PollSender channel closed",
-            ))),
-            Poll::Pending => Poll::Pending,
-        }
-    }
-
-    fn start_send(
-        mut self: Pin<&mut Self>,
-        item: UdpPacket,
-    ) -> Result<(), Self::Error> {
-        self.pkt = Some(item);
-        Ok(())
-    }
-
-    fn poll_flush(
-        self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
-    ) -> Poll<Result<(), Self::Error>> {
-        if self.pkt.is_none() {
-            return Poll::Ready(Ok(()));
-        }
-
-        let this = self.get_mut();
-        let pkt = this.pkt.take().unwrap();
-
-        match Pin::new(&mut this.tx).send_item(pkt) {
-            Ok(()) => Poll::Ready(Ok(())),
-            Err(_) => Poll::Ready(Err(std::io::Error::new(
-                std::io::ErrorKind::BrokenPipe,
-                "PollSender failed to send item",
-            ))),
-        }
-    }
-
-    fn poll_close(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Result<(), Self::Error>> {
-        self.poll_flush(cx)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -206,19 +117,6 @@ mod tests {
             panic!("expected domain address");
         };
         assert!(Arc::ptr_eq(&domain, cloned_domain));
-    }
-}
-
-impl DatagramBatch for ChannelDatagram {
-    fn poll_send_batch(
-        &mut self, cx: &mut Context<'_>, batch: &mut PacketBatch,
-    ) -> Poll<BatchResult> {
-        match Pin::new(&mut *self).poll_flush(cx) {
-            Poll::Pending => return Poll::Pending,
-            Poll::Ready(Err(error)) => return Poll::Ready(BatchResult::terminated(error)),
-            Poll::Ready(Ok(())) => {}
-        }
-        poll_send_channel(&mut self.tx, cx, batch)
     }
 }
 
