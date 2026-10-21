@@ -37,7 +37,7 @@ mod tests {
         let config = Config::Str("mode: direct\ntun:\n  enable: false\n".into())
             .try_parse().unwrap();
         let components = create_components(
-            dir.path().to_path_buf(), config, None, None, None, None,
+            dir.path().to_path_buf(), config, None, None, None,
         ).await.unwrap();
         let runtime = Arc::new(ProviderRuntime {
             dispatcher: components.dispatcher.clone(),

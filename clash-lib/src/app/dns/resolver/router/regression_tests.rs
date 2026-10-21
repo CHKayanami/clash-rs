@@ -223,7 +223,7 @@ fn response_rule(from: &str, action: ResponseAction) -> ResponseRule {
 }
 
 async fn resolver(cfg: RouterConfig) -> RouterResolver {
-    RouterResolver::new(cfg, None, None, Arc::new(ArcSwap::from_pointee(HashMap::new())), None).await.unwrap()
+    RouterResolver::new(cfg, None, None, Arc::new(ArcSwap::from_pointee(HashMap::new()))).await.unwrap()
 }
 
 fn query(qtype: QType) -> Vec<u8> {
@@ -268,7 +268,7 @@ async fn independent_proxy_nameserver_resolves_node_domain() {
         ..Default::default()
     }, None))));
     outbounds.store(Arc::new(handlers));
-    let resolver = RouterResolver::new(cfg, None, None, outbounds, None).await.unwrap();
+    let resolver = RouterResolver::new(cfg, None, None, outbounds).await.unwrap();
     assert_eq!(resolver.resolve("example.test", false).await.unwrap(), Some("192.0.2.2".parse().unwrap()));
     server.received().await;
 }
@@ -406,11 +406,11 @@ async fn constructor_returns_error_for_invalid_fakeip_configuration() {
     let mut cfg = RouterConfig::default();
     cfg.upstreams = vec![upstream("first", None), upstream("second", None)];
     assert!(RouterResolver::new(cfg.clone(), None, None,
-        Arc::new(ArcSwap::from_pointee(HashMap::new())), None).await.is_err());
+        Arc::new(ArcSwap::from_pointee(HashMap::new()))).await.is_err());
     cfg.upstreams.pop();
     cfg.upstreams[0].inet4_range = "198.18.0.1/32".parse().unwrap();
     assert!(RouterResolver::new(cfg, None, None,
-        Arc::new(ArcSwap::from_pointee(HashMap::new())), None).await.is_err());
+        Arc::new(ArcSwap::from_pointee(HashMap::new()))).await.is_err());
 }
 
 #[tokio::test]

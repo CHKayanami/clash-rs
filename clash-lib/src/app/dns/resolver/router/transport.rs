@@ -19,7 +19,7 @@ use crate::app::dns::singleflight::{
 };
 use crate::app::dns::upstream_pool::UpstreamPool;
 
-use crate::app::dns::{DnsResolutionHookWrapper, ThreadSafeDnsCollector};
+use crate::app::dns::DnsResolutionHookWrapper;
 
 use super::config::UpstreamType;
 
@@ -67,19 +67,16 @@ impl DnsCachePolicy {
 pub struct DnsResolvedNotifier {
     reverse_lookup_cache: ReverseLookupCache,
     resolution_hook: Arc<ArcSwapOption<DnsResolutionHookWrapper>>,
-    collector: Option<ThreadSafeDnsCollector>,
 }
 
 impl DnsResolvedNotifier {
     pub fn new(
         reverse_lookup_cache: ReverseLookupCache,
         resolution_hook: Arc<ArcSwapOption<DnsResolutionHookWrapper>>,
-        collector: Option<ThreadSafeDnsCollector>,
     ) -> Self {
         Self {
             reverse_lookup_cache,
             resolution_hook,
-            collector,
         }
     }
 
@@ -99,11 +96,6 @@ impl DnsResolvedNotifier {
             && !ips.is_empty()
         {
             (hook.0)(qname, ips, Duration::from_secs(effective_ttl as u64));
-        }
-
-        // 3. 记录 DNS 统计
-        if let Some(collector) = &self.collector {
-            collector.record(qname, false);
         }
     }
 }

@@ -29,7 +29,6 @@ pub async fn new(
     mmdb: Option<PendingMmdb>,
     outbounds: OutboundNodeRegistry,
     rule_dispatch: Option<Arc<RuleDispatch>>,
-    collector: Option<super::ThreadSafeDnsCollector>,
 ) -> Result<ThreadSafeDNSResolver, Error> {
     if let Some(ref d2) = cfg.dns2 {
         if d2.enable {
@@ -41,7 +40,6 @@ pub async fn new(
                     cfg.fw_mark,
                     store,
                     outbounds,
-                    collector,
                 )
                 .await?,
             ));
@@ -53,7 +51,7 @@ pub async fn new(
             "enhanced resolver requires cache store".into(),
         ))?;
         Ok(Arc::new(EnhancedResolver::new(
-            cfg, store, mmdb, outbounds, rule_dispatch, collector,
+            cfg, store, mmdb, outbounds, rule_dispatch,
         ).await))
     } else {
         let resolver = SystemResolver::new(cfg.ipv6)

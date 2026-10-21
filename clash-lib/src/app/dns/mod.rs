@@ -5,7 +5,6 @@ use std::sync::Arc;
 #[cfg(test)]
 use mockall::automock;
 
-pub mod collector;
 pub mod config;
 mod domain;
 pub(crate) use domain::normalize_domain;
@@ -26,7 +25,6 @@ pub mod wire;
 
 use crate::app::router::Router;
 use query::QueryContext;
-pub use collector::{DnsCollector, ThreadSafeDnsCollector};
 pub use config::{Config, EdnsClientSubnet};
 
 pub use filters::PendingMmdb;

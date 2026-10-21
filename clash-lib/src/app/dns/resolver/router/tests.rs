@@ -56,7 +56,6 @@ async fn test_cache_delete_prefers_configured_upstream_tag_over_fakeip_alias() {
         None,
         None,
         Arc::new(ArcSwap::from_pointee(HashMap::new())),
-        None,
     ).await.unwrap();
 
     let name = DnsName::from_domain("example.com").unwrap();
@@ -600,7 +599,6 @@ async fn test_router_resolver_fresh_vs_cache_hit_notification() {
         None,
         None,
         Arc::new(ArcSwap::from_pointee(HashMap::new())),
-        None,
     ).await.unwrap();
 
     let hook_calls = Arc::new(AtomicUsize::new(0));
@@ -728,7 +726,6 @@ async fn test_router_resolver_polluted_requery_prevents_dirty_cache_and_hook() {
         None,
         None,
         Arc::new(ArcSwap::from_pointee(HashMap::new())),
-        None,
     ).await.unwrap();
 
     let hooked_ips = Arc::new(parking_lot::Mutex::new(Vec::new()));
@@ -827,7 +824,6 @@ async fn test_router_resolver_stale_refresh_notification_with_rule_filter() {
         None,
         None,
         Arc::new(ArcSwap::from_pointee(HashMap::new())),
-        None,
     ).await.unwrap();
 
     let hooked_ips = Arc::new(parking_lot::Mutex::new(Vec::new()));

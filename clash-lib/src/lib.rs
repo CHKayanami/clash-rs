@@ -98,7 +98,6 @@ pub struct Options {
     /// from the dashboard. Set this when starting from a file; leave `None`
     /// for string/inline configs (e.g. FFI).
     pub config_path: Option<String>,
-    pub dns_collect_file: Option<String>,
 }
 
 pub enum TokioRuntime {
@@ -178,7 +177,6 @@ pub fn start_scaffold(opts: Options) -> Result<()> {
         rt,
         log_file,
         config_path,
-        dns_collect_file,
     } = opts;
 
     let rt = match rt.unwrap_or(TokioRuntime::MultiThread) {
@@ -219,7 +217,6 @@ pub fn start_scaffold(opts: Options) -> Result<()> {
             config,
             cwd,
             config_path,
-            dns_collect_file,
             log_tx,
             shutdown_token,
         )
@@ -250,7 +247,6 @@ pub fn start_scaffold_instance(
         rt,
         log_file: _,
         config_path,
-        dns_collect_file,
     } = opts;
 
     let config_path = config_path.or_else(|| {
@@ -284,7 +280,6 @@ pub fn start_scaffold_instance(
             config,
             cwd,
             config_path,
-            dns_collect_file,
             log_tx,
             token_clone,
         )) {
@@ -331,7 +326,6 @@ pub async fn start(
     config: InternalConfig,
     cwd: String,
     config_path: Option<String>,
-    dns_collect_file: Option<String>,
     log_tx: broadcast::Sender<LogEvent>,
     shutdown_token: tokio_util::sync::CancellationToken,
 ) -> Result<()> {
@@ -388,7 +382,6 @@ pub async fn start(
         cwd_path.clone(),
         config,
         None,
-        dns_collect_file.clone(),
         Some(fatal_tx.clone()),
         None,
     )
@@ -453,7 +446,6 @@ pub async fn start(
         log_tx,
         shutdown_token: shutdown_token.clone(),
         fatal_tx: fatal_tx.clone(),
-        dns_collect_file,
     };
     let shutdown_token_clone = shutdown_token.clone();
     let reload_guard = CriticalTaskGuard::new(
@@ -599,7 +591,6 @@ async fn create_components(
     cwd: PathBuf,
     config: InternalConfig,
     old_components: Option<&RuntimeComponents>,
-    dns_collect_file: Option<String>,
     fatal_tx: Option<tokio::sync::mpsc::Sender<crate::Error>>,
     dns_prepared: Option<PreparedDnsListener>,
 ) -> Result<RuntimeComponents> {
@@ -700,39 +691,12 @@ async fn create_components(
         None
     };
 
-    let dns_collector = if let Some(file_str) = &dns_collect_file {
-        let path = PathBuf::from(file_str);
-        let resolved_path = if path.is_relative() {
-            cwd.join(path)
-        } else {
-            path
-        };
-        if resolved_path.exists() {
-            match dns::DnsCollector::new(resolved_path) {
-                Ok(collector) => Some(collector),
-                Err(e) => {
-                    warn!("failed to initialize DNS collector: {e}");
-                    None
-                }
-            }
-        } else {
-            debug!(
-                "DNS collect file {:?} does not exist, DNS statistics collection disabled",
-                resolved_path
-            );
-            None
-        }
-    } else {
-        None
-    };
-
     let dns_resolver = dns::new_resolver(
         config.dns,
         Some(cache_store.clone()),
         pending_country_mmdb.clone(),
         outbound_registry.clone(),
         rule_dispatch.clone(),
-        dns_collector,
     )
     .await?;
 
@@ -1012,7 +976,6 @@ mod tests {
                 rt: None,
                 log_file: None,
                 config_path: None,
-                dns_collect_file: None,
             })
             .unwrap()
         });

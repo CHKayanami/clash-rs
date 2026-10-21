@@ -37,7 +37,6 @@ impl EnhancedResolver {
                 fake_ip_ttl: 1,
                 reverse_lookup_cache: None,
                 black_domain_filter: None,
-                collector: None,
                 singleflight: Singleflight::new(),
                 optimistic_cache_ttl: 0,
                 stale_cache_retention: Duration::from_secs(3600),
@@ -198,7 +197,6 @@ async fn test_dns_resolution_hook_end_to_end_on_exchange() {
             fake_ip_ttl: 1,
             reverse_lookup_cache: None,
             black_domain_filter: None,
-            collector: None,
             singleflight: Singleflight::new(),
             optimistic_cache_ttl: 0,
             stale_cache_retention: Duration::from_secs(3600),
@@ -266,7 +264,6 @@ async fn test_fake_ip_exchange() {
             fake_ip_ttl: 1,
             reverse_lookup_cache: None,
             black_domain_filter: None,
-            collector: None,
             singleflight: Singleflight::new(),
             optimistic_cache_ttl: 0,
             stale_cache_retention: Duration::from_secs(3600),
@@ -407,7 +404,6 @@ async fn test_optimistic_cache_ttl_and_never_cache() {
         None,
         Arc::new(ArcSwap::from_pointee(HashMap::new())),
         None,
-        None,
     )
     .await;
 
@@ -447,7 +443,6 @@ async fn test_reverse_lookup_cache_integration_and_conflict() {
         store,
         None,
         Arc::new(ArcSwap::from_pointee(HashMap::new())),
-        None,
         None,
     )
     .await;
@@ -518,7 +513,6 @@ async fn test_qtype_filter_exchange() {
             fake_ip_ttl: 1,
             reverse_lookup_cache: None,
             black_domain_filter: None,
-            collector: None,
             singleflight: Singleflight::new(),
             optimistic_cache_ttl: 0,
             stale_cache_retention: Duration::from_secs(3600),

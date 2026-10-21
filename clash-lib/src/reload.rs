@@ -24,7 +24,6 @@ pub(super) struct RuntimeState {
     pub log_tx: broadcast::Sender<LogEvent>,
     pub shutdown_token: CancellationToken,
     pub fatal_tx: mpsc::Sender<Error>,
-    pub dns_collect_file: Option<String>,
 }
 
 impl RuntimeState {
@@ -107,7 +106,7 @@ impl RuntimeState {
         let restored = create_components(
             PathBuf::from(&self.components.cwd),
             self.active_config.clone(), Some(&self.components),
-            self.dns_collect_file.clone(), Some(self.fatal_tx.clone()),
+            Some(self.fatal_tx.clone()),
             Some(self.components.dns_prepared.clone()),
         ).await?;
         if let Err(e) = restored.start_all().await {
@@ -142,7 +141,7 @@ impl RuntimeState {
         // and global network defaults untouched.
         let next = create_components(
             PathBuf::from(&self.components.cwd), config.clone(),
-            Some(&self.components), self.dns_collect_file.clone(),
+            Some(&self.components),
             Some(self.fatal_tx.clone()), None,
         ).await?;
         let previous_network = NetworkConfig::capture();
@@ -225,7 +224,7 @@ mod tests {
         setup_default_crypto_provider();
         let (fatal_tx, fatal_rx) = mpsc::channel(16);
         let components = create_components(
-            dir.to_path_buf(), config.clone(), None, None, Some(fatal_tx.clone()), None,
+            dir.to_path_buf(), config.clone(), None, Some(fatal_tx.clone()), None,
         ).await.unwrap();
         let (reload_tx, _) = mpsc::channel(1);
         let global_state = Arc::new(Mutex::new(GlobalState {
@@ -258,7 +257,7 @@ mod tests {
         (RuntimeState {
             components, api_listener, api_service_context,
             active_config: config, global_state, log_tx, shutdown_token,
-            fatal_tx, dns_collect_file: None,
+            fatal_tx,
         }, fatal_rx)
     }
 

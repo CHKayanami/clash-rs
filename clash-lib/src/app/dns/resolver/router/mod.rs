@@ -35,7 +35,7 @@ use crate::app::dns::upstream_pool::{UpstreamEntry, UpstreamPool};
 
 use crate::app::dns::{
     ClashResolver, DnsCacheItem, DnsCacheReport, DnsCacheUpstreamStat, DnsResolutionHook,
-    DnsResolutionHookWrapper, DnsUpstreamInfo, ResolverKind, ThreadSafeDnsCollector,
+    DnsResolutionHookWrapper, DnsUpstreamInfo, ResolverKind,
     parse_ip_literal,
 };
 use crate::app::profile::ThreadSafeCacheFile;
@@ -83,7 +83,6 @@ impl RouterResolver {
         fw_mark: Option<u32>,
         store: Option<ThreadSafeCacheFile>,
         outbounds: OutboundNodeRegistry,
-        collector: Option<ThreadSafeDnsCollector>,
     ) -> Result<Self, Error> {
         cfg.validate()?;
         let mut entries = HashMap::new();
@@ -151,7 +150,6 @@ impl RouterResolver {
         let notifier = DnsResolvedNotifier::new(
             reverse_lookup_cache.clone(),
             Arc::clone(&resolution_hook),
-            collector.clone(),
         );
         let cache = DnsCache::new(capacity);
         let cache_policy = DnsCachePolicy::new(cfg.optimistic_cache_ttl, cfg.stale_cache_retention);

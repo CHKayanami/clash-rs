@@ -114,14 +114,6 @@ struct Cli {
                 errors."
     )]
     strict_config: bool,
-
-    #[clap(
-        long,
-        value_parser,
-        value_name = "FILE",
-        help = "Specify DNS statistics collection output file path. If the file exists on startup, DNS statistics will be collected and written periodically."
-    )]
-    dns_collect_file: Option<PathBuf>,
 }
 
 /// Returns `true` if the env var is set to `1` or `true` (case-insensitive).
@@ -320,7 +312,6 @@ fn main() -> anyhow::Result<()> {
         rt: Some(TokioRuntime::MultiThread),
         log_file: cli.log_file,
         config_path: Some(file),
-        dns_collect_file: cli.dns_collect_file.map(|p| p.to_string_lossy().to_string()),
     })
     .inspect_err(|err| eprintln!("Failed to start clash: {err}"))?;
     Ok(())

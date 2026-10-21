@@ -36,7 +36,7 @@ use crate::app::dns::wire::{
 use crate::app::dns::{
     ClashResolver, DnsCacheItem, DnsCacheReport, DnsCacheUpstreamStat, DnsResolutionHook,
     DnsResolutionHookWrapper, DnsUpstreamInfo, ResolverKind, RuleDispatch,
-    ThreadSafeDnsCollector, parse_ip_literal,
+    parse_ip_literal,
 };
 use crate::app::profile::ThreadSafeCacheFile;
 use crate::app::router::Router;
@@ -77,7 +77,6 @@ pub struct EnhancedResolverInner {
 
     reverse_lookup_cache: Option<ReverseLookupCache>,
     black_domain_filter: Option<BlackDomainFilter>,
-    collector: Option<ThreadSafeDnsCollector>,
 
     singleflight: Singleflight,
     optimistic_cache_ttl: u32,
@@ -94,7 +93,6 @@ impl EnhancedResolver {
         mmdb: Option<PendingMmdb>,
         outbounds: OutboundNodeRegistry,
         rule_dispatch: Option<Arc<RuleDispatch>>,
-        collector: Option<ThreadSafeDnsCollector>,
     ) -> Self {
         let mut entries = HashMap::new();
 
@@ -282,7 +280,6 @@ impl EnhancedResolver {
             fake_ip_ttl: cfg.fake_ip_ttl,
             reverse_lookup_cache,
             black_domain_filter,
-            collector,
             singleflight: Singleflight::new(),
             optimistic_cache_ttl: cfg.optimistic_cache_ttl,
             stale_cache_retention: Duration::from_secs(cfg.stale_cache_retention as u64),
@@ -499,11 +496,6 @@ impl EnhancedResolver {
                 (hook.0)(host, &ips, Duration::from_secs(ttl as u64));
             }
         }
-
-        // 4. Record DNS statistics
-        if let Some(collector) = &self.collector {
-            collector.record(host, false);
-        }
     }
 }
 
@@ -550,18 +542,12 @@ impl ClashResolver for EnhancedResolver {
             if !fake_dns.should_skip(host) {
                 let ip = fake_dns.lookup(host);
                 debug!(domain = %host, ?ip, "DNS Fake-IP assigned");
-                if let Some(collector) = &self.collector {
-                    collector.record(host, true);
-                }
                 return Ok(Some(ip));
             }
         }
 
         let is_v6 = self.ipv6();
         let ips = self.lookup_ip(host, is_v6).await?;
-        if let Some(collector) = &self.collector {
-            collector.record(host, false);
-        }
         let chosen = ips.into_iter().choose(&mut rand::rng());
         debug!(domain = %host, ?chosen, "DNS resolve completed");
         Ok(chosen)
@@ -600,9 +586,6 @@ impl ClashResolver for EnhancedResolver {
         if enhanced && let Some(fake_dns) = &self.fake_dns {
             if !fake_dns.should_skip(host) {
                 if let net::IpAddr::V4(ip) = fake_dns.lookup(host) {
-                    if let Some(collector) = &self.collector {
-                        collector.record(host, true);
-                    }
                     return Ok(Some(ip));
                 }
             }
@@ -617,12 +600,7 @@ impl ClashResolver for EnhancedResolver {
             })
             .collect();
         match v4s.into_iter().choose(&mut rand::rng()) {
-            Some(v4) => {
-                if let Some(collector) = &self.collector {
-                    collector.record(host, false);
-                }
-                Ok(Some(v4))
-            }
+            Some(v4) => Ok(Some(v4)),
             None => Ok(None),
         }
     }
@@ -664,9 +642,6 @@ impl ClashResolver for EnhancedResolver {
         if enhanced && let Some(fake_dns) = &self.fake_dns {
             if !fake_dns.should_skip(host) {
                 if let net::IpAddr::V6(ip) = fake_dns.lookupv6(host) {
-                    if let Some(collector) = &self.collector {
-                        collector.record(host, true);
-                    }
                     return Ok(Some(ip));
                 }
             }
@@ -681,12 +656,7 @@ impl ClashResolver for EnhancedResolver {
             })
             .collect();
         match v6s.into_iter().choose(&mut rand::rng()) {
-            Some(v6) => {
-                if let Some(collector) = &self.collector {
-                    collector.record(host, false);
-                }
-                Ok(Some(v6))
-            }
+            Some(v6) => Ok(Some(v6)),
             None => Ok(None),
         }
     }

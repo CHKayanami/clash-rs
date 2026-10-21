@@ -27,7 +27,7 @@ async fn dns2_factory_propagates_initialization_errors() {
     let mut cfg = fake_config(false);
     cfg.dns2.as_mut().unwrap().request_fallback = RequestAction::Route("missing".into());
     let error = new(cfg, None, None,
-        Arc::new(ArcSwap::from_pointee(HashMap::new())), None, None,
+        Arc::new(ArcSwap::from_pointee(HashMap::new())), None,
     ).await.err().unwrap();
     assert!(error.to_string().contains("unknown dns2 upstream 'missing'"));
 }
@@ -46,7 +46,7 @@ async fn dns2_honors_fakeip_persistence_for_restore_and_new_mappings() {
         }]).unwrap();
         let before = store.get_fake_ip_tables().unwrap();
         let resolver = new(fake_config(persist), Some(store.clone()), None,
-            Arc::new(ArcSwap::from_pointee(HashMap::new())), None, None,
+            Arc::new(ArcSwap::from_pointee(HashMap::new())), None,
         ).await.unwrap();
         assert_eq!(resolver.reverse_lookup(retained),
             persist.then(|| "retained.example".to_string()));
