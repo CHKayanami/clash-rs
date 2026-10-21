@@ -34,7 +34,8 @@ pub struct DaeParam {
     pub has_bypass_dscps: u8,
     pub has_bypass_fwmarks: u8,
     pub has_proxy_src_macs: u8,
-    pub _pad1: [u8; 2],
+    pub log_events: u8,
+    pub _pad1: [u8; 1],
 }
 
 // Keep address copies aligned for BPF code generation. The key remains 40
@@ -178,6 +179,9 @@ unsafe impl aya::Pod for FlowTrackEntry {}
 pub mod tracking;
 
 const _: () = {
+    // The diagnostic switch consumes former padding; the map ABI stays 44 bytes.
+    assert!(core::mem::size_of::<DaeParam>() == 44);
+    assert!(core::mem::offset_of!(DaeParam, log_events) == 42);
     assert!(core::mem::size_of::<RedirectEntry>() == 20);
     assert!(core::mem::size_of::<FlowTrackEntry>() == 40);
     assert!(core::mem::align_of::<FlowTrackEntry>() >= 8);

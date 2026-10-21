@@ -10,37 +10,34 @@ fn main() {
     println!("cargo:rerun-if-changed={}", ebpf_crate.join("Cargo.toml").display());
     println!("cargo:rerun-if-changed={}", manifest_dir.join("../clash-ebpf-common").display());
 
-    let profile = if std::env::var("PROFILE").as_deref() == Ok("debug") {
-        "debug"
-    } else {
-        "release"
-    };
-    let artifact = format!("target/bpfel-unknown-none/{profile}/clash-ebpf-bpf");
-    let candidates = [
-        ebpf_crate.join(&artifact),
-        manifest_dir.join("..").join(&artifact),
-    ];
+    let profile = std::env::var("PROFILE").expect("Cargo did not set PROFILE");
+    let bpf_target = manifest_dir.join("../target/bpfel-unknown-none");
+    let mut candidates = vec![bpf_target.join(&profile).join("clash-ebpf-bpf")];
+    if profile != "release" {
+        candidates.push(bpf_target.join("release/clash-ebpf-bpf"));
+    }
     for candidate in &candidates {
         println!("cargo:rerun-if-changed={}", candidate.display());
     }
 
-    let found = candidates.iter().find(|p| p.exists() && p.metadata().map(|m| m.len()).unwrap_or(0) > 0);
-
-    if let Some(target_obj) = found {
-        let size = target_obj.metadata().map(|m| m.len()).unwrap_or(0);
-        std::fs::copy(target_obj, &dest).expect("Failed to copy built eBPF binary");
-        println!(
-            "cargo:warning=Successfully embedded eBPF object from {} ({} bytes)",
-            target_obj.display(),
-            size
+    let target_obj = candidates.iter().find(|path| {
+        path.metadata().is_ok_and(|metadata| metadata.is_file() && metadata.len() > 0)
+    }).unwrap_or_else(|| {
+        let searched = candidates.iter().map(|path| path.display().to_string())
+            .collect::<Vec<_>>().join("\n  ");
+        panic!(
+            "eBPF binary not found or empty. Searched:\n  {searched}\n\
+             Build it first: cd clash-ebpf-bpf && cargo +nightly build --release \
+             -Zbuild-std=core --target bpfel-unknown-none"
         );
-    } else {
-        std::fs::write(&dest, b"").expect("Failed to create dummy eBPF object");
-        println!(
-            "cargo:warning=eBPF binary not found, created dummy artifact at {}. Real eBPF functionality requires building clash-ebpf-bpf first.",
-            dest.display()
-        );
-    }
+    });
+    let size = target_obj.metadata().expect("Failed to stat eBPF binary").len();
+    std::fs::copy(target_obj, &dest).expect("Failed to copy built eBPF binary");
+    println!(
+        "cargo:warning=Successfully embedded eBPF object from {} ({} bytes)",
+        target_obj.display(),
+        size
+    );
 
     println!("cargo:rustc-env=CLASH_EBPF_OBJECT={}", dest.display());
 }

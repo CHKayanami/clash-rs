@@ -24,10 +24,13 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use tokio::io::{Interest, unix::AsyncFd};
 use tracing::{debug, error, info, warn};
 
+mod event_log;
 mod static_bypass;
 mod tracking_gc;
 mod tracking_gc_program;
 use static_bypass::StaticBypass;
+use event_log::EventLogLimits;
+use std::time::Instant;
 
 /// Keep inactive process tracking maps minimal; their BPF references still
 /// require a real map, so zero capacity is not valid for a hash map.
@@ -1334,10 +1337,7 @@ async fn consume_dae_events(
     mut async_fd: AsyncFd<RingBuf<MapData>>,
 ) {
     use clash_ebpf_common::{DaeEvent, DaeEventType};
-    let mut window = std::time::Instant::now();
-    let mut emitted: u32 = 0;
-    let mut suppressed: u64 = 0;
-    const EVENT_LOG_MAX_PER_SEC: u32 = 32;
+    let mut limits = EventLogLimits::new(Instant::now());
 
     loop {
         let mut guard = match async_fd.readable_mut().await {
@@ -1359,22 +1359,16 @@ async fn consume_dae_events(
                     core::ptr::read_unaligned(bytes.as_ptr() as *const DaeEvent)
                 };
 
-                if window.elapsed() >= std::time::Duration::from_secs(1) {
-                    if suppressed > 0 {
-                        warn!(
-                            "eBPF datapath events suppressed: {suppressed} in the last second"
-                        );
+                let normal = ev.type_ == DaeEventType::Redirected as u32;
+                let decision = limits.check(normal, Instant::now());
+                if decision.suppressed != 0 {
+                    if normal {
+                        debug!(count = decision.suppressed, "eBPF redirection events suppressed in previous window");
+                    } else {
+                        warn!(count = decision.suppressed, "eBPF exceptional events suppressed in previous window");
                     }
-                    window = std::time::Instant::now();
-                    emitted = 0;
-                    suppressed = 0;
                 }
-
-                if emitted >= EVENT_LOG_MAX_PER_SEC {
-                    suppressed += 1;
-                    continue;
-                }
-                emitted += 1;
+                if !decision.allowed { continue; }
 
                 let pname_end = ev
                     .pname
@@ -1409,7 +1403,7 @@ async fn consume_dae_events(
                         } else {
                             "LAN-Ingress(Forward)"
                         };
-                        info!(
+                        debug!(
                             target: "clash-ebpf",
                             dir = dir,
                             pid = ev.pid,

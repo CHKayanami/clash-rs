@@ -568,6 +568,52 @@ mod tests {
     use tracing_subscriber::{layer::SubscriberExt, registry};
 
     #[test]
+    fn ebpf_startup_event_gate_matches_configured_log_level() {
+        use super::log_filter;
+        use tracing::{Level, enabled};
+
+        for (level, expected) in [
+            (LogLevel::Silent, false), (LogLevel::Error, false),
+            (LogLevel::Warning, false), (LogLevel::Info, false),
+            (LogLevel::Debug, true), (LogLevel::Trace, true),
+        ] {
+            let (tx, mut rx) = broadcast::channel(4);
+            let subscriber = registry().with(log_filter(level))
+                .with(EventCollector::new(vec![tx]));
+            tracing::subscriber::with_default(subscriber, || {
+                // Same target and level as the BPF manager's startup check.
+                assert_eq!(enabled!(target: "clash-ebpf", Level::DEBUG), expected);
+                tracing::debug!(target: "clash-ebpf", "redirected");
+            });
+            assert_eq!(rx.try_recv().is_ok(), expected);
+        }
+    }
+
+    #[test]
+    fn ebpf_startup_event_gate_respects_rust_log_target_overrides() {
+        use super::EnvFilter;
+        use tracing::{Level, enabled};
+
+        // Parse startup RUST_LOG directives without mutating process-wide env.
+        for (directives, expected) in [
+            ("info", false), ("debug", true), ("trace", true),
+            ("info,clash-ebpf=debug", true),
+            ("trace,clash-ebpf=info", false),
+            ("debug,clash-ebpf=off", false),
+            ("info,clash_lib=debug", false),
+        ] {
+            let (tx, mut rx) = broadcast::channel(4);
+            let subscriber = registry().with(EnvFilter::try_new(directives).unwrap())
+                .with(EventCollector::new(vec![tx]));
+            tracing::subscriber::with_default(subscriber, || {
+                assert_eq!(enabled!(target: "clash-ebpf", Level::DEBUG), expected, "{directives}");
+                tracing::debug!(target: "clash-ebpf", "redirected");
+            });
+            assert_eq!(rx.try_recv().is_ok(), expected, "{directives}");
+        }
+    }
+
+    #[test]
     fn debug_connection_span_is_only_retained_at_debug_level() {
         use super::{TraceIdLayer, log_filter, reload};
         let (tx, mut rx) = broadcast::channel(4);

@@ -242,3 +242,33 @@ fn linear_cache_misses_preserve_nonzero_dscp_for_both_ip_families() {
         assert_ne!((state(&bpf).1 >> 32) as u32 & DIRECT, 0);
     }
 }
+
+#[test]
+#[ignore = "requires freshly built BPF bytecode and root; attaches no hooks"]
+fn normal_events_are_opt_in_but_overflow_events_are_unconditional() {
+    use aya::maps::RingBuf;
+    use clash_ebpf_common::DaeEventType;
+
+    for enabled in [false, true] {
+        let mut loader = EbpfLoader::new();
+        loader.map_max_entries("FLOW_TRACK", 1);
+        let mut bpf = loader.load(BYTECODE).unwrap();
+        let program: &mut SchedClassifier = bpf.program_mut("lan_ingress_l2").unwrap().try_into().unwrap();
+        program.load().unwrap();
+        params(&mut bpf, DaeParam { log_events: enabled as u8, ..DaeParam::default() });
+        let mut events = RingBuf::try_from(bpf.take_map("EVENT_RINGBUF").unwrap()).unwrap();
+        assert_eq!(run(&mut bpf, &packet(10)), 7);
+        {
+            let event = events.next();
+            assert_eq!(event.is_some(), enabled);
+            if let Some(event) = event {
+                assert_eq!(u32::from_ne_bytes(event[8..12].try_into().unwrap()), DaeEventType::Redirected as u32);
+            }
+        }
+        let mut overflow = packet(10);
+        overflow[34..36].copy_from_slice(&40001u16.to_be_bytes());
+        assert_eq!(run(&mut bpf, &overflow), 2);
+        let event = events.next().expect("overflow must remain observable without normal event logging");
+        assert_eq!(u32::from_ne_bytes(event[8..12].try_into().unwrap()), DaeEventType::UdpConnOverflow as u32);
+    }
+}

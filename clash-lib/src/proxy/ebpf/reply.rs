@@ -22,18 +22,18 @@ impl ReplySocketCache {
     fn get_or_create(&mut self, source: SocketAddr, now: Instant,
         create: impl FnOnce() -> io::Result<UdpSocket>,
     ) -> io::Result<Arc<UdpSocket>> {
-        if self.sockets.peek(&source)
-            .is_some_and(|entry| now.saturating_duration_since(entry.last_used) >= IDLE_TIMEOUT) {
+        if let Some(entry) = self.sockets.get_mut(&source) {
+            if now.saturating_duration_since(entry.last_used) < IDLE_TIMEOUT {
+                entry.last_used = now;
+                return Ok(entry.socket.clone());
+            }
+            // Remove the expired descriptor before opening its replacement.
             self.sockets.pop(&source);
         }
-        if !self.sockets.contains(&source) {
-            // Release a descriptor before opening another one at capacity.
-            if self.sockets.len() == self.sockets.cap().get() { self.sockets.pop_lru(); }
-            self.sockets.put(source, Entry { socket: Arc::new(create()?), last_used: now });
-        }
-        let entry = self.sockets.get_mut(&source).unwrap();
-        entry.last_used = now;
-        Ok(entry.socket.clone())
+        if self.sockets.len() == self.sockets.cap().get() { self.sockets.pop_lru(); }
+        let socket = Arc::new(create()?);
+        self.sockets.put(source, Entry { socket: socket.clone(), last_used: now });
+        Ok(socket)
     }
 
     fn expire(&mut self, now: Instant) {
@@ -54,8 +54,9 @@ pub(super) async fn relay(listener: Arc<EbpfListener>, mut packets: mpsc::Receiv
             _ = sweep.tick() => { sockets.expire(Instant::now()); continue; },
         };
         if count == 0 { break; }
+        let now = Instant::now();
         send_replies(&batch, |source| {
-            sockets.get_or_create(source, Instant::now(), || listener.create_reply_socket(source))
+            sockets.get_or_create(source, now, || listener.create_reply_socket(source))
         }).await;
         batch.clear();
     }
@@ -86,6 +87,20 @@ mod tests {
         assert_eq!(cache.sockets.len(), 2);
         assert!(cache.sockets.contains(&a));
         assert!(!cache.sockets.contains(&b));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn expired_hit_is_removed_even_if_replacement_fails() {
+        let mut cache = ReplySocketCache::default();
+        let source = SocketAddr::from(([192, 0, 2, 1], 1));
+        let old = cache.get_or_create(source, Instant::now(), socket).unwrap();
+        tokio::time::advance(IDLE_TIMEOUT).await;
+        assert!(cache.get_or_create(source, Instant::now(), || {
+            Err(io::Error::other("replacement failed"))
+        }).is_err());
+        assert!(!cache.sockets.contains(&source));
+        let new = cache.get_or_create(source, Instant::now(), socket).unwrap();
+        assert!(!Arc::ptr_eq(&old, &new));
     }
 
     #[tokio::test(start_paused = true)]

@@ -419,7 +419,7 @@ fn handle_lan_ipv4(
             IPPROTO_UDP
         };
 
-        if is_new_flow {
+        if is_new_flow && param.log_events != 0 {
             let sip_u32 = [u32::from_be_bytes([tuple.src_ip[12], tuple.src_ip[13], tuple.src_ip[14], tuple.src_ip[15]]), 0, 0, 0];
             let dip_u32 = [u32::from_be_bytes([tuple.dst_ip[12], tuple.dst_ip[13], tuple.dst_ip[14], tuple.dst_ip[15]]), 0, 0, 0];
             send_dae_event(
@@ -500,7 +500,7 @@ fn handle_lan_ipv6(
             IPPROTO_UDP
         };
 
-        if is_new_flow {
+        if is_new_flow && param.log_events != 0 {
             send_dae_event(
                 DaeEventType::Redirected as u32,
                 0,
@@ -650,7 +650,7 @@ fn handle_wan_ipv4(
             IPPROTO_UDP
         };
 
-        if is_new_flow {
+        if is_new_flow && param.log_events != 0 {
             let pid = pid_pname.map(|p| p.pid).unwrap_or(0);
             let pname = pid_pname.map(|p| &p.pname);
             let sip_u32 = [u32::from_be_bytes(src_ip_be), 0, 0, 0];
@@ -734,7 +734,7 @@ fn handle_wan_ipv6(
             IPPROTO_UDP
         };
 
-        if is_new_flow {
+        if is_new_flow && param.log_events != 0 {
             let pid = pid_pname.map(|p| p.pid).unwrap_or(0);
             let pname = pid_pname.map(|p| &p.pname);
             send_dae_event(

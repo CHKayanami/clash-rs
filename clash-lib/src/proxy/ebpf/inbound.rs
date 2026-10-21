@@ -5,7 +5,7 @@ use clash_common::udp::{BatchReceiver, MAX_BATCH};
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use super::offloader::{DirectOffloader, RoutingAction};
 use super::reply::relay as relay_replies;
@@ -352,7 +352,7 @@ async fn udp_listener_loop(
                                         .await
                                     {
                                         Ok(_) => {
-                                            tracing::info!(
+                                            tracing::debug!(
                                                 "[eBPF DNS] Replied {} -> {}",
                                                 dst,
                                                 src
@@ -381,7 +381,7 @@ async fn udp_listener_loop(
                     }
 
                     // 2. Regular UDP packet -> Dispatcher
-                    info!("[eBPF UDP] Intercepted: {} -> {}", src, dst);
+                    debug!("[eBPF UDP] Intercepted: {} -> {}", src, dst);
                     let packet = UdpPacket::new(payload, src.into(), dst.into());
 
                     match d_tx.try_send(packet) {

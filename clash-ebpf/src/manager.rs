@@ -7,7 +7,7 @@ use std::io::Write;
 use std::os::fd::AsRawFd;
 use std::sync::Arc;
 use thiserror::Error;
-use tracing::info;
+use tracing::{Level, enabled, info};
 
 const DAENS_HOST_IP: &str = "169.254.0.1";
 
@@ -395,7 +395,9 @@ impl EbpfManager {
             has_bypass_dscps,
             has_bypass_fwmarks,
             has_proxy_src_macs,
-            _pad1: [0; 2],
+            // Match the event consumer target; snapshot the filter at startup.
+            log_events: enabled!(target: "clash-ebpf", Level::DEBUG) as u8,
+            _pad1: [0; 1],
         };
 
         let mut bpf_manager = crate::bpf::BpfProgramManager::new();
