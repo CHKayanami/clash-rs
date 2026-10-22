@@ -6,6 +6,11 @@ on:
 permissions:
   contents: read
 
+env:
+  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+  ZIG_VERSION: "0.17.0"
+  CARGO_ZIGBUILD_VERSION: "0.24.0"
+
 jobs:
   build-dashboard:
     name: Build Dashboard
@@ -63,15 +68,36 @@ jobs:
           if-no-files-found: error
 
   build:
-    name: Build (${{ matrix.target }})
+    name: Build (${{ matrix.variant }}, ${{ matrix.target }})
     needs: [build-dashboard, build-ebpf]
     runs-on: ${{ matrix.os }}
+    env:
+      CARGO_PROFILE_RELEASE_OPT_LEVEL: ${{ matrix.opt-level }}
+      # Match Zig's musl time_t ABI in boring's high-level libc API.
+      CARGO_TARGET_I686_UNKNOWN_LINUX_MUSL_RUSTFLAGS: "--cfg tokio_unstable --cfg libc_unstable_musl_v1_2_3"
+      CARGO_TARGET_ARMV7_UNKNOWN_LINUX_MUSLEABIHF_RUSTFLAGS: "--cfg tokio_unstable --cfg libc_unstable_musl_v1_2_3"
     strategy:
       fail-fast: false
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
-            variants: "minimal standard"
+            variant: minimal
+            extra-features: "jemallocator,ebpf"
+            binary-name: clash-rs
+            archive-ext: tar.gz
+            os: ubuntu-latest
+            use-zigbuild: false
+            opt-level: "3"
+          - target: x86_64-unknown-linux-gnu
+            variant: standard
+            extra-features: "jemallocator,ebpf"
+            binary-name: clash-rs
+            archive-ext: tar.gz
+            os: ubuntu-latest
+            use-zigbuild: false
+            opt-level: "3"
+          - target: x86_64-unknown-linux-musl
+            variant: minimal
             extra-features: "jemallocator,ebpf"
             binary-name: clash-rs
             archive-ext: tar.gz
@@ -79,7 +105,7 @@ jobs:
             use-zigbuild: true
             opt-level: "3"
           - target: x86_64-unknown-linux-musl
-            variants: "minimal standard"
+            variant: standard
             extra-features: "jemallocator,ebpf"
             binary-name: clash-rs
             archive-ext: tar.gz
@@ -87,7 +113,15 @@ jobs:
             use-zigbuild: true
             opt-level: "3"
           - target: aarch64-unknown-linux-gnu
-            variants: "minimal standard"
+            variant: minimal
+            extra-features: "jemallocator,ebpf"
+            binary-name: clash-rs
+            archive-ext: tar.gz
+            os: ubuntu-latest
+            use-zigbuild: true
+            opt-level: "3"
+          - target: aarch64-unknown-linux-gnu
+            variant: standard
             extra-features: "jemallocator,ebpf"
             binary-name: clash-rs
             archive-ext: tar.gz
@@ -95,7 +129,15 @@ jobs:
             use-zigbuild: true
             opt-level: "3"
           - target: aarch64-unknown-linux-musl
-            variants: "minimal standard"
+            variant: minimal
+            extra-features: "jemallocator,ebpf"
+            binary-name: clash-rs
+            archive-ext: tar.gz
+            os: ubuntu-latest
+            use-zigbuild: true
+            opt-level: "s"
+          - target: aarch64-unknown-linux-musl
+            variant: standard
             extra-features: "jemallocator,ebpf"
             binary-name: clash-rs
             archive-ext: tar.gz
@@ -103,7 +145,15 @@ jobs:
             use-zigbuild: true
             opt-level: "s"
           - target: armv7-unknown-linux-gnueabihf
-            variants: "minimal standard"
+            variant: minimal
+            extra-features: "jemallocator,ebpf"
+            binary-name: clash-rs
+            archive-ext: tar.gz
+            os: ubuntu-latest
+            use-zigbuild: true
+            opt-level: "s"
+          - target: armv7-unknown-linux-gnueabihf
+            variant: standard
             extra-features: "jemallocator,ebpf"
             binary-name: clash-rs
             archive-ext: tar.gz
@@ -111,7 +161,15 @@ jobs:
             use-zigbuild: true
             opt-level: "s"
           - target: armv7-unknown-linux-musleabihf
-            variants: "minimal standard"
+            variant: minimal
+            extra-features: "jemallocator"
+            binary-name: clash-rs
+            archive-ext: tar.gz
+            os: ubuntu-latest
+            use-zigbuild: true
+            opt-level: "s"
+          - target: armv7-unknown-linux-musleabihf
+            variant: standard
             extra-features: "jemallocator"
             binary-name: clash-rs
             archive-ext: tar.gz
@@ -119,7 +177,8 @@ jobs:
             use-zigbuild: true
             opt-level: "s"
           - target: riscv64gc-unknown-linux-musl
-            variants: "minimal"
+            variant: minimal
+            save-cache: true
             extra-features: "jemallocator,ebpf"
             binary-name: clash-rs
             archive-ext: tar.gz
@@ -127,7 +186,8 @@ jobs:
             use-zigbuild: true
             opt-level: "s"
           - target: i686-unknown-linux-musl
-            variants: "minimal"
+            variant: minimal
+            save-cache: true
             extra-features: "jemallocator"
             binary-name: clash-rs
             archive-ext: tar.gz
@@ -135,7 +195,15 @@ jobs:
             use-zigbuild: true
             opt-level: "s"
           - target: x86_64-apple-darwin
-            variants: "minimal standard"
+            variant: minimal
+            extra-features: ""
+            binary-name: clash-rs
+            archive-ext: tar.gz
+            os: macos-latest
+            use-zigbuild: false
+            opt-level: "3"
+          - target: x86_64-apple-darwin
+            variant: standard
             extra-features: ""
             binary-name: clash-rs
             archive-ext: tar.gz
@@ -143,7 +211,15 @@ jobs:
             use-zigbuild: false
             opt-level: "3"
           - target: aarch64-apple-darwin
-            variants: "minimal standard"
+            variant: minimal
+            extra-features: ""
+            binary-name: clash-rs
+            archive-ext: tar.gz
+            os: macos-latest
+            use-zigbuild: false
+            opt-level: "3"
+          - target: aarch64-apple-darwin
+            variant: standard
             extra-features: ""
             binary-name: clash-rs
             archive-ext: tar.gz
@@ -151,7 +227,15 @@ jobs:
             use-zigbuild: false
             opt-level: "3"
           - target: x86_64-pc-windows-gnu
-            variants: "minimal standard"
+            variant: minimal
+            extra-features: ""
+            binary-name: clash-rs.exe
+            archive-ext: zip
+            os: ubuntu-latest
+            use-zigbuild: true
+            opt-level: "3"
+          - target: x86_64-pc-windows-gnu
+            variant: standard
             extra-features: ""
             binary-name: clash-rs.exe
             archive-ext: zip
@@ -159,7 +243,15 @@ jobs:
             use-zigbuild: true
             opt-level: "3"
           - target: aarch64-pc-windows-gnullvm
-            variants: "minimal standard"
+            variant: minimal
+            extra-features: ""
+            binary-name: clash-rs.exe
+            archive-ext: zip
+            os: ubuntu-latest
+            use-zigbuild: true
+            opt-level: "3"
+          - target: aarch64-pc-windows-gnullvm
+            variant: standard
             extra-features: ""
             binary-name: clash-rs.exe
             archive-ext: zip
@@ -190,13 +282,22 @@ jobs:
         if: matrix.use-zigbuild
         uses: goto-bus-stop/setup-zig@v2
         with:
-          version: 0.16.0
+          version: ${{ env.ZIG_VERSION }}
 
       - name: Install cargo-zigbuild
         if: matrix.use-zigbuild
         uses: taiki-e/install-action@v2
         with:
-          tool: cargo-zigbuild@0.23.2
+          tool: cargo-zigbuild@${{ env.CARGO_ZIGBUILD_VERSION }}
+
+      - name: Cache Rust Dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: zigbuild-${{ matrix.target }}-${{ matrix.use-zigbuild && format('zig-{0}-cargo-zigbuild-{1}', env.ZIG_VERSION, env.CARGO_ZIGBUILD_VERSION) || 'native' }}
+          cmd-format: rustup run stable {0}
+          cache-bin: false
+          # Feature variants share dependencies; only one job saves each target.
+          save-if: ${{ matrix.variant == 'standard' || matrix.save-cache == true }}
 
       - name: Download Dashboard
         uses: actions/download-artifact@v8
@@ -211,38 +312,23 @@ jobs:
           name: ebpf-bytecode
           path: target/bpfel-unknown-none/release
 
-      - name: Build and Package Variants
+      - name: Build and Package Variant
         shell: bash
         env:
           TARGET: ${{ matrix.target }}
-          VARIANTS: ${{ matrix.variants }}
+          VARIANT: ${{ matrix.variant }}
           EXTRA_FEATURES: ${{ matrix.extra-features }}
           BINARY_NAME: ${{ matrix.binary-name }}
           ARCHIVE_EXT: ${{ matrix.archive-ext }}
           USE_ZIGBUILD: ${{ matrix.use-zigbuild }}
           CLASH_DASHBOARD_PREBUILT: "1"
-          CARGO_PROFILE_RELEASE_OPT_LEVEL: ${{ matrix.opt-level }}
-          # Match Zig's musl time_t ABI in boring's high-level libc API.
-          CARGO_TARGET_I686_UNKNOWN_LINUX_MUSL_RUSTFLAGS: "--cfg tokio_unstable --cfg libc_unstable_musl_v1_2_3"
-          CARGO_TARGET_ARMV7_UNKNOWN_LINUX_MUSLEABIHF_RUSTFLAGS: "--cfg tokio_unstable --cfg libc_unstable_musl_v1_2_3"
         run: bash scripts/build_zigbuild.sh
 
-      - name: Upload Minimal Archive
-        if: contains(format(' {0} ', matrix.variants), ' minimal ')
+      - name: Upload Archive
         uses: actions/upload-artifact@v7
         with:
-          name: clash-rs-minimal-${{ matrix.target }}
-          path: dist/minimal/clash-rs-minimal-${{ matrix.target }}.${{ matrix.archive-ext }}
-          retention-days: 1
-          compression-level: 0
-          if-no-files-found: error
-
-      - name: Upload Standard Archive
-        if: contains(format(' {0} ', matrix.variants), ' standard ')
-        uses: actions/upload-artifact@v7
-        with:
-          name: clash-rs-standard-${{ matrix.target }}
-          path: dist/standard/clash-rs-standard-${{ matrix.target }}.${{ matrix.archive-ext }}
+          name: clash-rs-${{ matrix.variant }}-${{ matrix.target }}
+          path: dist/${{ matrix.variant }}/clash-rs-${{ matrix.variant }}-${{ matrix.target }}.${{ matrix.archive-ext }}
           retention-days: 1
           compression-level: 0
           if-no-files-found: error
