@@ -6,8 +6,10 @@ use tokio::net::UdpSocket;
 use tokio::io::Interest;
 use crate::proxy::datagram::batch::{BatchResult, MAX_BATCH_PACKETS};
 #[cfg(target_os = "linux")]
-use std::{io, mem::zeroed, os::fd::AsRawFd, sync::Arc};
-#[cfg(target_os = "linux")]
+use std::{io, mem::zeroed, os::fd::AsRawFd};
+#[cfg(all(target_os = "linux", any(feature = "tproxy", feature = "ebpf", test)))]
+use std::sync::Arc;
+#[cfg(all(target_os = "linux", any(feature = "tproxy", feature = "ebpf", test)))]
 use crate::{proxy::datagram::UdpPacket, session::SocksAddr};
 #[cfg(target_os = "linux")]
 use socket2::SockAddr;
@@ -97,7 +99,7 @@ fn map_destination(destination: SocketAddr, ipv6: bool) -> SocketAddr {
 /// Source-bound sockets may serve multiple clients. Group only within the
 /// current bounded batch; preserve each socket's packet order and never wait
 /// for another packet to fill it. Borrowed payloads remain owned by the caller.
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", any(feature = "tproxy", feature = "ebpf", test)))]
 pub(crate) async fn send_replies(
     packets: &[UdpPacket],
     mut get_socket: impl FnMut(SocketAddr) -> io::Result<Arc<UdpSocket>>,

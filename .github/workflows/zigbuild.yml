@@ -1,0 +1,248 @@
+name: Shared Build (cargo-zigbuild)
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  build-dashboard:
+    name: Build Dashboard
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: "24"
+          cache: "npm"
+          cache-dependency-path: "clash-dashboard/package-lock.json"
+
+      - name: Build Dashboard
+        working-directory: clash-dashboard
+        run: |
+          npm ci
+          npm run build
+
+      - name: Upload Dashboard
+        uses: actions/upload-artifact@v7
+        with:
+          name: dashboard-dist
+          path: clash-dashboard/dist
+          retention-days: 1
+          if-no-files-found: error
+
+  build-ebpf:
+    name: Build eBPF Bytecode
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Nightly Rust (for eBPF)
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+
+      - name: Install bpf-linker
+        uses: taiki-e/install-action@bpf-linker
+
+      - name: Build eBPF Bytecode
+        working-directory: clash-ebpf-bpf
+        run: cargo +nightly build --release -Zbuild-std=core --target bpfel-unknown-none
+
+      - name: Upload eBPF Bytecode
+        uses: actions/upload-artifact@v7
+        with:
+          name: ebpf-bytecode
+          path: target/bpfel-unknown-none/release/clash-ebpf-bpf
+          retention-days: 1
+          if-no-files-found: error
+
+  build:
+    name: Build (${{ matrix.target }})
+    needs: [build-dashboard, build-ebpf]
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            variants: "minimal standard"
+            extra-features: "jemallocator,ebpf"
+            binary-name: clash-rs
+            archive-ext: tar.gz
+            os: ubuntu-latest
+            use-zigbuild: true
+            opt-level: "3"
+          - target: x86_64-unknown-linux-musl
+            variants: "minimal standard"
+            extra-features: "jemallocator,ebpf"
+            binary-name: clash-rs
+            archive-ext: tar.gz
+            os: ubuntu-latest
+            use-zigbuild: true
+            opt-level: "3"
+          - target: aarch64-unknown-linux-gnu
+            variants: "minimal standard"
+            extra-features: "jemallocator,ebpf"
+            binary-name: clash-rs
+            archive-ext: tar.gz
+            os: ubuntu-latest
+            use-zigbuild: true
+            opt-level: "3"
+          - target: aarch64-unknown-linux-musl
+            variants: "minimal standard"
+            extra-features: "jemallocator,ebpf"
+            binary-name: clash-rs
+            archive-ext: tar.gz
+            os: ubuntu-latest
+            use-zigbuild: true
+            opt-level: "s"
+          - target: armv7-unknown-linux-gnueabihf
+            variants: "minimal standard"
+            extra-features: "jemallocator,ebpf"
+            binary-name: clash-rs
+            archive-ext: tar.gz
+            os: ubuntu-latest
+            use-zigbuild: true
+            opt-level: "s"
+          - target: armv7-unknown-linux-musleabihf
+            variants: "minimal standard"
+            extra-features: "jemallocator"
+            binary-name: clash-rs
+            archive-ext: tar.gz
+            os: ubuntu-latest
+            use-zigbuild: true
+            opt-level: "s"
+          - target: riscv64gc-unknown-linux-musl
+            variants: "minimal"
+            extra-features: "jemallocator,ebpf"
+            binary-name: clash-rs
+            archive-ext: tar.gz
+            os: ubuntu-latest
+            use-zigbuild: true
+            opt-level: "s"
+          - target: i686-unknown-linux-musl
+            variants: "minimal"
+            extra-features: "jemallocator"
+            binary-name: clash-rs
+            archive-ext: tar.gz
+            os: ubuntu-latest
+            use-zigbuild: true
+            opt-level: "s"
+          - target: x86_64-apple-darwin
+            variants: "minimal standard"
+            extra-features: ""
+            binary-name: clash-rs
+            archive-ext: tar.gz
+            os: macos-latest
+            use-zigbuild: false
+            opt-level: "3"
+          - target: aarch64-apple-darwin
+            variants: "minimal standard"
+            extra-features: ""
+            binary-name: clash-rs
+            archive-ext: tar.gz
+            os: macos-latest
+            use-zigbuild: false
+            opt-level: "3"
+          - target: x86_64-pc-windows-gnu
+            variants: "minimal standard"
+            extra-features: ""
+            binary-name: clash-rs.exe
+            archive-ext: zip
+            os: ubuntu-latest
+            use-zigbuild: true
+            opt-level: "3"
+          - target: aarch64-pc-windows-gnullvm
+            variants: "minimal standard"
+            extra-features: ""
+            binary-name: clash-rs.exe
+            archive-ext: zip
+            os: ubuntu-latest
+            use-zigbuild: true
+            opt-level: "3"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install System Dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake libclang-dev nasm ninja-build zip
+
+      - name: Install System Dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: brew install cmake nasm ninja
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Setup Zig
+        if: matrix.use-zigbuild
+        uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Install cargo-zigbuild
+        if: matrix.use-zigbuild
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild@0.23.2
+
+      - name: Download Dashboard
+        uses: actions/download-artifact@v8
+        with:
+          name: dashboard-dist
+          path: clash-dashboard/dist
+
+      - name: Download eBPF Bytecode
+        if: contains(format(',{0},', matrix.extra-features), ',ebpf,')
+        uses: actions/download-artifact@v8
+        with:
+          name: ebpf-bytecode
+          path: target/bpfel-unknown-none/release
+
+      - name: Build and Package Variants
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          VARIANTS: ${{ matrix.variants }}
+          EXTRA_FEATURES: ${{ matrix.extra-features }}
+          BINARY_NAME: ${{ matrix.binary-name }}
+          ARCHIVE_EXT: ${{ matrix.archive-ext }}
+          USE_ZIGBUILD: ${{ matrix.use-zigbuild }}
+          CLASH_DASHBOARD_PREBUILT: "1"
+          CARGO_PROFILE_RELEASE_OPT_LEVEL: ${{ matrix.opt-level }}
+          # Match Zig's musl time_t ABI in boring's high-level libc API.
+          CARGO_TARGET_I686_UNKNOWN_LINUX_MUSL_RUSTFLAGS: "--cfg tokio_unstable --cfg libc_unstable_musl_v1_2_3"
+          CARGO_TARGET_ARMV7_UNKNOWN_LINUX_MUSLEABIHF_RUSTFLAGS: "--cfg tokio_unstable --cfg libc_unstable_musl_v1_2_3"
+        run: bash scripts/build_zigbuild.sh
+
+      - name: Upload Minimal Archive
+        if: contains(format(' {0} ', matrix.variants), ' minimal ')
+        uses: actions/upload-artifact@v7
+        with:
+          name: clash-rs-minimal-${{ matrix.target }}
+          path: dist/minimal/clash-rs-minimal-${{ matrix.target }}.${{ matrix.archive-ext }}
+          retention-days: 1
+          compression-level: 0
+          if-no-files-found: error
+
+      - name: Upload Standard Archive
+        if: contains(format(' {0} ', matrix.variants), ' standard ')
+        uses: actions/upload-artifact@v7
+        with:
+          name: clash-rs-standard-${{ matrix.target }}
+          path: dist/standard/clash-rs-standard-${{ matrix.target }}.${{ matrix.archive-ext }}
+          retention-days: 1
+          compression-level: 0
+          if-no-files-found: error

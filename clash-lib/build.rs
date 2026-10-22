@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 fn main() -> anyhow::Result<()> {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo::rustc-check-cfg=cfg(docker_test)");
@@ -80,7 +82,7 @@ fn build_dashboard() -> anyhow::Result<()> {
 
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR")?;
     let dashboard_dir =
-        std::path::PathBuf::from(&manifest_dir).join("../clash-dashboard");
+        PathBuf::from(&manifest_dir).join("../clash-dashboard");
 
     let dashboard_dir = dashboard_dir.canonicalize().map_err(|e| {
         anyhow::anyhow!(
@@ -88,6 +90,26 @@ fn build_dashboard() -> anyhow::Result<()> {
             dashboard_dir.display()
         )
     })?;
+
+    println!("cargo:rerun-if-env-changed=CLASH_DASHBOARD_PREBUILT");
+    if let Some(value) = std::env::var_os("CLASH_DASHBOARD_PREBUILT") {
+        anyhow::ensure!(value == "1", "CLASH_DASHBOARD_PREBUILT must be 1");
+        let dist_dir = dashboard_dir.join("dist");
+        let index = dist_dir.join("index.html");
+        anyhow::ensure!(
+            index.is_file() && index.metadata()?.len() > 0,
+            "Prebuilt dashboard index.html missing or empty at {}",
+            index.display()
+        );
+        let assets_dir = dist_dir.join("assets");
+        anyhow::ensure!(
+            assets_dir.is_dir() && assets_dir.read_dir()?.next().is_some(),
+            "Prebuilt dashboard assets missing or empty at {}",
+            assets_dir.display()
+        );
+        println!("cargo:rerun-if-changed={}", dist_dir.display());
+        return Ok(());
+    }
 
     // Watch source files so cargo reruns this script on any frontend change.
     let src_dir = dashboard_dir.join("src");
