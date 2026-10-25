@@ -1,5 +1,5 @@
 use crate::{
-    Packet, device::NetstackDevice, packet::IpPacket,
+    Packet, device::NetstackDevice, interface::new_interface, packet::IpPacket,
     ring_buffer::LockFreeRingBuffer, stack::IfaceEvent, tcp_stream::TcpStream,
 };
 use futures::task::AtomicWaker;
@@ -107,37 +107,8 @@ impl TcpListener {
         // the global bus that drives the iface polling
         let (iface_notifier, iface_notifier_rx) = mpsc::unbounded_channel();
 
-        let mut config =
-            smoltcp::iface::Config::new(smoltcp::wire::HardwareAddress::Ip);
-        config.random_seed = rand::random();
         let mut device = NetstackDevice::new(outbound, iface_notifier.clone());
-        let mut iface = smoltcp::iface::Interface::new(
-            config,
-            &mut device,
-            smoltcp::time::Instant::now(),
-        );
-        iface.set_any_ip(true);
-        iface.update_ip_addrs(|ip_addrs| {
-            let _ = ip_addrs.push(smoltcp::wire::IpCidr::new(
-                smoltcp::wire::Ipv4Address::new(10, 0, 0, 1).into(),
-                24,
-            ));
-            let _ = ip_addrs.push(smoltcp::wire::IpCidr::new(
-                smoltcp::wire::Ipv6Address::new(0x0, 0xfac, 0, 0, 0, 0, 0, 1).into(),
-                64,
-            ));
-        });
-
-        iface
-            .routes_mut()
-            .add_default_ipv4_route(smoltcp::wire::Ipv4Address::new(10, 0, 0, 1))
-            .expect("Failed to add default IPv4 route");
-        iface
-            .routes_mut()
-            .add_default_ipv6_route(smoltcp::wire::Ipv6Address::new(
-                0x0, 0xfac, 0, 0, 0, 0, 0, 1,
-            ))
-            .expect("Failed to add default IPv6 route");
+        let mut iface = new_interface(&mut device);
 
         let (socket_stream_emitter, socket_stream) =
             mpsc::unbounded_channel::<TcpStream>();
@@ -343,6 +314,7 @@ impl TcpListener {
             Arc<TcpStreamHandle>,
         > = HashMap::new();
         let mut next_poll = None;
+        let mut poll_requested = false;
 
         loop {
             trace!(
@@ -351,7 +323,7 @@ impl TcpListener {
                 socket_maps.len()
             );
 
-            let should_poll_now = match (next_poll, socket_maps.len()) {
+            let should_poll_now = poll_requested || match (next_poll, socket_maps.len()) {
                 (None, 0) => {
                     trace!("No sockets to poll, waiting indefinitely");
                     false
@@ -368,6 +340,7 @@ impl TcpListener {
             let now = smoltcp::time::Instant::now();
 
             if should_poll_now {
+                poll_requested = false;
                 trace!("Woke up to poll sockets");
 
                 // Drain any pending notifier events before calling iface.poll().
@@ -556,6 +529,8 @@ impl TcpListener {
                     Some(event) = notifier_rx.recv() => {
                         trace!("Received iface event, will poll sockets");
                         next_poll = None; // reset the next poll time
+                        // ICMP must run even when no TCP sockets exist.
+                        poll_requested = true;
                         match event {
                             IfaceEvent::TcpStream(stream) => {
                                 let socket_handle = sockets.add(stream.0);
@@ -579,6 +554,8 @@ impl TcpListener {
                     _ = tokio::time::sleep(next_poll.unwrap_or(Duration::MAX)) => {
                         trace!("Woke up to poll sockets after delay");
                         next_poll = None; // reset the next poll time
+                        // ICMP must run even when no TCP sockets exist.
+                        poll_requested = true;
                     }
                 }
             }

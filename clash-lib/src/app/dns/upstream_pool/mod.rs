@@ -23,7 +23,7 @@ pub use routes::TransportKey;
 pub use transports::{PooledTransport, TransportPool};
 pub use udp::UdpUpstream;
 
-use crate::app::net::OutboundInterface;
+use crate::app::net::{OutboundInterface, get_default_outbound_interface};
 use crate::app::dns::ClashResolver;
 use crate::app::dns::query::QueryContext;
 use crate::proxy::utils::OutboundNodeRegistry;
@@ -43,6 +43,11 @@ pub struct UpstreamPool {
 }
 
 impl UpstreamPool {
+    fn outbound_interface(&self, entry: &UpstreamEntry) -> Option<Arc<OutboundInterface>> {
+        entry.interface.clone().or_else(|| self.default_interface.clone())
+            .or_else(get_default_outbound_interface)
+    }
+
     pub fn new(
         entries: HashMap<String, UpstreamEntry>,
         outbounds: OutboundNodeRegistry,

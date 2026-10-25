@@ -15,6 +15,30 @@ use serde::{Deserialize, Serialize};
 use tracing::{trace, warn};
 
 use std::sync::Mutex;
+#[cfg(feature = "tun")]
+use std::sync::LazyLock;
+#[cfg(feature = "tun")]
+use tokio::sync::watch;
+
+#[cfg(feature = "tun")]
+static NETWORK_CHANGES: LazyLock<watch::Sender<u64>> =
+    LazyLock::new(|| watch::channel(0).0);
+
+#[cfg(feature = "tun")]
+pub(crate) fn subscribe_network_changes() -> watch::Receiver<u64> {
+    NETWORK_CHANGES.subscribe()
+}
+
+#[cfg(feature = "tun")]
+pub(crate) fn network_generation() -> u64 { *NETWORK_CHANGES.borrow() }
+
+#[cfg(feature = "tun")]
+pub(crate) fn notify_network_change() {
+    NETWORK_CHANGES.send_modify(|generation| *generation = generation.wrapping_add(1));
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) mod macos;
 
 static DEFAULT_OUTBOUND_INTERFACE: ArcSwapOption<OutboundInterface> =
     ArcSwapOption::const_empty();
@@ -52,6 +76,12 @@ pub fn get_default_outbound_interface() -> Option<Arc<OutboundInterface>> {
     DEFAULT_OUTBOUND_INTERFACE.load_full()
 }
 
+#[cfg(all(target_os = "macos", feature = "tun"))]
+pub(crate) fn get_explicit_outbound_interface() -> Option<Arc<OutboundInterface>> {
+    let state = WRITE_MUTEX.lock().unwrap();
+    state.is_explicit.then(|| DEFAULT_OUTBOUND_INTERFACE.load_full()).flatten()
+}
+
 
 /// Atomically compare and update the default outbound interface if it has changed.
 /// Returns true if updated, false if unchanged or if an explicit interface is configured.
@@ -65,12 +95,16 @@ pub fn update_default_outbound_interface_if_changed(
 
     let current = DEFAULT_OUTBOUND_INTERFACE.load();
     let changed = match current.as_deref() {
-        Some(old) => old.name != new_iface.name || old.index != new_iface.index,
+        Some(old) => old.name != new_iface.name || old.index != new_iface.index
+            || old.addr_v4 != new_iface.addr_v4 || old.addr_v6 != new_iface.addr_v6,
         None => true,
     };
 
     if changed {
         DEFAULT_OUTBOUND_INTERFACE.store(Some(Arc::new(new_iface)));
+        drop(state);
+        #[cfg(feature = "tun")]
+        notify_network_change();
         true
     } else {
         false
@@ -121,6 +155,7 @@ impl NetworkConfig {
         state.is_explicit = self.is_explicit;
         DEFAULT_OUTBOUND_INTERFACE.store(self.interface.clone());
         set_tun_somark(self.so_mark);
+        drop(state);
         trace!(
             "default outbound interface: {:?}, tun somark: {:?}",
             self.interface, self.so_mark
@@ -226,6 +261,15 @@ pub fn get_interface_by_name(name: &str) -> Option<OutboundInterface> {
 }
 
 pub fn get_outbound_interface() -> Option<OutboundInterface> {
+    #[cfg(target_os = "macos")]
+    return macos::default_interface();
+
+    #[cfg(not(target_os = "macos"))]
+    get_outbound_interface_by_priority()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn get_outbound_interface_by_priority() -> Option<OutboundInterface> {
     let now = std::time::Instant::now();
 
     let mut all_outbounds = network_interface::NetworkInterface::show()
@@ -255,8 +299,6 @@ pub fn get_outbound_interface() -> Option<OutboundInterface> {
         &["Ethernet", "Wi-Fi", "Tailscale"]
     } else if cfg!(target_os = "linux") {
         &["pppoe", "wan", "ppp", "eth", "wlp", "en", "Tailscale"]
-    } else if cfg!(target_os = "macos") {
-        &["en", "pdp_ip", "Tailscale"]
     } else {
         &["pppoe", "wan", "ppp", "eth", "en", "wlp"]
     };

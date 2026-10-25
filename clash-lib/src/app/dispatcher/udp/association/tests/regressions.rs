@@ -58,6 +58,8 @@ async fn old_worker_cannot_remove_slot_while_replacement_dial_is_pending() {
     let sess = session(30001);
     let slot = fixture.pool.slot(AssociationKey { outbound: outbound.identity(),
         source: sess.source, inbound: sess.typ, user: None, interface: None,
+        #[cfg(feature = "tun")]
+        network_generation: 0,
         mark: sess.so_mark, isolated: None }, &outbound);
     slot.generation.store(77, Ordering::Relaxed);
     let (outgoing, packets) = mpsc::channel(1);
@@ -88,6 +90,8 @@ async fn waiter_retries_a_slot_removed_before_it_acquires_the_dial_lock() {
     let sess = session(30001);
     let slot = fixture.pool.slot(AssociationKey { outbound: outbound.identity(),
         source: sess.source, inbound: sess.typ, user: None, interface: None,
+        #[cfg(feature = "tun")]
+        network_generation: 0,
         mark: sess.so_mark, isolated: None }, &outbound);
     let locked = slot.association.lock().await;
     let pool = fixture.pool.clone();

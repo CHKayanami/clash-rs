@@ -33,12 +33,14 @@ use crate::{
 use super::{Dispatcher, TrackerInfo};
 use super::dispatcher_impl::{decode_mode, effective_outbound_type, is_reject_error, reverse_lookup};
 use association::{AssociationConfig, ReplyActivity, UdpAssociationPool, UdpFlow, UdpConnectContext};
+#[cfg(feature = "tun")]
+use crate::{app::net::get_default_outbound_interface, session::Type};
 
 const DEFAULT_UDP_SESSION_TIMEOUT_SECS: u64 = 60;
 const UDP_CHANNEL_CAPACITY: usize = 64;
 const UDP_ROUTE_SHARDS: usize = 4;
 const MAX_PENDING_SNIFF_PACKETS: usize = 4;
-const MAX_CONNECTING_PACKETS: usize = 8;
+const MAX_CONNECTING_PACKETS: usize = 64;
 const MAX_CONNECTING_SESSIONS: usize = 256;
 /// Bound all resident UDP outbound state, not just concurrent connection
 /// attempts. A permit is retained by an established session until it is
@@ -162,6 +164,10 @@ fn make_udp_flow_session(
     inbound_user: Option<Arc<str>>,
 ) -> Session {
     let mut sess = sess_base.clone();
+    #[cfg(feature = "tun")]
+    if sess.typ == Type::Tun {
+        sess.iface = get_default_outbound_interface();
+    }
     sess.id = crate::session::generate_session_id();
     sess.source = src_addr;
     sess.destination = dest;

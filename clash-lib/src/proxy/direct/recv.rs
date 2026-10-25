@@ -107,11 +107,11 @@ pub(crate) fn recv_batch_map<M>(
                 let storage =
                     std::mem::replace(&mut addresses[i], SockAddrStorage::zeroed());
                 // SAFETY: recvmmsg initialized this sender's address and length.
-                let address = unsafe { SockAddr::new(storage, header.msg_namelen) }
-                    .as_socket()
-                    .ok_or_else(|| {
-                        io::Error::other("unexpected UDP sender address family")
-                    })?;
+                let Some(address) = (unsafe { SockAddr::new(storage, header.msg_namelen) })
+                    .as_socket() else {
+                    tracing::debug!("dropping UDP packet with unexpected sender address family");
+                    continue;
+                };
                 let len = messages[i].msg_len as usize;
                 let len = len.min(MAX_DATAGRAM_SIZE);
                 packets[i] = Some((i * MAX_DATAGRAM_SIZE, len, address));

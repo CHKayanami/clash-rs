@@ -1,5 +1,5 @@
 #![recursion_limit = "256"]
-#![feature(ip)]
+#![cfg_attr(not(target_os = "macos"), feature(ip))]
 #![feature(duration_millis_float)]
 
 use arc_swap::ArcSwap;

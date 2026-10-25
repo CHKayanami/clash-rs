@@ -78,7 +78,11 @@ pub(super) fn convert(mut c: def::Config) -> Result<config::Config, Error> {
 
     let explicit_mark = conf_routing_mark.or(conf_tun_mark).or(conf_ebpf_mark);
 
-    let default_mark = if ebpf_enabled {
+    // Automatic marks implement Linux policy routing. Other platforms bind
+    // outbound sockets to an interface instead and must not inherit SO_MARK.
+    let default_mark = if !cfg!(target_os = "linux") {
+        None
+    } else if ebpf_enabled {
         #[cfg(all(target_os = "linux", feature = "ebpf"))]
         {
             Some(clash_ebpf::DAE_BYPASS_MARK)
@@ -217,6 +221,18 @@ impl TryFrom<HashMap<String, Value>> for OutboundGroupProtocol {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn automatic_tun_mark_is_linux_only() {
+        for dns in ["dns:\n  enable: true\n  nameserver: [192.0.2.53]\n",
+            "dns2:\n  enable: true\n"] {
+            let yaml = format!("{dns}tun:\n  enable: true\n  auto-route: true\n");
+            let cfg = convert(yaml_serde::from_str(&yaml).unwrap()).unwrap();
+            let expected = cfg!(target_os = "linux").then_some(0x162);
+            assert_eq!(cfg.tun.so_mark, expected);
+            assert_eq!(cfg.dns.fw_mark, expected);
+        }
+    }
 
     #[test]
     fn test_mark_conflict_resolution_tun() {

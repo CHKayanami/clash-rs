@@ -1,5 +1,5 @@
 use crate::{stack::IfaceEvent, tcp_listener::TcpStreamHandle};
-use log::{error, trace};
+use log::trace;
 use std::{
     io::{Error, ErrorKind},
     net::SocketAddr,
@@ -32,7 +32,9 @@ impl Drop for TcpStream {
         self.handle.recv_waker.wake();
         self.handle.send_waker.wake();
         if let Err(e) = self.stack_notifier.send(IfaceEvent::TcpSocketClosed) {
-            error!("Failed to notify TCP socket closed: {e}");
+            // The listener may stop before aborted relay tasks drop their streams.
+            // Local close state and wakers above do not depend on this notice.
+            trace!("TCP stack stopped before socket close notification: {e}");
         }
     }
 }
@@ -53,7 +55,7 @@ impl TcpStream {
 
     fn notify_tcp_socket_ready(&self) {
         if let Err(e) = self.stack_notifier.send(IfaceEvent::TcpSocketReady) {
-            error!("Failed to notify TCP socket ready: {e}");
+            trace!("TCP stack stopped before socket ready notification: {e}");
         }
     }
 }
@@ -205,6 +207,24 @@ mod tests {
 
     fn noop_cx() -> Context<'static> {
         Context::from_waker(noop_waker_ref())
+    }
+
+    #[test]
+    fn drop_marks_stream_closed_after_stack_stops() {
+        let (stream, rx) = build_stream();
+        let handle = stream.handle.clone();
+        drop(rx);
+        drop(stream);
+        assert!(handle.socket_dropped.load(Ordering::Acquire));
+        assert!(handle.read_closed.load(Ordering::Acquire));
+        assert!(handle.write_closed.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn drop_notifies_running_stack() {
+        let (stream, mut rx) = build_stream();
+        drop(stream);
+        assert!(matches!(rx.try_recv(), Ok(IfaceEvent::TcpSocketClosed)));
     }
 
     #[test]

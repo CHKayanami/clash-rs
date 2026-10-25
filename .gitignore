@@ -54,6 +54,9 @@ dhat-heap.json
 mise.toml
 rust-analyzer.toml
 
+# Local manual test scripts and configurations
+/tests/manual/
+
 
 # Local eBPF benchmark reports, scripts and opt-in harness
 /clash-ebpf/benchmarks/

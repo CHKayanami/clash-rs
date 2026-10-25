@@ -2,8 +2,7 @@ use std::{
     collections::HashMap,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     sync::{
-        Arc,
-        atomic::{AtomicU16, AtomicU64, Ordering},
+        atomic::{AtomicU64, Ordering},
         LazyLock,
     },
     time::{Duration, Instant},
@@ -11,10 +10,9 @@ use std::{
 
 use parking_lot::RwLock;
 use smoltcp::wire::{
-    IpAddress, IpProtocol, IpVersion, Ipv4Address, Ipv4Packet, Ipv6Address, Ipv6Packet,
+    IpProtocol, IpVersion, Ipv4Address, Ipv4Packet, Ipv6Address, Ipv6Packet,
     TcpPacket,
 };
-use tracing::{debug, error, trace};
 
 static START_TIME: LazyLock<Instant> = LazyLock::new(Instant::now);
 
@@ -23,14 +21,14 @@ fn current_monotonic_us() -> u64 {
     START_TIME.elapsed().as_micros() as u64
 }
 
-pub struct TcpSession {
-    pub source: SocketAddr,
-    pub destination: SocketAddr,
-    pub last_active_us: AtomicU64,
+struct TcpSession {
+    source: SocketAddr,
+    destination: SocketAddr,
+    last_active_us: AtomicU64,
 }
 
 impl TcpSession {
-    pub fn new(source: SocketAddr, destination: SocketAddr) -> Self {
+    fn new(source: SocketAddr, destination: SocketAddr) -> Self {
         Self {
             source,
             destination,
@@ -39,114 +37,104 @@ impl TcpSession {
     }
 
     #[inline]
-    pub fn touch(&self) {
+    fn touch(&self) {
         self.last_active_us
             .store(current_monotonic_us(), Ordering::Relaxed);
     }
 
     #[inline]
-    pub fn last_active_us(&self) -> u64 {
+    fn last_active_us(&self) -> u64 {
         self.last_active_us.load(Ordering::Relaxed)
     }
 }
 
+const FIRST_NAT_PORT: u16 = 10000;
+const LAST_NAT_PORT: u16 = 65500;
+const NAT_PORT_COUNT: usize = (LAST_NAT_PORT - FIRST_NAT_PORT + 1) as usize;
+
+#[derive(Default)]
+struct NatState {
+    next_port: u16,
+    addresses: HashMap<(SocketAddr, SocketAddr), u16>,
+    ports: HashMap<u16, TcpSession>,
+}
+
 pub struct SystemTcpNat {
-    port_index: AtomicU16,
-    addr_map: RwLock<HashMap<(SocketAddr, SocketAddr), u16>>,
-    port_map: RwLock<HashMap<u16, Arc<TcpSession>>>,
+    // Both indexes form one invariant. A hot lookup takes one read lock;
+    // insert/expiry update both indexes under the same write lock.
+    state: RwLock<NatState>,
 }
 
 impl Default for SystemTcpNat {
-    fn default() -> Self {
-        Self::new()
-    }
+    fn default() -> Self { Self::new() }
 }
 
 impl SystemTcpNat {
     pub fn new() -> Self {
-        Self {
-            port_index: AtomicU16::new(10000),
-            addr_map: RwLock::new(HashMap::new()),
-            port_map: RwLock::new(HashMap::new()),
-        }
+        Self { state: RwLock::new(NatState {
+            next_port: FIRST_NAT_PORT, ..Default::default()
+        }) }
     }
 
-    pub fn lookup(&self, source: SocketAddr, destination: SocketAddr) -> u16 {
+    pub fn lookup(&self, source: SocketAddr, destination: SocketAddr) -> Option<u16> {
         let key = (source, destination);
         {
-            let addr_map = self.addr_map.read();
-            if let Some(&port) = addr_map.get(&key) {
-                let port_map = self.port_map.read();
-                if let Some(session) = port_map.get(&port) {
-                    session.touch();
-                    return port;
-                }
+            let state = self.state.read();
+            if let Some(port) = state.addresses.get(&key) {
+                state.ports[port].touch();
+                return Some(*port);
             }
         }
-
-        let mut addr_map = self.addr_map.write();
-        let mut port_map = self.port_map.write();
-
-        // Double check after acquiring write locks
-        if let Some(&port) = addr_map.get(&key) {
-            if let Some(session) = port_map.get(&port) {
-                session.touch();
-                return port;
-            }
+        let mut state = self.state.write();
+        if let Some(port) = state.addresses.get(&key) {
+            state.ports[port].touch();
+            return Some(*port);
         }
-
-        // Allocate a new port in range 10000..65535
-        let mut attempts = 0;
-        let mut port;
+        if state.ports.len() == NAT_PORT_COUNT { return None; }
         loop {
-            let next = self.port_index.fetch_add(1, Ordering::Relaxed);
-            port = if next < 10000 || next > 65500 {
-                self.port_index.store(10001, Ordering::Relaxed);
-                10000
-            } else {
-                next
-            };
-
-            if !port_map.contains_key(&port) {
-                break;
-            }
-            attempts += 1;
-            if attempts > 55535 {
-                // If completely full, evict oldest or replace
-                break;
-            }
+            let port = state.next_port;
+            state.next_port = if port == LAST_NAT_PORT { FIRST_NAT_PORT } else { port + 1 };
+            if state.ports.contains_key(&port) { continue; }
+            state.addresses.insert(key, port);
+            state.ports.insert(port, TcpSession::new(source, destination));
+            return Some(port);
         }
-
-        let session = Arc::new(TcpSession::new(source, destination));
-
-        addr_map.insert(key, port);
-        port_map.insert(port, session);
-        port
     }
 
-    pub fn lookup_back(&self, port: u16) -> Option<Arc<TcpSession>> {
-        let port_map = self.port_map.read();
-        let session = port_map.get(&port)?.clone();
+    pub fn lookup_back(&self, port: u16) -> Option<(SocketAddr, SocketAddr)> {
+        let state = self.state.read();
+        let session = state.ports.get(&port)?;
         session.touch();
-        Some(session)
+        Some((session.source, session.destination))
     }
 
     pub fn cleanup_timeout(&self, timeout: Duration) {
         let now = current_monotonic_us();
         let timeout_us = timeout.as_micros() as u64;
-        let mut addr_map = self.addr_map.write();
-        let mut port_map = self.port_map.write();
-
-        port_map.retain(|_port, session| {
-            let last = session.last_active_us();
-            if timeout.is_zero() || now.saturating_sub(last) > timeout_us {
-                addr_map.remove(&(session.source, session.destination));
+        let mut state = self.state.write();
+        let NatState { addresses, ports, .. } = &mut *state;
+        ports.retain(|_, session| {
+            let expired = now.saturating_sub(session.last_active_us()) > timeout_us;
+            if timeout.is_zero() || expired {
+                addresses.remove(&(session.source, session.destination));
                 false
-            } else {
-                true
-            }
+            } else { true }
         });
     }
+}
+
+// RFC 1624: adjust only changed header words. Payload bytes are never scanned,
+// and an invalid incoming checksum is not silently repaired by NAT.
+fn replace_checksum(checksum: u16, old: &[u8], new: &[u8]) -> u16 {
+    debug_assert_eq!(old.len(), new.len());
+    debug_assert_eq!(old.len() % 2, 0);
+    let mut sum = u32::from(!checksum);
+    for (old, new) in old.chunks_exact(2).zip(new.chunks_exact(2)) {
+        sum += u32::from(!u16::from_be_bytes([old[0], old[1]]));
+        sum += u32::from(u16::from_be_bytes([new[0], new[1]]));
+    }
+    while sum >> 16 != 0 { sum = (sum & 0xffff) + (sum >> 16); }
+    !(sum as u16)
 }
 
 /// Rewrites IPv4/TCP headers in-place for System NAT.
@@ -178,26 +166,27 @@ pub fn process_ipv4_tcp(
     let dst_ip: Ipv4Addr = ipv4.dst_addr().into();
     let src_port = tcp.src_port();
     let dst_port = tcp.dst_port();
+    let original_tcp_checksum = tcp.checksum();
 
     let server_v4_repr = Ipv4Address::from(server_addr);
     let client_v4_repr = Ipv4Address::from(client_addr);
 
     if src_ip == server_addr && src_port == listener_port {
         // Inbound: OS Kernel -> Client
-        let session = nat.lookup_back(dst_port)?;
-        let orig_dst_ip = match session.destination.ip() {
+        let (source, destination) = nat.lookup_back(dst_port)?;
+        let orig_dst_ip = match destination.ip() {
             IpAddr::V4(v4) => Ipv4Address::from(v4),
             _ => return None,
         };
-        let orig_src_ip = match session.source.ip() {
+        let orig_src_ip = match source.ip() {
             IpAddr::V4(v4) => Ipv4Address::from(v4),
             _ => return None,
         };
 
         ipv4.set_src_addr(orig_dst_ip);
-        tcp.set_src_port(session.destination.port());
+        tcp.set_src_port(destination.port());
         ipv4.set_dst_addr(orig_src_ip);
-        tcp.set_dst_port(session.source.port());
+        tcp.set_dst_port(source.port());
     } else {
         // Outbound: Client -> External Target
         if dst_ip.is_broadcast() || dst_ip.is_multicast() {
@@ -206,7 +195,7 @@ pub fn process_ipv4_tcp(
 
         let source = SocketAddr::new(IpAddr::V4(src_ip), src_port);
         let destination = SocketAddr::new(IpAddr::V4(dst_ip), dst_port);
-        let nat_port = nat.lookup(source, destination);
+        let nat_port = nat.lookup(source, destination)?;
 
         ipv4.set_src_addr(client_v4_repr);
         tcp.set_src_port(nat_port);
@@ -214,11 +203,12 @@ pub fn process_ipv4_tcp(
         tcp.set_dst_port(listener_port);
     }
 
-    // Recompute IP & TCP checksums
-    ipv4.fill_checksum();
-    let src_addr_repr = IpAddress::Ipv4(ipv4.src_addr());
-    let dst_addr_repr = IpAddress::Ipv4(ipv4.dst_addr());
-    tcp.fill_checksum(&src_addr_repr, &dst_addr_repr);
+    let checksum = replace_checksum(ipv4.checksum(), &src_ip.octets(), &ipv4.src_addr().octets());
+    ipv4.set_checksum(replace_checksum(checksum, &dst_ip.octets(), &ipv4.dst_addr().octets()));
+    let checksum = replace_checksum(original_tcp_checksum, &src_ip.octets(), &ipv4.src_addr().octets());
+    let checksum = replace_checksum(checksum, &dst_ip.octets(), &ipv4.dst_addr().octets());
+    let checksum = replace_checksum(checksum, &src_port.to_be_bytes(), &tcp.src_port().to_be_bytes());
+    tcp.set_checksum(replace_checksum(checksum, &dst_port.to_be_bytes(), &tcp.dst_port().to_be_bytes()));
 
     Some(true)
 }
@@ -252,26 +242,27 @@ pub fn process_ipv6_tcp(
     let dst_ip: Ipv6Addr = ipv6.dst_addr().into();
     let src_port = tcp.src_port();
     let dst_port = tcp.dst_port();
+    let original_tcp_checksum = tcp.checksum();
 
     let server_v6_repr = Ipv6Address::from(server_addr);
     let client_v6_repr = Ipv6Address::from(client_addr);
 
     if src_ip == server_addr && src_port == listener_port6 {
         // Inbound: OS Kernel -> Client
-        let session = nat.lookup_back(dst_port)?;
-        let orig_dst_ip = match session.destination.ip() {
+        let (source, destination) = nat.lookup_back(dst_port)?;
+        let orig_dst_ip = match destination.ip() {
             IpAddr::V6(v6) => Ipv6Address::from(v6),
             _ => return None,
         };
-        let orig_src_ip = match session.source.ip() {
+        let orig_src_ip = match source.ip() {
             IpAddr::V6(v6) => Ipv6Address::from(v6),
             _ => return None,
         };
 
         ipv6.set_src_addr(orig_dst_ip);
-        tcp.set_src_port(session.destination.port());
+        tcp.set_src_port(destination.port());
         ipv6.set_dst_addr(orig_src_ip);
-        tcp.set_dst_port(session.source.port());
+        tcp.set_dst_port(source.port());
     } else {
         // Outbound: Client -> External Target
         if dst_ip.is_multicast() {
@@ -280,7 +271,7 @@ pub fn process_ipv6_tcp(
 
         let source = SocketAddr::new(IpAddr::V6(src_ip), src_port);
         let destination = SocketAddr::new(IpAddr::V6(dst_ip), dst_port);
-        let nat_port = nat.lookup(source, destination);
+        let nat_port = nat.lookup(source, destination)?;
 
         ipv6.set_src_addr(client_v6_repr);
         tcp.set_src_port(nat_port);
@@ -288,10 +279,10 @@ pub fn process_ipv6_tcp(
         tcp.set_dst_port(listener_port6);
     }
 
-    // Recompute TCP checksum
-    let src_addr_repr = IpAddress::Ipv6(ipv6.src_addr());
-    let dst_addr_repr = IpAddress::Ipv6(ipv6.dst_addr());
-    tcp.fill_checksum(&src_addr_repr, &dst_addr_repr);
+    let checksum = replace_checksum(original_tcp_checksum, &src_ip.octets(), &ipv6.src_addr().octets());
+    let checksum = replace_checksum(checksum, &dst_ip.octets(), &ipv6.dst_addr().octets());
+    let checksum = replace_checksum(checksum, &src_port.to_be_bytes(), &tcp.src_port().to_be_bytes());
+    tcp.set_checksum(replace_checksum(checksum, &dst_port.to_be_bytes(), &tcp.dst_port().to_be_bytes()));
 
     Some(true)
 }
@@ -315,201 +306,6 @@ pub fn process_system_tcp_packet(
     }
 }
 
-/// Starts the system TCP listener loop for `stack: system`.
-pub async fn start_system_tcp_listener(
-    tcp_listener: tokio::net::TcpListener,
-    nat: Arc<SystemTcpNat>,
-    dispatcher: Arc<crate::app::dispatcher::Dispatcher>,
-    resolver: crate::app::dns::ThreadSafeDNSResolver,
-    so_mark: Option<u32>,
-    dns_hijack: crate::config::internal::config::DnsHijack,
-    strict_route: bool,
-    exclude_routes: Arc<Vec<ipnet::IpNet>>,
-) {
-    loop {
-        match tcp_listener.accept().await {
-            Ok((stream, peer_addr)) => {
-                let nat_port = peer_addr.port();
-                let Some(session) = nat.lookup_back(nat_port) else {
-                    debug!("system stack: unknown incoming TCP connection from {peer_addr}");
-                    continue;
-                };
-
-                let source = session.source;
-                let destination = session.destination;
-                trace!("system stack: accepted connection {source} -> {destination}");
-
-                let dispatcher = dispatcher.clone();
-                let resolver = resolver.clone();
-                let dns_hijack = dns_hijack.clone();
-                let exclude_routes = exclude_routes.clone();
-
-                tokio::spawn(async move {
-                    crate::proxy::tun::stream::handle_inbound_stream(
-                        stream,
-                        source,
-                        destination,
-                        dispatcher,
-                        resolver,
-                        so_mark,
-                        dns_hijack,
-                        strict_route,
-                        exclude_routes,
-                    )
-                    .await;
-                });
-            }
-            Err(e) => {
-                error!("system stack: TCP listener accept error: {e}");
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-        }
-    }
-}
-
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use smoltcp::wire::{IpProtocol, Ipv4Address, Ipv4Packet, Ipv4Repr, TcpControl, TcpPacket, TcpRepr};
-
-    #[test]
-    fn test_system_tcp_nat_lookup() {
-        let nat = SystemTcpNat::new();
-        let src: SocketAddr = "192.168.1.100:54321".parse().unwrap();
-        let dst: SocketAddr = "8.8.8.8:443".parse().unwrap();
-
-        let port1 = nat.lookup(src, dst);
-        assert!(port1 >= 10000);
-
-        let port2 = nat.lookup(src, dst);
-        assert_eq!(port1, port2);
-
-        let session = nat.lookup_back(port1).expect("session must exist");
-        assert_eq!(session.source, src);
-        assert_eq!(session.destination, dst);
-    }
-
-    #[test]
-    fn test_system_ipv4_tcp_bidirectional_rewrite() {
-        let nat = SystemTcpNat::new();
-        let server_addr = Ipv4Addr::new(198, 18, 0, 1);
-        let client_addr = Ipv4Addr::new(198, 18, 0, 2);
-        let listener_port = 54321;
-
-        let client_src = Ipv4Address::new(10, 0, 0, 5);
-        let target_dst = Ipv4Address::new(1, 1, 1, 1);
-        let client_port = 12345;
-        let target_port = 80;
-
-        // 1. Build an outbound client -> target TCP SYN packet
-        let mut packet = vec![0u8; 40];
-        let ip_repr = Ipv4Repr {
-            src_addr: client_src,
-            dst_addr: target_dst,
-            next_header: IpProtocol::Tcp,
-            payload_len: 20,
-            hop_limit: 64,
-        };
-        let tcp_repr = TcpRepr {
-            src_port: client_port,
-            dst_port: target_port,
-            control: TcpControl::Syn,
-            seq_number: smoltcp::wire::TcpSeqNumber(100),
-            ack_number: None,
-            window_len: 65535,
-            window_scale: None,
-            max_seg_size: None,
-            sack_permitted: false,
-            sack_ranges: [None, None, None],
-            timestamp: None,
-            payload: &[],
-        };
-
-        ip_repr.emit(&mut Ipv4Packet::new_unchecked(&mut packet[..20]), &smoltcp::phy::ChecksumCapabilities::default());
-        tcp_repr.emit(
-            &mut TcpPacket::new_unchecked(&mut packet[20..]),
-            &IpAddress::Ipv4(client_src),
-            &IpAddress::Ipv4(target_dst),
-            &smoltcp::phy::ChecksumCapabilities::default(),
-        );
-
-        // 2. Process outbound packet (Client -> Target)
-        let res = process_ipv4_tcp(&mut packet, server_addr, client_addr, listener_port, &nat);
-        assert_eq!(res, Some(true));
-
-        let rewritten_ip = Ipv4Packet::new_checked(&packet[..]).unwrap();
-        let rewritten_tcp = TcpPacket::new_checked(&packet[20..]).unwrap();
-
-        assert_eq!(rewritten_ip.src_addr(), Ipv4Address::from(client_addr));
-        assert_eq!(rewritten_ip.dst_addr(), Ipv4Address::from(server_addr));
-        let nat_port = rewritten_tcp.src_port();
-        assert_eq!(rewritten_tcp.dst_port(), listener_port);
-        assert!(nat_port >= 10000);
-
-        // 3. Build return packet from OS kernel (Server -> Client nat_port)
-        let mut reply_packet = vec![0u8; 40];
-        let reply_ip_repr = Ipv4Repr {
-            src_addr: Ipv4Address::from(server_addr),
-            dst_addr: Ipv4Address::from(client_addr),
-            next_header: IpProtocol::Tcp,
-            payload_len: 20,
-            hop_limit: 64,
-        };
-        let reply_tcp_repr = TcpRepr {
-            src_port: listener_port,
-            dst_port: nat_port,
-            control: TcpControl::Syn,
-            seq_number: smoltcp::wire::TcpSeqNumber(500),
-            ack_number: Some(smoltcp::wire::TcpSeqNumber(101)),
-            window_len: 65535,
-            window_scale: None,
-            max_seg_size: None,
-            sack_permitted: false,
-            sack_ranges: [None, None, None],
-            timestamp: None,
-            payload: &[],
-        };
-
-        reply_ip_repr.emit(&mut Ipv4Packet::new_unchecked(&mut reply_packet[..20]), &smoltcp::phy::ChecksumCapabilities::default());
-        reply_tcp_repr.emit(
-            &mut TcpPacket::new_unchecked(&mut reply_packet[20..]),
-            &IpAddress::Ipv4(Ipv4Address::from(server_addr)),
-            &IpAddress::Ipv4(Ipv4Address::from(client_addr)),
-            &smoltcp::phy::ChecksumCapabilities::default(),
-        );
-
-        // 4. Process return packet (Server -> Client)
-        let res_reply = process_ipv4_tcp(&mut reply_packet, server_addr, client_addr, listener_port, &nat);
-        assert_eq!(res_reply, Some(true));
-
-        let restored_ip = Ipv4Packet::new_checked(&reply_packet[..]).unwrap();
-        let restored_tcp = TcpPacket::new_checked(&reply_packet[20..]).unwrap();
-
-        assert_eq!(restored_ip.src_addr(), target_dst);
-        assert_eq!(restored_ip.dst_addr(), client_src);
-        assert_eq!(restored_tcp.src_port(), target_port);
-        assert_eq!(restored_tcp.dst_port(), client_port);
-    }
-
-    #[test]
-    fn test_system_tcp_nat_different_destinations() {
-        let nat = SystemTcpNat::new();
-        let src: SocketAddr = "192.168.1.100:54321".parse().unwrap();
-        let dst1: SocketAddr = "8.8.8.8:443".parse().unwrap();
-        let dst2: SocketAddr = "1.1.1.1:443".parse().unwrap();
-
-        let port1 = nat.lookup(src, dst1);
-        let port2 = nat.lookup(src, dst2);
-        assert_ne!(port1, port2, "different destinations must not share the same nat port");
-
-        let session1 = nat.lookup_back(port1).expect("session1 must exist");
-        let session2 = nat.lookup_back(port2).expect("session2 must exist");
-        assert_eq!(session1.destination, dst1);
-        assert_eq!(session2.destination, dst2);
-
-        // Verify cleanup removes specific 4-tuple
-        nat.cleanup_timeout(Duration::from_secs(0));
-        assert!(nat.lookup_back(port1).is_none());
-        assert!(nat.lookup_back(port2).is_none());
-    }
-}
+#[path = "system_stack_tests.rs"]
+mod tests;

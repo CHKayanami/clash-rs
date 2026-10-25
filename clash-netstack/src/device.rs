@@ -75,6 +75,41 @@ impl Device for NetstackDevice {
     }
 }
 
+/// One synchronous ICMP exchange. The packet never enters an unbounded queue;
+/// reserving output capacity first keeps receive/transmit token ownership paired.
+pub(crate) struct SinglePacketDevice<'a> {
+    packet: Option<Packet>,
+    outbound: &'a mpsc::Sender<Packet>,
+}
+
+impl<'a> SinglePacketDevice<'a> {
+    pub(crate) fn new(packet: Option<Packet>, outbound: &'a mpsc::Sender<Packet>) -> Self {
+        Self { packet, outbound }
+    }
+}
+
+impl Device for SinglePacketDevice<'_> {
+    type RxToken<'a> = RxTokenImpl where Self: 'a;
+    type TxToken<'a> = TxTokenImpl<'a> where Self: 'a;
+
+    fn receive(&mut self, _timestamp: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
+        let permit = self.outbound.try_reserve().ok()?;
+        let packet = self.packet.take()?;
+        Some((RxTokenImpl { packet }, TxTokenImpl { tx_sender: permit }))
+    }
+
+    fn transmit(&mut self, _timestamp: Instant) -> Option<Self::TxToken<'_>> {
+        self.outbound.try_reserve().ok().map(|permit| TxTokenImpl { tx_sender: permit })
+    }
+
+    fn capabilities(&self) -> DeviceCapabilities {
+        let mut capabilities = DeviceCapabilities::default();
+        capabilities.max_transmission_unit = 1500;
+        capabilities.medium = Medium::Ip;
+        capabilities
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

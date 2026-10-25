@@ -1,5 +1,6 @@
 mod debug;
 mod device;
+mod interface;
 mod packet;
 mod ring_buffer;
 mod stack;

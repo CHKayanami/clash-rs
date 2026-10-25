@@ -5,12 +5,16 @@ use crate::{
         dns::{ThreadSafeDNSResolver, exchange_with_resolver},
         net::get_default_outbound_interface,
     },
-    // common::errors::new_io_error,
     proxy::datagram::UdpPacket,
     session::{Network, Session, Type},
 };
 use std::sync::Arc;
 use tracing::{debug, trace, warn};
+use tokio::task::JoinSet;
+use tokio_util::task::AbortOnDropHandle;
+use super::device_io::DEVICE_BATCH;
+
+const MAX_PENDING_DNS: usize = 256;
 
 pub(crate) async fn handle_inbound_datagram(
     socket: watfaq_netstack::UdpSocket,
@@ -59,29 +63,40 @@ pub(crate) async fn handle_inbound_datagram(
         .await;
 
     // dispatcher -> tun
-    let fut1 = tokio::spawn(async move {
-        let mut reply_batch = Vec::with_capacity(32);
-        let mut packets = Vec::with_capacity(32);
-        while l_rx.recv_many(&mut reply_batch, 32).await > 0 {
+    let mut fut1 = AbortOnDropHandle::new(tokio::spawn(async move {
+        let mut reply_batch = Vec::with_capacity(DEVICE_BATCH);
+        let mut packets = Vec::with_capacity(DEVICE_BATCH);
+        while l_rx.recv_many(&mut reply_batch, DEVICE_BATCH).await > 0 {
             for packet in reply_batch.drain(..) {
                 let (Some(source), Some(destination)) = (
                     packet.src_addr.try_into_socket_addr(), packet.dst_addr.try_into_socket_addr(),
                 ) else { warn!("tun drop reply with non-IP address"); continue; };
                 packets.push((packet.data, source, destination).into());
             }
-            if let Err(error) = ls.send_batch(&packets) {
-                warn!("failed to send UDP batch to netstack: {error}");
+            match ls.send_batch(&packets) {
+                Ok(sent) if sent < packets.len() => {
+                    debug!("TUN UDP reply queue full: submitted {sent}/{} packets", packets.len());
+                }
+                Err(error) => warn!("failed to send UDP batch to netstack: {error}"),
+                _ => {}
             }
             packets.clear();
         }
-    });
+    }));
 
     // tun -> dispatcher
-    let fut2 = tokio::spawn(async move {
-        let mut batch = Vec::with_capacity(32);
+    let mut fut2 = AbortOnDropHandle::new(tokio::spawn(async move {
+        let mut batch = Vec::with_capacity(DEVICE_BATCH);
+        let mut dns_queries = JoinSet::new();
         'outer: loop {
             batch.clear();
-            let count = lr.recv_many(&mut batch, 32).await;
+            let count = tokio::select! {
+                count = lr.recv_many(&mut batch, DEVICE_BATCH) => count,
+                Some(result) = dns_queries.join_next(), if !dns_queries.is_empty() => {
+                    if let Err(error) = result { warn!("TUN DNS task failed: {error}"); }
+                    continue;
+                }
+            };
             if count == 0 {
                 break 'outer;
             }
@@ -117,11 +132,20 @@ pub(crate) async fn handle_inbound_datagram(
 
                 if dns_hijack.is_hijacked(Network::Udp, &remote_addr) {
                     trace!("got dns packet: {:?}, returning from Clash DNS server", pkt);
+                    // Bound admission, not only resolver execution: otherwise
+                    // queued DNS tasks can retain unlimited packet buffers.
+                    while let Some(result) = dns_queries.try_join_next() {
+                        if let Err(error) = result { warn!("TUN DNS task failed: {error}"); }
+                    }
+                    if dns_queries.len() >= MAX_PENDING_DNS {
+                        debug!("TUN DNS concurrency limit reached, dropping query");
+                        continue 'read_packet;
+                    }
                     let mut ls_dns = ls_dns.clone();
                     let resolver = resolver_dns.clone();
-                    tokio::spawn(async move {
+                    dns_queries.spawn(async move {
                         match exchange_with_resolver(
-                            &resolver, pkt.data.clone(),
+                            &resolver, pkt.data,
                             IngressProfile::Udp { advertised_size: 512 },
                             Some(local_addr.ip()),
                         ).await {
@@ -156,11 +180,20 @@ pub(crate) async fn handle_inbound_datagram(
         }
 
         closer.send(0).ok();
-    });
+    }));
 
     debug!("tun UDP ready");
 
-    let _ = futures::future::join(fut1, fut2).await;
+    // If one direction stops, dropping the guards cancels the other and its
+    // owned DNS tasks, releasing channels and packet buffers on shutdown.
+    tokio::select! {
+        result = &mut fut1 => {
+            if let Err(error) = result { warn!("TUN UDP reply task failed: {error}"); }
+        }
+        result = &mut fut2 => {
+            if let Err(error) = result { warn!("TUN UDP ingress task failed: {error}"); }
+        }
+    }
 }
 
 pub use crate::proxy::datagram::ChannelDatagram as TunDatagram;

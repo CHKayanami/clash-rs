@@ -84,10 +84,7 @@ impl UpstreamPool {
             query_timeout: self.dns_query_timeout,
             dial_timeout: self.dns_dial_timeout,
             outbound,
-            iface: entry
-                .interface
-                .clone()
-                .or_else(|| self.default_interface.clone()),
+            iface: self.outbound_interface(entry),
             so_mark: self.fw_mark,
             resolver: self.bootstrap_resolver.clone(),
         }
@@ -188,6 +185,40 @@ mod tests {
     use std::sync::atomic::Ordering;
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "changes global network configuration; run this test in isolation"]
+    fn dns_inherits_the_current_runtime_interface() {
+        use crate::app::net::{NetworkConfig, OutboundInterface, get_default_outbound_interface};
+        use crate::app::dns::config::Config as DnsConfig;
+
+        struct Restore(NetworkConfig);
+        impl Drop for Restore {
+            fn drop(&mut self) { self.0.apply(); }
+        }
+        let _restore = Restore(NetworkConfig::capture());
+        NetworkConfig::resolve(None, false, None).apply();
+        let nameservers = DnsConfig::parse_nameserver(&["192.0.2.53".to_owned()]).unwrap();
+        let mut entry = UpstreamEntry::from_nameserver(&nameservers[0], None).unwrap();
+        // Resolvers are prepared before runtime network configuration is
+        // committed. Selection must happen at dial time, not pool creation.
+        let mut pool = UpstreamPool::new(HashMap::new(),
+            Arc::new(ArcSwap::from_pointee(HashMap::new())), None, None, None, None);
+        assert!(pool.dial_context(&entry, None).iface.is_none());
+        NetworkConfig::resolve(Some("lo0"), false, None).apply();
+        let runtime = get_default_outbound_interface().unwrap();
+        assert_eq!(runtime.name, "lo0");
+        assert!(Arc::ptr_eq(&pool.dial_context(&entry, None).iface.unwrap(), &runtime));
+
+        let configured = Arc::new(OutboundInterface {
+            name: "configured".to_owned(), ..Default::default()
+        });
+        Arc::get_mut(&mut pool).unwrap().default_interface = Some(configured.clone());
+        assert!(Arc::ptr_eq(&pool.dial_context(&entry, None).iface.unwrap(), &configured));
+        entry.interface = Some(runtime.clone());
+        assert!(Arc::ptr_eq(&pool.dial_context(&entry, None).iface.unwrap(), &runtime));
+    }
 
     #[tokio::test]
     async fn fixed_and_override_routes_reuse_separate_connections_and_close() {

@@ -455,7 +455,7 @@ async fn selector_reject_is_detected_before_connecting() {
     assert_eq!(effective_outbound_type(&reject).await, OutboundType::Reject);
 }
 
-async fn test_dispatcher(proto: OutboundType) -> Arc<Dispatcher> {
+pub(super) async fn test_dispatcher(proto: OutboundType) -> Arc<Dispatcher> {
     let direct_handler: OutboundNode =
         OutboundNode::protocol(Arc::new(DirectHandler::new("DIRECT")));
     test_dispatcher_with_leaf(proto, direct_handler).await
@@ -1074,3 +1074,37 @@ async fn check_busy_route_control(wide: bool) {
 impl DatagramBatch for BackpressuredDatagram {}
 
 impl DatagramBatch for MockInboundDatagram {}
+
+#[cfg(feature = "tun")]
+#[tokio::test]
+#[serial_test::serial(tun_network_changes)]
+async fn tun_network_change_reconnects_an_existing_udp_route() {
+    use crate::app::net::notify_network_change;
+    let dispatcher = test_dispatcher(OutboundType::Direct).await;
+    let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let destination = SocksAddr::Ip(server.local_addr().unwrap());
+    let source: SocketAddr = "127.0.0.1:54329".parse().unwrap();
+    let sess = Session { network: Network::Udp, typ: Type::Tun, source,
+        destination: destination.clone(), udp_timeout: Some(Duration::from_secs(60)),
+        ..Default::default() };
+    let (client_tx, inbound_rx) = tokio::sync::mpsc::channel(4);
+    let (inbound_tx, mut client_rx) = tokio::sync::mpsc::channel(4);
+    let closer = dispatcher.dispatch_datagram(sess,
+        Box::new(MockInboundDatagram { rx: inbound_rx, tx: inbound_tx })).await;
+    let mut buffer = [0; 64];
+    client_tx.send(UdpPacket::new(Bytes::from_static(b"before"),
+        source.into(), destination.clone())).await.unwrap();
+    let (_, first) = tokio::time::timeout(Duration::from_secs(2), server.recv_from(&mut buffer))
+        .await.unwrap().unwrap();
+    notify_network_change();
+    client_tx.send(UdpPacket::new(Bytes::from_static(b"after"),
+        source.into(), destination)).await.unwrap();
+    let (_, second) = tokio::time::timeout(Duration::from_secs(2), server.recv_from(&mut buffer))
+        .await.unwrap().unwrap();
+    assert_ne!(first, second, "old physical UDP socket must not be reused");
+    server.send_to(b"reply", second).await.unwrap();
+    let reply = tokio::time::timeout(Duration::from_secs(2), client_rx.recv())
+        .await.unwrap().unwrap();
+    assert_eq!(&reply.data[..], b"reply");
+    let _ = closer.send(0);
+}

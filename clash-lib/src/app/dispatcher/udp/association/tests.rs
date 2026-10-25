@@ -504,6 +504,8 @@ async fn shared_routes_can_register_before_an_earlier_registration_is_acknowledg
     let first = session(30001);
     let slot = fixture.pool.slot(AssociationKey { outbound: outbound.identity(),
         source: first.source, inbound: first.typ, user: None, interface: None,
+        #[cfg(feature = "tun")]
+        network_generation: 0,
         mark: first.so_mark, isolated: None }, &outbound);
     let (outgoing, _packets) = mpsc::channel(64);
     let (control, mut commands) = mpsc::channel(64);
@@ -608,4 +610,20 @@ async fn native_batch_preserves_flow_statistics_after_a_failed_datagram() {
         assert_eq!(stats["batch-user"].upload, 8);
         assert_eq!(stats["batch-user"].download, 8);
     }).await.unwrap();
+}
+
+#[cfg(feature = "tun")]
+#[tokio::test]
+#[serial_test::serial(tun_network_changes)]
+async fn tun_network_generation_prevents_reusing_old_physical_associations() {
+    use crate::app::net::notify_network_change;
+    let fixture = Fixture::new(Duration::from_secs(60));
+    let (outbound, count, _servers) = outbound();
+    let mut sess = session(30001);
+    sess.typ = Type::Tun;
+    let first = fixture.connect(&outbound, &sess).await;
+    notify_network_change();
+    let second = fixture.connect(&outbound, &sess).await;
+    assert_eq!(count.load(Ordering::SeqCst), 2);
+    assert!(!Arc::ptr_eq(&first.association, &second.association));
 }

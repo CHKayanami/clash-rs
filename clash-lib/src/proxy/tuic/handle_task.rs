@@ -1,7 +1,7 @@
 use crate::{proxy::datagram::UdpPacket, session::SocksAddr as ClashSocksAddr};
 use anyhow::{Result, anyhow};
 use bytes::Bytes;
-use std::{sync::Arc, time::Duration};
+use std::{io, sync::Arc, time::Duration};
 
 use super::{
     proto::{
@@ -107,16 +107,19 @@ impl TuicConnection {
 
     pub fn send_native_packet(
         &self, pkt: &[u8], addr: Address, assoc_id: u16, max_size: usize,
-    ) -> Result<()> {
+    ) -> io::Result<()> {
         let pkt_id = self.get_next_pkt_id();
-        let frames = packet_fragments(assoc_id, pkt_id, &addr, pkt, max_size)?;
+        // Constructor validation happens before any fragment is submitted.
+        // Iterator or QUIC failures remain terminal: earlier fragments may exist.
+        let frames = packet_fragments(assoc_id, pkt_id, &addr, pkt, max_size)
+            .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
         for frame in frames {
-            let frame = frame?;
+            let frame = frame.map_err(io::Error::other)?;
             self.conn.send_datagram(frame).map_err(|err| {
                 tracing::warn!(
                     "[udp] [{assoc_id:#06x}] [to-native] to {addr}: {err}"
                 );
-                anyhow!(err)
+                io::Error::other(err)
             })?;
         }
         Ok(())

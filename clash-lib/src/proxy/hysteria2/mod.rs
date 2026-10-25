@@ -46,6 +46,7 @@ use quinn_proto::TransportConfig;
 use std::{
     collections::HashMap,
     fmt::{Debug, Formatter},
+    io::{Error as IoError, ErrorKind},
     net::SocketAddr,
     num::ParseIntError,
     path::PathBuf,
@@ -759,7 +760,7 @@ impl HysteriaConnection {
         max_frag_size: usize,
     ) -> std::io::Result<()> {
         let fragments = Fragments::new(session_id, pkt_id, addr, max_frag_size, pkt)
-            .map_err(|e| std::io::Error::other(e.to_string()))?;
+            .map_err(|e| IoError::new(ErrorKind::InvalidInput, e.to_string()))?;
         let mut frag_count = 0;
         for frag in fragments {
             frag_count += 1;

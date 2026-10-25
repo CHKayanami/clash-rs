@@ -5,13 +5,6 @@ use windows::add_route;
 #[cfg(windows)]
 pub use windows::maybe_routes_clean_up;
 
-#[cfg(target_os = "macos")]
-mod macos;
-#[cfg(target_os = "macos")]
-use macos::add_route;
-#[cfg(target_os = "macos")]
-pub use macos::maybe_routes_clean_up;
-
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "linux")]
@@ -19,11 +12,11 @@ use linux::add_route;
 #[cfg(target_os = "linux")]
 pub use linux::maybe_routes_clean_up;
 
-#[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
+#[cfg(not(any(windows, target_os = "linux")))]
 mod other;
-#[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
+#[cfg(not(any(windows, target_os = "linux")))]
 use other::add_route;
-#[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
+#[cfg(not(any(windows, target_os = "linux")))]
 pub use other::maybe_routes_clean_up;
 
 use tracing::warn;
@@ -102,10 +95,6 @@ pub fn maybe_add_routes(cfg: &TunConfig, tun_name: &str) -> std::io::Result<()> 
                                 tracing::error!("failed to set dns due to:{}", e)
                             });
                     }
-                }
-                #[cfg(target_os = "macos")]
-                {
-                    macos::maybe_add_default_route()?;
                 }
             }
             #[cfg(target_os = "linux")]

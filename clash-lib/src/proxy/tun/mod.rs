@@ -1,9 +1,15 @@
 mod datagram;
 mod device_io;
+#[cfg(target_os = "macos")]
+mod macos;
+#[cfg(not(target_os = "macos"))]
 mod routes;
 pub mod runner;
 pub use runner::TunRunner;
 mod stream;
+mod packet_queue;
+mod packet;
+mod tcp;
 pub mod system_stack;
 
 #[cfg(test)]

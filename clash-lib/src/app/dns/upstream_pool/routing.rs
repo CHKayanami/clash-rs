@@ -50,7 +50,7 @@ impl UpstreamPool {
             network,
             typ: Type::Ignore,
             destination: SocksAddr::try_from((entry.endpoint.host.clone(), entry.endpoint.port))?,
-            iface: entry.interface.clone().or_else(|| self.default_interface.clone()),
+            iface: self.outbound_interface(entry),
             so_mark: self.fw_mark,
             ..Default::default()
         })

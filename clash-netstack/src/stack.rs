@@ -1,6 +1,8 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
+use futures::future::poll_fn;
+use std::io;
 use futures::Stream;
 use log::debug;
 use smoltcp::wire::IpProtocol;
@@ -14,11 +16,12 @@ use crate::{
     UdpSocket,
     debug::trace_ip_packet,
     packet::IpPacket,
+    interface::IcmpResponder,
     tcp_listener::{TcpListener, TcpStreamHandle},
 };
 
 /// Thin `Stream` wrapper around a bounded `mpsc::Receiver`.
-struct ReceiverStream(mpsc::Receiver<Packet>);
+struct ReceiverStream(Option<mpsc::Receiver<Packet>>);
 
 impl Stream for ReceiverStream {
     type Item = Packet;
@@ -27,7 +30,10 @@ impl Stream for ReceiverStream {
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Self::Item>> {
-        self.0.poll_recv(cx)
+        match self.0.as_mut() {
+            Some(receiver) => receiver.poll_recv(cx),
+            None => Poll::Ready(None),
+        }
     }
 }
 
@@ -60,11 +66,13 @@ pub struct NetStack {
     udp_inbound: mpsc::Sender<crate::udp_socket::UdpPacket>,
     // inject TCP packets into the stack
     // where the packets get into TCP Stack
-    tcp_inbound: mpsc::UnboundedSender<Packet>,
+    tcp_inbound: Option<mpsc::UnboundedSender<Packet>>,
 
     // outside poll this to receive packets from the stack
-    tcp_outbound: mpsc::Receiver<Packet>,
+    tcp_outbound: Option<mpsc::Receiver<Packet>>,
     udp_outbound: mpsc::Receiver<Packet>,
+    icmp_outbound: Option<mpsc::Sender<Packet>>,
+    enable_icmp: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -122,7 +130,12 @@ impl NetStack {
         crate::tcp_listener::TcpListener,
         crate::udp_socket::UdpSocket,
     ) {
-        let (tcp_packet_sender, tcp_packet_receiver) = mpsc::channel::<Packet>(4096);
+        let (stack, listener, udp) = Self::new_with_protocols(true, true);
+        (stack, listener.expect("TCP enabled"), udp)
+    }
+
+    /// Select TCP and local ICMP handling independently; UDP is always enabled.
+    pub fn new_with_protocols(enable_tcp: bool, enable_icmp: bool) -> (Self, Option<TcpListener>, UdpSocket) {
         // UDP uses a separate bounded channel. UDP is inherently lossy so
         // drop-on-full (via try_send) is correct; the bound prevents unbounded
         // memory growth if a remote floods responses faster than the consumer
@@ -134,16 +147,20 @@ impl NetStack {
 
         // this UdpSocket is essentially an Iface for UDP but much simpler as it only
         // does packets forwarding
-        let udp_socket = UdpSocket::new(udp_outbound_stack, udp_packet_sender);
-        let (tcp_inbound_app, tcp_outbound_stack) =
-            mpsc::unbounded_channel::<Packet>();
-        let tcp_listener = TcpListener::new(tcp_outbound_stack, tcp_packet_sender);
+        let udp_socket = UdpSocket::new(udp_outbound_stack, udp_packet_sender.clone());
+        let (tcp_inbound_app, tcp_packet_receiver, tcp_listener) = if enable_tcp {
+            let (sender, receiver) = mpsc::channel(4096);
+            let (inbound, packets) = mpsc::unbounded_channel();
+            (Some(inbound), Some(receiver), Some(TcpListener::new(packets, sender)))
+        } else { (None, None, None) };
 
         let stack = NetStack {
             udp_inbound: udp_inbound_app,
             tcp_inbound: tcp_inbound_app,
             tcp_outbound: tcp_packet_receiver,
             udp_outbound: udp_packet_receiver,
+            icmp_outbound: (!enable_tcp && enable_icmp).then_some(udp_packet_sender),
+            enable_icmp,
         };
 
         (stack, tcp_listener, udp_socket)
@@ -151,7 +168,7 @@ impl NetStack {
 
     pub fn split(self) -> (StackSplitSink, StackSplitStream) {
         (
-            StackSplitSink::new(self.udp_inbound, self.tcp_inbound),
+            StackSplitSink::new(self.udp_inbound, self.tcp_inbound, self.icmp_outbound, self.enable_icmp),
             StackSplitStream::new(self.tcp_outbound, self.udp_outbound),
         )
     }
@@ -164,20 +181,28 @@ enum PendingInbound {
 
 pub struct StackSplitSink {
     udp_inbound: mpsc::Sender<crate::udp_socket::UdpPacket>,
-    tcp_inbound: mpsc::UnboundedSender<Packet>,
+    tcp_inbound: Option<mpsc::UnboundedSender<Packet>>,
 
     packet_container: Option<PendingInbound>,
+    icmp_outbound: Option<mpsc::Sender<Packet>>,
+    enable_icmp: bool,
+    icmp: Option<Box<IcmpResponder>>,
 }
 
 impl StackSplitSink {
     pub fn new(
         udp_inbound: mpsc::Sender<crate::udp_socket::UdpPacket>,
-        tcp_inbound: mpsc::UnboundedSender<Packet>,
+        tcp_inbound: Option<mpsc::UnboundedSender<Packet>>,
+        icmp_outbound: Option<mpsc::Sender<Packet>>,
+        enable_icmp: bool,
     ) -> Self {
         Self {
             udp_inbound,
             tcp_inbound,
             packet_container: None,
+            icmp_outbound,
+            enable_icmp,
+            icmp: None,
         }
     }
 }
@@ -226,11 +251,16 @@ impl futures::Sink<Packet> for StackSplitSink {
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
         let protocol = packet.protocol();
-        if matches!(
-            protocol,
-            IpProtocol::Tcp | IpProtocol::Icmp | IpProtocol::Icmpv6
-        ) {
+        if !self.enable_icmp && matches!(protocol, IpProtocol::Icmp | IpProtocol::Icmpv6) {
+            return Ok(());
+        }
+        if self.tcp_inbound.is_some() && matches!(protocol,
+            IpProtocol::Tcp | IpProtocol::Icmp | IpProtocol::Icmpv6) {
             self.packet_container = Some(PendingInbound::Tcp(item));
+        } else if matches!(protocol, IpProtocol::Icmp | IpProtocol::Icmpv6) {
+            let this = self.get_mut();
+            let outbound = this.icmp_outbound.as_ref().expect("ICMP output without TCP");
+            this.icmp.get_or_insert_with(|| Box::new(IcmpResponder::new(outbound))).respond(item, outbound);
         } else {
             debug!("tun IP packet ignored (protocol: {protocol:?})");
         }
@@ -260,7 +290,7 @@ impl futures::Sink<Packet> for StackSplitSink {
                 }
             }
             PendingInbound::Tcp(tcp_pkt) => {
-                self.tcp_inbound.send(tcp_pkt).map_err(|e| {
+                self.tcp_inbound.as_ref().expect("TCP enabled").send(tcp_pkt).map_err(|e| {
                     debug!("Failed to send TCP packet: {e}");
                     std::io::Error::new(std::io::ErrorKind::BrokenPipe, e)
                 })?;
@@ -282,16 +312,35 @@ pub struct StackSplitStream {
 }
 impl StackSplitStream {
     pub fn new(
-        tcp_outbound: mpsc::Receiver<Packet>,
+        tcp_outbound: Option<mpsc::Receiver<Packet>>,
         udp_outbound: mpsc::Receiver<Packet>,
     ) -> Self {
         Self {
             inner: futures::stream::select(
                 ReceiverStream(tcp_outbound),
-                ReceiverStream(udp_outbound),
+                ReceiverStream(Some(udp_outbound)),
             ),
         }
     }
+
+    /// Drain currently ready replies into reusable storage without waiting for
+    /// a full batch. A partial batch is returned as soon as the stream parks.
+    pub async fn recv_many(&mut self, packets: &mut Vec<Bytes>, limit: usize) -> io::Result<usize> {
+        let initial = packets.len();
+        poll_fn(|cx| {
+            while packets.len() - initial < limit {
+                match Pin::new(&mut *self).poll_next(cx) {
+                    Poll::Ready(Some(Ok(packet))) => packets.push(packet.into_bytes()),
+                    Poll::Ready(Some(Err(error))) => return Poll::Ready(Err(error)),
+                    Poll::Ready(None) => break,
+                    Poll::Pending if packets.len() == initial => return Poll::Pending,
+                    Poll::Pending => break,
+                }
+            }
+            Poll::Ready(Ok(packets.len() - initial))
+        }).await
+    }
+
 }
 impl futures::Stream for StackSplitStream {
     type Item = std::io::Result<Packet>;
@@ -309,3 +358,7 @@ impl futures::Stream for StackSplitStream {
         })
     }
 }
+
+#[cfg(test)]
+#[path = "stack_tests.rs"]
+mod tests;

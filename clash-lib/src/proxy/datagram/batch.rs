@@ -96,14 +96,16 @@ pub trait DatagramBatch: Stream<Item = UdpPacket> + Sink<UdpPacket, Error = io::
 }
 
 /// Submit independent datagrams synchronously without copying their payloads.
-/// Errors are terminal: a protocol may already have submitted some fragments.
+/// InvalidInput is reserved for validation before any fragment is submitted.
+/// Other errors are terminal: a protocol may already have submitted fragments.
 pub(crate) fn poll_send_ready(
     batch: &PacketBatch, mut send: impl FnMut(&UdpPacket) -> io::Result<()>,
 ) -> BatchResult {
     let mut sent = 0;
     for packet in batch.packets() {
         if let Err(error) = send(packet) {
-            return BatchResult { sent, error: Some(error), fatal: true };
+            let fatal = error.kind() != io::ErrorKind::InvalidInput;
+            return BatchResult { sent, error: Some(error), fatal };
         }
         sent += 1;
     }
@@ -219,6 +221,26 @@ mod tests {
         // Completion belongs to the relay; submission leaves packet ownership intact.
         assert_eq!(batch.len(), 4);
         assert_eq!(batch.packets().count(), 4);
+    }
+
+    #[test]
+    fn validation_failure_keeps_suffix_retryable() {
+        let mut batch = PacketBatch::default();
+        for _ in 0..3 { batch.push(UdpPacket::default()).unwrap(); }
+        let mut attempts = 0;
+        let result = poll_send_ready(&batch, |_| {
+            attempts += 1;
+            if attempts == 2 {
+                Err(io::Error::new(io::ErrorKind::InvalidInput, "packet too large"))
+            } else { Ok(()) }
+        });
+        assert_eq!(result.sent, 1);
+        assert!(!result.fatal && result.error.is_some());
+        batch.complete();
+        batch.complete();
+        let result = poll_send_ready(&batch, |_| Ok(()));
+        assert_eq!(result.sent, 1);
+        assert!(result.error.is_none());
     }
 
     #[test]

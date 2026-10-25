@@ -1,5 +1,7 @@
 use crate::app::dns::query::IngressProfile;
 use bytes::Bytes;
+use ipnet::IpNet;
+use crate::config::internal::config::DnsHijack;
 use crate::proxy::AnyStream;
 use std::{net::SocketAddr, sync::Arc};
 
@@ -15,19 +17,20 @@ use crate::{
     session::{Network, Session, Type},
 };
 
-pub(crate) async fn handle_inbound_stream<S: ProxyStream + Sync + Into<AnyStream> + 'static>(
-    stream: S,
-    source: SocketAddr,
-    destination: SocketAddr,
-    dispatcher: Arc<Dispatcher>,
-    resolver: ThreadSafeDNSResolver,
-    so_mark: Option<u32>,
-    dns_hijack: crate::config::internal::config::DnsHijack,
-    strict_route: bool,
-    exclude_routes: Arc<Vec<ipnet::IpNet>>,
+pub(super) struct TcpContext {
+    pub dispatcher: Arc<Dispatcher>,
+    pub resolver: ThreadSafeDNSResolver,
+    pub so_mark: Option<u32>,
+    pub dns_hijack: DnsHijack,
+    pub strict_route: bool,
+    pub exclude_routes: Arc<Vec<IpNet>>,
+}
+
+pub(super) async fn handle_inbound_stream<S: ProxyStream + Sync + Into<AnyStream> + 'static>(
+    stream: S, source: SocketAddr, destination: SocketAddr, context: Arc<TcpContext>,
 ) {
     let remote_ip = destination.ip();
-    if strict_route && exclude_routes.iter().any(|net| net.contains(&remote_ip)) {
+    if context.strict_route && context.exclude_routes.iter().any(|net| net.contains(&remote_ip)) {
         debug!(
             "strict-route: rejecting tun TCP stream to excluded subnet: {}",
             destination
@@ -35,8 +38,8 @@ pub(crate) async fn handle_inbound_stream<S: ProxyStream + Sync + Into<AnyStream
         return;
     }
 
-    if dns_hijack.is_hijacked(Network::Tcp, &destination) {
-        handle_tcp_dns_hijack(stream, source, destination, resolver).await;
+    if context.dns_hijack.is_hijacked(Network::Tcp, &destination) {
+        handle_tcp_dns_hijack(stream, source, destination, context.resolver.clone()).await;
         return;
     }
 
@@ -51,39 +54,22 @@ pub(crate) async fn handle_inbound_stream<S: ProxyStream + Sync + Into<AnyStream
                 x
             );
         }),
-        so_mark,
+        so_mark: context.so_mark,
         ..Default::default()
     };
 
     debug!("new tun TCP session assigned: {}", sess);
-    dispatcher
+    context.dispatcher
         .dispatch_stream(sess, AnyStream::new(stream))
         .await;
 }
 
-pub(crate) async fn handle_inbound_netstack_stream(
-    stream: watfaq_netstack::TcpStream,
-    dispatcher: Arc<Dispatcher>,
-    resolver: ThreadSafeDNSResolver,
-    so_mark: Option<u32>,
-    dns_hijack: crate::config::internal::config::DnsHijack,
-    strict_route: bool,
-    exclude_routes: Arc<Vec<ipnet::IpNet>>,
+pub(super) async fn handle_inbound_netstack_stream(
+    stream: watfaq_netstack::TcpStream, context: Arc<TcpContext>,
 ) {
     let source = stream.local_addr();
     let destination = stream.remote_addr();
-    handle_inbound_stream(
-        stream,
-        source,
-        destination,
-        dispatcher,
-        resolver,
-        so_mark,
-        dns_hijack,
-        strict_route,
-        exclude_routes,
-    )
-    .await;
+    handle_inbound_stream(stream, source, destination, context).await;
 }
 
 async fn handle_tcp_dns_hijack<S: ProxyStream + 'static>(

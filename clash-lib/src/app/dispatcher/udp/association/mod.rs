@@ -12,9 +12,11 @@ pub(crate) use traffic::UserTrafficCounters;
 pub(crate) use flow::{FlowClosed, ReplyActivity, UdpFlow};
 use flow::FlowState;
 use worker::AssociationRelay;
+#[cfg(feature = "tun")]
+use crate::app::net::network_generation;
 use semantics::{FlowIsolation, IsolationReason};
 
-use std::{collections::HashMap, io, net::{IpAddr, SocketAddr}, sync::{Arc, Weak, atomic::{AtomicBool, AtomicU64, Ordering}}, time::Duration};
+use std::{collections::HashMap, io, net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr}, sync::{Arc, Weak, atomic::{AtomicBool, AtomicU64, Ordering}}, time::Duration};
 use futures::future::BoxFuture;
 use parking_lot::Mutex;
 use tokio::{sync::{Mutex as AsyncMutex, OwnedSemaphorePermit, Semaphore, mpsc, oneshot}, task::JoinHandle};
@@ -38,7 +40,9 @@ struct AssociationKey {
     source: SocketAddr,
     inbound: Type,
     user: Option<Arc<str>>,
-    interface: Option<String>,
+    interface: Option<(String, u32, Option<Ipv4Addr>, Option<Ipv6Addr>)>,
+    #[cfg(feature = "tun")]
+    network_generation: u64,
     mark: Option<u32>,
     isolated: Option<FlowIsolation>,
 }
@@ -144,7 +148,10 @@ impl UdpAssociationPool {
         let unresolved_fake = fake && resolved.is_none() && !direct;
         let key = AssociationKey {
             outbound: outbound.identity(), source: sess.source, inbound: sess.typ,
-            user: sess.inbound_user.clone(), interface: sess.iface.as_ref().map(|i| i.name.clone()),
+            user: sess.inbound_user.clone(), interface: sess.iface.as_ref()
+                .map(|i| (i.name.clone(), i.index, i.addr_v4, i.addr_v6)),
+            #[cfg(feature = "tun")]
+            network_generation: if sess.typ == Type::Tun { network_generation() } else { 0 },
             mark: sess.so_mark,
             isolated: FlowIsolation::select(sess.id, isolation, unresolved_fake, sess.source.port()),
         };

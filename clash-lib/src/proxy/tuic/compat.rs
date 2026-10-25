@@ -40,7 +40,9 @@ impl Sink<UdpPacket> for TuicDatagramOutbound {
             None => {
                 let result = self.max_datagram_size()
                     .and_then(|limit| self.send_native(&item, limit));
-                if result.is_err() { self.close_native(); }
+                if result.as_ref().is_err_and(|error| error.kind() != io::ErrorKind::InvalidInput) {
+                    self.close_native();
+                }
                 result
             }
         }
@@ -99,7 +101,7 @@ impl TuicDatagramOutbound {
     fn send_native(&self, item: &UdpPacket, max_size: usize) -> io::Result<()> {
         self.conn.send_native_packet(
             &item.data, item.dst_addr.clone().into_tuic(), self.assoc_id, max_size,
-        ).map_err(new_io_error)
+        )
     }
 
     fn close_native(&mut self) {
@@ -129,7 +131,7 @@ impl DatagramBatch for TuicDatagramOutbound {
             Ok(limit) => poll_send_ready(batch, |packet| self.send_native(packet, limit)),
             Err(error) => BatchResult::terminated(error),
         };
-        if result.error.is_some() { self.close_native(); }
+        if result.fatal { self.close_native(); }
         Poll::Ready(result)
     }
 }

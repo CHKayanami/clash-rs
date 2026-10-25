@@ -6,11 +6,13 @@ use crate::{
     },
     app::sniffer::SniffUdpOutcome,
 };
+#[cfg(feature = "tun")]
+use crate::{app::net::subscribe_network_changes, session::Type};
 use std::{pin::Pin as PacketPin, task::Poll};
 use futures::{Stream, future::poll_fn};
 use hashbrown::{Equivalent, HashMap as RouteMap};
 use std::{collections::hash_map::RandomState, hash::{Hash, Hasher}};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tracing::{trace, warn};
 
 struct SessionLookup<'a> {
@@ -54,6 +56,11 @@ pub(super) async fn run<S: Stream<Item = UdpPacket> + Unpin>(
     allow_quic: Arc<AtomicBool>, mut incoming: S,
     mut closed: mpsc::UnboundedReceiver<FlowClosed>,
 ) {
+    #[cfg(feature = "tun")]
+    let mut network_changes: Option<watch::Receiver<u64>> =
+        (sess.typ == Type::Tun).then(subscribe_network_changes);
+    #[cfg(not(feature = "tun"))]
+    let mut network_changes: Option<watch::Receiver<u64>> = None;
     let (session_established_tx, mut established) = mpsc::channel(64);
     let mut routes = UdpRoutes {
         force_dns_mapping: sniffer.as_ref().is_some_and(|s| s.config.force_dns_mapping),
@@ -67,6 +74,11 @@ pub(super) async fn run<S: Stream<Item = UdpPacket> + Unpin>(
         tokio::select! {
             biased;
             _ = routes.ctx.reply_sender.closed() => break,
+            _ = async {
+                network_changes.as_mut().expect("enabled TUN subscription").changed().await
+            }, if network_changes.is_some() => {
+                routes.reset_network();
+            },
             Some(outcome) = established.recv() => routes.established(outcome),
             Some(closed) = closed.recv() => routes.closed(closed),
             Some(expired) = routes.delay_queue.next() => routes.expired(expired.into_inner()),
@@ -95,6 +107,14 @@ pub(super) async fn run<S: Stream<Item = UdpPacket> + Unpin>(
 }
 
 impl UdpRoutes {
+    fn reset_network(&mut self) {
+        // Dropping leases closes old flows; dropping connecting tasks aborts
+        // their establishment. Late results cannot resurrect removed entries.
+        self.sessions.clear();
+        self.connecting_sessions.clear();
+        self.pending_sniff_sessions.clear();
+        self.delay_queue.clear();
+    }
     fn closed(&mut self, closed: FlowClosed) {
         let key = (closed.source, closed.original, closed.user);
         if self.sessions.get(&key).is_some_and(|flow| flow.id == closed.id)
@@ -308,6 +328,8 @@ impl UdpRoutes {
         if let Some(buf) = self.connecting_sessions.get_mut(&session_key) {
             if buf.packets.len() < MAX_CONNECTING_PACKETS {
                 buf.packets.push(packet);
+            } else {
+                debug!("UDP dial buffer limit reached for session #{}", buf.id);
             }
             return;
         }
@@ -499,6 +521,56 @@ impl UdpRoutes {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
+    use tokio::net::UdpSocket;
+    use super::super::tests::test_dispatcher;
+
+    #[tokio::test]
+    async fn first_udp_burst_survives_outbound_establishment() {
+        let dispatcher = test_dispatcher(OutboundType::Direct).await;
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let destination: SocksAddr = server.local_addr().unwrap().into();
+        let source: SocketAddr = "127.0.0.1:54321".parse().unwrap();
+        let (replies, _reply_rx) = mpsc::channel(UDP_CHANNEL_CAPACITY);
+        let (closed_flows, _closed) = mpsc::unbounded_channel();
+        let associations = UdpAssociationPool::new(AssociationConfig {
+            replies: replies.clone(), closed_flows, manager: dispatcher.manager.clone(),
+            allow_quic: dispatcher.allow_quic.clone(), timeout: Duration::from_secs(60),
+            capacity: dispatcher.udp_association_semaphore.clone(),
+        });
+        let ctx = UdpDispatchContext {
+            outbound_manager: dispatcher.outbound_manager.clone(), router: dispatcher.router.clone(),
+            resolver: dispatcher.resolver.clone(), mode: dispatcher.mode.clone(),
+            reply_sender: replies, session_semaphore: dispatcher.udp_session_semaphore.clone(), associations,
+        };
+        let (session_established_tx, mut established) = mpsc::channel(64);
+        let mut routes = UdpRoutes {
+            sess: Session::default(), ctx, sniffer: None, allow_quic: dispatcher.allow_quic.clone(),
+            force_dns_mapping: false, has_explicit_timeout: false, timeout_duration: Duration::from_secs(60),
+            sessions: RouteMap::with_hasher(RandomState::new()), connecting_sessions: HashMap::new(),
+            pending_sniff_sessions: HashMap::new(), delay_queue: DelayQueue::new(), session_established_tx,
+        };
+        // This current-thread test does not yield while delivering the burst:
+        // the spawned dial cannot complete until all 32 packets are admitted.
+        for index in 0..32u8 {
+            routes.packet(UdpPacket::new(Bytes::from(vec![index; 1024]),
+                source.into(), destination.clone()));
+        }
+        assert_eq!(routes.connecting_sessions.len(), 1);
+        assert_eq!(routes.connecting_sessions.values().next().unwrap().packets.len(), 32);
+        let outcome = tokio::time::timeout(Duration::from_secs(2), established.recv())
+            .await.unwrap().unwrap();
+        assert!(matches!(&outcome, EstablishOutcome::Success(..)));
+        routes.established(outcome);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            let mut buffer = [0; 2048];
+            for index in 0..32u8 {
+                let (size, _) = server.recv_from(&mut buffer).await.unwrap();
+                assert_eq!(size, 1024);
+                assert!(buffer[..size].iter().all(|byte| *byte == index));
+            }
+        }).await.unwrap();
+    }
 
     #[test]
     fn udp_sniffed_ip_preserves_mapped_destination() {

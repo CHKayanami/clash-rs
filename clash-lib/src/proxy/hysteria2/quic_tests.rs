@@ -85,7 +85,7 @@ async fn hysteria_native_batch_roundtrip_and_close() {
 }
 
 #[tokio::test]
-async fn hysteria_native_batch_failure_preserves_prefix() {
+async fn hysteria_native_batch_validation_preserves_prefix_and_suffix() {
     let (_client, _server, raw, peer) = pair().await;
     let conn = Arc::new(HysteriaConnection {
         conn: Arc::new(raw), udp_sessions: Arc::new(Mutex::new(HashMap::new())),
@@ -106,16 +106,21 @@ async fn hysteria_native_batch_failure_preserves_prefix() {
     batch.push(packet.clone()).unwrap();
     let result = poll_fn(|cx| udp.poll_send_batch(cx, &mut batch)).await;
     assert_eq!(result.sent, 1);
-    assert!(result.fatal && result.error.is_some());
+    assert!(!result.fatal && result.error.is_some());
     assert_eq!(batch.len(), 3);
-    assert!(!conn.udp_sessions.lock().contains_key(&10));
+    assert!(conn.udp_sessions.lock().contains_key(&10));
     let wire = timeout(Duration::from_secs(5), peer.read_datagram()).await.unwrap().unwrap();
     let sent = HysUdpPacket::decode(&mut BytesMut::from(wire.as_ref())).unwrap();
     assert_eq!(sent.addr, packet.dst_addr);
     assert!(sent.data.is_empty());
+    batch.complete(); // Successful prefix.
+    batch.complete(); // Rejected packet.
     let result = poll_fn(|cx| udp.poll_send_batch(cx, &mut batch)).await;
-    assert_eq!(result.sent, 0);
-    assert!(result.fatal && result.error.is_some());
+    assert_eq!(result.sent, 1);
+    assert!(!result.fatal && result.error.is_none());
+    let wire = timeout(Duration::from_secs(5), peer.read_datagram()).await.unwrap().unwrap();
+    let sent = HysUdpPacket::decode(&mut BytesMut::from(wire.as_ref())).unwrap();
+    assert_eq!(sent.addr, packet.dst_addr);
 }
 
 #[tokio::test]
@@ -138,6 +143,7 @@ async fn hysteria_native_send_failure_removes_session() {
 mod tuic {
     use super::*;
     use futures::FutureExt;
+    use std::io::ErrorKind;
     use std::{sync::atomic::AtomicU16, thread};
     use parking_lot::RwLock;
     use uuid::Uuid;
@@ -200,6 +206,29 @@ mod tuic {
         let result = poll_fn(|cx| udp.poll_send_batch(cx, &mut batch)).await;
         assert_eq!(result.sent, 0);
         assert!(result.fatal && result.error.is_some());
+    }
+
+    #[tokio::test]
+    async fn native_validation_keeps_session_usable() {
+        let (_client, _server, raw, peer) = pair().await;
+        let conn = connection(raw, UdpRelayMode::Native);
+        let mut udp = TuicDatagramOutbound::new(12, conn.clone(), SocksAddr::any_ipv4());
+        let mut invalid = PacketBatch::default();
+        invalid.push(UdpPacket {
+            data: Bytes::from(vec![0; 65536]),
+            dst_addr: "127.0.0.1:1000".parse().unwrap(),
+            ..UdpPacket::default()
+        }).unwrap();
+        let result = poll_fn(|cx| udp.poll_send_batch(cx, &mut invalid)).await;
+        assert_eq!(result.sent, 0);
+        assert!(!result.fatal);
+        assert_eq!(result.error.unwrap().kind(), ErrorKind::InvalidInput);
+        assert!(conn.udp_sessions.read().contains_key(&12));
+        let mut valid = batch();
+        let result = poll_fn(|cx| udp.poll_send_batch(cx, &mut valid)).await;
+        assert_eq!(result.sent, MAX_BATCH_PACKETS);
+        assert!(result.error.is_none());
+        timeout(Duration::from_secs(5), peer.read_datagram()).await.unwrap().unwrap();
     }
 
     #[tokio::test]

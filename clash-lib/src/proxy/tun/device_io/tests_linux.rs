@@ -20,7 +20,7 @@ async fn receive_error_after_progress_is_delivered_on_next_read() {
     // SAFETY: ownership of a valid, open FD is transferred exactly once. This
     // test exercises only descriptor reads, not TUN-specific control operations.
     let device = unsafe { AsyncDevice::from_fd(stream.into_raw_fd()) }.unwrap();
-    let mut reader = Reader::new(&device);
+    let mut reader = Reader::new(&device, 65535, true).unwrap();
     let mut packets = Vec::new();
     assert_eq!(reader.recv(&device, &mut packets).await.unwrap(), 1);
     assert_eq!(&packets[0][..], b"prefix");
@@ -37,8 +37,8 @@ async fn kernel_udp_roundtrip(offload: bool) {
         .ipv4("198.18.77.1", 24, None).ipv6("fd00:198:18::1", 64)
         .mtu(1500).offload(offload).enable(true).build_async().unwrap();
     if offload { assert!(device.udp_gso(), "test kernel must support TUN UDP GSO"); }
-    let mut reader = Reader::new(&device);
-    let mut writer = Writer::new();
+    let mut reader = Reader::new(&device, 65535, true).unwrap();
+    let mut writer = Writer::new(&reader, true).unwrap();
     for (bind, target) in [
         ("198.18.77.1:0", "198.18.77.2:5555"),
         ("[fd00:198:18::1]:0", "[fd00:198:18::2]:5555"),
@@ -111,3 +111,19 @@ async fn kernel_udp_roundtrip_plain() { kernel_udp_roundtrip(false).await; }
 #[tokio::test]
 #[ignore = "requires Linux CAP_NET_ADMIN and an isolated network namespace"]
 async fn kernel_udp_roundtrip_gso() { kernel_udp_roundtrip(true).await; }
+
+#[test]
+fn offload_validation_preserves_valid_neighbors() {
+    let before = Bytes::from(vec![0x45; 20]);
+    let after = Bytes::from(vec![0x60; 40]);
+    let packets = [Bytes::new(), before.clone(), Bytes::from_static(b"\x30bad"),
+        after.clone(), Bytes::new()];
+    let mut buffers = vec![Vec::new(); DEVICE_BATCH];
+    let count = prepare_offload(&packets, &mut buffers);
+    assert_eq!(count, 2);
+    let mut gro = GROTable::default();
+    gro.apply_gro(&mut buffers[..count], VIRTIO_NET_HDR_LEN, true).unwrap();
+    assert_eq!(&buffers[0][VIRTIO_NET_HDR_LEN..], before.as_ref());
+    assert_eq!(&buffers[1][VIRTIO_NET_HDR_LEN..], after.as_ref());
+    assert_eq!(prepare_offload(&[Bytes::new()], &mut buffers), 0);
+}

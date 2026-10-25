@@ -115,7 +115,7 @@ impl DatagramBatch for HysteriaDatagramOutbound {
             Ok(limit) => poll_send_ready(batch, |packet| self.send(packet, limit)),
             Err(error) => BatchResult::terminated(error),
         };
-        if result.error.is_some() { self.close_session(); }
+        if result.fatal { self.close_session(); }
         Poll::Ready(result)
     }
 }
@@ -131,7 +131,9 @@ impl Sink<UdpPacket> for HysteriaDatagramOutbound {
 
     fn start_send(mut self: Pin<&mut Self>, item: UdpPacket) -> Result<(), Self::Error> {
         let result = self.max_fragment_size().and_then(|limit| self.send(&item, limit));
-        if result.is_err() { self.close_session(); }
+        if result.as_ref().is_err_and(|error| error.kind() != ErrorKind::InvalidInput) {
+            self.close_session();
+        }
         result
     }
 

@@ -44,6 +44,7 @@ tun = [
     "dep:tun-rs",
     "dep:watfaq-netstack",
     "dep:smoltcp",
+    "dep:route_manager",
 ]
 redir = []
 zero_copy = []
@@ -265,6 +266,11 @@ netlink-packet-route = "0.33"
 
 [target.'cfg(target_os="ios")'.dependencies]
 tracing-oslog = "0.3"
+
+[target.'cfg(target_os="macos")'.dependencies]
+route_manager = { version = "0.2.16", optional = true }
+core-foundation = "0.9.4"
+system-configuration = "0.7"
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62", features = [
