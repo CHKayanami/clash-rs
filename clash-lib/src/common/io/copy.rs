@@ -112,6 +112,8 @@ impl<A: ProxyStream> Future for StreamCopy<A> {
 enum BidirectionalCopy {
     Tcp(StreamCopy<TcpStream>),
     Other(StreamCopy<AnyStream>),
+    #[cfg(feature = "tun")]
+    Tun(Pin<Box<dyn Future<Output = CopyResult> + Send>>),
 }
 
 impl Future for BidirectionalCopy {
@@ -120,6 +122,8 @@ impl Future for BidirectionalCopy {
         match self.get_mut() {
             Self::Tcp(copy) => Pin::new(copy).poll(cx),
             Self::Other(copy) => Pin::new(copy).poll(cx),
+            #[cfg(feature = "tun")]
+            Self::Tun(copy) => copy.as_mut().poll(cx),
         }
     }
 }
@@ -130,6 +134,24 @@ pub fn copy_bidirectional(
     a: AnyStream, b: AnyStream, size: usize,
     upload_timeout: Duration, download_timeout: Duration, tracker: TrafficTracker,
 ) -> impl Future<Output = CopyResult> + Send {
+    #[cfg(feature = "tun")]
+    let (a, b) = match (a, b) {
+        (a, AnyStream::Tcp(socket)) => match a.into_tun() {
+            Ok((stream, prefix)) => {
+                tracing::trace!("handing native TCP relay to TUN stack");
+                let counter = Box::new(move |upload, download| {
+                    tracker.push_upload(upload);
+                    tracker.push_download(download);
+                });
+                return BidirectionalCopy::Tun(Box::pin(async move {
+                    stream.forward(socket, prefix, counter, upload_timeout, download_timeout)
+                        .await.map_err(CopyBidirectionalError::Other)
+                }));
+            }
+            Err(a) => (a, AnyStream::Tcp(socket)),
+        },
+        pair => pair,
+    };
     let settings = Settings { size, upload_timeout, download_timeout, tracker };
     match a {
         AnyStream::Tcp(stream) => BidirectionalCopy::Tcp(StreamCopy::new(stream, b, settings)),

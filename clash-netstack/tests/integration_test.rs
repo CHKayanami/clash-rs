@@ -3,6 +3,7 @@ use watfaq_netstack::{NetStack, Packet};
 
 mod common;
 mod mock_tun;
+mod tcp_forward;
 
 use common::{
     build_tcp_ack, build_tcp_syn_packet, build_tcp_syn_packet_with_port,

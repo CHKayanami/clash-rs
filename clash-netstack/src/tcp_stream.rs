@@ -1,4 +1,4 @@
-use crate::{stack::IfaceEvent, tcp_listener::TcpStreamHandle};
+use crate::tcp_listener::TcpStreamHandle;
 use log::trace;
 use std::{
     io::{Error, ErrorKind},
@@ -13,8 +13,6 @@ pub struct TcpStream {
     pub(crate) remote_addr: SocketAddr,
 
     pub(crate) handle: Arc<TcpStreamHandle>,
-    pub(crate) stack_notifier:
-        tokio::sync::mpsc::UnboundedSender<IfaceEvent<'static>>,
 }
 
 impl Drop for TcpStream {
@@ -24,18 +22,14 @@ impl Drop for TcpStream {
             self.local_addr, self.remote_addr
         );
 
-        // socket_dropped tells poll_sockets to drain send_buffer and issue FIN.
+        // socket_dropped tells the stack task to drain send_buffer and issue FIN.
         // read_closed / write_closed unblock any concurrent poll_read / poll_write.
         self.handle.socket_dropped.store(true, Ordering::Release);
         self.handle.read_closed.store(true, Ordering::Release);
         self.handle.write_closed.store(true, Ordering::Release);
         self.handle.recv_waker.wake();
         self.handle.send_waker.wake();
-        if let Err(e) = self.stack_notifier.send(IfaceEvent::TcpSocketClosed) {
-            // The listener may stop before aborted relay tasks drop their streams.
-            // Local close state and wakers above do not depend on this notice.
-            trace!("TCP stack stopped before socket close notification: {e}");
-        }
+        self.handle.notify();
     }
 }
 
@@ -54,9 +48,7 @@ impl TcpStream {
     }
 
     fn notify_tcp_socket_ready(&self) {
-        if let Err(e) = self.stack_notifier.send(IfaceEvent::TcpSocketReady) {
-            trace!("TCP stack stopped before socket ready notification: {e}");
-        }
+        self.handle.notify();
     }
 }
 
@@ -79,11 +71,11 @@ impl tokio::io::AsyncRead for TcpStream {
             "TcpStream::poll_read called: {} <-> {}",
             self.local_addr, self.remote_addr
         );
-        let read_buf = &self.handle.recv_buffer;
+        let read_buf = self.handle.recv();
 
         if read_buf.is_empty() {
             // Register waker FIRST, then re-check to close the TOCTOU window.
-            // If poll_sockets enqueues data between is_empty() and register(),
+            // If the stack task enqueues data between is_empty() and register(),
             // wake() is a no-op (no waker stored). The re-check below detects
             // the buffer is now non-empty and falls through to read it.
             self.handle.recv_waker.register(cx.waker());
@@ -106,13 +98,7 @@ impl tokio::io::AsyncRead for TcpStream {
             }
         }
 
-        buf.initialize_unfilled();
-        let recv_buf = unsafe {
-            std::mem::transmute::<&mut [std::mem::MaybeUninit<u8>], &mut [u8]>(
-                buf.unfilled_mut(),
-            )
-        };
-        let n = read_buf.dequeue_slice(recv_buf);
+        let n = read_buf.dequeue_slice(buf.initialize_unfilled());
         buf.advance(n);
 
         self.notify_tcp_socket_ready();
@@ -137,11 +123,11 @@ impl tokio::io::AsyncWrite for TcpStream {
             )));
         }
 
-        let send_buf = &self.handle.send_buffer;
+        let send_buf = self.handle.send();
 
         if send_buf.is_full() {
             // Register waker FIRST, then re-check to close the TOCTOU window.
-            // If poll_sockets drains the buffer between is_full() and register(),
+            // If the stack task drains the buffer between is_full() and register(),
             // wake() is a no-op (no waker stored). The re-check below detects
             // the buffer is now non-full and falls through to enqueue data.
             self.handle.send_waker.register(cx.waker());
@@ -177,6 +163,7 @@ impl tokio::io::AsyncWrite for TcpStream {
         ready!(self.as_mut().poll_flush(cx))?;
         trace!("TcpStream::poll_shutdown called, client side closing");
         self.handle.write_shutdown.store(true, Ordering::Release);
+        self.handle.notify();
         self.handle.send_waker.wake();
         Poll::Ready(Ok(()))
     }
@@ -187,22 +174,17 @@ mod tests {
     use super::*;
     use crate::tcp_listener::TcpStreamHandle;
     use futures::task::noop_waker_ref;
-    use tokio::{
-        io::{AsyncRead, AsyncWrite},
-        sync::mpsc,
-    };
+    use tokio::io::{AsyncRead, AsyncWrite};
+    use crate::ready::{Ready, ReadyQueue};
 
-    fn build_stream() -> (TcpStream, mpsc::UnboundedReceiver<IfaceEvent<'static>>) {
-        let (tx, rx) = mpsc::unbounded_channel();
-        (
-            TcpStream {
-                local_addr: "127.0.0.1:12345".parse().unwrap(),
-                remote_addr: "127.0.0.1:80".parse().unwrap(),
-                handle: Arc::new(TcpStreamHandle::new()),
-                stack_notifier: tx,
-            },
-            rx,
-        )
+    fn build_stream() -> (TcpStream, Arc<ReadyQueue>) {
+        let queue = Arc::new(ReadyQueue::default());
+        let ready = Ready::new(1, queue.clone());
+        (TcpStream {
+            local_addr: "127.0.0.1:12345".parse().unwrap(),
+            remote_addr: "127.0.0.1:80".parse().unwrap(),
+            handle: Arc::new(TcpStreamHandle::new(ready)),
+        }, queue)
     }
 
     fn noop_cx() -> Context<'static> {
@@ -222,9 +204,9 @@ mod tests {
 
     #[test]
     fn drop_notifies_running_stack() {
-        let (stream, mut rx) = build_stream();
+        let (stream, rx) = build_stream();
         drop(stream);
-        assert!(matches!(rx.try_recv(), Ok(IfaceEvent::TcpSocketClosed)));
+        assert!(rx.pop().is_some());
     }
 
     #[test]
@@ -243,15 +225,15 @@ mod tests {
 
     #[test]
     fn poll_shutdown_marks_write_shutdown() {
-        let (mut stream, mut rx) = build_stream();
+        let (mut stream, rx) = build_stream();
         let mut cx = noop_cx();
 
         let result = Pin::new(&mut stream).poll_shutdown(&mut cx);
 
         assert!(matches!(result, Poll::Ready(Ok(()))));
         assert!(stream.handle.write_shutdown.load(Ordering::Acquire));
-        assert!(matches!(rx.try_recv(), Ok(IfaceEvent::TcpSocketReady)));
-        assert!(rx.try_recv().is_err());
+        assert!(rx.pop().is_some());
+        assert!(rx.pop().is_none());
     }
 
     #[test]

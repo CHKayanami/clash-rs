@@ -172,6 +172,38 @@ impl AnyStream {
     pub fn from_boxed(stream: Box<dyn ProxyStream + Sync>) -> Self {
         Self::Dynamic(stream)
     }
+
+    /// Only transparent prefix wrappers may be removed for a stack handoff.
+    #[cfg(feature = "tun")]
+    pub(crate) fn into_tun(self) -> Result<(TunTcpStream, Vec<u8>), Self> {
+        // Preserve all ordinary transports without rebuilding their wrappers.
+        if !self.is_tun() { return Err(self); }
+        let mut stream = self;
+        let mut bytes = Vec::new();
+        loop {
+            match stream {
+                Self::Tun(stream) => return Ok((*stream, bytes)),
+                Self::Prefixed(wrapper) => {
+                    let (prefix, inner) = wrapper.into_parts();
+                    if let Some(prefix) = prefix { bytes.extend_from_slice(prefix.as_slice()); }
+                    stream = inner;
+                }
+                _ => unreachable!("TUN transport checked before consuming wrappers"),
+            }
+        }
+    }
+
+    #[cfg(feature = "tun")]
+    fn is_tun(&self) -> bool {
+        let mut stream = self;
+        loop {
+            match stream {
+                Self::Tun(_) => return true,
+                Self::Prefixed(wrapper) => stream = wrapper.inner_ref(),
+                _ => return false,
+            }
+        }
+    }
 }
 
 macro_rules! stream_io {
@@ -455,5 +487,26 @@ mod tests {
                 dynamic
             );
         }
+    }
+
+    #[cfg(feature = "tun")]
+    #[tokio::test]
+    async fn failed_tun_handoff_preserves_nested_prefixes() {
+        let (client, mut peer) = tokio::io::duplex(64);
+        let mut inner_prefix = SlideBuffer::new(8);
+        inner_prefix.extend_from_slice(b"inner:");
+        let mut outer_prefix = SlideBuffer::new(8);
+        outer_prefix.extend_from_slice(b"outer:");
+        let stream = AnyStream::new(PrefixedStream::new(outer_prefix,
+            AnyStream::new(PrefixedStream::new(inner_prefix, AnyStream::new(client)))));
+        let mut stream = match stream.into_tun() {
+            Err(stream) => stream,
+            Ok(_) => panic!("duplex transport cannot be handed to a TCP stack"),
+        };
+        peer.write_all(b"body").await.unwrap();
+        peer.shutdown().await.unwrap();
+        let mut bytes = Vec::new();
+        stream.read_to_end(&mut bytes).await.unwrap();
+        assert_eq!(bytes, b"outer:inner:body");
     }
 }

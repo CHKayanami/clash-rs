@@ -1,5 +1,3 @@
-use std::sync::Arc;
-
 use bytes::Bytes;
 use futures::future::poll_fn;
 use std::io;
@@ -17,7 +15,7 @@ use crate::{
     debug::trace_ip_packet,
     packet::IpPacket,
     interface::IcmpResponder,
-    tcp_listener::{TcpListener, TcpStreamHandle},
+    tcp_listener::TcpListener,
 };
 
 /// Thin `Stream` wrapper around a bounded `mpsc::Receiver`.
@@ -37,25 +35,6 @@ impl Stream for ReceiverStream {
     }
 }
 
-pub(crate) enum IfaceEvent<'a> {
-    Icmp, // ICMP packet received
-    TcpStream(Box<(smoltcp::socket::tcp::Socket<'a>, Arc<TcpStreamHandle>)>), /* new TCP stream created */
-    TcpSocketReady, // at least one TCP socket is ready to read/write
-    TcpSocketClosed, /* TCP socket closed by the application, e.g. the TcpStream
-                     * is dropped */
-    DeviceReady, // Device generated some packets
-}
-impl std::fmt::Debug for IfaceEvent<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            IfaceEvent::Icmp => write!(f, "IfaceEvent::Icmp"),
-            IfaceEvent::TcpStream(_) => write!(f, "IfaceEvent::TcpStream"),
-            IfaceEvent::TcpSocketReady => write!(f, "IfaceEvent::TcpSocketReady"),
-            IfaceEvent::TcpSocketClosed => write!(f, "IfaceEvent::TcpSocketClosed"),
-            IfaceEvent::DeviceReady => write!(f, "IfaceEvent::DeviceReady"),
-        }
-    }
-}
 /// IO of the stack:
 /// Sink to the stack with any IP packets
 /// it will be demultiplexed to the correct protocol handler and each handler
@@ -66,7 +45,7 @@ pub struct NetStack {
     udp_inbound: mpsc::Sender<crate::udp_socket::UdpPacket>,
     // inject TCP packets into the stack
     // where the packets get into TCP Stack
-    tcp_inbound: Option<mpsc::UnboundedSender<Packet>>,
+    tcp_inbound: Option<mpsc::Sender<Packet>>,
 
     // outside poll this to receive packets from the stack
     tcp_outbound: Option<mpsc::Receiver<Packet>>,
@@ -150,7 +129,7 @@ impl NetStack {
         let udp_socket = UdpSocket::new(udp_outbound_stack, udp_packet_sender.clone());
         let (tcp_inbound_app, tcp_packet_receiver, tcp_listener) = if enable_tcp {
             let (sender, receiver) = mpsc::channel(4096);
-            let (inbound, packets) = mpsc::unbounded_channel();
+            let (inbound, packets) = mpsc::channel(256);
             (Some(inbound), Some(receiver), Some(TcpListener::new(packets, sender)))
         } else { (None, None, None) };
 
@@ -181,7 +160,7 @@ enum PendingInbound {
 
 pub struct StackSplitSink {
     udp_inbound: mpsc::Sender<crate::udp_socket::UdpPacket>,
-    tcp_inbound: Option<mpsc::UnboundedSender<Packet>>,
+    tcp_inbound: Option<mpsc::Sender<Packet>>,
 
     packet_container: Option<PendingInbound>,
     icmp_outbound: Option<mpsc::Sender<Packet>>,
@@ -192,7 +171,7 @@ pub struct StackSplitSink {
 impl StackSplitSink {
     pub fn new(
         udp_inbound: mpsc::Sender<crate::udp_socket::UdpPacket>,
-        tcp_inbound: Option<mpsc::UnboundedSender<Packet>>,
+        tcp_inbound: Option<mpsc::Sender<Packet>>,
         icmp_outbound: Option<mpsc::Sender<Packet>>,
         enable_icmp: bool,
     ) -> Self {
@@ -290,10 +269,14 @@ impl futures::Sink<Packet> for StackSplitSink {
                 }
             }
             PendingInbound::Tcp(tcp_pkt) => {
-                self.tcp_inbound.as_ref().expect("TCP enabled").send(tcp_pkt).map_err(|e| {
-                    debug!("Failed to send TCP packet: {e}");
-                    std::io::Error::new(std::io::ErrorKind::BrokenPipe, e)
-                })?;
+                match self.tcp_inbound.as_ref().expect("TCP enabled").try_send(tcp_pkt) {
+                    Ok(()) => {}
+                    // TCP retransmission recovers congestion loss. Never block
+                    // the shared TUN reader (and UDP) on this queue.
+                    Err(mpsc::error::TrySendError::Full(_)) => log::trace!("TCP input queue full"),
+                    Err(mpsc::error::TrySendError::Closed(_)) => return Poll::Ready(Err(
+                        io::Error::new(io::ErrorKind::BrokenPipe, "TCP stack stopped"))),
+                }
             }
         }
         std::task::Poll::Ready(Ok(()))

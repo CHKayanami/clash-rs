@@ -22,6 +22,14 @@ impl<S> PrefixedStream<S> {
     pub fn into_inner(self) -> S {
         self.inner
     }
+
+    #[cfg(feature = "tun")]
+    pub(crate) fn inner_ref(&self) -> &S { &self.inner }
+
+    #[cfg(feature = "tun")]
+    pub(crate) fn into_parts(self) -> (Option<SlideBuffer>, S) {
+        (self.prefix, self.inner)
+    }
 }
 
 impl<S: AsyncRead + Unpin> AsyncRead for PrefixedStream<S> {

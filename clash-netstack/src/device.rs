@@ -1,4 +1,5 @@
-use crate::{Packet, stack::IfaceEvent};
+use crate::Packet;
+use std::collections::VecDeque;
 use smoltcp::{
     phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken},
     time::Instant,
@@ -6,38 +7,36 @@ use smoltcp::{
 use tokio::sync::mpsc;
 
 pub struct NetstackDevice {
-    rx_sender: mpsc::UnboundedSender<Packet>,
-    rx_queue: mpsc::UnboundedReceiver<Packet>,
+    rx_queue: VecDeque<Packet>,
 
     tx_sender: mpsc::Sender<Packet>,
     capabilities: DeviceCapabilities,
 
-    iface_notifier: mpsc::UnboundedSender<IfaceEvent<'static>>,
 }
 
 impl NetstackDevice {
     pub fn new(
         tx_sender: mpsc::Sender<Packet>,
-        iface_notifier: mpsc::UnboundedSender<IfaceEvent<'static>>,
     ) -> Self {
         let mut capabilities = DeviceCapabilities::default();
         capabilities.max_transmission_unit = 1500;
         capabilities.medium = Medium::Ip;
 
-        let (rx_sender, rx_queue) = mpsc::unbounded_channel::<Packet>();
 
         Self {
-            rx_sender,
-            rx_queue,
+            rx_queue: VecDeque::with_capacity(32),
             tx_sender,
             capabilities,
-            iface_notifier,
         }
     }
 
-    pub fn create_injector(&self) -> mpsc::UnboundedSender<Packet> {
-        self.rx_sender.clone()
-    }
+    pub fn inject(&mut self, packet: Packet) { self.rx_queue.push_back(packet); }
+
+    pub fn is_empty(&self) -> bool { self.rx_queue.is_empty() }
+
+    pub fn output_available(&self) -> bool { self.tx_sender.capacity() > 0 }
+
+    pub fn output(&self) -> &mpsc::Sender<Packet> { &self.tx_sender }
 }
 
 impl Device for NetstackDevice {
@@ -53,13 +52,10 @@ impl Device for NetstackDevice {
         // the inbound packet even when try_reserve() subsequently fails, silently
         // dropping ACKs and preventing smoltcp from advancing its send window.
         let permit = self.tx_sender.try_reserve().ok()?;
-        let packet = self.rx_queue.try_recv().ok()?;
+        let packet = self.rx_queue.pop_front()?;
 
         let rx_token = RxTokenImpl { packet };
         let tx_token = TxTokenImpl { tx_sender: permit };
-        self.iface_notifier
-            .send(IfaceEvent::DeviceReady)
-            .expect("Failed to notify iface event");
         Some((rx_token, tx_token))
     }
 
@@ -126,10 +122,7 @@ mod tests {
     #[tokio::test]
     async fn test_receive_drops_inbound_packet_when_tx_channel_full() {
         let (tx_sender, mut tx_receiver) = tokio::sync::mpsc::channel::<Packet>(1);
-        let (iface_notifier, _iface_rx) =
-            tokio::sync::mpsc::unbounded_channel::<IfaceEvent<'static>>();
-        let mut device = NetstackDevice::new(tx_sender, iface_notifier);
-        let injector = device.create_injector();
+        let mut device = NetstackDevice::new(tx_sender);
 
         // Fill the tx channel to its capacity of 1
         device
@@ -139,9 +132,7 @@ mod tests {
         // tx channel: FULL (capacity = 1)
 
         // Simulate an inbound ACK entering rx_queue
-        injector
-            .send(Packet::new(vec![0u8; 60]))
-            .expect("unbounded, should not fail");
+        device.inject(Packet::new(vec![0u8; 60]));
         // rx_queue: [ack_packet]
 
         // Call receive() while tx is full.
