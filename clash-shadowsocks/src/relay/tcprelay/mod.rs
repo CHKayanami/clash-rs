@@ -19,3 +19,13 @@ pub enum StreamType {
     /// Connection initiated from server to client
     Server,
 }
+
+#[cfg(all(
+    test,
+    any(
+        feature = "aead-cipher",
+        feature = "aead-cipher-2022",
+        feature = "stream-cipher"
+    )
+))]
+mod pending_write_tests;

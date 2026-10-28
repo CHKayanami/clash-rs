@@ -196,7 +196,7 @@ impl DecryptedReader {
 
 enum EncryptWriteState {
     AssemblePacket,
-    Writing { pos: usize },
+    Writing { pos: usize, plaintext_len: usize },
 }
 
 /// Writer wrapper that will encrypt data automatically
@@ -243,9 +243,9 @@ impl EncryptedWriter {
                     let n = self.buffer.len();
                     self.buffer.put_slice(buf);
                     self.cipher.encrypt_packet(&mut self.buffer[n..]);
-                    self.state = EncryptWriteState::Writing { pos: 0 };
+                    self.state = EncryptWriteState::Writing { pos: 0, plaintext_len: buf.len() };
                 }
-                EncryptWriteState::Writing { ref mut pos } => {
+                EncryptWriteState::Writing { ref mut pos, plaintext_len } => {
                     while *pos < self.buffer.len() {
                         let n = ready!(Pin::new(&mut *stream).poll_write(cx, &self.buffer[*pos..]))?;
                         if n == 0 {
@@ -258,7 +258,9 @@ impl EncryptedWriter {
                     self.state = EncryptWriteState::AssemblePacket;
                     self.buffer.clear();
 
-                    return Ok(buf.len()).into();
+                    // The caller may append input while this encrypted frame
+                    // is backpressured. Only the saved frame was consumed.
+                    return Ok(plaintext_len).into();
                 }
             }
         }
