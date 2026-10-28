@@ -1,6 +1,6 @@
 use crate::Packet;
 use bytes::BytesMut;
-use std::net::SocketAddr;
+use std::{io, net::SocketAddr, task::{Context, Poll}};
 use tokio::sync::mpsc;
 
 /// Single-pass, zero-allocation fast parser for IPv4 and IPv6 UDP packets.
@@ -26,9 +26,11 @@ pub fn parse_udp_packet(
                 // Not UDP (protocol 17)
                 return None;
             }
-            let total_len = u16::from_be_bytes([data[2], data[3]]) as usize;
-            let packet_len = data.len().min(total_len);
-            if packet_len < ihl + 8 {
+            // No reassembly is performed here. Neither first fragments (MF)
+            // nor later fragments may be interpreted as whole UDP datagrams.
+            if u16::from_be_bytes([data[6], data[7]]) & 0x3fff != 0 { return None; }
+            let packet_len = u16::from_be_bytes([data[2], data[3]]) as usize;
+            if packet_len > data.len() || packet_len < ihl + 8 {
                 return None;
             }
             let src_ip =
@@ -40,12 +42,12 @@ pub fn parse_udp_packet(
             let src_port = u16::from_be_bytes([udp_slice[0], udp_slice[1]]);
             let dst_port = u16::from_be_bytes([udp_slice[2], udp_slice[3]]);
             let udp_len = u16::from_be_bytes([udp_slice[4], udp_slice[5]]) as usize;
-            if udp_len < 8 {
+            if udp_len < 8 || udp_len > packet_len - ihl {
                 return None;
             }
 
             let payload_start = ihl + 8;
-            let payload_end = (ihl + udp_len).min(packet_len);
+            let payload_end = ihl + udp_len;
             if payload_start > payload_end {
                 return None;
             }
@@ -72,8 +74,8 @@ pub fn parse_udp_packet(
             let dst_ip = std::net::Ipv6Addr::from(dst_bytes);
 
             let payload_len = u16::from_be_bytes([data[4], data[5]]) as usize;
-            let packet_len = data.len().min(40 + payload_len);
-            if packet_len < 48 {
+            let packet_len = 40 + payload_len;
+            if packet_len > data.len() || packet_len < 48 {
                 return None;
             }
 
@@ -81,12 +83,12 @@ pub fn parse_udp_packet(
             let src_port = u16::from_be_bytes([udp_slice[0], udp_slice[1]]);
             let dst_port = u16::from_be_bytes([udp_slice[2], udp_slice[3]]);
             let udp_len = u16::from_be_bytes([udp_slice[4], udp_slice[5]]) as usize;
-            if udp_len < 8 {
+            if udp_len < 8 || udp_len > payload_len {
                 return None;
             }
 
             let payload_start = 48;
-            let payload_end = (40 + udp_len).min(packet_len);
+            let payload_end = 40 + udp_len;
             if payload_start > payload_end {
                 return None;
             }
@@ -165,6 +167,15 @@ pub struct SplitRead {
 }
 
 impl SplitRead {
+    pub fn poll_recv(&mut self, cx: &mut Context<'_>) -> Poll<Option<UdpPacket>> {
+        self.recv.poll_recv(cx)
+    }
+
+    pub fn poll_recv_many(&mut self, cx: &mut Context<'_>,
+        buffer: &mut Vec<UdpPacket>, limit: usize) -> Poll<usize> {
+        self.recv.poll_recv_many(cx, buffer, limit)
+    }
+
     /// Receive a single UDP packet.
     pub async fn recv(&mut self) -> Option<UdpPacket> {
         self.recv.recv().await
@@ -180,64 +191,67 @@ impl SplitRead {
     }
 }
 
+/// Successful submissions and deliberate congestion drops form one prefix.
+/// An error, if present, refers to the packet immediately after that prefix.
+pub struct UdpSendResult {
+    pub sent: usize,
+    pub dropped: usize,
+    pub error: Option<io::Error>,
+}
+
 #[derive(Clone)]
 pub struct SplitWrite {
     send: mpsc::Sender<Packet>,
 }
 
 impl SplitWrite {
-    pub async fn send(&mut self, packet: UdpPacket) -> Result<(), std::io::Error> {
+    /// Submit without waiting; a saturated queue deliberately drops the packet.
+    /// The async signature is retained for compatibility and does not yield.
+    /// A closed outbound channel returns `io::ErrorKind::BrokenPipe`.
+    pub async fn send(&mut self, packet: UdpPacket) -> io::Result<()> {
         let packet = encode_packet(&packet)?;
         match self.send.try_send(packet) {
             Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => Ok(()),
             Err(mpsc::error::TrySendError::Closed(_)) => {
-                Err(std::io::Error::other("packet outbound channel closed"))
+                Err(io::Error::new(io::ErrorKind::BrokenPipe, "packet outbound channel closed"))
             }
         }
     }
 
-    /// Reserve packet-based queue capacity once for the ready batch. Invalid
-    /// packets are reported after the independent valid packets are submitted;
-    /// excess packets are dropped, matching the single-packet UDP policy.
-    pub fn send_batch(&mut self, packets: &[UdpPacket]) -> Result<usize, std::io::Error> {
-        let count = packets.len();
-        if count == 0 {
-            return if self.send.is_closed() {
-                Err(std::io::Error::other("packet outbound channel closed"))
-            } else { Ok(0) };
+    /// Submit a contiguous prefix, stopping at the first invalid packet.
+    /// Queue saturation drops the unsubmitted suffix without blocking reads.
+    /// `sent + dropped` packets are consumed; an error belongs to the next one.
+    pub fn send_batch(&mut self, packets: &[UdpPacket]) -> UdpSendResult {
+        let mut result = UdpSendResult { sent: 0, dropped: 0, error: None };
+        if self.send.is_closed() {
+            result.error = Some(io::Error::new(io::ErrorKind::BrokenPipe, "packet outbound channel closed"));
+            return result;
         }
-        let mut permits = match self.send.try_reserve_many(count) {
-            Ok(permits) => Some(permits),
-            // Partial capacity or competing senders must not lose the batch.
-            // Keep the bulk fast path, then reserve individually under pressure.
-            Err(mpsc::error::TrySendError::Full(_)) => None,
-            Err(mpsc::error::TrySendError::Closed(_)) => {
-                return Err(std::io::Error::other("packet outbound channel closed"));
-            }
-        };
-        let mut sent = 0;
-        let mut error = None;
-        let mut permit = None;
-        for packet in packets {
-            if permit.is_none() {
-                permit = permits.as_mut().and_then(Iterator::next);
-                if permit.is_none() {
-                    match self.send.try_reserve() {
-                        Ok(reserved) => permit = Some(reserved),
-                        Err(mpsc::error::TrySendError::Full(_)) => break,
-                        Err(mpsc::error::TrySendError::Closed(_)) => {
-                            return Err(std::io::Error::other("packet outbound channel closed"));
-                        }
+        if packets.is_empty() { return result; }
+        let mut permits = self.send.try_reserve_many(packets.len()).ok();
+        for (index, packet) in packets.iter().enumerate() {
+            let permit = match permits.as_mut().and_then(Iterator::next) {
+                Some(permit) => permit,
+                None => match self.send.try_reserve() {
+                    Ok(permit) => permit,
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        result.dropped = packets.len() - index;
+                        break;
                     }
-                }
-            }
+                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                        result.error = Some(io::Error::new(io::ErrorKind::BrokenPipe, "packet outbound channel closed"));
+                        break;
+                    }
+                },
+            };
             match encode_packet(packet) {
-                Ok(packet) => { permit.take().unwrap().send(packet); sent += 1; }
-                Err(err) => { error.get_or_insert(err); }
+                Ok(packet) => { permit.send(packet); result.sent += 1; }
+                Err(error) => { result.error = Some(error); break; }
             }
         }
-        error.map_or(Ok(sent), Err)
+        result
     }
+
 }
 
 fn encode_packet(packet: &UdpPacket) -> Result<Packet, std::io::Error> {
@@ -452,7 +466,9 @@ mod batch_tests {
                 UdpPacket::from((Bytes::new(), source, target)),
                 UdpPacket::from((Bytes::from_static(b"odd"), source, target)),
             ];
-            assert_eq!(writer.send_batch(&packets).unwrap(), 2);
+            let result = writer.send_batch(&packets);
+            assert_eq!((result.sent, result.dropped), (2, packets.len() - 2));
+            assert!(result.error.is_none());
             for expected in &packets {
                 let packet = receive.recv().await.unwrap();
                 let raw = packet.data();
@@ -473,15 +489,19 @@ mod batch_tests {
         let packets: Vec<_> = (0..4).map(|i| UdpPacket::from((
             Bytes::from(vec![i]), "127.0.0.1:1".parse().unwrap(), "127.0.0.2:2".parse().unwrap(),
         ))).collect();
-        assert_eq!(writer.send_batch(&packets).unwrap(), 2);
-        assert_eq!(writer.send_batch(&packets).unwrap(), 0);
+        let result = writer.send_batch(&packets);
+        assert_eq!((result.sent, result.dropped), (2, 2));
+        assert!(result.error.is_none());
+        let result = writer.send_batch(&packets);
+        assert_eq!((result.sent, result.dropped), (0, 4));
+        assert!(result.error.is_none());
         for expected in &packets[..2] {
             let packet = receive.recv().await.unwrap();
             let (_, _, payload) = parse_udp_packet(packet.data()).unwrap();
             assert_eq!(&packet.data()[payload], expected.data());
         }
         drop(receive);
-        assert!(writer.send_batch(&packets).is_err());
+        assert_eq!(writer.send_batch(&packets).error.unwrap().kind(), io::ErrorKind::BrokenPipe);
     }
 
     #[tokio::test]
@@ -493,7 +513,9 @@ mod batch_tests {
         let packets: Vec<_> = (0..4).map(|i| UdpPacket::from((
             Bytes::from(vec![i]), "127.0.0.1:1".parse().unwrap(), "127.0.0.2:2".parse().unwrap(),
         ))).collect();
-        assert_eq!(writer.send_batch(&packets).unwrap(), 2);
+        let result = writer.send_batch(&packets);
+        assert_eq!((result.sent, result.dropped), (2, 2));
+        assert!(result.error.is_none());
         for expected in &packets[..2] {
             let packet = receive.try_recv().unwrap();
             let (_, _, payload) = parse_udp_packet(packet.data()).unwrap();
@@ -510,9 +532,71 @@ mod batch_tests {
             "127.0.0.1:1".parse().unwrap(), "127.0.0.2:2".parse().unwrap()));
         let invalid = UdpPacket::from((Bytes::new(),
             "127.0.0.1:1".parse().unwrap(), "[::1]:2".parse().unwrap()));
-        assert!(writer.send_batch(&[valid(), invalid, valid()]).is_err());
+        let packets = [valid(), invalid, valid()];
+        let result = writer.send_batch(&packets);
+        assert_eq!((result.sent, result.dropped), (1, 0));
+        assert_eq!(result.error.unwrap().kind(), io::ErrorKind::InvalidInput);
         assert!(receive.try_recv().is_ok());
+        assert!(receive.try_recv().is_err());
+        // Consume the successful prefix and invalid packet before retrying.
+        let result = writer.send_batch(&packets[2..]);
+        assert_eq!((result.sent, result.dropped), (1, 0));
+        assert!(result.error.is_none());
         assert!(receive.try_recv().is_ok());
         assert!(receive.try_recv().is_err());
     }
+
+    fn wire(ipv6: bool) -> Vec<u8> {
+        let (source, target) = if ipv6 { ("[::1]:1", "[::2]:2") }
+            else { ("127.0.0.1:1", "127.0.0.2:2") };
+        encode_packet(&UdpPacket::from((Bytes::from_static(b"payload"),
+            source.parse().unwrap(), target.parse().unwrap()))).unwrap().data().to_vec()
+    }
+
+    #[test]
+    fn rejects_fragments_and_truncated_datagrams_without_clamping() {
+        for flags in [0x2000u16, 1, 0x2001] {
+            let mut packet = wire(false);
+            packet[6..8].copy_from_slice(&flags.to_be_bytes());
+            assert!(parse_udp_packet(&packet).is_none());
+        }
+        for ipv6 in [false, true] {
+            let original = wire(ipv6);
+            let header = if ipv6 { 40 } else { 20 };
+            for size in 0..original.len() {
+                assert!(parse_udp_packet(&original[..size]).is_none(), "accepted truncated packet: {ipv6}/{size}");
+            }
+            for length in [0u16, 7, 16, u16::MAX] {
+                let mut packet = original.clone();
+                packet[header + 4..header + 6].copy_from_slice(&length.to_be_bytes());
+                assert!(parse_udp_packet(&packet).is_none(), "accepted UDP length {length}");
+            }
+            let mut padded = original.clone();
+            padded.extend_from_slice(b"padding");
+            let (_, _, payload) = parse_udp_packet(&padded).unwrap();
+            assert_eq!(&padded[payload], b"payload");
+        }
+        let mut ipv6 = wire(true);
+        ipv6[6] = 44; // Fragment header is not handled by this fast parser.
+        assert!(parse_udp_packet(&ipv6).is_none());
+    }
+
+    #[tokio::test]
+    async fn malformed_input_does_not_stop_following_valid_udp() {
+        use futures::SinkExt;
+        use tokio::time::{timeout, Duration};
+        let (stack, _listener, udp) = crate::NetStack::new();
+        let (mut sink, _output) = stack.split();
+        let (mut reader, _writer) = udp.split();
+        let valid = wire(false);
+        sink.send(Packet::new(valid[..27].to_vec())).await.unwrap();
+        let mut fragment = valid.clone();
+        fragment[6..8].copy_from_slice(&0x2000u16.to_be_bytes());
+        sink.send(Packet::new(fragment)).await.unwrap();
+        sink.send(Packet::new(valid)).await.unwrap();
+        let packet = timeout(Duration::from_secs(1), reader.recv()).await.unwrap().unwrap();
+        assert_eq!(packet.data(), b"payload");
+        assert!(timeout(Duration::from_millis(10), reader.recv()).await.is_err());
+    }
+
 }

@@ -3,7 +3,6 @@ use std::{collections::VecDeque, io, pin::Pin, task::{Context, Poll}};
 use futures::{Sink, Stream};
 #[cfg(any(
     test,
-    feature = "tun",
     feature = "shadowquic",
     all(target_os = "linux", any(feature = "tproxy", feature = "ebpf")),
 ))]
@@ -116,7 +115,6 @@ pub(crate) fn poll_send_ready(
 /// The caller completes the returned prefix before polling the batch again.
 #[cfg(any(
     test,
-    feature = "tun",
     feature = "shadowquic",
     all(target_os = "linux", any(feature = "tproxy", feature = "ebpf")),
 ))]

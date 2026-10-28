@@ -6,7 +6,7 @@ use tokio::net::UdpSocket;
 pub(super) const MAX_RECV_BATCH: usize = 16;
 const MAX_DATAGRAM_SIZE: usize = 65535;
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 thread_local! {
     // At most 1 MiB of scratch per receiving worker, never per association.
     // Kernel writes initialize the returned ranges; packets handed to queues
@@ -15,7 +15,7 @@ thread_local! {
         RefCell::new(Box::new_uninit_slice(MAX_RECV_BATCH * MAX_DATAGRAM_SIZE));
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
 thread_local! {
     static RECV_BUFFER: RefCell<Vec<u8>> = RefCell::new(vec![0; MAX_RECV_BATCH * MAX_DATAGRAM_SIZE]);
 }
@@ -49,7 +49,7 @@ pub(crate) fn recv_batch_map<M>(
         let mut packets = [None; MAX_RECV_BATCH];
         let mut total_len = 0;
         let count;
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         {
             use socket2::{SockAddr, SockAddrStorage};
             use std::os::fd::AsRawFd;
@@ -117,7 +117,7 @@ pub(crate) fn recv_batch_map<M>(
                 packets[i] = Some((i * MAX_DATAGRAM_SIZE, len, address));
             }
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
         {
             let mut received = 0;
             while received < limit {
@@ -147,13 +147,13 @@ pub(crate) fn recv_batch_map<M>(
         let mut metadata = std::array::from_fn::<_, MAX_RECV_BATCH, _>(|_| None);
         for i in 0..count {
             let Some((offset, len, address)) = packets[i] else { continue; };
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "android"))]
             // SAFETY: only initialized, non-truncated ranges are exposed. The
             // exclusive scratch borrow remains held until all copies finish.
             let data = unsafe {
                 std::slice::from_raw_parts_mut(buffer.as_mut_ptr().add(offset).cast::<u8>(), len)
             };
-            #[cfg(not(target_os = "linux"))]
+            #[cfg(not(any(target_os = "linux", target_os = "android")))]
             let data = &mut buffer[offset..offset + len];
             if let Some((output_len, value)) = transform(data, address) {
                 assert!(output_len <= len, "packet transform exceeded its initialized range");
@@ -164,7 +164,7 @@ pub(crate) fn recv_batch_map<M>(
         }
         let mut payloads = BytesMut::with_capacity(total_len);
         for &(offset, len, _) in packets[..count].iter().flatten() {
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "android"))]
             // SAFETY: recvmmsg initialized these ranges and truncated packets
             // were excluded above. The scratch remains borrowed until copying ends.
             let data = unsafe {
@@ -173,7 +173,7 @@ pub(crate) fn recv_batch_map<M>(
                     len,
                 )
             };
-            #[cfg(not(target_os = "linux"))]
+            #[cfg(not(any(target_os = "linux", target_os = "android")))]
             let data = &buffer[offset..offset + len];
             payloads.extend_from_slice(data);
         }

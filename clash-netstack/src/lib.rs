@@ -15,4 +15,4 @@ pub use stack::{NetStack, Packet, StackSplitSink, StackSplitStream};
 pub use tcp_listener::TcpListener;
 pub use tcp_forward::ForwardCounter;
 pub use tcp_stream::TcpStream;
-pub use udp_socket::{SplitRead, SplitWrite, UdpPacket, UdpSocket, parse_udp_packet};
+pub use udp_socket::{SplitRead, SplitWrite, UdpPacket, UdpSocket, UdpSendResult, parse_udp_packet};

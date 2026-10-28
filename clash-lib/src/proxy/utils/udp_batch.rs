@@ -2,18 +2,18 @@
 use std::{net::{SocketAddr, SocketAddrV6}, task::{Context, Poll}};
 use futures::ready;
 use tokio::net::UdpSocket;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 use tokio::io::Interest;
 use crate::proxy::datagram::batch::{BatchResult, MAX_BATCH_PACKETS};
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 use std::{io, mem::zeroed, os::fd::AsRawFd};
 #[cfg(all(target_os = "linux", any(feature = "tproxy", feature = "ebpf", test)))]
 use std::sync::Arc;
 #[cfg(all(target_os = "linux", any(feature = "tproxy", feature = "ebpf", test)))]
 use crate::{proxy::datagram::UdpPacket, session::SocksAddr};
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 use socket2::SockAddr;
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
 use super::poll_send_to_vectored;
 
 pub(crate) struct DatagramSlice<'a> {
@@ -26,7 +26,7 @@ pub(crate) fn poll_send_batch(
     socket: &UdpSocket, local_is_ipv6: bool, cx: &mut Context<'_>, packets: &[DatagramSlice<'_>],
 ) -> Poll<BatchResult> {
     assert!(!packets.is_empty() && packets.len() <= MAX_BATCH_PACKETS);
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     {
         let addresses = std::array::from_fn::<_, MAX_BATCH_PACKETS, _>(|i| {
             let destination = packets.get(i).unwrap_or(&packets[0]).destination;
@@ -80,7 +80,7 @@ pub(crate) fn poll_send_batch(
             }
         }
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
     {
         let packet = &packets[0];
         match ready!(poll_send_to_vectored(socket, cx, packet.header, packet.payload, map_destination(packet.destination, local_is_ipv6))) {
@@ -210,3 +210,7 @@ mod tests {
         }).await.unwrap();
     }
 }
+
+#[cfg(test)]
+#[path = "udp_batch_tests.rs"]
+mod socket_tests;

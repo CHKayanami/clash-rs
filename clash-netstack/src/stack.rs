@@ -226,8 +226,13 @@ impl futures::Sink<Packet> for StackSplitSink {
         }
 
         // TCP / ICMP parsing
-        let packet = IpPacket::new_checked(item.data())
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        let packet = match IpPacket::new_checked(item.data()) {
+            Ok(packet) => packet,
+            Err(error) => {
+                log::trace!("dropping malformed TUN IP packet: {error}");
+                return Ok(());
+            }
+        };
 
         let protocol = packet.protocol();
         if !self.enable_icmp && matches!(protocol, IpProtocol::Icmp | IpProtocol::Icmpv6) {

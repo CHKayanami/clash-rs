@@ -2,13 +2,11 @@ pub mod batch;
 pub(crate) mod framed;
 #[cfg(any(
     test,
-    feature = "tun",
     all(target_os = "linux", any(feature = "tproxy", feature = "ebpf")),
 ))]
 mod channel;
 #[cfg(any(
     test,
-    feature = "tun",
     all(target_os = "linux", any(feature = "tproxy", feature = "ebpf")),
 ))]
 pub use channel::ChannelDatagram;
