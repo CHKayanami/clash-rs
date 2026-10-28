@@ -1,7 +1,6 @@
 use std::{net::{Ipv4Addr, Ipv6Addr}, sync::Arc};
 
 use bytes::BytesMut;
-use futures::SinkExt;
 use smoltcp::wire::{IpProtocol, IpVersion, Ipv4Packet, Ipv6Packet};
 use tracing::debug;
 use clash_netstack::{Packet, StackSplitSink};
@@ -20,6 +19,10 @@ pub(super) struct PacketDispatcher {
 
 impl PacketDispatcher {
     pub async fn dispatch(&self, mut packet: BytesMut, stack: &mut StackSplitSink) -> Result<(), Error> {
+        if self.enable_tcp && !self.system_tcp {
+            stack.send_packet(Packet::from(packet))?;
+            return Ok(());
+        }
         let is_tcp = match IpVersion::of_packet(&packet) {
             Ok(IpVersion::Ipv4) => Ipv4Packet::new_checked(&packet[..])
                 .is_ok_and(|ip| ip.next_header() == IpProtocol::Tcp),
@@ -38,7 +41,7 @@ impl PacketDispatcher {
                 return Ok(());
             }
         }
-        stack.send(Packet::from(packet)).await?;
+        stack.send_packet(Packet::from(packet))?;
         Ok(())
     }
 }

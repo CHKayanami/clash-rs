@@ -1,10 +1,10 @@
 //! One owner for packet admission, socket registration and TCP polling.
 use std::{collections::HashMap, io, net::SocketAddr, sync::{Arc, atomic::Ordering},
-    task::{Context, Poll}, time::Duration, future::pending};
+    task::{Context, Poll}, time::Duration};
 use futures::task::waker_ref;
 use smoltcp::{iface::{Interface, SocketHandle, SocketSet}, socket::tcp,
     time::{Instant as StackInstant, Duration as StackDuration}, wire::{IpProtocol, TcpPacket}};
-use tokio::sync::mpsc;
+use tokio::{sync::mpsc, time::{Instant, sleep}};
 use crate::{Packet, device::NetstackDevice, interface::new_interface, packet::IpPacket,
     ready::{Ready, ReadyQueue}, tcp_buffers::Buffers,
     tcp_forward::{Forward, past_handshake}, tcp_listener::{TcpStreamHandle,
@@ -42,8 +42,8 @@ pub(crate) struct Engine {
 }
 
 impl Engine {
-    pub fn new(outbound: mpsc::Sender<Packet>, ready: Arc<ReadyQueue>) -> Self {
-        let mut device = NetstackDevice::new(outbound);
+    pub fn new(outbound: mpsc::Sender<Packet>, ready: Arc<ReadyQueue>, mtu: usize) -> Self {
+        let mut device = NetstackDevice::new(outbound, mtu);
         let iface = new_interface(&mut device);
         Self { iface, device, sockets: SocketSet::new(vec![]), entries: HashMap::new(),
             tuples: HashMap::new(), ready, next_id: 0 }
@@ -55,6 +55,7 @@ impl Engine {
         let mut protocol_due = true;
         let mut ready_batch = Vec::with_capacity(SOCKET_BUDGET);
         let output = self.device.output().clone();
+        let mut timer = Box::pin(sleep(Duration::ZERO));
         loop {
             // Keep the local device queue bounded to one ingress batch. Socket
             // registration and SYN injection happen together in admit().
@@ -83,12 +84,19 @@ impl Engine {
             }
             let delay = self.iface.poll_delay(StackInstant::now(), &self.sockets);
             let blocked_output = !self.device.output_available();
-            if !self.ready.is_empty() || (!self.device.is_empty() && !blocked_output) {
+            if streams.is_closed() || output.is_closed() { return Ok(()); }
+            if !self.ready.is_empty() || (!self.device.is_empty() && !blocked_output)
+                || (self.device.is_empty() && !inbound.is_empty()) {
                 // A continuous stream of application wakes must not starve
                 // retransmission and delayed-ACK timers.
                 protocol_due |= delay == Some(StackDuration::ZERO) && !blocked_output;
                 tokio::task::yield_now().await;
                 continue;
+            }
+            let timer_enabled = delay.is_some_and(|delay|
+                !blocked_output || delay != StackDuration::ZERO);
+            if let Some(delay) = delay.filter(|_| timer_enabled) {
+                timer.as_mut().reset(Instant::now() + Duration::from(delay));
             }
             tokio::select! {
                 value = inbound.recv(), if self.device.is_empty() => {
@@ -97,12 +105,7 @@ impl Engine {
                 }
                 _ = self.ready.notify.notified() => {}
                 // None means no protocol timer, not a request for a busy poll.
-                _ = async { match delay {
-                    Some(delay) if !blocked_output || delay != StackDuration::ZERO =>
-                        tokio::time::sleep(Duration::from(delay)).await,
-                    Some(_) => pending().await,
-                    None => pending().await,
-                } } => { protocol_due = true; }
+                _ = timer.as_mut(), if timer_enabled => { protocol_due = true; }
                 permit = output.reserve(), if blocked_output => {
                     drop(permit.map_err(|_| io::ErrorKind::BrokenPipe)?);
                     protocol_due = true;
@@ -127,9 +130,10 @@ impl Engine {
             Ok(tcp) => tcp,
             Err(_) => return Ok(()),
         };
-        let tuple = (SocketAddr::new(packet.src_addr(), tcp.src_port()),
-            SocketAddr::new(packet.dst_addr(), tcp.dst_port()));
-        if tcp.syn() && !tcp.ack() && !self.tuples.contains_key(&tuple) {
+        if tcp.syn() && !tcp.ack() {
+            let tuple = (SocketAddr::new(packet.src_addr(), tcp.src_port()),
+                SocketAddr::new(packet.dst_addr(), tcp.dst_port()));
+            if self.tuples.contains_key(&tuple) { self.device.inject(frame); return Ok(()); }
             if self.entries.len() >= MAX_CONNECTIONS { return Ok(()); }
             let permit = match streams.try_reserve() { Ok(permit) => permit, Err(_) => return Ok(()) };
             let (buffers, mut socket) = Buffers::new();
@@ -186,8 +190,9 @@ impl Engine {
         }
         let consumed = before.1.saturating_sub(socket.recv_queue());
         let send_capacity = socket.send_capacity();
+        let sent = socket.send_queue().saturating_sub(before.2);
         let grown = socket.is_active() && past_handshake(socket)
-            && entry.buffers.grow(socket, before.1, consumed);
+            && entry.buffers.grow(socket, before.1, consumed, sent);
         if socket.send_capacity() > send_capacity { entry.handle.notify(); }
         let changed = grown || before != (socket.state(), socket.recv_queue(), socket.send_queue());
         if !socket.is_active() && socket.remote_endpoint().is_none() {
@@ -201,6 +206,9 @@ impl Engine {
 }
 
 fn pump_stream(socket: &mut tcp::Socket<'_>, handle: &TcpStreamHandle) {
+    // Publish before checking ring capacity: a concurrent consumer either
+    // frees space for this pass or observes the flag and schedules another.
+    handle.recv_pending.store(socket.can_recv(), Ordering::Release);
     let mut budget = 64 * 1024;
     while socket.can_recv() && !handle.recv().is_full() && budget > 0 {
         let n = socket.recv(|data| {
@@ -209,9 +217,10 @@ fn pump_stream(socket: &mut tcp::Socket<'_>, handle: &TcpStreamHandle) {
         }).unwrap_or(0);
         if n == 0 { break; }
         budget -= n;
-        handle.recv_waker.wake();
     }
-    if budget == 0 { handle.notify(); }
+    if budget < 64 * 1024 { handle.recv_waker.wake(); }
+    if !socket.can_recv() { handle.recv_pending.store(false, Ordering::Release); }
+    if budget == 0 && socket.can_recv() && !handle.recv().is_full() { handle.notify(); }
     let mut budget = 64 * 1024;
     if let Some(buffer) = handle.send_buffer.get() {
         while socket.can_send() && !buffer.is_empty() && budget > 0 {
@@ -222,10 +231,11 @@ fn pump_stream(socket: &mut tcp::Socket<'_>, handle: &TcpStreamHandle) {
             }).unwrap_or(0);
             if n == 0 { break; }
             budget -= n;
-            handle.send_waker.wake();
         }
     }
-    if budget == 0 { handle.notify(); }
+    if budget < 64 * 1024 { handle.send_waker.wake(); }
+    if budget == 0 && socket.can_send()
+        && handle.send_buffer.get().is_some_and(|buffer| !buffer.is_empty()) { handle.notify(); }
     if past_handshake(socket) && !socket.may_recv() && !socket.can_recv()
         && !handle.read_closed.swap(true, Ordering::AcqRel) { handle.recv_waker.wake(); }
     let drained = handle.send_buffer.get().is_none_or(|buffer| buffer.is_empty());

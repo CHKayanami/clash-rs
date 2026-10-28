@@ -71,6 +71,7 @@ impl tokio::io::AsyncRead for TcpStream {
             "TcpStream::poll_read called: {} <-> {}",
             self.local_addr, self.remote_addr
         );
+        if buf.remaining() == 0 { return Poll::Ready(Ok(())); }
         let read_buf = self.handle.recv();
 
         if read_buf.is_empty() {
@@ -101,7 +102,9 @@ impl tokio::io::AsyncRead for TcpStream {
         let n = read_buf.dequeue_slice(buf.initialize_unfilled());
         buf.advance(n);
 
-        self.notify_tcp_socket_ready();
+        if n > 0 && self.handle.recv_pending.swap(false, Ordering::AcqRel) {
+            self.notify_tcp_socket_ready();
+        }
         trace!("TcpStream::poll_read: (proxy)read {n} bytes from recv buffer");
 
         Poll::Ready(Ok(()))
@@ -152,7 +155,7 @@ impl tokio::io::AsyncWrite for TcpStream {
         self: Pin<&mut Self>,
         _cx: &mut Context<'_>,
     ) -> Poll<std::io::Result<()>> {
-        self.notify_tcp_socket_ready();
+        // poll_write already publishes every accepted write to the engine.
         Poll::Ready(Ok(()))
     }
 
@@ -259,4 +262,29 @@ mod tests {
 
         assert!(matches!(result, Poll::Ready(Ok(()))));
     }
+    #[test]
+    fn reads_only_reschedule_engine_when_protocol_receive_data_is_waiting() {
+        let (mut stream, ready) = build_stream();
+        let mut cx = noop_cx();
+        for pending in [false, true] {
+            stream.handle.recv().enqueue_slice(b"data");
+            stream.handle.recv_pending.store(pending, Ordering::Release);
+            let mut storage = [0; 4];
+            let mut buffer = tokio::io::ReadBuf::new(&mut storage);
+            assert!(Pin::new(&mut stream).poll_read(&mut cx, &mut buffer).is_ready());
+            assert_eq!(buffer.filled(), b"data");
+            assert_eq!(ready.pop().is_some(), pending);
+        }
+    }
+
+    #[test]
+    fn flushing_an_accepted_write_does_not_schedule_a_second_service() {
+        let (mut stream, ready) = build_stream();
+        let mut cx = noop_cx();
+        assert!(Pin::new(&mut stream).poll_write(&mut cx, b"data").is_ready());
+        assert!(ready.pop().is_some());
+        assert!(Pin::new(&mut stream).poll_flush(&mut cx).is_ready());
+        assert!(ready.pop().is_none());
+    }
+
 }

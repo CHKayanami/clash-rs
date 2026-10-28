@@ -189,3 +189,23 @@ async fn cancelled_pending_handoff_drops_prefix_and_sends_reset() {
         }
     }).await.expect("pending handoff cancellation did not reset both endpoints");
 }
+
+#[tokio::test]
+async fn configured_mtu_controls_tcp_mss_with_synchronous_ingress() {
+    use std::time::Duration;
+    use smoltcp::{phy::ChecksumCapabilities, wire::{Ipv4Packet, TcpPacket, TcpRepr}};
+    for mtu in [1280, 1400, 9000, 65535] {
+        let (stack, _listener, _udp) = NetStack::new_with_mtu(true, true, mtu).unwrap();
+        let (mut input, mut output) = stack.split();
+        input.send_packet(build_tcp_syn_packet().into()).unwrap();
+        let reply = tokio::time::timeout(Duration::from_secs(1), output.next()).await
+            .unwrap().unwrap().unwrap();
+        let ip = Ipv4Packet::new_checked(reply.data()).unwrap();
+        let tcp = TcpPacket::new_checked(ip.payload()).unwrap();
+        let repr = TcpRepr::parse(&tcp, &ip.src_addr().into(), &ip.dst_addr().into(),
+            &ChecksumCapabilities::default()).unwrap();
+        assert!(is_syn_ack(reply.data()));
+        assert_eq!(repr.max_seg_size, Some((mtu - 40) as u16));
+        assert!(reply.data().len() <= mtu);
+    }
+}

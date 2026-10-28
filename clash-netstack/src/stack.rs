@@ -52,6 +52,7 @@ pub struct NetStack {
     udp_outbound: mpsc::Receiver<Packet>,
     icmp_outbound: Option<mpsc::Sender<Packet>>,
     enable_icmp: bool,
+    mtu: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -115,6 +116,15 @@ impl NetStack {
 
     /// Select TCP and local ICMP handling independently; UDP is always enabled.
     pub fn new_with_protocols(enable_tcp: bool, enable_icmp: bool) -> (Self, Option<TcpListener>, UdpSocket) {
+        Self::new_with_mtu(enable_tcp, enable_icmp, 1500).expect("valid default MTU")
+    }
+
+    /// Configure the actual L3 link MTU, independently of read buffer capacity.
+    pub fn new_with_mtu(enable_tcp: bool, enable_icmp: bool, mtu: usize)
+        -> io::Result<(Self, Option<TcpListener>, UdpSocket)> {
+        if !(1280..=65535).contains(&mtu) {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid dual-stack MTU"));
+        }
         // UDP uses a separate bounded channel. UDP is inherently lossy so
         // drop-on-full (via try_send) is correct; the bound prevents unbounded
         // memory growth if a remote floods responses faster than the consumer
@@ -129,8 +139,8 @@ impl NetStack {
         let udp_socket = UdpSocket::new(udp_outbound_stack, udp_packet_sender.clone());
         let (tcp_inbound_app, tcp_packet_receiver, tcp_listener) = if enable_tcp {
             let (sender, receiver) = mpsc::channel(4096);
-            let (inbound, packets) = mpsc::channel(256);
-            (Some(inbound), Some(receiver), Some(TcpListener::new(packets, sender)))
+            let (inbound, packets) = mpsc::channel(4096);
+            (Some(inbound), Some(receiver), Some(TcpListener::new(packets, sender, mtu)))
         } else { (None, None, None) };
 
         let stack = NetStack {
@@ -139,15 +149,15 @@ impl NetStack {
             tcp_outbound: tcp_packet_receiver,
             udp_outbound: udp_packet_receiver,
             icmp_outbound: (!enable_tcp && enable_icmp).then_some(udp_packet_sender),
-            enable_icmp,
+            enable_icmp, mtu,
         };
 
-        (stack, tcp_listener, udp_socket)
+        Ok((stack, tcp_listener, udp_socket))
     }
 
     pub fn split(self) -> (StackSplitSink, StackSplitStream) {
         (
-            StackSplitSink::new(self.udp_inbound, self.tcp_inbound, self.icmp_outbound, self.enable_icmp),
+            StackSplitSink::new(self.udp_inbound, self.tcp_inbound, self.icmp_outbound, self.enable_icmp, self.mtu),
             StackSplitStream::new(self.tcp_outbound, self.udp_outbound),
         )
     }
@@ -165,6 +175,7 @@ pub struct StackSplitSink {
     packet_container: Option<PendingInbound>,
     icmp_outbound: Option<mpsc::Sender<Packet>>,
     enable_icmp: bool,
+    mtu: usize,
     icmp: Option<Box<IcmpResponder>>,
 }
 
@@ -174,36 +185,29 @@ impl StackSplitSink {
         tcp_inbound: Option<mpsc::Sender<Packet>>,
         icmp_outbound: Option<mpsc::Sender<Packet>>,
         enable_icmp: bool,
+        mtu: usize,
     ) -> Self {
         Self {
             udp_inbound,
             tcp_inbound,
             packet_container: None,
             icmp_outbound,
-            enable_icmp,
+            enable_icmp, mtu,
             icmp: None,
         }
     }
 }
 
-impl futures::Sink<Packet> for StackSplitSink {
-    type Error = std::io::Error;
-
-    fn poll_ready(
-        self: std::pin::Pin<&mut Self>,
-        _cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Result<(), Self::Error>> {
-        if self.packet_container.is_none() {
-            std::task::Poll::Ready(Ok(()))
-        } else {
-            std::task::Poll::Pending
-        }
+impl StackSplitSink {
+    /// Submit synchronously without creating a per-packet Sink future.
+    /// Full queues retain the same drop policy as the Sink adapter.
+    pub fn send_packet(&mut self, item: Packet) -> io::Result<()> {
+        self.flush_pending()?;
+        self.enqueue_packet(item)?;
+        self.flush_pending()
     }
 
-    fn start_send(
-        mut self: std::pin::Pin<&mut Self>,
-        item: Packet,
-    ) -> Result<(), Self::Error> {
+    fn enqueue_packet(&mut self, item: Packet) -> io::Result<()> {
         if item.data().is_empty() {
             return Ok(());
         }
@@ -242,9 +246,9 @@ impl futures::Sink<Packet> for StackSplitSink {
             IpProtocol::Tcp | IpProtocol::Icmp | IpProtocol::Icmpv6) {
             self.packet_container = Some(PendingInbound::Tcp(item));
         } else if matches!(protocol, IpProtocol::Icmp | IpProtocol::Icmpv6) {
-            let this = self.get_mut();
+            let this = self;
             let outbound = this.icmp_outbound.as_ref().expect("ICMP output without TCP");
-            this.icmp.get_or_insert_with(|| Box::new(IcmpResponder::new(outbound))).respond(item, outbound);
+            this.icmp.get_or_insert_with(|| Box::new(IcmpResponder::new(outbound, this.mtu))).respond(item, outbound);
         } else {
             debug!("tun IP packet ignored (protocol: {protocol:?})");
         }
@@ -252,13 +256,10 @@ impl futures::Sink<Packet> for StackSplitSink {
         Ok(())
     }
 
-    fn poll_flush(
-        mut self: std::pin::Pin<&mut Self>,
-        _cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Result<(), Self::Error>> {
+    fn flush_pending(&mut self) -> io::Result<()> {
         let pending = match self.packet_container.take() {
             Some(val) => val,
-            None => return std::task::Poll::Ready(Ok(())),
+            None => return Ok(()),
         };
 
         match pending {
@@ -279,12 +280,35 @@ impl futures::Sink<Packet> for StackSplitSink {
                     // TCP retransmission recovers congestion loss. Never block
                     // the shared TUN reader (and UDP) on this queue.
                     Err(mpsc::error::TrySendError::Full(_)) => log::trace!("TCP input queue full"),
-                    Err(mpsc::error::TrySendError::Closed(_)) => return Poll::Ready(Err(
-                        io::Error::new(io::ErrorKind::BrokenPipe, "TCP stack stopped"))),
+                    Err(mpsc::error::TrySendError::Closed(_)) => return Err(
+                        io::Error::new(io::ErrorKind::BrokenPipe, "TCP stack stopped")),
                 }
             }
         }
-        std::task::Poll::Ready(Ok(()))
+        Ok(())
+    }
+}
+
+impl futures::Sink<Packet> for StackSplitSink {
+    type Error = std::io::Error;
+
+    fn poll_ready(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        if self.packet_container.is_none() {
+            std::task::Poll::Ready(Ok(()))
+        } else {
+            std::task::Poll::Pending
+        }
+    }
+
+    fn start_send(self: Pin<&mut Self>, item: Packet) -> Result<(), Self::Error> {
+        self.get_mut().enqueue_packet(item)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(self.get_mut().flush_pending())
     }
 
     fn poll_close(

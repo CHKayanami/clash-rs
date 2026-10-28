@@ -16,10 +16,10 @@ pub struct NetstackDevice {
 
 impl NetstackDevice {
     pub fn new(
-        tx_sender: mpsc::Sender<Packet>,
+        tx_sender: mpsc::Sender<Packet>, mtu: usize,
     ) -> Self {
         let mut capabilities = DeviceCapabilities::default();
-        capabilities.max_transmission_unit = 1500;
+        capabilities.max_transmission_unit = mtu;
         capabilities.medium = Medium::Ip;
 
 
@@ -76,11 +76,12 @@ impl Device for NetstackDevice {
 pub(crate) struct SinglePacketDevice<'a> {
     packet: Option<Packet>,
     outbound: &'a mpsc::Sender<Packet>,
+    mtu: usize,
 }
 
 impl<'a> SinglePacketDevice<'a> {
-    pub(crate) fn new(packet: Option<Packet>, outbound: &'a mpsc::Sender<Packet>) -> Self {
-        Self { packet, outbound }
+    pub(crate) fn new(packet: Option<Packet>, outbound: &'a mpsc::Sender<Packet>, mtu: usize) -> Self {
+        Self { packet, outbound, mtu }
     }
 }
 
@@ -100,7 +101,7 @@ impl Device for SinglePacketDevice<'_> {
 
     fn capabilities(&self) -> DeviceCapabilities {
         let mut capabilities = DeviceCapabilities::default();
-        capabilities.max_transmission_unit = 1500;
+        capabilities.max_transmission_unit = self.mtu;
         capabilities.medium = Medium::Ip;
         capabilities
     }
@@ -122,7 +123,7 @@ mod tests {
     #[tokio::test]
     async fn test_receive_drops_inbound_packet_when_tx_channel_full() {
         let (tx_sender, mut tx_receiver) = tokio::sync::mpsc::channel::<Packet>(1);
-        let mut device = NetstackDevice::new(tx_sender);
+        let mut device = NetstackDevice::new(tx_sender, 1500);
 
         // Fill the tx channel to its capacity of 1
         device
@@ -186,7 +187,7 @@ impl<'a> TxToken for TxTokenImpl<'a> {
         let mut buffer = crate::ring_buffer::acquire_vec(len);
         let result = f(&mut buffer[..len]);
 
-        let packet = Packet::new(bytes::Bytes::from(buffer).slice(..len));
+        let packet = Packet::new(buffer);
         self.tx_sender.send(packet);
 
         result

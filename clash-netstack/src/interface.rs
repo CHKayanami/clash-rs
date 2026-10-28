@@ -43,16 +43,17 @@ pub(crate) fn new_interface<D: Device>(device: &mut D) -> Interface {
 pub(crate) struct IcmpResponder {
     iface: Interface,
     sockets: SocketSet<'static>,
+    mtu: usize,
 }
 
 impl IcmpResponder {
-    pub(crate) fn new(outbound: &mpsc::Sender<Packet>) -> Self {
-        let mut device = SinglePacketDevice::new(None, outbound);
-        Self { iface: new_interface(&mut device), sockets: SocketSet::new(vec![]) }
+    pub(crate) fn new(outbound: &mpsc::Sender<Packet>, mtu: usize) -> Self {
+        let mut device = SinglePacketDevice::new(None, outbound, mtu);
+        Self { iface: new_interface(&mut device), sockets: SocketSet::new(vec![]), mtu }
     }
 
     pub(crate) fn respond(&mut self, packet: Packet, outbound: &mpsc::Sender<Packet>) {
-        let mut device = SinglePacketDevice::new(Some(packet), outbound);
+        let mut device = SinglePacketDevice::new(Some(packet), outbound, self.mtu);
         self.iface.poll(Instant::now(), &mut device, &mut self.sockets);
     }
 }

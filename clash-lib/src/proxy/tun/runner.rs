@@ -361,15 +361,22 @@ impl AsyncService for TunRunner {
 
         // Bind all fallible TCP listeners before publishing platform routes/DNS
         // or spawning the packet pipeline. Failure releases both listeners.
-        let listeners = TcpListeners::bind(&cfg).await.inspect_err(|_| {
+        let rollback_routes = || {
             #[cfg(not(any(target_os = "macos", target_os = "android")))]
             if let Err(error) = routes::maybe_routes_clean_up(&cfg) {
-                warn!("failed to roll back TUN routes after TCP initialization failure: {error}");
+                warn!("failed to roll back TUN routes after initialization failure: {error}");
             }
-        })?;
+        };
+        let listeners = TcpListeners::bind(&cfg).await.inspect_err(|_| rollback_routes())?;
 
-        let (stack, tcp_listener, udp_socket) =
-            NetStack::new_with_protocols(cfg.enable_tcp && !listeners.system, cfg.enable_tcp);
+        #[cfg(target_os = "android")]
+        let frame_size = usize::from(super::mobile::validate(&cfg).inspect_err(|_| rollback_routes())?);
+        #[cfg(not(target_os = "android"))]
+        let frame_size = usize::from(tun.mtu().inspect_err(|_| rollback_routes())?);
+
+        let (stack, tcp_listener, udp_socket) = NetStack::new_with_mtu(
+            cfg.enable_tcp && !listeners.system, cfg.enable_tcp, frame_size)
+            .inspect_err(|_| rollback_routes())?;
 
         // Externally supplied descriptors belong to their platform host; it
         // remains responsible for routes and DNS (e.g. NetworkExtension).
@@ -380,10 +387,6 @@ impl AsyncService for TunRunner {
                 !cfg.device_id.starts_with("fd://"), ctx, &cancellation_token).await?)
         } else { None };
 
-        #[cfg(target_os = "android")]
-        let frame_size = usize::from(super::mobile::validate(&cfg)?);
-        #[cfg(not(target_os = "android"))]
-        let frame_size = usize::from(tun.mtu()?);
         let (mut device_reader, mut device_writer) = device_io::split(
             &tun, frame_size, !cfg.device_id.starts_with("fd://"),
         )?;

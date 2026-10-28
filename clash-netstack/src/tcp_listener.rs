@@ -6,11 +6,13 @@ use crate::{Packet, ready::{Ready, ReadyQueue}, ring_buffer::LockFreeRingBuffer,
     tcp_engine::Engine, tcp_forward::ForwardRequest, tcp_stream::TcpStream};
 
 // Adapter queues decouple protocol relays from the growable protocol buffers.
-const STREAM_BUFFER_SIZE: usize = 16 * 1024;
+// One unused ring slot distinguishes full from empty. Allocate only on use.
+const STREAM_BUFFER_SIZE: usize = 64 * 1024 + 1;
 
 pub(crate) struct TcpStreamHandle {
     pub recv_buffer: OnceLock<LockFreeRingBuffer>,
     pub recv_waker: AtomicWaker,
+    pub recv_pending: AtomicBool,
     pub send_buffer: OnceLock<LockFreeRingBuffer>,
     pub send_waker: AtomicWaker,
     pub socket_dropped: AtomicBool,
@@ -28,6 +30,7 @@ impl TcpStreamHandle {
     pub fn new(ready: Arc<Ready>) -> Self {
         Self {
             recv_buffer: OnceLock::new(), recv_waker: AtomicWaker::new(),
+            recv_pending: AtomicBool::new(false),
             send_buffer: OnceLock::new(), send_waker: AtomicWaker::new(),
             socket_dropped: AtomicBool::new(false), socket_closed: AtomicBool::new(false),
             read_closed: AtomicBool::new(false), write_closed: AtomicBool::new(false),
@@ -65,11 +68,11 @@ impl Drop for TcpListener {
 }
 
 impl TcpListener {
-    pub fn new(inbound: mpsc::Receiver<Packet>, outbound: mpsc::Sender<Packet>) -> Self {
+    pub fn new(inbound: mpsc::Receiver<Packet>, outbound: mpsc::Sender<Packet>, mtu: usize) -> Self {
         let (sender, socket_stream) = mpsc::channel(256);
         let ready = Arc::new(ReadyQueue::default());
         let task_handle = tokio::spawn(async move {
-            if let Err(error) = Engine::new(outbound, ready).run(inbound, sender).await {
+            if let Err(error) = Engine::new(outbound, ready, mtu).run(inbound, sender).await {
                 log::debug!("TCP stack stopped: {error}");
             }
         });

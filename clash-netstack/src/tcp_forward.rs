@@ -77,13 +77,18 @@ impl Forward {
 
     pub fn poll(&mut self, socket: &mut tcp::Socket<'_>, handle: &TcpStreamHandle,
         cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        self.pump_upload(socket, handle, cx)?;
-        self.pump_download(socket, handle, cx)?;
+        let now = Instant::now();
+        let before = (self.upload, self.download);
+        let result = self.pump_upload(socket, handle, cx, now)
+            .and_then(|()| self.pump_download(socket, handle, cx, now));
+        let upload = (self.upload - before.0) as usize;
+        let download = (self.download - before.1) as usize;
+        if upload > 0 || download > 0 { (self.request.counter)(upload, download); }
+        result?;
         if past_handshake(socket) && !socket.may_send() && !self.download_done {
             return Poll::Ready(Err(closed_error()));
         }
         if self.upload_done && self.download_done { return Poll::Ready(Ok(())); }
-        let now = Instant::now();
         if self.half_close.is_some_and(|deadline| now >= deadline) {
             socket.close();
             return Poll::Ready(Ok(()));
@@ -94,12 +99,15 @@ impl Forward {
         if deadline < self.timer.deadline() || self.timer.is_elapsed() {
             self.timer.as_mut().reset(deadline);
         }
-        if self.timer.as_mut().poll(cx).is_ready() { handle.notify(); }
+        if self.timer.as_mut().poll(cx).is_ready() {
+            self.timer.as_mut().reset(deadline);
+            let _ = self.timer.as_mut().poll(cx);
+        }
         Poll::Pending
     }
 
     fn pump_upload(&mut self, socket: &mut tcp::Socket<'_>, handle: &TcpStreamHandle,
-        cx: &mut Context<'_>) -> io::Result<()> {
+        cx: &mut Context<'_>, now: Instant) -> io::Result<()> {
         let mut budget: usize = 64 * 1024;
         // Prefix bytes and already-published adapter bytes precede smoltcp RX.
         while !self.upload_done && budget > 0 {
@@ -107,7 +115,7 @@ impl Forward {
                 let end = (self.offset + budget).min(self.request.prefix.len());
                 match Pin::new(&mut self.request.socket).poll_write(cx, &self.request.prefix[self.offset..end]) {
                     Poll::Ready(Ok(0)) => return Err(io::ErrorKind::WriteZero.into()),
-                    Poll::Ready(Ok(n)) => { self.offset += n; self.count(n, 0); budget -= n; }
+                    Poll::Ready(Ok(n)) => { self.offset += n; self.count(n, 0, now); budget -= n; }
                     Poll::Ready(Err(error)) => return Err(error),
                     Poll::Pending => break,
                 }
@@ -120,7 +128,7 @@ impl Forward {
             }
             if let Some(buffer) = handle.recv_buffer.get() && !buffer.is_empty() {
                 // A stream used for sniffing can have adapter bytes queued at
-                // handoff. This bounded prefix is drained exactly once.
+                // handoff. Drain them in bounded chunks before protocol RX.
                 self.request.prefix.resize(16 * 1024, 0);
                 let n = buffer.dequeue_slice(&mut self.request.prefix);
                 self.request.prefix.truncate(n);
@@ -135,7 +143,7 @@ impl Forward {
                 }).map_err(|_| closed_error())?;
                 match written {
                     Poll::Ready(Ok(0)) => return Err(io::ErrorKind::WriteZero.into()),
-                    Poll::Ready(Ok(n)) => { self.count(n, 0); budget -= n; }
+                    Poll::Ready(Ok(n)) => { self.count(n, 0, now); budget -= n; }
                     Poll::Ready(Err(error)) => return Err(error),
                     Poll::Pending => break,
                 }
@@ -143,7 +151,7 @@ impl Forward {
                 match Pin::new(&mut self.request.socket).poll_shutdown(cx) {
                     Poll::Ready(Ok(())) => {
                         self.upload_done = true;
-                        self.half_close = Some(Instant::now() + self.request.download_timeout);
+                        self.half_close = Some(now + self.request.download_timeout);
                     },
                     Poll::Ready(Err(error)) => return Err(error),
                     Poll::Pending => break,
@@ -155,7 +163,7 @@ impl Forward {
     }
 
     fn pump_download(&mut self, socket: &mut tcp::Socket<'_>, handle: &TcpStreamHandle,
-        cx: &mut Context<'_>) -> io::Result<()> {
+        cx: &mut Context<'_>, now: Instant) -> io::Result<()> {
         let mut budget: usize = 64 * 1024;
         while !self.download_done && socket.can_send() && budget > 0 {
             // Drain writes accepted by the generic stream before handoff.
@@ -178,10 +186,10 @@ impl Forward {
             match read {
                 Poll::Ready(Ok(())) if n == 0 => {
                     self.download_done = true;
-                    self.half_close = Some(Instant::now() + self.request.upload_timeout);
+                    self.half_close = Some(now + self.request.upload_timeout);
                     socket.close();
                 }
-                Poll::Ready(Ok(())) => { self.count(0, n); budget -= n; }
+                Poll::Ready(Ok(())) => { self.count(0, n, now); budget -= n; }
                 Poll::Ready(Err(error)) => return Err(error),
                 Poll::Pending => break,
             }
@@ -190,15 +198,14 @@ impl Forward {
         Ok(())
     }
 
-    fn count(&mut self, upload: usize, download: usize) {
-        self.last_active = Instant::now();
+    fn count(&mut self, upload: usize, download: usize, now: Instant) {
+        self.last_active = now;
         if self.half_close.is_some() {
             let timeout = if upload > 0 { self.request.upload_timeout } else { self.request.download_timeout };
             self.half_close = Some(self.last_active + timeout);
         }
         self.upload += upload as u64;
         self.download += download as u64;
-        (self.request.counter)(upload, download);
     }
 }
 
