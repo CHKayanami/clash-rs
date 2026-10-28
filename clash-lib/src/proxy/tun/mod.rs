@@ -1,8 +1,10 @@
+#[cfg(any(target_os = "android", test))]
+mod mobile;
 mod datagram;
 mod device_io;
 #[cfg(target_os = "macos")]
 mod macos;
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "android")))]
 mod routes;
 pub mod runner;
 pub use runner::TunRunner;

@@ -1,7 +1,11 @@
-use std::{sync::Arc, time::Duration};
+use std::sync::Arc;
+#[cfg(not(target_os = "android"))]
+use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+use tracing::debug;
 use url::Url;
 use tun_rs::AsyncDevice;
 use watfaq_netstack::NetStack;
@@ -24,17 +28,19 @@ use super::{
     stream::TcpContext,
     tcp::TcpListeners,
 };
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "android")))]
 use super::routes;
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "android")))]
 use crate::app::net::{
     get_outbound_interface, update_default_outbound_interface_if_changed,
 };
 
 /// Maximum number of attempts to wait for a newly created TUN interface to
 /// become visible via NetworkInterface::show().
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 const TUN_VISIBILITY_MAX_ATTEMPTS: u32 = 40;
 /// Interval in milliseconds between each visibility poll attempt.
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 const TUN_VISIBILITY_POLL_INTERVAL_MS: u64 = 50;
 
 #[derive(Default)]
@@ -70,17 +76,21 @@ impl TunRunner {
     async fn new_internal(
         cfg: &TunConfig,
     ) -> Result<AsyncDevice, Error> {
+        #[cfg(target_os = "android")]
+        super::mobile::validate(cfg)?;
         let mut tun_init_config = TunInitializationConfig::default();
         match Url::parse(&cfg.device_id) {
             Ok(u) => match u.scheme() {
                 "fd" => {
-                    let fd = u
-                        .host()
-                        .expect("tun fd must be provided")
-                        .to_string()
+                    let fd: i32 = u
+                        .host_str()
+                        .ok_or_else(|| Error::InvalidConfig("tun fd must be provided".into()))?
                         .parse()
                         .map_err(|x| Error::InvalidConfig(format!("tun fd {x}")))?;
-                    tun_init_config.fd = Some(fd);
+                    if fd < 0 {
+                        return Err(Error::InvalidConfig("tun fd must be nonnegative".into()));
+                    }
+                    tun_init_config.fd = Some(fd as u32);
                 }
                 "dev" => {
                     let dev =
@@ -127,6 +137,15 @@ impl TunRunner {
         };
 
         let tun = if let Some(fd) = tun_init_config.fd {
+            #[cfg(target_os = "android")]
+            let fd = {
+                use std::os::fd::IntoRawFd;
+                use crate::android::take_registered_tun_fd;
+                match take_registered_tun_fd(fd as i32)? {
+                    Some(owned) => owned.into_raw_fd() as u32,
+                    None => fd,
+                }
+            };
             #[cfg(target_family = "unix")]
             {
                 info!("tun started with fd {}", fd);
@@ -142,7 +161,7 @@ impl TunRunner {
         } else {
             #[cfg(not(any(target_os = "ios", target_os = "android")))]
             {
-                #[cfg(not(target_os = "macos"))]
+                #[cfg(not(any(target_os = "macos", target_os = "android")))]
                 use crate::proxy::tun::routes::maybe_add_routes;
                 use network_interface::NetworkInterfaceConfig;
                 use tun_rs::DeviceBuilder;
@@ -276,7 +295,7 @@ impl TunRunner {
                 }
 
                 info!("setting up routes for tun {}", &tun_name);
-                #[cfg(not(target_os = "macos"))]
+                #[cfg(not(any(target_os = "macos", target_os = "android")))]
                 maybe_add_routes(cfg, &tun_name)?;
 
                 dev
@@ -295,7 +314,7 @@ impl TunRunner {
     pub fn shutdown(&self) {
         info!("shutting down tun runner");
         self.cancellation_token.cancel();
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(any(target_os = "macos", target_os = "android")))]
         match routes::maybe_routes_clean_up(&self.cfg) {
             Ok(_) => {}
             Err(e) => {
@@ -343,7 +362,7 @@ impl AsyncService for TunRunner {
         // Bind all fallible TCP listeners before publishing platform routes/DNS
         // or spawning the packet pipeline. Failure releases both listeners.
         let listeners = TcpListeners::bind(&cfg).await.inspect_err(|_| {
-            #[cfg(not(target_os = "macos"))]
+            #[cfg(not(any(target_os = "macos", target_os = "android")))]
             if let Err(error) = routes::maybe_routes_clean_up(&cfg) {
                 warn!("failed to roll back TUN routes after TCP initialization failure: {error}");
             }
@@ -361,6 +380,9 @@ impl AsyncService for TunRunner {
                 !cfg.device_id.starts_with("fd://"), ctx, &cancellation_token).await?)
         } else { None };
 
+        #[cfg(target_os = "android")]
+        let frame_size = usize::from(super::mobile::validate(&cfg)?);
+        #[cfg(not(target_os = "android"))]
         let frame_size = usize::from(tun.mtu()?);
         let (mut device_reader, mut device_writer) = device_io::split(
             &tun, frame_size, !cfg.device_id.starts_with("fd://"),
@@ -368,9 +390,9 @@ impl AsyncService for TunRunner {
         let tun_for_writer = tun.clone();
         let (mut stack_sink, mut stack_stream) = stack.split();
 
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(any(target_os = "macos", target_os = "android")))]
         let auto_detect_cancel = cancellation_token.clone();
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(any(target_os = "macos", target_os = "android")))]
         if cfg.auto_detect_interface {
             ctx.spawn(async move {
                 let mut interval =
@@ -510,7 +532,7 @@ impl AsyncService for TunRunner {
             if let Err(ref e) = run_res {
                 error!("tun runner error: {}", e);
             }
-            #[cfg(not(target_os = "macos"))]
+            #[cfg(not(any(target_os = "macos", target_os = "android")))]
             if let Err(e) = routes::maybe_routes_clean_up(&cfg) {
                 warn!("error cleaning up routes during tun runner shutdown: {}", e);
             }

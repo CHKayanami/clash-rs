@@ -46,6 +46,8 @@ use tokio::sync::{Mutex, broadcast, mpsc, oneshot};
 use tracing::{debug, error, info, warn};
 
 pub mod app;
+#[cfg(any(target_os = "android", all(test, unix)))]
+pub mod android;
 pub mod config;
 
 mod common;
@@ -378,14 +380,16 @@ pub async fn start(
     let (fatal_tx, mut fatal_rx) = mpsc::channel(16);
     let active_config = config.clone();
 
-    let components = create_components(
-        cwd_path.clone(),
-        config,
-        None,
-        Some(fatal_tx.clone()),
-        None,
-    )
-    .await?;
+    // The mobile host may revoke the VPN while initial providers are loading.
+    // Cancelling here drops pending initialization instead of waiting for every
+    // remote resource before the shutdown loop becomes reachable.
+    let components = tokio::select! {
+        biased;
+        _ = shutdown_token.cancelled() => return Ok(()),
+        result = create_components(
+            cwd_path.clone(), config, None, Some(fatal_tx.clone()), None,
+        ) => result?,
+    };
 
     let (reload_tx, mut reload_rx) = mpsc::channel(1);
 

@@ -1,4 +1,8 @@
 use std::future::Future;
+#[cfg(target_os = "android")]
+use std::os::fd::AsRawFd;
+#[cfg(target_os = "android")]
+use crate::android::protect_socket;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -167,6 +171,8 @@ pub(crate) fn direct_udp_socket(
 ) -> anyhow::Result<std::net::UdpSocket> {
     let domain = socket2::Domain::for_address(address);
     let socket = socket2::Socket::new(domain, socket2::Type::DGRAM, None)?;
+    #[cfg(target_os = "android")]
+    protect_socket(socket.as_raw_fd())?;
     socket.set_nonblocking(true)?;
     #[cfg(target_os = "linux")]
     if let Some(mark) = so_mark {

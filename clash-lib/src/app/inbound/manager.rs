@@ -341,7 +341,7 @@ impl InboundManager {
             let mut guard = self.inbound_handlers.write();
             for (opt, entry) in guard.iter_mut() {
                 if let Some(h) = entry.handle.take() {
-                    warn!(
+                    info!(
                         "Shutting down inbound handler: {}",
                         opt.common_opts().name
                     );
@@ -360,7 +360,7 @@ impl InboundManager {
             for handles in guard.values_mut() {
                 for (opt, entry) in handles.iter_mut() {
                     if let Some(h) = entry.handle.take() {
-                        warn!(
+                        info!(
                             "Shutting down provider inbound handler: {}",
                             opt.common_opts().name
                         );
@@ -389,7 +389,7 @@ impl InboundManager {
             }
         }
         for (name, h) in handles {
-            warn!("Shutting down inbound handler: {}", name);
+            info!("Shutting down inbound handler: {}", name);
             h.await.unwrap_or_else(|e| {
                 warn!("Inbound handler {} shutdown with error: {}", name, e);
                 last_join_error = Some(e);
@@ -409,7 +409,7 @@ impl InboundManager {
             }
         }
         for (name, h) in provider_handles {
-            warn!("Shutting down provider inbound handler: {}", name);
+            info!("Shutting down provider inbound handler: {}", name);
             h.await.unwrap_or_else(|e| {
                 warn!(
                     "Provider inbound handler {} shutdown with error: {}",

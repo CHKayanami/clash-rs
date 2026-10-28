@@ -1,4 +1,8 @@
 use super::platform::must_bind_socket_on_interface;
+#[cfg(target_os = "android")]
+use std::os::fd::AsRawFd;
+#[cfg(target_os = "android")]
+use crate::android::protect_socket;
 #[cfg(target_os = "linux")]
 use crate::app::net::get_tun_somark;
 use crate::{
@@ -83,6 +87,8 @@ pub fn prepare_tcp_socket(
     };
 
     let socket = Socket::new(domain, Type::STREAM, Some(protocol))?;
+    #[cfg(target_os = "android")]
+    protect_socket(socket.as_raw_fd())?;
     debug!("created tcp socket for {}", endpoint);
 
     // 接口绑定与策略路由
@@ -325,6 +331,18 @@ pub async fn new_udp_socket(
             socket2::Domain::IPV4,
         ),
     };
+    #[cfg(target_os = "android")]
+    {
+        protect_socket(socket.as_raw_fd())?;
+        let bind_addr = src.unwrap_or_else(|| {
+            if family == Domain::IPV6 {
+                SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0))
+            } else {
+                SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))
+            }
+        });
+        socket.bind(&bind_addr.into())?;
+    }
     debug!("created udp socket");
 
     if !cfg!(target_os = "android") {
@@ -452,6 +470,9 @@ pub fn new_dual_stack_udp_socket(
                 ipv4_only,
             ),
         };
+
+    #[cfg(target_os = "android")]
+    protect_socket(socket.as_raw_fd())?;
 
     if let Some(iface) = iface {
         let family = socket2::Domain::for_address(bind_addr);
