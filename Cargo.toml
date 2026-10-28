@@ -83,4 +83,5 @@ redundant_clone = "deny"
 needless_collect = "deny"
 
 [patch.crates-io]
+smoltcp = { git = "https://github.com/CHKayanami/smoltcp.git", rev = "6b126ba1e965add8d765dffee0338756ffdfb6da" }
 boring-sys = { git = "https://github.com/CHKayanami/boring-sys", rev = "d35cf29760a44f3c45a1199451aeca83bbae1d82" }

@@ -6,8 +6,8 @@ use smoltcp::{iface::{Interface, SocketHandle, SocketSet}, socket::tcp,
     time::{Instant as StackInstant, Duration as StackDuration}, wire::{IpProtocol, TcpPacket}};
 use tokio::sync::mpsc;
 use crate::{Packet, device::NetstackDevice, interface::new_interface, packet::IpPacket,
-    ready::{Ready, ReadyQueue}, ring_buffer::acquire_vec,
-    tcp_forward::{Forward, past_handshake}, tcp_listener::{TCP_BUFFER_SIZE, TcpStreamHandle,
+    ready::{Ready, ReadyQueue}, tcp_buffers::Buffers,
+    tcp_forward::{Forward, past_handshake}, tcp_listener::{TcpStreamHandle,
         closed_error, new_stream}, tcp_stream::TcpStream};
 
 const PACKET_BUDGET: usize = 32;
@@ -16,6 +16,7 @@ const MAX_CONNECTIONS: usize = 10_000;
 
 struct Entry {
     socket: SocketHandle,
+    buffers: Buffers,
     handle: Arc<TcpStreamHandle>,
     forward: Option<Forward>,
     tuple: (SocketAddr, SocketAddr),
@@ -131,9 +132,7 @@ impl Engine {
         if tcp.syn() && !tcp.ack() && !self.tuples.contains_key(&tuple) {
             if self.entries.len() >= MAX_CONNECTIONS { return Ok(()); }
             let permit = match streams.try_reserve() { Ok(permit) => permit, Err(_) => return Ok(()) };
-            let mut socket = tcp::Socket::new(
-                tcp::SocketBuffer::new(acquire_vec(TCP_BUFFER_SIZE)),
-                tcp::SocketBuffer::new(acquire_vec(TCP_BUFFER_SIZE)));
+            let (buffers, mut socket) = Buffers::new();
             socket.set_keep_alive(Some(StackDuration::from_secs(28)));
             socket.set_timeout(Some(StackDuration::from_secs(60)));
             socket.set_ack_delay(Some(Duration::from_millis(10).into()));
@@ -145,7 +144,7 @@ impl Engine {
             let ready = Ready::new(id, self.ready.clone());
             let (stream, handle) = new_stream(tuple.0, tuple.1, ready.clone());
             let socket = self.sockets.add(socket);
-            self.entries.insert(id, Entry { socket, handle, forward: None, tuple });
+            self.entries.insert(id, Entry { socket, buffers, handle, forward: None, tuple });
             self.tuples.insert(tuple, id);
             ready.schedule();
             permit.send(stream);
@@ -185,7 +184,12 @@ impl Engine {
         } else {
             pump_stream(socket, &entry.handle);
         }
-        let changed = before != (socket.state(), socket.recv_queue(), socket.send_queue());
+        let consumed = before.1.saturating_sub(socket.recv_queue());
+        let send_capacity = socket.send_capacity();
+        let grown = socket.is_active() && past_handshake(socket)
+            && entry.buffers.grow(socket, before.1, consumed);
+        if socket.send_capacity() > send_capacity { entry.handle.notify(); }
+        let changed = grown || before != (socket.state(), socket.recv_queue(), socket.send_queue());
         if !socket.is_active() && socket.remote_endpoint().is_none() {
             let socket_handle = entry.socket;
             self.sockets.remove(socket_handle);

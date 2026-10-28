@@ -1484,6 +1484,7 @@ dependencies = [
  "clash-common",
  "clash-dns",
  "clash-ebpf",
+ "clash-netstack",
  "clash-shadowsocks",
  "console-subscriber",
  "const-fnv1a-hash",
@@ -1597,13 +1598,34 @@ dependencies = [
  "tun-rs",
  "url",
  "uuid",
- "watfaq-netstack",
  "webpki-root-certs",
  "webpki-roots",
  "windows 0.62.2",
  "yaml_serde",
  "zip",
  "zstd",
+]
+
+[[package]]
+name = "clash-netstack"
+version = "0.20.24-alpha"
+dependencies = [
+ "bytes",
+ "clash-common",
+ "env_logger",
+ "futures",
+ "ipnet",
+ "libc",
+ "log",
+ "netstack-lwip",
+ "netstack-smoltcp",
+ "rand 0.10.3",
+ "smoltcp 0.14.0",
+ "socket2",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "tun-rs",
 ]
 
 [[package]]
@@ -8212,8 +8234,7 @@ dependencies = [
 [[package]]
 name = "smoltcp"
 version = "0.14.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b6f8b28ad56c6e35524a37dd492af5d1a47e31e1a4d175cd12f89c075f01980f"
+source = "git+https://github.com/CHKayanami/smoltcp.git?rev=6b126ba1e965add8d765dffee0338756ffdfb6da#6b126ba1e965add8d765dffee0338756ffdfb6da"
 dependencies = [
  "bitflags 1.3.2",
  "byteorder",
@@ -11394,28 +11415,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "23f0c9c52aa7cd7d77769a4cfe2a9adb1b331f489a41d912ce14513d5ab995c6"
 dependencies = [
  "unicode-ident",
-]
-
-[[package]]
-name = "watfaq-netstack"
-version = "0.1.0"
-dependencies = [
- "bytes",
- "clash-common",
- "env_logger",
- "futures",
- "ipnet",
- "libc",
- "log",
- "netstack-lwip",
- "netstack-smoltcp",
- "rand 0.10.3",
- "smoltcp 0.14.0",
- "socket2",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "tun-rs",
 ]
 
 [[package]]

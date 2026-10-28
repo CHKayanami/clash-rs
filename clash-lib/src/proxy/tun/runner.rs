@@ -8,7 +8,7 @@ use tracing::{error, info, warn};
 use tracing::debug;
 use url::Url;
 use tun_rs::AsyncDevice;
-use watfaq_netstack::NetStack;
+use clash_netstack::NetStack;
 
 use crate::{
     Error,

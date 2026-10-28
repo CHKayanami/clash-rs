@@ -3,7 +3,7 @@ use adapter::TunDatagram;
 use std::{sync::Arc, time::Duration};
 use ipnet::IpNet;
 use tracing::{debug, warn};
-use watfaq_netstack::UdpSocket;
+use clash_netstack::UdpSocket;
 use crate::{
     app::{dispatcher::Dispatcher, dns::ThreadSafeDNSResolver,
         net::get_default_outbound_interface},

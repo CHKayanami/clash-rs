@@ -243,7 +243,7 @@ fn log_filter(level: LogLevel) -> EnvFilter {
         EnvFilter::new("off")
     } else {
         EnvFilter::new(format!(
-            "warn,clash={level},clash_shadowsocks={level},clash_dns={level},watfaq_netstack={level}"
+            "warn,clash={level},clash_shadowsocks={level},clash_dns={level},clash_netstack={level}"
         ))
     };
     #[cfg(all(feature = "telemetry", tokio_unstable))]

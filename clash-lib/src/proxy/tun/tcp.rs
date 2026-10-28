@@ -3,7 +3,7 @@ use std::{net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr}, sync::Arc, time::Durati
 use tokio::{net::TcpListener, task::JoinSet};
 use futures::{StreamExt, future::pending};
 use tracing::{debug, error, trace};
-use watfaq_netstack::TcpListener as NetstackTcpListener;
+use clash_netstack::TcpListener as NetstackTcpListener;
 use super::{stream::{TcpContext, handle_inbound_stream, handle_inbound_netstack_stream},
     system_stack::SystemTcpNat};
 

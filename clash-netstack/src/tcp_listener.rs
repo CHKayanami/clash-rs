@@ -5,8 +5,7 @@ use tokio::{sync::mpsc, task::JoinHandle};
 use crate::{Packet, ready::{Ready, ReadyQueue}, ring_buffer::LockFreeRingBuffer,
     tcp_engine::Engine, tcp_forward::ForwardRequest, tcp_stream::TcpStream};
 
-pub(crate) const TCP_BUFFER_SIZE: usize = 64 * 1024;
-// Adapter queues decouple protocol relays; the protocol window remains 64 KiB.
+// Adapter queues decouple protocol relays from the growable protocol buffers.
 const STREAM_BUFFER_SIZE: usize = 16 * 1024;
 
 pub(crate) struct TcpStreamHandle {

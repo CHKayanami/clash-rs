@@ -3,7 +3,7 @@ use std::{future::pending, net::SocketAddr, sync::atomic::{AtomicBool, Ordering}
 use bytes::Bytes;
 use futures::{SinkExt, StreamExt, future::poll_fn};
 use tokio::{sync::mpsc, time::timeout};
-use watfaq_netstack::{Packet, parse_udp_packet};
+use clash_netstack::{Packet, parse_udp_packet};
 use crate::{app::dns::{MockClashResolver, query::{DnsName, QType, QueryContext}},
     proxy::utils::test_utils::noop::NoopResolver};
 

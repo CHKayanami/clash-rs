@@ -14,7 +14,7 @@ mod macos {
     //! dig google.com @1.1.1.1
     //! dig -6 google.com @2606:4700:4700::1111
     //! ```
-    //! This example demonstrates how to use the `watfaq_netstack` library with
+    //! This example demonstrates how to use the `clash_netstack` library with
     //! a TUN device created using `tun_rs`. It sets up a basic network
     //! stack that can handle TCP and UDP traffic through the TUN interface.
     use std::{ffi::CString, net::SocketAddr, pin::Pin};

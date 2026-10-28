@@ -65,7 +65,7 @@ pub(super) async fn handle_inbound_stream<S: ProxyStream + Sync + Into<AnyStream
 }
 
 pub(super) async fn handle_inbound_netstack_stream(
-    stream: watfaq_netstack::TcpStream, context: Arc<TcpContext>,
+    stream: clash_netstack::TcpStream, context: Arc<TcpContext>,
 ) {
     let source = stream.local_addr();
     let destination = stream.remote_addr();

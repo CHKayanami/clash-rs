@@ -8,7 +8,7 @@ See the [examples](examples) directory for how to use the `clash-netstack` libra
 To run the tests, use the following command:
 
 ```bash
-cargo test -p watfaq-netstack
+cargo test -p clash-netstack
 ```
 
 ## Disclaimer

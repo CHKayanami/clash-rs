@@ -5,7 +5,7 @@ use futures::{Sink, Stream, ready};
 use ipnet::IpNet;
 use tokio::{sync::oneshot, task::JoinSet};
 use tracing::{debug, trace, warn};
-use watfaq_netstack::{SplitRead, SplitWrite, UdpPacket as StackUdpPacket,
+use clash_netstack::{SplitRead, SplitWrite, UdpPacket as StackUdpPacket,
     UdpSocket};
 use crate::{
     app::dns::{ThreadSafeDNSResolver, exchange_with_resolver, query::IngressProfile},

@@ -4,7 +4,7 @@ use bytes::BytesMut;
 use futures::SinkExt;
 use smoltcp::wire::{IpProtocol, IpVersion, Ipv4Packet, Ipv6Packet};
 use tracing::debug;
-use watfaq_netstack::{Packet, StackSplitSink};
+use clash_netstack::{Packet, StackSplitSink};
 
 use crate::Error;
 use super::{packet_queue::Sender, system_stack::{SystemTcpNat, process_system_tcp_packet}};
@@ -50,7 +50,7 @@ mod tests {
     use futures::StreamExt;
     use smoltcp::wire::{IpAddress, TcpPacket, TcpSeqNumber};
     use tokio::time::timeout;
-    use watfaq_netstack::NetStack;
+    use clash_netstack::NetStack;
     use super::super::packet_queue;
 
     #[tokio::test]

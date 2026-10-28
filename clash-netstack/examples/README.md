@@ -7,10 +7,10 @@ Being the weaker implementation compared to netstack-lwip, there could be a few 
 - [ ] What else?
 
 
-### watfaq-netstack
+### clash-netstack
 
 ```
-cargo flamegraph -p watfaq-netstack --example with_tun_rs --root
+cargo flamegraph -p clash-netstack --example with_tun_rs --root
 
 
 ➜  ~ iperf3 -c dsm -t 10
@@ -38,7 +38,7 @@ iperf Done.
 ### netstack-lwip
 
 ```
-cargo flamegraph -p watfaq-netstack --example netstack_lwip --root
+cargo flamegraph -p clash-netstack --example netstack_lwip --root
 
 
 ➜  ~ iperf3 -c dsm -t 10
@@ -67,7 +67,7 @@ iperf Done.
 
 _Note that the socket buffer size matters in terms of max throughput._
 
-```cargo flamegraph -p watfaq-netstack --example netstack_smoltcp --root
+```cargo flamegraph -p clash-netstack --example netstack_smoltcp --root
 
 ➜  ~ iperf3 -c dsm -t 10
 Connecting to host dsm, port 5201

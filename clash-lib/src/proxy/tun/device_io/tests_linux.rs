@@ -5,7 +5,7 @@ use futures::StreamExt;
 use tokio::{net::UdpSocket, time::timeout};
 use tun_rs::DeviceBuilder;
 use socket2::SockRef;
-use watfaq_netstack::{NetStack, UdpPacket, parse_udp_packet};
+use clash_netstack::{NetStack, UdpPacket, parse_udp_packet};
 
 #[tokio::test]
 async fn receive_error_after_progress_is_delivered_on_next_read() {

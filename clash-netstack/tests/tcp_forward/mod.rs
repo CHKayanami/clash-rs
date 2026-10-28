@@ -1,5 +1,5 @@
 use futures::{SinkExt, StreamExt};
-use watfaq_netstack::NetStack;
+use clash_netstack::NetStack;
 use super::common::{self, build_tcp_ack, build_tcp_syn_packet, is_syn_ack,
     parse_server_isn, parse_tcp_data};
 

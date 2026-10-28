@@ -1,5 +1,5 @@
 use futures::{SinkExt, StreamExt};
-use watfaq_netstack::{NetStack, Packet};
+use clash_netstack::{NetStack, Packet};
 
 mod common;
 mod mock_tun;

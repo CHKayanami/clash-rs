@@ -117,7 +117,7 @@ impl ProxyStream for tokio::net::TcpStream {
 
 impl ProxyStream for tokio::io::DuplexStream {}
 #[cfg(feature = "tun")]
-impl ProxyStream for watfaq_netstack::TcpStream {}
+impl ProxyStream for clash_netstack::TcpStream {}
 impl ProxyStream for hyper_util::rt::TokioIo<hyper::upgrade::Upgraded> {}
 impl ProxyStream for tokio_tfo::TfoStream {}
 

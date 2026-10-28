@@ -70,7 +70,7 @@ use shadowsocks::{
 use tailscale::netstack::TcpStream as TailscaleTcpStream;
 use tokio_tfo::TfoStream;
 #[cfg(feature = "tun")]
-use watfaq_netstack::TcpStream as TunTcpStream;
+use clash_netstack::TcpStream as TunTcpStream;
 #[cfg(feature = "shadowquic")]
 use super::shadowquic::stream::ShadowQuicStream;
 

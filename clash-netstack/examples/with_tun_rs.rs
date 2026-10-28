@@ -14,7 +14,7 @@ mod macos {
     //! dig google.com @1.1.1.1
     //! dig -6 google.com @2606:4700:4700::1111
     //! ```
-    //! This example demonstrates how to use the `watfaq_netstack` library with
+    //! This example demonstrates how to use the `clash_netstack` library with
     //! a TUN device created using `tun_rs`. It sets up a basic network
     //! stack that can handle TCP and UDP traffic through the TUN interface.
     use std::{ffi::CString, net::SocketAddr, sync::Arc};
@@ -78,7 +78,7 @@ mod macos {
         tokio::net::UdpSocket::from_std(socket.into())
     }
 
-    async fn handle_inbound_stream(mut stream: watfaq_netstack::TcpStream) {
+    async fn handle_inbound_stream(mut stream: clash_netstack::TcpStream) {
         let start = std::time::Instant::now();
         let mut remote_stream =
             new_tcp_stream(stream.remote_addr(), OUTBOUND_INTERFACE)
@@ -98,7 +98,7 @@ mod macos {
         }
     }
 
-    async fn handle_inbound_datagram(socket: watfaq_netstack::UdpSocket) {
+    async fn handle_inbound_datagram(socket: clash_netstack::UdpSocket) {
         let (mut r, w) = socket.split();
         while let Some(packet) = r.recv().await {
             debug!("received UDP packet from tun inbound {packet:?}");
@@ -113,8 +113,8 @@ mod macos {
                         "received UDP packet from remote reply {n} bytes from \
                          {peer}"
                     );
-                    w.send(watfaq_netstack::UdpPacket {
-                        data: watfaq_netstack::Packet::new(buf[..n].to_vec()),
+                    w.send(clash_netstack::UdpPacket {
+                        data: clash_netstack::Packet::new(buf[..n].to_vec()),
                         local_addr: peer,
                         remote_addr: packet.local_addr,
                     })
@@ -244,7 +244,7 @@ mod macos {
 
         add_test_routes(tun_name);
 
-        let (stack, mut tcp_listener, udp_socket) = watfaq_netstack::NetStack::new();
+        let (stack, mut tcp_listener, udp_socket) = clash_netstack::NetStack::new();
 
         let framed = tun_rs::async_framed::DeviceFramed::new(
             dev,
@@ -282,7 +282,7 @@ mod macos {
                 match pkt {
                     Ok(pkt) => {
                         if let Err(e) =
-                            stack_sink.send(watfaq_netstack::Packet::new(pkt)).await
+                            stack_sink.send(clash_netstack::Packet::new(pkt)).await
                         {
                             error!("failed to send pkt to stack: {}", e);
                             break;

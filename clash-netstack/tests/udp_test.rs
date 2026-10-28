@@ -1,6 +1,6 @@
 use bytes::Bytes;
 use std::net::SocketAddr;
-use watfaq_netstack::{NetStack, Packet, UdpPacket, parse_udp_packet};
+use clash_netstack::{NetStack, Packet, UdpPacket, parse_udp_packet};
 
 #[test]
 fn test_parse_udp_v4() {
