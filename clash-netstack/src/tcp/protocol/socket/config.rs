@@ -209,23 +209,18 @@ impl<'a> Socket<'a> {
         u16::try_from(self.rx_buffer.window() >> self.remote_win_shift).unwrap_or(u16::MAX)
     }
 
-    /// Return the last window field value, including scaling according to RFC 1323.
-    ///
-    /// Used in internal calculations as well as packet generation.
-    ///
-    /// Unlike `remote_last_win_len`, we take into account new packets received (but not acknowledged)
-    /// since the last window update and adjust the window length accordingly. This ensures a fair
-    /// comparison between the last window length and the new window length we're going to
-    /// advertise.
+    /// Remaining bytes below the last advertised receive-window right edge.
+    /// Keep byte precision here: rounding before comparing right edges can
+    /// turn unchanged scaled windows into apparent capacity increases.
     #[inline]
-    pub(super) fn last_scaled_window(&self) -> Option<u16> {
+    pub(super) fn last_window_len(&self) -> Option<usize> {
         let last_ack = self.remote_last_ack?;
         let next_ack = self.remote_seq_no + self.rx_buffer.len();
 
         let last_win = self.remote_last_win_len;
         let last_win_adjusted = last_win.saturating_sub(next_ack - last_ack);
 
-        Some(u16::try_from(last_win_adjusted >> self.remote_win_shift).unwrap_or(u16::MAX))
+        Some(last_win_adjusted)
     }
 
     /// Set the timeout duration.
@@ -403,8 +398,9 @@ impl<'a> Socket<'a> {
     /// The replacement may be owned or borrowed; exclusive socket access
     /// ensures no slices into the previous storage can remain outstanding.
     /// Callers must poll the interface afterwards to publish window updates.
-    /// Growth alone triggers an immediate update only when the scaled available
-    /// window at least doubles the remaining previously advertised window.
+    /// Growth triggers an immediate update when the advertised right edge can
+    /// advance by the smaller of half the receive capacity and one local MSS,
+    /// or when a zero window can reopen after scaling.
     /// Smaller increases are advertised with subsequent outgoing segments.
     ///
     /// # Panics

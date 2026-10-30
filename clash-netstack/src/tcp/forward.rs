@@ -85,6 +85,14 @@ impl Forward {
         let download = (self.download - before.1) as usize;
         if upload > 0 || download > 0 { (self.request.counter)(upload, download); }
         result?;
+        if !self.download_done && handle.write_shutdown.load(Ordering::Acquire)
+            && handle.send_buffer.get().is_none_or(|buffer| buffer.is_empty()) {
+            // Handoff must preserve an earlier application write shutdown,
+            // but only after draining every write accepted by the stream.
+            self.download_done = true;
+            self.half_close = Some(now + self.request.upload_timeout);
+            socket.close();
+        }
         if past_handshake(socket) && !socket.may_send() && !self.download_done {
             return Poll::Ready(Err(closed_error()));
         }
@@ -175,6 +183,9 @@ impl Forward {
                 budget = budget.saturating_sub(n);
                 continue;
             }
+            // An explicit shutdown forbids new native downloads. Any writes
+            // accepted before handoff were drained by the branch above.
+            if handle.write_shutdown.load(Ordering::Acquire) { break; }
             let mut read = Poll::Pending;
             let n = socket.send(|data| {
                 let length = data.len().min(budget);

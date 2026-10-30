@@ -33,10 +33,11 @@ provides wire codecs, address/time types, and ICMP handling from crates.io
 TCP core; no workspace smoltcp patch is required.
 
 Input uses one authoritative four-tuple index. Protocol output has its own
-deduplicated FIFO: each ready connection emits one segment before rotating to
-the tail, with a per-pass limit of 128 work items and 256 KiB. Immediate ingress
+deduplicated FIFO: each ready connection emits up to two segments before rotating
+to the tail, with per-pass limits of 128 packets, 128 visits and 256 KiB. Immediate ingress
 control responses, including SYN|ACK, run before application close handling.
-Ingress itself is limited to a 32-packet engine batch.
+Ingress itself is limited to a 32-packet engine batch. Scheduling refreshes are
+coalesced per connection at the end of each batch, preserving first-seen order.
 
 The indexed minimum heap retains at most one protocol deadline per connection;
 updates and cancellation remove old records immediately. The engine reuses one
@@ -70,7 +71,18 @@ measured RTTs use a 1 ms floor to match clock precision;
 connections without an RTT measurement do not grow. Storage remains contiguous
 and is retained until the connection is released.
 
+Receive-window updates compare the advertised right edge in bytes after window
+scaling. Releasing half the receive capacity or one local MSS, whichever is
+smaller, publishes an update without waiting for window doubling. A zero window
+reopens immediately once nonzero space can be represented on the wire. Smaller
+increases can accompany other ACKs; no space beyond receive storage is promised.
+
+A native handoff preserves an earlier application write shutdown: queued
+stream writes drain before FIN, while the sniffed prefix and remaining upload
+are forwarded without reopening the download direction.
+
 ## Run Tests
+
 To run the tests, use the following command:
 
 ```bash

@@ -2,6 +2,91 @@
 use super::*;
 
 #[test]
+fn test_receive_window_publishes_mss_progress_without_doubling() {
+    for mtu in [1280, 1500, 9000] {
+        let mut s = socket_established_with_buffer_sizes(64, 32 * 1024);
+        s.cx = Context::new(mtu);
+        // The peer's advertised MSS limits our downloads, not its uploads.
+        s.remote_mss = 64;
+        let payload = vec![b'x'; 16 * 1024];
+        send(&mut s, Instant::ZERO, &TcpRepr {
+            seq_number: REMOTE_SEQ + 1,
+            ack_number: Some(LOCAL_SEQ + 1),
+            payload: &payload,
+            ..SEND_TEMPL
+        });
+        recv(&mut s, Instant::ZERO, |reply| {
+            assert_eq!(reply.unwrap().window_len, 16 * 1024);
+        });
+        let mss = mtu - 40;
+        assert_eq!(s.recv_slice(&mut vec![0; mss - 1]), Ok(mss - 1));
+        recv_nothing(&mut s, Instant::ZERO);
+        assert_eq!(s.recv_slice(&mut [0]), Ok(1));
+        let TestSocket { socket, cx } = &mut s;
+        assert_eq!(socket.poll_at(cx), PollAt::Now);
+        // A failed output reservation must not consume the pending update.
+        assert_eq!(socket.dispatch(cx, |_, _, _| Err(())), Err(()));
+        assert_eq!(socket.poll_at(cx), PollAt::Now);
+        recv(&mut s, Instant::ZERO, |reply| {
+            let reply = reply.unwrap();
+            assert_eq!(reply.ack_number, Some(REMOTE_SEQ + 1 + payload.len()));
+            assert_eq!(reply.window_len as usize, 16 * 1024 + mss);
+        });
+        recv_nothing(&mut s, Instant::ZERO);
+    }
+}
+
+#[test]
+fn test_scaled_receive_window_requires_representable_right_edge_progress() {
+    let mut s = socket_established_with_buffer_sizes(64, 16 * 1024);
+    s.remote_win_shift = 7;
+    s.remote_last_win_len = 16 * 1024;
+    let payload = vec![b'x'; 8192];
+    send(&mut s, Instant::ZERO, &TcpRepr {
+        seq_number: REMOTE_SEQ + 1,
+        ack_number: Some(LOCAL_SEQ + 1),
+        payload: &payload,
+        ..SEND_TEMPL
+    });
+    assert!(!s.window_to_update(&s.cx));
+    recv(&mut s, Instant::ZERO, |reply| {
+        assert_eq!(reply.unwrap().window_len, 8192 >> 7);
+    });
+    // 1460 bytes have been consumed, but only 1408 can be represented.
+    assert_eq!(s.recv_slice(&mut [0; 1460]), Ok(1460));
+    recv_nothing(&mut s, Instant::ZERO);
+    assert_eq!(s.recv_slice(&mut [0; 76]), Ok(76));
+    recv(&mut s, Instant::ZERO, |reply| {
+        assert_eq!(reply.unwrap().window_len as usize, (8192 + 1536) >> 7);
+    });
+    recv_nothing(&mut s, Instant::ZERO);
+}
+
+#[test]
+fn test_scaled_zero_receive_window_reopens_without_waiting_for_a_segment() {
+    let mut s = socket_established_with_buffer_sizes(64, 16 * 1024);
+    s.remote_win_shift = 7;
+    s.remote_last_win_len = 16 * 1024;
+    let payload = vec![b'x'; 16 * 1024];
+    send(&mut s, Instant::ZERO, &TcpRepr {
+        seq_number: REMOTE_SEQ + 1,
+        ack_number: Some(LOCAL_SEQ + 1),
+        payload: &payload,
+        ..SEND_TEMPL
+    });
+    recv(&mut s, Instant::ZERO, |reply| {
+        assert_eq!(reply.unwrap().window_len, 0);
+    });
+    assert_eq!(s.recv_slice(&mut [0; 127]), Ok(127));
+    recv_nothing(&mut s, Instant::ZERO);
+    assert_eq!(s.recv_slice(&mut [0]), Ok(1));
+    recv(&mut s, Instant::ZERO, |reply| {
+        assert_eq!(reply.unwrap().window_len, 1);
+    });
+    recv_nothing(&mut s, Instant::ZERO);
+}
+
+#[test]
 fn test_close_wait_no_window_update() {
     let mut s = socket_established();
     send!(
@@ -206,7 +291,7 @@ fn test_zero_window_fin() {
         }
     );
     assert_eq!(s.state, State::CloseWait);
-    assert_eq!(s.last_scaled_window(), Some(0));
+    assert_eq!(s.last_window_len(), Some(0));
 
     recv!(
         s,
@@ -313,13 +398,19 @@ fn test_window_update_with_delay_ack() {
         (1, ())
     })
     .unwrap();
+    recv_nothing!(s, time 5);
+    s.recv(|buffer| {
+        assert_eq!(&buffer[..1], b"e");
+        (1, ())
+    })
+    .unwrap();
     recv!(
         s,
         time 5,
         Ok(TcpRepr {
             seq_number: LOCAL_SEQ + 1,
             ack_number: Some(REMOTE_SEQ + 1 + 6),
-            window_len: 4,
+            window_len: 5,
             ..RECV_TEMPL
         })
     );
@@ -351,7 +442,7 @@ fn test_announce_window_after_read() {
     // Test that `dispatch` updates `remote_last_win_len`
     assert_eq!(s.remote_last_win_len, s.rx_buffer.window());
     s.recv(|buffer| (buffer.len(), ())).unwrap();
-    assert!(s.window_to_update());
+    assert!(s.window_to_update(&s.cx));
     recv!(
         s,
         [TcpRepr {
@@ -395,7 +486,7 @@ fn test_announce_window_after_read() {
     );
     assert_eq!(s.remote_last_win_len, s.rx_buffer.window());
     s.recv(|buffer| (buffer.len(), ())).unwrap();
-    assert!(s.window_to_update());
+    assert!(s.window_to_update(&s.cx));
 }
 
 #[test]

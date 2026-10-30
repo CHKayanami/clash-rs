@@ -399,7 +399,7 @@ fn growth_handshake(initial: usize) -> TestSocket {
         assert_eq!(reply.window_len, initial as u16);
         assert_eq!(reply.window_scale, Some(7));
     });
-    assert!(!s.window_to_update());
+    assert!(!s.window_to_update(&s.cx));
     assert_eq!(s.remote_last_win_len, initial);
     let ack = s.local_seq_no + 1;
     send(

@@ -11,17 +11,20 @@ use std::{convert::Infallible, net::SocketAddr};
 
 const OUTPUT_PACKETS: usize = 128;
 const OUTPUT_BYTES: usize = 256 * 1024;
+const OUTPUT_BURST: usize = 2;
 
 pub(crate) struct Driver {
     context: Context,
     icmp: Option<IcmpResponder>,
     mtu: usize,
     schedule: Schedule,
+    ingress_dirty: Vec<SocketHandle>,
 }
 
 impl Driver {
     pub fn new(mtu: usize) -> Self {
-        Self { context: Context::new(mtu), icmp: None, mtu, schedule: Schedule::default() }
+        Self { context: Context::new(mtu), icmp: None, mtu, schedule: Schedule::default(),
+            ingress_dirty: Vec::with_capacity(32) }
     }
 
     pub fn ingress(&mut self, now: Instant, device: &mut NetstackDevice, sockets: &mut SocketTable) {
@@ -66,9 +69,16 @@ impl Driver {
                     });
                 result.expect("reserved SYN response capacity");
             }
-            if let Some(handle) = handle { self.refresh(now, handle, sockets); }
-
+            if let Some(handle) = handle && !self.ingress_dirty.contains(&handle) {
+                self.ingress_dirty.push(handle);
+            }
         }
+        // Preserve first-seen order, including when output backpressure stops
+        // ingress early. Retain the scratch allocation for the next batch.
+        for index in 0..self.ingress_dirty.len() {
+            self.refresh(now, self.ingress_dirty[index], sockets);
+        }
+        self.ingress_dirty.clear();
     }
 
     /// Validate new-flow admission before publishing a stream. This extra
@@ -99,26 +109,40 @@ impl Driver {
         sockets.remove(handle);
     }
 
-    /// One segment per ready connection, then rotate to the tail. Keep both
+    /// A small burst per ready connection, then rotate to the tail. Keep both
     /// packet and byte budgets independent of MTU and active connection count.
     pub fn poll_egress(&mut self, now: Instant, device: &mut NetstackDevice, sockets: &mut SocketTable) {
         self.context.set_now(now);
         self.schedule.expire(now, OUTPUT_PACKETS);
         let output = device.output().clone();
         let mut bytes = 0;
+        let mut packets = 0;
+        // Also bound visits that produce no packets (for example a timer that
+        // changes state), independently of the emitted-packet budget.
         for _ in 0..OUTPUT_PACKETS {
-            if bytes >= OUTPUT_BYTES || output.capacity() == 0 { break; }
+            if packets >= OUTPUT_PACKETS || bytes >= OUTPUT_BYTES || output.capacity() == 0 { break; }
             let Some(handle) = self.schedule.pop_ready() else { break; };
-            let result: Result<(), ()> = sockets.get_mut(handle)
-                .dispatch(&mut self.context, |_, _, (ip, tcp)| {
-                    let length = ip.header_len() + tcp.buffer_len();
-                    if bytes + length > OUTPUT_BYTES { return Err(()); }
-                    let permit = output.try_reserve().map_err(|_| ())?;
-                    bytes += length;
-                    emit(permit, ip, tcp);
-                    Ok(())
-                });
-            if result.is_err() { self.schedule.retry(handle); break; }
+            let socket = sockets.get_mut(handle);
+            for _ in 0..OUTPUT_BURST {
+                if packets >= OUTPUT_PACKETS || bytes >= OUTPUT_BYTES || output.capacity() == 0 { break; }
+                let mut emitted = false;
+                let result: Result<(), ()> = socket
+                    .dispatch(&mut self.context, |_, _, (ip, tcp)| {
+                        let length = ip.header_len() + tcp.buffer_len();
+                        if bytes + length > OUTPUT_BYTES { return Err(()); }
+                        let permit = output.try_reserve().map_err(|_| ())?;
+                        bytes += length;
+                        packets += 1;
+                        emitted = true;
+                        emit(permit, ip, tcp);
+                        Ok(())
+                    });
+                if result.is_err() {
+                    self.schedule.retry(handle);
+                    return;
+                }
+                if !emitted { break; }
+            }
             self.refresh(now, handle, sockets);
         }
     }
@@ -283,6 +307,117 @@ mod tests {
         let (output, mut input) = mpsc::channel(1);
         emit(output.try_reserve().unwrap(), ip, repr);
         input.try_recv().unwrap()
+    }
+
+    fn established(driver: &mut Driver, sockets: &mut SocketTable, port: u16)
+        -> (SocketHandle, TcpSeqNumber) {
+        let packet = client_packet(port, None);
+        let (ip, payload) = parse_ip(packet.data()).unwrap();
+        let tcp = TcpPacket::new_checked(payload).unwrap();
+        let mut repr = TcpRepr::parse(&tcp, &ip.src_addr(), &ip.dst_addr(),
+            &ChecksumCapabilities::default()).unwrap();
+        repr.window_len = u16::MAX;
+        repr.window_scale = Some(7);
+        repr.max_seg_size = Some((driver.mtu - 40) as u16);
+        let mut socket = Socket::new(SocketBuffer::new(vec![0; 16384]),
+            SocketBuffer::new(vec![0; 512 * 1024]));
+        socket.listen(80).unwrap();
+        socket.process(&mut driver.context, &ip, &repr);
+        let mut ack = TcpSeqNumber(0);
+        socket.dispatch(&mut driver.context, |_, _, (_, tcp)| {
+            ack = tcp.seq_number + 1;
+            Ok::<_, Infallible>(())
+        }).unwrap();
+        repr.control = TcpControl::None;
+        repr.seq_number += 1;
+        repr.ack_number = Some(ack);
+        repr.window_scale = None;
+        repr.max_seg_size = None;
+        socket.process(&mut driver.context, &ip, &repr);
+        assert_eq!(socket.state(), State::Established);
+        socket.set_congestion_control(CongestionControl::None);
+        socket.set_nagle_enabled(false);
+        socket.send_slice(&vec![b'x'; 400 * 1024]).unwrap();
+        let flow = (SocketAddr::new(ip.src_addr().into(), port),
+            SocketAddr::new(ip.dst_addr().into(), 80));
+        let handle = sockets.add(socket, flow);
+        driver.refresh(Instant::ZERO, handle, sockets);
+        (handle, ack)
+    }
+
+    #[test]
+    fn busy_flows_rotate_after_small_bursts_with_a_global_packet_budget() {
+        let (output, mut input) = mpsc::channel(512);
+        let mut device = NetstackDevice::new(output);
+        let mut driver = Driver::new(1500);
+        let mut sockets = SocketTable::new();
+        established(&mut driver, &mut sockets, 49152);
+        established(&mut driver, &mut sockets, 49153);
+        driver.poll_egress(Instant::ZERO, &mut device, &mut sockets);
+        let mut count = 0;
+        while let Ok(packet) = input.try_recv() {
+            let (_, payload) = parse_ip(packet.data()).unwrap();
+            let tcp = TcpPacket::new_checked(payload).unwrap();
+            assert_eq!(tcp.dst_port(), 49152 + ((count / OUTPUT_BURST) % 2) as u16);
+            assert!(!tcp.payload().is_empty());
+            count += 1;
+        }
+        assert_eq!(count, OUTPUT_PACKETS);
+        assert!(driver.has_ready());
+    }
+
+    #[test]
+    fn byte_budget_preserves_unsent_data_and_resumes_on_the_next_poll() {
+        let (output, mut input) = mpsc::channel(512);
+        let mut device = NetstackDevice::new(output);
+        let mut driver = Driver::new(9000);
+        let mut sockets = SocketTable::new();
+        established(&mut driver, &mut sockets, 49152);
+        let mut expected = None;
+        for _ in 0..2 {
+            driver.poll_egress(Instant::ZERO, &mut device, &mut sockets);
+            let mut bytes = 0;
+            while let Ok(packet) = input.try_recv() {
+                bytes += packet.data().len();
+                let (_, payload) = parse_ip(packet.data()).unwrap();
+                let tcp = TcpPacket::new_checked(payload).unwrap();
+                if let Some(sequence) = expected { assert_eq!(tcp.seq_number(), sequence); }
+                expected = Some(tcp.seq_number() + tcp.payload().len());
+            }
+            assert!(bytes > 0 && bytes <= OUTPUT_BYTES);
+        }
+    }
+
+    #[test]
+    fn repeated_ingress_updates_keep_first_seen_order_and_final_deadlines() {
+        let (output, mut input) = mpsc::channel(512);
+        let mut device = NetstackDevice::new(output);
+        let mut driver = Driver::new(1500);
+        let mut sockets = SocketTable::new();
+        let (first, first_ack) = established(&mut driver, &mut sockets, 49152);
+        let (second, second_ack) = established(&mut driver, &mut sockets, 49153);
+        driver.schedule.remove(first);
+        driver.schedule.remove(second);
+        for (port, ack) in [(49152, first_ack), (49153, second_ack), (49152, first_ack)] {
+            device.inject(client_packet(port, Some(ack)));
+        }
+        driver.ingress(Instant::ZERO, &mut device, &mut sockets);
+        assert!(driver.ingress_dirty.is_empty());
+        assert_eq!(driver.schedule.pop_ready(), Some(first));
+        assert_eq!(driver.schedule.pop_ready(), Some(second));
+        assert_eq!(driver.schedule.pop_ready(), None);
+        assert!(input.try_recv().is_err());
+        driver.refresh(Instant::ZERO, first, &mut sockets);
+        driver.refresh(Instant::ZERO, second, &mut sockets);
+        driver.poll_egress(Instant::ZERO, &mut device, &mut sockets);
+        assert!(input.try_recv().is_ok());
+        for _ in 0..16 {
+            if !driver.has_ready() { break; }
+            while input.try_recv().is_ok() {}
+            driver.poll_egress(Instant::ZERO, &mut device, &mut sockets);
+        }
+        assert!(!driver.has_ready());
+        assert!(driver.poll_delay(Instant::ZERO).is_some());
     }
 
     #[test]

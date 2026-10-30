@@ -1,5 +1,6 @@
 // Derived from smoltcp; see ../LICENSE-0BSD.txt.
 use super::*;
+use smoltcp::wire::{IPV4_HEADER_LEN, IPV6_HEADER_LEN};
 
 impl<'a> Socket<'a> {
 
@@ -120,21 +121,24 @@ impl<'a> Socket<'a> {
         }
     }
 
-    /// Return whether we should send ACK immediately due to significant window updates.
-    ///
-    /// ACKs with significant window updates should be sent immediately to let the sender know that
-    /// more data can be sent. According to the Linux kernel implementation, "significant" means
-    /// doubling the receive window. The Linux kernel implementation can be found at
-    /// <https://elixir.bootlin.com/linux/v6.9.9/source/net/ipv4/tcp.c#L1472>.
-    pub(super) fn window_to_update(&self) -> bool {
+    /// Publish useful receive-space progress without waiting for window doubling.
+    /// Compare right edges in bytes after wire scaling. The receiver SWS
+    /// threshold is half the capacity or one expected segment, whichever is
+    /// smaller; reopening a representable zero window remains immediate.
+    pub(super) fn window_to_update(&self, cx: &Context) -> bool {
         match self.state {
             State::Established | State::FinWait1 | State::FinWait2 => {
-                let new_win = self.scaled_window();
-                if let Some(last_win) = self.last_scaled_window() {
-                    new_win > 0 && new_win / 2 >= last_win
-                } else {
-                    false
-                }
+                let Some(last_win) = self.last_window_len() else { return false; };
+                let Some(tuple) = self.tuple else { return false; };
+                let ip_header_len = match tuple.local.addr {
+                    IpAddress::Ipv4(_) => IPV4_HEADER_LEN,
+                    IpAddress::Ipv6(_) => IPV6_HEADER_LEN,
+                };
+                let mss = cx.ip_mtu().saturating_sub(ip_header_len + TCP_HEADER_LEN).max(1);
+                let threshold = self.rx_buffer.capacity().div_ceil(2).min(mss).max(1);
+                let new_win = (self.scaled_window() as usize) << self.remote_win_shift;
+                new_win > last_win && (last_win >> self.remote_win_shift == 0
+                    || new_win - last_win >= threshold)
             }
             _ => false,
         }
@@ -236,7 +240,7 @@ impl<'a> Socket<'a> {
         } else if self.ack_to_transmit() && self.delayed_ack_expired(cx.now()) {
             // If we have data to acknowledge, do it.
             tcp_trace!("outgoing segment will acknowledge");
-        } else if self.window_to_update() {
+        } else if self.window_to_update(cx) {
             // If we have window length increase to advertise, do it.
             tcp_trace!("outgoing segment will update window");
         } else if self.state == State::Closed {
@@ -552,7 +556,7 @@ impl<'a> Socket<'a> {
         } else if self.seq_to_transmit(cx) {
             // We have a data or flag packet to transmit.
             PollAt::Now
-        } else if self.window_to_update() {
+        } else if self.window_to_update(cx) {
             // The receive window has been raised significantly.
             PollAt::Now
         } else {

@@ -35,7 +35,7 @@ async fn native_handoff_preserves_prefix_buffered_bytes_and_half_close() {
         sink.send(build_tcp_ack(1, ack, u16::MAX).into()).await.unwrap();
         let mut stream = listener.next().await.unwrap();
         let upload = b"sniffed-prefix-and-buffered-tail";
-        sink.send(client_segment(1, ack, 0x18, upload).into()).await.unwrap();
+        sink.send(client_segment(1, ack, 0x19, upload).into()).await.unwrap();
         let mut prefix = vec![0; 7];
         stream.read_exact(&mut prefix).await.unwrap();
         let server = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -49,7 +49,7 @@ async fn native_handoff_preserves_prefix_buffered_bytes_and_half_close() {
             count_down.fetch_add(d, Ordering::Relaxed);
         }), Duration::from_secs(2), Duration::from_secs(2)));
         let seq = 1 + upload.len() as u32;
-        sink.send(client_segment(seq, ack, 0x11, &[]).into()).await.unwrap();
+
         let mut received = Vec::new();
         peer.read_to_end(&mut received).await.unwrap();
         assert_eq!(received, upload);
@@ -242,3 +242,53 @@ async fn invalid_syn_is_not_published_and_valid_retry_can_connect() {
     assert!(is_syn_ack(reply.data()));
     assert!(tokio::time::timeout(Duration::from_secs(1), listener.next()).await.unwrap().is_some());
 }
+
+#[tokio::test]
+async fn handoff_after_write_shutdown_preserves_prefix_and_accepted_tx() {
+    use std::time::Duration;
+    use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::{TcpListener, TcpStream}};
+    tokio::time::timeout(Duration::from_secs(3), async {
+        let (stack, mut listener, _udp) = NetStack::new();
+        let (mut sink, mut packets) = stack.split();
+        sink.send(build_tcp_syn_packet().into()).await.unwrap();
+        let syn = packets.next().await.unwrap().unwrap();
+        let mut ack = parse_server_isn(syn.data()).wrapping_add(1);
+        sink.send(build_tcp_ack(1, ack, u16::MAX).into()).await.unwrap();
+        let mut stream = listener.next().await.unwrap();
+        stream.write_all(b"accepted-before-shutdown").await.unwrap();
+        stream.shutdown().await.unwrap();
+        let mut accepted = Vec::new();
+        loop {
+            let packet = packets.next().await.unwrap().unwrap();
+            if let Some((start, length)) = parse_tcp_data(packet.data()) {
+                let ip = (packet.data()[0] & 15) as usize * 4;
+                let tcp = (packet.data()[ip + 12] >> 4) as usize * 4;
+                assert_eq!(packet.data()[ip + 13] & 4, 0, "unexpected reset");
+                if start == ack && length > 0 {
+                    accepted.extend_from_slice(&packet.data()[ip + tcp..]);
+                    ack = ack.wrapping_add(length as u32);
+                }
+                let fin = packet.data()[ip + 13] & 1 != 0;
+                if fin { ack = ack.wrapping_add(1); }
+                sink.send(build_tcp_ack(1, ack, u16::MAX).into()).await.unwrap();
+                if fin { break; }
+            }
+        }
+        assert_eq!(accepted, b"accepted-before-shutdown");
+        let request = b"sniffed-request-with-fin";
+        sink.send(client_segment(1, ack, 0x19, request).into()).await.unwrap();
+        let mut prefix = vec![0; 7];
+        stream.read_exact(&mut prefix).await.unwrap();
+        let server = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let native = TcpStream::connect(server.local_addr().unwrap()).await.unwrap();
+        let (mut peer, _) = server.accept().await.unwrap();
+        let relay = tokio::spawn(stream.forward(native, prefix, Box::new(|_, _| {}),
+            Duration::from_secs(1), Duration::from_secs(1)));
+        let mut uploaded = Vec::new();
+        peer.read_to_end(&mut uploaded).await.unwrap();
+        assert_eq!(uploaded, request);
+        assert_eq!(relay.await.unwrap().unwrap(), (request.len() as u64, 0));
+    }).await.expect("half-closed handoff stalled");
+}
+
+mod half_close;

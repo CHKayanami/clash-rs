@@ -22,7 +22,7 @@ fn test_buffer_growth_preserves_wrapped_receive_and_reassembly() {
     let mut data = [0; 8];
     assert_eq!(s.recv_slice(&mut data).unwrap(), 8);
     assert_eq!(&data, b"abcdefgh");
-    assert!(s.window_to_update());
+    assert!(s.window_to_update(&s.cx));
 }
 
 #[test]
@@ -140,28 +140,39 @@ fn test_buffer_growth_after_handshake_publishes_scaled_window() {
     for (initial, capacity) in [(4096, 8192), (4096, 128 * 1024), (64, 8192)] {
         let mut s = growth_handshake(initial);
         s.grow_receive_buffer(SocketBuffer::new(vec![0; capacity]));
-        assert!(s.window_to_update());
+        assert!(s.window_to_update(&s.cx));
         let TestSocket { socket, cx } = &mut s;
         assert_eq!(socket.poll_at(cx), PollAt::Now);
         recv(&mut s, Instant::from_millis(0), |reply| {
             assert_eq!(reply.unwrap().window_len as usize, capacity >> 7);
         });
         assert_eq!(s.remote_last_win_len, capacity);
-        assert!(!s.window_to_update());
+        assert!(!s.window_to_update(&s.cx));
     }
 }
 
 #[test]
 fn test_buffer_growth_small_increase_waits_for_other_output() {
     let mut s = growth_handshake(4096);
-    s.grow_receive_buffer(SocketBuffer::new(vec![0; 6144]));
-    assert!(!s.window_to_update());
+    s.grow_receive_buffer(SocketBuffer::new(vec![0; 5120]));
+    assert!(!s.window_to_update(&s.cx));
     recv_nothing(&mut s, Instant::from_millis(0));
     s.send_slice(b"x").unwrap();
     recv(&mut s, Instant::from_millis(0), |reply| {
+        assert_eq!(reply.unwrap().window_len as usize, 5120 >> 7);
+    });
+    assert_eq!(s.remote_last_win_len, 5120);
+}
+
+#[test]
+fn test_buffer_growth_below_double_publishes_a_segment_of_new_space() {
+    let mut s = growth_handshake(4096);
+    s.grow_receive_buffer(SocketBuffer::new(vec![0; 6144]));
+    assert!(s.window_to_update(&s.cx));
+    recv(&mut s, Instant::ZERO, |reply| {
         assert_eq!(reply.unwrap().window_len as usize, 6144 >> 7);
     });
-    assert_eq!(s.remote_last_win_len, 6144);
+    assert!(!s.window_to_update(&s.cx));
 }
 
 #[test]
