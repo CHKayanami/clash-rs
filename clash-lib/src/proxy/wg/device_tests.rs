@@ -62,3 +62,70 @@ async fn task_owned_socket_set_routes_udp_and_accepts_new_sockets() {
     let _ = polling.await;
     drop(incoming);
 }
+
+#[tokio::test]
+async fn upstream_tcp_socket_completes_handshake_and_bidirectional_transfer() {
+    use smoltcp::{phy::ChecksumCapabilities, wire::{IpAddress, IpProtocol, Ipv4Repr,
+        TcpControl, TcpPacket, TcpRepr, TcpSeqNumber}};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let (notifier, notified) = mpsc::channel(4);
+    let manager = Arc::new(DeviceManager::new(
+        Ipv4Addr::new(10, 0, 0, 1), None, Arc::new(NoopResolver), Vec::new(), notified,
+    ));
+    let (outgoing, mut packets) = mpsc::channel(8);
+    let (incoming, received) = mpsc::channel(8);
+    let device = VirtualIpDevice::new(outgoing, received, notifier, 1500);
+    let polling = tokio::spawn({
+        let manager = manager.clone();
+        async move { manager.poll_sockets(device).await }
+    });
+    let mut stream = manager.new_tcp_socket(SocketAddr::from(([10, 0, 0, 2], 443))).await;
+    let syn = tokio::time::timeout(Duration::from_secs(1), packets.recv()).await.unwrap().unwrap();
+    let ip = Ipv4Packet::new_checked(&syn[..]).unwrap();
+    let tcp = TcpPacket::new_checked(ip.payload()).unwrap();
+    assert!(tcp.syn());
+    let local_port = tcp.src_port();
+    let client_sequence = tcp.seq_number() + 1;
+    let reply = |control, sequence, ack, payload: &[u8]| {
+        let tcp = TcpRepr {
+            src_port: 443, dst_port: local_port, control, seq_number: sequence,
+            ack_number: Some(ack), window_len: 65535, window_scale: None,
+            max_seg_size: if control == TcpControl::Syn { Some(1460) } else { None },
+            sack_permitted: false, sack_ranges: [None; 3], timestamp: None, payload,
+        };
+        let ip = Ipv4Repr {
+            src_addr: Ipv4Addr::new(10, 0, 0, 2), dst_addr: Ipv4Addr::new(10, 0, 0, 1),
+            next_header: IpProtocol::Tcp, payload_len: tcp.buffer_len(), hop_limit: 64,
+        };
+        let checksums = ChecksumCapabilities::default();
+        let mut bytes = vec![0; 20 + tcp.buffer_len()];
+        ip.emit(&mut Ipv4Packet::new_unchecked(&mut bytes[..20]), &checksums);
+        tcp.emit(&mut TcpPacket::new_unchecked(&mut bytes[20..]),
+            &IpAddress::from(ip.src_addr), &IpAddress::from(ip.dst_addr), &checksums);
+        Bytes::from(bytes)
+    };
+    incoming.send((PortProtocol::Tcp,
+        reply(TcpControl::Syn, TcpSeqNumber(900), client_sequence, &[]))).await.unwrap();
+    stream.write_all(b"hello").await.unwrap();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            let packet = packets.recv().await.unwrap();
+            let ip = Ipv4Packet::new_checked(&packet[..]).unwrap();
+            let tcp = TcpPacket::new_checked(ip.payload()).unwrap();
+            assert!(tcp.verify_checksum(&IpAddress::from(ip.src_addr()), &IpAddress::from(ip.dst_addr())));
+            if !tcp.payload().is_empty() {
+                assert_eq!(tcp.payload(), b"hello");
+                assert_eq!(tcp.seq_number(), client_sequence);
+                break;
+            }
+        }
+    }).await.unwrap();
+    incoming.send((PortProtocol::Tcp,
+        reply(TcpControl::Psh, TcpSeqNumber(901), client_sequence + 5, b"world"))).await.unwrap();
+    let mut bytes = [0; 5];
+    tokio::time::timeout(Duration::from_secs(1), stream.read_exact(&mut bytes)).await.unwrap().unwrap();
+    assert_eq!(&bytes, b"world");
+    polling.abort();
+    let _ = polling.await;
+}

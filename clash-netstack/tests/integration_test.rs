@@ -221,12 +221,9 @@ async fn test_speedtest_bulk_download() {
 /// before `iface.poll()` ran.  smoltcp saw the incoming SYN with no matching
 /// socket in the `SocketSet` and replied with RST.
 ///
-/// **Fix**: drain `notifier_rx` with `try_recv()` before every `iface.poll()`
-/// call, regardless of `should_poll_now`.
-///
-/// **How to observe the failure**: remove the `loop { notifier_rx.try_recv() …
-/// }` block in `poll_sockets` (tcp_listener.rs ~line 327).  The test will then
-/// either panic with "Got RST" or time out at the 5-second SYN-ACK deadline.
+/// The current engine registers each socket and admits its SYN together in
+/// `src/tcp/engine.rs`. Active downloads must not delay that registration or
+/// allow protocol processing to reject a new connection with RST.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_new_connection_during_active_transfer() {
     init();

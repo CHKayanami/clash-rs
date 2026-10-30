@@ -12,10 +12,10 @@ use tokio::sync::mpsc;
 
 use crate::{
     UdpSocket,
-    debug::trace_ip_packet,
-    packet::IpPacket,
-    interface::IcmpResponder,
-    tcp_listener::TcpListener,
+    link::debug::trace_ip_packet,
+    link::packet::IpPacket,
+    link::icmp::IcmpResponder,
+    tcp::listener::TcpListener,
 };
 
 /// Thin `Stream` wrapper around a bounded `mpsc::Receiver`.
@@ -42,7 +42,7 @@ impl Stream for ReceiverStream {
 /// Application can Stream the packets from the stack
 pub struct NetStack {
     // where the packets get into UDP Stack
-    udp_inbound: mpsc::Sender<crate::udp_socket::UdpPacket>,
+    udp_inbound: mpsc::Sender<crate::udp::socket::UdpPacket>,
     // inject TCP packets into the stack
     // where the packets get into TCP Stack
     tcp_inbound: Option<mpsc::Sender<Packet>>,
@@ -107,8 +107,8 @@ impl NetStack {
     /// Returns the NetStack instance, a TcpListener and a UdpSocket
     pub fn new() -> (
         Self,
-        crate::tcp_listener::TcpListener,
-        crate::udp_socket::UdpSocket,
+        crate::tcp::listener::TcpListener,
+        crate::udp::socket::UdpSocket,
     ) {
         let (stack, listener, udp) = Self::new_with_protocols(true, true);
         (stack, listener.expect("TCP enabled"), udp)
@@ -132,13 +132,14 @@ impl NetStack {
         let (udp_packet_sender, udp_packet_receiver) = mpsc::channel::<Packet>(4096);
 
         let (udp_inbound_app, udp_outbound_stack) =
-            mpsc::channel::<crate::udp_socket::UdpPacket>(4096);
+            mpsc::channel::<crate::udp::socket::UdpPacket>(4096);
 
         // this UdpSocket is essentially an Iface for UDP but much simpler as it only
         // does packets forwarding
         let udp_socket = UdpSocket::new(udp_outbound_stack, udp_packet_sender.clone());
         let (tcp_inbound_app, tcp_packet_receiver, tcp_listener) = if enable_tcp {
-            let (sender, receiver) = mpsc::channel(4096);
+            // Bound local TCP output residence independently of ingress capacity.
+            let (sender, receiver) = mpsc::channel(512);
             let (inbound, packets) = mpsc::channel(4096);
             (Some(inbound), Some(receiver), Some(TcpListener::new(packets, sender, mtu)))
         } else { (None, None, None) };
@@ -164,12 +165,12 @@ impl NetStack {
 }
 
 enum PendingInbound {
-    Udp(crate::udp_socket::UdpPacket),
+    Udp(crate::udp::socket::UdpPacket),
     Tcp(Packet),
 }
 
 pub struct StackSplitSink {
-    udp_inbound: mpsc::Sender<crate::udp_socket::UdpPacket>,
+    udp_inbound: mpsc::Sender<crate::udp::socket::UdpPacket>,
     tcp_inbound: Option<mpsc::Sender<Packet>>,
 
     packet_container: Option<PendingInbound>,
@@ -181,7 +182,7 @@ pub struct StackSplitSink {
 
 impl StackSplitSink {
     pub fn new(
-        udp_inbound: mpsc::Sender<crate::udp_socket::UdpPacket>,
+        udp_inbound: mpsc::Sender<crate::udp::socket::UdpPacket>,
         tcp_inbound: Option<mpsc::Sender<Packet>>,
         icmp_outbound: Option<mpsc::Sender<Packet>>,
         enable_icmp: bool,
@@ -216,11 +217,11 @@ impl StackSplitSink {
 
         // Fast-path: single-pass zero-copy parsing for UDP packets
         if let Some((src_addr, dst_addr, payload_range)) =
-            crate::udp_socket::parse_udp_packet(item.data())
+            crate::udp::socket::parse_udp_packet(item.data())
         {
             let payload = item.into_bytes().slice(payload_range);
             self.packet_container = Some(PendingInbound::Udp(
-                crate::udp_socket::UdpPacket {
+                crate::udp::socket::UdpPacket {
                     data: Packet::new(payload),
                     local_addr: src_addr,
                     remote_addr: dst_addr,
@@ -372,5 +373,4 @@ impl futures::Stream for StackSplitStream {
 }
 
 #[cfg(test)]
-#[path = "stack_tests.rs"]
 mod tests;

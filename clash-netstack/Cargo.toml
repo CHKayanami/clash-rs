@@ -1,7 +1,7 @@
 [package]
 name = "clash-netstack"
 version.workspace = true
-license = "MIT OR Apache-2.0"
+license = "(MIT OR Apache-2.0) AND 0BSD"
 repository.workspace = true
 edition.workspace = true
 authors.workspace = true
@@ -17,17 +17,15 @@ smoltcp = { version = "0.14", default-features = false, features = [
     "medium-ip",
     "proto-ipv4",
     "proto-ipv6",
-    "socket-tcp",
-    "socket-udp",
     "socket-icmp",
     "auto-icmp-echo-reply",
-    "async",
-    "socket-tcp-cubic",
 ]}
+managed = { version = "0.8", features = ["std"] }
 bytes = "1.11"
 tokio = { version = "1.52", features = ["full"] }
 futures = "0.3"
 log = "0.4"
+tracing = { version = "0.1", default-features = false, features = ["std"] }
 rand = "0.10"
 clash-common = { path = "../clash-common" }
 
@@ -40,7 +38,6 @@ libc = "0.2"
 env_logger = "0.11"
 netstack-lwip = { git = "https://github.com/eycorsican/netstack-lwip", rev = "f434fef" }
 netstack-smoltcp = "0.2"
-tracing = { version = "0.1", default-features = false, features = ["std"] }
 tracing-subscriber = "0.3.23"
 
 [lints]

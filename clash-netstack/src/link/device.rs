@@ -1,4 +1,5 @@
 use crate::Packet;
+use clash_common::ring_buffer::acquire_vec;
 use std::collections::VecDeque;
 use smoltcp::{
     phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken},
@@ -10,24 +11,19 @@ pub struct NetstackDevice {
     rx_queue: VecDeque<Packet>,
 
     tx_sender: mpsc::Sender<Packet>,
-    capabilities: DeviceCapabilities,
 
 }
 
 impl NetstackDevice {
-    pub fn new(
-        tx_sender: mpsc::Sender<Packet>, mtu: usize,
-    ) -> Self {
-        let mut capabilities = DeviceCapabilities::default();
-        capabilities.max_transmission_unit = mtu;
-        capabilities.medium = Medium::Ip;
+    pub fn new(tx_sender: mpsc::Sender<Packet>) -> Self {
+        Self { rx_queue: VecDeque::with_capacity(32), tx_sender }
+    }
 
-
-        Self {
-            rx_queue: VecDeque::with_capacity(32),
-            tx_sender,
-            capabilities,
-        }
+    /// Reserve reply capacity before consuming input, including pure ACKs.
+    pub(crate) fn take_packet(&mut self) -> Option<(Packet, mpsc::Permit<'_, Packet>)> {
+        let permit = self.tx_sender.try_reserve().ok()?;
+        let packet = self.rx_queue.pop_front()?;
+        Some((packet, permit))
     }
 
     pub fn inject(&mut self, packet: Packet) { self.rx_queue.push_back(packet); }
@@ -37,38 +33,6 @@ impl NetstackDevice {
     pub fn output_available(&self) -> bool { self.tx_sender.capacity() > 0 }
 
     pub fn output(&self) -> &mpsc::Sender<Packet> { &self.tx_sender }
-}
-
-impl Device for NetstackDevice {
-    type RxToken<'a> = RxTokenImpl;
-    type TxToken<'a> = TxTokenImpl<'a>;
-
-    fn receive(
-        &mut self,
-        _timestamp: Instant,
-    ) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
-        // Reserve a tx slot FIRST before touching rx_queue.
-        // If we checked rx_queue first, a successful try_recv() would consume
-        // the inbound packet even when try_reserve() subsequently fails, silently
-        // dropping ACKs and preventing smoltcp from advancing its send window.
-        let permit = self.tx_sender.try_reserve().ok()?;
-        let packet = self.rx_queue.pop_front()?;
-
-        let rx_token = RxTokenImpl { packet };
-        let tx_token = TxTokenImpl { tx_sender: permit };
-        Some((rx_token, tx_token))
-    }
-
-    fn transmit(&mut self, _timestamp: Instant) -> Option<Self::TxToken<'_>> {
-        self.tx_sender
-            .try_reserve()
-            .map(|permit| TxTokenImpl { tx_sender: permit })
-            .ok()
-    }
-
-    fn capabilities(&self) -> DeviceCapabilities {
-        self.capabilities.clone()
-    }
 }
 
 /// One synchronous ICMP exchange. The packet never enters an unbounded queue;
@@ -110,20 +74,13 @@ impl Device for SinglePacketDevice<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use smoltcp::phy::Device;
 
-    /// Reproduces the ACK-drop bug: when the outbound tx channel is full
-    /// (simulating a slow consumer), `receive()` calls `try_recv()`
-    /// unconditionally, consuming the inbound ACK from the queue, then
-    /// `try_reserve()` fails because the tx channel is at capacity → the ACK
-    /// is silently dropped.
-    ///
-    /// Without ACKs, smoltcp never advances its send window and the download
-    /// stalls.
+    /// A full output queue must leave ingress untouched so TCP ACKs cannot
+    /// disappear before the protocol has a chance to advance its send window.
     #[tokio::test]
-    async fn test_receive_drops_inbound_packet_when_tx_channel_full() {
+    async fn input_waits_for_reply_capacity() {
         let (tx_sender, mut tx_receiver) = tokio::sync::mpsc::channel::<Packet>(1);
-        let mut device = NetstackDevice::new(tx_sender, 1500);
+        let mut device = NetstackDevice::new(tx_sender);
 
         // Fill the tx channel to its capacity of 1
         device
@@ -136,11 +93,9 @@ mod tests {
         device.inject(Packet::new(vec![0u8; 60]));
         // rx_queue: [ack_packet]
 
-        // Call receive() while tx is full.
-        // Due to the bug: try_recv() pops the ACK, then try_reserve() fails,
-        // and the ACK is dropped (never returned, never processed by smoltcp).
+        // Full output must not consume the pending ACK.
         {
-            let result = device.receive(smoltcp::time::Instant::now());
+            let result = device.take_packet();
             assert!(
                 result.is_none(),
                 "receive() must return None when tx channel is full"
@@ -150,14 +105,12 @@ mod tests {
         // Drain the tx channel to make space
         tx_receiver.recv().await.expect("should have a packet");
 
-        // Now try to receive again — with the bug the ACK is gone forever.
-        // After the fix (check try_reserve first), the packet stays in rx_queue
-        // and receive() can process it once tx space is available.
-        let result2 = device.receive(smoltcp::time::Instant::now());
+        // Releasing output capacity makes the same ACK available again.
+        let result2 = device.take_packet();
         assert!(
             result2.is_some(),
             "BUG: inbound ACK was silently dropped when tx channel was full; \
-             smoltcp will never advance its send window → download stalls to 0"
+             TCP will never advance its send window → download stalls to 0"
         );
     }
 }
@@ -184,7 +137,7 @@ impl<'a> TxToken for TxTokenImpl<'a> {
     where
         F: FnOnce(&mut [u8]) -> R,
     {
-        let mut buffer = crate::ring_buffer::acquire_vec(len);
+        let mut buffer = acquire_vec(len);
         let result = f(&mut buffer[..len]);
 
         let packet = Packet::new(buffer);

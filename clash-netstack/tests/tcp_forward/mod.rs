@@ -209,3 +209,36 @@ async fn configured_mtu_controls_tcp_mss_with_synchronous_ingress() {
         assert!(reply.data().len() <= mtu);
     }
 }
+
+#[tokio::test]
+async fn reset_during_passive_handshake_releases_stream() {
+    use std::time::Duration;
+    use tokio::io::AsyncReadExt;
+    let (stack, mut listener, _udp) = NetStack::new();
+    let (mut input, mut output) = stack.split();
+    input.send_packet(build_tcp_syn_packet().into()).unwrap();
+    let reply = tokio::time::timeout(Duration::from_secs(1), output.next()).await
+        .unwrap().unwrap().unwrap();
+    assert!(is_syn_ack(reply.data()));
+    let mut stream = listener.next().await.unwrap();
+    input.send_packet(client_segment(1, 0, 0x04, &[]).into()).unwrap();
+    let mut bytes = [0; 1];
+    assert_eq!(tokio::time::timeout(Duration::from_secs(1), stream.read(&mut bytes))
+        .await.unwrap().unwrap(), 0);
+}
+
+#[tokio::test]
+async fn invalid_syn_is_not_published_and_valid_retry_can_connect() {
+    use std::time::Duration;
+    let (stack, mut listener, _udp) = NetStack::new();
+    let (mut input, mut output) = stack.split();
+    let mut invalid = build_tcp_syn_packet().to_vec();
+    invalid[36] ^= 1;
+    input.send_packet(invalid.into()).unwrap();
+    assert!(tokio::time::timeout(Duration::from_millis(20), listener.next()).await.is_err());
+    input.send_packet(build_tcp_syn_packet().into()).unwrap();
+    let reply = tokio::time::timeout(Duration::from_secs(1), output.next()).await
+        .unwrap().unwrap().unwrap();
+    assert!(is_syn_ack(reply.data()));
+    assert!(tokio::time::timeout(Duration::from_secs(1), listener.next()).await.unwrap().is_some());
+}

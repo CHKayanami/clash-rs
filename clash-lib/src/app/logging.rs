@@ -396,8 +396,16 @@ fn setup_logging_inner(
     #[cfg(all(feature = "telemetry", tokio_unstable))]
     let subscriber = subscriber.with(console_subscriber::spawn());
     let exclude = filter_fn(|metadata| {
-        !metadata.target().contains("tokio")
-            && !metadata.target().contains("runtime")
+        #[cfg(all(feature = "telemetry", tokio_unstable))]
+        {
+            !metadata.target().contains("tokio")
+                && !metadata.target().contains("runtime")
+        }
+        #[cfg(not(all(feature = "telemetry", tokio_unstable)))]
+        {
+            let _ = metadata;
+            true
+        }
     });
 
     let format = time::macros::format_description!(

@@ -1,9 +1,9 @@
 use std::{io, net::SocketAddr, pin::Pin, sync::{Arc, Mutex, OnceLock,
     atomic::{AtomicBool, Ordering}}, task::{Context, Poll}};
 use futures::{Stream, task::AtomicWaker};
+use clash_common::ring_buffer::LockFreeRingBuffer;
 use tokio::{sync::mpsc, task::JoinHandle};
-use crate::{Packet, ready::{Ready, ReadyQueue}, ring_buffer::LockFreeRingBuffer,
-    tcp_engine::Engine, tcp_forward::ForwardRequest, tcp_stream::TcpStream};
+use crate::{Packet, tcp::ready::{Ready, ReadyQueue},     tcp::engine::Engine, tcp::forward::ForwardRequest, tcp::stream::TcpStream};
 
 // Adapter queues decouple protocol relays from the growable protocol buffers.
 // One unused ring slot distinguishes full from empty. Allocate only on use.

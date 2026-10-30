@@ -1,4 +1,4 @@
-use crate::tcp_listener::TcpStreamHandle;
+use crate::tcp::listener::TcpStreamHandle;
 use log::trace;
 use std::{
     io::{Error, ErrorKind},
@@ -81,7 +81,7 @@ impl tokio::io::AsyncRead for TcpStream {
             // the buffer is now non-empty and falls through to read it.
             self.handle.recv_waker.register(cx.waker());
             if read_buf.is_empty() {
-                // Return EOF when smoltcp is done (socket removed) OR when the
+                // Return EOF when the protocol is done (socket removed) OR when the
                 // read half was explicitly closed (peer FIN / local drop).
                 if self
                     .handle
@@ -175,10 +175,10 @@ impl tokio::io::AsyncWrite for TcpStream {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tcp_listener::TcpStreamHandle;
+    use crate::tcp::listener::TcpStreamHandle;
     use futures::task::noop_waker_ref;
     use tokio::io::{AsyncRead, AsyncWrite};
-    use crate::ready::{Ready, ReadyQueue};
+    use crate::tcp::ready::{Ready, ReadyQueue};
 
     fn build_stream() -> (TcpStream, Arc<ReadyQueue>) {
         let queue = Arc::new(ReadyQueue::default());

@@ -17,7 +17,7 @@ pub(super) struct Sender {
 }
 
 pub(super) fn channel() -> (Sender, mpsc::Receiver<Packet>) {
-    let (channel, receiver) = mpsc::channel(4096);
+    let (channel, receiver) = mpsc::channel(512);
     (Sender { channel, budget: Arc::new(Semaphore::new(BYTE_BUDGET)) }, receiver)
 }
 

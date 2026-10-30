@@ -1,11 +1,11 @@
 //! Native socket handoff. All I/O is polled by the owning stack task; neither
-//! smoltcp slices nor raw descriptors escape a synchronous poll operation.
+//! protocol buffer slices nor raw descriptors escape a synchronous poll operation.
 use std::{future::Future, io, pin::Pin, sync::atomic::Ordering, task::{Context, Poll}, time::Duration};
 use tokio::time::{Instant, Sleep, sleep_until};
 use tokio::{io::{AsyncRead, AsyncWrite, ReadBuf}, net::TcpStream as NativeTcpStream,
     sync::oneshot};
-use smoltcp::socket::tcp;
-use crate::{tcp_listener::{TcpStreamHandle, closed_error}, tcp_stream::TcpStream};
+use super::protocol as tcp;
+use crate::{tcp::listener::{TcpStreamHandle, closed_error}, tcp::stream::TcpStream};
 
 pub type ForwardCounter = Box<dyn FnMut(usize, usize) + Send + Sync>;
 type ForwardResult = io::Result<(u64, u64)>;
@@ -109,7 +109,7 @@ impl Forward {
     fn pump_upload(&mut self, socket: &mut tcp::Socket<'_>, handle: &TcpStreamHandle,
         cx: &mut Context<'_>, now: Instant) -> io::Result<()> {
         let mut budget: usize = 64 * 1024;
-        // Prefix bytes and already-published adapter bytes precede smoltcp RX.
+        // Prefix bytes and already-published adapter bytes precede protocol RX.
         while !self.upload_done && budget > 0 {
             if self.offset < self.request.prefix.len() {
                 let end = (self.offset + budget).min(self.request.prefix.len());

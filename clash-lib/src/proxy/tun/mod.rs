@@ -1,5 +1,7 @@
 #[cfg(any(target_os = "android", test))]
 mod mobile;
+#[cfg(any(target_os = "android", target_os = "linux", all(test, unix)))]
+mod icmp;
 mod datagram;
 mod device_io;
 #[cfg(target_os = "macos")]
@@ -10,6 +12,7 @@ pub mod runner;
 pub use runner::TunRunner;
 mod stream;
 mod packet_queue;
+mod pipeline;
 mod packet;
 mod tcp;
 pub mod system_stack;

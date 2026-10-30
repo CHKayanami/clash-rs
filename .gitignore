@@ -58,7 +58,8 @@ rust-analyzer.toml
 /tests/manual/
 
 
-# Local eBPF benchmark reports, scripts and opt-in harness
+# Local network benchmark reports, scripts and opt-in harness
+/clash-netstack/bench/
 /clash-ebpf/benchmarks/
 /clash-ebpf/tests/benchmark_local.rs
 /clash-ebpf/tests/tracking/benchmark.rs

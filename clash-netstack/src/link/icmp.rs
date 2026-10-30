@@ -2,7 +2,7 @@ use smoltcp::{iface::{Config, Interface, SocketSet}, phy::Device, time::Instant,
     wire::{HardwareAddress, IpCidr, Ipv4Address, Ipv6Address}};
 use tokio::sync::mpsc;
 
-use crate::{Packet, device::SinglePacketDevice};
+use crate::{Packet, link::device::SinglePacketDevice};
 
 pub(crate) fn new_interface<D: Device>(device: &mut D) -> Interface {
     let mut config =

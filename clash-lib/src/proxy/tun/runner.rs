@@ -21,9 +21,12 @@ use crate::{
     runner::{AsyncService, ServiceContext},
 };
 use async_trait::async_trait;
+#[cfg(any(target_os = "android", target_os = "linux"))]
+use super::icmp;
 use super::{
     device_io::{self, DEVICE_BATCH},
     packet_queue,
+    pipeline::PacketPipeline,
     packet::PacketDispatcher,
     stream::TcpContext,
     tcp::TcpListeners,
@@ -391,6 +394,7 @@ impl AsyncService for TunRunner {
             &tun, frame_size, !cfg.device_id.starts_with("fd://"),
         )?;
         let tun_for_writer = tun.clone();
+        let tun_for_reader = tun.clone();
         let (mut stack_sink, mut stack_stream) = stack.split();
 
         #[cfg(not(any(target_os = "macos", target_os = "android")))]
@@ -425,11 +429,25 @@ impl AsyncService for TunRunner {
         ctx.spawn_critical_with_token("tun_packet_pipeline", lifecycle_token, async move {
             #[cfg(target_os = "macos")]
             let _platform = platform;
+            let mut pipeline = PacketPipeline::default();
             let (tun_tx, mut tun_rx) = packet_queue::channel();
             let tun_tx_for_dispatcher = tun_tx.clone();
             let tun_tx_for_system_tcp = tun_tx.clone();
+            #[cfg(any(target_os = "android", target_os = "linux"))]
+            let direct_icmp = if cfg.enable_tcp {
+                let (client, relay) = icmp::channel(frame_size, tun_tx.clone(), so_mark);
+                pipeline.spawn("icmp", async move {
+                    relay.run().await?;
+                    Err(Error::Operation("TUN ICMP relay stopped unexpectedly".into()))
+                });
+                Some(client)
+            } else { None };
+            #[cfg(any(target_os = "android", target_os = "linux"))]
+            let icmp_resolver = resolver.clone();
+            #[cfg(any(target_os = "android", target_os = "linux"))]
+            let icmp_gateway = (cfg.gateway, cfg.gateway_v6);
 
-            let mut fut_tun_writer = async || {
+            pipeline.spawn("writer", async move {
                 let mut queued = Vec::with_capacity(DEVICE_BATCH);
                 let mut batch = Vec::with_capacity(DEVICE_BATCH);
                 let mut budgets = Vec::with_capacity(DEVICE_BATCH);
@@ -453,10 +471,10 @@ impl AsyncService for TunRunner {
                     }
                 }
                 Err(Error::Operation("tun stopped unexpectedly 0".to_string()))
-            };
+            });
 
             // dispatcher -> stack -> tun
-            let mut fut_dispatcher_tun = async || {
+            pipeline.spawn("replies", async move {
                 let mut packets = Vec::with_capacity(DEVICE_BATCH);
                 while stack_stream.recv_many(&mut packets, DEVICE_BATCH).await? > 0 {
                     if let Err(error) = tun_tx_for_dispatcher.send_batch(&mut packets).await {
@@ -465,7 +483,7 @@ impl AsyncService for TunRunner {
                     }
                 }
                 Err(Error::Operation("tun stopped unexpectedly 0".to_string()))
-            };
+            });
 
             let use_system_stack = listeners.system;
             let v4_nat_info = listeners.ipv4.as_ref().map(|bound| bound.nat);
@@ -480,20 +498,28 @@ impl AsyncService for TunRunner {
                 enable_tcp, system_tcp: use_system_stack, ipv4: v4_nat_info, ipv6: v6_nat_info,
                 nat: system_nat.clone(), replies: tun_tx_for_system_tcp,
             };
-            let mut fut_tun_dispatcher = async || {
+            pipeline.spawn("reader", async move {
                 let mut batch = Vec::with_capacity(DEVICE_BATCH);
                 loop {
-                    match device_reader.recv(&tun, &mut batch).await {
+                    match device_reader.recv(&tun_for_reader, &mut batch).await {
                         Ok(0) => { info!("tun reader reached EOF"); break; }
                         Ok(_) => {
-                            for packet in batch.drain(..) { packets.dispatch(packet, &mut stack_sink).await?; }
+                            for packet in batch.drain(..) {
+                                #[cfg(any(target_os = "android", target_os = "linux"))]
+                                if let Some(icmp) = &direct_icmp
+                                    && icmp.intercept(&packet, |address| {
+                                        let local = icmp::is_gateway(address, icmp_gateway.0, icmp_gateway.1);
+                                        local || icmp_resolver.is_fake_ip(address)
+                                    }) { continue; }
+                                packets.dispatch(packet, &mut stack_sink).await?;
+                            }
                         }
                         Err(error) => { error!("tun stream recv error: {error}"); break; }
                     }
                 }
 
                 Err(Error::Operation("tun stopped unexpectedly 1".to_string()))
-            };
+            });
 
             let strict_route = cfg.strict_route;
             let exclude_routes = Arc::new(cfg.route_exclude_address.clone());
@@ -501,11 +527,11 @@ impl AsyncService for TunRunner {
                 dispatcher: dispatcher.clone(), resolver: resolver.clone(), so_mark,
                 dns_hijack: dns_hijack.clone(), strict_route, exclude_routes: exclude_routes.clone(),
             });
-            let fut_tcp_dispatch = async || {
+            pipeline.spawn("tcp", async move {
                 listeners.run(tcp_listener, system_nat.clone(), tcp_context, enable_tcp).await
-            };
+            });
             let udp_timeout = cfg.udp_timeout;
-            let fut_udp_dispatch = async || {
+            pipeline.spawn("udp", async move {
                 handle_inbound_datagram(
                     udp_socket,
                     dispatcher.clone(),
@@ -518,19 +544,9 @@ impl AsyncService for TunRunner {
                 )
                 .await;
                 Err(Error::Operation("tun stopped unexpectedly 3".to_string()))
-            };
+            });
 
-            let run_res = tokio::select! {
-                res = fut_tun_writer() => res,
-                res = fut_dispatcher_tun() => res,
-                res = fut_tun_dispatcher() => res,
-                res = fut_tcp_dispatch() => res,
-                res = fut_udp_dispatch() => res,
-                _ = cancellation_token.cancelled() => {
-                    info!("tun stop signal received");
-                    Ok(())
-                },
-            };
+            let run_res = pipeline.run(cancellation_token).await;
 
             if let Err(ref e) = run_res {
                 error!("tun runner error: {}", e);
@@ -539,6 +555,8 @@ impl AsyncService for TunRunner {
             if let Err(e) = routes::maybe_routes_clean_up(&cfg) {
                 warn!("error cleaning up routes during tun runner shutdown: {}", e);
             }
+            // Keep the device alive until children stop and routes are cleaned up.
+            drop(tun);
             info!("tun runner exited");
             run_res
         });
