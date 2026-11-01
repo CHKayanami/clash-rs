@@ -4,8 +4,8 @@ use std::{collections::HashMap, io, net::SocketAddr, sync::{Arc, atomic::Orderin
 use futures::task::waker_ref;
 use smoltcp::{
     time::{Instant as StackInstant, Duration as StackDuration}, wire::{IpProtocol, TcpPacket}};
-use tokio::{sync::mpsc, time::{Instant, sleep}};
-use super::{driver::Driver, connections::{SocketHandle, SocketTable}, protocol as tcp};
+use tokio::{sync::mpsc, task::consume_budget, time::{Instant, sleep}};
+use super::{driver::{Driver, IngressStatus}, connections::{SocketHandle, SocketTable}, protocol as tcp};
 use crate::{Packet, link::device::NetstackDevice, link::packet::IpPacket,
     tcp::ready::{Ready, ReadyQueue}, tcp::buffers::Buffers,
     tcp::forward::{Forward, past_handshake}, tcp::listener::{TcpStreamHandle,
@@ -63,7 +63,7 @@ impl Engine {
                     self.admit(frame, &streams)?;
                 }
             }
-            self.driver.ingress(StackInstant::now(), &mut self.device, &mut self.sockets);
+            let ingress_status = self.driver.ingress(StackInstant::now(), &mut self.device, &mut self.sockets);
             self.reap_completed();
             self.ready.take_batch(&mut ready_batch, SOCKET_BUDGET);
             for ready in ready_batch.drain(..) {
@@ -77,13 +77,21 @@ impl Engine {
             let delay = self.driver.poll_delay(StackInstant::now());
             let blocked_output = !self.device.output_available();
             if streams.is_closed() || output.is_closed() { return Ok(()); }
-            if !self.ready.is_empty() || (!self.device.is_empty() && !blocked_output)
+            // Egress may have drained a local reply after ingress stopped.
+            // Resume remaining TCP input even if that used the last output slot.
+            let ingress_ready = !self.device.is_empty() && match ingress_status {
+                IngressStatus::Drained => false,
+                IngressStatus::RepliesFull => self.driver.reply_capacity_available(),
+                IngressStatus::OutputFull => !blocked_output,
+            };
+            if !self.ready.is_empty() || ingress_ready
                 || (self.device.is_empty() && !inbound.is_empty())
                 || (self.driver.has_ready() && !blocked_output)
                 || delay == Some(StackDuration::ZERO) {
                 // Each pass services bounded ingress, application and protocol
                 // work, including timers even while the output link is blocked.
-                tokio::task::yield_now().await;
+                // Continue immediately while cooperative budget remains.
+                consume_budget().await;
                 continue;
             }
             let timer_enabled = delay.is_some();

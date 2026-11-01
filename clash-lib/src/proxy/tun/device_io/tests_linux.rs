@@ -89,7 +89,10 @@ async fn kernel_udp_roundtrip(offload: bool) {
         let replies: Vec<_> = (0..16).map(|i| UdpPacket::from((
             Bytes::from(vec![i; if i == 15 { 0 } else { 64 }]), target, client.local_addr().unwrap(),
         ))).collect();
-        assert_eq!(send.send_batch(&replies).unwrap(), 16);
+        let result = send.send_batch(&replies);
+        assert_eq!(result.sent, 16);
+        assert_eq!(result.dropped, 0);
+        assert!(result.error.is_none());
         let mut outbound = Vec::new();
         for _ in 0..16 { outbound.push(stack_read.next().await.unwrap().unwrap().into_bytes()); }
         writer.send(&device, &outbound).await.unwrap();

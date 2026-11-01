@@ -2,6 +2,7 @@ use std::sync::Arc;
 #[cfg(not(target_os = "android"))]
 use std::time::Duration;
 
+use tokio::task::unconstrained;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
@@ -456,7 +457,9 @@ impl AsyncService for TunRunner {
                         batch.push(bytes);
                         budgets.push(budget);
                     }
-                    let result = device_writer.send(&tun_for_writer, &batch).await;
+                    // Exempt only this bounded batch; queue receives retain
+                    // cooperative scheduling.
+                    let result = unconstrained(device_writer.send(&tun_for_writer, &batch)).await;
                     batch.clear();
                     budgets.clear();
                     if let Err(e) = result {
