@@ -6,10 +6,14 @@ use crate::android::protect_socket;
 #[cfg(target_os = "linux")]
 use crate::app::net::get_tun_somark;
 use crate::{
-    app::{dns::ThreadSafeDNSResolver, net::OutboundInterface},
+    app::{
+        dns::ThreadSafeDNSResolver,
+        net::{OutboundInterface, tcp_keepalive_config},
+    },
     proxy::AnyStream,
 };
 
+use crate::config::def::TcpKeepaliveConfig;
 use futures::io;
 use socket2::{Domain, Protocol, Socket, TcpKeepalive, Type};
 
@@ -74,6 +78,21 @@ pub(crate) fn resolve_so_mark(so_mark: Option<u32>) -> Option<u32> {
     }
 }
 
+fn configure_tcp_keepalive(
+    socket: &Socket,
+    config: TcpKeepaliveConfig,
+) -> io::Result<()> {
+    if config.disable_keep_alive {
+        return socket.set_keepalive(false);
+    }
+    let keepalive = TcpKeepalive::new()
+        .with_time(Duration::from_secs(config.keep_alive_idle.get().into()))
+        .with_interval(Duration::from_secs(config.keep_alive_interval.get().into()));
+    #[cfg(not(target_os = "windows"))]
+    let keepalive = keepalive.with_retries(3);
+    socket.set_tcp_keepalive(&keepalive)
+}
+
 /// Create and configure a `TcpSocket` with interface binding, keepalive, and
 /// nodelay. The returned socket is ready to call `.connect()` on.
 pub fn prepare_tcp_socket(
@@ -105,13 +124,8 @@ pub fn prepare_tcp_socket(
         socket.set_mark(so_mark)?;
     }
 
-    // 高性能保活参数
-    let keepalive = TcpKeepalive::new()
-        .with_time(Duration::from_secs(30))
-        .with_interval(Duration::from_secs(5))
-        .with_retries(3);
-
-    socket.set_tcp_keepalive(&keepalive)?;
+    let config = tcp_keepalive_config();
+    configure_tcp_keepalive(&socket, config)?;
     socket.set_tcp_nodelay(true)?;
     socket.set_nonblocking(true)?;
 
@@ -516,6 +530,26 @@ pub fn try_create_dualstack_tcplistener(
 mod tests {
     use super::*;
     use std::{net::SocketAddrV6, time::Duration};
+
+    #[cfg(any(target_os = "linux", target_os = "android",
+              target_os = "macos", target_os = "ios"))]
+    #[test]
+    fn test_outbound_tcp_keepalive_options() {
+        let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).unwrap();
+        let mut config = TcpKeepaliveConfig::default();
+        configure_tcp_keepalive(&socket, config).unwrap();
+        assert!(socket.keepalive().unwrap());
+        assert_eq!(socket.tcp_keepalive_time().unwrap(), Duration::from_secs(180));
+        config.keep_alive_idle = 60.try_into().unwrap();
+        config.keep_alive_interval = 10.try_into().unwrap();
+        configure_tcp_keepalive(&socket, config).unwrap();
+        assert_eq!(socket.tcp_keepalive_time().unwrap(), Duration::from_secs(60));
+        #[cfg(not(target_os = "windows"))]
+        assert_eq!(socket.tcp_keepalive_interval().unwrap(), Duration::from_secs(10));
+        config.disable_keep_alive = true;
+        configure_tcp_keepalive(&socket, config).unwrap();
+        assert!(!socket.keepalive().unwrap());
+    }
 
     /// Locate the loopback network interface on the current host.
     /// Returns `None` if the interface cannot be found or enumeration fails.

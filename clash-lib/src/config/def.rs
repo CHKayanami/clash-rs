@@ -7,8 +7,10 @@ use crate::{
 };
 use educe::Educe;
 use serde::{Deserialize, Deserializer, Serialize};
+use std::{
+    collections::HashMap, fmt::Display, num::NonZeroU32, path::PathBuf, str::FromStr,
+};
 use yaml_serde::Value;
-use std::{collections::HashMap, fmt::Display, path::PathBuf, str::FromStr};
 
 const DEFAULT_ROUTE_TABLE: u32 = 2468;
 
@@ -364,12 +366,36 @@ impl Display for LogLevel {
     }
 }
 
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(rename_all = "kebab-case", default)]
+pub struct TcpKeepaliveConfig {
+    pub disable_keep_alive: bool,
+    /// Idle time before the first probe, in seconds; must be positive.
+    pub keep_alive_idle: NonZeroU32,
+    /// Time between probes, in seconds; must be positive.
+    pub keep_alive_interval: NonZeroU32,
+}
+
+impl Default for TcpKeepaliveConfig {
+    fn default() -> Self {
+        Self {
+            disable_keep_alive: false,
+            keep_alive_idle: NonZeroU32::new(180).unwrap(),
+            keep_alive_interval: NonZeroU32::new(30).unwrap(),
+        }
+    }
+}
+
 /// Example
 /// ```yaml
 /// ---
 /// port: 8888
 /// socks-port: 8889
 /// mixed-port: 8899
+/// # Outbound TCP keepalive durations are in seconds.
+/// disable-keep-alive: false
+/// keep-alive-idle: 180
+/// keep-alive-interval: 30
 ///
 /// tun:
 ///   enable: false
@@ -580,6 +606,9 @@ impl Display for LogLevel {
 #[serde(rename_all = "kebab-case", default)]
 #[educe(Default)]
 pub struct Config {
+    /// Outbound TCP keepalive settings (durations in seconds).
+    #[serde(flatten)]
+    pub tcp_keepalive: TcpKeepaliveConfig,
     /// The HTTP proxy port
     #[serde(alias = "http_port")]
     pub port: Option<Port>,
@@ -1315,6 +1344,29 @@ mod tests {
     };
 
     use super::Config;
+
+    #[test]
+    fn parse_tcp_keepalive() {
+        let default: Config = yaml_serde::from_str("{}").unwrap();
+        assert!(!default.tcp_keepalive.disable_keep_alive);
+        assert_eq!(default.tcp_keepalive.keep_alive_idle.get(), 180);
+        assert_eq!(default.tcp_keepalive.keep_alive_interval.get(), 30);
+        let configured: Config = yaml_serde::from_str(
+            "disable-keep-alive: true\nkeep-alive-idle: 60\nkeep-alive-interval: 10",
+        )
+        .unwrap();
+        assert!(configured.tcp_keepalive.disable_keep_alive);
+        assert_eq!(configured.tcp_keepalive.keep_alive_idle.get(), 60);
+        assert_eq!(configured.tcp_keepalive.keep_alive_interval.get(), 10);
+        for yaml in [
+            "keep-alive-idle: 0",
+            "keep-alive-interval: 0",
+            "keep-alive-idle: -1",
+            "keep-alive-interval: -1",
+        ] {
+            assert!(yaml_serde::from_str::<Config>(yaml).is_err());
+        }
+    }
 
     #[test]
     fn parse_simple() {

@@ -624,7 +624,7 @@ async fn create_components(
     };
     let network_config = NetworkConfig::resolve(
         explicit_iface.as_deref(), detect_interface, so_mark,
-    );
+    ).with_tcp_keepalive(config.general.tcp_keepalive);
 
     let cancellation_token = tokio_util::sync::CancellationToken::new();
     let cwd_str = cwd.to_string_lossy().to_string();

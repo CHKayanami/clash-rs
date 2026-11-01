@@ -1,4 +1,5 @@
-use arc_swap::ArcSwapOption;
+use arc_swap::{ArcSwap, ArcSwapOption};
+use crate::config::def::TcpKeepaliveConfig;
 use network_interface::{
     NetworkInterface, NetworkInterfaceConfig, V4IfAddr, V6IfAddr,
 };
@@ -14,9 +15,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 use tracing::{trace, warn};
 
-use std::sync::Mutex;
-#[cfg(feature = "tun")]
-use std::sync::LazyLock;
+use std::sync::{LazyLock, Mutex};
 #[cfg(feature = "tun")]
 use tokio::sync::watch;
 
@@ -39,6 +38,13 @@ pub(crate) fn notify_network_change() {
 
 #[cfg(target_os = "macos")]
 pub(crate) mod macos;
+
+static TCP_KEEPALIVE: LazyLock<ArcSwap<TcpKeepaliveConfig>> =
+    LazyLock::new(|| ArcSwap::from_pointee(TcpKeepaliveConfig::default()));
+
+pub(crate) fn tcp_keepalive_config() -> TcpKeepaliveConfig {
+    **TCP_KEEPALIVE.load()
+}
 
 static DEFAULT_OUTBOUND_INTERFACE: ArcSwapOption<OutboundInterface> =
     ArcSwapOption::const_empty();
@@ -115,6 +121,7 @@ pub fn update_default_outbound_interface_if_changed(
 /// not mutate the running generation; apply only during the service switch.
 #[derive(Clone)]
 pub(crate) struct NetworkConfig {
+    tcp_keepalive: TcpKeepaliveConfig,
     interface: Option<Arc<OutboundInterface>>,
     is_explicit: bool,
     so_mark: Option<u32>,
@@ -138,12 +145,21 @@ impl NetworkConfig {
             (detect_interface || explicit_iface.is_some())
                 .then(get_outbound_interface).flatten()
         }).map(Arc::new);
-        Self { interface, is_explicit, so_mark }
+        Self {
+            interface, is_explicit, so_mark,
+            tcp_keepalive: TcpKeepaliveConfig::default(),
+        }
+    }
+
+    pub fn with_tcp_keepalive(mut self, config: TcpKeepaliveConfig) -> Self {
+        self.tcp_keepalive = config;
+        self
     }
 
     pub fn capture() -> Self {
         let state = WRITE_MUTEX.lock().unwrap();
         Self {
+            tcp_keepalive: tcp_keepalive_config(),
             interface: DEFAULT_OUTBOUND_INTERFACE.load_full(),
             is_explicit: state.is_explicit,
             so_mark: get_tun_somark(),
@@ -155,6 +171,7 @@ impl NetworkConfig {
         state.is_explicit = self.is_explicit;
         DEFAULT_OUTBOUND_INTERFACE.store(self.interface.clone());
         set_tun_somark(self.so_mark);
+        TCP_KEEPALIVE.store(Arc::new(self.tcp_keepalive));
         drop(state);
         trace!(
             "default outbound interface: {:?}, tun somark: {:?}",

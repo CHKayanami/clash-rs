@@ -15,6 +15,7 @@ pub(super) fn convert(c: &def::Config) -> Result<General, crate::Error> {
         c.bind_address
     };
     Ok(General {
+        tcp_keepalive: c.tcp_keepalive,
         authentication: c.authentication.clone(),
         controller: Controller {
             external_controller: c.external_controller.clone(),

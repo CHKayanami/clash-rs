@@ -99,6 +99,7 @@ impl Config {
 
 #[derive(Clone)]
 pub struct General {
+    pub tcp_keepalive: def::TcpKeepaliveConfig,
     pub authentication: Vec<String>,
     pub bind_address: BindAddress,
     pub controller: Controller,
