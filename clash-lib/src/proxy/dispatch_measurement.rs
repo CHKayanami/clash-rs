@@ -17,6 +17,7 @@ use crate::{
     session::Session,
     app::sniffer::{Sniffer, SnifferConfig},
     app::dispatcher::{Manager as StatisticsManager, TrackerInfo, TrafficTracker},
+    app::dispatcher::udp::replies,
     app::dispatcher::udp::association::{UdpConnectContext, AssociationConfig, UdpAssociationPool},
 };
 
@@ -235,9 +236,10 @@ pub async fn measure_dispatch_futures(start: impl Fn(), finish: impl Fn(&str, us
     assert!(result.unwrap().unwrap().ptr_eq(&rejected));
 
     let manager = StatisticsManager::new();
-    let (replies, _reply_rx) = mpsc::channel(1);
+    let (replies, _reply_rx) = replies::channel(1);
     let (closed_flows, _closed_rx) = mpsc::unbounded_channel();
     let pool = UdpAssociationPool::new(AssociationConfig {
+            #[cfg(feature = "tun")] direct: None,
         replies, closed_flows, manager, timeout: Duration::from_secs(60),
         allow_quic: Arc::new(AtomicBool::new(true)),
         capacity: Arc::new(Semaphore::new(1)),

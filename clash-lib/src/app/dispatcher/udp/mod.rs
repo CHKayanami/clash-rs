@@ -10,10 +10,14 @@
 //! provides an endpoint-independent public mapping or filtering policy.
 use crate::proxy::datagram::batch::MAX_BATCH_PACKETS;
 use inbound::InboundIo;
+use replies::Sender as ReplySender;
+#[cfg(feature = "tun")]
+use association::direct::DirectPath;
 use futures::future::poll_fn as poll_batch;
 pub(crate) mod association;
 mod routes;
 mod inbound;
+pub(crate) mod replies;
 #[cfg(test)]
 mod tests;
 
@@ -58,7 +62,6 @@ fn is_short_flow_port(port: u16) -> bool {
 }
 
 type SessionKey = (SocketAddr, SocksAddr, Option<Arc<str>>);
-type OutboundPacketSender = tokio::sync::mpsc::Sender<UdpPacket>;
 
 struct OutboundSession {
     id: u64,
@@ -91,8 +94,15 @@ impl OutboundSession {
     }
 
     fn latest_idle_deadline(&self, timeout: Duration) -> Instant {
+        let last_upload = self.last_upload;
+        let idle_deadline = self.idle_deadline;
+        #[cfg(feature = "tun")]
+        let (last_upload, idle_deadline) = match self.reply_activity.latest_upload() {
+            Some(upload) if upload > last_upload => (upload, upload + timeout),
+            _ => (last_upload, idle_deadline),
+        };
         match self.reply_activity.latest() {
-            Some(reply) if reply > self.last_upload => {
+            Some(reply) if reply > last_upload => {
                 let reply_timeout = if self.is_short_flow {
                     FAST_RESPONSE_TIMEOUT
                 } else {
@@ -100,7 +110,7 @@ impl OutboundSession {
                 };
                 reply + reply_timeout
             }
-            _ => self.idle_deadline,
+            _ => idle_deadline,
         }
     }
 }
@@ -150,7 +160,7 @@ struct UdpDispatchContext {
     router: ArcRouter,
     resolver: ThreadSafeDNSResolver,
     mode: Arc<AtomicU8>,
-    reply_sender: OutboundPacketSender,
+    reply_sender: ReplySender,
     session_semaphore: Arc<tokio::sync::Semaphore>,
     associations: Arc<UdpAssociationPool>,
 }
@@ -183,17 +193,26 @@ impl Dispatcher {
         &self, sess: Session, udp_inbound: AnyInboundDatagram,
     ) -> impl Future<Output = tokio::sync::oneshot::Sender<u8>> + Send + '_ {
         let span = info_span!("dispatch_datagram", trace_id = sess.id);
-        self.dispatch_datagram_inner(sess, udp_inbound).instrument(span)
+        self.dispatch_datagram_inner(sess, udp_inbound, #[cfg(feature = "tun")] None).instrument(span)
+    }
+
+    #[cfg(feature = "tun")]
+    pub(crate) async fn dispatch_tun_datagram(&self, sess: Session,
+        udp_inbound: AnyInboundDatagram, direct: Arc<DirectPath>,
+    ) -> tokio::sync::oneshot::Sender<u8> {
+        let span = info_span!("dispatch_datagram", trace_id = sess.id);
+        self.dispatch_datagram_inner(sess, udp_inbound, Some(direct)).instrument(span).await
     }
 
     async fn dispatch_datagram_inner(
         &self, sess: Session, udp_inbound: AnyInboundDatagram,
+        #[cfg(feature = "tun")] direct: Option<Arc<DirectPath>>,
     ) -> tokio::sync::oneshot::Sender<u8> {
-        let (replies, reply_rx) = tokio::sync::mpsc::channel(UDP_CHANNEL_CAPACITY);
+        let (replies, reply_rx) = replies::channel(UDP_CHANNEL_CAPACITY);
         let (closed_flows, mut closed_rx) = tokio::sync::mpsc::unbounded_channel();
         let (close_sender, mut close_receiver) = tokio::sync::oneshot::channel();
         let associations = UdpAssociationPool::new(AssociationConfig {
-            replies: replies.clone(), closed_flows, manager: self.manager.clone(),
+            replies: replies.clone(), #[cfg(feature = "tun")] direct, closed_flows, manager: self.manager.clone(),
             allow_quic: self.allow_quic.clone(),
             timeout: sess.udp_timeout.unwrap_or_else(|| Duration::from_secs(DEFAULT_UDP_SESSION_TIMEOUT_SECS)),
             capacity: self.udp_association_semaphore.clone(),

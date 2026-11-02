@@ -135,6 +135,9 @@ where
 }
 
 impl UdpPacket {
+    /// Encode one complete IP/UDP datagram for a direct device reply.
+    pub fn encode(&self) -> io::Result<Packet> { encode_packet(self) }
+
     pub fn data(&self) -> &[u8] {
         self.data.data()
     }

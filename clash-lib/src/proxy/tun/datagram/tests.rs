@@ -167,3 +167,23 @@ async fn sink_errors_do_not_consume_following_batch_packets() {
         assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
     }
 }
+
+#[tokio::test]
+async fn custom_dns_hijack_port_never_reaches_routing() {
+    use crate::config::internal::config::DnsHijackRule;
+    let mut resolver = MockClashResolver::new();
+    resolver.expect_exchange().once().returning(|query, _| Ok(query.wire().to_vec()));
+    let hijack = DnsHijack::Rules(vec![DnsHijackRule::Any { network: Some(Network::Udp), port: 5354 }]);
+    let (mut adapter, input, mut output, _finished) = adapter(Arc::new(resolver), 4, hijack);
+    let query = QueryContext::new(DnsName::from_domain("adapter.test").unwrap(), QType::A);
+    input.send(inbound(Bytes::copy_from_slice(query.wire()), 5354)).await.unwrap();
+    input.send(inbound(Bytes::from_static(b"ordinary"), 443)).await.unwrap();
+    let mut received = Vec::new();
+    poll_fn(|cx| adapter.poll_recv_batch(cx, &mut received)).await.unwrap();
+    assert_eq!(received.len(), 1);
+    assert_eq!(received[0].data, b"ordinary"[..]);
+    while let Some(result) = adapter.dns.join_next().await { result.unwrap(); }
+    let packet = output.recv().await.unwrap();
+    let (source, _, _) = parse_udp_packet(packet.data()).unwrap();
+    assert_eq!(source.port(), 5354);
+}

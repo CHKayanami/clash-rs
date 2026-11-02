@@ -5,6 +5,12 @@ mod semantics;
 mod lifecycle;
 mod traffic;
 mod worker;
+mod reply;
+#[cfg(feature = "tun")]
+pub(crate) mod direct;
+#[cfg(feature = "tun")]
+use direct::DirectPath;
+use reply::Destination as ReplyDestination;
 
 pub(crate) use lifecycle::{AssociationGuard, AssociationRegistry};
 pub(crate) use traffic::UserTrafficCounters;
@@ -12,12 +18,13 @@ pub(crate) use traffic::UserTrafficCounters;
 pub(crate) use flow::{FlowClosed, ReplyActivity, UdpFlow};
 use flow::FlowState;
 use worker::AssociationRelay;
+use super::replies::Sender as ReplySender;
 #[cfg(feature = "tun")]
-use crate::app::net::network_generation;
+use crate::app::net::{network_generation, subscribe_network_changes};
 use semantics::{FlowIsolation, IsolationReason};
 
 use std::{collections::HashMap, io, net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr}, sync::{Arc, Weak, atomic::{AtomicBool, AtomicU64, Ordering}}, time::Duration};
-use futures::future::BoxFuture;
+use futures::future::{BoxFuture, pending};
 use parking_lot::Mutex;
 use tokio::{sync::{Mutex as AsyncMutex, OwnedSemaphorePermit, Semaphore, mpsc, oneshot}, task::JoinHandle};
 
@@ -48,7 +55,9 @@ struct AssociationKey {
 }
 
 pub(crate) struct AssociationConfig {
-    pub replies: mpsc::Sender<UdpPacket>,
+    pub replies: ReplySender,
+    #[cfg(feature = "tun")]
+    pub direct: Option<Arc<DirectPath>>,
     pub closed_flows: mpsc::UnboundedSender<FlowClosed>,
     pub manager: Arc<Manager>,
     pub allow_quic: Arc<AtomicBool>,
@@ -246,14 +255,37 @@ impl UdpAssociationPool {
         let (control, commands) = mpsc::channel(QUEUE_CAPACITY);
         let force_source = (unresolved_fake || !datagram.reports_peer_source()).then(||
             sess.orig_destination.clone().unwrap_or_else(|| sess.destination.clone()));
+        let replies = ReplyDestination::queued(&self.config.replies);
+        #[cfg(feature = "tun")]
+        let direct = (sess.typ == Type::Tun && matches!(&slot._outbound, ProtocolOutbound::Direct(_))
+            && datagram.physical_socket().is_some() && self.config.direct.is_some())
+            .then_some(slot.key.network_generation);
+        #[cfg(feature = "tun")]
+        let replies = if direct.is_some() {
+            ReplyDestination::Direct(self.config.direct.as_ref().unwrap().writer())
+        } else { replies };
         let context = AssociationRelay::new(packets, commands, &self.config,
-            sess.source, sess.inbound_user.clone(), force_source, datagram.physical_socket().is_some() || matches!(&datagram, AnyOutboundDatagram::Socks5(inner) if inner.has_native_send()));
+            sess.source, sess.inbound_user.clone(), force_source, replies,
+            datagram.physical_socket().is_some() || matches!(&datagram, AnyOutboundDatagram::Socks5(inner) if inner.has_native_send()));
         let cleanup = WorkerGuard(Arc::downgrade(slot), id);
         let task = dispatch_datagram!(datagram, |inner| tokio::spawn(async move {
             let (_permit, _guard, _cleanup) = (permit, guard, cleanup);
-            tokio::select! { _ = relay(inner, context) => {}, _ = close_rx => {} }
+            let network_closed = async move {
+                #[cfg(feature = "tun")]
+                if let Some(generation) = direct {
+                    let mut changes = subscribe_network_changes();
+                    let _ = changes.wait_for(|current| *current != generation).await;
+                    return;
+                }
+                pending::<()>().await;
+            };
+            tokio::select! {
+                _ = relay(inner, context) => {},
+                _ = close_rx => {},
+                _ = network_closed => {},
+            }
         }));
-        Ok(Arc::new(Association { id, outgoing, control, chain: sess.proxy_chain.snapshot(), task }))
+        Ok(Arc::new(Association { id, outgoing, control, #[cfg(feature = "tun")] direct, chain: sess.proxy_chain.snapshot(), task }))
     }
 
     async fn register(&self, association: &Arc<Association>, sess: &Session,
@@ -282,12 +314,17 @@ impl UdpAssociationPool {
         association.control.send(Registration { state: state.clone(), close_rx, reply: tx })
             .await.map_err(|_| closed())?;
         rx.await.map_err(|_| closed())??;
-        Ok(UdpFlow { state, association: association.clone() })
+        #[cfg(feature = "tun")]
+        let direct_registration = association.direct.and_then(|generation|
+            self.config.direct.as_ref().and_then(|path| path.registration(&state, generation, &self.config.allow_quic)));
+        Ok(UdpFlow { state, association: association.clone(), #[cfg(feature = "tun")] _direct_registration: direct_registration })
     }
 }
 
 struct Association {
     id: u64,
+    #[cfg(feature = "tun")]
+    direct: Option<u64>,
     outgoing: mpsc::Sender<Outgoing>, control: mpsc::Sender<Registration>,
     chain: Vec<String>, task: JoinHandle<()>,
 }

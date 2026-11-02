@@ -152,6 +152,8 @@ impl UdpRoutes {
                 for packet in buffered_packets {
                     let _ = forward_to_remote(&flow, packet, sess_id);
                 }
+                #[cfg(feature = "tun")]
+                flow.enable_direct_upload();
                 let is_short_flow = !self.has_explicit_timeout
                     && initial_upload_count <= 2
                     && is_short_flow_port(session_key.1.port());
@@ -523,7 +525,7 @@ mod tests {
     use super::*;
     use bytes::Bytes;
     use tokio::net::UdpSocket;
-    use super::super::tests::test_dispatcher;
+    use super::super::{tests::test_dispatcher, replies};
 
     #[tokio::test]
     async fn first_udp_burst_survives_outbound_establishment() {
@@ -531,9 +533,10 @@ mod tests {
         let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let destination: SocksAddr = server.local_addr().unwrap().into();
         let source: SocketAddr = "127.0.0.1:54321".parse().unwrap();
-        let (replies, _reply_rx) = mpsc::channel(UDP_CHANNEL_CAPACITY);
+        let (replies, _reply_rx) = replies::channel(UDP_CHANNEL_CAPACITY);
         let (closed_flows, _closed) = mpsc::unbounded_channel();
         let associations = UdpAssociationPool::new(AssociationConfig {
+            #[cfg(feature = "tun")] direct: None,
             replies: replies.clone(), closed_flows, manager: dispatcher.manager.clone(),
             allow_quic: dispatcher.allow_quic.clone(), timeout: Duration::from_secs(60),
             capacity: dispatcher.udp_association_semaphore.clone(),

@@ -5,7 +5,7 @@ use smoltcp::wire::{IpProtocol, IpVersion, Ipv4Packet, Ipv6Packet};
 use tracing::debug;
 use clash_netstack::{Packet, StackSplitSink};
 
-use crate::Error;
+use crate::{Error, app::dispatcher::udp::association::direct::DirectPath};
 use super::{packet_queue::Sender, system_stack::{SystemTcpNat, process_system_tcp_packet}};
 
 pub(super) struct PacketDispatcher {
@@ -15,10 +15,15 @@ pub(super) struct PacketDispatcher {
     pub ipv6: Option<(Ipv6Addr, Ipv6Addr, u16)>,
     pub nat: Arc<SystemTcpNat>,
     pub replies: Sender,
+    pub direct: Arc<DirectPath>,
 }
 
 impl PacketDispatcher {
     pub async fn dispatch(&self, mut packet: BytesMut, stack: &mut StackSplitSink) -> Result<(), Error> {
+        packet = match self.direct.upload(packet) {
+            Ok(()) => return Ok(()),
+            Err(packet) => packet,
+        };
         if self.enable_tcp && !self.system_tcp {
             stack.send_packet(Packet::from(packet))?;
             return Ok(());
@@ -66,7 +71,7 @@ mod tests {
                     let (replies, mut receiver) = packet_queue::channel();
                     let nat = Arc::new(SystemTcpNat::new());
                     let dispatcher = PacketDispatcher {
-                        enable_tcp, system_tcp, nat: nat.clone(), replies,
+                        enable_tcp, system_tcp, nat: nat.clone(), direct: super::super::datagram::direct_path(replies.clone()), replies,
                         ipv4: Some((Ipv4Addr::new(198, 18, 0, 1), Ipv4Addr::new(198, 18, 0, 2), 1234)),
                         ipv6: Some(("fd00::1".parse().unwrap(), "fd00::2".parse().unwrap(), 1234)),
                     };

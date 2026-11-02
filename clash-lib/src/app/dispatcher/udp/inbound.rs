@@ -1,7 +1,7 @@
 //! One task owns protocol state and polls both directions without a shared lock.
 use std::{collections::VecDeque, pin::Pin, task::{Context, Poll}};
 use futures::Stream;
-use tokio::sync::mpsc;
+use super::replies::{Batch, Receiver};
 use tracing::error;
 use crate::proxy::datagram::{UdpPacket,
     batch::{DatagramBatch, PacketBatch, MAX_BATCH_PACKETS}};
@@ -9,15 +9,15 @@ use crate::proxy::datagram::{UdpPacket,
 pub(super) struct InboundIo<D> {
     datagram: D,
     closed: bool,
-    replies: mpsc::Receiver<UdpPacket>,
+    replies: Receiver,
     sending: PacketBatch,
-    deferred: Option<UdpPacket>,
+    deferred: Option<Batch>,
     queued: VecDeque<UdpPacket>,
     scratch: Vec<UdpPacket>,
 }
 
 impl<D: DatagramBatch> InboundIo<D> {
-    pub(super) fn new(datagram: D, replies: mpsc::Receiver<UdpPacket>) -> Self {
+    pub(super) fn new(datagram: D, replies: Receiver) -> Self {
         Self { datagram, closed: false, replies, sending: PacketBatch::default(), deferred: None,
             queued: VecDeque::with_capacity(MAX_BATCH_PACKETS),
             scratch: Vec::with_capacity(MAX_BATCH_PACKETS) }
@@ -28,23 +28,16 @@ impl<D: DatagramBatch> InboundIo<D> {
     fn poll_replies(&mut self, cx: &mut Context<'_>) -> Option<bool> {
         if self.closed { return None; }
         if self.sending.is_empty() {
-            let packet = match self.deferred.take() {
-                Some(packet) => packet,
-                None => match self.replies.poll_recv(cx) {
-                    Poll::Ready(Some(packet)) => packet,
+            if self.deferred.is_none() {
+                self.deferred = match self.replies.poll_recv(cx) {
+                    Poll::Ready(Some(batch)) => Some(batch),
                     Poll::Ready(None) => return None,
                     Poll::Pending => return Some(false),
-                },
-            };
-            self.sending.push(packet).unwrap();
-            while !self.sending.is_full() {
-                let Ok(packet) = self.replies.try_recv() else { break; };
-                if let Err(packet) = self.sending.push(packet) {
-                    self.deferred = Some(packet);
-                    break;
-                }
+                };
             }
+            self.deferred.as_mut().unwrap().fill(&mut self.sending);
         }
+
         if let Poll::Ready(result) = self.datagram.poll_send_batch(cx, &mut self.sending) {
             assert!(result.sent > 0 || result.error.is_some(), "batch send made no progress");
             for _ in 0..result.sent { self.sending.complete(); }
@@ -53,7 +46,9 @@ impl<D: DatagramBatch> InboundIo<D> {
                 error!("failed to send UDP packet to local: {error}");
                 if result.fatal { self.closed = true; self.replies.close(); return None; }
             }
-            if !self.sending.is_empty() || self.deferred.is_some() { return Some(true); }
+            if !self.sending.is_empty() { return Some(true); }
+            if self.deferred.as_ref().is_some_and(|batch| !batch.is_empty()) { return Some(true); }
+            self.deferred = None;
             // Register the receiver's waker even after the last ready reply.
             // try_recv does not subscribe us to the next arrival.
             return match self.replies.poll_recv(cx) {

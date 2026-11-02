@@ -1,4 +1,5 @@
 use super::*;
+use super::super::replies::{self, Receiver as ReplyReceiver};
 use bytes::{BufMut, Bytes, BytesMut};
 use futures::StreamExt;
 use std::{net::IpAddr, sync::atomic::{AtomicUsize, Ordering}, time::Duration};
@@ -25,16 +26,17 @@ fn session(port: u16) -> Session {
 
 struct Fixture {
     pool: Arc<UdpAssociationPool>,
-    replies: mpsc::Receiver<UdpPacket>,
+    replies: ReplyReceiver,
     events: mpsc::UnboundedReceiver<FlowClosed>,
     manager: Arc<Manager>,
 }
 impl Fixture {
     fn new(timeout: Duration) -> Self {
-        let (replies, rx) = mpsc::channel(64);
+        let (replies, rx) = replies::channel(64);
         let (closed_flows, events) = mpsc::unbounded_channel();
         let manager = Manager::new();
         let pool = UdpAssociationPool::new(AssociationConfig {
+            #[cfg(feature = "tun")] direct: None,
             replies, closed_flows, manager: manager.clone(), allow_quic: Arc::new(AtomicBool::new(true)),
             timeout, capacity: Arc::new(Semaphore::new(64)),
         });
@@ -62,11 +64,12 @@ pub(crate) fn inert_flow() -> UdpFlow {
     let (outgoing, _) = mpsc::channel(1);
     let (control, _) = mpsc::channel(1);
     UdpFlow {
+        #[cfg(feature = "tun")] _direct_registration: None,
         state: Arc::new(FlowState { id: sess.id, source: sess.source, target: sess.destination.clone(),
             original: sess.destination.clone(), aliases: vec![], tracker: Arc::new(TrackerInfo::new(&sess, None)),
             activity: Arc::new(ReplyActivity::new()), closed: AtomicBool::new(false), events,
             _guard: TrackGuard::new(sess.id, manager), }),
-        association: Arc::new(Association { id: 0, outgoing, control, chain: vec![], task: tokio::spawn(std::future::pending()) }),
+        association: Arc::new(Association { #[cfg(feature = "tun")] direct: None, id: 0, outgoing, control, chain: vec![], task: tokio::spawn(std::future::pending()) }),
     }
 }
 
@@ -510,6 +513,7 @@ async fn shared_routes_can_register_before_an_earlier_registration_is_acknowledg
     let (outgoing, _packets) = mpsc::channel(64);
     let (control, mut commands) = mpsc::channel(64);
     *slot.association.lock().await = Some(Arc::new(Association {
+        #[cfg(feature = "tun")] direct: None,
         id: 0, outgoing, control, chain: vec!["test-proxy".to_owned()], task: tokio::spawn(std::future::pending()),
     }));
     let pool = fixture.pool.clone();

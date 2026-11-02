@@ -1,4 +1,6 @@
 use super::*;
+use super::super::replies;
+use tokio::sync::mpsc;
 use std::{io, sync::{Arc, atomic::{AtomicUsize, Ordering}}};
 use bytes::Bytes;
 use futures::{Sink, StreamExt, future::poll_fn, task::{ArcWake, noop_waker_ref, waker}};
@@ -58,7 +60,7 @@ async fn blocked_reply_preserves_reads_and_resumes_without_new_input() {
         let (permits_tx, permits) = mpsc::channel(4);
         let (sent, mut received) = mpsc::unbounded_channel();
         let attempts = Arc::new(AtomicUsize::new(0));
-        let (reply_tx, reply_rx) = mpsc::channel(4);
+        let (reply_tx, reply_rx) = replies::channel(4);
         let mut io = InboundIo::new(TestDatagram { incoming, permits, sent,
             pending: None, fail_first: false, attempts: attempts.clone() }, reply_rx);
         reply_tx.send(UdpPacket { data: Bytes::from_static(b"reply"), ..Default::default() }).await.unwrap();
@@ -86,7 +88,7 @@ async fn reply_only_batches_keep_progressing_and_drop_on_cancellation() {
         let (incoming_tx, incoming) = mpsc::channel(1);
         let (permits_tx, permits) = mpsc::channel(64);
         let (sent, mut received) = mpsc::unbounded_channel();
-        let (reply_tx, reply_rx) = mpsc::channel(64);
+        let (reply_tx, reply_rx) = replies::channel(64);
         let mut io = InboundIo::new(TestDatagram { incoming, permits, sent,
             pending: None, fail_first: false, attempts: Arc::new(AtomicUsize::new(0)) }, reply_rx);
         // Cross both the packet-count and payload-byte batch boundaries.
@@ -114,7 +116,7 @@ async fn failed_reply_does_not_discard_suffix_or_block_reads() {
         let (incoming_tx, incoming) = mpsc::channel(1);
         let (permits_tx, permits) = mpsc::channel(2);
         let (sent, mut received) = mpsc::unbounded_channel();
-        let (reply_tx, reply_rx) = mpsc::channel(2);
+        let (reply_tx, reply_rx) = replies::channel(2);
         let attempts = Arc::new(AtomicUsize::new(0));
         let mut io = InboundIo::new(TestDatagram { incoming, permits, sent,
             pending: None, fail_first: true, attempts: attempts.clone() }, reply_rx);
@@ -142,7 +144,7 @@ async fn idle_reply_writer_subscribes_to_next_reply_without_self_waking() {
     let (_incoming_tx, incoming) = mpsc::channel(1);
     let (permits_tx, permits) = mpsc::channel(2);
     let (sent, mut received) = mpsc::unbounded_channel();
-    let (reply_tx, reply_rx) = mpsc::channel(2);
+    let (reply_tx, reply_rx) = replies::channel(2);
     let mut io = InboundIo::new(TestDatagram { incoming, permits, sent, pending: None,
         fail_first: false, attempts: Arc::new(AtomicUsize::new(0)) }, reply_rx);
     let wakes = Arc::new(WakeCount(AtomicUsize::new(0)));
@@ -183,7 +185,7 @@ async fn stream_write_failure_terminates_single_and_multi_packet_replies() {
     for count in [1, 2] {
         let calls = Arc::new(AtomicUsize::new(0));
         let datagram = OutboundDatagramUotV2::packet_mode(AnyStream::dynamic(FailedStream(calls.clone())));
-        let (reply_tx, reply_rx) = mpsc::channel(4);
+        let (reply_tx, reply_rx) = replies::channel(4);
         for _ in 0..count { reply_tx.send(UdpPacket::default()).await.unwrap(); }
         let mut io = InboundIo::new(datagram, reply_rx);
         let mut cx = Context::from_waker(noop_waker_ref());

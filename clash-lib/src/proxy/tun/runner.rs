@@ -432,6 +432,7 @@ impl AsyncService for TunRunner {
             let _platform = platform;
             let mut pipeline = PacketPipeline::default();
             let (tun_tx, mut tun_rx) = packet_queue::channel();
+            let udp_direct = super::datagram::direct_path(tun_tx.clone());
             let tun_tx_for_dispatcher = tun_tx.clone();
             let tun_tx_for_system_tcp = tun_tx.clone();
             #[cfg(any(target_os = "android", target_os = "linux"))]
@@ -448,7 +449,7 @@ impl AsyncService for TunRunner {
             #[cfg(any(target_os = "android", target_os = "linux"))]
             let icmp_gateway = (cfg.gateway, cfg.gateway_v6);
 
-            pipeline.spawn("writer", async move {
+            pipeline.spawn_writer(async move {
                 let mut queued = Vec::with_capacity(DEVICE_BATCH);
                 let mut batch = Vec::with_capacity(DEVICE_BATCH);
                 let mut budgets = Vec::with_capacity(DEVICE_BATCH);
@@ -499,7 +500,7 @@ impl AsyncService for TunRunner {
             let enable_tcp = cfg.enable_tcp;
             let packets = PacketDispatcher {
                 enable_tcp, system_tcp: use_system_stack, ipv4: v4_nat_info, ipv6: v6_nat_info,
-                nat: system_nat.clone(), replies: tun_tx_for_system_tcp,
+                nat: system_nat.clone(), replies: tun_tx_for_system_tcp, direct: udp_direct.clone(),
             };
             pipeline.spawn("reader", async move {
                 let mut batch = Vec::with_capacity(DEVICE_BATCH);
@@ -544,6 +545,7 @@ impl AsyncService for TunRunner {
                     udp_timeout,
                     strict_route,
                     exclude_routes,
+                    udp_direct,
                 )
                 .await;
                 Err(Error::Operation("tun stopped unexpectedly 3".to_string()))

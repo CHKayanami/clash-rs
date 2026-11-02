@@ -7,11 +7,13 @@ use super::{Association, Outgoing};
 pub(crate) struct ReplyActivity {
     epoch: Instant,
     last_reply: AtomicU64,
+    #[cfg(feature = "tun")]
+    last_upload: AtomicU64,
 }
 
 impl ReplyActivity {
     pub(crate) fn new() -> Self {
-        Self { epoch: Instant::now(), last_reply: AtomicU64::new(0) }
+        Self { epoch: Instant::now(), last_reply: AtomicU64::new(0), #[cfg(feature = "tun")] last_upload: AtomicU64::new(0) }
     }
     #[cfg(test)]
     pub(crate) fn record(&self) {
@@ -19,6 +21,15 @@ impl ReplyActivity {
     }
     pub(crate) fn record_at(&self, now: Instant) {
         self.last_reply.store(now.duration_since(self.epoch).as_nanos() as u64 + 1, Ordering::Relaxed);
+    }
+    #[cfg(feature = "tun")]
+    pub(crate) fn record_upload_at(&self, now: Instant) {
+        self.last_upload.store(now.duration_since(self.epoch).as_nanos() as u64 + 1, Ordering::Relaxed);
+    }
+    #[cfg(feature = "tun")]
+    pub(crate) fn latest_upload(&self) -> Option<Instant> {
+        let elapsed = self.last_upload.load(Ordering::Relaxed);
+        (elapsed != 0).then(|| self.epoch + Duration::from_nanos(elapsed - 1))
     }
     pub(crate) fn latest(&self) -> Option<Instant> {
         let elapsed = self.last_reply.load(Ordering::Relaxed);
@@ -66,9 +77,17 @@ impl FlowState {
 pub(crate) struct UdpFlow {
     pub(super) state: Arc<FlowState>,
     pub(super) association: Arc<Association>,
+    #[cfg(feature = "tun")]
+    pub(super) _direct_registration: Option<super::direct::Registration>,
 }
 
 impl UdpFlow {
+    #[cfg(feature = "tun")]
+    pub(crate) fn enable_direct_upload(&self) {
+        if !self.is_closed() && let Some(registration) = &self._direct_registration {
+            registration.enable(&self.state, &self.association);
+        }
+    }
     pub(crate) fn is_closed(&self) -> bool {
         self.state.is_closed() || self.association.outgoing.is_closed()
     }

@@ -370,6 +370,16 @@ async fn reply_activity_obeys_latest_direction_and_short_flow_timeout() {
     tokio::time::advance(Duration::from_secs(1)).await;
     session.reply_activity.record();
     assert_eq!(session.latest_idle_deadline(timeout), Instant::now() + timeout);
+    #[cfg(feature = "tun")]
+    {
+        // Direct uploads bypass routes.packet but must extend the same lease.
+        tokio::time::advance(Duration::from_secs(61)).await;
+        let uploaded = Instant::now();
+        session.reply_activity.record_upload_at(uploaded);
+        assert_eq!(session.latest_idle_deadline(timeout), uploaded + timeout);
+        tokio::time::advance(Duration::from_secs(2)).await;
+        assert_eq!(session.latest_idle_deadline(timeout), uploaded + timeout);
+    }
 }
 
 #[test]
@@ -1004,8 +1014,8 @@ async fn relay_datagram<D, W, R>(
             true
         }
 
-        fn received(&mut self, packet: UdpPacket) -> bool {
-            (self.on_received)(packet)
+        fn received_batch(&mut self, packets: &mut Vec<UdpPacket>) -> bool {
+            packets.drain(..).all(&mut self.on_received)
         }
     }
 

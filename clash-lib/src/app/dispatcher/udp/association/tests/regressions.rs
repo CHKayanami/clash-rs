@@ -27,7 +27,7 @@ async fn admission_failure_preserves_original_domain_address_and_packet() {
     state.original = original.clone();
     let (outgoing, mut packets) = mpsc::channel(1);
     let (control, _commands) = mpsc::channel(1);
-    flow.association = Arc::new(Association { id: 0, outgoing, control,
+    flow.association = Arc::new(Association { #[cfg(feature = "tun")] direct: None, id: 0, outgoing, control,
         chain: vec![], task: tokio::spawn(std::future::pending()) });
     let packet = UdpPacket::new(Bytes::from_static(b"first"), flow.state.source.into(), original.clone());
     flow.try_send(packet).unwrap();
@@ -65,7 +65,7 @@ async fn old_worker_cannot_remove_slot_while_replacement_dial_is_pending() {
     let (outgoing, packets) = mpsc::channel(1);
     drop(packets);
     let (control, _commands) = mpsc::channel(1);
-    *slot.association.lock().await = Some(Arc::new(Association { id: 77,
+    *slot.association.lock().await = Some(Arc::new(Association { #[cfg(feature = "tun")] direct: None, id: 77,
         outgoing, control, chain: vec![], task: tokio::spawn(std::future::pending()) }));
     let old_worker = WorkerGuard(Arc::downgrade(&slot), 77);
     let pool = fixture.pool.clone();
@@ -108,4 +108,40 @@ async fn waiter_retries_a_slot_removed_before_it_acquires_the_dial_lock() {
     assert!(Arc::ptr_eq(&first.association, &second.association));
     assert_eq!(slot_count(&fixture.pool), 1);
     assert_eq!(count.load(Ordering::Relaxed), 1);
+}
+
+#[cfg(feature = "tun")]
+#[tokio::test]
+async fn full_tun_reply_queue_preserves_upload_and_close_progress() {
+    use crate::proxy::direct::Handler;
+    use tokio::net::UdpSocket;
+
+    let fixture = Fixture::new(Duration::from_secs(60));
+    let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let outbound: ProtocolOutbound = Arc::new(Handler::new("DIRECT")).into();
+    let mut sess = session(server.local_addr().unwrap().port());
+    sess.typ = Type::Tun;
+    let flow = fixture.connect(&outbound, &sess).await;
+    send(&flow, b"initial");
+    let mut buffer = [0; 128];
+    let (_, peer) = timeout(Duration::from_secs(2), server.recv_from(&mut buffer)).await.unwrap().unwrap();
+    for _ in 0..64 { server.send_to(b"reply", peer).await.unwrap(); }
+    timeout(Duration::from_secs(2), async {
+        while fixture.replies.available_credits() != 0 { tokio::task::yield_now().await; }
+    }).await.unwrap();
+    send(&flow, b"upload-while-replies-blocked");
+    let (count, _) = timeout(Duration::from_secs(2), server.recv_from(&mut buffer)).await.unwrap().unwrap();
+    assert_eq!(&buffer[..count], b"upload-while-replies-blocked");
+    let association = flow.association.clone();
+    let state = Arc::downgrade(&flow.state);
+    drop(flow);
+    timeout(Duration::from_secs(2), async {
+        while state.upgrade().is_some() { tokio::task::yield_now().await; }
+    }).await.unwrap();
+    // Fullcone keeps the physical mapping alive after its last logical flow.
+    assert!(!association.task.is_finished());
+    fixture.manager.close_all();
+    timeout(Duration::from_secs(2), async {
+        while !association.task.is_finished() { tokio::task::yield_now().await; }
+    }).await.unwrap();
 }

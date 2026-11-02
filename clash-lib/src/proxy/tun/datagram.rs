@@ -1,4 +1,8 @@
 mod adapter;
+mod direct;
+use direct::Target;
+use super::packet_queue::Sender;
+use crate::app::dispatcher::udp::association::direct::DirectPath;
 use adapter::TunDatagram;
 use std::{sync::Arc, time::Duration};
 use ipnet::IpNet;
@@ -20,6 +24,7 @@ pub(crate) async fn handle_inbound_datagram(
     udp_timeout: Option<u64>,
     strict_route: bool,
     exclude_routes: Arc<Vec<IpNet>>,
+    direct: Arc<DirectPath>,
 ) {
     let sess = Session {
         network: Network::Udp,
@@ -34,9 +39,13 @@ pub(crate) async fn handle_inbound_datagram(
     );
     // The dispatcher owns both directions and the adapter's DNS tasks. Dropping
     // the close sender on cancellation stops that entire inbound namespace.
-    let closer = dispatcher.dispatch_datagram(sess, Box::new(datagram)).await;
+    let closer = dispatcher.dispatch_tun_datagram(sess, Box::new(datagram), direct).await;
     debug!("tun UDP ready");
     let _ = finished.await;
     let _ = closer.send(0);
     warn!("TUN UDP dispatcher stopped");
+}
+
+pub(super) fn direct_path(sender: Sender) -> Arc<DirectPath> {
+    DirectPath::new(Arc::new(Target(sender)))
 }

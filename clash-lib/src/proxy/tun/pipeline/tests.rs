@@ -48,9 +48,8 @@ async fn failed_stage_preserves_error_and_releases_sibling() {
         Err(Error::Operation("device failure".to_owned()))
     });
     let error = timeout(Duration::from_secs(2), pipeline.run(CancellationToken::new()))
-        .await.unwrap().unwrap_err().to_string();
-    assert!(error.contains("reader"));
-    assert!(error.contains("device failure"));
+        .await.unwrap().unwrap_err();
+    assert!(matches!(error, Error::Operation(message) if message == "device failure"));
     assert_eq!(dropped.load(Ordering::Relaxed), 1);
 }
 
@@ -81,7 +80,7 @@ async fn reader_progresses_while_writer_is_inside_a_synchronous_call() {
     let (started_tx, started_rx) = oneshot::channel();
     let (read_tx, read_rx) = oneshot::channel();
     let (release_tx, release_rx) = mpsc::channel();
-    pipeline.spawn("writer", async move {
+    pipeline.spawn_writer(async move {
         started_tx.send(()).unwrap();
         // Model a syscall retaining its worker while another stage needs polling.
         release_rx.recv_timeout(Duration::from_secs(5)).unwrap();

@@ -2,9 +2,10 @@ use std::{collections::{HashMap, VecDeque}, io, net::SocketAddr, pin::Pin,
     sync::{Arc, atomic::{AtomicBool, Ordering}}, task::{Context, Poll}, time::Duration};
 use futures::{Stream, stream::FuturesUnordered, future::BoxFuture};
 use tokio::{sync::{mpsc, oneshot}, time::{Instant, Sleep, sleep}};
-use tracing::{debug, warn};
+use tracing::warn;
 
 use crate::{common::io::datagram_relay::RelayContext, proxy::datagram::{UdpPacket, batch::MAX_BATCH_PACKETS}, session::SocksAddr};
+use super::reply::Destination as ReplyDestination;
 use super::{AssociationConfig, Registration, Outgoing, flow::FlowState, traffic::UdpTraffic, peer::PeerTable};
 
 const CONTROL_BUDGET: usize = 32;
@@ -16,7 +17,7 @@ pub(super) struct AssociationRelay {
     closing: FuturesUnordered<BoxFuture<'static, u64>>,
     sending: VecDeque<(Arc<FlowState>, usize)>,
     last_sender: Option<Arc<FlowState>>,
-    replies: mpsc::Sender<UdpPacket>,
+    replies: ReplyDestination,
     source: SocketAddr,
     allow_quic: Arc<AtomicBool>,
     traffic: UdpTraffic,
@@ -32,12 +33,12 @@ pub(super) struct AssociationRelay {
 impl AssociationRelay {
     pub(super) fn new(packets: mpsc::Receiver<Outgoing>, commands: mpsc::Receiver<Registration>,
         config: &AssociationConfig, source: SocketAddr, user: Option<Arc<str>>,
-        force_source: Option<SocksAddr>, native: bool,
+        force_source: Option<SocksAddr>, replies: ReplyDestination, native: bool,
     ) -> Self {
         Self {
             packets, commands, flows: HashMap::new(), peers: PeerTable::default(),
             closing: FuturesUnordered::new(), sending: VecDeque::with_capacity(MAX_BATCH_PACKETS + 1), last_sender: None,
-            replies: config.replies.clone(), source, allow_quic: config.allow_quic.clone(),
+            replies, source, allow_quic: config.allow_quic.clone(),
             traffic: UdpTraffic::new(config.manager.clone(), user.as_ref()), force_source, user, native,
             timeout: config.timeout, last_active: Instant::now(), timer: Box::pin(sleep(config.timeout)),
         }
@@ -154,34 +155,38 @@ impl RelayContext for AssociationRelay {
         keep_running
     }
 
-    fn received(&mut self, mut packet: UdpPacket) -> bool {
-        self.last_active = Instant::now();
-        self.traffic.push_download(packet.data.len());
-        if let SocksAddr::Ip(addr) = &mut packet.src_addr { addr.set_ip(addr.ip().to_canonical()); }
-        // Endpoint-independent filtering: unknown peers are admitted too.
-        // This table restores addresses and attributes bytes; it is not an allowlist.
-        let (owner, original) = self.peers.reply(&packet.src_addr);
-        let flow = owner.and_then(|id| self.flows.get(&id))
-            .filter(|flow| !flow.is_closed());
-        if let Some(flow) = flow {
-            flow.tracker.record_download(packet.data.len());
-        }
-        let original = self.force_source.as_ref().or(original);
-        if let Some(original) = original && packet.src_addr != *original {
-            packet.src_addr = original.clone();
-        }
-        packet.dst_addr = self.source.into();
-        packet.inbound_user = self.user.clone();
-        // Protocol policy remains separate from NAT filtering.
-        if !self.allow_quic.load(Ordering::Relaxed) && packet.src_addr.port() == 443 { return true; }
-        if let Some(flow) = flow { flow.activity.record_at(self.last_active); }
-        match self.replies.try_send(packet) {
-            Ok(()) => true,
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                debug!("UDP inbound reply queue full, dropping packet");
-                true
+    fn received_batch(&mut self, packets: &mut Vec<UdpPacket>) -> bool {
+        packets.retain_mut(|packet| {
+            self.last_active = Instant::now();
+            self.traffic.push_download(packet.data.len());
+            if let SocksAddr::Ip(addr) = &mut packet.src_addr { addr.set_ip(addr.ip().to_canonical()); }
+            // Endpoint-independent filtering: unknown peers are admitted too.
+            // This table restores addresses and attributes bytes; it is not an allowlist.
+            let (owner, original) = self.peers.reply(&packet.src_addr);
+            let flow = owner.and_then(|id| self.flows.get(&id))
+                .filter(|flow| !flow.is_closed());
+            if let Some(flow) = flow {
+                flow.tracker.record_download(packet.data.len());
             }
-            Err(mpsc::error::TrySendError::Closed(_)) => false,
+            let original = self.force_source.as_ref().or(original);
+            if let Some(original) = original && packet.src_addr != *original {
+                packet.src_addr = original.clone();
+            }
+            packet.dst_addr = self.source.into();
+            packet.inbound_user = self.user.clone();
+            // Protocol policy remains separate from NAT filtering.
+            if !self.allow_quic.load(Ordering::Relaxed) && packet.src_addr.port() == 443 { return false; }
+            if let Some(flow) = flow { flow.activity.record_at(self.last_active); }
+            true
+        });
+        match self.replies.send(packets) {
+            Ok(()) => true,
+            Err(error) => { warn!("UDP reply batch failed: {error}"); false }
         }
     }
+
+    fn poll_receive_ready(&mut self, cx: &mut Context<'_>) -> Poll<bool> {
+        self.replies.poll_ready(cx)
+    }
+
 }
