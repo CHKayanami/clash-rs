@@ -4,14 +4,17 @@ use std::collections::HashMap;
 use smoltcp::time::Instant;
 use super::super::connections::SocketHandle;
 
-#[derive(Default)]
-pub(super) struct Timers {
-    heap: Vec<(Instant, SocketHandle)>,
+pub(crate) struct Timers<T = Instant> {
+    heap: Vec<(T, SocketHandle)>,
     positions: HashMap<SocketHandle, usize>,
 }
 
-impl Timers {
-    pub fn set(&mut self, handle: SocketHandle, deadline: Instant) {
+impl<T> Default for Timers<T> {
+    fn default() -> Self { Self { heap: Vec::new(), positions: HashMap::new() } }
+}
+
+impl<T: Copy + Ord> Timers<T> {
+    pub fn set(&mut self, handle: SocketHandle, deadline: T) {
         if let Some(&index) = self.positions.get(&handle) {
             if self.heap[index].0 == deadline { return; }
             self.heap[index].0 = deadline;
@@ -35,9 +38,9 @@ impl Timers {
         self.sift_down(index);
     }
 
-    pub fn first(&self) -> Option<Instant> { self.heap.first().map(|(deadline, _)| *deadline) }
+    pub fn first(&self) -> Option<T> { self.heap.first().map(|(deadline, _)| *deadline) }
 
-    pub fn pop_due(&mut self, now: Instant) -> Option<SocketHandle> {
+    pub fn pop_due(&mut self, now: T) -> Option<SocketHandle> {
         let &(deadline, handle) = self.heap.first()?;
         if deadline > now { return None; }
         self.remove(handle);

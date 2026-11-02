@@ -161,6 +161,15 @@ impl<'a> Socket<'a> {
         self.tx_buffer.len()
     }
 
+    /// Flight includes packets committed to the software output channel; it
+    /// is not proof that the device has physically transmitted those bytes.
+    pub(crate) fn transmit_state(&self) -> TransmitState {
+        let queued = self.tx_buffer.len();
+        let in_flight = self.flight_size().min(queued);
+        TransmitState { capacity: self.tx_buffer.capacity(), queued,
+            unsent: queued - in_flight }
+    }
+
     /// Number of octets transmitted but not yet ACKed.
     pub(super) fn flight_size(&self) -> usize {
         self.remote_last_seq - self.local_seq_no

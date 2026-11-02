@@ -5,7 +5,7 @@ mod timers;
 use smoltcp::time::{Duration, Instant};
 use super::{connections::SocketHandle, protocol::PollAt};
 use ready::ReadyList;
-use timers::Timers;
+pub(crate) use timers::Timers;
 
 #[derive(Default)]
 pub(crate) struct Schedule {

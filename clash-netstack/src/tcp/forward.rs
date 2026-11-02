@@ -172,12 +172,13 @@ impl Forward {
 
     fn pump_download(&mut self, socket: &mut tcp::Socket<'_>, handle: &TcpStreamHandle,
         cx: &mut Context<'_>, now: Instant) -> io::Result<()> {
-        let mut budget: usize = 64 * 1024;
+        let mut budget = 64 * 1024;
         while !self.download_done && socket.can_send() && budget > 0 {
             // Drain writes accepted by the generic stream before handoff.
             if let Some(buffer) = handle.send_buffer.get() && !buffer.is_empty() {
                 let n = socket.send(|data| {
-                    let n = buffer.dequeue_slice(data);
+                    let length = data.len().min(budget);
+                    let n = buffer.dequeue_slice(&mut data[..length]);
                     (n, n)
                 }).map_err(|_| closed_error())?;
                 budget = budget.saturating_sub(n);
@@ -205,7 +206,7 @@ impl Forward {
                 Poll::Pending => break,
             }
         }
-        if budget == 0 { handle.notify(); }
+        if budget == 0 && socket.can_send() { handle.notify(); }
         Ok(())
     }
 

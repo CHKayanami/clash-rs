@@ -8,7 +8,7 @@ use tokio::{sync::mpsc, task::consume_budget, time::{Instant, sleep}};
 use super::{driver::{Driver, IngressStatus}, connections::{SocketHandle, SocketTable}, protocol as tcp};
 use crate::{Packet, link::device::NetstackDevice, link::packet::IpPacket,
     tcp::ready::{Ready, ReadyQueue}, tcp::buffers::Buffers,
-    tcp::forward::{Forward, past_handshake}, tcp::listener::{TcpStreamHandle,
+    tcp::schedule::Timers, tcp::forward::{Forward, past_handshake}, tcp::listener::{TcpStreamHandle,
         closed_error, new_stream}, tcp::stream::TcpStream};
 
 const PACKET_BUDGET: usize = 32;
@@ -37,6 +37,7 @@ pub(crate) struct Engine {
     sockets: SocketTable,
     entries: HashMap<u64, Entry>,
     ready: Arc<ReadyQueue>,
+    buffer_timers: Timers<Instant>,
 }
 
 impl Engine {
@@ -44,7 +45,7 @@ impl Engine {
         let device = NetstackDevice::new(outbound);
         let driver = Driver::new(mtu);
         Self { driver, device, sockets: SocketTable::new(), entries: HashMap::new(),
-            ready }
+            ready, buffer_timers: Timers::default() }
     }
 
     pub async fn run(mut self, mut inbound: mpsc::Receiver<Packet>,
@@ -54,6 +55,7 @@ impl Engine {
         let output = self.device.output().clone();
         let mut timer = Box::pin(sleep(Duration::ZERO));
         loop {
+            self.expire_buffers(Instant::now());
             // Keep the local device queue bounded to one ingress batch. Socket
             // registration and SYN injection happen together in admit().
             if self.device.is_empty() {
@@ -74,7 +76,10 @@ impl Engine {
             }
             self.driver.poll_egress(StackInstant::now(), &mut self.device, &mut self.sockets);
             self.reap_completed();
-            let delay = self.driver.poll_delay(StackInstant::now());
+            let protocol_delay = self.driver.poll_delay(StackInstant::now());
+            let buffer_delay = self.buffer_timers.first()
+                .map(|deadline| StackDuration::from(deadline.saturating_duration_since(Instant::now())));
+            let delay = protocol_delay.into_iter().chain(buffer_delay).min();
             let blocked_output = !self.device.output_available();
             if streams.is_closed() || output.is_closed() { return Ok(()); }
             // Egress may have drained a local reply after ingress stopped.
@@ -112,6 +117,13 @@ impl Engine {
                 _ = streams.closed() => return Ok(()),
                 _ = output.closed() => return Ok(()),
             }
+        }
+    }
+
+    fn expire_buffers(&mut self, now: Instant) {
+        for _ in 0..SOCKET_BUDGET {
+            let Some(handle) = self.buffer_timers.pop_due(now) else { break; };
+            if let Some(entry) = self.entries.get(&handle.0) { entry.handle.notify(); }
         }
     }
 
@@ -168,7 +180,9 @@ impl Engine {
     }
 
     fn service(&mut self, id: u64) -> bool {
+        let output_ready = self.device.output_available();
         let Some(entry) = self.entries.get_mut(&id) else { return false; };
+        let now = Instant::now();
         let started = self.sockets.started(entry.socket);
         let socket = self.sockets.get_mut(entry.socket);
         let before = (socket.state(), socket.recv_queue(), socket.send_queue());
@@ -205,21 +219,27 @@ impl Engine {
             // full queue revisited by unrelated wakes or stalled peers.
             let send_limited = socket.may_send() && !socket.can_send()
                 && socket.send_queue() > before.2;
-            grown = socket.is_active() && past_handshake(socket)
-                && entry.buffers.grow(socket, consumed, send_limited);
+            grown |= socket.is_active() && past_handshake(socket)
+                && entry.buffers.grow(socket, consumed, send_limited, output_ready, now);
             if socket.send_capacity() > send_capacity { entry.handle.notify(); }
         }
+        // A draining RX grant can become reclaimable during this relay pass.
+        grown |= entry.buffers.reclaim(socket, now);
         let changed = aborted || grown || before != (socket.state(), socket.recv_queue(), socket.send_queue());
         if !socket.is_active() && socket.remote_endpoint().is_none()
             && (started || socket.state() != tcp::State::Listen) {
             let socket_handle = entry.socket;
             self.driver.remove(socket_handle, &mut self.sockets);
             self.entries.remove(&id);
+            self.buffer_timers.remove(socket_handle);
         } else {
             // Includes pending SYNs and aborts waiting for RST capacity. Arm
             // only after close/growth/abort can no longer consume these wakes.
             socket.register_recv_waker(&waker);
             socket.register_send_waker(&waker);
+            if let Some(deadline) = entry.buffers.idle_deadline(socket) {
+                self.buffer_timers.set(entry.socket, deadline);
+            } else { self.buffer_timers.remove(entry.socket); }
         }
         changed
     }
@@ -270,6 +290,7 @@ fn pump_stream(socket: &mut tcp::Socket<'_>, handle: &TcpStreamHandle) {
 mod tests {
     use super::*;
     use crate::tcp::protocol::SocketBuffer;
+    use smoltcp::wire::{IpRepr, Ipv4Repr, TcpControl, TcpRepr, TcpSeqNumber};
 
     fn half_open() -> (Engine, TcpStream, Arc<ReadyQueue>, SocketHandle, mpsc::Receiver<Packet>) {
         let ready = Arc::new(ReadyQueue::default());
@@ -287,6 +308,18 @@ mod tests {
         engine.sockets.get_mut(handle).register_send_waker(&waker);
         engine.entries.insert(handle.0, Entry { socket: handle, buffers, handle: shared, forward: None });
         (engine, stream, ready, handle, receiver)
+    }
+
+    #[test]
+    fn buffer_deadline_wakes_service_without_protocol_traffic() {
+        let (mut engine, _stream, ready, handle, _receiver) = half_open();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        engine.buffer_timers.set(handle, deadline);
+        engine.expire_buffers(deadline - Duration::from_millis(1));
+        assert!(ready.is_empty());
+        engine.expire_buffers(deadline);
+        assert!(!ready.is_empty());
+        assert!(engine.buffer_timers.first().is_none());
     }
 
     #[test]
@@ -325,5 +358,48 @@ mod tests {
         let flow = (stream.local_addr(), stream.remote_addr());
         assert!(engine.sockets.find(&flow).is_none());
         assert_eq!(engine.driver.poll_delay(StackInstant::ZERO), None);
+    }
+
+    #[test]
+    fn full_socket_preserves_adapter_bytes_without_self_waking() {
+        let local: SocketAddr = "192.0.2.2:49152".parse().unwrap();
+        let remote: SocketAddr = "198.51.100.2:80".parse().unwrap();
+        let mut socket = tcp::Socket::new(SocketBuffer::new(vec![0; 64]),
+            SocketBuffer::new(vec![0; 16]));
+        let mut cx = tcp::Context::new(1500);
+        socket.connect(&mut cx, remote, local).unwrap();
+        let mut sequence = None;
+        socket.dispatch(&mut cx, |_, _, (_, syn)| {
+            sequence = Some(syn.seq_number);
+            Ok::<_, ()>(())
+        }).unwrap();
+        let ip = IpRepr::Ipv4(Ipv4Repr { src_addr: [198, 51, 100, 2].into(),
+            dst_addr: [192, 0, 2, 2].into(), next_header: IpProtocol::Tcp,
+            payload_len: 20, hop_limit: 64 });
+        let synack = TcpRepr { src_port: 80, dst_port: 49152,
+            control: TcpControl::Syn, seq_number: TcpSeqNumber(100),
+            ack_number: Some(sequence.unwrap() + 1), window_len: 4096,
+            window_scale: None, max_seg_size: None, sack_permitted: false,
+            sack_ranges: [None; 3], timestamp: None, payload: &[] };
+        socket.process(&mut cx, &ip, &synack);
+        assert_eq!(socket.state(), tcp::State::Established);
+        let ready = Arc::new(ReadyQueue::default());
+        let wake = Ready::new(1, ready.clone());
+        let (_stream, handle) = new_stream(local, remote, wake);
+        assert_eq!(handle.send().enqueue_slice(&[b'x'; 64]), 64);
+        pump_stream(&mut socket, &handle);
+        assert_eq!(socket.send_queue(), 16);
+        assert!(!handle.send().is_empty());
+        assert!(ready.is_empty());
+        // A second service cannot consume more adapter bytes or self-wake
+        // until an ACK frees actual socket storage.
+        pump_stream(&mut socket, &handle);
+        assert_eq!(socket.send_queue(), 16);
+        assert!(!handle.send().is_empty());
+        assert!(ready.is_empty());
+        let mut remaining = [0; 64];
+        assert_eq!(handle.send().dequeue_slice(&mut remaining), 48);
+        assert_eq!(&remaining[..48], &[b'x'; 48]);
+        assert!(ready.is_empty());
     }
 }

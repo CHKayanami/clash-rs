@@ -487,6 +487,24 @@ pub enum CongestionControl {
     Cubic,
 }
 
+/// RX storage and outstanding advertised credit must both fit on reclaim.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ReceiveState {
+    pub capacity: usize,
+    pub stored: usize,
+    pub required: usize,
+    pub storage_limited: bool,
+    pub credit_limited: bool,
+}
+
+/// Accepted TX storage and the portion still waiting for dispatch.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct TransmitState {
+    pub capacity: usize,
+    pub queued: usize,
+    pub unsent: usize,
+}
+
 /// A Transmission Control Protocol socket.
 ///
 /// A TCP socket may passively listen for connections or actively connect to another endpoint.
@@ -529,6 +547,11 @@ pub struct Socket<'a> {
     remote_last_ack: Option<TcpSeqNumber>,
     /// Last advertised receive window in bytes, including an unscaled SYN window.
     remote_last_win_len: usize,
+    /// Latched actual storage pressure, consumed by the buffer controller.
+    receive_storage_limited: bool,
+    receive_window_limited: bool,
+    receive_admission_limit: Option<usize>,
+    receive_advertised_end: Option<TcpSeqNumber>,
     /// The sending window scaling factor advertised to remotes which support RFC 1323.
     /// It is zero if the window <= 64KiB and/or the remote does not support it.
     remote_win_shift: u8,

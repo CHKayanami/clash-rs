@@ -467,6 +467,11 @@ impl<'a> Socket<'a> {
         // for sure will not be successfully transmitted.
         ip_repr.set_payload_len(repr.buffer_len());
         emit(cx, packet_meta, (ip_repr, repr))?;
+        // Include keepalives and committed software-queue packets in the
+        // outstanding promise, even when state updates below return early.
+        let advertised = if repr.control == TcpControl::Syn { repr.window_len as usize }
+            else { (repr.window_len as usize) << self.remote_win_shift };
+        Self::record_receive_window(&mut self.receive_advertised_end, repr.ack_number, advertised);
 
         // We have successfully emitted, if this was a fast retransmission it is not pending anymore
         self.pending_fast_retransmit = false;

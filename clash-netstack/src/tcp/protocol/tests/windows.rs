@@ -911,3 +911,71 @@ fn test_zero_window_reopens_inflight_data() {
         PollAt::Time(Instant::from_millis(4000))
     );
 }
+
+#[test]
+fn receive_storage_pressure_survives_drain_and_ack_but_is_consumed_once() {
+    let mut s = socket_established_with_buffer_sizes(64, 64);
+    send(&mut s, Instant::ZERO, &TcpRepr {
+        seq_number: REMOTE_SEQ + 1,
+        ack_number: Some(LOCAL_SEQ + 1),
+        payload: &[b'x'; 32],
+        ..SEND_TEMPL
+    });
+    assert!(!s.take_receive_state().storage_limited);
+    send(&mut s, Instant::ZERO, &TcpRepr {
+        seq_number: REMOTE_SEQ + 33,
+        ack_number: Some(LOCAL_SEQ + 1),
+        payload: &[b'x'; 16],
+        ..SEND_TEMPL
+    });
+    assert_eq!(s.recv_slice(&mut [0; 48]), Ok(48));
+    // Reopening the window must not erase a pressure event from ingress.
+    recv(&mut s, Instant::ZERO, |reply| {
+        assert_eq!(reply.unwrap().window_len, 64);
+    });
+    assert!(s.take_receive_state().storage_limited);
+    assert!(!s.take_receive_state().storage_limited);
+    // An old duplicate cannot create another pressure observation.
+    send(&mut s, Instant::ZERO, &TcpRepr {
+        seq_number: REMOTE_SEQ + 1,
+        ack_number: Some(LOCAL_SEQ + 1),
+        payload: &[b'x'; 48],
+        ..SEND_TEMPL
+    });
+    assert!(!s.take_receive_state().storage_limited);
+}
+
+#[test]
+fn receive_credit_detects_pressure_hidden_by_the_32_packet_ingress_batch() {
+    let mut s = socket_established_with_buffer_sizes(64, 64 * 1024);
+    for index in 0..32 {
+        send(&mut s, Instant::ZERO, &TcpRepr {
+            seq_number: REMOTE_SEQ + 1 + index * 1460,
+            ack_number: Some(LOCAL_SEQ + 1),
+            payload: &[b'x'; 1460],
+            ..SEND_TEMPL
+        });
+    }
+    assert_eq!(s.recv_queue(), 32 * 1460);
+    assert!(s.recv_queue() < s.recv_capacity() * 3 / 4);
+    assert_eq!(s.recv_slice(&mut [0; 32 * 1460]), Ok(32 * 1460));
+    let pressure = s.take_receive_state();
+    assert!(!pressure.storage_limited);
+    assert!(pressure.credit_limited);
+    assert!(!s.take_receive_state().credit_limited);
+}
+
+#[test]
+fn receive_credit_from_a_small_grant_does_not_imply_storage_is_too_small() {
+    let mut s = socket_established_with_buffer_sizes(64, 64 * 1024);
+    s.remote_last_win_len = 8192;
+    send(&mut s, Instant::ZERO, &TcpRepr {
+        seq_number: REMOTE_SEQ + 1,
+        ack_number: Some(LOCAL_SEQ + 1),
+        payload: &[b'x'; 4096],
+        ..SEND_TEMPL
+    });
+    let pressure = s.take_receive_state();
+    assert!(!pressure.storage_limited);
+    assert!(!pressure.credit_limited);
+}

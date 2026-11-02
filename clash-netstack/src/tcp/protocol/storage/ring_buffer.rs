@@ -35,6 +35,25 @@ pub struct RingBuffer<'a, T: 'a> {
 }
 
 impl<'a, T: Copy> RingBuffer<'a, T> {
+    /// Resize committed FIFO data only. Suitable for TX, never RX reassembly:
+    /// unallocated out-of-order bytes are deliberately not copied.
+    pub(crate) fn resize_fifo(&mut self, replacement: Self) {
+        self.resize_prefix(replacement, self.length);
+    }
+
+    /// Preserve a logical prefix including RX out-of-order storage. The caller
+    /// supplies its highest reassembly offset and validates advertised credit.
+    pub(crate) fn resize_prefix(&mut self, mut replacement: Self, span: usize) {
+        assert!(span >= self.length && span <= self.capacity());
+        assert!(replacement.capacity() >= span);
+        let tail = span.min(self.capacity() - self.read_at);
+        replacement.storage[..tail].copy_from_slice(&self.storage[self.read_at..self.read_at + tail]);
+        replacement.storage[tail..span].copy_from_slice(&self.storage[..span - tail]);
+        replacement.read_at = 0;
+        replacement.length = self.length;
+        *self = replacement;
+    }
+
     /// Replace backing storage without changing logical offsets. TCP may have
     /// out-of-order data in the unallocated region, so copy the entire old
     /// storage rather than just the committed FIFO prefix.

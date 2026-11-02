@@ -330,3 +330,205 @@ fn test_buffer_wraparound_tx() {
         })
     );
 }
+
+#[test]
+fn tx_shrink_preserves_wrapped_unacknowledged_and_unsent_bytes() {
+    let mut s = socket_established_with_buffer_sizes(128, 64);
+    assert_eq!(s.tx_buffer.enqueue_slice(&[b'a'; 120]), 120);
+    s.tx_buffer.dequeue_allocated(100);
+    assert_eq!(s.tx_buffer.enqueue_slice(&[b'b'; 100]), 100);
+    s.remote_last_seq = s.local_seq_no + 80;
+    let mut expected = vec![0; 120];
+    assert_eq!(s.tx_buffer.read_allocated(0, &mut expected), 120);
+    let before = (s.local_seq_no, s.remote_last_seq, s.timer, s.acknowledged_bytes);
+    s.shrink_send_buffer(SocketBuffer::new(vec![0; 120]));
+    assert_eq!(s.send_capacity(), 120);
+    assert_eq!((s.local_seq_no, s.remote_last_seq, s.timer, s.acknowledged_bytes), before);
+    let mut actual = vec![0; 120];
+    assert_eq!(s.tx_buffer.read_allocated(0, &mut actual), 120);
+    assert_eq!(actual, expected);
+    send(&mut s, Instant::ZERO, &TcpRepr {
+        seq_number: REMOTE_SEQ + 1,
+        ack_number: Some(LOCAL_SEQ + 21),
+        ..SEND_TEMPL
+    });
+    assert_eq!(s.send_queue(), 100);
+    assert_eq!(s.tx_buffer.read_allocated(0, &mut actual[..100]), 100);
+    assert_eq!(&actual[..100], &expected[20..]);
+}
+
+#[test]
+#[should_panic]
+fn tx_shrink_rejects_storage_smaller_than_accepted_data() {
+    let mut s = socket_established_with_buffer_sizes(128, 64);
+    assert_eq!(s.send_slice(&[b'x'; 64]), Ok(64));
+    s.shrink_send_buffer(SocketBuffer::new(vec![0; 63]));
+}
+
+#[test]
+fn tx_state_distinguishes_dispatched_data_from_unsent_data() {
+    for window in [32, 4096] {
+        let mut s = socket_established_with_buffer_sizes(128, 64);
+        s.set_congestion_control(CongestionControl::None);
+        s.remote_win_len = window;
+        assert_eq!(s.send_slice(&[b'x'; 128]), Ok(128));
+        let before = s.transmit_state();
+        assert_eq!(before.unsent, 128);
+        assert_eq!(before.queued, 128);
+        recv(&mut s, Instant::ZERO, |reply| {
+            assert_eq!(reply.unwrap().payload.len(), window.min(128));
+        });
+        let after = s.transmit_state();
+        assert_eq!(after.queued, 128);
+        assert_eq!(after.unsent, 128 - window.min(128));
+    }
+}
+
+#[test]
+fn rx_reclaim_honors_old_credit_and_keeps_the_advertised_right_edge() {
+    let mut s = socket_established_with_buffer_sizes(64, 128);
+    s.set_ack_delay(None);
+    assert!(s.limit_receive_admission(64));
+    assert_eq!(s.receive_state().required, 128);
+    send(&mut s, Instant::ZERO, &TcpRepr {
+        seq_number: REMOTE_SEQ + 1, ack_number: Some(LOCAL_SEQ + 1),
+        payload: &[b'a'; 64], ..SEND_TEMPL
+    });
+    recv(&mut s, Instant::ZERO, |reply| {
+        let reply = reply.unwrap();
+        assert_eq!(reply.ack_number, Some(REMOTE_SEQ + 65));
+        assert_eq!(reply.window_len, 64);
+        // ACK advances, but credit is not extended while a reclaim is pending.
+        assert_eq!(reply.ack_number.unwrap() + reply.window_len as usize, REMOTE_SEQ + 129);
+    });
+    assert_eq!(s.receive_state().required, 128);
+    assert_eq!(s.recv_slice(&mut [0; 64]), Ok(64));
+    assert_eq!(s.receive_state().required, 64);
+    let shift = s.remote_win_shift;
+    s.shrink_receive_buffer(SocketBuffer::new(vec![0; 64]));
+    assert_eq!(s.remote_win_shift, shift);
+    // The remaining bytes of the earlier grant are still accepted after shrink.
+    send(&mut s, Instant::ZERO, &TcpRepr {
+        seq_number: REMOTE_SEQ + 65, ack_number: Some(LOCAL_SEQ + 1),
+        payload: &[b'b'; 64], ..SEND_TEMPL
+    });
+    let mut actual = [0; 64];
+    assert_eq!(s.recv_slice(&mut actual), Ok(64));
+    assert_eq!(actual, [b'b'; 64]);
+}
+
+#[test]
+#[should_panic]
+fn rx_reclaim_rejects_empty_storage_with_outstanding_credit() {
+    let mut s = socket_established_with_buffer_sizes(64, 128);
+    assert_eq!(s.recv_queue(), 0);
+    s.shrink_receive_buffer(SocketBuffer::new(vec![0; 64]));
+}
+
+#[test]
+fn rx_reclaim_preserves_wrapped_out_of_order_bytes_and_can_fill_the_gap() {
+    let mut s = socket_established_with_buffer_sizes(64, 128);
+    // An endpoint can advertise less credit than its physical storage.
+    s.remote_last_win_len = 64;
+    assert_eq!(s.rx_buffer.enqueue_slice(&[0; 120]), 120);
+    s.rx_buffer.dequeue_allocated(120);
+    assert_eq!(s.rx_buffer.write_unallocated(32, &[b'h'; 8]), 8);
+    s.assembler.add(32, 8).unwrap();
+    assert_eq!(s.receive_state().stored, 40);
+    assert_eq!(s.receive_state().required, 64);
+    s.shrink_receive_buffer(SocketBuffer::new(vec![0; 64]));
+    send(&mut s, Instant::ZERO, &TcpRepr {
+        seq_number: REMOTE_SEQ + 1, ack_number: Some(LOCAL_SEQ + 1),
+        payload: &[b'a'; 32], ..SEND_TEMPL
+    });
+    let mut actual = [0; 40];
+    assert_eq!(s.recv_slice(&mut actual), Ok(40));
+    assert_eq!(&actual[..32], &[b'a'; 32]);
+    assert_eq!(&actual[32..], &[b'h'; 8]);
+}
+
+#[test]
+fn rx_reclaim_keeps_scaled_credit_when_ack_rounding_moves_the_wire_edge() {
+    let mut s = socket_established_with_buffer_sizes(64, 1024);
+    s.remote_win_shift = 7;
+    s.remote_last_win_len = 1024;
+    s.receive_advertised_end = Some(REMOTE_SEQ + 1025);
+    s.set_ack_delay(None);
+    s.limit_receive_admission(512);
+    send(&mut s, Instant::ZERO, &TcpRepr {
+        seq_number: REMOTE_SEQ + 1, ack_number: Some(LOCAL_SEQ + 1),
+        payload: &[b'a'; 65], ..SEND_TEMPL
+    });
+    recv(&mut s, Instant::ZERO, |reply| {
+        // Scaling may round the wire window down; earlier credit stays valid.
+        assert_eq!(reply.unwrap().window_len, 7);
+    });
+    assert_eq!(s.recv_slice(&mut [0; 65]), Ok(65));
+    assert_eq!(s.receive_state().required, 959);
+    send(&mut s, Instant::ZERO, &TcpRepr {
+        seq_number: REMOTE_SEQ + 66, ack_number: Some(LOCAL_SEQ + 1),
+        payload: &[b'a'; 447], ..SEND_TEMPL
+    });
+    recv(&mut s, Instant::ZERO, |reply| {
+        assert_eq!(reply.unwrap().window_len, 4);
+    });
+    assert_eq!(s.recv_slice(&mut [0; 447]), Ok(447));
+    assert_eq!(s.receive_state().required, 512);
+    s.shrink_receive_buffer(SocketBuffer::new(vec![0; 512]));
+    assert_eq!(s.remote_win_shift, 7);
+    send(&mut s, Instant::ZERO, &TcpRepr {
+        seq_number: REMOTE_SEQ + 513, ack_number: Some(LOCAL_SEQ + 1),
+        payload: &[b'b'; 512], ..SEND_TEMPL
+    });
+    assert_eq!(s.recv_queue(), 512);
+}
+
+#[test]
+fn rx_controller_keeps_idle_reclaim_while_consuming_old_advertised_credit() {
+    use crate::tcp::buffers::Buffers;
+    use tokio::time::{Duration as TokioDuration, Instant as TokioInstant};
+
+    let (mut buffers, _) = Buffers::new();
+    let mut s = socket_established_with_buffer_sizes(16 * 1024, 64 * 1024);
+    s.remote_last_win_len = 64 * 1024;
+    s.receive_advertised_end = Some(REMOTE_SEQ + 1 + 64 * 1024);
+    s.set_ack_delay(None);
+    let now = TokioInstant::now() + TokioDuration::from_secs(31);
+    assert!(buffers.reclaim(&mut s.socket, now));
+    assert_eq!(s.recv_capacity(), 64 * 1024);
+    let payload = [b'x'; 16 * 1024];
+    for batch in 0..3 {
+        send(&mut s, Instant::ZERO, &TcpRepr {
+            seq_number: REMOTE_SEQ + 1 + batch * payload.len(),
+            ack_number: Some(LOCAL_SEQ + 1), payload: &payload, ..SEND_TEMPL
+        });
+        assert_eq!(s.recv_slice(&mut [0; 16 * 1024]), Ok(payload.len()));
+        buffers.grow(&mut s.socket, payload.len(), false, true, now);
+        buffers.reclaim(&mut s.socket, now);
+        recv(&mut s, Instant::ZERO, |reply| { assert!(reply.is_ok()); });
+    }
+    assert_eq!(s.recv_capacity(), 16 * 1024);
+    assert!(s.receive_admission_limit.is_none());
+}
+
+#[test]
+fn rx_reassembly_without_readable_bytes_does_not_arm_an_expired_idle_deadline() {
+    use crate::tcp::buffers::Buffers;
+    use tokio::time::{Duration as TokioDuration, Instant as TokioInstant};
+
+    let (mut buffers, _) = Buffers::new();
+    let mut s = socket_established_with_buffer_sizes(16 * 1024, 64 * 1024);
+    assert!(buffers.idle_deadline(&s.socket).is_some());
+    send(&mut s, Instant::ZERO, &TcpRepr {
+        seq_number: REMOTE_SEQ + 1025,
+        ack_number: Some(LOCAL_SEQ + 1), payload: b"hole", ..SEND_TEMPL
+    });
+    assert_eq!(s.recv_queue(), 0);
+    assert!(s.receive_state().stored > 0);
+    let now = TokioInstant::now() + TokioDuration::from_secs(31);
+    for _ in 0..3 {
+        assert!(!buffers.reclaim(&mut s.socket, now));
+        assert_eq!(buffers.idle_deadline(&s.socket), None);
+    }
+    assert_eq!(s.recv_capacity(), 64 * 1024);
+}

@@ -40,6 +40,10 @@ impl<'a> Socket<'a> {
             remote_last_seq: TcpSeqNumber::default(),
             remote_last_ack: None,
             remote_last_win_len: 0,
+            receive_storage_limited: false,
+            receive_window_limited: false,
+            receive_admission_limit: None,
+            receive_advertised_end: None,
             remote_win_len: 0,
             remote_win_shift: Self::receive_window_shift(rx_capacity),
             remote_win_scale: None,
@@ -206,7 +210,16 @@ impl<'a> Socket<'a> {
     /// Used in internal calculations as well as packet generation.
     #[inline]
     pub(super) fn scaled_window(&self) -> u16 {
-        u16::try_from(self.rx_buffer.window() >> self.remote_win_shift).unwrap_or(u16::MAX)
+        let available = match self.receive_admission_limit {
+            Some(limit) => {
+                let desired = limit.saturating_sub(self.rx_buffer.len());
+                // Hold the old right edge while draining. A smaller desired
+                // capacity never revokes credit that was already advertised.
+                desired.max(self.promised_receive_window()).min(self.rx_buffer.window())
+            },
+            None => self.rx_buffer.window(),
+        };
+        u16::try_from(available >> self.remote_win_shift).unwrap_or(u16::MAX)
     }
 
     /// Remaining bytes below the last advertised receive-window right edge.
@@ -221,6 +234,65 @@ impl<'a> Socket<'a> {
         let last_win_adjusted = last_win.saturating_sub(next_ack - last_ack);
 
         Some(last_win_adjusted)
+    }
+
+    pub(super) fn record_receive_window(previous: &mut Option<TcpSeqNumber>, ack: Option<TcpSeqNumber>, length: usize) {
+        if let Some(ack) = ack {
+            let end = ack + length;
+            *previous = Some(previous.map_or(end, |old| old.max(end)));
+        }
+    }
+
+    pub(super) fn receive_window_end(&self) -> Option<TcpSeqNumber> {
+        let current = self.remote_last_ack.map(|ack| ack + self.remote_last_win_len);
+        match (self.receive_advertised_end, current) {
+            (Some(old), Some(current)) => Some(old.max(current)),
+            (old, current) => old.or(current),
+        }
+    }
+
+    fn promised_receive_window(&self) -> usize {
+        let next = self.remote_seq_no + self.rx_buffer.len();
+        self.receive_window_end().filter(|&end| end > next).map_or(0, |end| end - next)
+    }
+
+    pub(super) fn receive_storage_span(&self) -> usize {
+        self.rx_buffer.len() + self.assembler.iter_data().map(|(_, end)| end).max().unwrap_or(0)
+    }
+
+    pub(crate) fn receive_state(&self) -> ReceiveState {
+        let stored = self.receive_storage_span();
+        ReceiveState { capacity: self.rx_buffer.capacity(), stored,
+            required: stored.max(self.rx_buffer.len() + self.promised_receive_window()),
+            storage_limited: self.receive_storage_limited, credit_limited: self.receive_window_limited }
+    }
+
+    /// Storage pressure survives replies and reads, and is consumed once by
+    /// the RX controller rather than counted again on unrelated wakes.
+    pub(crate) fn take_receive_state(&mut self) -> ReceiveState {
+        let state = self.receive_state();
+        self.receive_storage_limited = false;
+        self.receive_window_limited = false;
+        state
+    }
+
+    pub(crate) fn limit_receive_admission(&mut self, capacity: usize) -> bool {
+        assert!(capacity > 0 && capacity <= self.rx_buffer.capacity());
+        let changed = self.receive_admission_limit != Some(capacity);
+        self.receive_admission_limit = Some(capacity);
+        changed
+    }
+
+    /// Reclaim only when committed data, all reassembly offsets and every
+    /// outstanding advertised grant fit. Window scaling is never renegotiated.
+    pub(crate) fn shrink_receive_buffer(&mut self, buffer: SocketBuffer<'a>) {
+        assert!(buffer.capacity() <= self.rx_buffer.capacity());
+        assert!(buffer.capacity() >= self.receive_state().required);
+        let span = self.receive_storage_span();
+        self.rx_buffer.resize_prefix(buffer, span);
+        self.receive_admission_limit = None;
+        self.receive_storage_limited = false;
+        self.receive_window_limited = false;
     }
 
     /// Set the timeout duration.
@@ -427,6 +499,16 @@ impl<'a> Socket<'a> {
         }
     }
 
+    /// Resize TX after the owner has stopped admitting bytes beyond the new
+    /// limit. All committed bytes, including unacknowledged data, are retained.
+    /// Exclusive socket access prevents outstanding slices during replacement;
+    /// sequence numbers, RTT state and retransmission timers are unchanged.
+    pub(crate) fn shrink_send_buffer(&mut self, buffer: SocketBuffer<'a>) {
+        assert!(buffer.capacity() <= self.tx_buffer.capacity());
+        assert!(buffer.capacity() >= self.tx_buffer.len());
+        self.tx_buffer.resize_fifo(buffer);
+    }
+
     /// Return the remote endpoint, or None if not connected.
     #[inline]
     pub fn remote_endpoint(&self) -> Option<IpEndpoint> {
@@ -467,6 +549,10 @@ impl<'a> Socket<'a> {
         self.remote_last_seq = TcpSeqNumber::default();
         self.remote_last_ack = None;
         self.remote_last_win_len = 0;
+        self.receive_storage_limited = false;
+        self.receive_window_limited = false;
+        self.receive_admission_limit = None;
+        self.receive_advertised_end = None;
         self.remote_win_len = 0;
         self.remote_win_scale = None;
         self.remote_win_shift = Self::receive_window_shift(self.rx_capacity_limit);

@@ -56,13 +56,14 @@ impl<'a> Socket<'a> {
         // to be received.
         reply_repr.seq_number = self.remote_last_seq;
         reply_repr.ack_number = Some(self.remote_seq_no + self.rx_buffer.len());
-        self.remote_last_ack = reply_repr.ack_number;
 
         // From RFC 1323:
         // The window field [...] of every outgoing segment, with the exception of SYN
         // segments, is right-shifted by [advertised scale value] bits[...]
         reply_repr.window_len = self.scaled_window();
+        self.remote_last_ack = reply_repr.ack_number;
         self.remote_last_win_len = (reply_repr.window_len as usize) << self.remote_win_shift;
+        Self::record_receive_window(&mut self.receive_advertised_end, reply_repr.ack_number, self.remote_last_win_len);
 
         // If the remote supports selective acknowledgement, add the option to the outgoing
         // segment.
@@ -276,11 +277,7 @@ impl<'a> Socket<'a> {
         }
 
         let window_start = self.remote_seq_no + self.rx_buffer.len();
-        let window_end = if let Some(last_ack) = self.remote_last_ack {
-            last_ack + self.remote_last_win_len
-        } else {
-            window_start
-        };
+        let window_end = self.receive_window_end().unwrap_or(window_start);
         let segment_start = repr.seq_number;
         let segment_end = repr.seq_number + repr.payload.len();
 
@@ -817,10 +814,24 @@ impl<'a> Socket<'a> {
                 self.rx_buffer.len() + contig_len
             );
             self.rx_buffer.enqueue_unallocated(contig_len);
+            // Service drains each ingress batch. Its peak occupancy can stay
+            // below 75% even when the advertised window limits the sender.
+            // Observe credit before ACK publication: spending half of a nearly
+            // full grant is pressure even if the application immediately reads.
+            // A small grant caused by an already backed-up reader is excluded.
+            let capacity = self.rx_buffer.capacity();
+            if self.remote_last_win_len >= capacity - capacity / 4
+                && self.last_window_len().is_some_and(|remaining| remaining <= capacity / 2) {
+                self.receive_window_limited = true;
+            }
 
             // There's new data in rx_buffer, notify waiting task if any.
 
             self.rx_waker.wake();
+        }
+
+        if self.receive_storage_span() >= self.rx_buffer.capacity() - self.rx_buffer.capacity() / 4 {
+            self.receive_storage_limited = true;
         }
 
         if !self.assembler.is_empty() {
