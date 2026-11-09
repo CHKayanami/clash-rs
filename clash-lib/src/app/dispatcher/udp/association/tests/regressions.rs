@@ -28,7 +28,7 @@ async fn admission_failure_preserves_original_domain_address_and_packet() {
     let (outgoing, mut packets) = mpsc::channel(1);
     let (control, _commands) = mpsc::channel(1);
     flow.association = Arc::new(Association { #[cfg(feature = "tun")] direct: None, id: 0, outgoing, control,
-        chain: vec![], task: tokio::spawn(std::future::pending()) });
+        chain: vec![], task: tokio::spawn(std::future::pending()).into() });
     let packet = UdpPacket::new(Bytes::from_static(b"first"), flow.state.source.into(), original.clone());
     flow.try_send(packet).unwrap();
     let mut packet = UdpPacket::new(Bytes::from_static(b"retry"), flow.state.source.into(), original.clone());
@@ -66,7 +66,7 @@ async fn old_worker_cannot_remove_slot_while_replacement_dial_is_pending() {
     drop(packets);
     let (control, _commands) = mpsc::channel(1);
     *slot.association.lock().await = Some(Arc::new(Association { #[cfg(feature = "tun")] direct: None, id: 77,
-        outgoing, control, chain: vec![], task: tokio::spawn(std::future::pending()) }));
+        outgoing, control, chain: vec![], task: tokio::spawn(std::future::pending()).into() }));
     let old_worker = WorkerGuard(Arc::downgrade(&slot), 77);
     let pool = fixture.pool.clone();
     let task = tokio::spawn(async move {

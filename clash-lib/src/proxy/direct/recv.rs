@@ -1,7 +1,21 @@
-use std::{cell::RefCell, io, net::SocketAddr};
+use std::{cell::RefCell, io, net::SocketAddr, num::NonZeroU16};
 
 use bytes::{Bytes, BytesMut};
 use tokio::net::UdpSocket;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+mod native;
+#[cfg(target_os = "linux")]
+mod owned;
+#[cfg(any(target_os = "linux", test))]
+mod slots;
+#[cfg(target_os = "linux")]
+pub(crate) use slots::ReceiveSlots;
+#[cfg(any(target_os = "linux", test))]
+mod budget;
+#[cfg(target_os = "linux")]
+pub(super) use budget::ReceiveBudget;
+
+type ReceivedPacket = (usize, usize, SocketAddr, Option<NonZeroU16>);
 
 pub(super) const MAX_RECV_BATCH: usize = 16;
 const MAX_DATAGRAM_SIZE: usize = 65535;
@@ -38,6 +52,19 @@ pub(crate) fn recv_batch(
 pub(crate) fn recv_batch_map<M>(
     socket: &UdpSocket,
     limit: usize,
+    transform: impl FnMut(&mut [u8], SocketAddr) -> Option<(usize, M)>,
+    on_packet: impl FnMut(Bytes, SocketAddr, M),
+) -> io::Result<usize> {
+    recv_batch_map_impl(socket, limit, transform, on_packet)
+}
+
+#[cfg(target_os = "linux")]
+pub(super) use owned::{recv_groups, recv_groups_in};
+#[cfg(any(target_os = "linux", test))]
+pub(super) const MAX_GRO_PACKETS: usize = 32;
+
+
+fn recv_batch_map_impl<M>(socket: &UdpSocket, limit: usize,
     mut transform: impl FnMut(&mut [u8], SocketAddr) -> Option<(usize, M)>,
     mut on_packet: impl FnMut(Bytes, SocketAddr, M),
 ) -> io::Result<usize> {
@@ -46,77 +73,11 @@ pub(crate) fn recv_batch_map<M>(
         return Ok(0);
     }
     RECV_BUFFER.with_borrow_mut(|buffer| {
-        let mut packets = [None; MAX_RECV_BATCH];
+        let mut packets: [Option<ReceivedPacket>; MAX_RECV_BATCH] = [None; MAX_RECV_BATCH];
         let mut total_len = 0;
         let count;
         #[cfg(any(target_os = "linux", target_os = "android"))]
-        {
-            use socket2::{SockAddr, SockAddrStorage};
-            use std::os::fd::AsRawFd;
-            use tokio::io::Interest;
-
-            let mut addresses = std::array::from_fn::<_, MAX_RECV_BATCH, _>(|_| {
-                SockAddrStorage::zeroed()
-            });
-            let mut iovecs =
-                std::array::from_fn::<_, MAX_RECV_BATCH, _>(|i| libc::iovec {
-                    // SAFETY: each slot is a disjoint, live writable range. No Rust
-                    // reference to uninitialized bytes is created.
-                    iov_base: unsafe {
-                        buffer.as_mut_ptr().add(i * MAX_DATAGRAM_SIZE).cast()
-                    },
-                    iov_len: MAX_DATAGRAM_SIZE,
-                });
-            let mut messages = std::array::from_fn::<_, MAX_RECV_BATCH, _>(|i| {
-                // SAFETY: zero is valid for the scalar and pointer fields.
-                let mut message: libc::mmsghdr = unsafe { std::mem::zeroed() };
-                message.msg_hdr.msg_name =
-                    (&mut addresses[i] as *mut SockAddrStorage).cast();
-                message.msg_hdr.msg_namelen = addresses[i].size_of();
-                message.msg_hdr.msg_iov = &mut iovecs[i];
-                message.msg_hdr.msg_iovlen = 1;
-                message
-            });
-            count = socket.try_io(Interest::READABLE, || {
-                loop {
-                    // SAFETY: message/address/iovec arrays and all payload slots
-                    // remain live and stable for the nonblocking syscall.
-                    let count = unsafe {
-                        libc::recvmmsg(
-                            socket.as_raw_fd(),
-                            messages.as_mut_ptr(),
-                            limit as u32,
-                            libc::MSG_DONTWAIT as _,
-                            std::ptr::null_mut(),
-                        )
-                    };
-                    if count >= 0 {
-                        break Ok(count as usize);
-                    }
-                    let err = io::Error::last_os_error();
-                    if err.kind() != io::ErrorKind::Interrupted {
-                        break Err(err);
-                    }
-                }
-            })?;
-            for i in 0..count {
-                let header = &messages[i].msg_hdr;
-                if header.msg_flags & libc::MSG_TRUNC != 0 {
-                    continue;
-                }
-                let storage =
-                    std::mem::replace(&mut addresses[i], SockAddrStorage::zeroed());
-                // SAFETY: recvmmsg initialized this sender's address and length.
-                let Some(address) = (unsafe { SockAddr::new(storage, header.msg_namelen) })
-                    .as_socket() else {
-                    tracing::debug!("dropping UDP packet with unexpected sender address family");
-                    continue;
-                };
-                let len = messages[i].msg_len as usize;
-                let len = len.min(MAX_DATAGRAM_SIZE);
-                packets[i] = Some((i * MAX_DATAGRAM_SIZE, len, address));
-            }
-        }
+        { count = native::receive(socket, limit, false, buffer.as_mut(), &mut packets)?; }
         #[cfg(not(any(target_os = "linux", target_os = "android")))]
         {
             let mut received = 0;
@@ -127,7 +88,7 @@ pub(crate) fn recv_batch_map<M>(
                 ) {
                     Ok((len, address)) => {
                         packets[received] =
-                            Some((received * MAX_DATAGRAM_SIZE, len, address));
+                            Some((received * MAX_DATAGRAM_SIZE, len, address, None));
                         received += 1;
                     }
                     Err(err) if received > 0 => {
@@ -146,7 +107,7 @@ pub(crate) fn recv_batch_map<M>(
 
         let mut metadata = std::array::from_fn::<_, MAX_RECV_BATCH, _>(|_| None);
         for i in 0..count {
-            let Some((offset, len, address)) = packets[i] else { continue; };
+            let Some((offset, len, address, segment)) = packets[i] else { continue; };
             #[cfg(any(target_os = "linux", target_os = "android"))]
             // SAFETY: only initialized, non-truncated ranges are exposed. The
             // exclusive scratch borrow remains held until all copies finish.
@@ -157,13 +118,13 @@ pub(crate) fn recv_batch_map<M>(
             let data = &mut buffer[offset..offset + len];
             if let Some((output_len, value)) = transform(data, address) {
                 assert!(output_len <= len, "packet transform exceeded its initialized range");
-                packets[i] = Some((offset, output_len, address));
+                packets[i] = Some((offset, output_len, address, segment));
                 metadata[i] = Some(value);
                 total_len += output_len;
             } else { packets[i] = None; }
         }
         let mut payloads = BytesMut::with_capacity(total_len);
-        for &(offset, len, _) in packets[..count].iter().flatten() {
+        for &(offset, len, _, _) in packets[..count].iter().flatten() {
             #[cfg(any(target_os = "linux", target_os = "android"))]
             // SAFETY: recvmmsg initialized these ranges and truncated packets
             // were excluded above. The scratch remains borrowed until copying ends.
@@ -180,7 +141,7 @@ pub(crate) fn recv_batch_map<M>(
         let payloads = payloads.freeze();
         let mut offset = 0;
         for (packet, value) in packets[..count].iter().zip(&mut metadata) {
-            if let Some((_, len, address)) = packet {
+            if let Some((_, len, address, _)) = packet {
                 on_packet(payloads.slice(offset..offset + *len), *address, value.take().unwrap());
                 offset += len;
             }
@@ -190,96 +151,4 @@ pub(crate) fn recv_batch_map<M>(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn zero_limit_does_not_consume_an_empty_datagram() {
-        let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        sender
-            .send_to(b"", receiver.local_addr().unwrap())
-            .await
-            .unwrap();
-        assert_eq!(
-            recv_batch(&receiver, 0, |_, _| panic!("unexpected packet")).unwrap(),
-            0
-        );
-        loop {
-            receiver.readable().await.unwrap();
-            match recv_batch(&receiver, MAX_RECV_BATCH + 1, |data, address| {
-                assert!(data.is_empty());
-                assert_eq!(address, sender.local_addr().unwrap());
-            }) {
-                Ok(count) => {
-                    assert_eq!(count, 1);
-                    break;
-                }
-                Err(err) if err.kind() == io::ErrorKind::WouldBlock => continue,
-                Err(err) => panic!("receive failed: {err}"),
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn receive_batch_preserves_boundaries_senders_and_empty_packets() {
-        let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let first = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let second = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let destination = receiver.local_addr().unwrap();
-        let first_addr = first.local_addr().unwrap();
-        let second_addr = second.local_addr().unwrap();
-        for (sender, data) in [
-            (&first, &b"one"[..]),
-            (&second, &b"three"[..]),
-            (&first, &b""[..]),
-        ] {
-            sender.send_to(data, destination).await.unwrap();
-        }
-        let mut packets = Vec::new();
-        let mut shared_pairs = 0;
-        while packets.len() < 3 {
-            receiver.readable().await.unwrap();
-            let mut previous_end = None;
-            match recv_batch(&receiver, 2, |data, addr| {
-                if !data.is_empty() {
-                    if let Some(end) = previous_end {
-                        assert_eq!(data.as_ptr(), end);
-                        shared_pairs += 1;
-                    }
-                    previous_end = Some(data.as_ptr().wrapping_add(data.len()));
-                }
-                packets.push((data, addr))
-            }) {
-                Ok(count) => assert!(count <= 2),
-                Err(err) if err.kind() == io::ErrorKind::WouldBlock => continue,
-                Err(err) => panic!("receive failed: {err}"),
-            }
-        }
-        assert!(
-            shared_pairs > 0,
-            "nonempty payloads should share batch storage"
-        );
-        assert_eq!(
-            packets,
-            vec![
-                (Bytes::from_static(b"one"), first_addr),
-                (Bytes::from_static(b"three"), second_addr),
-                (Bytes::new(), first_addr),
-            ]
-        );
-        // Reusing scratch for another batch must not overwrite queued packets.
-        second.send_to(b"replacement", destination).await.unwrap();
-        loop {
-            receiver.readable().await.unwrap();
-            match recv_batch(&receiver, 1, |_, _| {}) {
-                Ok(1) => break,
-                Err(err) if err.kind() == io::ErrorKind::WouldBlock => (),
-                other => panic!("unexpected receive result: {other:?}"),
-            }
-        }
-        assert_eq!(packets[0].0.as_ref(), b"one");
-        assert_eq!(packets[1].0.as_ref(), b"three");
-        assert!(packets[2].0.is_empty());
-    }
-}
+mod tests;

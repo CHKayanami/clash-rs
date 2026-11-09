@@ -1,16 +1,21 @@
 //! Final device admission charges actual storage until device writes complete.
-use std::{io, sync::Arc};
-use bytes::{Bytes, BytesMut};
+use std::{sync::Arc, task::{Context, Poll}};
+#[cfg(any(target_os = "linux", target_os = "android", test))]
+use std::io;
+use clash_netstack::Packet as IpPacket;
+#[cfg(any(target_os = "linux", target_os = "android", test))]
+use bytes::BytesMut;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 
 const BYTE_BUDGET: usize = 4 * 1024 * 1024;
 const PACKET_BUDGET: usize = 512;
 
 pub(super) struct Packet {
-    pub bytes: Bytes,
+    pub bytes: IpPacket,
     pub budget: OwnedSemaphorePermit,
 }
 
+#[cfg(any(target_os = "linux", target_os = "android", test))]
 #[derive(Clone)]
 pub(super) struct Sender {
     channel: mpsc::Sender<Packet>,
@@ -22,15 +27,23 @@ pub(super) struct Receiver {
     budget: Arc<Semaphore>,
 }
 
+#[cfg(any(target_os = "linux", target_os = "android", test))]
 pub(super) fn channel() -> (Sender, Receiver) {
     let (channel, receiver) = mpsc::channel(PACKET_BUDGET);
     let budget = Arc::new(Semaphore::new(BYTE_BUDGET));
     (Sender { channel, budget: budget.clone() }, Receiver { channel: receiver, budget })
 }
+#[cfg(not(any(target_os = "linux", target_os = "android", test)))]
+pub(super) fn closed() -> Receiver {
+    let (_, channel) = mpsc::channel(PACKET_BUDGET);
+    Receiver { channel, budget: Arc::new(Semaphore::new(BYTE_BUDGET)) }
+}
 impl Receiver {
-    pub async fn recv_many(&mut self, packets: &mut Vec<Packet>, limit: usize) -> usize {
-        self.channel.recv_many(packets, limit).await
+    pub fn poll_recv_many(&mut self, cx: &mut Context<'_>, packets: &mut Vec<Packet>,
+        limit: usize) -> Poll<usize> {
+        self.channel.poll_recv_many(cx, packets, limit)
     }
+
     #[cfg(test)]
     pub async fn recv(&mut self) -> Option<Packet> { self.channel.recv().await }
     #[cfg(test)]
@@ -40,8 +53,8 @@ impl Drop for Receiver {
     fn drop(&mut self) { self.budget.close(); }
 }
 
+#[cfg(any(target_os = "linux", target_os = "android", test))]
 impl Sender {
-    pub fn is_closed(&self) -> bool { self.channel.is_closed() }
     async fn acquire(&self, charge: usize) -> io::Result<OwnedSemaphorePermit> {
         if charge > BYTE_BUDGET {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "TUN batch exceeds byte budget"));
@@ -50,26 +63,13 @@ impl Sender {
             .map_err(|_| io::ErrorKind::BrokenPipe.into())
     }
 
+    #[cfg(any(target_os = "linux", target_os = "android", test))]
     pub async fn send(&self, packet: BytesMut) -> io::Result<()> {
         let budget = self.acquire(packet.capacity().max(1)).await?;
-        self.channel.send(Packet { bytes: packet.freeze(), budget }).await
+        self.channel.send(Packet { bytes: IpPacket::from(packet), budget }).await
             .map_err(|_| io::ErrorKind::BrokenPipe.into())
     }
 
-    pub async fn send_batch(&self, packets: &mut Vec<Bytes>) -> io::Result<()> {
-        if packets.is_empty() { return Ok(()); }
-        let charge = packets.iter().map(|packet| packet.len().max(1)).sum();
-        // Every producer acquires bytes before slots. Byte permits cover the
-        // channel and device-write batch; packet slots cover the channel.
-        let mut budget = self.acquire(charge).await?;
-        let slots = self.channel.reserve_many(packets.len()).await
-            .map_err(|_| io::ErrorKind::BrokenPipe)?;
-        for (slot, bytes) in slots.zip(packets.drain(..)) {
-            let permit = budget.split(bytes.len().max(1)).expect("reserved batch budget");
-            slot.send(Packet { bytes, budget: permit });
-        }
-        Ok(())
-    }
 
 }
 

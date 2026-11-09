@@ -1,12 +1,15 @@
-use std::{net::{Ipv4Addr, Ipv6Addr}, sync::Arc};
+use std::{cell::RefCell, net::{Ipv4Addr, Ipv6Addr}, sync::Arc};
 
 use bytes::BytesMut;
-use smoltcp::wire::{IpProtocol, IpVersion, Ipv4Packet, Ipv6Packet};
+use tokio::time::Instant;
+use smoltcp::wire::IpProtocol;
+#[cfg(test)]
+use smoltcp::wire::{Ipv4Packet, Ipv6Packet};
 use tracing::debug;
-use clash_netstack::{Packet, StackSplitSink};
+use clash_netstack::{Packet, PacketHeaders, UdpPacket};
 
-use crate::{Error, app::dispatcher::udp::association::direct::DirectPath};
-use super::{packet_queue::Sender, system_stack::{SystemTcpNat, process_system_tcp_packet}};
+use crate::app::dispatcher::udp::association::direct::{DirectPath, Upload, UploadCache};
+use super::system_stack::{SystemTcpNat, process_system_tcp_packet};
 
 pub(super) struct PacketDispatcher {
     pub enable_tcp: bool,
@@ -14,48 +17,62 @@ pub(super) struct PacketDispatcher {
     pub ipv4: Option<(Ipv4Addr, Ipv4Addr, u16)>,
     pub ipv6: Option<(Ipv6Addr, Ipv6Addr, u16)>,
     pub nat: Arc<SystemTcpNat>,
-    pub replies: Sender,
     pub direct: Arc<DirectPath>,
+    pub uploads: RefCell<UploadCache>,
+}
+
+pub(super) enum Dispatch {
+    Stack(Packet, IpProtocol),
+    Udp(UdpPacket),
+    Direct(Upload),
+    Split(Packet),
+    Reply(BytesMut),
+    Drop,
 }
 
 impl PacketDispatcher {
-    pub async fn dispatch(&self, mut packet: BytesMut, stack: &mut StackSplitSink) -> Result<(), Error> {
-        packet = match self.direct.upload(packet) {
-            Ok(()) => return Ok(()),
-            Err(packet) => packet,
-        };
-        if self.enable_tcp && !self.system_tcp {
-            stack.send_packet(Packet::from(packet))?;
-            return Ok(());
-        }
-        let is_tcp = match IpVersion::of_packet(&packet) {
-            Ok(IpVersion::Ipv4) => Ipv4Packet::new_checked(&packet[..])
-                .is_ok_and(|ip| ip.next_header() == IpProtocol::Tcp),
-            Ok(IpVersion::Ipv6) => Ipv6Packet::new_checked(&packet[..])
-                .is_ok_and(|ip| ip.next_header() == IpProtocol::Tcp),
-            Err(_) => false,
-        };
-        if is_tcp {
-            if !self.enable_tcp { return Ok(()); }
-            if self.system_tcp {
-                if process_system_tcp_packet(&mut packet, self.ipv4, self.ipv6, &self.nat) == Some(true) {
-                    self.replies.send(packet).await?;
-                } else {
-                    debug!("dropping TUN TCP packet rejected by system NAT");
-                }
-                return Ok(());
+    pub(super) fn prepare_frame(&self, packet: Packet, now: Instant) -> Dispatch {
+        let Some(headers) = PacketHeaders::new(packet.data()) else { return Dispatch::Drop; };
+        let protocol = headers.protocol();
+        let udp = headers.udp();
+        if protocol == IpProtocol::Tcp {
+            if !self.enable_tcp { return Dispatch::Drop; }
+            // Native TCP retains the device allocation and checksum metadata.
+            if !self.system_tcp { return Dispatch::Stack(packet, protocol); }
+            let bytes = packet.into_bytes();
+            let mut packet = bytes.try_into_mut().unwrap_or_else(|bytes| BytesMut::from(bytes.as_ref()));
+            if process_system_tcp_packet(&mut packet, self.ipv4, self.ipv6, &self.nat) == Some(true) {
+                return Dispatch::Reply(packet);
             }
+            debug!("dropping TUN TCP packet rejected by system NAT");
+            return Dispatch::Drop;
         }
-        stack.send_packet(Packet::from(packet))?;
-        Ok(())
+        match self.direct.upload_parsed(packet, udp.clone(), &mut self.uploads.borrow_mut(), now) {
+            Ok(Some(upload)) => Dispatch::Direct(upload),
+            Ok(None) => Dispatch::Drop,
+            Err(packet) if packet.udp_segmentation().is_some() => Dispatch::Split(packet),
+            Err(packet) => match udp {
+                Some((source, destination, payload)) => Dispatch::Udp(UdpPacket {
+                    data: Packet::new(packet.into_payload(payload)),
+                    local_addr: source, remote_addr: destination,
+                }),
+                None => Dispatch::Stack(packet, protocol),
+            },
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn prepare(&self, packet: BytesMut) -> Dispatch {
+        self.prepare_frame(Packet::from(packet), Instant::now())
     }
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use std::{net::IpAddr, time::Duration};
     use futures::StreamExt;
+    use bytes::Bytes;
     use smoltcp::wire::{IpAddress, TcpPacket, TcpSeqNumber};
     use tokio::time::timeout;
     use clash_netstack::NetStack;
@@ -71,11 +88,18 @@ mod tests {
                     let (replies, mut receiver) = packet_queue::channel();
                     let nat = Arc::new(SystemTcpNat::new());
                     let dispatcher = PacketDispatcher {
-                        enable_tcp, system_tcp, nat: nat.clone(), direct: super::super::datagram::direct_path(replies.clone()), replies,
+                        enable_tcp, system_tcp, nat: nat.clone(), direct: super::super::datagram::direct_path(None), uploads: Default::default(),
                         ipv4: Some((Ipv4Addr::new(198, 18, 0, 1), Ipv4Addr::new(198, 18, 0, 2), 1234)),
                         ipv6: Some(("fd00::1".parse().unwrap(), "fd00::2".parse().unwrap(), 1234)),
                     };
-                    dispatcher.dispatch(tcp_syn(ipv6), &mut sink).await.unwrap();
+                    match dispatcher.prepare(tcp_syn(ipv6)) {
+                        Dispatch::Stack(packet, protocol) => sink.send_checked_packet(packet, protocol).unwrap(),
+                        Dispatch::Udp(_) => panic!("no UDP in protocol-switch test"),
+                        Dispatch::Reply(packet) => replies.send(packet).await.unwrap(),
+                        Dispatch::Drop => {},
+                        Dispatch::Split(_) => panic!("no aggregate in protocol-switch test"),
+                        Dispatch::Direct(_) => panic!("no established direct route in protocol-switch test"),
+                    }
                     if !enable_tcp {
                         assert!(listener.is_none());
                         assert!(receiver.try_recv().is_err());
@@ -103,7 +127,30 @@ mod tests {
         }
     }
 
-    fn tcp_syn(ipv6: bool) -> BytesMut {
+    #[tokio::test]
+    async fn udp_route_miss_keeps_checked_payload_and_addresses() {
+        let dispatcher = PacketDispatcher {
+            enable_tcp: true, system_tcp: false, ipv4: None, ipv6: None,
+            nat: Arc::new(SystemTcpNat::new()),
+            direct: super::super::datagram::direct_path(None), uploads: Default::default(),
+        };
+        for (source, destination) in [
+            ("192.0.2.1:1234", "198.51.100.1:53"),
+            ("[2001:db8::1]:1234", "[2001:db8::2]:53"),
+        ] {
+            let source = source.parse().unwrap();
+            let destination = destination.parse().unwrap();
+            let frame = UdpPacket::from((Bytes::from_static(b"query"), source, destination)).encode().unwrap();
+            let Dispatch::Udp(packet) = dispatcher.prepare_frame(frame, Instant::now()) else {
+                panic!("unregistered UDP must enter the ordinary route");
+            };
+            assert_eq!(packet.local_addr, source);
+            assert_eq!(packet.remote_addr, destination);
+            assert_eq!(packet.data.data(), b"query");
+        }
+    }
+
+    pub(in crate::proxy::tun) fn tcp_syn(ipv6: bool) -> BytesMut {
         let (source, destination, offset): (IpAddr, IpAddr, usize) = if ipv6 {
             ("2001:db8::2".parse().unwrap(), "2001:db8::3".parse().unwrap(), 40)
         } else {

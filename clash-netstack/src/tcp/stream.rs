@@ -138,7 +138,6 @@ impl tokio::io::AsyncWrite for TcpStream {
                 trace!(
                     "TcpStream::poll_write: send buffer is full, waiting for space"
                 );
-                self.notify_tcp_socket_ready();
                 return std::task::Poll::Pending;
             }
         }

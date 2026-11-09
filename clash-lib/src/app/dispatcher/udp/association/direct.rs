@@ -1,22 +1,47 @@
 //! TUN-owned data shortcuts retain the association's routing and mapping lease.
-use std::{io, net::SocketAddr, sync::{Arc, Weak, atomic::{AtomicBool, Ordering}}, task::{Context, Poll}};
-use bytes::{Bytes, BytesMut};
+use std::{collections::{HashMap, hash_map::Entry}, net::SocketAddr, ops::Range, sync::{Arc, Weak, atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering}}};
+use bytes::Bytes;
 use dashmap::DashMap;
-use tokio::{sync::mpsc::error::TrySendError, time::Instant};
+use tokio::time::Instant;
+use clash_netstack::Packet;
+#[cfg(test)]
 use clash_netstack::parse_udp_packet;
 use crate::{app::net::network_generation, proxy::datagram::UdpPacket, session::SocksAddr};
-use super::{Association, Outgoing, flow::FlowState};
+use super::{Association, Outgoing, flow::{FlowState, ReplyActivity}};
+use parking_lot::Mutex;
+pub(crate) mod engine;
 use super::super::is_short_flow_port;
 
-pub(crate) trait ReplyWriter: Send {
-    fn is_closed(&self) -> bool;
-    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<bool>;
-    fn send(&mut self, packets: &mut Vec<UdpPacket>) -> io::Result<()>;
-}
-pub(crate) trait ReplyTarget: Send + Sync {
-    fn writer(&self) -> Box<dyn ReplyWriter>;
+pub(crate) struct Upload {
+    association: u64,
+    slot: usize,
+    id: u64,
+    source: SocketAddr,
+    destination: SocketAddr,
+    frame: Packet,
+    payload: Range<usize>,
+    segmentation: Option<u16>,
 }
 
+impl Upload {
+    fn data(&self) -> &[u8] { &self.frame.data()[self.payload.clone()] }
+    // Only retained Pending data crosses into the ordinary owned queue.
+    fn retain(&self) -> Outgoing { self.retain_from(0) }
+    fn retain_from(&self, offset: usize) -> Outgoing {
+        Outgoing { id: self.id, packet: UdpPacket { data: Bytes::copy_from_slice(&self.data()[offset..]),
+            src_addr: self.source.into(), dst_addr: self.destination.into(), inbound_user: None } }
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct UploadCache {
+    revision: u64,
+    entries: HashMap<(SocketAddr, SocketAddr), Live>,
+}
+struct Live {
+    id: u64, generation: u64, allow_quic: Arc<AtomicBool>, closed: Arc<AtomicBool>, activity: Arc<ReplyActivity>,
+    association: u64, location: Arc<AtomicUsize>, finished: Arc<AtomicBool>,
+}
 struct Cached {
     id: u64,
     generation: u64,
@@ -26,8 +51,15 @@ struct Cached {
 }
 
 pub(crate) struct DirectPath {
-    target: Arc<dyn ReplyTarget>,
+    executor: engine::Sender,
+    engine: Mutex<Option<engine::Engine>>,
+    revision: AtomicU64,
     uploads: DashMap<(SocketAddr, SocketAddr), Cached>,
+}
+
+pub(super) struct Lease {
+    pub generation: u64,
+    pub location: Arc<AtomicUsize>,
 }
 
 pub(super) struct Registration {
@@ -39,10 +71,12 @@ pub(super) struct Registration {
 }
 
 impl DirectPath {
-    pub(crate) fn new(target: Arc<dyn ReplyTarget>) -> Arc<Self> {
-        Arc::new(Self { target, uploads: DashMap::new() })
+    pub(crate) fn integrated(mtu: Option<usize>) -> Arc<Self> {
+        let (executor, engine) = engine::channel(mtu);
+        Arc::new(Self { executor, engine: Mutex::new(Some(engine)), revision: AtomicU64::new(1), uploads: DashMap::new() })
     }
-    pub(super) fn writer(&self) -> Box<dyn ReplyWriter> { self.target.writer() }
+    pub(crate) fn take_engine(&self) -> Option<engine::Engine> { self.engine.lock().take() }
+    pub(super) fn executor(&self) -> &engine::Sender { &self.executor }
 
     pub(super) fn registration(self: &Arc<Self>, state: &Arc<FlowState>, generation: u64, allow_quic: &Arc<AtomicBool>) -> Option<Registration> {
         let SocksAddr::Ip(destination) = state.original else { return None; };
@@ -58,39 +92,46 @@ impl DirectPath {
     /// Registration is enabled only after TunDatagram applied the full DNS
     /// hijack/route policy and routing completed sniffing. Hijacked queries on
     /// custom ports never reach registration; this does not rely on port 53.
-    pub(crate) fn upload(&self, packet: BytesMut) -> Result<(), BytesMut> {
-        let Some((mut source, destination, payload)) = parse_udp_packet(&packet) else { return Err(packet); };
+    #[cfg(test)]
+    pub(crate) fn upload_frame(&self, packet: Packet, cache: &mut UploadCache, now: Instant) -> Result<Option<Upload>, Packet> {
+        let parsed = parse_udp_packet(&packet);
+        self.upload_parsed(packet, parsed, cache, now)
+    }
+
+    pub(crate) fn upload_parsed(&self, packet: Packet,
+        parsed: Option<(SocketAddr, SocketAddr, Range<usize>)>, cache: &mut UploadCache, now: Instant) -> Result<Option<Upload>, Packet> {
+        let Some((mut source, destination, payload)) = parsed else { return Err(packet); };
         source.set_ip(source.ip().to_canonical());
         let key = (source, destination);
-        let Some((id, generation, allowed, state, association)) = self.uploads.get(&key)
-            .map(|entry| (entry.id, entry.generation, destination.port() != 443 || entry.allow_quic.load(Ordering::Relaxed), entry.state.upgrade(), entry.association.upgrade()))
-            else { return Err(packet); };
-        let live = state.zip(association).filter(|(state, association)|
-            generation == network_generation() && !state.is_closed() && !association.outgoing.is_closed());
-        let Some((state, association)) = live else {
+        let revision = self.revision.load(Ordering::Acquire);
+        if cache.revision != revision { cache.entries.clear(); cache.revision = revision; }
+        let live = match cache.entries.entry(key) {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(slot) => {
+                let Some(entry) = self.uploads.get(&key) else { return Err(packet); };
+                let Some((state, association)) = entry.state.upgrade().zip(entry.association.upgrade()) else { return Err(packet); };
+                let Some(finished) = association.task.completion_flag() else { return Err(packet); };
+                slot.insert(Live { id: entry.id, generation: entry.generation,
+                    allow_quic: entry.allow_quic.clone(), closed: state.closed.clone(), activity: state.activity.clone(),
+                    association: association.id, location: association.direct.as_ref().expect("DIRECT lease").location.clone(), finished })
+            },
+        };
+        if live.generation != network_generation() || live.closed.load(Ordering::Relaxed) || live.finished.load(Ordering::Acquire) {
+            let id = live.id; cache.entries.remove(&key);
             self.uploads.remove_if(&key, |_, entry| entry.id == id);
             return Err(packet);
-        };
-        if !allowed { return Ok(()); }
-        // Activity is observed even on congestion drops, as in routes.packet.
-        state.activity.record_upload_at(Instant::now());
-        match association.outgoing.try_reserve() {
-            Ok(permit) => {
-                // Small payloads must not pin a large device-read allocation
-                // throughout association queuing and native send backpressure.
-                let data = if packet.capacity() > 4096 && payload.len() < packet.capacity() / 4 {
-                    Bytes::copy_from_slice(&packet[payload])
-                } else { packet.freeze().slice(payload) };
-                permit.send(Outgoing { id, packet: UdpPacket { data, src_addr: source.into(),
-                    dst_addr: destination.into(), inbound_user: None } });
-                Ok(())
-            }
-            Err(TrySendError::Full(_)) => Ok(()),
-            Err(TrySendError::Closed(_)) => {
-                self.uploads.remove_if(&key, |_, entry| entry.id == id);
-                Err(packet)
-            }
         }
+        let slot = live.location.load(Ordering::Acquire);
+        // An installed registration is not sufficient: until the owner has
+        // published a slot, keep this packet on the ordinary association path.
+        // Do not evict the registration/cache; the same lease can become ready.
+        if slot == usize::MAX { return Err(packet); }
+        if destination.port() == 443 && !live.allow_quic.load(Ordering::Relaxed) { return Ok(None); }
+        let (id, association) = (live.id, live.association);
+        // Activity is observed even on congestion drops, as in routes.packet.
+        live.activity.record_upload_at(now);
+        let segmentation = packet.udp_segmentation().filter(|&size| size > 0 && payload.len() > usize::from(size));
+        Ok(Some(Upload { association, slot, id, source, destination, payload, segmentation, frame: packet }))
     }
 }
 
@@ -102,6 +143,7 @@ impl Registration {
             path.uploads.insert(self.key, Cached { id: self.id, generation: self.generation,
                 allow_quic: self.allow_quic.clone(), state: Arc::downgrade(state),
                 association: Arc::downgrade(association) });
+            path.revision.fetch_add(1, Ordering::Release);
         }
     }
 }
@@ -110,6 +152,7 @@ impl Drop for Registration {
     fn drop(&mut self) {
         if let Some(path) = self.path.upgrade() {
             path.uploads.remove_if(&self.key, |_, entry| entry.id == self.id);
+            path.revision.fetch_add(1, Ordering::Release);
         }
     }
 }

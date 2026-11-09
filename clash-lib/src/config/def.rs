@@ -236,7 +236,6 @@ pub struct TunConfig {
     pub auto_detect_interface: Option<bool>,
     pub mtu: Option<u16>,
     pub gso: Option<bool>,
-    pub gso_max_size: Option<u32>,
     /// fwmark on Linux only
     pub so_mark: Option<u32>,
     /// policy routing table on Linux only
@@ -2277,7 +2276,6 @@ tun:
     - fc00::/7
   mtu: 9000
   gso: true
-  gso-max-size: 65536
   udp-timeout: 300
   iproute2-table-index: 2024
   iproute2-rule-index: 9000
@@ -2293,7 +2291,6 @@ tun:
         assert_eq!(tun_def.gateway_v6.as_deref(), Some("fdfe:dcba:9876::1/64"));
         assert_eq!(tun_def.mtu, Some(9000));
         assert_eq!(tun_def.gso, Some(true));
-        assert_eq!(tun_def.gso_max_size, Some(65536));
         assert_eq!(tun_def.route_table, 2024);
         assert_eq!(tun_def.iproute2_rule_index, Some(9000));
         assert_eq!(tun_def.strict_route, Some(true));

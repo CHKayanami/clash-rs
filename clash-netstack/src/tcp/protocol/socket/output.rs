@@ -3,10 +3,11 @@ use super::*;
 use smoltcp::wire::{IPV4_HEADER_LEN, IPV6_HEADER_LEN};
 
 impl<'a> Socket<'a> {
-
     pub(super) fn timed_out(&self, timestamp: Instant) -> bool {
         match (self.remote_last_ts, self.timeout) {
-            (Some(remote_last_ts), Some(timeout)) => timestamp >= remote_last_ts + timeout,
+            (Some(remote_last_ts), Some(timeout)) => {
+                timestamp >= remote_last_ts + timeout
+            }
             (_, _) => false,
         }
     }
@@ -18,7 +19,6 @@ impl<'a> Socket<'a> {
         }
 
         let ip_header_len = match self.tuple.unwrap().local.addr {
-
             IpAddress::Ipv4(_) => smoltcp::wire::IPV4_HEADER_LEN,
 
             IpAddress::Ipv6(_) => smoltcp::wire::IPV6_HEADER_LEN,
@@ -32,19 +32,22 @@ impl<'a> Socket<'a> {
         };
 
         let local_mss = cx.ip_mtu() - ip_header_len - TCP_HEADER_LEN;
-        let effective_mss = local_mss.min(self.remote_mss).saturating_sub(options_len);
+        let effective_mss =
+            local_mss.min(self.remote_mss).saturating_sub(options_len);
 
         // Have we sent data that hasn't been ACKed yet?
         let data_in_flight = self.remote_last_seq != self.local_seq_no;
 
         // If we want to send a SYN and we haven't done so, do it!
-        if matches!(self.state, State::SynSent | State::SynReceived) && !data_in_flight {
+        if matches!(self.state, State::SynSent | State::SynReceived)
+            && !data_in_flight
+        {
             return true;
         }
 
         // max sequence number we can send.
-        let max_send_seq =
-            self.local_seq_no + core::cmp::min(self.remote_win_len, self.tx_buffer.len());
+        let max_send_seq = self.local_seq_no
+            + core::cmp::min(self.remote_win_len, self.tx_buffer.len());
 
         // Max amount of octets we can send.
         let capped_send_seq = if max_send_seq >= self.remote_last_seq {
@@ -82,7 +85,8 @@ impl<'a> Socket<'a> {
         // 1. We have unsent data that fits in the remote window.
         // 2. We have no unsent data.
         // This condition matches only if #2, because #1 is already covered by can_data and we're ORing them.
-        let can_fin = want_fin && self.remote_last_seq == self.local_seq_no + self.tx_buffer.len();
+        let can_fin = want_fin
+            && self.remote_last_seq == self.local_seq_no + self.tx_buffer.len();
 
         can_send || can_fin
     }
@@ -115,7 +119,8 @@ impl<'a> Socket<'a> {
     /// <https://elixir.bootlin.com/linux/v6.11.4/source/net/ipv4/tcp_input.c#L5747>.
     pub(super) fn immediate_ack_to_transmit(&self) -> bool {
         if let Some(remote_last_ack) = self.remote_last_ack {
-            remote_last_ack + self.remote_mss < self.remote_seq_no + self.rx_buffer.len()
+            remote_last_ack + self.remote_mss
+                < self.remote_seq_no + self.rx_buffer.len()
         } else {
             false
         }
@@ -128,23 +133,37 @@ impl<'a> Socket<'a> {
     pub(super) fn window_to_update(&self, cx: &Context) -> bool {
         match self.state {
             State::Established | State::FinWait1 | State::FinWait2 => {
-                let Some(last_win) = self.last_window_len() else { return false; };
-                let Some(tuple) = self.tuple else { return false; };
+                let Some(last_win) = self.last_window_len() else {
+                    return false;
+                };
+                let Some(tuple) = self.tuple else {
+                    return false;
+                };
                 let ip_header_len = match tuple.local.addr {
                     IpAddress::Ipv4(_) => IPV4_HEADER_LEN,
                     IpAddress::Ipv6(_) => IPV6_HEADER_LEN,
                 };
-                let mss = cx.ip_mtu().saturating_sub(ip_header_len + TCP_HEADER_LEN).max(1);
-                let threshold = self.rx_buffer.capacity().div_ceil(2).min(mss).max(1);
-                let new_win = (self.scaled_window() as usize) << self.remote_win_shift;
-                new_win > last_win && (last_win >> self.remote_win_shift == 0
-                    || new_win - last_win >= threshold)
+                let mss = cx
+                    .ip_mtu()
+                    .saturating_sub(ip_header_len + TCP_HEADER_LEN)
+                    .max(1);
+                let threshold =
+                    self.rx_buffer.capacity().div_ceil(2).min(mss).max(1);
+                let new_win =
+                    (self.scaled_window() as usize) << self.remote_win_shift;
+                new_win > last_win
+                    && (last_win >> self.remote_win_shift == 0
+                        || new_win - last_win >= threshold)
             }
             _ => false,
         }
     }
 
-    pub(crate) fn dispatch<F, E>(&mut self, cx: &mut Context, emit: F) -> Result<(), E>
+    pub(crate) fn dispatch<F, E>(
+        &mut self,
+        cx: &mut Context,
+        emit: F,
+    ) -> Result<(), E>
     where
         F: FnOnce(&mut Context, PacketMeta, (IpRepr, TcpRepr)) -> Result<(), E>,
     {
@@ -165,6 +184,7 @@ impl<'a> Socket<'a> {
             return Ok(());
         }
 
+        let prev_last_ts = self.remote_last_ts;
         if self.remote_last_ts.is_none() {
             // We get here in exactly two cases:
             //  1) This socket just transitioned into SYN-SENT.
@@ -310,14 +330,16 @@ impl<'a> Socket<'a> {
                 repr.control = TcpControl::Syn;
                 repr.seq_number = self.local_seq_no;
                 // window len must NOT be scaled in SYNs.
-                repr.window_len = u16::try_from(self.rx_buffer.window()).unwrap_or(u16::MAX);
+                repr.window_len =
+                    u16::try_from(self.rx_buffer.window()).unwrap_or(u16::MAX);
                 if self.state == State::SynSent {
                     repr.ack_number = None;
                     repr.window_scale = Some(self.remote_win_shift);
                     repr.sack_permitted = true;
                 } else {
                     repr.sack_permitted = self.remote_has_sack;
-                    repr.window_scale = self.remote_win_scale.map(|_| self.remote_win_shift);
+                    repr.window_scale =
+                        self.remote_win_scale.map(|_| self.remote_win_shift);
                 }
             }
 
@@ -338,7 +360,8 @@ impl<'a> Socket<'a> {
                 // 4. Our congestion window
                 let options_len = repr.header_len() - TCP_HEADER_LEN;
                 let local_mss = cx.ip_mtu() - ip_repr.header_len() - TCP_HEADER_LEN;
-                let effective_mss = local_mss.min(self.remote_mss).saturating_sub(options_len);
+                let effective_mss =
+                    local_mss.min(self.remote_mss).saturating_sub(options_len);
 
                 let offset = if self.pending_fast_retransmit {
                     let size = effective_mss.min(self.tx_buffer.len());
@@ -363,7 +386,9 @@ impl<'a> Socket<'a> {
                     };
 
                     // To send a zero-window-probe, force the window limit to at least 1 byte.
-                    if win_limit == 0 && self.timer.should_zero_window_probe(cx.now()) {
+                    if win_limit == 0
+                        && self.timer.should_zero_window_probe(cx.now())
+                    {
                         win_limit = 1;
                         is_zero_window_probe = true;
                     }
@@ -378,7 +403,13 @@ impl<'a> Socket<'a> {
                     // to comply with the latter two will be handled by the device based on the
                     // metadata we provide.
 
-                    let device_limit = effective_mss;
+                    let device_limit = if cx.tcp_gso() && effective_mss > 0 {
+                        // Preserve MSS/MTU; the device receives the segment size.
+                        65535usize
+                            .saturating_sub(ip_repr.header_len() + repr.header_len())
+                    } else {
+                        effective_mss
+                    };
 
                     let size = if is_zero_window_probe {
                         // Zero-window probes are exempt from the congestion window: they
@@ -404,7 +435,9 @@ impl<'a> Socket<'a> {
                         State::FinWait1 | State::LastAck | State::Closing => {
                             repr.control = TcpControl::Fin
                         }
-                        State::Established | State::CloseWait if !repr.payload.is_empty() => {
+                        State::Established | State::CloseWait
+                            if !repr.payload.is_empty() =>
+                        {
                             repr.control = TcpControl::Psh
                         }
                         _ => (),
@@ -454,7 +487,8 @@ impl<'a> Socket<'a> {
 
         if repr.control == TcpControl::Syn {
             // Fill the MSS option. See RFC 6691 for an explanation of this calculation.
-            let max_segment_size = cx.ip_mtu() - ip_repr.header_len() - TCP_HEADER_LEN;
+            let max_segment_size =
+                cx.ip_mtu() - ip_repr.header_len() - TCP_HEADER_LEN;
             repr.max_seg_size = Some(max_segment_size as u16);
         }
 
@@ -466,12 +500,24 @@ impl<'a> Socket<'a> {
         // to not waste time waiting for the retransmit timer on packets that we know
         // for sure will not be successfully transmitted.
         ip_repr.set_payload_len(repr.buffer_len());
-        emit(cx, packet_meta, (ip_repr, repr))?;
+        if let Err(err) = emit(cx, packet_meta, (ip_repr, repr)) {
+            // Unlike upstream, local output backpressure must not start the
+            // peer timeout before the first packet has actually been accepted.
+            self.remote_last_ts = prev_last_ts;
+            return Err(err);
+        }
         // Include keepalives and committed software-queue packets in the
         // outstanding promise, even when state updates below return early.
-        let advertised = if repr.control == TcpControl::Syn { repr.window_len as usize }
-            else { (repr.window_len as usize) << self.remote_win_shift };
-        Self::record_receive_window(&mut self.receive_advertised_end, repr.ack_number, advertised);
+        let advertised = if repr.control == TcpControl::Syn {
+            repr.window_len as usize
+        } else {
+            (repr.window_len as usize) << self.remote_win_shift
+        };
+        Self::record_receive_window(
+            &mut self.receive_advertised_end,
+            repr.ack_number,
+            advertised,
+        );
 
         // We have successfully emitted, if this was a fast retransmission it is not pending anymore
         self.pending_fast_retransmit = false;
@@ -577,7 +623,9 @@ impl<'a> Socket<'a> {
             let timeout_poll_at = match (self.remote_last_ts, self.timeout) {
                 // If we're transmitting or retransmitting data, we need to poll at the moment
                 // when the timeout would expire.
-                (Some(remote_last_ts), Some(timeout)) => PollAt::Time(remote_last_ts + timeout),
+                (Some(remote_last_ts), Some(timeout)) => {
+                    PollAt::Time(remote_last_ts + timeout)
+                }
                 // Otherwise we have no timeout.
                 (_, _) => PollAt::Ingress,
             };

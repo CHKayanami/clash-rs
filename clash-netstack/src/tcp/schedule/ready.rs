@@ -18,6 +18,14 @@ pub(super) struct ReadyList {
 impl ReadyList {
     pub fn is_empty(&self) -> bool { self.first.is_none() }
 
+    pub fn can_dispatch(&self, handle: SocketHandle) -> bool {
+        self.first.is_none_or(|first| first == handle)
+    }
+
+    pub fn has_other(&self, handle: SocketHandle) -> bool {
+        self.links.len() > usize::from(self.links.contains_key(&handle))
+    }
+
     pub fn push_back(&mut self, handle: SocketHandle) {
         if self.links.contains_key(&handle) { return; }
         if let Some(last) = self.last { self.links.get_mut(&last).unwrap().next = Some(handle); }

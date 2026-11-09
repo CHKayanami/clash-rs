@@ -2,6 +2,7 @@
 use super::*;
 
 impl<'a> Socket<'a> {
+    pub(crate) fn peer_mss(&self) -> usize { self.remote_mss }
 
     pub(super) fn send_impl<'b, F, R>(&'b mut self, f: F) -> Result<R, SendError>
     where
@@ -169,6 +170,14 @@ impl<'a> Socket<'a> {
         TransmitState { capacity: self.tx_buffer.capacity(), queued,
             unsent: queued - in_flight }
     }
+
+    /// Protocol permission only; read-ahead policy belongs to the buffer owner.
+    pub(crate) fn transmit_allowance(&self) -> (usize, usize) {
+        (self.remote_win_len.min(self.congestion_controller.inner().window()), self.flight_size())
+    }
+
+    /// Notify an adapter whose owner-side read permission has recovered.
+    pub(crate) fn wake_send(&mut self) { self.tx_waker.wake(); }
 
     /// Number of octets transmitted but not yet ACKed.
     pub(super) fn flight_size(&self) -> usize {

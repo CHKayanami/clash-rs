@@ -8,7 +8,7 @@ fn state(address: SocksAddr, original: SocksAddr) -> Arc<FlowState> {
     state.target = address.clone();
     state.original = original;
     state.aliases = vec![address];
-    state.closed = AtomicBool::new(false);
+    state.closed = Arc::new(AtomicBool::new(false));
     state.activity = Arc::new(ReplyActivity::new());
     let state = flow.state.clone();
     drop(flow);

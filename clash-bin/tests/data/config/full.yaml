@@ -485,13 +485,12 @@ tun:
   # When enabled, prevents traffic from leaking through default interface and drops unreachable destinations
   strict-route: true
 
-  # Interface MTU (default: 1500; on Windows defaults to 65535 when GSO is disabled)
+  # Interface MTU (default: 1500; on Windows defaults to 65535)
   mtu: 1500
 
   # Generic Segmentation Offload (GSO) - Linux only:
-  # Offloads large TCP packet segmentation to userspace GSO engine, dramatically improving throughput
+  # Enables segmented large-frame I/O without changing the interface MTU
   gso: true
-  gso-max-size: 65536                # Maximum GSO buffer size in bytes (max: 65536)
 
   # UDP Session Timeout in seconds (default: 300 seconds)
   udp-timeout: 300

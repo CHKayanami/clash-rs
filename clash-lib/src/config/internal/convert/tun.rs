@@ -78,7 +78,6 @@ pub fn convert(
                     .transpose()?,
                 mtu: t.mtu,
                 gso: t.gso,
-                gso_max_size: t.gso_max_size,
                 so_mark: t.so_mark,
                 route_table: t.route_table,
                 iproute2_rule_index: t.iproute2_rule_index,

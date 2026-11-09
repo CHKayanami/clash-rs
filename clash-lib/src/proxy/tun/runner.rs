@@ -2,14 +2,13 @@ use std::sync::Arc;
 #[cfg(not(target_os = "android"))]
 use std::time::Duration;
 
-use tokio::task::unconstrained;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 use tracing::debug;
 use url::Url;
 use tun_rs::AsyncDevice;
-use clash_netstack::NetStack;
+use clash_netstack::{NetStack, TcpDriver};
 
 use crate::{
     Error,
@@ -25,7 +24,8 @@ use async_trait::async_trait;
 #[cfg(any(target_os = "android", target_os = "linux"))]
 use super::icmp;
 use super::{
-    device_io::{self, DEVICE_BATCH},
+    device_io::{self, DeviceIo},
+    device_loop::{DeviceLoop, Protocols},
     packet_queue,
     pipeline::PacketPipeline,
     packet::PacketDispatcher,
@@ -195,23 +195,15 @@ impl TunRunner {
                 #[cfg(target_os = "linux")]
                 let gso_enabled = cfg.gso.unwrap_or(false);
 
-                let gso_max_size = cfg.gso_max_size.unwrap_or(65536) as usize;
-                let stack_mtu = cfg.mtu.unwrap_or(1500) as usize;
-                let effective_mtu = if gso_enabled {
-                    (gso_max_size.min(65535)) as u16
-                } else {
-                    cfg.mtu
-                        .unwrap_or(if cfg!(windows) { 65535u16 } else { 1500u16 })
-                };
-
+                // GSO frames carry segmentation metadata and may exceed the
+                // link MTU; enabling offload must not change the configured MTU.
+                let mtu = cfg.mtu
+                    .unwrap_or(if cfg!(windows) { 65535u16 } else { 1500u16 });
                 if gso_enabled {
-                    info!(
-                        "TUN GSO enabled (gso_max_size: {}, standard MTU: {})",
-                        gso_max_size, stack_mtu
-                    );
+                    info!("TUN GSO enabled (MTU: {})", mtu);
                 }
 
-                tun_builder = tun_builder.name(&tun_name).mtu(effective_mtu);
+                tun_builder = tun_builder.name(&tun_name).mtu(mtu);
 
                 #[cfg(target_os = "linux")]
                 if gso_enabled {
@@ -378,9 +370,26 @@ impl AsyncService for TunRunner {
         #[cfg(not(target_os = "android"))]
         let frame_size = usize::from(tun.mtu().inspect_err(|_| rollback_routes())?);
 
-        let (stack, tcp_listener, udp_socket) = NetStack::new_with_mtu(
-            cfg.enable_tcp && !listeners.system, cfg.enable_tcp, frame_size)
+        let (tcp_driver, tcp_listener) = if cfg.enable_tcp && !listeners.system {
+            let (driver, listener) = TcpDriver::new(frame_size, 32)
+                .inspect_err(|_| rollback_routes())?;
+            #[cfg(target_os = "linux")]
+            let driver = {
+                let mut driver = driver;
+                if tun.tcp_gso() { driver.enable_tcp_gso(); }
+                driver
+            };
+            (Some(driver), Some(listener))
+        } else { (None, None) };
+        let (stack, _, udp_socket) = NetStack::new_with_mtu(false, cfg.enable_tcp, frame_size)
             .inspect_err(|_| rollback_routes())?;
+
+        #[cfg(target_os = "linux")]
+        let udp_socket = {
+            let mut socket = udp_socket;
+            if !listeners.system && tun.udp_gso() { socket.enable_output_offload(); }
+            socket
+        };
 
         // Externally supplied descriptors belong to their platform host; it
         // remains responsible for routes and DNS (e.g. NetworkExtension).
@@ -391,12 +400,16 @@ impl AsyncService for TunRunner {
                 !cfg.device_id.starts_with("fd://"), ctx, &cancellation_token).await?)
         } else { None };
 
-        let (mut device_reader, mut device_writer) = device_io::split(
+        let (device_reader, device_writer) = device_io::split(
             &tun, frame_size, !cfg.device_id.starts_with("fd://"),
-        )?;
-        let tun_for_writer = tun.clone();
-        let tun_for_reader = tun.clone();
-        let (mut stack_sink, mut stack_stream) = stack.split();
+        ).inspect_err(|_| rollback_routes())?;
+        #[cfg(target_os = "linux")]
+        let device_writer = {
+            let mut writer = device_writer;
+            if !listeners.system && tun.tcp_gso() { writer.enable_native_offload(); }
+            writer
+        };
+        let (stack_sink, stack_stream) = stack.split();
 
         #[cfg(not(any(target_os = "macos", target_os = "android")))]
         let auto_detect_cancel = cancellation_token.clone();
@@ -431,13 +444,18 @@ impl AsyncService for TunRunner {
             #[cfg(target_os = "macos")]
             let _platform = platform;
             let mut pipeline = PacketPipeline::default();
-            let (tun_tx, mut tun_rx) = packet_queue::channel();
-            let udp_direct = super::datagram::direct_path(tun_tx.clone());
-            let tun_tx_for_dispatcher = tun_tx.clone();
-            let tun_tx_for_system_tcp = tun_tx.clone();
+            #[cfg(any(target_os = "linux", target_os = "android", test))]
+            let (_tun_tx, tun_rx) = packet_queue::channel();
+            #[cfg(not(any(target_os = "linux", target_os = "android", test)))]
+            let tun_rx = packet_queue::closed();
+            #[cfg(target_os = "linux")]
+            let udp_mtu = (!listeners.system && tun.udp_gso()).then_some(frame_size);
+            #[cfg(not(target_os = "linux"))]
+            let udp_mtu = None;
+            let udp_direct = super::datagram::direct_path(udp_mtu);
             #[cfg(any(target_os = "android", target_os = "linux"))]
             let direct_icmp = if cfg.enable_tcp {
-                let (client, relay) = icmp::channel(frame_size, tun_tx.clone(), so_mark);
+                let (client, relay) = icmp::channel(frame_size, _tun_tx.clone(), so_mark);
                 pipeline.spawn("icmp", async move {
                     relay.run().await?;
                     Err(Error::Operation("TUN ICMP relay stopped unexpectedly".into()))
@@ -448,46 +466,6 @@ impl AsyncService for TunRunner {
             let icmp_resolver = resolver.clone();
             #[cfg(any(target_os = "android", target_os = "linux"))]
             let icmp_gateway = (cfg.gateway, cfg.gateway_v6);
-
-            pipeline.spawn_writer(async move {
-                let mut queued = Vec::with_capacity(DEVICE_BATCH);
-                let mut batch = Vec::with_capacity(DEVICE_BATCH);
-                let mut budgets = Vec::with_capacity(DEVICE_BATCH);
-                while tun_rx.recv_many(&mut queued, DEVICE_BATCH).await > 0 {
-                    for packet_queue::Packet { bytes, budget } in queued.drain(..) {
-                        batch.push(bytes);
-                        budgets.push(budget);
-                    }
-                    // Exempt only this bounded batch; queue receives retain
-                    // cooperative scheduling.
-                    let result = unconstrained(device_writer.send(&tun_for_writer, &batch)).await;
-                    batch.clear();
-                    budgets.clear();
-                    if let Err(e) = result {
-                        if matches!(e.kind(), std::io::ErrorKind::TimedOut
-                            | std::io::ErrorKind::WouldBlock | std::io::ErrorKind::InvalidInput)
-                            || e.raw_os_error() == Some(libc::ENOBUFS) {
-                            warn!("failed to write TUN batch, dropping unsent packets: {e}");
-                            continue;
-                        }
-                        error!("failed to send batch to tun: {e}");
-                        break;
-                    }
-                }
-                Err(Error::Operation("tun stopped unexpectedly 0".to_string()))
-            });
-
-            // dispatcher -> stack -> tun
-            pipeline.spawn("replies", async move {
-                let mut packets = Vec::with_capacity(DEVICE_BATCH);
-                while stack_stream.recv_many(&mut packets, DEVICE_BATCH).await? > 0 {
-                    if let Err(error) = tun_tx_for_dispatcher.send_batch(&mut packets).await {
-                        error!("failed to enqueue TUN reply batch: {error}");
-                        break;
-                    }
-                }
-                Err(Error::Operation("tun stopped unexpectedly 0".to_string()))
-            });
 
             let use_system_stack = listeners.system;
             let v4_nat_info = listeners.ipv4.as_ref().map(|bound| bound.nat);
@@ -500,29 +478,31 @@ impl AsyncService for TunRunner {
             let enable_tcp = cfg.enable_tcp;
             let packets = PacketDispatcher {
                 enable_tcp, system_tcp: use_system_stack, ipv4: v4_nat_info, ipv6: v6_nat_info,
-                nat: system_nat.clone(), replies: tun_tx_for_system_tcp, direct: udp_direct.clone(),
+                nat: system_nat.clone(), direct: udp_direct.clone(), uploads: Default::default(),
             };
-            pipeline.spawn("reader", async move {
-                let mut batch = Vec::with_capacity(DEVICE_BATCH);
-                loop {
-                    match device_reader.recv(&tun_for_reader, &mut batch).await {
-                        Ok(0) => { info!("tun reader reached EOF"); break; }
-                        Ok(_) => {
-                            for packet in batch.drain(..) {
-                                #[cfg(any(target_os = "android", target_os = "linux"))]
-                                if let Some(icmp) = &direct_icmp
-                                    && icmp.intercept(&packet, |address| {
-                                        let local = icmp::is_gateway(address, icmp_gateway.0, icmp_gateway.1);
-                                        local || icmp_resolver.is_fake_ip(address)
-                                    }) { continue; }
-                                packets.dispatch(packet, &mut stack_sink).await?;
-                            }
-                        }
-                        Err(error) => { error!("tun stream recv error: {error}"); break; }
-                    }
-                }
-
-                Err(Error::Operation("tun stopped unexpectedly 1".to_string()))
+            let intercept = move |packet: &[u8]| {
+                #[cfg(any(target_os = "android", target_os = "linux"))]
+                if let Some(icmp) = &direct_icmp
+                    && icmp.intercept(packet, |address| {
+                        let local = icmp::is_gateway(address, icmp_gateway.0, icmp_gateway.1);
+                        local || icmp_resolver.is_fake_ip(address)
+                    }) { return true; }
+                #[cfg(not(any(target_os = "android", target_os = "linux")))]
+                let _ = packet;
+                false
+            };
+            let device_tun = tun.clone();
+            #[cfg(target_os = "linux")]
+            let native_tcp = !use_system_stack && device_tun.tcp_gso();
+            #[cfg(not(target_os = "linux"))]
+            let native_tcp = false;
+            pipeline.spawn("device", async move {
+                let device = DeviceLoop::new(
+                    DeviceIo::new(device_tun, device_reader, device_writer, native_tcp),
+                    Protocols { tcp: tcp_driver, sink: stack_sink, stream: stack_stream },
+                    packets, tun_rx, intercept,
+                );
+                device.run().await
             });
 
             let strict_route = cfg.strict_route;

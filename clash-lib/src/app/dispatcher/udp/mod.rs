@@ -256,7 +256,6 @@ impl Dispatcher {
                     result = poll_batch(|cx| local.poll_recv_batch(cx, &mut inbound_batch)) => {
                         let Some(()) = result else { break; };
                         for mut packet in inbound_batch.drain(..) {
-                            tokio::task::consume_budget().await;
                             let source = match &mut packet.src_addr {
                                 SocksAddr::Ip(addr) => { addr.set_ip(addr.ip().to_canonical()); *addr }
                                 SocksAddr::Domain(..) => continue,
@@ -268,6 +267,7 @@ impl Dispatcher {
                                 Err(TrySendError::Closed(_)) => break 'ingress,
                             }
                         }
+                        tokio::task::consume_budget().await;
                     }
                 }
             }

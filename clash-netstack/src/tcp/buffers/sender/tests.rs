@@ -142,3 +142,15 @@ fn saturated_wan_delivery_grows_despite_sampling_lag() {
         }
     }
 }
+
+#[test]
+fn read_ahead_preserves_startup_but_bounds_small_and_zero_window_backlogs() {
+    let cap = 4 * 1024 * 1024;
+    assert_eq!(Sender::read_budget(INITIAL_CAPACITY, 0, 0, 2048, 0), INITIAL_CAPACITY);
+    assert_eq!(Sender::read_budget(64 * 1024, 0, 0, 2048, 0), 64 * 1024);
+    assert_eq!(Sender::read_budget(cap, 64 * 1024, 64 * 1024, 2048, 0), 0);
+    assert_eq!(Sender::read_budget(cap, INITIAL_CAPACITY, INITIAL_CAPACITY, 0, 0), 0);
+    // ACK progress frees permission; a healthy large window can use capacity.
+    assert_eq!(Sender::read_budget(cap, 128 * 1024, 0, 256 * 1024, 128 * 1024), 256 * 1024);
+    assert_eq!(Sender::read_budget(cap, cap, 0, cap, cap), 0);
+}

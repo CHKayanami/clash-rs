@@ -1,11 +1,30 @@
 use super::*;
 use std::{io::Write, mem::size_of, net::{SocketAddr, TcpListener, TcpStream},
-    os::fd::{AsRawFd, IntoRawFd}, time::Duration};
+    os::fd::{AsRawFd, RawFd}, time::Duration};
 use futures::StreamExt;
-use tokio::{net::UdpSocket, time::timeout};
+use tokio::{io::{Interest, unix::AsyncFd}, net::UdpSocket, time::timeout};
+use super::linux::NativeReceive;
 use tun_rs::DeviceBuilder;
 use socket2::SockRef;
 use clash_netstack::{NetStack, UdpPacket, parse_udp_packet};
+
+fn read_descriptor(fd: RawFd, buffer: &mut [u8]) -> io::Result<usize> {
+    // SAFETY: AsyncFd owns this live descriptor. The writable buffer remains
+    // exclusively borrowed throughout the synchronous read.
+    let length = unsafe { libc::read(fd, buffer.as_mut_ptr().cast(), buffer.len()) };
+    if length < 0 { Err(io::Error::last_os_error()) } else { Ok(length as usize) }
+}
+impl<T: AsRawFd + Send + Sync> NativeReceive for AsyncFd<T> {
+    async fn receive<'a>(&'a self, buffer: &'a mut [u8]) -> io::Result<usize> {
+        loop {
+            let mut ready = self.readable().await?;
+            if let Ok(result) = ready.try_io(|fd| read_descriptor(fd.get_ref().as_raw_fd(), buffer)) { return result; }
+        }
+    }
+    fn try_receive(&self, buffer: &mut [u8]) -> io::Result<usize> {
+        self.try_io(Interest::READABLE, |fd| read_descriptor(fd.as_raw_fd(), buffer))
+    }
+}
 
 #[tokio::test]
 async fn receive_error_after_progress_is_delivered_on_next_read() {
@@ -17,15 +36,16 @@ async fn receive_error_after_progress_is_delivered_on_next_read() {
     peer.write_all(b"prefix").unwrap();
     SockRef::from(&peer).set_linger(Some(Duration::ZERO)).unwrap();
     drop(peer);
-    // SAFETY: ownership of a valid, open FD is transferred exactly once. This
-    // test exercises only descriptor reads, not TUN-specific control operations.
-    let device = unsafe { AsyncDevice::from_fd(stream.into_raw_fd()) }.unwrap();
-    let mut reader = Reader::new(&device, 65535, true).unwrap();
+    stream.set_nonblocking(true).unwrap();
+    // SAFETY: ownership of this open socket moves into AsyncFd. Its FD is
+    // never closed, replaced or exposed as an owner until AsyncFd drops it.
+    let device = unsafe { AsyncFd::register(stream) }.unwrap();
+    let mut reader = Reader::new_native(65535, false);
     let mut packets = Vec::new();
-    assert_eq!(reader.recv(&device, &mut packets).await.unwrap(), 1);
-    assert_eq!(&packets[0][..], b"prefix");
+    assert_eq!(reader.recv_native(&device, &mut packets, false).await.unwrap(), 1);
+    assert_eq!(packets[0].data(), b"prefix");
     packets.clear();
-    let error = timeout(Duration::from_secs(2), reader.recv(&device, &mut packets))
+    let error = timeout(Duration::from_secs(2), reader.recv_native(&device, &mut packets, false))
         .await.unwrap().unwrap_err();
     assert_eq!(error.kind(), io::ErrorKind::ConnectionReset);
 }
@@ -95,7 +115,7 @@ async fn kernel_udp_roundtrip(offload: bool) {
         assert!(result.error.is_none());
         let mut outbound = Vec::new();
         for _ in 0..16 { outbound.push(stack_read.next().await.unwrap().unwrap().into_bytes()); }
-        writer.send(&device, &outbound).await.unwrap();
+        writer.send(&device, &mut outbound).await.unwrap();
         timeout(Duration::from_secs(5), async {
             let mut buffer = [0; 128];
             for i in 0..16 {
@@ -129,4 +149,25 @@ fn offload_validation_preserves_valid_neighbors() {
     assert_eq!(&buffers[0][VIRTIO_NET_HDR_LEN..], before.as_ref());
     assert_eq!(&buffers[1][VIRTIO_NET_HDR_LEN..], after.as_ref());
     assert_eq!(prepare_offload(&[Bytes::new()], &mut buffers), 0);
+}
+
+#[tokio::test]
+async fn native_receive_drains_one_ready_batch_and_rearms_after_eagain() {
+    use std::os::unix::net::UnixDatagram;
+    let (receiver, sender) = UnixDatagram::pair().unwrap();
+    receiver.set_nonblocking(true).unwrap();
+    // SAFETY: AsyncFd exclusively owns the open socket for its entire
+    // registration lifetime; no operation replaces or closes its FD.
+    let device = unsafe { AsyncFd::register(receiver) }.unwrap();
+    let mut reader = Reader::new_native(1500, false);
+    sender.send(b"first").unwrap(); sender.send(b"second").unwrap();
+    let mut packets = Vec::new();
+    assert_eq!(reader.recv_native(&device, &mut packets, false).await.unwrap(), 2);
+    assert_eq!(packets[0].data(), b"first");
+    assert_eq!(packets[1].data(), b"second");
+    packets.clear();
+    assert!(timeout(Duration::from_millis(10), reader.recv_native(&device, &mut packets, false)).await.is_err());
+    sender.send(b"third").unwrap();
+    assert_eq!(timeout(Duration::from_secs(1), reader.recv_native(&device, &mut packets, false)).await.unwrap().unwrap(), 1);
+    assert_eq!(packets[0].data(), b"third");
 }

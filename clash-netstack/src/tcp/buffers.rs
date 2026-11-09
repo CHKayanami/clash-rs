@@ -28,6 +28,12 @@ impl Buffers {
         (buffers, socket)
     }
 
+    pub fn read_budget(socket: &Socket<'_>) -> usize {
+        let state = socket.transmit_state();
+        let (window, flight) = socket.transmit_allowance();
+        Sender::read_budget(state.capacity, state.queued, state.unsent, window, flight)
+    }
+
     pub fn grow(&mut self, socket: &mut Socket<'_>, consumed: usize, send_limited: bool, output_ready: bool, now: Instant) -> bool {
         let (rtt, acknowledged) = socket.buffer_delivery();
         self.grow_at(socket, consumed, Duration::from(rtt), acknowledged,

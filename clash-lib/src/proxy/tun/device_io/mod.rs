@@ -1,8 +1,23 @@
-//! Device batches retain individual IP packet boundaries. Linux offload headers
-//! and segmentation/aggregation are handled by tun-rs, not inferred from IP length.
+//! Device batches retain IP packet boundaries. Native Linux offload frames carry
+//! explicit segmentation metadata through protocol processing and device I/O.
+mod combined;
+mod frame;
+#[cfg(any(target_os = "linux", test))]
+mod offload;
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(any(target_os = "linux", test))]
+mod receive_pool;
+pub(super) use combined::DeviceIo;
 use std::io;
-use bytes::{Bytes, BytesMut};
+#[cfg(target_os = "linux")]
+use std::io::IoSlice;
+use bytes::BytesMut;
+#[cfg(test)]
+use bytes::Bytes;
 use tun_rs::AsyncDevice;
+use clash_netstack::Packet;
+use frame::Frame;
 #[cfg(target_os = "macos")]
 use std::env::{self, VarError};
 use tracing::debug;
@@ -16,6 +31,11 @@ use tun_rs::{GROTable, IDEAL_BATCH_SIZE, VIRTIO_NET_HDR_LEN};
 use futures::FutureExt;
 
 pub(super) const DEVICE_BATCH: usize = 32;
+
+pub(super) fn recoverable_write_error(error: &io::Error) -> bool {
+    matches!(error.kind(), io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+        | io::ErrorKind::InvalidInput) || error.raw_os_error() == Some(libc::ENOBUFS)
+}
 
 #[cfg(target_os = "macos")]
 fn parse_native_io(value: &str) -> io::Result<bool> {
@@ -48,11 +68,17 @@ pub(super) fn split(device: &AsyncDevice, frame_size: usize, native_batch: bool)
 }
 
 pub(super) struct Reader {
+    #[cfg(target_os = "linux")]
+    mtu: usize,
     #[cfg(target_os = "macos")]
     darwin: Option<DarwinReader>,
     original: Vec<u8>,
     #[cfg(target_os = "linux")]
     pending_error: Option<io::Error>,
+    #[cfg(target_os = "linux")]
+    pool: receive_pool::Pool,
+    #[cfg(target_os = "linux")]
+    frame_capacity: usize,
     #[cfg(target_os = "linux")]
     buffers: Vec<Vec<u8>>,
     #[cfg(target_os = "linux")]
@@ -66,28 +92,45 @@ impl Reader {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid TUN frame capacity"));
         }
         #[cfg(target_os = "linux")]
-        let slots = if device.tcp_gso() || device.udp_gso() { IDEAL_BATCH_SIZE } else { 1 };
-        #[cfg(not(target_os = "macos"))]
-        let _ = (frame_size, native_io);
-        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-        let _ = device;
-        Ok(Self {
-            #[cfg(target_os = "macos")]
-            darwin: native_io.then(|| DarwinReader::new(device, frame_size)).transpose()?,
-            #[cfg(target_os = "macos")]
-            original: if native_io { Vec::new() } else { vec![0; frame_size + 1] },
-            #[cfg(target_os = "linux")]
-            original: if slots > 1 { vec![0; 65535 + 80] } else { Vec::new() },
+        { let _ = native_io; Ok(Self::new_native(frame_size, device.tcp_gso() || device.udp_gso())) }
+        #[cfg(not(target_os = "linux"))]
+        {
+            #[cfg(not(target_os = "macos"))]
+            let _ = (frame_size, native_io);
             #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-            original: vec![0; 65535 + 80],
-            #[cfg(target_os = "linux")]
-            pending_error: None,
-            #[cfg(target_os = "linux")]
-            buffers: (0..slots)
-                .map(|_| vec![0; 65535]).collect(),
-            #[cfg(target_os = "linux")]
-            sizes: vec![0; slots],
-        })
+            let _ = device;
+            Ok(Self {
+                #[cfg(target_os = "macos")]
+                darwin: native_io.then(|| DarwinReader::new(device, frame_size)).transpose()?,
+                #[cfg(target_os = "macos")]
+                original: if native_io { Vec::new() } else { vec![0; frame_size + 1] },
+                #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+                original: vec![0; 65535 + 80],
+            })
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn new_native(frame_size: usize, offload: bool) -> Self {
+        let slots = if offload { IDEAL_BATCH_SIZE } else { 1 };
+        let frame_capacity = if offload { 65535 + 80 } else { frame_size + 1 };
+        Self { mtu: frame_size, original: if offload { vec![0; 65535 + 80] } else { Vec::new() },
+            pending_error: None, pool: receive_pool::Pool::new(frame_capacity + 64 * 1024), frame_capacity,
+            buffers: (0..slots).map(|_| Vec::new()).collect(), sizes: vec![0; slots] }
+    }
+
+    pub(super) async fn recv_frames(&mut self, device: &AsyncDevice, packets: &mut Vec<Packet>,
+        scratch: &mut Vec<BytesMut>, native_tcp: bool) -> io::Result<usize> {
+        #[cfg(target_os = "linux")]
+        {
+            let offload = device.tcp_gso() || device.udp_gso();
+            if !offload || native_tcp { return self.recv_native(device, packets, offload).await; }
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = native_tcp;
+        let count = self.recv(device, scratch).await?;
+        packets.extend(scratch.drain(..).map(Packet::from));
+        Ok(count)
     }
 
     pub(super) async fn recv(&mut self, device: &AsyncDevice, packets: &mut Vec<BytesMut>) -> io::Result<usize> {
@@ -96,6 +139,7 @@ impl Reader {
         #[cfg(target_os = "linux")]
         {
             let mut bytes = 0;
+            for buffer in &mut self.buffers { buffer.resize(65535, 0); }
             loop {
                 let receive = device.recv_multiple(&mut self.original, &mut self.buffers, &mut self.sizes, 0);
                 let result = if packets.is_empty() { receive.await }
@@ -142,10 +186,14 @@ impl Reader {
 }
 
 pub(super) struct Writer {
+    #[cfg(target_os = "linux")]
+    mtu: usize,
     #[cfg(target_os = "macos")]
     darwin: Option<DarwinWriter>,
     #[cfg(target_os = "linux")]
     gro: GROTable,
+    #[cfg(target_os = "linux")]
+    native_offload: bool,
     #[cfg(target_os = "linux")]
     buffers: Vec<Vec<u8>>,
 }
@@ -155,6 +203,8 @@ impl Writer {
         #[cfg(not(target_os = "macos"))]
         let _ = (reader, native_batch);
         Ok(Self {
+            #[cfg(target_os = "linux")]
+            mtu: reader.mtu,
             #[cfg(target_os = "macos")]
             darwin: if native_batch {
                 reader.darwin.as_ref().map(DarwinReader::writer).transpose()?
@@ -162,16 +212,25 @@ impl Writer {
             #[cfg(target_os = "linux")]
             gro: GROTable::default(),
             #[cfg(target_os = "linux")]
+            native_offload: false,
+            #[cfg(target_os = "linux")]
             buffers: (0..DEVICE_BATCH).map(|_| Vec::new()).collect(),
         })
     }
 
-    pub(super) async fn send(&mut self, device: &AsyncDevice, packets: &[Bytes]) -> io::Result<()> {
+    #[cfg(target_os = "linux")]
+    pub(super) fn enable_native_offload(&mut self) { self.native_offload = true; }
+
+    pub(super) async fn send<P: Frame>(&mut self, device: &AsyncDevice, packets: &mut [P]) -> io::Result<()> {
         assert!(packets.len() <= DEVICE_BATCH);
         #[cfg(target_os = "linux")]
         {
-            // The default non-offload path can borrow packet bytes directly.
-            // Avoid an extra payload copy when aggregation is unavailable.
+            // Split UDP output requires preserving checksum metadata even on
+            // a descriptor exposing UDP offload independently of TCP offload.
+            if (device.tcp_gso() || device.udp_gso())
+                && (self.native_offload || packets.iter().any(|packet| packet.parts().is_some())) {
+                return linux::send_native(device, packets, self.mtu).await;
+            }
             if !device.tcp_gso() { return send_plain(device, packets).await; }
             let count = prepare_offload(packets, &mut self.buffers);
             // Each slice is a complete IP packet with explicit virtio headroom.
@@ -197,9 +256,10 @@ impl Writer {
 }
 
 #[cfg(target_os = "linux")]
-fn prepare_offload(packets: &[Bytes], buffers: &mut [Vec<u8>]) -> usize {
+fn prepare_offload<P: Frame>(packets: &[P], buffers: &mut [Vec<u8>]) -> usize {
     let mut count = 0;
     for packet in packets {
+        let packet = packet.as_ref();
         if !valid_packet(packet) { continue; }
         let buffer = &mut buffers[count];
         count += 1;
@@ -220,15 +280,33 @@ fn valid_packet(packet: &[u8]) -> bool {
     false
 }
 
-async fn send_plain(device: &AsyncDevice, packets: &[Bytes]) -> io::Result<()> {
+async fn send_plain<P: Frame>(device: &AsyncDevice, packets: &mut [P]) -> io::Result<()> {
     let mut error = None;
     for packet in packets {
-        if !valid_packet(packet) { continue; }
-        match device.send(packet).await {
-            Ok(count) if count == packet.len() => {}
+        #[cfg(target_os = "linux")]
+        let (result, expected) = if let Some((header, payload)) = packet.parts() {
+            if !valid_packet(header) { continue; }
+            if packet.udp_partial() {
+                return Err(io::Error::new(io::ErrorKind::Unsupported, "UDP partial checksum needs TUN offload"));
+            }
+            let vectors = [IoSlice::new(header), IoSlice::new(payload)];
+            (device.send_vectored(&vectors).await, header.len() + payload.len())
+        } else {
+            let data = packet.as_ref();
+            if !valid_packet(data) { continue; }
+            (device.send(data).await, data.len())
+        };
+        #[cfg(not(target_os = "linux"))]
+        let (result, expected) = {
+            let data = packet.as_ref();
+            if !valid_packet(data) { continue; }
+            (device.send(data).await, data.len())
+        };
+        match result {
+            Ok(count) if count == expected => {},
             Ok(_) => return Err(io::Error::new(io::ErrorKind::WriteZero, "partial TUN packet write")),
             Err(err) if matches!(err.kind(), io::ErrorKind::InvalidInput
-                | io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock) => { error.get_or_insert(err); }
+                | io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock) => { error.get_or_insert(err); },
             Err(err) => return Err(err),
         }
     }

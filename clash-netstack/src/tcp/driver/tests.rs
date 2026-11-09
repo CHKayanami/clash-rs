@@ -1,4 +1,6 @@
 use super::*;
+use tokio::sync::mpsc;
+use crate::link::output::Output;
 use super::super::protocol::{CongestionControl, SocketBuffer, State};
 use smoltcp::wire::{Ipv6Address, TcpSeqNumber};
 
@@ -22,7 +24,7 @@ fn syn(ipv6: bool) -> Packet {
         sack_permitted: true, sack_ranges: [None; 3], timestamp: None, payload: &[],
     };
     let (output, mut input) = mpsc::channel(1);
-    emit(output.try_reserve().unwrap(), ip, tcp);
+    emit(Output::Channel(output).reserve().unwrap(), ip, tcp, None);
     input.try_recv().unwrap()
 }
 
@@ -92,11 +94,16 @@ fn client_packet(port: u16, ack: Option<TcpSeqNumber>) -> Packet {
         repr.sack_permitted = false;
     }
     let (output, mut input) = mpsc::channel(1);
-    emit(output.try_reserve().unwrap(), ip, repr);
+    emit(Output::Channel(output).reserve().unwrap(), ip, repr, None);
     input.try_recv().unwrap()
 }
 
 fn established(driver: &mut Driver, sockets: &mut SocketTable, port: u16)
+    -> (SocketHandle, TcpSeqNumber) {
+    established_with_data(driver, sockets, port, 400 * 1024)
+}
+
+fn established_with_data(driver: &mut Driver, sockets: &mut SocketTable, port: u16, bytes: usize)
     -> (SocketHandle, TcpSeqNumber) {
     let packet = client_packet(port, None);
     let (ip, payload) = parse_ip(packet.data()).unwrap();
@@ -124,7 +131,7 @@ fn established(driver: &mut Driver, sockets: &mut SocketTable, port: u16)
     assert_eq!(socket.state(), State::Established);
     socket.set_congestion_control(CongestionControl::None);
     socket.set_nagle_enabled(false);
-    socket.send_slice(&vec![b'x'; 400 * 1024]).unwrap();
+    socket.send_slice(&vec![b'x'; bytes]).unwrap();
     let flow = (SocketAddr::new(ip.src_addr().into(), port),
         SocketAddr::new(ip.dst_addr().into(), 80));
     let handle = sockets.add(socket, flow);
@@ -316,3 +323,179 @@ fn removal_cancels_deadline_before_reusing_the_flow() {
 }
 
 mod ingress;
+
+#[test]
+fn native_gso_preserves_link_mss_and_emits_large_frames_with_checksum_seeds() {
+    let mut device = NetstackDevice::local(8);
+    let mut driver = Driver::new(1500);
+    driver.enable_tcp_gso();
+    let mut sockets = SocketTable::new();
+    let (handle, _) = established(&mut driver, &mut sockets, 49152);
+    driver.poll_egress(Instant::ZERO, &mut device, &mut sockets);
+    let mut end = None;
+    let mut count = 0;
+    while let Some(packet) = device.pop_output() {
+        assert_eq!(packet.tcp_segmentation(), Some(1460));
+        assert!(packet.len() <= 65535);
+        let (ip, payload) = parse_ip(packet.data()).unwrap();
+        let tcp = TcpPacket::new_checked(payload).unwrap();
+        assert!(tcp.payload().len() > 1460);
+        if let Some(end) = end { assert_eq!(tcp.seq_number(), end); }
+        end = Some(tcp.seq_number() + tcp.payload().len());
+        assert_eq!(tcp.checksum(), checksum::pseudo_header(&ip.src_addr(), &ip.dst_addr(),
+            IpProtocol::Tcp, payload.len() as u32));
+        assert_eq!(sockets.get_mut(handle).peer_mss(), 1460);
+        count += 1;
+    }
+    assert!(count > 0);
+}
+
+#[test]
+fn kernel_verified_checksum_is_explicit_and_does_not_disable_ip_validation() {
+    let mut bytes = syn(false).data().to_vec();
+    bytes[36] ^= 1;
+    assert!(!Driver::valid_syn(&Packet::new(bytes.clone())));
+    assert!(Driver::valid_syn(&Packet::new(bytes.clone()).with_verified_rx_checksum()));
+    bytes[10] ^= 1;
+    assert!(!Driver::valid_syn(&Packet::new(bytes).with_verified_rx_checksum()));
+}
+
+#[test]
+fn borrowed_gso_output_preserves_headers_and_queues_only_after_backpressure() {
+    let mut device = NetstackDevice::local(8);
+    let mut driver = Driver::new(1500);
+    driver.enable_tcp_gso();
+    let mut sockets = SocketTable::new();
+    let (handle, _) = established(&mut driver, &mut sockets, 49152);
+    let mut sent = Vec::new();
+    driver.poll_egress_with(Instant::ZERO, &mut device, &mut sockets, &mut |header, payload, size| {
+        assert_eq!(size, Some(1460));
+        let mut data = header.to_vec();
+        data.extend_from_slice(payload);
+        let (ip, tcp_bytes) = parse_ip(&data).unwrap();
+        let tcp = TcpPacket::new_checked(tcp_bytes).unwrap();
+        assert_eq!(tcp.checksum(), checksum::pseudo_header(&ip.src_addr(), &ip.dst_addr(),
+            IpProtocol::Tcp, tcp_bytes.len() as u32));
+        let queued = build_packet(ip.clone(), TcpRepr::parse(&tcp, &ip.src_addr(), &ip.dst_addr(), &{
+                let mut caps = ChecksumCapabilities::default(); caps.tcp = Checksum::Tx; caps
+            }).unwrap(), size);
+        assert_eq!(queued.data(), data);
+        sent.push(data);
+        true
+    });
+    assert!(!sent.is_empty());
+    assert!(device.pop_output().is_none());
+    assert!(sockets.get_mut(handle).send_queue() > 0, "unacknowledged payload remains owned by TCP");
+
+    let mut device = NetstackDevice::local(8);
+    let mut driver = Driver::new(1500);
+    driver.enable_tcp_gso();
+    let mut sockets = SocketTable::new();
+    established(&mut driver, &mut sockets, 49153);
+    let mut calls = 0;
+    let mut expected = Vec::new();
+    driver.poll_egress_with(Instant::ZERO, &mut device, &mut sockets, &mut |header, payload, _| {
+        calls += 1; expected.extend_from_slice(header); expected.extend_from_slice(payload);
+        false
+    });
+    assert_eq!(calls, 1, "queued data must prevent later packets bypassing it");
+    let fallback = device.pop_output().unwrap();
+    assert_eq!(fallback.data(), expected);
+    assert_eq!(fallback.tcp_segmentation(), Some(1460));
+}
+
+#[test]
+fn full_output_preserves_fifo_and_direct_write_resumes_after_drain() {
+    let mut device = NetstackDevice::local(1);
+    let mut driver = Driver::new(1500);
+    driver.enable_tcp_gso();
+    let mut sockets = SocketTable::new();
+    let (handle, initial_seq) = established_with_data(&mut driver, &mut sockets, 49152, 32 * 1024);
+    let queued = syn(false);
+    device.split().1.send(queued.clone()).unwrap();
+    assert!(!device.output_available());
+
+    let mut attempts = 0;
+    driver.poll_egress_with(Instant::ZERO, &mut device, &mut sockets, &mut |_, _, _| {
+        attempts += 1;
+        false
+    });
+    assert_eq!(attempts, 0, "direct writes must not bypass queued output");
+    let socket = sockets.get_mut(handle);
+    assert_eq!(socket.transmit_state().unsent, 32 * 1024);
+    assert_eq!(socket.transmit_allowance().1, 0, "failed direct write with full queue must not advance flight");
+    assert!(driver.has_ready());
+    assert_eq!(device.pop_output().unwrap().data(), queued.data());
+
+    let mut direct_seq = None;
+    let mut direct_len = 0;
+    driver.poll_egress_with(Instant::ZERO, &mut device, &mut sockets, &mut |header, payload, size| {
+        assert_eq!(size, Some(1460));
+        let mut data = header.to_vec();
+        data.extend_from_slice(payload);
+        let (_, tcp_bytes) = parse_ip(&data).unwrap();
+        let tcp = TcpPacket::new_checked(tcp_bytes).unwrap();
+        direct_seq.get_or_insert(tcp.seq_number());
+        direct_len += payload.len();
+        true
+    });
+    assert_eq!(direct_seq, Some(initial_seq));
+    assert_eq!(direct_len, 32 * 1024);
+    assert!(device.pop_output().is_none());
+    let socket = sockets.get_mut(handle);
+    assert_eq!(socket.transmit_state().unsent, 0);
+    assert_eq!(socket.transmit_allowance().1, 32 * 1024);
+}
+
+#[test]
+fn inline_flush_cannot_bypass_an_older_protocol_ready_connection() {
+    let mut device = NetstackDevice::local(8);
+    let mut driver = Driver::new(1500);
+    driver.enable_tcp_gso();
+    let mut sockets = SocketTable::new();
+    let (older, _) = established(&mut driver, &mut sockets, 49152);
+    let (newer, _) = established(&mut driver, &mut sockets, 49153);
+    let mut egress = driver.begin_egress(Instant::ZERO, &mut device);
+    let mut calls = 0;
+    let sent = driver.flush_socket(Instant::ZERO, &mut device, newer,
+        sockets.get_mut(newer), OUTPUT_BURST, &mut egress, &mut |_, _, _| {
+            calls += 1;
+            true
+        });
+    assert_eq!(sent, 0);
+    assert_eq!(calls, 0);
+    assert_eq!(egress.bytes, 0);
+    // Refreshing the application-ready connection must retain the older
+    // protocol-only connection at the front, even with just one packet left.
+    driver.refresh(Instant::ZERO, newer, &mut sockets);
+    egress.packets = OUTPUT_PACKETS - 1;
+    let mut ports = Vec::new();
+    driver.poll_egress_from(Instant::ZERO, &mut device, &mut sockets, &mut egress,
+        &mut |header, payload, _| {
+            let mut packet = header.to_vec();
+            packet.extend_from_slice(payload);
+            let (_, tcp) = parse_ip(&packet).unwrap();
+            ports.push(TcpPacket::new_unchecked(tcp).dst_port());
+            true
+        });
+    assert_eq!(ports, vec![49152]);
+    assert!(sockets.get_mut(older).transmit_allowance().1 > 0);
+}
+
+mod readiness;
+
+#[test]
+fn exhausted_inline_budget_does_not_change_protocol_time_or_readiness() {
+    let mut device = NetstackDevice::local(1);
+    let mut driver = Driver::new(1500);
+    let mut sockets = SocketTable::new();
+    let (handle, _) = established(&mut driver, &mut sockets, 49152);
+    let now = Instant::from_millis(1000);
+    driver.context.set_now(now);
+    let mut egress = Egress { packets: OUTPUT_PACKETS, bytes: OUTPUT_BYTES };
+    assert_eq!(driver.flush_socket(Instant::ZERO, &mut device, handle,
+        sockets.get_mut(handle), SOLO_OUTPUT_BURST, &mut egress,
+        &mut |_, _, _| panic!("exhausted budget must not transmit")), 0);
+    assert_eq!(driver.context.now(), now);
+    assert_eq!(driver.schedule.pop_ready(), Some(handle));
+}

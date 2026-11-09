@@ -7,7 +7,9 @@
 use std::{io, mem::{size_of, take, zeroed}, os::fd::{AsRawFd, BorrowedFd, OwnedFd}, ptr::null_mut, sync::Arc,
     time::Duration};
 
-use bytes::{Bytes, BytesMut};
+use bytes::BytesMut;
+#[cfg(test)]
+use bytes::Bytes;
 use libc::{iovec, msghdr};
 use socket2::SockRef;
 use tokio::io::unix::AsyncFd;
@@ -164,10 +166,10 @@ impl Writer {
         Ok(Self { io, max_bytes })
     }
 
-    pub(super) async fn send(&mut self, packets: &[Bytes]) -> io::Result<()> {
+    pub(super) async fn send<P: AsRef<[u8]>>(&mut self, packets: &[P]) -> io::Result<()> {
         let mut start = 0;
         while start < packets.len() {
-            if !valid_packet(&packets[start]) { start += 1; continue; }
+            if !valid_packet(packets[start].as_ref()) { start += 1; continue; }
             let count = batch_len(&packets[start..], self.max_bytes);
             let mut ready = self.io.writable().await?;
             let result = ready.try_io(|fd| transmit(fd.as_raw_fd(), &packets[start..start + count]));
@@ -193,10 +195,11 @@ impl Writer {
     }
 }
 
-fn batch_len(packets: &[Bytes], max_bytes: usize) -> usize {
+fn batch_len<P: AsRef<[u8]>>(packets: &[P], max_bytes: usize) -> usize {
     let mut total = 0;
     let mut count = 0;
     for packet in packets.iter().take(DEVICE_BATCH) {
+        let packet = packet.as_ref();
         if !matches!(packet.first().map(|byte| byte >> 4), Some(4 | 6)) { break; }
         let size = packet.len() + FAMILY_SIZE;
         if count > 0 && total + size > max_bytes { break; }
@@ -206,12 +209,13 @@ fn batch_len(packets: &[Bytes], max_bytes: usize) -> usize {
     count
 }
 
-fn transmit(fd: i32, packets: &[Bytes]) -> io::Result<usize> {
+fn transmit<P: AsRef<[u8]>>(fd: i32, packets: &[P]) -> io::Result<usize> {
     let mut headers = messages();
     let mut families = [[0u8; FAMILY_SIZE]; DEVICE_BATCH];
     let empty = iovec { iov_base: null_mut(), iov_len: 0 };
     let mut vectors = [[empty; 2]; DEVICE_BATCH];
     for (index, packet) in packets.iter().enumerate() {
+        let packet = packet.as_ref();
         let family = match packet.first().map(|byte| byte >> 4) {
             Some(4) => libc::AF_INET,
             Some(6) => libc::AF_INET6,

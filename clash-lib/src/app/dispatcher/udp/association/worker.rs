@@ -1,129 +1,37 @@
-use std::{collections::{HashMap, VecDeque}, io, net::SocketAddr, pin::Pin,
-    sync::{Arc, atomic::{AtomicBool, Ordering}}, task::{Context, Poll}, time::Duration};
-use futures::{Stream, stream::FuturesUnordered, future::BoxFuture};
-use tokio::{sync::{mpsc, oneshot}, time::{Instant, Sleep, sleep}};
+//! Adapter for proxy relays. TUN DIRECT drives the same policy state itself.
+use std::{io, mem, net::SocketAddr, sync::Arc, task::{Context, Poll}};
+use tokio::{sync::mpsc, time::Instant};
 use tracing::warn;
+use crate::{common::io::datagram_relay::RelayContext,
+    proxy::datagram::UdpPacket, session::SocksAddr};
+use super::{AssociationConfig, Outgoing, Registration, state::AssociationState};
+use super::super::replies::Sender as ReplySender;
 
-use crate::{common::io::datagram_relay::RelayContext, proxy::datagram::{UdpPacket, batch::MAX_BATCH_PACKETS}, session::SocksAddr};
-use super::reply::Destination as ReplyDestination;
-use super::{AssociationConfig, Registration, Outgoing, flow::FlowState, traffic::UdpTraffic, peer::PeerTable};
-
-const CONTROL_BUDGET: usize = 32;
 pub(super) struct AssociationRelay {
     packets: mpsc::Receiver<Outgoing>,
-    commands: mpsc::Receiver<Registration>,
-    flows: HashMap<u64, Arc<FlowState>>,
-    peers: PeerTable,
-    closing: FuturesUnordered<BoxFuture<'static, u64>>,
-    sending: VecDeque<(Arc<FlowState>, usize)>,
-    last_sender: Option<Arc<FlowState>>,
-    replies: ReplyDestination,
-    source: SocketAddr,
-    allow_quic: Arc<AtomicBool>,
-    traffic: UdpTraffic,
-    // Reply address projection, not a peer-admission filter.
-    force_source: Option<SocksAddr>,
-    user: Option<Arc<str>>,
-    native: bool,
-    timeout: Duration,
-    last_active: Instant,
-    timer: Pin<Box<Sleep>>,
+    state: AssociationState,
+    now: Instant,
+    replies: ReplySender,
 }
-
 impl AssociationRelay {
     pub(super) fn new(packets: mpsc::Receiver<Outgoing>, commands: mpsc::Receiver<Registration>,
         config: &AssociationConfig, source: SocketAddr, user: Option<Arc<str>>,
-        force_source: Option<SocksAddr>, replies: ReplyDestination, native: bool,
+        force_source: Option<SocksAddr>, replies: ReplySender, native: bool,
     ) -> Self {
-        Self {
-            packets, commands, flows: HashMap::new(), peers: PeerTable::default(),
-            closing: FuturesUnordered::new(), sending: VecDeque::with_capacity(MAX_BATCH_PACKETS + 1), last_sender: None,
-            replies, source, allow_quic: config.allow_quic.clone(),
-            traffic: UdpTraffic::new(config.manager.clone(), user.as_ref()), force_source, user, native,
-            timeout: config.timeout, last_active: Instant::now(), timer: Box::pin(sleep(config.timeout)),
-        }
-    }
-
-    fn remove(&mut self, id: u64) {
-        if let Some(flow) = self.flows.remove(&id) {
-            flow.close();
-            self.last_sender = None;
-            self.peers.remove(&flow, &self.flows);
-        }
-    }
-
-    fn register(&mut self, state: Arc<FlowState>, close_rx: oneshot::Receiver<()>) -> io::Result<()> {
-        self.peers.register(&state)?;
-        self.last_sender = None;
-        let id = state.id;
-        self.flows.insert(id, state);
-        // One small control future per route, never a forwarding task. Dropped
-        // senders (expired routes) also complete and reclaim this registration.
-        self.closing.push(Box::pin(async move { let _ = close_rx.await; id }));
-        Ok(())
+        Self { packets, now: Instant::now(), state: AssociationState::new(commands, config, source, user, force_source, native), replies }
     }
 }
-
-impl Drop for AssociationRelay {
-    fn drop(&mut self) {
-        for flow in self.flows.values() { flow.close(); }
-        for (flow, _) in &self.sending { flow.close(); }
-    }
-}
-
 impl RelayContext for AssociationRelay {
     fn poll_control(&mut self, cx: &mut Context<'_>) -> bool {
-        if self.replies.is_closed() { return false; }
-        if self.timer.as_mut().poll(cx).is_ready() {
-            let deadline = self.last_active + self.timeout;
-            if deadline <= Instant::now() { return false; }
-            self.timer.as_mut().reset(deadline);
-            let _ = self.timer.as_mut().poll(cx);
-        }
-        for index in 0..CONTROL_BUDGET {
-            if index + 1 == CONTROL_BUDGET { cx.waker().wake_by_ref(); }
-            match Pin::new(&mut self.closing).poll_next(cx) {
-                Poll::Ready(Some(id)) => self.remove(id),
-                _ => break,
-            }
-        }
-        for _ in 0..CONTROL_BUDGET {
-            match self.commands.poll_recv(cx) {
-                Poll::Ready(Some(Registration { state, close_rx, reply })) => {
-                    let id = state.id;
-                    let result = self.register(state, close_rx);
-                    if reply.send(result).is_err() { self.remove(id); }
-                    // Newly pushed close futures must be polled to subscribe
-                    // their receivers before this relay becomes idle.
-                    cx.waker().wake_by_ref();
-                }
-                _ => return true,
-            }
-        }
-        cx.waker().wake_by_ref();
-        true
+        self.now = Instant::now();
+        !self.replies.is_closed() && self.state.poll_control(cx)
     }
-
     fn poll_outgoing(&mut self, cx: &mut Context<'_>) -> Poll<Option<UdpPacket>> {
-        for _ in 0..CONTROL_BUDGET {
+        for _ in 0..32 {
             match self.packets.poll_recv(cx) {
-                Poll::Ready(Some(outgoing)) => {
-                    let flow = self.last_sender.take().filter(|flow| flow.id == outgoing.id)
-                        .or_else(|| self.flows.get(&outgoing.id).cloned());
-                    let Some(flow) = flow else { continue; };
-                    if flow.is_closed() { self.remove(outgoing.id); continue; }
-                    let mut packet = outgoing.packet;
-                    if packet.dst_addr != flow.target { packet.dst_addr = flow.target.clone(); }
-                    if let Some((previous, count)) = self.sending.back_mut()
-                        && previous.id == flow.id {
-                        *count += 1;
-                    } else {
-                        self.sending.push_back((flow.clone(), 1));
-                    }
-                    self.last_sender = Some(flow);
-                    self.last_active = Instant::now();
+                Poll::Ready(Some(packet)) => if let Some(packet) = self.state.outgoing(packet, self.now) {
                     return Poll::Ready(Some(packet));
-                }
+                },
                 Poll::Ready(None) => return Poll::Ready(None),
                 Poll::Pending => return Poll::Pending,
             }
@@ -131,62 +39,17 @@ impl RelayContext for AssociationRelay {
         cx.waker().wake_by_ref();
         Poll::Pending
     }
-
-    fn sent(&mut self, result: io::Result<usize>) -> bool {
-        let (flow, remaining) = self.sending.front_mut().expect("queued UDP flow completion");
-        *remaining -= 1;
-        let keep_running = match result {
-            Ok(len) => {
-                self.last_active = Instant::now();
-                self.traffic.push_upload(len);
-                // Commit ownership in actual send order, not when a later
-                // unsent packet was merely admitted to the batch.
-                if !flow.is_closed() { self.peers.select_sender(flow); }
-                flow.tracker.record_upload(len);
-                true
-            }
-            Err(err) => {
-                warn!("UDP association send failed: {err}");
-                // An invalid datagram does not invalidate a native socket.
-                self.native || matches!(err.kind(), io::ErrorKind::InvalidInput | io::ErrorKind::InvalidData)
-            }
-        };
-        if *remaining == 0 { self.sending.pop_front(); }
-        keep_running
-    }
-
+    fn sent(&mut self, result: io::Result<usize>) -> bool { self.state.sent(result, self.now) }
     fn received_batch(&mut self, packets: &mut Vec<UdpPacket>) -> bool {
-        packets.retain_mut(|packet| {
-            self.last_active = Instant::now();
-            self.traffic.push_download(packet.data.len());
-            if let SocksAddr::Ip(addr) = &mut packet.src_addr { addr.set_ip(addr.ip().to_canonical()); }
-            // Endpoint-independent filtering: unknown peers are admitted too.
-            // This table restores addresses and attributes bytes; it is not an allowlist.
-            let (owner, original) = self.peers.reply(&packet.src_addr);
-            let flow = owner.and_then(|id| self.flows.get(&id))
-                .filter(|flow| !flow.is_closed());
-            if let Some(flow) = flow {
-                flow.tracker.record_download(packet.data.len());
-            }
-            let original = self.force_source.as_ref().or(original);
-            if let Some(original) = original && packet.src_addr != *original {
-                packet.src_addr = original.clone();
-            }
-            packet.dst_addr = self.source.into();
-            packet.inbound_user = self.user.clone();
-            // Protocol policy remains separate from NAT filtering.
-            if !self.allow_quic.load(Ordering::Relaxed) && packet.src_addr.port() == 443 { return false; }
-            if let Some(flow) = flow { flow.activity.record_at(self.last_active); }
-            true
-        });
-        match self.replies.send(packets) {
-            Ok(()) => true,
-            Err(error) => { warn!("UDP reply batch failed: {error}"); false }
-        }
+        packets.retain_mut(|packet| self.state.map_received(packet, self.now));
+        reply_result(self.replies.send_batch(mem::take(packets)))
     }
 
-    fn poll_receive_ready(&mut self, cx: &mut Context<'_>) -> Poll<bool> {
-        self.replies.poll_ready(cx)
-    }
+}
 
+fn reply_result(result: io::Result<()>) -> bool {
+    match result {
+        Ok(()) => true,
+        Err(error) => { warn!("UDP reply batch failed: {error}"); false },
+    }
 }

@@ -1,9 +1,12 @@
+use crate::proxy::datagram::segments::DatagramSegments;
 use crate::proxy::datagram::batch::{DatagramBatch, PacketBatch, BatchResult, poll_send_single};
 use crate::{app::dns::ThreadSafeDNSResolver, proxy::datagram::UdpPacket, session::SocksAddr};
 use futures::{Sink, Stream, ready};
 use std::{collections::HashMap, io, net::SocketAddr, pin::Pin,
     task::{Context, Poll}, time::{Duration, Instant}};
 use tokio::net::UdpSocket;
+#[cfg(feature = "tun")]
+use crate::proxy::datagram::segments::SegmentSendResult;
 use super::{native::NativeDatagram, resolve::{PendingResolution, poll_resolve_destination}};
 
 const UDP_DOMAIN_MAP_TTL: Duration = Duration::from_secs(60);
@@ -48,6 +51,13 @@ impl OutboundDatagramImpl {
         &self, cx: &mut Context<'_>, header: &[u8], payload: &[u8], destination: SocketAddr,
     ) -> Poll<io::Result<()>> {
         self.native.poll_send_to_vectored(cx, header, payload, destination)
+    }
+
+    #[cfg(feature = "tun")]
+    pub(crate) fn poll_send_segments(&mut self, cx: &mut Context<'_>,
+        group: &DatagramSegments, offset: usize)
+        -> Poll<SegmentSendResult> {
+        self.native.poll_send_segments(cx, group, offset)
     }
 
     fn clear_send(&mut self) {
@@ -483,6 +493,12 @@ mod tests {
 }
 
 impl DatagramBatch for OutboundDatagramImpl {
+    fn enable_udp_offload(&mut self) { self.native.enable_udp_offload(); }
+    fn poll_recv_segments(&mut self, cx: &mut Context<'_>, packets: &mut Vec<DatagramSegments>) -> Poll<Option<()>> {
+        let Self { native, ip_to_logical, .. } = self;
+        native.poll_recv_segments_with(cx, |peer| ip_to_logical.get(&peer)
+            .map(|(logical, _)| logical.clone()).unwrap_or_else(|| peer.into()), packets)
+    }
     fn poll_send_batch(&mut self, cx: &mut Context<'_>, batch: &mut PacketBatch) -> Poll<BatchResult> {
         if !self.flushed || batch.packets().next().is_some_and(|packet| packet.dst_addr.is_domain()) {
             return poll_send_single(self, cx, batch);
@@ -496,13 +512,8 @@ impl DatagramBatch for OutboundDatagramImpl {
         Poll::Ready(result)
     }
     fn poll_recv_batch(&mut self, cx: &mut Context<'_>, packets: &mut Vec<UdpPacket>) -> Poll<Option<()>> {
-        if ready!(DatagramBatch::poll_recv_batch(&mut self.native, cx, packets)).is_none() { return Poll::Ready(None); }
-        for packet in packets {
-            if let SocksAddr::Ip(peer) = packet.src_addr
-                && let Some((logical, _)) = self.ip_to_logical.get(&peer) {
-                packet.src_addr = logical.clone();
-            }
-        }
-        Poll::Ready(Some(()))
+        let Self { native, ip_to_logical, .. } = self;
+        native.poll_recv_batch_with(cx, |peer| ip_to_logical.get(&peer)
+            .map(|(logical, _)| logical.clone()).unwrap_or_else(|| peer.into()), packets)
     }
 }

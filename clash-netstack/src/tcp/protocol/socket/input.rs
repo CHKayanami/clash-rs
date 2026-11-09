@@ -638,6 +638,7 @@ impl<'a> Socket<'a> {
         };
         let new_remote_win_len = (repr.window_len as usize) << (scale as usize);
         let is_window_update = new_remote_win_len != self.remote_win_len;
+        let window_increased = new_remote_win_len > self.remote_win_len;
         self.remote_win_len = new_remote_win_len;
 
         self.congestion_controller
@@ -657,6 +658,10 @@ impl<'a> Socket<'a> {
 
             // There's new room available in tx_buffer, wake the waiting task if any.
 
+            self.tx_waker.wake();
+        } else if window_increased {
+            // A relay can be waiting on read-ahead permission even while the
+            // backing buffer has space. A pure window update frees no storage.
             self.tx_waker.wake();
         }
 

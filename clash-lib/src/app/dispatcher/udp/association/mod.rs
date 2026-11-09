@@ -5,12 +5,17 @@ mod semantics;
 mod lifecycle;
 mod traffic;
 mod worker;
-mod reply;
+mod state;
+mod task;
+use task::Task;
+#[cfg(feature = "tun")]
+use task::Owner;
+#[cfg(feature = "tun")]
+use state::AssociationState;
 #[cfg(feature = "tun")]
 pub(crate) mod direct;
 #[cfg(feature = "tun")]
-use direct::DirectPath;
-use reply::Destination as ReplyDestination;
+use direct::{DirectPath, engine::session::Session as DirectSession};
 
 pub(crate) use lifecycle::{AssociationGuard, AssociationRegistry};
 pub(crate) use traffic::UserTrafficCounters;
@@ -24,9 +29,9 @@ use crate::app::net::{network_generation, subscribe_network_changes};
 use semantics::{FlowIsolation, IsolationReason};
 
 use std::{collections::HashMap, io, net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr}, sync::{Arc, Weak, atomic::{AtomicBool, AtomicU64, Ordering}}, time::Duration};
-use futures::future::{BoxFuture, pending};
+use futures::future::BoxFuture;
 use parking_lot::Mutex;
-use tokio::{sync::{Mutex as AsyncMutex, OwnedSemaphorePermit, Semaphore, mpsc, oneshot}, task::JoinHandle};
+use tokio::{sync::{Mutex as AsyncMutex, OwnedSemaphorePermit, Semaphore, mpsc, oneshot}};
 
 use crate::{
     app::{dns::ThreadSafeDNSResolver, dispatcher::{Manager, TrackGuard, TrackerInfo}},
@@ -81,6 +86,15 @@ struct Slot {
 }
 
 struct WorkerGuard(Weak<Slot>, u64);
+
+#[cfg(feature = "tun")]
+struct DirectLifetime {
+    _permit: OwnedSemaphorePermit,
+    _guard: AssociationGuard,
+    _cleanup: WorkerGuard,
+    _owner: Owner,
+}
+
 impl Drop for WorkerGuard {
     fn drop(&mut self) {
         if let Some(slot) = self.0.upgrade()
@@ -255,37 +269,46 @@ impl UdpAssociationPool {
         let (control, commands) = mpsc::channel(QUEUE_CAPACITY);
         let force_source = (unresolved_fake || !datagram.reports_peer_source()).then(||
             sess.orig_destination.clone().unwrap_or_else(|| sess.destination.clone()));
-        let replies = ReplyDestination::queued(&self.config.replies);
         #[cfg(feature = "tun")]
         let direct = (sess.typ == Type::Tun && matches!(&slot._outbound, ProtocolOutbound::Direct(_))
             && datagram.physical_socket().is_some() && self.config.direct.is_some())
             .then_some(slot.key.network_generation);
-        #[cfg(feature = "tun")]
-        let replies = if direct.is_some() {
-            ReplyDestination::Direct(self.config.direct.as_ref().unwrap().writer())
-        } else { replies };
-        let context = AssociationRelay::new(packets, commands, &self.config,
-            sess.source, sess.inbound_user.clone(), force_source, replies,
-            datagram.physical_socket().is_some() || matches!(&datagram, AnyOutboundDatagram::Socks5(inner) if inner.has_native_send()));
+        let native = datagram.physical_socket().is_some()
+            || matches!(&datagram, AnyOutboundDatagram::Socks5(inner) if inner.has_native_send());
         let cleanup = WorkerGuard(Arc::downgrade(slot), id);
-        let task = dispatch_datagram!(datagram, |inner| tokio::spawn(async move {
-            let (_permit, _guard, _cleanup) = (permit, guard, cleanup);
-            let network_closed = async move {
-                #[cfg(feature = "tun")]
-                if let Some(generation) = direct {
-                    let mut changes = subscribe_network_changes();
-                    let _ = changes.wait_for(|current| *current != generation).await;
-                    return;
+        #[cfg(feature = "tun")]
+        if let Some(generation) = direct {
+            let executor = self.config.direct.as_ref().expect("DIRECT TUN owner").executor();
+            let state = AssociationState::new(commands, &self.config,
+                sess.source, sess.inbound_user.clone(), force_source, native);
+            let (task, owner) = Task::owned();
+            let cancel = owner.cancel.clone();
+            let closed: BoxFuture<'static, ()> = Box::pin(async move {
+                let mut changes = subscribe_network_changes();
+                tokio::select! {
+                    _ = cancel.cancelled() => {},
+                    _ = close_rx => {},
+                    _ = changes.wait_for(|current| *current != generation) => {},
                 }
-                pending::<()>().await;
-            };
+            });
+            let session = DirectSession::new(id, datagram, state, packets,
+                closed, DirectLifetime { _permit: permit, _guard: guard, _cleanup: cleanup, _owner: owner }, executor.offload());
+            let direct = Some(direct::Lease { generation, location: session.location.clone() });
+            executor.install(session)?;
+            return Ok(Arc::new(Association { id, outgoing, control, direct,
+                chain: sess.proxy_chain.snapshot(), task }));
+        }
+        let context = AssociationRelay::new(packets, commands, &self.config,
+            sess.source, sess.inbound_user.clone(), force_source, self.config.replies.clone(), native);
+        let future: BoxFuture<'static, ()> = dispatch_datagram!(datagram, |inner| Box::pin(async move {
+            let (_permit, _guard, _cleanup) = (permit, guard, cleanup);
             tokio::select! {
                 _ = relay(inner, context) => {},
                 _ = close_rx => {},
-                _ = network_closed => {},
             }
         }));
-        Ok(Arc::new(Association { id, outgoing, control, #[cfg(feature = "tun")] direct, chain: sess.proxy_chain.snapshot(), task }))
+        let task = tokio::spawn(future).into();
+        Ok(Arc::new(Association { id, outgoing, control, #[cfg(feature = "tun")] direct: None, chain: sess.proxy_chain.snapshot(), task }))
     }
 
     async fn register(&self, association: &Arc<Association>, sess: &Session,
@@ -305,7 +328,7 @@ impl UdpAssociationPool {
             id: sess.id, source: sess.source, target,
             original: sess.orig_destination.clone().unwrap_or_else(|| sess.destination.clone()),
             aliases, tracker: tracker.clone(), activity: Arc::new(ReplyActivity::new()),
-            closed: AtomicBool::new(false), events: self.config.closed_flows.clone(),
+            closed: Arc::new(AtomicBool::new(false)), events: self.config.closed_flows.clone(),
             _guard: TrackGuard::new(sess.id, self.config.manager.clone()),
         });
         let (close_tx, close_rx) = oneshot::channel();
@@ -315,8 +338,8 @@ impl UdpAssociationPool {
             .await.map_err(|_| closed())?;
         rx.await.map_err(|_| closed())??;
         #[cfg(feature = "tun")]
-        let direct_registration = association.direct.and_then(|generation|
-            self.config.direct.as_ref().and_then(|path| path.registration(&state, generation, &self.config.allow_quic)));
+        let direct_registration = association.direct.as_ref().and_then(|lease|
+            self.config.direct.as_ref().and_then(|path| path.registration(&state, lease.generation, &self.config.allow_quic)));
         Ok(UdpFlow { state, association: association.clone(), #[cfg(feature = "tun")] _direct_registration: direct_registration })
     }
 }
@@ -324,9 +347,9 @@ impl UdpAssociationPool {
 struct Association {
     id: u64,
     #[cfg(feature = "tun")]
-    direct: Option<u64>,
+    direct: Option<direct::Lease>,
     outgoing: mpsc::Sender<Outgoing>, control: mpsc::Sender<Registration>,
-    chain: Vec<String>, task: JoinHandle<()>,
+    chain: Vec<String>, task: Task,
 }
 impl Drop for Association { fn drop(&mut self) { self.task.abort(); } }
 struct Outgoing { id: u64, packet: UdpPacket }

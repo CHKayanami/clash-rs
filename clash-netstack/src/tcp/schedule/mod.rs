@@ -46,6 +46,9 @@ impl Schedule {
     }
 
     pub fn has_ready(&self) -> bool { !self.ready.is_empty() }
+    pub fn can_dispatch(&self, handle: SocketHandle) -> bool { self.ready.can_dispatch(handle) }
+    pub fn remove_ready(&mut self, handle: SocketHandle) { self.ready.remove(handle); }
+    pub fn has_other_ready(&self, handle: SocketHandle) -> bool { self.ready.has_other(handle) }
     pub fn pop_ready(&mut self) -> Option<SocketHandle> { self.ready.pop_front() }
 
     pub fn retry(&mut self, handle: SocketHandle) {

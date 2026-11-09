@@ -1,7 +1,6 @@
 mod adapter;
 mod direct;
-use direct::Target;
-use super::packet_queue::Sender;
+pub(super) use direct::encode as encode_direct_reply;
 use crate::app::dispatcher::udp::association::direct::DirectPath;
 use adapter::TunDatagram;
 use std::{sync::Arc, time::Duration};
@@ -46,6 +45,6 @@ pub(crate) async fn handle_inbound_datagram(
     warn!("TUN UDP dispatcher stopped");
 }
 
-pub(super) fn direct_path(sender: Sender) -> Arc<DirectPath> {
-    DirectPath::new(Arc::new(Target(sender)))
+pub(super) fn direct_path(mtu: Option<usize>) -> Arc<DirectPath> {
+    DirectPath::integrated(mtu)
 }

@@ -1,5 +1,10 @@
 //! Unified transports. Concrete common paths and dynamic protocol stacks share
 //! one connection API; dispatch belongs here, not in every outbound handler.
+#[cfg(all(target_os = "linux", feature = "tun"))]
+use super::direct::recv::ReceiveSlots;
+#[cfg(feature = "tun")]
+use crate::proxy::datagram::segments::SegmentSendResult;
+use super::datagram::segments::DatagramSegments;
 use super::datagram::batch::{DatagramBatch, PacketBatch, BatchResult};
 
 use super::{
@@ -299,6 +304,31 @@ define_transport!($, AnyOutboundDatagram, DynamicDatagram, [OutboundDatagram], d
 ]);
 
 impl AnyOutboundDatagram {
+    #[cfg(feature = "tun")]
+    pub(crate) fn native_udp(&mut self) -> Option<&mut NativeDatagram> {
+        match self { Self::NativeUdp(inner) => Some(inner), _ => None }
+    }
+
+    #[cfg(all(target_os = "linux", feature = "tun"))]
+    pub(crate) fn poll_recv_segments_in(&mut self, cx: &mut Context<'_>, packets: &mut Vec<DatagramSegments>,
+        slots: &mut ReceiveSlots) -> Poll<Option<()>> {
+        match self {
+            Self::NativeUdp(inner) => inner.poll_segments(cx, packets, Some(slots)),
+            _ => self.poll_recv_segments(cx, packets),
+        }
+    }
+
+    #[cfg(feature = "tun")]
+    pub(crate) fn poll_send_segments(&mut self, cx: &mut Context<'_>, group: &DatagramSegments,
+        offset: usize) -> Poll<SegmentSendResult> {
+        match self {
+            Self::NativeUdp(inner) => inner.poll_send_segments(cx, group, offset),
+            Self::Udp(inner) => inner.poll_send_segments(cx, group, offset),
+            _ => Poll::Ready(SegmentSendResult { bytes: 0, failed: 0,
+                error: Some(io::Error::new(io::ErrorKind::Unsupported, "segmented send requires a physical UDP socket")), fatal: true }),
+        }
+    }
+
     pub(crate) fn physical_socket(&self) -> Option<(&UdpSocket, bool)> {
         match self {
             Self::NativeUdp(inner) => Some(inner.physical_socket()),
@@ -391,6 +421,10 @@ impl Sink<UdpPacket> for AnyOutboundDatagram {
 }
 
 impl DatagramBatch for AnyOutboundDatagram {
+    fn enable_udp_offload(&mut self) { dispatch_datagram!(self, |inner| inner.enable_udp_offload()) }
+    fn poll_recv_segments(&mut self, cx: &mut Context<'_>, packets: &mut Vec<DatagramSegments>) -> Poll<Option<()>> {
+        dispatch_datagram!(self, |inner| inner.poll_recv_segments(cx, packets))
+    }
     fn poll_send_batch(&mut self, cx: &mut Context<'_>, batch: &mut PacketBatch) -> Poll<BatchResult> {
         dispatch_datagram!(self, |inner| inner.poll_send_batch(cx, batch))
     }

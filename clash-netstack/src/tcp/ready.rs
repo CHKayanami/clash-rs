@@ -1,12 +1,13 @@
 //! One queued wake per connection, shared by socket, stream and relay readiness.
 use std::{collections::VecDeque, sync::{Arc, Mutex, Weak, atomic::{AtomicBool, Ordering}}};
-use futures::task::ArcWake;
+use futures::task::{ArcWake, AtomicWaker};
 use tokio::sync::Notify;
 
 #[derive(Default)]
 pub(crate) struct ReadyQueue {
     queue: Mutex<VecDeque<Arc<Ready>>>,
     pub notify: Notify,
+    pub waker: AtomicWaker,
 }
 
 pub(crate) struct Ready {
@@ -30,6 +31,7 @@ impl Ready {
             && !self.queued.swap(true, Ordering::AcqRel) {
             queue.queue.lock().unwrap().push_back(self.clone());
             queue.notify.notify_one();
+            queue.waker.wake();
         }
     }
 }

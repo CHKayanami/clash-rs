@@ -1,6 +1,6 @@
 //! Bounded storage for immediate TCP control replies, independent of egress slots.
 use std::collections::VecDeque;
-use tokio::sync::mpsc;
+use crate::link::output::Output;
 use crate::Packet;
 
 pub(super) const MAX_PENDING_REPLIES: usize = 32;
@@ -22,13 +22,13 @@ impl Replies {
     /// The caller checks capacity before mutating an incoming TCP socket.
     /// Replies have no payload; their IPv4/IPv6 and TCP headers fit in 128 bytes.
     /// Previously queued replies always go first.
-    pub fn send(&mut self, packet: Packet, output: &mpsc::Sender<Packet>) {
+    pub fn send(&mut self, packet: Packet, output: &mut Output) {
         assert!(self.has_capacity(), "TCP reply queue was not reserved");
         assert!(packet.data().len() <= MAX_CONTROL_BYTES, "TCP control reply too large");
         let packet = if self.pending.is_empty() {
-            match output.try_send(packet) {
+            match output.send(packet) {
                 Ok(()) => return,
-                Err(error) => error.into_inner(),
+                Err(packet) => packet,
             }
         } else { packet };
         self.pending.push_back(packet);
@@ -36,11 +36,11 @@ impl Replies {
 
     /// Reserve before removing a packet: full/closed output never loses a reply.
     /// At most MAX_PENDING_REPLIES small control packets are drained per call.
-    pub fn flush(&mut self, output: &mpsc::Sender<Packet>) -> (usize, usize) {
+    pub fn flush(&mut self, output: &mut Output) -> (usize, usize) {
         let mut packets = 0;
         let mut bytes = 0;
         while !self.pending.is_empty() {
-            let Ok(permit) = output.try_reserve() else { break; };
+            let Some(permit) = output.reserve() else { break; };
             let packet = self.pending.pop_front().unwrap();
             packets += 1;
             bytes += packet.data().len();

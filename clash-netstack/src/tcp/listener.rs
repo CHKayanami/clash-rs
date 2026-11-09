@@ -60,14 +60,23 @@ impl TcpStreamHandle {
 
 pub struct TcpListener {
     socket_stream: mpsc::Receiver<TcpStream>,
-    task_handle: JoinHandle<()>,
+    task_handle: Option<JoinHandle<()>>,
+    wake: Option<Arc<ReadyQueue>>,
 }
 
 impl Drop for TcpListener {
-    fn drop(&mut self) { self.task_handle.abort(); }
+    fn drop(&mut self) {
+        self.socket_stream.close();
+        if let Some(task) = &self.task_handle { task.abort(); }
+        if let Some(ready) = &self.wake { ready.waker.wake(); }
+    }
 }
 
 impl TcpListener {
+    pub(super) fn local(socket_stream: mpsc::Receiver<TcpStream>, ready: Arc<ReadyQueue>) -> Self {
+        Self { socket_stream, task_handle: None, wake: Some(ready) }
+    }
+
     pub fn new(inbound: mpsc::Receiver<Packet>, outbound: mpsc::Sender<Packet>, mtu: usize) -> Self {
         let (sender, socket_stream) = mpsc::channel(256);
         let ready = Arc::new(ReadyQueue::default());
@@ -76,7 +85,7 @@ impl TcpListener {
                 log::debug!("TCP stack stopped: {error}");
             }
         });
-        Self { socket_stream, task_handle }
+        Self { socket_stream, task_handle: Some(task_handle), wake: None }
     }
 }
 

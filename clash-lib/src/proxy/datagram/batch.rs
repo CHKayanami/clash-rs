@@ -7,9 +7,10 @@ use futures::{Sink, Stream};
     all(target_os = "linux", any(feature = "tproxy", feature = "ebpf")),
 ))]
 use tokio_util::sync::PollSender;
-use super::UdpPacket;
+use super::{UdpPacket, segments::DatagramSegments};
 
 pub const MAX_BATCH_PACKETS: usize = 16;
+pub const MAX_DIRECT_BATCH_PACKETS: usize = 32;
 pub const MAX_BATCH_BYTES: usize = 64 * 1024;
 
 struct Entry {
@@ -23,19 +24,24 @@ pub struct PacketBatch {
     entries: VecDeque<Entry>,
     bytes: usize,
     flushing: bool,
+    limit: usize,
 }
 
 impl Default for PacketBatch {
     fn default() -> Self {
-        Self { entries: VecDeque::with_capacity(MAX_BATCH_PACKETS), bytes: 0, flushing: false }
+        Self::with_limit(MAX_BATCH_PACKETS)
     }
 }
 
 impl PacketBatch {
+    pub fn with_limit(limit: usize) -> Self {
+        assert!(limit > 0 && limit <= MAX_DIRECT_BATCH_PACKETS);
+        Self { entries: VecDeque::with_capacity(limit), bytes: 0, flushing: false, limit }
+    }
     pub fn is_empty(&self) -> bool { self.entries.is_empty() }
     pub fn len(&self) -> usize { self.entries.len() }
     pub fn is_full(&self) -> bool {
-        self.len() == MAX_BATCH_PACKETS || self.bytes >= MAX_BATCH_BYTES
+        self.len() == self.limit || self.bytes >= MAX_BATCH_BYTES
     }
     // A lone oversize packet is admitted so its transport can report its error.
     pub fn push(&mut self, packet: UdpPacket) -> Result<(), UdpPacket> {
@@ -81,6 +87,20 @@ impl BatchResult {
 /// Physical transports override these operations. Protocols without batch I/O
 /// use the same relay and retain their existing Sink completion semantics.
 pub trait DatagramBatch: Stream<Item = UdpPacket> + Sink<UdpPacket, Error = io::Error> + Unpin {
+    fn enable_udp_offload(&mut self) {}
+
+    fn poll_recv_segments(&mut self, cx: &mut Context<'_>, packets: &mut Vec<DatagramSegments>) -> Poll<Option<()>> {
+        let mut bytes = 0;
+        while packets.len() < MAX_BATCH_PACKETS && bytes < MAX_BATCH_BYTES {
+            match Pin::new(&mut *self).poll_next(cx) {
+                Poll::Ready(Some(packet)) => { bytes += packet.data.len(); packets.push(packet.into()); }
+                Poll::Ready(None) if packets.is_empty() => return Poll::Ready(None),
+                _ => break,
+            }
+        }
+        if packets.is_empty() { Poll::Pending } else { Poll::Ready(Some(())) }
+    }
+
     fn poll_send_batch(&mut self, cx: &mut Context<'_>, batch: &mut PacketBatch)
         -> Poll<BatchResult>
     {
@@ -191,6 +211,10 @@ pub fn poll_recv_packets<D: Stream<Item = UdpPacket> + Unpin + ?Sized>(
 }
 
 impl<T: DatagramBatch + ?Sized> DatagramBatch for Box<T> {
+    fn enable_udp_offload(&mut self) { (**self).enable_udp_offload(); }
+    fn poll_recv_segments(&mut self, cx: &mut Context<'_>, packets: &mut Vec<DatagramSegments>) -> Poll<Option<()>> {
+        (**self).poll_recv_segments(cx, packets)
+    }
     fn poll_send_batch(&mut self, cx: &mut Context<'_>, batch: &mut PacketBatch) -> Poll<BatchResult> {
         (**self).poll_send_batch(cx, batch)
     }

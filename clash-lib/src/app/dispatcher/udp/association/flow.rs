@@ -53,7 +53,7 @@ pub(super) struct FlowState {
     pub aliases: Vec<SocksAddr>,
     pub tracker: Arc<TrackerInfo>,
     pub activity: Arc<ReplyActivity>,
-    pub closed: AtomicBool,
+    pub closed: Arc<AtomicBool>,
     pub events: mpsc::UnboundedSender<FlowClosed>,
     pub _guard: TrackGuard,
 }

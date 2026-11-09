@@ -67,9 +67,9 @@ pub(crate) fn inert_flow() -> UdpFlow {
         #[cfg(feature = "tun")] _direct_registration: None,
         state: Arc::new(FlowState { id: sess.id, source: sess.source, target: sess.destination.clone(),
             original: sess.destination.clone(), aliases: vec![], tracker: Arc::new(TrackerInfo::new(&sess, None)),
-            activity: Arc::new(ReplyActivity::new()), closed: AtomicBool::new(false), events,
+            activity: Arc::new(ReplyActivity::new()), closed: Arc::new(AtomicBool::new(false)), events,
             _guard: TrackGuard::new(sess.id, manager), }),
-        association: Arc::new(Association { #[cfg(feature = "tun")] direct: None, id: 0, outgoing, control, chain: vec![], task: tokio::spawn(std::future::pending()) }),
+        association: Arc::new(Association { #[cfg(feature = "tun")] direct: None, id: 0, outgoing, control, chain: vec![], task: tokio::spawn(std::future::pending()).into() }),
     }
 }
 
@@ -514,7 +514,7 @@ async fn shared_routes_can_register_before_an_earlier_registration_is_acknowledg
     let (control, mut commands) = mpsc::channel(64);
     *slot.association.lock().await = Some(Arc::new(Association {
         #[cfg(feature = "tun")] direct: None,
-        id: 0, outgoing, control, chain: vec!["test-proxy".to_owned()], task: tokio::spawn(std::future::pending()),
+        id: 0, outgoing, control, chain: vec!["test-proxy".to_owned()], task: tokio::spawn(std::future::pending()).into(),
     }));
     let pool = fixture.pool.clone();
     let leaf = outbound.clone();

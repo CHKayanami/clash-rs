@@ -4,6 +4,7 @@ mod mobile;
 mod icmp;
 mod datagram;
 mod device_io;
+mod device_loop;
 #[cfg(target_os = "macos")]
 mod macos;
 #[cfg(not(any(target_os = "macos", target_os = "android")))]

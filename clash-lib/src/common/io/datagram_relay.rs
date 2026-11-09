@@ -8,7 +8,6 @@ pub(crate) trait RelayContext {
     fn poll_outgoing(&mut self, cx: &mut Context<'_>) -> Poll<Option<UdpPacket>>;
     fn sent(&mut self, result: io::Result<usize>) -> bool;
     fn received_batch(&mut self, packets: &mut Vec<UdpPacket>) -> bool;
-    fn poll_receive_ready(&mut self, _cx: &mut Context<'_>) -> Poll<bool> { Poll::Ready(true) }
     fn poll_control(&mut self, _cx: &mut Context<'_>) -> bool { true }
 }
 
@@ -40,13 +39,9 @@ pub(crate) async fn relay<D: OutboundDatagram, C: RelayContext>(mut datagram: D,
                 && let Poll::Ready(result) = datagram.poll_send_batch(cx, &mut sending) {
                 return Poll::Ready(Event::Sent(result));
             }
-            match context.poll_receive_ready(cx) {
-                Poll::Ready(false) => return Poll::Ready(Event::Closed),
-                Poll::Ready(true) => match datagram.poll_recv_batch(cx, &mut received) {
-                    Poll::Ready(Some(())) => return Poll::Ready(Event::Received),
-                    Poll::Ready(None) => return Poll::Ready(Event::Closed),
-                    Poll::Pending => {},
-                },
+            match datagram.poll_recv_batch(cx, &mut received) {
+                Poll::Ready(Some(())) => return Poll::Ready(Event::Received),
+                Poll::Ready(None) => return Poll::Ready(Event::Closed),
                 Poll::Pending => {},
             }
             if read_first && !sending.is_empty() {
@@ -75,6 +70,6 @@ pub(crate) async fn relay<D: OutboundDatagram, C: RelayContext>(mut datagram: D,
             Event::Closed => return,
         }
         read_first = !read_first;
-        for _ in 0..processed { tokio::task::consume_budget().await; }
+        if processed > 0 { tokio::task::consume_budget().await; }
     }
 }

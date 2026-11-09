@@ -1,4 +1,5 @@
 pub mod batch;
+pub mod segments;
 pub(crate) mod framed;
 #[cfg(any(
     test,

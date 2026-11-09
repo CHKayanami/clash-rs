@@ -1,4 +1,5 @@
-use crate::Packet;
+use crate::{Packet, PacketHeaders};
+use smoltcp::wire::{IpAddress, IpProtocol, checksum};
 use bytes::BytesMut;
 use std::{io, net::SocketAddr, task::{Context, Poll}};
 use tokio::sync::mpsc;
@@ -9,98 +10,7 @@ use tokio::sync::mpsc;
 pub fn parse_udp_packet(
     data: &[u8],
 ) -> Option<(SocketAddr, SocketAddr, std::ops::Range<usize>)> {
-    if data.is_empty() {
-        return None;
-    }
-    let version = data[0] >> 4;
-    match version {
-        4 => {
-            if data.len() < 20 {
-                return None;
-            }
-            let ihl = (data[0] & 0x0f) as usize * 4;
-            if ihl < 20 || data.len() < ihl {
-                return None;
-            }
-            if data[9] != 17 {
-                // Not UDP (protocol 17)
-                return None;
-            }
-            // No reassembly is performed here. Neither first fragments (MF)
-            // nor later fragments may be interpreted as whole UDP datagrams.
-            if u16::from_be_bytes([data[6], data[7]]) & 0x3fff != 0 { return None; }
-            let packet_len = u16::from_be_bytes([data[2], data[3]]) as usize;
-            if packet_len > data.len() || packet_len < ihl + 8 {
-                return None;
-            }
-            let src_ip =
-                std::net::Ipv4Addr::new(data[12], data[13], data[14], data[15]);
-            let dst_ip =
-                std::net::Ipv4Addr::new(data[16], data[17], data[18], data[19]);
-
-            let udp_slice = &data[ihl..packet_len];
-            let src_port = u16::from_be_bytes([udp_slice[0], udp_slice[1]]);
-            let dst_port = u16::from_be_bytes([udp_slice[2], udp_slice[3]]);
-            let udp_len = u16::from_be_bytes([udp_slice[4], udp_slice[5]]) as usize;
-            if udp_len < 8 || udp_len > packet_len - ihl {
-                return None;
-            }
-
-            let payload_start = ihl + 8;
-            let payload_end = ihl + udp_len;
-            if payload_start > payload_end {
-                return None;
-            }
-
-            Some((
-                SocketAddr::new(src_ip.into(), src_port),
-                SocketAddr::new(dst_ip.into(), dst_port),
-                payload_start..payload_end,
-            ))
-        }
-        6 => {
-            if data.len() < 40 {
-                return None;
-            }
-            if data[6] != 17 {
-                // Not direct UDP
-                return None;
-            }
-            let mut src_bytes = [0u8; 16];
-            src_bytes.copy_from_slice(&data[8..24]);
-            let mut dst_bytes = [0u8; 16];
-            dst_bytes.copy_from_slice(&data[24..40]);
-            let src_ip = std::net::Ipv6Addr::from(src_bytes);
-            let dst_ip = std::net::Ipv6Addr::from(dst_bytes);
-
-            let payload_len = u16::from_be_bytes([data[4], data[5]]) as usize;
-            let packet_len = 40 + payload_len;
-            if packet_len > data.len() || packet_len < 48 {
-                return None;
-            }
-
-            let udp_slice = &data[40..packet_len];
-            let src_port = u16::from_be_bytes([udp_slice[0], udp_slice[1]]);
-            let dst_port = u16::from_be_bytes([udp_slice[2], udp_slice[3]]);
-            let udp_len = u16::from_be_bytes([udp_slice[4], udp_slice[5]]) as usize;
-            if udp_len < 8 || udp_len > payload_len {
-                return None;
-            }
-
-            let payload_start = 48;
-            let payload_end = 40 + udp_len;
-            if payload_start > payload_end {
-                return None;
-            }
-
-            Some((
-                SocketAddr::new(src_ip.into(), src_port),
-                SocketAddr::new(dst_ip.into(), dst_port),
-                payload_start..payload_end,
-            ))
-        }
-        _ => None,
-    }
+    PacketHeaders::new(data)?.udp()
 }
 
 pub struct UdpPacket {
@@ -136,7 +46,19 @@ where
 
 impl UdpPacket {
     /// Encode one complete IP/UDP datagram for a direct device reply.
-    pub fn encode(&self) -> io::Result<Packet> { encode_packet(self) }
+    pub fn encode(&self) -> io::Result<Packet> { encode_packet(self, None) }
+
+    /// Native device output keeps header and payload separate. A partial
+    /// checksum is valid only when the device receives matching virtio metadata.
+    pub fn into_parts(self, segmentation: Option<u16>, partial: bool) -> io::Result<Packet> {
+        let (header, length) = encode_header(&self, segmentation, partial)?;
+        let mut packet = Packet::from_parts(&header[..length], self.data.into_bytes())?;
+        if let Some(size) = segmentation { packet = packet.with_udp_segmentation(size); }
+        if partial || segmentation.is_some() { packet = packet.with_partial_udp_checksum(); }
+        Ok(packet)
+    }
+    /// Encode a kernel-segmented UDP payload without scanning every segment.
+    pub fn encode_segments(&self, size: u16) -> io::Result<Packet> { encode_packet(self, Some(size)) }
 
     pub fn data(&self) -> &[u8] {
         self.data.data()
@@ -146,6 +68,7 @@ impl UdpPacket {
 pub struct UdpSocket {
     inbound: mpsc::Receiver<UdpPacket>,
     outbound: mpsc::Sender<Packet>,
+    output_offload: bool,
 }
 
 impl UdpSocket {
@@ -153,13 +76,16 @@ impl UdpSocket {
         inbound: mpsc::Receiver<UdpPacket>,
         outbound: mpsc::Sender<Packet>,
     ) -> Self {
-        Self { inbound, outbound }
+        Self { inbound, outbound, output_offload: false }
     }
 
+    /// Enable only when the final device writer preserves partial-checksum
+    /// metadata. This changes final TUN encoding, never proxy wire framing.
+    pub fn enable_output_offload(&mut self) { self.output_offload = true; }
     pub fn split(self) -> (SplitRead, SplitWrite) {
         let read = SplitRead { recv: self.inbound };
         let write = SplitWrite {
-            send: self.outbound,
+            send: self.outbound, output_offload: self.output_offload,
         };
         (read, write)
     }
@@ -205,6 +131,7 @@ pub struct UdpSendResult {
 #[derive(Clone)]
 pub struct SplitWrite {
     send: mpsc::Sender<Packet>,
+    output_offload: bool,
 }
 
 impl SplitWrite {
@@ -212,7 +139,7 @@ impl SplitWrite {
     /// The async signature is retained for compatibility and does not yield.
     /// A closed outbound channel returns `io::ErrorKind::BrokenPipe`.
     pub async fn send(&mut self, packet: UdpPacket) -> io::Result<()> {
-        let packet = encode_packet(&packet)?;
+        let packet = if self.output_offload { packet.into_parts(None, true)? } else { packet.encode()? };
         match self.send.try_send(packet) {
             Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => Ok(()),
             Err(mpsc::error::TrySendError::Closed(_)) => {
@@ -247,7 +174,10 @@ impl SplitWrite {
                     }
                 },
             };
-            match encode_packet(packet) {
+            let encoded = if self.output_offload {
+                UdpPacket::from((packet.data.clone(), packet.local_addr, packet.remote_addr)).into_parts(None, true)
+            } else { packet.encode() };
+            match encoded {
                 Ok(packet) => { permit.send(packet); result.sent += 1; }
                 Err(error) => { result.error = Some(error); break; }
             }
@@ -257,7 +187,7 @@ impl SplitWrite {
 
 }
 
-fn encode_packet(packet: &UdpPacket) -> Result<Packet, std::io::Error> {
+fn encode_header(packet: &UdpPacket, segmentation: Option<u16>, partial: bool) -> io::Result<([u8; 48], usize)> {
     let payload = packet.data.data();
     let is_v4 = match (&packet.local_addr, &packet.remote_addr) {
         (SocketAddr::V4(_), SocketAddr::V4(_)) => true,
@@ -270,6 +200,10 @@ fn encode_packet(packet: &UdpPacket) -> Result<Packet, std::io::Error> {
         }
     };
 
+    if let Some(size) = segmentation && (size == 0 || payload.len() <= usize::from(size)
+        || payload.len().div_ceil(usize::from(size)) > 128) {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid UDP segmentation size"));
+    }
     let ip_hdr_len = if is_v4 { 20 } else { 40 };
     let udp_hdr_len = 8;
     let total_len = ip_hdr_len + udp_hdr_len + payload.len();
@@ -281,7 +215,7 @@ fn encode_packet(packet: &UdpPacket) -> Result<Packet, std::io::Error> {
         ));
     }
 
-    let mut buf = BytesMut::with_capacity(total_len);
+    let mut header = [0u8; 48];
 
     if is_v4 {
         let SocketAddr::V4(src) = packet.local_addr else {
@@ -311,17 +245,18 @@ fn encode_packet(packet: &UdpPacket) -> Result<Packet, std::io::Error> {
         udp_hdr[0..2].copy_from_slice(&src.port().to_be_bytes());
         udp_hdr[2..4].copy_from_slice(&dst.port().to_be_bytes());
         udp_hdr[4..6].copy_from_slice(&udp_len.to_be_bytes());
-        let udp_csum = compute_udp_checksum_v4(
+        let udp_csum = if segmentation.is_some() || partial {
+            checksum::pseudo_header(&IpAddress::from(*src.ip()), &IpAddress::from(*dst.ip()), IpProtocol::Udp, u32::from(udp_len))
+        } else { compute_udp_checksum_v4(
             &src.ip().octets(),
             &dst.ip().octets(),
             &udp_hdr[..6],
             payload,
-        );
+        ) };
         udp_hdr[6..8].copy_from_slice(&udp_csum.to_be_bytes());
 
-        buf.extend_from_slice(&ip_hdr);
-        buf.extend_from_slice(&udp_hdr);
-        buf.extend_from_slice(payload);
+        header[..ip_hdr_len].copy_from_slice(&ip_hdr);
+        header[ip_hdr_len..ip_hdr_len + 8].copy_from_slice(&udp_hdr);
     } else {
         let SocketAddr::V6(src) = packet.local_addr else {
             unreachable!()
@@ -345,20 +280,28 @@ fn encode_packet(packet: &UdpPacket) -> Result<Packet, std::io::Error> {
         udp_hdr[0..2].copy_from_slice(&src.port().to_be_bytes());
         udp_hdr[2..4].copy_from_slice(&dst.port().to_be_bytes());
         udp_hdr[4..6].copy_from_slice(&udp_len.to_be_bytes());
-        let udp_csum = compute_udp_checksum_v6(
+        let udp_csum = if segmentation.is_some() || partial {
+            checksum::pseudo_header(&IpAddress::from(*src.ip()), &IpAddress::from(*dst.ip()), IpProtocol::Udp, u32::from(udp_len))
+        } else { compute_udp_checksum_v6(
             &src.ip().octets(),
             &dst.ip().octets(),
             &udp_hdr[..6],
             payload,
-        );
+        ) };
         udp_hdr[6..8].copy_from_slice(&udp_csum.to_be_bytes());
 
-        buf.extend_from_slice(&ip_hdr);
-        buf.extend_from_slice(&udp_hdr);
-        buf.extend_from_slice(payload);
+        header[..ip_hdr_len].copy_from_slice(&ip_hdr);
+        header[ip_hdr_len..ip_hdr_len + 8].copy_from_slice(&udp_hdr);
     }
 
-    Ok(Packet::new(buf.freeze()))
+    Ok((header, ip_hdr_len + 8))
+}
+fn encode_packet(packet: &UdpPacket, segmentation: Option<u16>) -> io::Result<Packet> {
+    let (header, length) = encode_header(packet, segmentation, false)?;
+    let mut bytes = BytesMut::with_capacity(length + packet.data.data().len());
+    bytes.extend_from_slice(&header[..length]); bytes.extend_from_slice(packet.data.data());
+    let packet = Packet::new(bytes.freeze());
+    Ok(match segmentation { Some(size) => packet.with_udp_segmentation(size), None => packet })
 }
 
 fn compute_ipv4_checksum(header: &[u8]) -> u16 {
@@ -464,7 +407,7 @@ mod batch_tests {
             let source: SocketAddr = source.parse().unwrap();
             let target: SocketAddr = target.parse().unwrap();
             let (send, mut receive) = mpsc::channel(4);
-            let mut writer = SplitWrite { send };
+            let mut writer = SplitWrite { send, output_offload: false };
             let packets = [
                 UdpPacket::from((Bytes::new(), source, target)),
                 UdpPacket::from((Bytes::from_static(b"odd"), source, target)),
@@ -488,7 +431,7 @@ mod batch_tests {
     #[tokio::test]
     async fn batches_keep_packet_capacity_and_do_not_block_on_full_queue() {
         let (send, mut receive) = mpsc::channel(2);
-        let mut writer = SplitWrite { send };
+        let mut writer = SplitWrite { send, output_offload: false };
         let packets: Vec<_> = (0..4).map(|i| UdpPacket::from((
             Bytes::from(vec![i]), "127.0.0.1:1".parse().unwrap(), "127.0.0.2:2".parse().unwrap(),
         ))).collect();
@@ -512,7 +455,7 @@ mod batch_tests {
         let (send, mut receive) = mpsc::channel(4);
         let competing = send.clone();
         let _held = competing.try_reserve_many(2).unwrap();
-        let mut writer = SplitWrite { send };
+        let mut writer = SplitWrite { send, output_offload: false };
         let packets: Vec<_> = (0..4).map(|i| UdpPacket::from((
             Bytes::from(vec![i]), "127.0.0.1:1".parse().unwrap(), "127.0.0.2:2".parse().unwrap(),
         ))).collect();
@@ -530,7 +473,7 @@ mod batch_tests {
     #[tokio::test]
     async fn invalid_packet_does_not_discard_valid_batch_suffix() {
         let (send, mut receive) = mpsc::channel(2);
-        let mut writer = SplitWrite { send };
+        let mut writer = SplitWrite { send, output_offload: false };
         let valid = || UdpPacket::from((Bytes::from_static(b"ok"),
             "127.0.0.1:1".parse().unwrap(), "127.0.0.2:2".parse().unwrap()));
         let invalid = UdpPacket::from((Bytes::new(),
@@ -553,7 +496,7 @@ mod batch_tests {
         let (source, target) = if ipv6 { ("[::1]:1", "[::2]:2") }
             else { ("127.0.0.1:1", "127.0.0.2:2") };
         encode_packet(&UdpPacket::from((Bytes::from_static(b"payload"),
-            source.parse().unwrap(), target.parse().unwrap()))).unwrap().data().to_vec()
+            source.parse().unwrap(), target.parse().unwrap())), None).unwrap().data().to_vec()
     }
 
     #[test]

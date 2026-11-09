@@ -86,19 +86,18 @@ pub(super) async fn run<S: Stream<Item = UdpPacket> + Unpin>(
                 Some(packet) => {
                     let started = Instant::now();
                     routes.packet(packet);
-                    tokio::task::consume_budget().await;
                     for _ in 1..PACKET_BATCH_LIMIT {
                         if started.elapsed() >= PACKET_BATCH_TIME { break; }
                         let next = poll_fn(|cx| Poll::Ready(PacketPin::new(&mut incoming).poll_next(cx))).await;
                         match next {
                             Poll::Ready(Some(packet)) => {
                                 routes.packet(packet);
-                                tokio::task::consume_budget().await;
                             },
                             Poll::Ready(None) => return,
                             Poll::Pending => break,
                         }
                     }
+                    tokio::task::consume_budget().await;
                 },
                 None => break,
             },

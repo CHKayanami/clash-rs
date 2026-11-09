@@ -8,6 +8,10 @@ pub(crate) mod native;
 pub(crate) mod pool;
 pub(crate) mod recv;
 mod resolve;
+#[cfg(any(target_os = "linux", test))]
+mod segment_plan;
+#[cfg(target_os = "linux")]
+mod offload;
 
 use crate::{
     app::dns::ThreadSafeDNSResolver,

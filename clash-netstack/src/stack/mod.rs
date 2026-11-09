@@ -1,8 +1,11 @@
+mod headers;
+pub use headers::PacketHeaders;
 use bytes::Bytes;
 use futures::future::poll_fn;
 use std::io;
 use futures::Stream;
 use log::debug;
+use tracing::{enabled, Level};
 use smoltcp::wire::IpProtocol;
 use std::{
     pin::Pin,
@@ -15,6 +18,7 @@ use crate::{
     link::debug::trace_ip_packet,
     link::packet::IpPacket,
     link::icmp::IcmpResponder,
+    link::output::Output,
     tcp::listener::TcpListener,
 };
 
@@ -55,53 +59,8 @@ pub struct NetStack {
     mtu: usize,
 }
 
-#[derive(Debug, Clone)]
-pub struct Packet {
-    data: Bytes,
-}
-
-impl Packet {
-    #[inline]
-    pub fn new(data: impl Into<Bytes>) -> Self {
-        Packet {
-            data: data.into(),
-        }
-    }
-
-    #[inline]
-    pub fn data(&self) -> &[u8] {
-        self.data.as_ref()
-    }
-
-    #[inline]
-    pub fn into_bytes(self) -> Bytes {
-        self.data
-    }
-}
-
-impl From<Bytes> for Packet {
-    fn from(data: Bytes) -> Self {
-        Packet::new(data)
-    }
-}
-
-impl From<Vec<u8>> for Packet {
-    fn from(data: Vec<u8>) -> Self {
-        Packet::new(Bytes::from(data))
-    }
-}
-
-impl From<&'static [u8]> for Packet {
-    fn from(data: &'static [u8]) -> Self {
-        Packet::new(Bytes::from_static(data))
-    }
-}
-
-impl From<bytes::BytesMut> for Packet {
-    fn from(data: bytes::BytesMut) -> Self {
-        Packet::new(data.freeze())
-    }
-}
+mod packet;
+pub use packet::Packet;
 
 impl NetStack {
     /// Returns the NetStack instance, a TcpListener and a UdpSocket
@@ -208,7 +167,26 @@ impl StackSplitSink {
         self.flush_pending()
     }
 
+    /// Submit a non-UDP packet whose IP header was checked by the caller.
+    /// `protocol` must come from this same packet, without intervening mutation.
+    pub fn send_checked_packet(&mut self, item: Packet, protocol: IpProtocol) -> io::Result<()> {
+        self.flush_pending()?;
+        self.enqueue_protocol(item, protocol)?;
+        self.flush_pending()
+    }
+
+    /// A logical datagram already validated by ingress parsing or GSO decoding.
+    /// Admission keeps the existing bounded drop-on-full queue policy.
+    pub fn send_udp_payload(&mut self, packet: crate::udp::socket::UdpPacket) -> io::Result<()> {
+        self.flush_pending()?;
+        self.packet_container = Some(PendingInbound::Udp(packet));
+        self.flush_pending()
+    }
     fn enqueue_packet(&mut self, item: Packet) -> io::Result<()> {
+        if item.udp_segmentation().is_some() {
+            return Err(io::Error::new(io::ErrorKind::Unsupported,
+                "UDP aggregates must be materialized before stack admission"));
+        }
         if item.data().is_empty() {
             return Ok(());
         }
@@ -219,7 +197,7 @@ impl StackSplitSink {
         if let Some((src_addr, dst_addr, payload_range)) =
             crate::udp::socket::parse_udp_packet(item.data())
         {
-            let payload = item.into_bytes().slice(payload_range);
+            let payload = item.into_payload(payload_range);
             self.packet_container = Some(PendingInbound::Udp(
                 crate::udp::socket::UdpPacket {
                     data: Packet::new(payload),
@@ -240,6 +218,10 @@ impl StackSplitSink {
         };
 
         let protocol = packet.protocol();
+        self.enqueue_protocol(item, protocol)
+    }
+
+    fn enqueue_protocol(&mut self, item: Packet, protocol: IpProtocol) -> io::Result<()> {
         if !self.enable_icmp && matches!(protocol, IpProtocol::Icmp | IpProtocol::Icmpv6) {
             return Ok(());
         }
@@ -248,8 +230,8 @@ impl StackSplitSink {
             self.packet_container = Some(PendingInbound::Tcp(item));
         } else if matches!(protocol, IpProtocol::Icmp | IpProtocol::Icmpv6) {
             let this = self;
-            let outbound = this.icmp_outbound.as_ref().expect("ICMP output without TCP");
-            this.icmp.get_or_insert_with(|| Box::new(IcmpResponder::new(outbound, this.mtu))).respond(item, outbound);
+            let mut outbound = Output::Channel(this.icmp_outbound.as_ref().expect("ICMP output without TCP").clone());
+            this.icmp.get_or_insert_with(|| Box::new(IcmpResponder::new(&mut outbound, this.mtu))).respond(item, &mut outbound);
         } else {
             debug!("tun IP packet ignored (protocol: {protocol:?})");
         }
@@ -365,7 +347,7 @@ impl futures::Stream for StackSplitStream {
         use futures::StreamExt;
         self.inner.poll_next_unpin(cx).map(|opt| {
             opt.map(|packet| {
-                trace_ip_packet("tun reply packet", packet.data());
+                if enabled!(Level::TRACE) { trace_ip_packet("tun reply packet", packet.data()); }
                 Ok(packet)
             })
         })
@@ -374,3 +356,21 @@ impl futures::Stream for StackSplitStream {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod payload_tests {
+    use super::*;
+
+    #[test]
+    fn payload_compaction_depends_on_retained_storage_not_just_frame_length() {
+        let packet = Packet::new(vec![0x5a; 1500]);
+        let pointer = packet.data()[28..].as_ptr();
+        let payload = packet.into_payload(28..1500);
+        assert_eq!(payload.as_ptr(), pointer, "small allocations should stay shared");
+        let packet = Packet::new(vec![0x5a; 1500]).with_backing_capacity(65535);
+        let pointer = packet.data()[28..].as_ptr();
+        let payload = packet.into_payload(28..1500);
+        assert_ne!(payload.as_ptr(), pointer, "small datagrams must release large receive storage");
+        assert_eq!(payload.len(), 1472);
+    }
+}

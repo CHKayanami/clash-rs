@@ -5,6 +5,7 @@ use smoltcp::{time::Instant, wire::{IpAddress, IpCidr}};
 pub struct Context {
     now: Instant,
     mtu: usize,
+    tcp_gso: bool,
     addresses: Vec<IpCidr>,
     any_ip: bool,
 }
@@ -13,12 +14,14 @@ impl Context {
     /// Create an IP-only transparent endpoint context. Passive connections may
     /// use any unicast local address; active opens need an explicit source.
     pub fn new(mtu: usize) -> Self {
-        Self { now: Instant::ZERO, mtu, addresses: Vec::new(), any_ip: true }
+        Self { now: Instant::ZERO, mtu, tcp_gso: false, addresses: Vec::new(), any_ip: true }
     }
 
     pub(crate) fn now(&self) -> Instant { self.now }
     pub(crate) fn set_now(&mut self, now: Instant) { self.now = now; }
     pub(crate) fn ip_mtu(&self) -> usize { self.mtu }
+    pub(crate) fn tcp_gso(&self) -> bool { self.tcp_gso }
+    pub(crate) fn enable_tcp_gso(&mut self) { self.tcp_gso = true; }
     #[cfg(not(test))]
     pub(crate) fn random_u32(&mut self) -> u32 { rand::random() }
 

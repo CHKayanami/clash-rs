@@ -105,6 +105,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "ahash"
+version = "0.8.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5a15f179cd60c4584b8a8c596927aadc462e27f2ca70c04e0071964a73ba7a75"
+dependencies = [
+ "cfg-if",
+ "getrandom 0.3.4",
+ "once_cell",
+ "version_check",
+ "zerocopy",
+]
+
+[[package]]
 name = "aho-corasick"
 version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -11011,12 +11024,12 @@ dependencies = [
 
 [[package]]
 name = "tun-rs"
-version = "2.8.11"
+version = "2.8.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "19e3459c60bb1cd4a5969fced4299be335b3e3169d8cb3466ffe23da56eeeeb4"
+checksum = "d7300c968315399fcef3b386a0690e9d772cc4005e92d3d6be1dec6774fb98fd"
 dependencies = [
+ "ahash",
  "blocking",
- "byteorder",
  "bytes",
  "encoding_rs",
  "futures",

@@ -40,7 +40,7 @@ async fn ordinary_mode_disables_both_native_sides_and_preserves_framing() {
     assert_eq!(timeout(Duration::from_secs(1), reader.recv(&device, &mut packets))
         .await.unwrap().unwrap(), 1);
     assert_eq!(&packets[0][..], &payload);
-    writer.send(&device, &[Bytes::copy_from_slice(&payload)]).await.unwrap();
+    writer.send(&device, &mut [Bytes::copy_from_slice(&payload)]).await.unwrap();
     peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
     let mut frame = [0; 128];
     let size = peer.recv(&mut frame).unwrap();
@@ -106,9 +106,9 @@ async fn invalid_send_packets_preserve_valid_neighbors_in_both_modes() {
         let mut writer = Writer::new(&reader, true).unwrap();
         let before = Bytes::from_static(b"\x45before");
         let after = Bytes::from_static(b"\x60after");
-        let packets = [Bytes::new(), before.clone(), Bytes::from_static(b"\x30bad"),
+        let mut packets = [Bytes::new(), before.clone(), Bytes::from_static(b"\x30bad"),
             after.clone(), Bytes::new()];
-        timeout(Duration::from_secs(1), writer.send(&device, &packets)).await.unwrap().unwrap();
+        timeout(Duration::from_secs(1), writer.send(&device, &mut packets)).await.unwrap().unwrap();
         peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
         let mut frame = [0; 64];
         for (family, expected) in [(libc::AF_INET, before), (libc::AF_INET6, after)] {
@@ -116,8 +116,63 @@ async fn invalid_send_packets_preserve_valid_neighbors_in_both_modes() {
             assert_eq!(&frame[..4], &(family as u32).to_be_bytes());
             assert_eq!(&frame[4..count], expected.as_ref());
         }
-        writer.send(&device, &[Bytes::new(), Bytes::from_static(b"\x10")]).await.unwrap();
+        writer.send(&device, &mut [Bytes::new(), Bytes::from_static(b"\x10")]).await.unwrap();
         peer.set_nonblocking(true).unwrap();
         assert_eq!(peer.recv(&mut frame).unwrap_err().kind(), io::ErrorKind::WouldBlock);
+    }
+}
+
+#[tokio::test]
+async fn combined_receive_keeps_its_waiter_between_polls() {
+    use std::sync::Arc;
+    use futures::future::poll_fn;
+    use crate::proxy::tun::device_loop::PacketIo;
+
+    let (peer, device, reader) = pair(64, false);
+    let writer = Writer::new(&reader, true).unwrap();
+    let mut io = DeviceIo::new(Arc::new(device), reader, writer, false);
+    let sender = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        send(&peer, &[0x45; 40]);
+    });
+    let mut packets = Vec::new();
+    let count = timeout(Duration::from_secs(2), poll_fn(|cx| io.poll_receive(cx, &mut packets)))
+        .await.unwrap().unwrap();
+    assert_eq!(count, 1);
+    assert_eq!(&packets[0][..], &[0x45; 40]);
+    sender.await.unwrap();
+}
+
+#[tokio::test]
+async fn inline_writer_preserves_order_and_holds_credits_through_completion() {
+    use std::sync::Arc;
+    use futures::future::poll_fn;
+    use tokio::sync::Semaphore;
+    use crate::proxy::tun::device_loop::PacketIo;
+
+    for native in [false, true] {
+        let (peer, device, reader) = pair(1500, native);
+        let writer = Writer::new(&reader, true).unwrap();
+        let mut io = DeviceIo::new(Arc::new(device), reader, writer, false);
+        let budget = Arc::new(Semaphore::new(1));
+        let mut packets = vec![Packet::new(&b"\x45first"[..]), Packet::new(&b"\x60second"[..])];
+        let mut credits = vec![budget.clone().acquire_owned().await.unwrap()];
+        timeout(Duration::from_secs(1), poll_fn(|cx| io.poll_send(cx, &mut packets, &mut credits)))
+            .await.unwrap().unwrap();
+        assert_eq!(budget.available_permits(), 0);
+        peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        let mut frame = [0; 64];
+        for expected in [&b"\x45first"[..], &b"\x60second"[..]] {
+            let count = peer.recv(&mut frame).unwrap();
+            assert_eq!(&frame[4..count], expected);
+        }
+        packets.clear();
+        credits.clear();
+        assert_eq!(budget.available_permits(), 1);
+        // A completed operation can be replaced without replaying its batch.
+        packets.push(Packet::new(&b"\x45next"[..]));
+        poll_fn(|cx| io.poll_send(cx, &mut packets, &mut credits)).await.unwrap();
+        let count = peer.recv(&mut frame).unwrap();
+        assert_eq!(&frame[4..count], b"\x45next");
     }
 }

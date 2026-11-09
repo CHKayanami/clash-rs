@@ -1,6 +1,6 @@
 use smoltcp::{iface::{Config, Interface, SocketSet}, phy::Device, time::Instant,
     wire::{HardwareAddress, IpCidr, Ipv4Address, Ipv6Address}};
-use tokio::sync::mpsc;
+use crate::link::output::Output;
 
 use crate::{Packet, link::device::SinglePacketDevice};
 
@@ -47,12 +47,12 @@ pub(crate) struct IcmpResponder {
 }
 
 impl IcmpResponder {
-    pub(crate) fn new(outbound: &mpsc::Sender<Packet>, mtu: usize) -> Self {
+    pub(crate) fn new(outbound: &mut Output, mtu: usize) -> Self {
         let mut device = SinglePacketDevice::new(None, outbound, mtu);
         Self { iface: new_interface(&mut device), sockets: SocketSet::new(vec![]), mtu }
     }
 
-    pub(crate) fn respond(&mut self, packet: Packet, outbound: &mpsc::Sender<Packet>) {
+    pub(crate) fn respond(&mut self, packet: Packet, outbound: &mut Output) {
         let mut device = SinglePacketDevice::new(Some(packet), outbound, self.mtu);
         self.iface.poll(Instant::now(), &mut device, &mut self.sockets);
     }
