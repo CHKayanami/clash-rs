@@ -1,11 +1,8 @@
 use crate::{Error, config::config::TunConfig};
-use url::Url;
+use crate::config::internal::tun::{TunDevice, parse_device_id};
 
 pub(super) fn validate(cfg: &TunConfig) -> Result<u16, Error> {
-    let device = Url::parse(&cfg.device_id)
-        .map_err(|e| Error::InvalidConfig(format!("mobile TUN device: {e}")))?;
-    let fd = device.host_str().and_then(|host| host.parse::<i32>().ok());
-    if device.scheme() != "fd" || fd.is_none_or(|fd| fd < 0) {
+    if !matches!(parse_device_id(&cfg.device_id)?, TunDevice::FileDescriptor(_)) {
         return Err(Error::InvalidConfig("mobile TUN requires a valid fd:// descriptor".into()));
     }
     if cfg.route_all || cfg.auto_detect_interface || !cfg.routes.is_empty()

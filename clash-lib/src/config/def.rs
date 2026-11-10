@@ -232,6 +232,13 @@ pub struct TunConfig {
     #[serde(alias = "auto-route")]
     #[serde(default)]
     pub route_all: bool,
+    /// Automatically redirect Linux traffic into TUN using nftables.
+    #[serde(default)]
+    pub auto_redirect: bool,
+    #[serde(default)]
+    pub route_address_set: Vec<String>,
+    #[serde(default)]
+    pub route_exclude_address_set: Vec<String>,
     #[serde(alias = "auto-detect-interface")]
     pub auto_detect_interface: Option<bool>,
     pub mtu: Option<u16>,

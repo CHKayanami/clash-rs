@@ -2,11 +2,11 @@ use std::sync::Arc;
 #[cfg(not(target_os = "android"))]
 use std::time::Duration;
 
+use tokio::{sync::Mutex, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 use tracing::debug;
-use url::Url;
 use tun_rs::AsyncDevice;
 use clash_netstack::{NetStack, TcpDriver};
 
@@ -16,13 +16,19 @@ use crate::{
         dispatcher::Dispatcher,
         dns::ThreadSafeDNSResolver,
     },
-    config::config::TunConfig,
+    config::{config::TunConfig, internal::tun::{TunDevice, parse_device_id}},
     proxy::tun::datagram::handle_inbound_datagram,
     runner::{AsyncService, ServiceContext},
 };
 use async_trait::async_trait;
 #[cfg(any(target_os = "android", target_os = "linux"))]
 use super::icmp;
+#[cfg(target_os = "linux")]
+use super::auto_redirect::{AutoRedirect, address_sets::RouteAddressSets, tcp as redirect_tcp};
+#[cfg(target_os = "linux")]
+use std::collections::HashMap;
+#[cfg(target_os = "linux")]
+use crate::app::remote_content_manager::providers::rule_provider::ThreadSafeRuleProvider;
 use super::{
     device_io::{self, DeviceIo},
     device_loop::{DeviceLoop, Protocols},
@@ -56,10 +62,13 @@ struct TunInitializationConfig {
 }
 
 pub struct TunRunner {
+    #[cfg(target_os = "linux")]
+    address_sets: RouteAddressSets,
     cfg: TunConfig,
     dispatcher: Arc<Dispatcher>,
     resolver: ThreadSafeDNSResolver,
     cancellation_token: CancellationToken,
+    pipeline_task: Mutex<Option<JoinHandle<Result<(), Error>>>>,
 }
 
 impl TunRunner {
@@ -68,75 +77,41 @@ impl TunRunner {
         dispatcher: Arc<Dispatcher>,
         resolver: ThreadSafeDNSResolver,
         cancellation_token: Option<CancellationToken>,
+        #[cfg(target_os = "linux")] rule_providers: &HashMap<String, ThreadSafeRuleProvider>,
     ) -> Result<TunRunner, Error> {
         Ok(Self {
+            #[cfg(target_os = "linux")]
+            address_sets: RouteAddressSets::new(&cfg, rule_providers)?,
             cfg,
             dispatcher,
             resolver,
             cancellation_token: cancellation_token.unwrap_or_default(),
+            pipeline_task: Mutex::new(None),
         })
     }
 
     async fn new_internal(
         cfg: &TunConfig,
-    ) -> Result<AsyncDevice, Error> {
+    ) -> Result<(AsyncDevice, bool), Error> {
         #[cfg(target_os = "android")]
         super::mobile::validate(cfg)?;
         let mut tun_init_config = TunInitializationConfig::default();
-        match Url::parse(&cfg.device_id) {
-            Ok(u) => match u.scheme() {
-                "fd" => {
-                    let fd: i32 = u
-                        .host_str()
-                        .ok_or_else(|| Error::InvalidConfig("tun fd must be provided".into()))?
-                        .parse()
-                        .map_err(|x| Error::InvalidConfig(format!("tun fd {x}")))?;
-                    if fd < 0 {
-                        return Err(Error::InvalidConfig("tun fd must be nonnegative".into()));
-                    }
-                    tun_init_config.fd = Some(fd as u32);
-                }
-                "dev" => {
-                    let dev =
-                        u.host().expect("tun dev must be provided").to_string();
-                    if cfg!(target_os = "macos") && !dev.starts_with("utun") {
-                        warn!(
-                            "tun device id '{}' is not supported on macOS (must start with 'utun'), falling back to 'utun1989'",
-                            dev
-                        );
-                        tun_init_config.tun_name = Some("utun1989".to_string());
-                    } else {
-                        tun_init_config.tun_name = Some(dev);
-                    }
-                    #[cfg(target_os = "windows")]
-                    {
-                        let guid = u.query_pairs().find(|(k, _)| k == "guid");
-                        if let Some((_, v)) = guid {
-                            let guid = uuid::Uuid::parse_str(&v).map_err(|x| {
-                                Error::InvalidConfig(format!("invalid guid: {x}"))
-                            })?;
-                            tun_init_config.guid = Some(guid.as_u128());
-                        }
-                    }
-                }
-                _ => {
-                    return Err(Error::InvalidConfig(format!(
-                        "invalid device id: {}",
-                        cfg.device_id
-                    )));
-                }
-            },
-            Err(_) => {
-                let dev = cfg.device_id.clone();
-                if cfg!(target_os = "macos") && !dev.starts_with("utun") {
+        let device = parse_device_id(&cfg.device_id)?;
+        let manage_network = matches!(device, TunDevice::Interface { .. });
+        match device {
+            TunDevice::FileDescriptor(fd) => tun_init_config.fd = Some(fd),
+            TunDevice::Interface { name, #[cfg(windows)] guid } => {
+                if cfg!(target_os = "macos") && !name.starts_with("utun") {
                     warn!(
                         "tun device id '{}' is not supported on macOS (must start with 'utun'), falling back to 'utun1989'",
-                        dev
+                        name
                     );
                     tun_init_config.tun_name = Some("utun1989".to_string());
                 } else {
-                    tun_init_config.tun_name = Some(dev);
+                    tun_init_config.tun_name = Some(name);
                 }
+                #[cfg(windows)]
+                { tun_init_config.guid = guid; }
             }
         };
 
@@ -292,7 +267,11 @@ impl TunRunner {
 
                 info!("setting up routes for tun {}", &tun_name);
                 #[cfg(not(any(target_os = "macos", target_os = "android")))]
-                maybe_add_routes(cfg, &tun_name)?;
+                maybe_add_routes(cfg, &tun_name).inspect_err(|_| {
+                    if let Err(error) = routes::maybe_routes_clean_up(cfg) {
+                        warn!("failed to roll back TUN routes: {error}");
+                    }
+                })?;
 
                 dev
             }
@@ -304,19 +283,15 @@ impl TunRunner {
             }
         };
 
-        Ok(tun)
+        Ok((tun, manage_network))
     }
 
     pub fn shutdown(&self) {
         info!("shutting down tun runner");
         self.cancellation_token.cancel();
-        #[cfg(not(any(target_os = "macos", target_os = "android")))]
-        match routes::maybe_routes_clean_up(&self.cfg) {
-            Ok(_) => {}
-            Err(e) => {
-                error!("failed to clean up routes: {}", e);
-            }
-        }
+        // The pipeline owns external state and cleans nftables before routes.
+        // AsyncService::stop awaits it; this synchronous method only signals.
+
     }
 }
 
@@ -335,7 +310,7 @@ impl AsyncService for TunRunner {
         let dns_hijack = self.cfg.dns_hijack.clone();
         let cancellation_token = self.cancellation_token.clone();
 
-        let tun = TunRunner::new_internal(&cfg)
+        let (tun, manage_network) = TunRunner::new_internal(&cfg)
             .await
             .inspect_err(|e| match e {
                 Error::Io(e) => {
@@ -359,11 +334,16 @@ impl AsyncService for TunRunner {
         // or spawning the packet pipeline. Failure releases both listeners.
         let rollback_routes = || {
             #[cfg(not(any(target_os = "macos", target_os = "android")))]
-            if let Err(error) = routes::maybe_routes_clean_up(&cfg) {
-                warn!("failed to roll back TUN routes after initialization failure: {error}");
+            if manage_network {
+                if let Err(error) = routes::maybe_routes_clean_up(&cfg) {
+                    warn!("failed to roll back TUN routes after initialization failure: {error}");
+                }
             }
         };
         let listeners = TcpListeners::bind(&cfg).await.inspect_err(|_| rollback_routes())?;
+        #[cfg(target_os = "linux")]
+        let redirect_listener = redirect_tcp::bind(&cfg)
+            .inspect_err(|_| rollback_routes())?;
 
         #[cfg(target_os = "android")]
         let frame_size = usize::from(super::mobile::validate(&cfg).inspect_err(|_| rollback_routes())?);
@@ -395,13 +375,13 @@ impl AsyncService for TunRunner {
         // remains responsible for routes and DNS (e.g. NetworkExtension).
         let tun = Arc::new(tun);
         #[cfg(target_os = "macos")]
-        let platform = if !cfg.device_id.starts_with("fd://") || cfg.auto_detect_interface {
+        let platform = if manage_network || cfg.auto_detect_interface {
             Some(super::macos::start(cfg.clone(), tun.clone(),
-                !cfg.device_id.starts_with("fd://"), ctx, &cancellation_token).await?)
+                manage_network, ctx, &cancellation_token).await?)
         } else { None };
 
         let (device_reader, device_writer) = device_io::split(
-            &tun, frame_size, !cfg.device_id.starts_with("fd://"),
+            &tun, frame_size, manage_network,
         ).inspect_err(|_| rollback_routes())?;
         #[cfg(target_os = "linux")]
         let device_writer = {
@@ -409,6 +389,26 @@ impl AsyncService for TunRunner {
             if !listeners.system && tun.tcp_gso() { writer.enable_native_offload(); }
             writer
         };
+        #[cfg(target_os = "linux")]
+        let address_sets = self.address_sets.clone();
+        #[cfg(target_os = "linux")]
+        let address_set_updates = address_sets.subscribe();
+        #[cfg(target_os = "linux")]
+        let auto_redirect = if cfg.auto_redirect {
+            let name = tun.name().inspect_err(|_| rollback_routes())?;
+            let port = redirect_listener.as_ref()
+                .map(|listener| listener.local_addr().map(|addr| addr.port()))
+                .transpose().inspect_err(|_| rollback_routes())?;
+            let cfg = cfg.clone();
+            let sets = address_sets.clone();
+            tokio::task::spawn_blocking(move || {
+                AutoRedirect::start(&sets.snapshot(&cfg), &name, port)
+                    .map(|guard| guard.map(Arc::new))
+            }).await.map_err(|error| Error::Operation(format!(
+                "TUN auto-redirect initialization task failed: {error}",
+            ))).inspect_err(|_| rollback_routes())?
+                .inspect_err(|_| rollback_routes())?
+        } else { None };
         let (stack_sink, stack_stream) = stack.split();
 
         #[cfg(not(any(target_os = "macos", target_os = "android")))]
@@ -440,10 +440,21 @@ impl AsyncService for TunRunner {
         }
 
         let lifecycle_token = cancellation_token.clone();
-        ctx.spawn_critical_with_token("tun_packet_pipeline", lifecycle_token, async move {
+        let task = ctx.spawn_critical_with_token("tun_packet_pipeline", lifecycle_token, async move {
             #[cfg(target_os = "macos")]
             let _platform = platform;
+            #[cfg(target_os = "linux")]
+            let auto_redirect_guard = auto_redirect.clone();
             let mut pipeline = PacketPipeline::default();
+            #[cfg(target_os = "linux")]
+            if let Some(guard) = auto_redirect
+                && (!cfg.route_address_set.is_empty() || !cfg.route_exclude_address_set.is_empty())
+            {
+                let cfg = cfg.clone();
+                pipeline.spawn("route_address_sets", async move {
+                    address_sets.run(cfg, guard, address_set_updates).await
+                });
+            }
             #[cfg(any(target_os = "linux", target_os = "android", test))]
             let (_tun_tx, tun_rx) = packet_queue::channel();
             #[cfg(not(any(target_os = "linux", target_os = "android", test)))]
@@ -511,6 +522,13 @@ impl AsyncService for TunRunner {
                 dispatcher: dispatcher.clone(), resolver: resolver.clone(), so_mark,
                 dns_hijack: dns_hijack.clone(), strict_route, exclude_routes: exclude_routes.clone(),
             });
+            #[cfg(target_os = "linux")]
+            if let Some(listener) = redirect_listener {
+                let context = tcp_context.clone();
+                pipeline.spawn("auto_redirect_tcp", async move {
+                    redirect_tcp::run(listener, context).await
+                });
+            }
             pipeline.spawn("tcp", async move {
                 listeners.run(tcp_listener, system_nat.clone(), tcp_context, enable_tcp).await
             });
@@ -536,21 +554,156 @@ impl AsyncService for TunRunner {
             if let Err(ref e) = run_res {
                 error!("tun runner error: {}", e);
             }
+            #[cfg(target_os = "linux")]
+            if let Some(guard) = auto_redirect_guard {
+                match tokio::task::spawn_blocking(move || guard.close()).await {
+                    Ok(Ok(())) => {}
+                    // Keep the policy/blackhole rules if nft removal failed.
+                    // Removing them while packets are still marked can leak.
+                    Ok(Err(error)) => {
+                        warn!("failed to remove TUN nftables rules; retaining policy routes: {error}");
+                        return Err(error.into());
+                    }
+                    Err(error) => {
+                        warn!("TUN nftables cleanup task failed; retaining policy routes: {error}");
+                        return Err(Error::Operation(format!("TUN auto-redirect cleanup task failed: {error}")));
+                    }
+                }
+            }
             #[cfg(not(any(target_os = "macos", target_os = "android")))]
-            if let Err(e) = routes::maybe_routes_clean_up(&cfg) {
-                warn!("error cleaning up routes during tun runner shutdown: {}", e);
+            if manage_network {
+                if let Err(e) = routes::maybe_routes_clean_up(&cfg) {
+                    warn!("error cleaning up routes during tun runner shutdown: {}", e);
+                }
             }
             // Keep the device alive until children stop and routes are cleaned up.
             drop(tun);
             info!("tun runner exited");
             run_res
         });
+        *self.pipeline_task.lock().await = Some(task);
 
         Ok(())
     }
 
     async fn stop(&self) -> Result<(), Error> {
         self.shutdown();
-        Ok(())
+        // Keep the handle in the slot while awaiting it: a cancelled stop
+        // future must not orphan cleanup, and concurrent stops must also wait.
+        let mut task = self.pipeline_task.lock().await;
+        let result = if let Some(handle) = task.as_mut() {
+            handle.await.unwrap_or_else(|error| Err(Error::Operation(format!(
+                "TUN pipeline shutdown task failed: {error}",
+            ))))
+        } else { Ok(()) };
+        *task = None;
+        result
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod route_rollback_tests {
+    use std::process::Command;
+    use super::*;
+
+    fn ip(args: &[&str]) -> String {
+        let output = Command::new("ip").args(args).output().unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        String::from_utf8(output.stdout).unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "requires TUN and an isolated network namespace"]
+    async fn tun_route_setup_failure_rolls_back_both_modes() {
+        ip(&["link", "add", "wan-test", "type", "dummy"]);
+        ip(&["link", "set", "wan-test", "up"]);
+        ip(&["-6", "route", "add", "default", "dev", "wan-test", "table", "2022"]);
+        ip(&["-4", "route", "add", "198.51.100.0/24", "dev", "wan-test", "table", "2022"]);
+        // A persistent device keeps kernel routes alive when initialization's
+        // descriptor closes, so the test detects missing explicit rollback.
+        ip(&["tuntap", "add", "dev", "tun-test", "mode", "tun"]);
+        ip(&["addr", "add", "198.18.0.1/30", "dev", "tun-test"]);
+        ip(&["-6", "addr", "add", "fd00::1/64", "dev", "tun-test", "nodad"]);
+        ip(&["link", "set", "tun-test", "up"]);
+        for auto_redirect in [false, true] {
+            let cfg = TunConfig { enable: true, route_all: true, auto_redirect,
+                device_id: "tun-test".into(), route_table: 2022,
+                gateway: "198.18.0.1/30".parse().unwrap(),
+                gateway_v6: Some("fd00::1/64".parse().unwrap()), ..Default::default() };
+            let error = TunRunner::new_internal(&cfg).await.err().unwrap().to_string();
+            assert!(error.contains("default route") && error.contains("expected"), "{error}");
+            let remaining = ip(&["-4", "route", "show", "table", "2022"]);
+            assert!(!remaining.contains("default"));
+            assert!(remaining.contains("198.51.100.0/24"));
+            assert!(ip(&["-6", "route", "show", "table", "2022"]).contains("wan-test"));
+            assert!(!ip(&["rule", "show"]).contains("9000:"));
+        }
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod shutdown_tests {
+    use std::{collections::HashMap, process::Command, sync::Arc, time::Duration};
+    use tokio::{sync::oneshot, time::timeout};
+    use tun_rs::DeviceBuilder;
+    use crate::{
+        app::{dispatcher::StatisticsManager, dns::MockClashResolver,
+            outbound::manager::OutboundManager, router::Router},
+        config::def::RunMode,
+    };
+    use super::*;
+
+    fn rules() -> String {
+        let output = Command::new("ip").args(["rule", "show"]).output().unwrap();
+        assert!(output.status.success());
+        String::from_utf8(output.stdout).unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "requires TUN and an isolated network namespace"]
+    async fn auto_redirect_shutdown_waits_for_nft_before_route_cleanup() {
+        let _tun = DeviceBuilder::new().name("tun0").ipv4("198.18.0.1", 24, None)
+            .enable(true).offload(false).build_async().unwrap();
+        let cfg = TunConfig { enable: true, route_all: true, auto_redirect: true,
+            strict_route: true, device_id: "tun0".into(), route_table: 2022,
+            ..Default::default() };
+        routes::maybe_add_routes(&cfg, "tun0").unwrap();
+        let guard = AutoRedirect::start(&cfg, "tun0", None).unwrap().unwrap();
+        let resolver: ThreadSafeDNSResolver = Arc::new(MockClashResolver::new());
+        let router = Arc::new(Router::new(Vec::new(), HashMap::new(), resolver.clone(),
+            None, None, None, None, None, String::new()).await.unwrap());
+        let dispatcher = Arc::new(Dispatcher::new(
+            Arc::new(OutboundManager::new_for_test(HashMap::new())), router,
+            resolver.clone(), RunMode::Direct, StatisticsManager::new(), None, None, true,
+        ));
+        let runner = TunRunner::new(cfg.clone(), dispatcher, resolver, None, &HashMap::new()).unwrap();
+        let token = runner.cancellation_token.clone();
+        let (started_tx, started_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            token.cancelled().await;
+            started_tx.send(()).unwrap();
+            release_rx.await.unwrap();
+            tokio::task::spawn_blocking(move || {
+                guard.close()?;
+                routes::maybe_routes_clean_up(&cfg)
+            }).await.unwrap().map_err(Error::Io)
+        });
+        *runner.pipeline_task.lock().await = Some(task);
+        runner.shutdown();
+        started_rx.await.unwrap();
+        // Hold pipeline drain open: synchronous shutdown must not remove the
+        // lookup or strict blackhole while nftables can still mark packets.
+        let before = rules();
+        assert!(before.contains("0x163/0x167"));
+        assert!(before.contains("9001:"));
+        // Cancelling a stop future must leave the task handle available so a
+        // later caller can still await the same cleanup operation.
+        assert!(timeout(Duration::from_millis(50), runner.stop()).await.is_err());
+        release_tx.send(()).unwrap();
+        timeout(Duration::from_secs(3), runner.stop()).await.unwrap().unwrap();
+        let after = rules();
+        assert!(!after.contains("9000:") && !after.contains("9001:"));
+        runner.stop().await.unwrap();
     }
 }

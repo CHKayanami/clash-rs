@@ -893,6 +893,8 @@ async fn create_components(
         dispatcher.clone(),
         dns_resolver.clone(),
         Some(cancellation_token.child_token()),
+        #[cfg(target_os = "linux")]
+        router.get_rule_providers(),
     )?);
 
     #[cfg(all(target_os = "linux", feature = "ebpf"))]

@@ -21,3 +21,8 @@ pub use socket_helpers::*;
 
 #[cfg(test)]
 pub(crate) mod dialer_proxy_tests;
+
+#[cfg(all(target_os = "linux", any(feature = "tun", feature = "redir")))]
+mod original_dst;
+#[cfg(all(target_os = "linux", any(feature = "tun", feature = "redir")))]
+pub(crate) use original_dst::get_original_destination_addr;

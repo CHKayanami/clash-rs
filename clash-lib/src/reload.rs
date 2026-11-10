@@ -586,7 +586,7 @@ dns2:
 
         let error = runtime.reload(next).await.unwrap_err();
         assert!(matches!(error, Error::InvalidConfig(message)
-            if message.contains("invalid device id")));
+            if message == "invalid tun device scheme: unsupported"));
         assert_eq!(get_tun_somark(), Some(42));
         assert_eq!(get_default_outbound_interface().map(|i| i.name.clone()), previous_interface);
         assert!(!runtime.shutdown_token.is_cancelled());

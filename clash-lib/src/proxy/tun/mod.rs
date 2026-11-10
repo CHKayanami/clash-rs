@@ -1,3 +1,5 @@
+#[cfg(any(target_os = "linux", test))]
+mod auto_redirect;
 #[cfg(any(target_os = "android", test))]
 mod mobile;
 #[cfg(any(target_os = "android", target_os = "linux", all(test, unix)))]

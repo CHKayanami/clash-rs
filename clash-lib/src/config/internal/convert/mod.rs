@@ -38,6 +38,7 @@ impl TryFrom<def::Config> for config::Config {
 }
 
 pub(super) fn convert(mut c: def::Config) -> Result<config::Config, Error> {
+    tun::validate_address_sets(c.tun.as_ref(), c.rule_provider.as_ref())?;
     let mut proxy_names =
         vec![String::from(PROXY_DIRECT), String::from(PROXY_REJECT)];
 
