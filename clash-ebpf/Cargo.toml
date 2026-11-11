@@ -28,13 +28,13 @@ clash-common = { path = "../clash-common" }
 rtnetlink = "0.23"
 netlink-packet-route = "0.33"
 nix = { version = "0.31", default-features = false, features = ["net", "socket", "fs"] }
-aya = { version = "0.14", default-features = false }
+aya = { version = "0.16", default-features = false }
 arc-swap = "1"
 
 
 
 [dev-dependencies]
-aya-obj = "0.3"
+aya-obj = "0.6"
 tokio-test = "0.4.5"
 anyhow = "1"
 yaml_serde = "0.10"

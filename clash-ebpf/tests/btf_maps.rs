@@ -5,7 +5,7 @@
 use aya::programs::Program;
 use aya_obj::{Map, Object, generated::bpf_map_type::*};
 use clash_ebpf_common::{
-    DaeParam, PIDName, ParseTransportCtx,
+    DaeEvent, DaeParam, PIDName, ParseTransportCtx,
     RedirectTuple, FlowTrackEntry, UdpReplyEntry, TrackingGcBatch, tracking::gate::BUCKETS,
 };
 use std::mem::size_of;
@@ -119,7 +119,9 @@ fn btf_map_definitions_match_userspace_abi() {
         ("BYPASS_PROCESSES", BPF_MAP_TYPE_HASH, 256, 16, Some(1)),
         ("BYPASS_DSCPS", BPF_MAP_TYPE_HASH, 64, 1, Some(1)),
         ("BYPASS_FWMARKS", BPF_MAP_TYPE_HASH, 256, 4, Some(1)),
-        ("EVENT_RINGBUF", BPF_MAP_TYPE_RINGBUF, 262144, 0, Some(0)),
+        // Aya now records the event type in BTF; the loader clears the ring
+        // buffer's value size before creating the kernel map.
+        ("EVENT_RINGBUF", BPF_MAP_TYPE_RINGBUF, 262144, 0, Some(size_of::<DaeEvent>())),
         ("PARSED_PKT_MAP", BPF_MAP_TYPE_PERCPU_ARRAY, 1, 4, None),
     ];
     assert_eq!(

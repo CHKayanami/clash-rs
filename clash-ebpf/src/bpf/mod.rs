@@ -16,6 +16,7 @@ use aya::programs::{
 };
 use aya::{Ebpf, EbpfLoader};
 
+use std::ffi::CString;
 use std::fs::File;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::os::fd::{AsFd, AsRawFd, RawFd};
@@ -366,7 +367,7 @@ impl BpfProgramManager {
         let mut param_map = Array::<_, DaeParam>::try_from(map)
             .map_err(|e| format!("map 'DAE_PARAM' has incompatible type: {e}"))?;
         param_map
-            .set(0, *param, 0)
+            .set(0, param, 0)
             .map_err(|e| format!("failed to initialize DAE_PARAM: {e}"))?;
         debug!(
             "DAE_PARAM map initialized: tproxy_port={}, dae0_ifindex={}",
@@ -381,7 +382,7 @@ impl BpfProgramManager {
             format!("map 'BYPASS_SRC_PORTS' has incompatible type: {e}")
         })?;
         for port in &source_bypass_ports {
-            port_map.insert(*port, 1, 0).map_err(|e| {
+            port_map.insert(port, &1, 0).map_err(|e| {
                 format!("failed to insert static source bypass port {port}: {e}")
             })?;
         }
@@ -398,7 +399,7 @@ impl BpfProgramManager {
             format!("map 'BYPASS_DST_PORTS' has incompatible type: {e}")
         })?;
         for port in &dest_bypass_ports {
-            port_map.insert(*port, 1, 0).map_err(|e| {
+            port_map.insert(port, &1, 0).map_err(|e| {
                 format!(
                     "failed to insert static destination bypass port {port}: {e}"
                 )
@@ -422,7 +423,7 @@ impl BpfProgramManager {
                     net.prefix_len() as u32,
                     u32::from_ne_bytes(net.network().octets()),
                 );
-                ip_trie.insert(&key, 1, 0).map_err(|e| {
+                ip_trie.insert(&key, &1, 0).map_err(|e| {
                     format!("failed to insert static source IPv4 bypass {net}: {e}")
                 })?;
             }
@@ -441,7 +442,7 @@ impl BpfProgramManager {
                 })?;
             for net in &bypass_src_v6 {
                 let key = Key::new(net.prefix_len() as u32, net.network().octets());
-                ip_trie.insert(&key, 1, 0).map_err(|e| {
+                ip_trie.insert(&key, &1, 0).map_err(|e| {
                     format!("failed to insert static source IPv6 bypass {net}: {e}")
                 })?;
             }
@@ -464,7 +465,7 @@ impl BpfProgramManager {
                     net.prefix_len() as u32,
                     u32::from_ne_bytes(net.network().octets()),
                 );
-                ip_trie.insert(&key, 1, 0).map_err(|e| {
+                ip_trie.insert(&key, &1, 0).map_err(|e| {
                     format!("failed to insert static IPv4 bypass {net}: {e}")
                 })?;
             }
@@ -484,7 +485,7 @@ impl BpfProgramManager {
                 })?;
             for net in &bypass_dst_v6 {
                 let key = Key::new(net.prefix_len() as u32, net.network().octets());
-                ip_trie.insert(&key, 1, 0).map_err(|e| {
+                ip_trie.insert(&key, &1, 0).map_err(|e| {
                     format!("failed to insert static IPv6 bypass {net}: {e}")
                 })?;
             }
@@ -498,7 +499,7 @@ impl BpfProgramManager {
         if let Some(map) = bpf.map_mut("PROXY_SRC_PORTS") {
             if let Ok(mut port_map) = HashMap::<_, u16, u8>::try_from(map) {
                 for &port in proxy_src_ports {
-                    let _ = port_map.insert(port, 1, 0);
+                    let _ = port_map.insert(&port, &1, 0);
                 }
             }
         }
@@ -507,7 +508,7 @@ impl BpfProgramManager {
         if let Some(map) = bpf.map_mut("PROXY_DST_PORTS") {
             if let Ok(mut port_map) = HashMap::<_, u16, u8>::try_from(map) {
                 for &port in proxy_dst_ports {
-                    let _ = port_map.insert(port, 1, 0);
+                    let _ = port_map.insert(&port, &1, 0);
                 }
             }
         }
@@ -519,11 +520,11 @@ impl BpfProgramManager {
                     if let Ok(net) = ipnet::Ipv4Net::from_str(ip_str) {
                         let ip_u32 = u32::from_ne_bytes(net.network().octets());
                         let key = Key::new(net.prefix_len() as u32, ip_u32);
-                        let _ = ip_trie.insert(&key, 1, 0);
+                        let _ = ip_trie.insert(&key, &1, 0);
                     } else if let Ok(ip) = Ipv4Addr::from_str(ip_str) {
                         let ip_u32 = u32::from_ne_bytes(ip.octets());
                         let key = Key::new(32, ip_u32);
-                        let _ = ip_trie.insert(&key, 1, 0);
+                        let _ = ip_trie.insert(&key, &1, 0);
                     }
                 }
             }
@@ -536,10 +537,10 @@ impl BpfProgramManager {
                             net.prefix_len() as u32,
                             net.network().octets(),
                         );
-                        let _ = ip_trie.insert(&key, 1, 0);
+                        let _ = ip_trie.insert(&key, &1, 0);
                     } else if let Ok(ip) = Ipv6Addr::from_str(ip_str) {
                         let key = Key::new(128, ip.octets());
-                        let _ = ip_trie.insert(&key, 1, 0);
+                        let _ = ip_trie.insert(&key, &1, 0);
                     }
                 }
             }
@@ -552,11 +553,11 @@ impl BpfProgramManager {
                     if let Ok(net) = ipnet::Ipv4Net::from_str(ip_str) {
                         let ip_u32 = u32::from_ne_bytes(net.network().octets());
                         let key = Key::new(net.prefix_len() as u32, ip_u32);
-                        let _ = ip_trie.insert(&key, 1, 0);
+                        let _ = ip_trie.insert(&key, &1, 0);
                     } else if let Ok(ip) = Ipv4Addr::from_str(ip_str) {
                         let ip_u32 = u32::from_ne_bytes(ip.octets());
                         let key = Key::new(32, ip_u32);
-                        let _ = ip_trie.insert(&key, 1, 0);
+                        let _ = ip_trie.insert(&key, &1, 0);
                     }
                 }
             }
@@ -569,10 +570,10 @@ impl BpfProgramManager {
                             net.prefix_len() as u32,
                             net.network().octets(),
                         );
-                        let _ = ip_trie.insert(&key, 1, 0);
+                        let _ = ip_trie.insert(&key, &1, 0);
                     } else if let Ok(ip) = Ipv6Addr::from_str(ip_str) {
                         let key = Key::new(128, ip.octets());
-                        let _ = ip_trie.insert(&key, 1, 0);
+                        let _ = ip_trie.insert(&key, &1, 0);
                     }
                 }
             }
@@ -599,7 +600,7 @@ impl BpfProgramManager {
                         "invalid MAC address in proxy-src-macs: '{mac_str}' (expected format: '00:11:22:33:44:55' or '00-11-22-33-44-55')"
                     )
                 })?;
-                mac_map.insert(mac_bytes, 1, 0).map_err(|e| {
+                mac_map.insert(&mac_bytes, &1, 0).map_err(|e| {
                     format!(
                         "failed to insert MAC '{mac_str}' into PROXY_SRC_MACS: {e}"
                     )
@@ -615,7 +616,7 @@ impl BpfProgramManager {
                     let bytes = proc.as_bytes();
                     let len = bytes.len().min(16);
                     key[..len].copy_from_slice(&bytes[..len]);
-                    let _ = proc_map.insert(key, 1, 0);
+                    let _ = proc_map.insert(&key, &1, 0);
                 }
                 debug!(
                     "Configured {} proxy processes in BPF map",
@@ -632,7 +633,7 @@ impl BpfProgramManager {
                     let bytes = proc.as_bytes();
                     let len = bytes.len().min(16);
                     key[..len].copy_from_slice(&bytes[..len]);
-                    let _ = proc_map.insert(key, 1, 0);
+                    let _ = proc_map.insert(&key, &1, 0);
                 }
                 debug!(
                     "Configured {} bypass processes in BPF map",
@@ -645,7 +646,7 @@ impl BpfProgramManager {
         if let Some(map) = bpf.map_mut("BYPASS_DSCPS") {
             if let Ok(mut dscp_map) = HashMap::<_, u8, u8>::try_from(map) {
                 for &dscp in bypass_dscps {
-                    let _ = dscp_map.insert(dscp, 1, 0);
+                    let _ = dscp_map.insert(&dscp, &1, 0);
                 }
                 debug!(
                     "Configured {} bypass DSCP values in BPF map",
@@ -658,7 +659,7 @@ impl BpfProgramManager {
         if let Some(map) = bpf.map_mut("BYPASS_FWMARKS") {
             if let Ok(mut fwmark_map) = HashMap::<_, u32, u8>::try_from(map) {
                 for &fwmark in bypass_fwmarks {
-                    let _ = fwmark_map.insert(fwmark, 1, 0);
+                    let _ = fwmark_map.insert(&fwmark, &1, 0);
                 }
                 debug!(
                     "Configured {} bypass FWMark values in BPF map",
@@ -1161,6 +1162,8 @@ impl BpfProgramManager {
         prog_name: &str,
         in_daens: bool,
     ) -> Result<(), String> {
+        let iface_c = CString::new(iface)
+            .map_err(|e| format!("Invalid interface name {iface:?}: {e}"))?;
         let Some(bpf) = self.bpf.as_mut() else {
             return Err("eBPF not loaded".to_string());
         };
@@ -1174,7 +1177,7 @@ impl BpfProgramManager {
         };
 
         if self.prepared_qdiscs.insert((in_daens, iface.to_string())) {
-            match aya::programs::tc::qdisc_add_clsact(iface) {
+            match aya::programs::tc::qdisc_add_clsact(iface_c.as_c_str()) {
                 Ok(()) => {
                     info!("Added clsact qdisc to {}", iface);
                     if let Some(ifindex) = owned_ifindex {
@@ -1218,7 +1221,7 @@ impl BpfProgramManager {
                 .map_err(|e| format!("Failed to load TC program '{prog_name}': {e}"))?;
         }
 
-        let link_id = p.attach(iface, attach_type).map_err(|e| {
+        let link_id = p.attach(iface_c.as_c_str(), attach_type).map_err(|e| {
             format!("Failed to attach TC program '{prog_name}' to {iface}: {e}")
         })?;
 
@@ -1488,7 +1491,7 @@ mod tests {
                 for net in nets {
                     let key = Key::new(net.prefix_len() as u32,
                         u32::from_ne_bytes(net.network().octets()));
-                    map.insert(&key, 1, 0).unwrap();
+                    map.insert(&key, &1, 0).unwrap();
                     assert_eq!(map.get(&key, 0).unwrap(), 1);
                 }
             }
@@ -1500,7 +1503,7 @@ mod tests {
                     .unwrap();
                 for net in nets {
                     let key = Key::new(net.prefix_len() as u32, net.network().octets());
-                    map.insert(&key, 1, 0).unwrap();
+                    map.insert(&key, &1, 0).unwrap();
                     assert_eq!(map.get(&key, 0).unwrap(), 1);
                 }
             }
@@ -1511,7 +1514,7 @@ mod tests {
                 let mut map = HashMap::<_, u16, u8>::try_from(bpf.map_mut(name).unwrap())
                     .unwrap();
                 for port in ports {
-                    map.insert(*port, 1, 0).unwrap();
+                    map.insert(port, &1, 0).unwrap();
                     assert_eq!(map.get(port, 0).unwrap(), 1);
                 }
             }

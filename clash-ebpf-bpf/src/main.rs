@@ -34,6 +34,7 @@ pub fn tracking_gc(_ctx: *mut __sk_buff) -> i32 {
     deleted as i32
 }
 
+use aya_ebpf::EbpfContext;
 use aya_ebpf::bindings::{__sk_buff, TC_ACT_OK, TC_ACT_SHOT, bpf_sk_lookup};
 use aya_ebpf::btf_maps::lpm_trie::Key;
 use aya_ebpf::helpers::{bpf_get_current_pid_tgid, bpf_redirect};
@@ -47,7 +48,7 @@ use clash_ebpf_common::{
     DAE_BYPASS_MARK, DAE_TPROXY_MARK, DaeEventType, GC_BATCH_SIZE, GC_FLOW, GC_UDP_REPLY,
     DaeParam, PIDName, RedirectEntry, RedirectTuple,
 };
-use core::mem;
+use core::{mem, ptr::NonNull};
 use maps::*;
 use network_types::eth::EthHdr;
 use transport::*;
@@ -520,7 +521,7 @@ fn handle_lan_ipv6(
 
 #[inline(never)]
 fn handle_lan_ingress_impl(tc_ctx: &TcContext, link_h_len: usize) -> i32 {
-    let ctx = tc_ctx.skb.skb;
+    let ctx = tc_ctx.as_ptr().cast::<__sk_buff>();
     let mark = unsafe { (*ctx).mark };
 
     let Some(param) = get_param() else {
@@ -549,7 +550,7 @@ fn handle_lan_ingress_impl(tc_ctx: &TcContext, link_h_len: usize) -> i32 {
 // intervening parser writes that map, and lifecycle transitions run only once.
 #[inline(never)]
 fn handle_lan_miss(tc_ctx: &TcContext, param: &DaeParam, link_h_len: usize, observed: bool) -> i32 {
-    let ctx = tc_ctx.skb.skb;
+    let ctx = tc_ctx.as_ptr().cast::<__sk_buff>();
     let parsed = if observed {
         PARSED_PKT_MAP.get_ptr(0).map(|ptr| unsafe { &*ptr }).ok_or(ERR_MALFORMED)
     } else { parse_packet(tc_ctx, link_h_len as u32) };
@@ -756,7 +757,7 @@ fn handle_wan_ipv6(
 
 #[inline(never)]
 fn handle_wan_egress_impl(tc_ctx: &TcContext, link_h_len: usize) -> i32 {
-    let ctx = tc_ctx.skb.skb;
+    let ctx = tc_ctx.as_ptr().cast::<__sk_buff>();
     let mark = unsafe { (*ctx).mark };
 
     let Some(param) = get_param() else {
@@ -833,7 +834,7 @@ fn handle_wan_egress_impl(tc_ctx: &TcContext, link_h_len: usize) -> i32 {
 fn handle_wan_miss(tc_ctx: &TcContext, param: &DaeParam, link_h_len: usize,
     state: &(Option<&PIDName>, *mut u32, bool),
 ) -> i32 {
-    let ctx = tc_ctx.skb.skb;
+    let ctx = tc_ctx.as_ptr().cast::<__sk_buff>();
     let (pid_pname, tcp_policy, observed) = *state;
     let parsed = if observed {
         PARSED_PKT_MAP.get_ptr(0).map(|ptr| unsafe { &*ptr }).ok_or(ERR_MALFORMED)
@@ -882,41 +883,42 @@ fn dispatch_wan(
 
 // ─────────────────────────────────────────────────────────────
 // 3. TC Entrypoints
+// The kernel supplies a live, non-null __sk_buff for each invocation.
 // ─────────────────────────────────────────────────────────────
 
 #[unsafe(no_mangle)]
 #[unsafe(link_section = "classifier")]
-pub fn lan_ingress(ctx: *mut __sk_buff) -> i32 {
+pub fn lan_ingress(ctx: NonNull<__sk_buff>) -> i32 {
     handle_lan_ingress_impl(&TcContext::new(ctx), EthHdr::LEN)
 }
 
 #[unsafe(no_mangle)]
 #[unsafe(link_section = "classifier")]
-pub fn lan_ingress_l2(ctx: *mut __sk_buff) -> i32 {
+pub fn lan_ingress_l2(ctx: NonNull<__sk_buff>) -> i32 {
     handle_lan_ingress_impl(&TcContext::new(ctx), EthHdr::LEN)
 }
 
 #[unsafe(no_mangle)]
 #[unsafe(link_section = "classifier")]
-pub fn lan_ingress_l3(ctx: *mut __sk_buff) -> i32 {
+pub fn lan_ingress_l3(ctx: NonNull<__sk_buff>) -> i32 {
     handle_lan_ingress_impl(&TcContext::new(ctx), 0)
 }
 
 #[unsafe(no_mangle)]
 #[unsafe(link_section = "classifier")]
-pub fn wan_egress(ctx: *mut __sk_buff) -> i32 {
+pub fn wan_egress(ctx: NonNull<__sk_buff>) -> i32 {
     handle_wan_egress_impl(&TcContext::new(ctx), EthHdr::LEN)
 }
 
 #[unsafe(no_mangle)]
 #[unsafe(link_section = "classifier")]
-pub fn wan_egress_l2(ctx: *mut __sk_buff) -> i32 {
+pub fn wan_egress_l2(ctx: NonNull<__sk_buff>) -> i32 {
     handle_wan_egress_impl(&TcContext::new(ctx), EthHdr::LEN)
 }
 
 #[unsafe(no_mangle)]
 #[unsafe(link_section = "classifier")]
-pub fn wan_egress_l3(ctx: *mut __sk_buff) -> i32 {
+pub fn wan_egress_l3(ctx: NonNull<__sk_buff>) -> i32 {
     handle_wan_egress_impl(&TcContext::new(ctx), 0)
 }
 
@@ -924,8 +926,9 @@ pub fn wan_egress_l3(ctx: *mut __sk_buff) -> i32 {
 /// Sets PACKET_HOST + fwmark so the packet is accepted and routed locally (table 100).
 #[unsafe(no_mangle)]
 #[unsafe(link_section = "classifier")]
-pub fn dae0peer_ingress(ctx: *mut __sk_buff) -> i32 {
+pub fn dae0peer_ingress(ctx: NonNull<__sk_buff>) -> i32 {
     let tc_ctx = TcContext::new(ctx);
+    let ctx = ctx.as_ptr();
 
     let cb0 = unsafe { (*ctx).cb[0] };
     let mark = unsafe { (*ctx).mark };
@@ -984,19 +987,19 @@ fn do_tproxy_sk_lookup(ctx: &SkLookupContext) -> u32 {
 
 #[unsafe(no_mangle)]
 #[unsafe(link_section = "classifier")]
-pub fn dae0_ingress(ctx: *mut __sk_buff) -> i32 {
+pub fn dae0_ingress(ctx: NonNull<__sk_buff>) -> i32 {
     handle_dae0_ingress_impl(&TcContext::new(ctx))
 }
 
 #[unsafe(no_mangle)]
 #[unsafe(link_section = "classifier")]
-pub fn dae0_ingress_l2(ctx: *mut __sk_buff) -> i32 {
+pub fn dae0_ingress_l2(ctx: NonNull<__sk_buff>) -> i32 {
     handle_dae0_ingress_impl(&TcContext::new(ctx))
 }
 
 #[inline(never)]
 fn handle_dae0_ingress_impl(tc_ctx: &TcContext) -> i32 {
-    let ctx = tc_ctx.skb.skb;
+    let ctx = tc_ctx.as_ptr().cast::<__sk_buff>();
     let mut entry = RedirectEntry::default();
     let status = fast_path::reply(tc_ctx, &mut entry);
     if status < 0 { return TC_ACT_SHOT; }
@@ -1062,9 +1065,7 @@ pub fn tproxy_wan_cg_connect4(ctx: SockAddrContext) -> i32 {
     if unsafe { (*ctx.sock_addr).protocol } == IPPROTO_TCP as u32 {
         let mut active = 1u32;
         // Preserve a decision if connect is called again on the same socket.
-        let _ = unsafe {
-            TCP_SOCKET_POLICY.get_or_insert_ptr_mut(&ctx, Some(&mut active))
-        };
+        let _ = TCP_SOCKET_POLICY.get_or_insert_ptr_mut(&ctx, Some(&mut active));
     }
 
     let cookie = unsafe { bpf_get_socket_cookie(ctx.sock_addr as *mut _) };
@@ -1077,9 +1078,7 @@ pub fn tproxy_wan_cg_connect6(ctx: SockAddrContext) -> i32 {
     if unsafe { (*ctx.sock_addr).protocol } == IPPROTO_TCP as u32 {
         let mut active = 1u32;
         // Preserve a decision if connect is called again on the same socket.
-        let _ = unsafe {
-            TCP_SOCKET_POLICY.get_or_insert_ptr_mut(&ctx, Some(&mut active))
-        };
+        let _ = TCP_SOCKET_POLICY.get_or_insert_ptr_mut(&ctx, Some(&mut active));
     }
 
     let cookie = unsafe { bpf_get_socket_cookie(ctx.sock_addr as *mut _) };

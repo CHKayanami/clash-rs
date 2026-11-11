@@ -51,7 +51,7 @@ impl GcProgram {
         if requests.len() > GC_BATCH_SIZE { return Err("tracking GC batch too large".to_string()); }
         let mut batch = TrackingGcBatch { count: requests.len() as u32, ..TrackingGcBatch::default() };
         batch.requests[..requests.len()].copy_from_slice(requests);
-        self.request.set(0, batch, 0).map_err(|e| e.to_string())?;
+        self.request.set(0, &batch, 0).map_err(|e| e.to_string())?;
         let data = [0u8; 14];
         let mut attr = TestRunAttr { prog_fd: self.program.as_fd().as_raw_fd() as u32,
             data_size_in: data.len() as u32, data_in: data.as_ptr() as u64,

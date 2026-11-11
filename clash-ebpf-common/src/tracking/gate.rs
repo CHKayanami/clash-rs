@@ -1,13 +1,28 @@
 //! Versioned bucket gates shared by packet writers and the BPF collector.
-use core::sync::atomic::AtomicU64;
 #[cfg(not(target_arch = "bpf"))]
-use core::sync::atomic::Ordering;
+use core::sync::atomic::{AtomicU64, Ordering};
 #[cfg(target_arch = "bpf")]
-use core::arch::asm;
+use core::{arch::asm, cell::UnsafeCell};
 
 use crate::{RedirectTuple, UdpReplyKey};
 
 pub const BUCKETS: u32 = 4096;
+
+#[cfg(not(target_arch = "bpf"))]
+pub type GateWord = AtomicU64;
+
+/// Eight-byte map storage accessed only through BPF scalar loads and atomic
+/// CMPXCHG. UnsafeCell permits mutation through shared references; the layout
+/// must match the u64 values in the gate map.
+#[cfg(target_arch = "bpf")]
+#[repr(C, align(8))]
+pub struct GateWord(UnsafeCell<u64>);
+
+#[cfg(target_arch = "bpf")]
+impl GateWord {
+    #[inline(always)]
+    fn as_ptr(&self) -> *mut u64 { self.0.get() }
+}
 
 #[inline(always)]
 fn hash(ip: &[u8; 16], seed: u32) -> u32 {
@@ -43,7 +58,7 @@ pub fn reply_bucket(key: &UdpReplyKey) -> u32 {
 }
 
 pub struct Guard<'a> {
-    word: &'a AtomicU64,
+    word: &'a GateWord,
     version: u64,
 }
 
@@ -64,7 +79,7 @@ impl Drop for Guard<'_> {
 }
 
 #[inline(always)]
-pub fn try_lock(word: &AtomicU64) -> Option<Guard<'_>> {
+pub fn try_lock(word: &GateWord) -> Option<Guard<'_>> {
     let version = load(word);
     if version & 1 != 0 || version >= u64::MAX - 2 { return None; }
     if compare_exchange(word, version, version + 1) == version {
@@ -73,7 +88,7 @@ pub fn try_lock(word: &AtomicU64) -> Option<Guard<'_>> {
 }
 
 #[inline(always)]
-fn load(word: &AtomicU64) -> u64 {
+fn load(word: &GateWord) -> u64 {
     #[cfg(not(target_arch = "bpf"))]
     { word.load(Ordering::Relaxed) }
     #[cfg(target_arch = "bpf")]
@@ -92,7 +107,7 @@ fn load(word: &AtomicU64) -> u64 {
 /// `ptr` must address live, eight-byte aligned atomic storage.
 #[inline(always)]
 pub unsafe fn load_u64(ptr: *const u64) -> u64 {
-    unsafe { load(&*ptr.cast::<AtomicU64>()) }
+    unsafe { load(&*ptr.cast::<GateWord>()) }
 }
 
 /// # Safety
@@ -107,14 +122,14 @@ pub unsafe fn store_u64(ptr: *mut u64, value: u64) {
 }
 
 #[inline(always)]
-fn compare_exchange(word: &AtomicU64, expected: u64, next: u64) -> u64 {
+fn compare_exchange(word: &GateWord, expected: u64, next: u64) -> u64 {
     #[cfg(not(target_arch = "bpf"))]
     { word.compare_exchange(expected, next, Ordering::SeqCst, Ordering::SeqCst)
         .unwrap_or_else(|actual| actual) }
     #[cfg(target_arch = "bpf")]
     {
         let previous;
-        // Rust's BPF target does not expose CAS in AtomicU64's API. Emit the
+        // Rust's BPF target does not expose AtomicU64. Emit the
         // native BPF CMPXCHG directly. No nomem/readonly: this is also a compiler
         // memory barrier. The JIT must implement the atomic RMW ordering.
         unsafe { asm!("r0 = cmpxchg_64({ptr} + 0, r0, {next})",

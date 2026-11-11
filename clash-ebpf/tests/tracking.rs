@@ -68,11 +68,11 @@ fn direct_decision_expiration_and_redirect_metadata_are_consistent() {
     let program: &mut SchedClassifier = bpf.program_mut("lan_ingress_l2").unwrap().try_into().unwrap();
     program.load().unwrap();
     let mut params = Array::try_from(bpf.map_mut("DAE_PARAM").unwrap()).unwrap();
-    params.set(0, DaeParam { dae0_ifindex: 1, tproxy_port: 12345,
+    params.set(0, &DaeParam { dae0_ifindex: 1, tproxy_port: 12345,
         direct_offload_enabled: 1, ..DaeParam::default() }, 0).unwrap();
     let ip = u32::from_ne_bytes([198, 51, 100, 9]);
     HashMap::<_, u32, u8>::try_from(bpf.map_mut("DYNAMIC_BYPASS_DST_IPS").unwrap())
-        .unwrap().insert(ip, 1, 0).unwrap();
+        .unwrap().insert(&ip, &1, 0).unwrap();
     assert_eq!(run(&mut bpf, &packet(10)), 0);
     let (key, direct) = state(&bpf);
     assert_ne!(direct >> 63, 0);
@@ -88,7 +88,7 @@ fn direct_decision_expiration_and_redirect_metadata_are_consistent() {
     let mut states = HashMap::<_, RedirectTuple, FlowTrackEntry>::try_from(bpf.map_mut("FLOW_TRACK").unwrap()).unwrap();
     let mut entry = states.get(&key, 0).unwrap();
     entry.set_activity(expired);
-    states.insert(key, entry, 0).unwrap();
+    states.insert(&key, &entry, 0).unwrap();
     assert_ne!(run(&mut bpf, &packet(10)), 2, "reclassification must not drop the datagram");
     let (_, redirected) = state(&bpf);
     assert_eq!(redirected >> 63, 0);
@@ -124,14 +124,14 @@ fn tcp_syn_resets_identity_and_fin_retains_reply_route_until_close_timeout() {
     let program: &mut SchedClassifier = bpf.program_mut("lan_ingress_l2").unwrap().try_into().unwrap();
     program.load().unwrap();
     Array::try_from(bpf.map_mut("DAE_PARAM").unwrap()).unwrap()
-        .set(0, DaeParam { dae0_ifindex: 1, tproxy_port: 12345, ..DaeParam::default() }, 0).unwrap();
+        .set(0, &DaeParam { dae0_ifindex: 1, tproxy_port: 12345, ..DaeParam::default() }, 0).unwrap();
     assert_ne!(run(&mut bpf, &tcp_packet(2)), 2);
     let (key, initial) = state(&bpf);
     let mut states = HashMap::<_, RedirectTuple, FlowTrackEntry>::try_from(bpf.map_mut("FLOW_TRACK").unwrap()).unwrap();
     let mut entry = states.get(&key, 0).unwrap();
     entry.set_activity((initial & !0xffffffff) | 1);
     let first = entry.activity();
-    states.insert(key, entry, 0).unwrap();
+    states.insert(&key, &entry, 0).unwrap();
     assert_ne!(run(&mut bpf, &tcp_packet(16)), 2);
     assert_eq!(state(&bpf).1, first, "active TCP does not refresh its timestamp");
     assert_ne!(run(&mut bpf, &tcp_packet(17)), 2);
@@ -151,7 +151,7 @@ fn tcp_syn_resets_identity_and_fin_retains_reply_route_until_close_timeout() {
 fn concurrent_metadata_publication_keeps_one_complete_route() {
     let mut bpf = EbpfLoader::new().load(BYTECODE).unwrap();
     Array::try_from(bpf.map_mut("DAE_PARAM").unwrap()).unwrap()
-        .set(0, DaeParam { dae0_ifindex: 1, tproxy_port: 12345, ..DaeParam::default() }, 0).unwrap();
+        .set(0, &DaeParam { dae0_ifindex: 1, tproxy_port: 12345, ..DaeParam::default() }, 0).unwrap();
     let program: &mut SchedClassifier = bpf.program_mut("lan_ingress_l2").unwrap().try_into().unwrap();
     program.load().unwrap();
     let program: &SchedClassifier = program;
@@ -183,7 +183,7 @@ fn client_socket_reply_route_refreshes_without_a_flow_and_expires() {
         program.load().unwrap();
     }
     Array::try_from(bpf.map_mut("DAE_PARAM").unwrap()).unwrap()
-        .set(0, DaeParam { dae0_ifindex: 1, tproxy_port: 12345, ..DaeParam::default() }, 0).unwrap();
+        .set(0, &DaeParam { dae0_ifindex: 1, tproxy_port: 12345, ..DaeParam::default() }, 0).unwrap();
     assert_ne!(run(&mut bpf, &packet(10)), 2);
     let (tuple, _) = state(&bpf);
     let key = UdpReplyKey::from_request(&tuple);
@@ -194,7 +194,7 @@ fn client_socket_reply_route_refreshes_without_a_flow_and_expires() {
     let mut entry = routes.get(&key, 0).unwrap();
     entry.last_seen_ns = now - 2_000_000_000;
     let old_stamp = entry.last_seen_ns;
-    routes.insert(key, entry, 0).unwrap();
+    routes.insert(&key, &entry, 0).unwrap();
     HashMap::<_, RedirectTuple, FlowTrackEntry>::try_from(bpf.map_mut("FLOW_TRACK").unwrap()).unwrap()
         .remove(&tuple).unwrap();
 
@@ -217,7 +217,7 @@ fn client_socket_reply_route_refreshes_without_a_flow_and_expires() {
     let mut routes = HashMap::<_, UdpReplyKey, UdpReplyEntry>::try_from(bpf.map_mut("UDP_REPLY_TRACK").unwrap()).unwrap();
     entry.last_seen_ns = now.saturating_sub(123_000_000_000);
     let expired_stamp = entry.last_seen_ns;
-    routes.insert(key, entry, 0).unwrap();
+    routes.insert(&key, &entry, 0).unwrap();
     let program: &mut SchedClassifier = bpf.program_mut("dae0_ingress_l2").unwrap().try_into().unwrap();
     assert_eq!(program.test_run(TestRunOptions { data_in: Some(&reply), ..TestRunOptions::new() })
         .unwrap().return_value, 0, "expired client socket cannot restore the reply");
@@ -234,7 +234,7 @@ fn udp_replies_use_client_socket_without_touching_flow_state() {
         program.load().unwrap();
     }
     Array::try_from(bpf.map_mut("DAE_PARAM").unwrap()).unwrap()
-        .set(0, DaeParam { dae0_ifindex: 1, tproxy_port: 12345, ..DaeParam::default() }, 0).unwrap();
+        .set(0, &DaeParam { dae0_ifindex: 1, tproxy_port: 12345, ..DaeParam::default() }, 0).unwrap();
     assert_ne!(run(&mut bpf, &packet(10)), 2);
     let (tuple, _) = state(&bpf);
     let key = UdpReplyKey::from_request(&tuple);
@@ -244,12 +244,12 @@ fn udp_replies_use_client_socket_without_touching_flow_state() {
     let mut states = HashMap::<_, RedirectTuple, FlowTrackEntry>::try_from(bpf.map_mut("FLOW_TRACK").unwrap()).unwrap();
     let mut flow = states.get(&tuple, 0).unwrap();
     flow.last_seen_seconds = clock.tv_sec as u32 + 2;
-    states.insert(tuple, flow, 0).unwrap();
+    states.insert(&tuple, &flow, 0).unwrap();
     let mut routes = HashMap::<_, UdpReplyKey, UdpReplyEntry>::try_from(bpf.map_mut("UDP_REPLY_TRACK").unwrap()).unwrap();
     let mut client = routes.get(&key, 0).unwrap();
     client.last_seen_ns = now - 2_000_000_000;
     let old_stamp = client.last_seen_ns;
-    routes.insert(key, client, 0).unwrap();
+    routes.insert(&key, &client, 0).unwrap();
     let reply = reply_packet([198, 51, 100, 9], 3478);
     let program: &mut SchedClassifier = bpf.program_mut("dae0_ingress_l2").unwrap().try_into().unwrap();
     assert_eq!(program.test_run(TestRunOptions { data_in: Some(&reply), ..TestRunOptions::new() })
@@ -259,7 +259,7 @@ fn udp_replies_use_client_socket_without_touching_flow_state() {
         "reply refreshes the client socket independently of flow activity");
     let mut states = HashMap::<_, RedirectTuple, FlowTrackEntry>::try_from(bpf.map_mut("FLOW_TRACK").unwrap()).unwrap();
     flow.last_seen_seconds = (clock.tv_sec as u32).wrapping_sub(2);
-    states.insert(tuple, flow, 0).unwrap();
+    states.insert(&tuple, &flow, 0).unwrap();
     let program: &mut SchedClassifier = bpf.program_mut("dae0_ingress_l2").unwrap().try_into().unwrap();
     assert_eq!(program.test_run(TestRunOptions { data_in: Some(&reply), ..TestRunOptions::new() })
         .unwrap().return_value, 7);
@@ -281,7 +281,7 @@ fn full_cone_reply_routes_ignore_remote_and_isolate_client_ports() {
             program.load().unwrap();
         }
         Array::try_from(bpf.map_mut("DAE_PARAM").unwrap()).unwrap()
-            .set(0, DaeParam { dae0_ifindex: 1, tproxy_port: 12345, ..DaeParam::default() }, 0).unwrap();
+            .set(0, &DaeParam { dae0_ifindex: 1, tproxy_port: 12345, ..DaeParam::default() }, 0).unwrap();
         let mut request = if ipv6 {
             let mut data = vec![0u8; 62];
             data[..12].copy_from_slice(&packet(10)[..12]);

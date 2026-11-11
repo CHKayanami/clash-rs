@@ -15,7 +15,7 @@ fn load() -> Ebpf {
 
 fn params(bpf: &mut Ebpf, mut param: DaeParam) {
     param.dae0_ifindex = 1; param.tproxy_port = 12345;
-    Array::try_from(bpf.map_mut("DAE_PARAM").unwrap()).unwrap().set(0, param, 0).unwrap();
+    Array::try_from(bpf.map_mut("DAE_PARAM").unwrap()).unwrap().set(0, &param, 0).unwrap();
 }
 
 // Validate packet output as well as the action: client MAC restoration must
@@ -43,16 +43,16 @@ fn every_packet_routing_rule_publishes_a_sticky_direct_decision() {
                 let (name, ip) = if rule == "src_ip" { ("BYPASS_SRC_IPS", [192, 0, 2, 2]) }
                     else { ("BYPASS_DST_IPS", [198, 51, 100, 9]) };
                 LpmTrie::<_, u32, u8>::try_from(bpf.map_mut(name).unwrap()).unwrap()
-                    .insert(&Key::new(32, u32::from_ne_bytes(ip)), 1, 0).unwrap();
+                    .insert(&Key::new(32, u32::from_ne_bytes(ip)), &1, 0).unwrap();
             }
             "src_port" | "dst_port" => {
                 let (name, port) = if rule == "src_port" { ("BYPASS_SRC_PORTS", 40000) }
                     else { ("BYPASS_DST_PORTS", 3478) };
-                HashMap::<_, u16, u8>::try_from(bpf.map_mut(name).unwrap()).unwrap().insert(port, 1, 0).unwrap();
+                HashMap::<_, u16, u8>::try_from(bpf.map_mut(name).unwrap()).unwrap().insert(&port, &1, 0).unwrap();
             }
             "dscp" => {
                 param.has_bypass_dscps = 1;
-                HashMap::<_, u8, u8>::try_from(bpf.map_mut("BYPASS_DSCPS").unwrap()).unwrap().insert(0, 1, 0).unwrap();
+                HashMap::<_, u8, u8>::try_from(bpf.map_mut("BYPASS_DSCPS").unwrap()).unwrap().insert(&0, &1, 0).unwrap();
             }
             "src_mac_allow" => param.has_proxy_src_macs = 1,
             "src_ip_allow" => param.has_proxy_src_ips = 1,
@@ -93,14 +93,14 @@ fn every_packet_routing_rule_publishes_a_sticky_direct_decision() {
 fn cached_proxy_decisions_precede_new_bypass_rules_but_dns_and_safety_keep_precedence() {
     let mut bpf = load();
     assert_eq!(run(&mut bpf, &packet(10)), 7);
-    HashMap::<_, u16, u8>::try_from(bpf.map_mut("BYPASS_DST_PORTS").unwrap()).unwrap().insert(3478, 1, 0).unwrap();
+    HashMap::<_, u16, u8>::try_from(bpf.map_mut("BYPASS_DST_PORTS").unwrap()).unwrap().insert(&3478, &1, 0).unwrap();
     params(&mut bpf, DaeParam { has_proxy_src_macs: 1, has_bypass_dscps: 1, ..DaeParam::default() });
-    HashMap::<_, u8, u8>::try_from(bpf.map_mut("BYPASS_DSCPS").unwrap()).unwrap().insert(0, 1, 0).unwrap();
+    HashMap::<_, u8, u8>::try_from(bpf.map_mut("BYPASS_DSCPS").unwrap()).unwrap().insert(&0, &1, 0).unwrap();
     assert_eq!(run(&mut bpf, &packet(10)), 7, "cached proxy ignores subsequently changed packet rules");
     let mut bpf = load();
     let mut dns = packet(10);
     dns[36..38].copy_from_slice(&53u16.to_be_bytes());
-    HashMap::<_, u16, u8>::try_from(bpf.map_mut("BYPASS_DST_PORTS").unwrap()).unwrap().insert(53, 1, 0).unwrap();
+    HashMap::<_, u16, u8>::try_from(bpf.map_mut("BYPASS_DST_PORTS").unwrap()).unwrap().insert(&53, &1, 0).unwrap();
     assert_eq!(run(&mut bpf, &dns), 7, "destination bypass cannot override DNS interception");
     let mut data = packet(10);
     data[..6].fill(0xff);
@@ -162,7 +162,7 @@ fn ipv6_extension_fallback_preserves_cached_rules_and_udp_reply_routes() {
     data[22..26].copy_from_slice(&[0x20, 1, 0x0d, 0xb8]); data[37] = 2;
     data[38..42].copy_from_slice(&[0x20, 1, 0x0d, 0xb8]); data[53] = 9;
     data[54..62].copy_from_slice(&packet(10)[34..42]);
-    HashMap::<_, u16, u8>::try_from(bpf.map_mut("BYPASS_DST_PORTS").unwrap()).unwrap().insert(3478, 1, 0).unwrap();
+    HashMap::<_, u16, u8>::try_from(bpf.map_mut("BYPASS_DST_PORTS").unwrap()).unwrap().insert(&3478, &1, 0).unwrap();
     assert_eq!(run(&mut bpf, &data), 0);
     let (tuple, first) = state(&bpf);
     HashMap::<_, u16, u8>::try_from(bpf.map_mut("BYPASS_DST_PORTS").unwrap()).unwrap().remove(&3478).unwrap();
@@ -190,7 +190,7 @@ fn stable_forward_and_tcp_reply_reads_leave_decision_scratch_untouched() {
     let mut bpf = load();
     for direct in [true, false] {
         if direct {
-            HashMap::<_, u16, u8>::try_from(bpf.map_mut("BYPASS_DST_PORTS").unwrap()).unwrap().insert(3478, 1, 0).unwrap();
+            HashMap::<_, u16, u8>::try_from(bpf.map_mut("BYPASS_DST_PORTS").unwrap()).unwrap().insert(&3478, &1, 0).unwrap();
         } else {
             HashMap::<_, u16, u8>::try_from(bpf.map_mut("BYPASS_DST_PORTS").unwrap()).unwrap().remove(&3478).unwrap();
         }
@@ -199,7 +199,7 @@ fn stable_forward_and_tcp_reply_reads_leave_decision_scratch_untouched() {
         for key in keys { flows.remove(&key).unwrap(); }
         assert_eq!(run(&mut bpf, &packet(10)), if direct { 0 } else { 7 });
         let marker = [0xabcddcba12344321u64; 10];
-        let values = PerCpuValues::try_from(vec![marker; nr_cpus().unwrap()]).unwrap();
+        let values = PerCpuValues::try_from(vec![marker; nr_cpus().unwrap().get() as usize]).unwrap();
         PerCpuArray::<_, [u64; 10]>::try_from(bpf.map_mut("FLOW_SCRATCH").unwrap()).unwrap().set(0, values, 0).unwrap();
         assert_eq!(run(&mut bpf, &packet(10)), if direct { 0 } else { 7 });
         let scratch = PerCpuArray::<_, [u64; 10]>::try_from(bpf.map("FLOW_SCRATCH").unwrap()).unwrap().get(&0, 0).unwrap();
@@ -207,7 +207,7 @@ fn stable_forward_and_tcp_reply_reads_leave_decision_scratch_untouched() {
     }
     assert_eq!(run(&mut bpf, &tcp_packet(2)), 7);
     let marker = [0x13579bdf2468ace0u64; 10];
-    let values = PerCpuValues::try_from(vec![marker; nr_cpus().unwrap()]).unwrap();
+    let values = PerCpuValues::try_from(vec![marker; nr_cpus().unwrap().get() as usize]).unwrap();
     PerCpuArray::<_, [u64; 10]>::try_from(bpf.map_mut("FLOW_SCRATCH").unwrap()).unwrap().set(0, values, 0).unwrap();
     let mut reply = tcp_packet(16);
     reply[26..30].copy_from_slice(&[198, 51, 100, 9]); reply[30..34].copy_from_slice(&[192, 0, 2, 2]);
@@ -237,7 +237,7 @@ fn linear_cache_misses_preserve_nonzero_dscp_for_both_ip_families() {
             data[54..62].copy_from_slice(&packet(10)[34..42]);
         } else { data[15] = 0xbb; }
         params(&mut bpf, DaeParam { has_bypass_dscps: 1, ..DaeParam::default() });
-        HashMap::<_, u8, u8>::try_from(bpf.map_mut("BYPASS_DSCPS").unwrap()).unwrap().insert(46, 1, 0).unwrap();
+        HashMap::<_, u8, u8>::try_from(bpf.map_mut("BYPASS_DSCPS").unwrap()).unwrap().insert(&46, &1, 0).unwrap();
         assert_eq!(run(&mut bpf, &data), 0, "IPv6={ipv6}: first packet retains DSCP");
         assert_ne!((state(&bpf).1 >> 32) as u32 & DIRECT, 0);
     }

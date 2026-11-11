@@ -94,17 +94,17 @@ fn deliver(kind: LinkPairKind, peer_redirect: bool) {
             socket.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
             sockets.push(socket);
         }
-        qdisc_add_clsact("dae0peer").unwrap();
+        qdisc_add_clsact(c"dae0peer").unwrap();
         let program: &mut SchedClassifier = bpf.program_mut("dae0peer_ingress").unwrap().try_into().unwrap();
-        program.load().unwrap(); program.attach("dae0peer", TcAttachType::Ingress).unwrap();
+        program.load().unwrap(); program.attach(c"dae0peer", TcAttachType::Ingress).unwrap();
         (mac, sockets)
     }).unwrap();
     Array::try_from(bpf.map_mut("DAE_PARAM").unwrap()).unwrap().set(0,
-        DaeParam { dae0_ifindex: dae0, dae0peer_mac: peer_mac, tproxy_port: 12345,
+        &DaeParam { dae0_ifindex: dae0, dae0peer_mac: peer_mac, tproxy_port: 12345,
             use_redirect_peer: peer_redirect as u8, ..DaeParam::default() }, 0).unwrap();
-    qdisc_add_clsact("lan").unwrap();
+    qdisc_add_clsact(c"lan").unwrap();
     let program: &mut SchedClassifier = bpf.program_mut("lan_ingress_l2").unwrap().try_into().unwrap();
-    program.load().unwrap(); program.attach("lan", TcAttachType::Ingress).unwrap();
+    program.load().unwrap(); program.attach(c"lan", TcAttachType::Ingress).unwrap();
     let fd = unsafe { libc::socket(libc::AF_PACKET, libc::SOCK_RAW | libc::SOCK_CLOEXEC, 0x0003u16.to_be() as i32) };
     assert!(fd >= 0, "{}", io::Error::last_os_error());
     // Own the successful raw descriptor; sockaddr storage is fully initialized.

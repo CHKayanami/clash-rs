@@ -1,6 +1,6 @@
 //! Cached forwarding never re-evaluates routing rules. Lifecycle mutations keep
 //! the same gates and generation checks as the full-parser fallback.
-use aya_ebpf::{bindings::{TC_ACT_OK, TC_ACT_SHOT}, programs::TcContext};
+use aya_ebpf::{EbpfContext, bindings::{__sk_buff, TC_ACT_OK, TC_ACT_SHOT}, programs::TcContext};
 use aya_ebpf_bindings::helpers::bpf_ktime_get_ns;
 use clash_ebpf_common::{DaeParam, RedirectEntry, RedirectTuple, UdpReplyKey};
 use network_types::eth::EthHdr;
@@ -37,7 +37,7 @@ pub fn forward(ctx: &TcContext, param: &DaeParam, link: usize, wan: bool, tcp_po
     }
     let verdict = if direct { TC_ACT_OK } else {
         if !read_macs(ctx, link, &mut packet) { return TC_ACT_SHOT; }
-        let route = RedirectEntry { ifindex: unsafe { (*ctx.skb.skb).ifindex },
+        let route = RedirectEntry { ifindex: unsafe { (*ctx.as_ptr().cast::<__sk_buff>()).ifindex },
             from_wan: wan as u8, _pad0: [0; 3], smac: packet.smac, dmac: packet.dmac };
         if !unsafe { tracking::route_matches(ptr, &route) } {
             let Some(scratch) = FLOW_SCRATCH.get_ptr_mut(0) else { return TC_ACT_SHOT; };
@@ -54,7 +54,7 @@ pub fn forward(ctx: &TcContext, param: &DaeParam, link: usize, wan: bool, tcp_po
         }
         let listener = if tcp { if pure_syn { IPPROTO_TCP } else { 0 } } else { IPPROTO_UDP };
         let protocol = if packet.tuple.ip_version == 4 { ETH_P_IP } else { ETH_P_IPV6 };
-        unsafe { do_redirect(ctx.skb.skb, param, link, listener, protocol, wan) }
+        unsafe { do_redirect(ctx.as_ptr().cast::<__sk_buff>(), param, link, listener, protocol, wan) }
     };
     if wan && tcp { unsafe { *tcp_policy = if verdict == TC_ACT_OK { 3 } else { 2 }; } }
     verdict

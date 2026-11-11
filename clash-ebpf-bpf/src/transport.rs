@@ -1,7 +1,7 @@
 pub mod fast;
 
 use crate::maps::{PARSE_CTX_MAP, PARSED_PKT_MAP};
-use aya_ebpf::programs::TcContext;
+use aya_ebpf::{EbpfContext, programs::TcContext};
 use aya_ebpf_bindings::helpers::bpf_skb_load_bytes;
 use clash_ebpf_bpf::policy::ipv4_is_fragment;
 use clash_ebpf_common::{In6Addr, ParseTransportCtx, Tuples};
@@ -136,7 +136,7 @@ pub fn udp_has_quic_long_header(
         return false;
     }
 
-    let skb = ctx.skb.skb as *mut _;
+    let skb = ctx.as_ptr();
     let mut offset = link_h_len;
     let mut nexthdr = IPPROTO_UDP;
 
@@ -237,7 +237,7 @@ impl ParseTransportExt for ParseTransportCtx {
         ctx: &TcContext,
         link_h_len: u32,
     ) -> Result<(), c_long> {
-        let skb_ptr = ctx.skb.skb as *mut _;
+        let skb_ptr = ctx.as_ptr();
         let mut offset = 0u32;
 
         if link_h_len == ETH_HLEN {
