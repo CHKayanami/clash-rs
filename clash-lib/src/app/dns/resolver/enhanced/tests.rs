@@ -544,3 +544,153 @@ async fn test_qtype_filter_exchange() {
     assert_eq!(rcode, 0);
     assert_eq!(ancount, 0);
 }
+
+#[tokio::test]
+async fn real_resolution_bypasses_fake_ip_and_preserves_policy_and_cache() {
+    use std::{collections::HashMap, net::{IpAddr, Ipv4Addr}, sync::{Arc, atomic::{AtomicUsize, Ordering}}, time::Duration};
+
+    use arc_swap::ArcSwap;
+    use bytes::Bytes;
+    use tokio::{net::UdpSocket, time::timeout};
+    use url::Host;
+
+    use super::{DnsCache, NameServerPolicyContainer, ReverseLookupCache};
+    use crate::app::dns::{
+        config::{DNSNetMode, NameServer},
+        fakeip::{FakeDns, Opts},
+        query::{DnsName, IngressProfile, QType, QueryContext},
+        response::build_dns_ip_response,
+        upstream_pool::{UpstreamEntry, UpstreamPool},
+        wire::extract_ips_from_dns_response,
+    };
+
+    for use_policy in [false, true] {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let address = socket.local_addr().unwrap();
+        let requests = Arc::new(AtomicUsize::new(0));
+        let received = requests.clone();
+        let server = tokio::spawn(async move {
+            let mut buffer = [0; 4096];
+            loop {
+                let (length, peer) = socket.recv_from(&mut buffer).await.unwrap();
+                let query = QueryContext::parse(Bytes::copy_from_slice(&buffer[..length]), IngressProfile::Internal).unwrap();
+                let ip: IpAddr = if query.qtype() == Some(QType::AAAA) {
+                    "2001:db8::2".parse().unwrap()
+                } else { "203.0.113.2".parse().unwrap() };
+                received.fetch_add(1, Ordering::SeqCst);
+                let response = build_dns_ip_response(&query, &[ip], 120).unwrap();
+                socket.send_to(&response, peer).await.unwrap();
+            }
+        });
+        let ns = NameServer { net: DNSNetMode::Udp, host: Host::Ipv4(Ipv4Addr::LOCALHOST),
+            port: address.port(), path: None, interface: None, proxy: None };
+        let key = ns.to_string();
+        let mut resolver = EnhancedResolver::new_default().await;
+        let inner = Arc::get_mut(&mut resolver.inner).unwrap();
+        inner.ipv6.store(true, Ordering::Relaxed);
+        inner.fake_dns = Some(Arc::new(FakeDns::new(Opts::new(
+            "198.18.0.1/16".parse().unwrap(), "fc00::/18".parse().unwrap(),
+        )).unwrap()));
+        inner.lru_cache = Some(DnsCache::new(16));
+        inner.reverse_lookup_cache = Some(ReverseLookupCache::new(16, Duration::from_secs(3600)));
+        inner.pool = UpstreamPool::new(
+            HashMap::from([(key.clone(), UpstreamEntry::from_nameserver(&ns, None).unwrap())]),
+            Arc::new(ArcSwap::from_pointee(HashMap::new())), None, None, None, None,
+        );
+        if use_policy {
+            let mut policy = NameServerPolicyContainer::new();
+            policy.insert("e2e.invalid", vec![key]);
+            inner.policy = Some(policy);
+        } else { inner.main_upstreams = vec![key]; }
+
+        let host = "e2e.invalid";
+        let query = QueryContext::new(DnsName::from_domain(host).unwrap(), QType::A);
+        let external = resolver.exchange(&query, None).await.unwrap();
+        let fake = extract_ips_from_dns_response(&external)[0];
+        assert!(resolver.is_fake_ip(fake));
+        assert_eq!(resolver.reverse_lookup(fake).as_deref(), Some(host));
+        assert_eq!(requests.load(Ordering::SeqCst), 0);
+        assert_eq!(timeout(Duration::from_secs(2), resolver.resolve_v4(host, false)).await.unwrap().unwrap(),
+            Some("203.0.113.2".parse().unwrap()));
+        assert_eq!(timeout(Duration::from_secs(2), resolver.resolve_v6(host, false)).await.unwrap().unwrap(),
+            Some("2001:db8::2".parse().unwrap()));
+        // Cached real answers remain available to internal callers while DNS
+        // clients continue receiving fake addresses for the very same domain.
+        assert_eq!(resolver.resolve(host, false).await.unwrap(), Some("2001:db8::2".parse().unwrap()));
+        assert_eq!(resolver.resolve_v4(host, false).await.unwrap(), Some("203.0.113.2".parse().unwrap()));
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
+        assert_eq!(resolver.cached_for("203.0.113.2".parse().unwrap()).as_deref(), Some(host));
+        let external = resolver.exchange(&query, None).await.unwrap();
+        assert_eq!(extract_ips_from_dns_response(&external), vec![fake]);
+        let fake_v6 = resolver.resolve_v6(host, true).await.unwrap().unwrap();
+        assert!(resolver.is_fake_ip(IpAddr::V6(fake_v6)));
+        assert_eq!(resolver.resolve(host, true).await.unwrap(), Some(IpAddr::V6(fake_v6)));
+        resolver.set_ipv6(false);
+        assert_eq!(resolver.resolve(host, true).await.unwrap(), Some(fake));
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
+        server.abort();
+    }
+}
+
+#[tokio::test]
+async fn hosts_family_mismatch_returns_none_without_upstream_or_fake_ip() {
+    use std::{net::IpAddr, sync::atomic::Ordering};
+    use super::{DnsCache, ResponseTemplate};
+    use crate::{app::dns::{
+        fakeip::{FakeDns, Opts},
+        query::{DnsName, QType},
+        response::build_dns_ip_response,
+        wire::extract_ips_from_dns_response,
+    }, common::trie::StringTrie};
+
+    let mut resolver = EnhancedResolver::new_default().await;
+    let inner = Arc::get_mut(&mut resolver.inner).unwrap();
+    inner.ipv6.store(true, Ordering::Relaxed);
+    let mut hosts = StringTrie::new();
+    hosts.insert("v4.invalid", Arc::new("203.0.113.4".parse::<IpAddr>().unwrap()));
+    hosts.insert("v6.invalid", Arc::new("2001:db8::4".parse::<IpAddr>().unwrap()));
+    inner.hosts = Some(hosts);
+    inner.fake_dns = Some(Arc::new(FakeDns::new(Opts::new(
+        "198.18.0.1/16".parse().unwrap(), "fc00::/18".parse().unwrap(),
+    )).unwrap()));
+    inner.lru_cache = Some(DnsCache::new(16));
+    // Even a cached address for the other family must not override hosts.
+    for (host, qtype, ip) in [("v4.invalid", QType::AAAA, "2001:db8::9"),
+        ("v6.invalid", QType::A, "203.0.113.9")] {
+        let query = QueryContext::new(DnsName::from_domain(host).unwrap(), qtype);
+        let response = build_dns_ip_response(&query, &[ip.parse().unwrap()], 120).unwrap();
+        let template = Arc::new(ResponseTemplate::validate(&query, &response).unwrap());
+        resolver.process_fresh_response(&query, host, &response, Some(template)).await;
+    }
+    for enhanced in [false, true] {
+        assert_eq!(resolver.resolve_v4("v4.invalid", enhanced).await.unwrap(), Some("203.0.113.4".parse().unwrap()));
+        assert_eq!(resolver.resolve_v6("v4.invalid", enhanced).await.unwrap(), None);
+        assert_eq!(resolver.resolve_v4("v6.invalid", enhanced).await.unwrap(), None);
+        assert_eq!(resolver.resolve_v6("v6.invalid", enhanced).await.unwrap(), Some("2001:db8::4".parse().unwrap()));
+    }
+    for (host, qtype) in [("v4.invalid", QType::AAAA), ("v6.invalid", QType::A)] {
+        let query = QueryContext::new(DnsName::from_domain(host).unwrap(), qtype);
+        let response = resolver.exchange(&query, None).await.unwrap();
+        assert!(extract_ips_from_dns_response(&response).is_empty());
+        assert_eq!(response[3] & 15, 0); // NODATA, not NXDOMAIN.
+    }
+}
+
+#[tokio::test]
+async fn address_resolution_uses_shared_filters_and_ipv6_switch() {
+    use super::BlackDomainFilter;
+    use crate::app::dns::query::QType;
+
+    let mut resolver = EnhancedResolver::new_default().await;
+    let inner = Arc::get_mut(&mut resolver.inner).unwrap();
+    inner.black_domain_filter = Some(BlackDomainFilter::new(["blocked.invalid"]));
+    inner.qtype_filter.insert(QType::A);
+    assert_eq!(resolver.resolve("blocked.invalid", false).await.unwrap(), None);
+    assert_eq!(resolver.resolve_v4("blocked.invalid", false).await.unwrap(), None);
+    assert_eq!(resolver.resolve_v6("blocked.invalid", false).await.unwrap(), None);
+    assert_eq!(resolver.resolve_v4("filtered.invalid", false).await.unwrap(), None);
+    assert_eq!(resolver.resolve_v6("disabled.invalid", false).await.unwrap(), None);
+    // Literals never enter DNS filtering or require a DNS transport.
+    assert_eq!(resolver.resolve_v4("127.0.0.1", false).await.unwrap(), Some("127.0.0.1".parse().unwrap()));
+    assert_eq!(resolver.resolve_v6("::1", false).await.unwrap(), Some("::1".parse().unwrap()));
+}

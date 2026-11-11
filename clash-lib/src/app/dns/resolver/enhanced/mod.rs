@@ -9,7 +9,7 @@ pub use policy::NameServerPolicyContainer;
 pub use reverse_cache::ReverseLookupCache;
 
 use std::collections::{HashMap, HashSet};
-use std::net::{self, IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::{self, IpAddr};
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -43,7 +43,6 @@ use crate::app::router::Router;
 use crate::common::trie;
 use crate::config::def::DNSMode;
 use crate::proxy::utils::OutboundNodeRegistry;
-use crate::Error;
 
 #[derive(Clone)]
 pub struct EnhancedResolver {
@@ -407,19 +406,15 @@ impl EnhancedResolver {
     async fn lookup_ip(
         &self,
         host: &str,
-        is_v6: bool,
+        qtype: QType,
+        enhanced: bool,
     ) -> anyhow::Result<Vec<net::IpAddr>> {
-        let qtype = if is_v6 { QType::AAAA } else { QType::A };
         let name = DnsName::from_domain(host)
             .ok_or_else(|| anyhow!("invalid domain name: {host}"))?;
 
         let query = QueryContext::new(name, qtype);
-        let response = self.exchange(&query, None).await?;
-        let ips = extract_ips_from_dns_response(&response);
-        if ips.is_empty() {
-            return Err(anyhow!("no record for hostname: {}", host));
-        }
-        Ok(ips)
+        let response = self.exchange_query(&query, enhanced).await?;
+        Ok(extract_ips_from_dns_response(&response))
     }
 
     async fn exchange_no_cache(&self, query: &QueryContext) -> anyhow::Result<Vec<u8>> {
@@ -447,237 +442,14 @@ impl EnhancedResolver {
         self.fallback_exchange(query).await
     }
 
-    async fn process_fresh_response(
-        &self,
-        query: &QueryContext,
-        host: &str,
-        raw_resp: &[u8],
-        template_to_publish: Option<Arc<ResponseTemplate>>,
-    ) {
-        let ips = extract_ips_from_dns_response(raw_resp);
-        let fixed_ttl = self.match_fixed_domain_ttl(host);
-        let mut ttl = fixed_ttl
-            .or_else(|| extract_min_ttl_from_dns_response(raw_resp))
-            .unwrap_or(60);
-
-        if fixed_ttl.is_none() && self.optimistic_cache_ttl > 0 {
-            ttl = ttl.max(self.optimistic_cache_ttl);
-        }
-
-        trace!(
-            domain = %host,
-            ?ips,
-            ttl,
-            "DNS resolved response received"
-        );
-
-        // 1. Cache insertion (with ACME challenge, 0.0.0.0 pollution filtering, and fixed_ttl=0 never-cache)
-        if let (Some(template), Some(lru)) = (template_to_publish, &self.lru_cache) {
-            let is_acme = query.qtype() == Some(QType::TXT) && host.starts_with("_acme-challenge.");
-            let is_unspecified = !ips.is_empty() && ips.iter().all(|ip| ip.is_unspecified());
-            let never_cache = fixed_ttl == Some(0) || ttl == 0;
-
-            if !is_acme && !is_unspecified && !never_cache {
-                lru.insert(query, template, ttl, self.stale_cache_retention);
-            }
-        }
-
-        // 2. Save reverse lookup cache (with same TTL and conflict detection)
-        if let Some(cache) = &self.reverse_lookup_cache {
-            let never_cache = fixed_ttl == Some(0) || ttl == 0;
-            if !never_cache {
-                for ip in &ips {
-                    if !ip.is_unspecified() {
-                        cache.insert(*ip, host, ttl);
-                    }
-                }
-            }
-        }
-
-        // 3. Trigger DNS resolution hook (e.g. for eBPF offloading)
-        if let Some(hook) = self.resolution_hook.load().as_ref() {
-            if !ips.is_empty() {
-                (hook.0)(host, &ips, Duration::from_secs(ttl as u64));
-            }
-        }
-    }
-}
-
-#[async_trait]
-impl ClashResolver for EnhancedResolver {
-    fn register_resolution_hook(&self, hook: DnsResolutionHook) {
-        self.resolution_hook
-            .store(Some(Arc::new(DnsResolutionHookWrapper(hook))));
-    }
-
-    fn unregister_resolution_hook(&self, hook: &DnsResolutionHook) {
-        self.resolution_hook.rcu(|current| match current {
-            Some(wrapper) if Arc::ptr_eq(&wrapper.0, hook) => None,
-            _ => current.clone(),
-        });
-    }
-
-    async fn resolve(
-        &self,
-        host: &str,
-        enhanced: bool,
-    ) -> anyhow::Result<Option<net::IpAddr>> {
-        if host.is_empty() {
-            return Ok(None);
-        }
-        debug!(domain = %host, enhanced, "DNS resolve requested");
-        if self.is_blacklisted(host) {
-            debug!("dns resolve domain in blacklist: {}", host);
-            return Ok(None);
-        }
-
-        if let Some(ip) = parse_ip_literal(host) {
-            return Ok(Some(ip));
-        }
-
-        if let Some(hosts) = &self.hosts {
-            if let Some(h) = hosts.search(host).and_then(|h| h.get_data()) {
-                debug!(domain = %host, ip = ?h, "DNS matched hosts file");
-                return Ok(Some(*h));
-            }
-        }
-
-        if enhanced && let Some(fake_dns) = &self.fake_dns {
-            if !fake_dns.should_skip(host) {
-                let ip = fake_dns.lookup(host);
-                debug!(domain = %host, ?ip, "DNS Fake-IP assigned");
-                return Ok(Some(ip));
-            }
-        }
-
-        let is_v6 = self.ipv6();
-        let ips = self.lookup_ip(host, is_v6).await?;
-        let chosen = ips.into_iter().choose(&mut rand::rng());
-        debug!(domain = %host, ?chosen, "DNS resolve completed");
-        Ok(chosen)
-    }
-
-    async fn resolve_v4(
-        &self,
-        host: &str,
-        enhanced: bool,
-    ) -> anyhow::Result<Option<net::Ipv4Addr>> {
-        if host.is_empty() {
-            return Ok(None);
-        }
-
-        if self.is_blacklisted(host) {
-            debug!("dns resolve_v4 domain in blacklist: {}", host);
-            return Ok(None);
-        }
-
-        if let Some(ip) = parse_ip_literal(host) {
-            match ip {
-                net::IpAddr::V4(v4) => return Ok(Some(v4)),
-                _ => return Ok(None),
-            }
-        }
-
-        if let Some(hosts) = &self.hosts {
-            if let Some(h) = hosts.search(host).and_then(|h| h.get_data()) {
-                match h {
-                    net::IpAddr::V4(v4) => return Ok(Some(*v4)),
-                    _ => return Ok(None),
-                }
-            }
-        }
-
-        if enhanced && let Some(fake_dns) = &self.fake_dns {
-            if !fake_dns.should_skip(host) {
-                if let net::IpAddr::V4(ip) = fake_dns.lookup(host) {
-                    return Ok(Some(ip));
-                }
-            }
-        }
-
-        let ips = self.lookup_ip(host, false).await?;
-        let v4s: Vec<Ipv4Addr> = ips
-            .into_iter()
-            .filter_map(|ip| match ip {
-                IpAddr::V4(v4) => Some(v4),
-                _ => None,
-            })
-            .collect();
-        match v4s.into_iter().choose(&mut rand::rng()) {
-            Some(v4) => Ok(Some(v4)),
-            None => Ok(None),
-        }
-    }
-
-    async fn resolve_v6(
-        &self,
-        host: &str,
-        enhanced: bool,
-    ) -> anyhow::Result<Option<net::Ipv6Addr>> {
-        if host.is_empty() {
-            return Ok(None);
-        }
-
-        if self.is_blacklisted(host) {
-            debug!("dns resolve_v6 domain in blacklist: {}", host);
-            return Ok(None);
-        }
-
-        if !self.ipv6() {
-            return Err(Error::DNSError("ipv6 disabled".into()).into());
-        }
-
-        if let Some(ip) = parse_ip_literal(host) {
-            match ip {
-                net::IpAddr::V6(v6) => return Ok(Some(v6)),
-                _ => return Ok(None),
-            }
-        }
-
-        if let Some(hosts) = &self.hosts {
-            if let Some(h) = hosts.search(host).and_then(|h| h.get_data()) {
-                match h {
-                    net::IpAddr::V6(v6) => return Ok(Some(*v6)),
-                    _ => return Ok(None),
-                }
-            }
-        }
-
-        if enhanced && let Some(fake_dns) = &self.fake_dns {
-            if !fake_dns.should_skip(host) {
-                if let net::IpAddr::V6(ip) = fake_dns.lookupv6(host) {
-                    return Ok(Some(ip));
-                }
-            }
-        }
-
-        let ips = self.lookup_ip(host, true).await?;
-        let v6s: Vec<Ipv6Addr> = ips
-            .into_iter()
-            .filter_map(|ip| match ip {
-                IpAddr::V6(v6) => Some(v6),
-                _ => None,
-            })
-            .collect();
-        match v6s.into_iter().choose(&mut rand::rng()) {
-            Some(v6) => Ok(Some(v6)),
-            None => Ok(None),
-        }
-    }
-
-    fn cached_for(&self, ip: net::IpAddr) -> Option<String> {
-        self.reverse_lookup_cache
-            .as_ref()
-            .and_then(|cache| cache.lookup(&ip))
-    }
-
-    #[instrument(skip_all, level = "trace")]
-    async fn exchange(&self, query: &QueryContext, _source_ip: Option<net::IpAddr>) -> anyhow::Result<Vec<u8>> {
+    // Internal address resolution must bypass fake-IP synthesis while sharing
+    // the same hosts, policy, cache and singleflight behavior as DNS requests.
+    async fn exchange_query(&self, query: &QueryContext, enhanced: bool) -> anyhow::Result<Vec<u8>> {
         let raw_query = query.wire();
         let host = query.qdomain().unwrap_or_default();
 
         let qtype = query.qtype().unwrap_or(QType::A);
-        debug!(domain = %host, ?qtype, "DNS exchange query received");
+        debug!(domain = %host, ?qtype, enhanced, "DNS exchange query received");
 
         if self.is_blacklisted(host) {
             debug!("dns query domain in blacklist: {}", host);
@@ -715,13 +487,16 @@ impl ClashResolver for EnhancedResolver {
                         return Ok(resp);
                     }
                 }
-                // When the host entry is for the other family or query is non-A/AAAA (e.g. HTTPS/TXT),
-                // fall through to normal resolution rather than returning NODATA.
+                if matches!(qtype, QType::A | QType::AAAA) {
+                    return Ok(build_dns_nodata(raw_query));
+                }
+                // Hosts owns address records. Other record types still use
+                // normal DNS resolution (e.g. HTTPS/TXT).
             }
         }
 
         // 2. Fake-IP match
-        if let Some(fake_dns) = &self.fake_dns {
+        if enhanced && let Some(fake_dns) = &self.fake_dns {
             if matches!(qtype, QType::A | QType::AAAA) && !fake_dns.should_skip(host) {
                 if qtype == QType::A {
                     let fake_ip = fake_dns.lookup(host);
@@ -821,6 +596,131 @@ impl ClashResolver for EnhancedResolver {
         self.process_fresh_response(&query, host, &raw_resp, template_to_publish).await;
 
         Ok(raw_resp)
+    }
+
+    async fn process_fresh_response(
+        &self,
+        query: &QueryContext,
+        host: &str,
+        raw_resp: &[u8],
+        template_to_publish: Option<Arc<ResponseTemplate>>,
+    ) {
+        let ips = extract_ips_from_dns_response(raw_resp);
+        let fixed_ttl = self.match_fixed_domain_ttl(host);
+        let mut ttl = fixed_ttl
+            .or_else(|| extract_min_ttl_from_dns_response(raw_resp))
+            .unwrap_or(60);
+
+        if fixed_ttl.is_none() && self.optimistic_cache_ttl > 0 {
+            ttl = ttl.max(self.optimistic_cache_ttl);
+        }
+
+        trace!(
+            domain = %host,
+            ?ips,
+            ttl,
+            "DNS resolved response received"
+        );
+
+        // 1. Cache insertion (with ACME challenge, 0.0.0.0 pollution filtering, and fixed_ttl=0 never-cache)
+        if let (Some(template), Some(lru)) = (template_to_publish, &self.lru_cache) {
+            let is_acme = query.qtype() == Some(QType::TXT) && host.starts_with("_acme-challenge.");
+            let is_unspecified = !ips.is_empty() && ips.iter().all(|ip| ip.is_unspecified());
+            let never_cache = fixed_ttl == Some(0) || ttl == 0;
+
+            if !is_acme && !is_unspecified && !never_cache {
+                lru.insert(query, template, ttl, self.stale_cache_retention);
+            }
+        }
+
+        // 2. Save reverse lookup cache (with same TTL and conflict detection)
+        if let Some(cache) = &self.reverse_lookup_cache {
+            let never_cache = fixed_ttl == Some(0) || ttl == 0;
+            if !never_cache {
+                for ip in &ips {
+                    if !ip.is_unspecified() {
+                        cache.insert(*ip, host, ttl);
+                    }
+                }
+            }
+        }
+
+        // 3. Trigger DNS resolution hook (e.g. for eBPF offloading)
+        if let Some(hook) = self.resolution_hook.load().as_ref() {
+            if !ips.is_empty() {
+                (hook.0)(host, &ips, Duration::from_secs(ttl as u64));
+            }
+        }
+    }
+}
+
+#[async_trait]
+impl ClashResolver for EnhancedResolver {
+    fn register_resolution_hook(&self, hook: DnsResolutionHook) {
+        self.resolution_hook
+            .store(Some(Arc::new(DnsResolutionHookWrapper(hook))));
+    }
+
+    fn unregister_resolution_hook(&self, hook: &DnsResolutionHook) {
+        self.resolution_hook.rcu(|current| match current {
+            Some(wrapper) if Arc::ptr_eq(&wrapper.0, hook) => None,
+            _ => current.clone(),
+        });
+    }
+
+    async fn resolve(
+        &self,
+        host: &str,
+        enhanced: bool,
+    ) -> anyhow::Result<Option<net::IpAddr>> {
+        if host.is_empty() { return Ok(None); }
+        if let Some(ip) = parse_ip_literal(host) { return Ok(Some(ip)); }
+        let qtype = if self.ipv6() { QType::AAAA } else { QType::A };
+        let ips = self.lookup_ip(host, qtype, enhanced).await?;
+        Ok(ips.into_iter().choose(&mut rand::rng()))
+    }
+
+    async fn resolve_v4(
+        &self,
+        host: &str,
+        enhanced: bool,
+    ) -> anyhow::Result<Option<net::Ipv4Addr>> {
+        if host.is_empty() { return Ok(None); }
+        if let Some(ip) = parse_ip_literal(host) {
+            return Ok(if let IpAddr::V4(ip) = ip { Some(ip) } else { None });
+        }
+        let ips = self.lookup_ip(host, QType::A, enhanced).await?;
+        Ok(ips.into_iter().filter_map(|ip| match ip {
+            IpAddr::V4(ip) => Some(ip),
+            _ => None,
+        }).choose(&mut rand::rng()))
+    }
+
+    async fn resolve_v6(
+        &self,
+        host: &str,
+        enhanced: bool,
+    ) -> anyhow::Result<Option<net::Ipv6Addr>> {
+        if host.is_empty() { return Ok(None); }
+        if let Some(ip) = parse_ip_literal(host) {
+            return Ok(if let IpAddr::V6(ip) = ip { Some(ip) } else { None });
+        }
+        let ips = self.lookup_ip(host, QType::AAAA, enhanced).await?;
+        Ok(ips.into_iter().filter_map(|ip| match ip {
+            IpAddr::V6(ip) => Some(ip),
+            _ => None,
+        }).choose(&mut rand::rng()))
+    }
+
+    fn cached_for(&self, ip: net::IpAddr) -> Option<String> {
+        self.reverse_lookup_cache
+            .as_ref()
+            .and_then(|cache| cache.lookup(&ip))
+    }
+
+    #[instrument(skip_all, level = "trace")]
+    async fn exchange(&self, query: &QueryContext, _source_ip: Option<net::IpAddr>) -> anyhow::Result<Vec<u8>> {
+        self.exchange_query(query, true).await
     }
 
     fn reverse_lookup(&self, ip: net::IpAddr) -> Option<String> {
