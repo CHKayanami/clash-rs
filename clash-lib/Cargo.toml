@@ -116,7 +116,7 @@ percent-encoding = "2"
 bytes = "1"
 ipnet = "2"
 regex = "1"
-fancy-regex = "0.19"
+fancy-regex = "0.20"
 byteorder = "1"
 moka = { version = "0.12", features = ["future", "sync"] }
 uuid = { version = "1", features = ["v4", "v5", "fast-rng", "macro-diagnostics", "serde"] }
@@ -127,11 +127,11 @@ zstd = "0.14"
 portable-atomic = { version = "1", features = ["serde"] }
 generic-array = "1.4"
 dashmap = "6"
-parking_lot = "0.12"
+parking_lot = "0.13"
 arc-swap = "1"
 itoa = "1"
 redb = "4"
-lru = "0.18"
+lru = "0.19"
 enum_dispatch = "0.3"
 
 h2 = "0.4"
@@ -263,8 +263,8 @@ hyperlocal = { version = "0.9", features = ["client"] }
 
 [target.'cfg(target_os="linux")'.dependencies]
 clash-ebpf = { path = "../clash-ebpf", optional = true }
-rtnetlink = "0.23"
-netlink-packet-route = "0.33"
+rtnetlink = "0.24"
+netlink-packet-route = "0.34"
 
 [target.'cfg(target_os="ios")'.dependencies]
 tracing-oslog = "0.3"

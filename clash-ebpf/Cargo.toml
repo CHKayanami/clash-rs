@@ -25,8 +25,8 @@ serde = { version = "1", features = ["derive"] }
 network-interface = "2"
 clash-ebpf-common = { path = "../clash-ebpf-common", features = ["user"] }
 clash-common = { path = "../clash-common" }
-rtnetlink = "0.23"
-netlink-packet-route = "0.33"
+rtnetlink = "0.24"
+netlink-packet-route = "0.34"
 nix = { version = "0.31", default-features = false, features = ["net", "socket", "fs"] }
 aya = { version = "0.16", default-features = false }
 arc-swap = "1"
