@@ -7,6 +7,7 @@ mod rp_filter_tests;
 #[cfg(all(test, target_os = "linux"))]
 mod address_set_tests;
 mod nft_sets;
+pub(super) mod dns;
 #[cfg(target_os = "linux")]
 mod rp_filter;
 #[cfg(target_os = "linux")]
@@ -115,6 +116,28 @@ fn quote(value: &str) -> io::Result<String> {
     Ok(format!("\"{value}\""))
 }
 
+// Share interface/UID selection between packet routing and DNS NAT hooks.
+fn scope_exclusions(cfg: &TunConfig, interface: &str, output: bool, verdict: &str)
+    -> io::Result<Vec<String>> {
+    let mut rules = Vec::new();
+    for name in &cfg.exclude_interface {
+        rules.push(format!("{interface} {} {verdict}", quote(name)?));
+    }
+    if !cfg.include_interface.is_empty() {
+        let names = cfg.include_interface.iter().map(|name| quote(name))
+            .collect::<io::Result<Vec<_>>>()?.join(", ");
+        rules.push(format!("{interface} != {{ {names} }} {verdict}"));
+    }
+    if output {
+        for uid in &cfg.exclude_uid { rules.push(format!("meta skuid {uid} {verdict}")); }
+        if !cfg.include_uid.is_empty() {
+            let users = cfg.include_uid.iter().map(u32::to_string).collect::<Vec<_>>().join(", ");
+            rules.push(format!("meta skuid != {{ {users} }} {verdict}"));
+        }
+    }
+    Ok(rules)
+}
+
 fn rules(cfg: &TunConfig, device: &str, table: &str, tcp_port: Option<u16>) -> io::Result<String> {
     let bypass = cfg.so_mark.unwrap_or(0x162);
     debug_assert!(!matches!(bypass, 0 | INPUT_MARK | BYPASS_MARK));
@@ -169,20 +192,8 @@ fn rules(cfg: &TunConfig, device: &str, table: &str, tcp_port: Option<u16>) -> i
         // packet mark used by Tailscale, WireGuard or other policy routing.
         add(format!("meta l4proto {{ tcp, udp }} ct mark {BYPASS_MARK} return"));
         add(format!("meta l4proto {{ tcp, udp }} ct mark {INPUT_MARK} meta mark set {INPUT_MARK} return"));
-        for name in &cfg.exclude_interface {
-            add(format!("{interface} {} {bypassed}", quote(name)?));
-        }
-        if !cfg.include_interface.is_empty() {
-            let names = cfg.include_interface.iter().map(|name| quote(name))
-                .collect::<io::Result<Vec<_>>>()?.join(", ");
-            add(format!("{interface} != {{ {names} }} {bypassed}"));
-        }
-        if chain == "output" {
-            for uid in &cfg.exclude_uid { add(format!("meta skuid {uid} {bypassed}")); }
-            if !cfg.include_uid.is_empty() {
-                let users = cfg.include_uid.iter().map(u32::to_string).collect::<Vec<_>>().join(", ");
-                add(format!("meta skuid != {{ {users} }} {bypassed}"));
-            }
+        for rule in scope_exclusions(cfg, interface, chain == "output", bypassed)? {
+            add(rule);
         }
         add(format!("ip daddr @exclude4 {bypassed}"));
         add(format!("ip6 daddr @exclude6 {bypassed}"));
@@ -194,6 +205,7 @@ fn rules(cfg: &TunConfig, device: &str, table: &str, tcp_port: Option<u16>) -> i
             add(bypassed.into());
         }
     }
+    dns::write_rules(&mut script, cfg, &device, table, tcp_port)?;
     if let Some(port) = tcp_port {
         for hook in ["prerouting", "output"] {
             let chain = format!("{hook}_tcp");

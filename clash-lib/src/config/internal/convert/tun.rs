@@ -1,13 +1,71 @@
 use std::collections::HashMap;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+use ipnet::IpNet;
 
 use crate::config::internal::tun::{AUTO_REDIRECT_INPUT_MARK, AUTO_REDIRECT_BYPASS_MARK, TunDevice, parse_device_id, validate_interface_name};
 
 use crate::app::remote_content_manager::providers::rule_provider::RuleSetBehavior;
+use crate::app::dns::{config::Config as DnsConfig, resolver::router::config::UpstreamType};
+use crate::session::Network;
 
 use crate::{
     Error,
     config::{config, def},
 };
+
+// Resolve once during conversion. Runtime DNS rules and hijack matching share
+// the same addresses, so neither has to derive or guess the other's targets.
+pub(super) fn configure_dns_hijack(tun: &mut config::TunConfig, dns: &DnsConfig)
+    -> Result<(), Error> {
+    tun.auto_redirect_dns_address = (None, None);
+    if !tun.auto_redirect || !tun.dns_hijack.is_enabled() { return Ok(()); }
+    let rules = tun.dns_hijack.rules();
+    let mut addresses = (None, None);
+    for network in [Some(IpNet::V4(tun.gateway)), tun.gateway_v6.map(IpNet::V6)]
+        .into_iter().flatten()
+    {
+        if !rules.iter().any(|rule| match rule {
+            config::DnsHijackRule::Any { network, .. } => *network != Some(Network::Tcp),
+            config::DnsHijackRule::IpNet { network: protocol, ipnet, .. } => {
+                *protocol != Some(Network::Tcp) && ipnet.addr().is_ipv4() == network.addr().is_ipv4()
+            }
+        }) { continue; }
+        let next = match network {
+            IpNet::V4(network) => u32::from(network.addr()).checked_add(1)
+                .map(Ipv4Addr::from).filter(|address| *address != network.broadcast()).map(IpAddr::V4),
+            IpNet::V6(network) => u128::from(network.addr()).checked_add(1)
+                .map(Ipv6Addr::from).map(IpAddr::V6),
+        };
+        let address = next.filter(|address| network.contains(address)).ok_or_else(|| Error::InvalidConfig(
+            format!("auto-redirect DNS hijack requires a non-broadcast next address in {network}"),
+        ))?;
+        let overlaps = if let Some(dns2) = &dns.dns2 {
+            dns2.enable && dns2.upstreams.iter().any(|upstream| {
+                upstream.upstream_type == UpstreamType::FakeIp && match address {
+                    IpAddr::V4(address) => upstream.inet4_range.contains(&address),
+                    IpAddr::V6(address) => upstream.inet6_range.contains(&address),
+                }
+            })
+        } else {
+            dns.enable && matches!(dns.enhance_mode, def::DNSMode::FakeIp) && match address {
+                IpAddr::V4(address) => dns.fake_ip_range.contains(&address),
+                IpAddr::V6(address) => dns.fake_ip_range6.contains(&address),
+            }
+        };
+        if overlaps {
+            return Err(Error::InvalidConfig(format!(
+                "auto-redirect DNS address {address} overlaps a fake-ip pool; change tun.gateway/gateway-v6 or the fake-ip range",
+            )));
+        }
+        match address {
+            IpAddr::V4(address) => addresses.0 = Some(address),
+            IpAddr::V6(address) => addresses.1 = Some(address),
+        }
+    }
+    tun.auto_redirect_dns_address = addresses;
+    Ok(())
+}
 
 pub(super) fn validate_address_sets(
     tun: Option<&def::TunConfig>,
@@ -134,6 +192,7 @@ pub fn convert(
                 stack: t.stack,
                 route_all: t.route_all,
                 auto_redirect: t.auto_redirect,
+                auto_redirect_dns_address: (None, None),
                 route_address_set: t.route_address_set,
                 route_exclude_address_set: t.route_exclude_address_set,
                 routes,
@@ -204,6 +263,39 @@ pub fn convert(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn auto_redirect_dns_addresses_reject_broadcast_and_fake_ip_overlap() {
+        let mut cfg = config::TunConfig { auto_redirect: true, dns_hijack: config::DnsHijack::All,
+            gateway: "172.18.0.1/30".parse().unwrap(),
+            gateway_v6: Some("fdfe:dcba:9876::1/126".parse().unwrap()), ..Default::default() };
+        let dns = DnsConfig { enable: true, enhance_mode: def::DNSMode::FakeIp,
+            fake_ip_range: "198.18.0.1/16".parse().unwrap(),
+            fake_ip_range6: "fc00::/18".parse().unwrap(), ..Default::default() };
+        configure_dns_hijack(&mut cfg, &dns).unwrap();
+        assert_eq!(cfg.auto_redirect_dns_address,
+            (Some("172.18.0.2".parse().unwrap()), Some("fdfe:dcba:9876::2".parse().unwrap())));
+        for gateway in ["172.18.0.2/30", "172.18.0.1/32", "255.255.255.255/32"] {
+            cfg.gateway = gateway.parse().unwrap();
+            assert!(configure_dns_hijack(&mut cfg, &dns).unwrap_err().to_string().contains("non-broadcast"));
+        }
+        cfg.gateway = "198.18.0.1/24".parse().unwrap();
+        assert!(configure_dns_hijack(&mut cfg, &dns).unwrap_err().to_string().contains("overlaps a fake-ip pool"));
+        cfg.gateway = "172.18.0.1/30".parse().unwrap();
+        cfg.gateway_v6 = Some("fc00::1/126".parse().unwrap());
+        assert!(configure_dns_hijack(&mut cfg, &dns).unwrap_err().to_string().contains("overlaps a fake-ip pool"));
+        cfg.gateway_v6 = Some("ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff/128".parse().unwrap());
+        assert!(configure_dns_hijack(&mut cfg, &dns).is_err());
+    }
+
+    #[test]
+    fn auto_redirect_dns_addresses_validate_dns2_fake_ip_pools() {
+        let raw: def::Config = "dns2:\n  enable: true\n  upstreams:\n    - tag: fake\n      type: fakeip\n      inet4-range: 172.18.0.0/24\n".parse().unwrap();
+        let dns = (&raw).try_into().unwrap();
+        let mut cfg = config::TunConfig { auto_redirect: true, dns_hijack: config::DnsHijack::All,
+            gateway: "172.18.0.1/30".parse().unwrap(), ..Default::default() };
+        assert!(configure_dns_hijack(&mut cfg, &dns).unwrap_err().to_string().contains("overlaps a fake-ip pool"));
+    }
 
     #[test]
     fn tun_fd_scheme_is_normalized_and_rejected_by_auto_redirect() {

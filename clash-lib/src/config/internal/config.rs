@@ -208,6 +208,14 @@ impl Default for DnsHijack {
 }
 
 impl DnsHijack {
+    pub(crate) fn rules(&self) -> &[DnsHijackRule] {
+        match self {
+            Self::Disabled => &[],
+            Self::All => &[DnsHijackRule::Any { network: None, port: 53 }],
+            Self::Rules(rules) => rules,
+        }
+    }
+
     pub fn is_enabled(&self) -> bool {
         !matches!(self, Self::Disabled)
     }
@@ -246,6 +254,7 @@ pub struct TunConfig {
     pub stack: Option<String>,
     pub route_all: bool,
     pub auto_redirect: bool,
+    pub auto_redirect_dns_address: (Option<Ipv4Addr>, Option<Ipv6Addr>),
     pub route_address_set: Vec<String>,
     pub route_exclude_address_set: Vec<String>,
     pub routes: Vec<IpNet>,
@@ -282,6 +291,7 @@ impl Default for TunConfig {
             stack: None,
             route_all: false,
             auto_redirect: false,
+            auto_redirect_dns_address: (None, None),
             route_address_set: Vec::new(),
             route_exclude_address_set: Vec::new(),
             routes: Vec::new(),

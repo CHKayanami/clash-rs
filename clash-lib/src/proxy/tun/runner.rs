@@ -308,6 +308,8 @@ impl AsyncService for TunRunner {
         let dispatcher = self.dispatcher.clone();
         let resolver = self.resolver.clone();
         let dns_hijack = self.cfg.dns_hijack.clone();
+        #[cfg(target_os = "linux")]
+        let dns_hijack = super::auto_redirect::dns::hijack_config(&cfg, dns_hijack);
         let cancellation_token = self.cancellation_token.clone();
 
         let (tun, manage_network) = TunRunner::new_internal(&cfg)

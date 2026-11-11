@@ -107,11 +107,14 @@ pub(super) fn convert(mut c: def::Config) -> Result<config::Config, Error> {
     if let Some(ebpf) = &mut c.ebpf {
         ebpf.routing_mark = effective_mark;
     }
+    let dns = (&c).try_into()?;
+    let mut tun = tun::convert(c.tun.take())?;
+    tun::configure_dns_hijack(&mut tun, &dns)?;
     config::Config {
         general: general::convert(&c)?,
-        dns: (&c).try_into()?,
+        dns,
         experimental: c.experimental.take(),
-        tun: tun::convert(c.tun.take())?,
+        tun,
         ebpf: c.ebpf.take(),
         profile: Profile {
 

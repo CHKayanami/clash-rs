@@ -29,11 +29,11 @@ fn default_tun_device_id() -> String {
 }
 
 fn default_tun_address() -> String {
-    "198.18.0.1/24".to_string()
+    "172.18.0.1/30".to_string()
 }
 
 fn default_tun_address_v6() -> Option<String> {
-    Some("fdfe:dcba:9876::1/64".to_string())
+    Some("fdfe:dcba:9876::1/126".to_string())
 }
 
 fn default_route_table() -> u32 {
@@ -213,7 +213,7 @@ pub struct TunConfig {
     /// tun interface address for IPv6
     /// # Note
     /// - set this to enable IPv6 support in the tun interface
-    /// - Example: `fdfe:dcba:9876::1/64`
+    /// - Example: `fdfe:dcba:9876::1/126`
     #[serde(alias = "gateway-v6", alias = "inet6-address")]
     #[serde(default = "default_tun_address_v6")]
     pub gateway_v6: Option<String>,
@@ -2250,6 +2250,14 @@ sniffer:
         assert!(sniff.http.is_some());
         assert!(sniff.quic.is_some());
         assert_eq!(sniff.http.unwrap().override_destination, Some(true));
+    }
+
+    #[test]
+    fn default_tun_addresses_avoid_the_default_fake_ip_pools() {
+        let config: Config = "tun:\n  enable: false\n".parse().unwrap();
+        let tun = config.tun.unwrap();
+        assert_eq!(tun.gateway, "172.18.0.1/30");
+        assert_eq!(tun.gateway_v6.as_deref(), Some("fdfe:dcba:9876::1/126"));
     }
 
     #[test]
