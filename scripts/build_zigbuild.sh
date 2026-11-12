@@ -7,6 +7,12 @@ if [[ "${USE_ZIGBUILD}" == "true" ]]; then
   export MAKEFLAGS="CC_MM="
 fi
 
+if [[ "${TARGET}" == "aarch64-pc-windows-gnullvm" ]]; then
+  # cargo-zigbuild copies this into both target-specific bindgen variables
+  # before appending Zig's include paths. Clang uses windows-gnu for this ABI.
+  export BINDGEN_EXTRA_CLANG_ARGS="--target=aarch64-pc-windows-gnu ${BINDGEN_EXTRA_CLANG_ARGS:-}"
+fi
+
 FEATURES="${VARIANT}"
 if [[ -n "${EXTRA_FEATURES}" ]]; then
   FEATURES+=",${EXTRA_FEATURES}"
