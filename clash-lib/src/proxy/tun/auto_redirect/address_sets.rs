@@ -1,4 +1,4 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, future::pending, io, sync::Arc, time::Duration};
 
 use tokio::sync::watch::{self, Receiver, Sender};
 use tracing::warn;
@@ -10,7 +10,7 @@ use crate::{
     },
     config::internal::config::TunConfig,
 };
-use super::AutoRedirect;
+use super::{AutoRedirect, dns, local_sources, nft};
 
 #[derive(Clone)]
 pub(in crate::proxy::tun) struct RouteAddressSets {
@@ -59,23 +59,72 @@ impl RouteAddressSets {
     pub async fn run(self, cfg: TunConfig, guard: Arc<AutoRedirect>, mut updates: Receiver<u64>)
         -> Result<(), Error>
     {
+        let mut sources = guard.local_sources.clone();
+        let mut monitor = if cfg.dns_hijack.is_enabled() {
+            match local_sources::SourceMonitor::new() {
+                Ok(monitor) => Some(monitor),
+                Err(error) => {
+                    warn!(
+                        "failed to start netlink local source monitor, falling back to polling: {error}"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let mut fallback = tokio::time::interval(Duration::from_secs(10));
+        fallback.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        fallback.tick().await;
         loop {
-            updates.changed().await.map_err(|error| Error::Operation(
-                format!("TUN address set notifications stopped: {error}"),
-            ))?;
+            let sources_only = tokio::select! {
+                changed = updates.changed() => {
+                    changed.map_err(|error| Error::Operation(
+                        format!("TUN address set notifications stopped: {error}"),
+                    ))?;
+                    false
+                }
+                ready = async {
+                    match monitor.as_mut() {
+                        Some(monitor) => monitor.changed().await,
+                        None => pending().await,
+                    }
+                }, if cfg.dns_hijack.is_enabled() && monitor.is_some() => {
+                    if !ready {
+                        warn!("netlink local source monitor stopped, falling back to polling");
+                        monitor = None;
+                    }
+                    true
+                }
+                _ = fallback.tick(), if cfg.dns_hijack.is_enabled() && monitor.is_none() => true,
+            };
             let sets = self.clone();
             let cfg = cfg.clone();
             let table = guard.table.clone();
+            let device = guard.device.clone();
+            let previous_sources = sources.clone();
             // CIDR aggregation and nft execution may be expensive for large
             // providers. Keep both off Tokio's worker threads. Capture only the
             // name so cancellation can release the table immediately. Refresh
             // only flushes/adds elements; it cannot recreate a deleted table.
-            match tokio::task::spawn_blocking(move || {
-                AutoRedirect::update_sets(&table, &sets.snapshot(&cfg))
+            match tokio::task::spawn_blocking(move || -> io::Result<_> {
+                if sources_only {
+                    let sources = local_sources::prefixes(&cfg, &device)?;
+                    if sources != previous_sources {
+                        let mut script = String::new();
+                        dns::write_sources(&mut script, &table, &sources, false);
+                        nft(&script)?;
+                    }
+                    Ok(Some(sources))
+                } else {
+                    AutoRedirect::update_sets(&table, &sets.snapshot(&cfg))?;
+                    Ok(None)
+                }
             }).await {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => warn!("TUN address set update failed; retrying on next provider update: {error}"),
-                Err(error) => warn!("TUN address set update task failed; retrying on next provider update: {error}"),
+                Ok(Ok(Some(updated))) => sources = updated,
+                Ok(Ok(None)) => {}
+                Ok(Err(error)) => warn!("TUN address set update failed; retrying on next update: {error}"),
+                Err(error) => warn!("TUN address set update task failed; retrying on next update: {error}"),
             }
         }
     }

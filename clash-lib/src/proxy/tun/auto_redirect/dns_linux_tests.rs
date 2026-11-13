@@ -22,23 +22,38 @@ const PEER: &str = r#"
 import socket, subprocess, sys
 print('ready', flush=True)
 sys.stdin.readline()
+for path in [ '/proc/sys/net/ipv6/conf/all/accept_dad',
+              '/proc/sys/net/ipv6/conf/default/accept_dad',
+              '/proc/sys/net/ipv6/conf/peer-test/accept_dad' ]:
+    with open(path, 'w') as f:
+        f.write('0')
 for args in [ ['link','set','lo','up'], ['link','set','peer-test','up'],
               ['addr','add','10.23.0.2/24','dev','peer-test'],
               ['route','add','default','via','10.23.0.1'],
               ['-6','addr','add','fd00:23::2/64','dev','peer-test','nodad'],
-              ['-6','route','add','default','via','fd00:23::1'] ]:
+              ['-6','route','add','default','via','fd00:23::1'],
+              ['addr','add','198.51.100.2/32','dev','lo'],
+              ['-6','addr','add','2001:db8:ffff::2/128','dev','lo','nodad'] ]:
     subprocess.run(['ip'] + args, check=True)
 print('configured', flush=True)
 for line in sys.stdin:
-    protocol, address = line.split()
+    fields = line.split()
+    protocol, address = fields[:2]
     family = socket.AF_INET6 if ':' in address else socket.AF_INET
     kind = socket.SOCK_STREAM if protocol == 'tcp' else socket.SOCK_DGRAM
     with socket.socket(family, kind) as s:
         s.settimeout(3)
+        if len(fields) > 2 and fields[2] != '-': s.bind((fields[2], 0))
         s.connect((address, 53))
         s.sendall(b'query')
         print('sent', flush=True)
         if protocol != 'send':
+            data = s.recv(64)
+            assert data == b'query', data
+            print('reply', flush=True)
+        if len(fields) > 3 and fields[3] == 'reuse':
+            s.sendall(b'query')
+            print('sent', flush=True)
             data = s.recv(64)
             assert data == b'query', data
             print('reply', flush=True)
@@ -72,11 +87,24 @@ impl Peer {
         self.input.write_all(format!("{protocol} {address}\n").as_bytes()).await.unwrap();
         self.expect("sent").await;
     }
+
+    async fn send_reuse(&mut self, protocol: &str, address: &str) {
+        self.input.write_all(format!("{protocol} {address} - reuse\n").as_bytes()).await.unwrap();
+        self.expect("sent").await;
+    }
+
+    async fn send_external(&mut self, protocol: &str, address: &str) {
+        let source = if address.contains(':') { "2001:db8:ffff::2" } else { "198.51.100.2" };
+        self.input.write_all(format!("{protocol} {address} {source}\n").as_bytes()).await.unwrap();
+        self.expect("sent").await;
+    }
 }
 
 async fn setup() -> (AsyncDevice, TunConfig, Peer) {
     for (path, value) in [("/proc/sys/net/ipv4/ip_forward", "1"),
         ("/proc/sys/net/ipv6/conf/all/forwarding", "1"),
+        ("/proc/sys/net/ipv6/conf/all/accept_dad", "0"),
+        ("/proc/sys/net/ipv6/conf/default/accept_dad", "0"),
         ("/proc/sys/net/ipv4/conf/all/rp_filter", "0"),
         ("/proc/sys/net/ipv4/conf/default/rp_filter", "0")] {
         fs::write(path, value).unwrap();
@@ -104,7 +132,10 @@ async fn setup() -> (AsyncDevice, TunConfig, Peer) {
         auto_redirect_dns_address: (Some("172.18.0.2".parse().unwrap()), Some("fdfe:dcba:9876::2".parse().unwrap())),
         dns_hijack: DnsHijack::All, ..Default::default() };
     routes::maybe_add_routes(&cfg, "tun0").unwrap();
-    (tun, cfg, Peer::new().await)
+    let peer = Peer::new().await;
+    ip(&["route", "add", "198.51.100.2/32", "via", "10.23.0.2", "dev", "wan-test"]);
+    ip(&["-6", "route", "add", "2001:db8:ffff::2/128", "via", "fd00:23::2", "dev", "wan-test"]);
+    (tun, cfg, peer)
 }
 
 async fn receive(tun: &AsyncDevice) -> (Vec<u8>, IpAddr) {
@@ -175,13 +206,13 @@ async fn auto_redirect_dns_preserves_host_services_and_exclusions() {
     for address in ["192.0.2.1", "10.23.0.1", "172.17.0.1", "2001:db8:1::1"] {
         let socket = (address.parse::<IpAddr>().unwrap(), 53);
         let server = UdpSocket::bind(socket).await.unwrap();
-        peer.send("udp", address).await;
+        peer.send_external("udp", address).await;
         let mut buffer = [0; 64];
         let (length, client) = timeout(Duration::from_secs(2), server.recv_from(&mut buffer)).await.unwrap().unwrap();
         server.send_to(&buffer[..length], client).await.unwrap();
         peer.expect("reply").await;
         let listener = TcpListener::bind(socket).await.unwrap();
-        peer.send("tcp", address).await;
+        peer.send_external("tcp", address).await;
         let (mut stream, _) = timeout(Duration::from_secs(2), listener.accept()).await.unwrap().unwrap();
         let mut query = [0; 5];
         stream.read_exact(&mut query).await.unwrap();
@@ -208,5 +239,55 @@ async fn auto_redirect_dns_preserves_host_services_and_exclusions() {
         assert!(timeout(Duration::from_millis(100), receive(&tun)).await.is_err(), "case {case}");
         guard.close().unwrap();
     }
+    routes::maybe_routes_clean_up(&cfg).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires TUN, python3 and an isolated network namespace"]
+async fn auto_redirect_lan_gateway_dns_enters_tun_with_fw4_drop_policy() {
+    use crate::proxy::utils::{ToCanonical, get_original_destination_addr};
+    use super::super::{nft, openwrt::Firewall};
+
+    let (tun, mut cfg, mut peer) = setup().await;
+    cfg.route_exclude_address = vec!["10.23.0.0/24".parse().unwrap(), "fd00:23::/64".parse().unwrap()];
+    let redirect = tcp::bind(&cfg).unwrap().unwrap();
+    let guard = AutoRedirect::start(&cfg, "tun0", Some(redirect.local_addr().unwrap().port())).unwrap().unwrap();
+    // Model fw4's actual chains and include order, not an independent accept
+    // base chain. Forwarding remains DROP except for managed TUN traffic.
+    let include = Firewall::rules("tun0", "test").unwrap();
+    nft(&format!("table inet fw4 {{\n{include}\n\
+        chain input {{ type filter hook input priority filter; policy drop; iifname {{ \"wan-test\", \"lo\" }} accept; }}\n\
+        chain forward {{ type filter hook forward priority filter; policy drop; }}\n}}\n")).unwrap();
+    for (gateway, synthetic) in [("10.23.0.1", "172.18.0.2"),
+        ("fd00:23::1", "fdfe:dcba:9876::2")] {
+        let original = (gateway.parse::<IpAddr>().unwrap(), 53);
+        let dnsmasq = UdpSocket::bind(original).await.unwrap();
+        // Send two queries on the same UDP socket/flow to verify conntrack-cached DNAT
+        // packets still recover INPUT_MARK before mangle's local-destination bypass.
+        peer.send_reuse("udp", gateway).await;
+        for iteration in 0..2 {
+            let (packet, destination) = timeout(Duration::from_secs(2), receive(&tun)).await.unwrap();
+            assert_eq!(destination, synthetic.parse::<IpAddr>().unwrap());
+            echo(&tun, packet).await;
+            peer.expect("reply").await;
+            if iteration == 0 {
+                peer.expect("sent").await;
+            }
+        }
+        let mut buffer = [0; 64];
+        assert!(timeout(Duration::from_millis(50), dnsmasq.recv_from(&mut buffer)).await.is_err());
+        let host_tcp = TcpListener::bind(original).await.unwrap();
+        peer.send("tcp", gateway).await;
+        let (mut accepted, _) = timeout(Duration::from_secs(2), redirect.accept()).await.unwrap().unwrap();
+        assert_eq!(get_original_destination_addr(&accepted).unwrap().to_canonical(), original.into());
+        let mut query = [0; 5];
+        accepted.read_exact(&mut query).await.unwrap();
+        accepted.write_all(&query).await.unwrap();
+        peer.expect("reply").await;
+        assert!(timeout(Duration::from_millis(50), host_tcp.accept()).await.is_err());
+    }
+    let policy = Command::new("nft").args(["list", "chain", "inet", "fw4", "forward"]).output().unwrap();
+    assert!(String::from_utf8(policy.stdout).unwrap().contains("policy drop"));
+    guard.close().unwrap();
     routes::maybe_routes_clean_up(&cfg).unwrap();
 }

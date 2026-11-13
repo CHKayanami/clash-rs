@@ -9,7 +9,7 @@ use netlink_packet_route::{
     rule::{RuleAction, RuleAttribute, RuleFlags, RulePortRange},
 };
 use rtnetlink::{IpVersion, RouteMessageBuilder, new_connection};
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::{
     app::net::OutboundInterface, common::errors::new_io_error,
@@ -519,7 +519,7 @@ pub fn setup_policy_routing(
     tun_cfg: &TunConfig,
     via: &OutboundInterface,
 ) -> std::io::Result<()> {
-    warn!("setting up policy routing via netlink for {}", via.name);
+    info!("setting up policy routing via netlink for {}", via.name);
     run_netlink_async(setup_policy_routing_async(tun_cfg, via))
 }
 
@@ -732,7 +732,7 @@ pub fn maybe_routes_clean_up(tun_cfg: &TunConfig) -> std::io::Result<()> {
         return Ok(());
     }
 
-    warn!("cleaning up policy routing via netlink");
+    info!("cleaning up policy routing via netlink");
     let tun_name = extract_tun_name(&tun_cfg.device_id);
     let mut ifindex = crate::app::net::get_interface_by_name(&tun_name).map(|i| i.index);
     if ifindex.is_none() {

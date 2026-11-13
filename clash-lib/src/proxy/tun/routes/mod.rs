@@ -19,7 +19,7 @@ use other::add_route;
 #[cfg(not(any(windows, target_os = "linux")))]
 pub use other::maybe_routes_clean_up;
 
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::config::internal::config::TunConfig;
 
@@ -36,7 +36,7 @@ pub fn maybe_add_routes(cfg: &TunConfig, tun_name: &str) -> std::io::Result<()> 
         })?;
 
         if cfg.route_all {
-            warn!(
+            info!(
                 "route_all is enabled, all traffic will be routed through the tun \
                  interface"
             );

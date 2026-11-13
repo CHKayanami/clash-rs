@@ -450,7 +450,9 @@ impl AsyncService for TunRunner {
             let mut pipeline = PacketPipeline::default();
             #[cfg(target_os = "linux")]
             if let Some(guard) = auto_redirect
-                && (!cfg.route_address_set.is_empty() || !cfg.route_exclude_address_set.is_empty())
+                && (!cfg.route_address_set.is_empty()
+                    || !cfg.route_exclude_address_set.is_empty()
+                    || cfg.dns_hijack.is_enabled())
             {
                 let cfg = cfg.clone();
                 pipeline.spawn("route_address_sets", async move {

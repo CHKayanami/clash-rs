@@ -14,25 +14,30 @@ pub(super) fn write_sets(script: &mut String, cfg: &TunConfig, table: &str, crea
         ("exclude4", true, &cfg.route_exclude_address),
         ("exclude6", false, &cfg.route_exclude_address),
     ] {
-        if create {
-            let kind = if ipv4 { "ipv4_addr" } else { "ipv6_addr" };
-            writeln!(script, "add set inet {table} {name} {{ type {kind}; flags interval; }}").unwrap();
-        } else {
-            writeln!(script, "flush set inet {table} {name}").unwrap();
+        write_set(script, table, name, ipv4, networks, create);
+    }
+}
+
+pub(super) fn write_set(script: &mut String, table: &str, name: &str, ipv4: bool,
+    networks: &[IpNet], create: bool) {
+    if create {
+        let kind = if ipv4 { "ipv4_addr" } else { "ipv6_addr" };
+        writeln!(script, "add set inet {table} {name} {{ type {kind}; flags interval; }}").unwrap();
+    } else {
+        writeln!(script, "flush set inet {table} {name}").unwrap();
+    }
+    let networks: Vec<_> = networks.iter().copied()
+        .filter(|network| network.addr().is_ipv4() == ipv4).collect();
+    let networks = IpNet::aggregate(&networks);
+    // Bound each command without truncating large providers. All chunks and
+    // all four sets remain part of one atomic nft transaction on stdin.
+    for chunk in networks.chunks(512) {
+        write!(script, "add element inet {table} {name} {{ ").unwrap();
+        for (index, network) in chunk.iter().enumerate() {
+            if index != 0 { script.push_str(", "); }
+            write!(script, "{network}").unwrap();
         }
-        let networks: Vec<_> = networks.iter().copied()
-            .filter(|network| network.addr().is_ipv4() == ipv4).collect();
-        let networks = IpNet::aggregate(&networks);
-        // Bound each command without truncating large providers. All chunks and
-        // all four sets remain part of one atomic nft transaction on stdin.
-        for chunk in networks.chunks(512) {
-            write!(script, "add element inet {table} {name} {{ ").unwrap();
-            for (index, network) in chunk.iter().enumerate() {
-                if index != 0 { script.push_str(", "); }
-                write!(script, "{network}").unwrap();
-            }
-            script.push_str(" }\n");
-        }
+        script.push_str(" }\n");
     }
 }
 

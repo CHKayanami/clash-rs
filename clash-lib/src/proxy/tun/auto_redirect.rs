@@ -7,6 +7,9 @@ mod rp_filter_tests;
 #[cfg(all(test, target_os = "linux"))]
 mod address_set_tests;
 mod nft_sets;
+mod local_sources;
+#[cfg(target_os = "linux")]
+mod openwrt;
 pub(super) mod dns;
 #[cfg(target_os = "linux")]
 mod rp_filter;
@@ -25,6 +28,7 @@ use std::{
 };
 
 use tracing::warn;
+use ipnet::IpNet;
 
 use crate::config::internal::{config::TunConfig, tun::validate_interface_name};
 use nft_sets::write_sets;
@@ -42,6 +46,12 @@ pub(super) struct AutoRedirect {
     closed: AtomicBool,
     #[cfg(target_os = "linux")]
     reverse_path_filter: Option<ReversePathFilter>,
+    #[cfg(target_os = "linux")]
+    firewall: Option<openwrt::Firewall>,
+    #[cfg(target_os = "linux")]
+    device: String,
+    #[cfg(target_os = "linux")]
+    local_sources: Vec<IpNet>,
 }
 
 impl AutoRedirect {
@@ -49,30 +59,54 @@ impl AutoRedirect {
         if !cfg.auto_redirect { return Ok(None); }
         let table = format!("clash_tun_{}_{}", id(),
             NEXT_TABLE.fetch_add(1, Ordering::Relaxed));
-        let script = rules(cfg, device, &table, tcp_port)?;
+        let sources = if cfg.dns_hijack.is_enabled() { local_sources::prefixes(cfg, device)? } else { Vec::new() };
+        let script = rules_with_sources(cfg, device, &table, tcp_port, &sources)?;
         // nft applies the complete batch atomically. A failure leaves no partial
         // table behind; never flush or replace another application's rules.
         #[cfg(target_os = "linux")]
         let reverse_path_filter = ReversePathFilter::enable(device)?;
         nft(&script)?;
-        Ok(Some(Self { table, closed: AtomicBool::new(false),
+        let guard = Self { table, closed: AtomicBool::new(false),
             #[cfg(target_os = "linux")]
             reverse_path_filter,
-        }))
+            #[cfg(target_os = "linux")]
+            firewall: None,
+            #[cfg(target_os = "linux")]
+            device: device.to_owned(),
+            #[cfg(target_os = "linux")]
+            local_sources: sources,
+        };
+        #[cfg(target_os = "linux")]
+        let guard = {
+            let mut guard = guard;
+            guard.firewall = openwrt::Firewall::enable(device, &guard.table)?;
+            guard
+        };
+        Ok(Some(guard))
     }
 
     // Normal shutdown invokes this on spawn_blocking before dropping the guard.
     // Drop remains a synchronous best-effort fallback for aborted initialization
     // or a forcibly aborted service task, where awaiting cleanup is impossible.
     fn cleanup(&self) -> io::Result<()> {
-        if self.closed.load(Ordering::Acquire) { return Ok(()); }
-        let deletion = nft(&format!("delete table inet {}\n", self.table));
-        if deletion.is_ok() { self.closed.store(true, Ordering::Release); }
+        let deletion = if self.closed.load(Ordering::Acquire) { Ok(()) } else {
+            let result = nft(&format!("delete table inet {}\n", self.table));
+            if result.is_ok() { self.closed.store(true, Ordering::Release); }
+            result
+        };
         #[cfg(target_os = "linux")]
-        let restoration = self.reverse_path_filter.as_ref().map_or(Ok(()), ReversePathFilter::restore);
-        #[cfg(not(target_os = "linux"))]
-        let restoration = Ok(());
-        deletion.and(restoration)
+        if let Some(firewall) = &self.firewall
+            && let Err(error) = firewall.close()
+        {
+            warn!("failed to remove TUN fw4 include: {error}");
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(rp_filter) = &self.reverse_path_filter
+            && let Err(error) = rp_filter.restore()
+        {
+            warn!("failed to restore TUN rp_filter: {error}");
+        }
+        deletion
     }
 
     #[cfg(target_os = "linux")]
@@ -138,12 +172,20 @@ fn scope_exclusions(cfg: &TunConfig, interface: &str, output: bool, verdict: &st
     Ok(rules)
 }
 
+#[cfg(test)]
 fn rules(cfg: &TunConfig, device: &str, table: &str, tcp_port: Option<u16>) -> io::Result<String> {
+    let sources = if cfg.dns_hijack.is_enabled() { local_sources::prefixes(cfg, device)? } else { Vec::new() };
+    rules_with_sources(cfg, device, table, tcp_port, &sources)
+}
+
+fn rules_with_sources(cfg: &TunConfig, device: &str, table: &str, tcp_port: Option<u16>,
+    sources: &[IpNet]) -> io::Result<String> {
     let bypass = cfg.so_mark.unwrap_or(0x162);
     debug_assert!(!matches!(bypass, 0 | INPUT_MARK | BYPASS_MARK));
     let device = quote(device)?;
     let mut script = format!("add table inet {table}\n");
     write_sets(&mut script, cfg, table, true);
+    if cfg.dns_hijack.is_enabled() { dns::write_sources(&mut script, table, sources, true); }
     // Only selected packets need a routing mark. Cache decisions exclusively in
     // previously unclaimed TCP/UDP conntrack entries; leave third-party marks
     // untouched. Goto returns to the base-chain policy when these chains end.
@@ -178,11 +220,6 @@ fn rules(cfg: &TunConfig, device: &str, table: &str, tcp_port: Option<u16>) -> i
         // return packets instead of proxying them as new outbound connections.
         add("ct direction reply goto return_traffic".into());
         add("ct state { invalid, untracked } goto return_traffic".into());
-        // These cheap checks do not claim conntrack marks, even on a cache hit.
-        add("fib daddr type local return".into());
-        add("ip daddr { 0.0.0.0/8, 127.0.0.0/8, 169.254.0.0/16, 224.0.0.0/3 } return".into());
-        add("ip6 daddr { ::/128, ::1/128, fe80::/10, ff00::/8 } return".into());
-        if cfg.gateway_v6.is_none() { add("meta nfproto ipv6 return".into()); }
         if chain == "output" {
             // Conntrack applies the existing TCP destination NAT later in this
             // hook. Do not mark/reroute an already redirected connection again.
@@ -190,8 +227,16 @@ fn rules(cfg: &TunConfig, device: &str, table: &str, tcp_port: Option<u16>) -> i
         }
         // ICMP/ICMPv6 ignore the cache. A cached bypass must not alter the
         // packet mark used by Tailscale, WireGuard or other policy routing.
+        // Restore cached UDP/TCP verdicts before the local-destination check so
+        // subsequent packets of a DNATed local DNS flow still get INPUT_MARK.
         add(format!("meta l4proto {{ tcp, udp }} ct mark {BYPASS_MARK} return"));
         add(format!("meta l4proto {{ tcp, udp }} ct mark {INPUT_MARK} meta mark set {INPUT_MARK} return"));
+        // These cheap checks do not claim conntrack marks on new flows.
+        add("fib daddr type local return".into());
+        add("ip daddr { 0.0.0.0/8, 127.0.0.0/8, 169.254.0.0/16, 224.0.0.0/3 } return".into());
+        add("ip6 daddr { ::/128, ::1/128, fe80::/10, ff00::/8 } return".into());
+        add("icmpv6 type { nd-router-solicit, nd-router-advert, nd-neighbor-solicit, nd-neighbor-advert, nd-redirect } return".into());
+        if cfg.gateway_v6.is_none() { add("meta nfproto ipv6 return".into()); }
         for rule in scope_exclusions(cfg, interface, chain == "output", bypassed)? {
             add(rule);
         }
