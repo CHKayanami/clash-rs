@@ -36,7 +36,6 @@ version = "0.20.24-alpha"
 repository = "https://github.com/CHKayanami/clash-rs"
 edition = "2024"
 authors = ["https://github.com/Watfaq/clash-rs/graphs/contributors"]
-homepage = "https://github.com/CHKayanami/clash-rs"
 
 [profile.dev]
 debug = 0

@@ -8,3 +8,6 @@ edition = { workspace = true }
 
 [dependencies]
 clash-lib = { path = "../clash-lib", default-features = false }
+
+[lints]
+workspace = true

@@ -10,3 +10,6 @@ clash-lib = { path = "../clash-lib", default-features = false, features = ["shad
 [lib]
 name = "clashrs"
 crate-type = ["staticlib", "cdylib"]
+
+[lints]
+workspace = true

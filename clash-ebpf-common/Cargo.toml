@@ -14,3 +14,6 @@ aya = { version = "0.16", default-features = false, optional = true }
 [features]
 default = []
 user = ["dep:aya"]
+
+[lints]
+workspace = true

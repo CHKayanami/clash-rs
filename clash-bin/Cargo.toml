@@ -3,7 +3,6 @@ name = "clash-rs"
 repository = { workspace = true }
 version = { workspace = true }
 edition = { workspace = true }
-homepage = { workspace = true }
 authors = { workspace = true }
 
 [features]
@@ -58,5 +57,5 @@ human-panic = "2.0"
 
 aws-lc-rs = { version = "1.16", optional = true, default-features = false }
 
-
-
+[lints]
+workspace = true
