@@ -76,6 +76,8 @@ jobs:
       # Match Zig's musl time_t ABI in boring's high-level libc API.
       CARGO_TARGET_I686_UNKNOWN_LINUX_MUSL_RUSTFLAGS: "--cfg tokio_unstable --cfg libc_unstable_musl_v1_2_3"
       CARGO_TARGET_ARMV7_UNKNOWN_LINUX_MUSLEABIHF_RUSTFLAGS: "--cfg tokio_unstable --cfg libc_unstable_musl_v1_2_3"
+      # Rust 1.100's gnullvm std needs explicit libunwind linkage with Zig.
+      CARGO_TARGET_AARCH64_PC_WINDOWS_GNULLVM_RUSTFLAGS: "--cfg tokio_unstable -C link-arg=-lunwind"
     strategy:
       fail-fast: false
       matrix:
