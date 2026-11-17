@@ -33,10 +33,18 @@ impl Upload {
     }
 }
 
+const INVALIDATION_LOG_CAP: usize = 256;
+type FlowKey = (SocketAddr, SocketAddr);
+
+struct InvalidationLog {
+    ring: [Option<FlowKey>; INVALIDATION_LOG_CAP],
+}
+
 #[derive(Default)]
 pub(crate) struct UploadCache {
     revision: u64,
-    entries: HashMap<(SocketAddr, SocketAddr), Live>,
+    entries: HashMap<FlowKey, Live>,
+    stale: Vec<FlowKey>,
 }
 struct Live {
     id: u64, generation: u64, allow_quic: Arc<AtomicBool>, closed: Arc<AtomicBool>, activity: Arc<ReplyActivity>,
@@ -54,7 +62,8 @@ pub(crate) struct DirectPath {
     executor: engine::Sender,
     engine: Mutex<Option<engine::Engine>>,
     revision: AtomicU64,
-    uploads: DashMap<(SocketAddr, SocketAddr), Cached>,
+    invalidations: Mutex<InvalidationLog>,
+    uploads: DashMap<FlowKey, Cached>,
 }
 
 pub(super) struct Lease {
@@ -64,7 +73,7 @@ pub(super) struct Lease {
 
 pub(super) struct Registration {
     path: Weak<DirectPath>,
-    key: (SocketAddr, SocketAddr),
+    key: FlowKey,
     id: u64,
     generation: u64,
     allow_quic: Arc<AtomicBool>,
@@ -73,7 +82,55 @@ pub(super) struct Registration {
 impl DirectPath {
     pub(crate) fn integrated(mtu: Option<usize>) -> Arc<Self> {
         let (executor, engine) = engine::channel(mtu);
-        Arc::new(Self { executor, engine: Mutex::new(Some(engine)), revision: AtomicU64::new(1), uploads: DashMap::new() })
+        Arc::new(Self {
+            executor,
+            engine: Mutex::new(Some(engine)),
+            revision: AtomicU64::new(0),
+            invalidations: Mutex::new(InvalidationLog {
+                ring: [None; INVALIDATION_LOG_CAP],
+            }),
+            uploads: DashMap::new(),
+        })
+    }
+
+    fn invalidate(&self, key: FlowKey) {
+        let mut log = self.invalidations.lock();
+        let next = self.revision.load(Ordering::Relaxed).wrapping_add(1);
+        log.ring[(next as usize) % INVALIDATION_LOG_CAP] = Some(key);
+        self.revision.store(next, Ordering::Release);
+    }
+
+    fn sync_cache(&self, cache: &mut UploadCache, observed: u64) {
+        if cache.entries.is_empty() {
+            cache.revision = observed;
+            return;
+        }
+        cache.stale.clear();
+        let current = {
+            let log = self.invalidations.lock();
+            let current = self.revision.load(Ordering::Acquire);
+            let delta = current.wrapping_sub(cache.revision);
+            if delta == 0 {
+                return;
+            }
+            if delta <= INVALIDATION_LOG_CAP as u64 {
+                for offset in 1..=delta {
+                    let rev = cache.revision.wrapping_add(offset);
+                    if let Some(key) = log.ring[(rev as usize) % INVALIDATION_LOG_CAP] {
+                        cache.stale.push(key);
+                    }
+                }
+            }
+            current
+        };
+        if current.wrapping_sub(cache.revision) > INVALIDATION_LOG_CAP as u64 {
+            cache.entries.clear();
+        } else {
+            for key in cache.stale.drain(..) {
+                cache.entries.remove(&key);
+            }
+        }
+        cache.revision = current;
     }
     pub(crate) fn take_engine(&self) -> Option<engine::Engine> { self.engine.lock().take() }
     pub(super) fn executor(&self) -> &engine::Sender { &self.executor }
@@ -104,7 +161,7 @@ impl DirectPath {
         source.set_ip(source.ip().to_canonical());
         let key = (source, destination);
         let revision = self.revision.load(Ordering::Acquire);
-        if cache.revision != revision { cache.entries.clear(); cache.revision = revision; }
+        if cache.revision != revision { self.sync_cache(cache, revision); }
         let live = match cache.entries.entry(key) {
             Entry::Occupied(entry) => entry.into_mut(),
             Entry::Vacant(slot) => {
@@ -140,19 +197,21 @@ impl Registration {
     /// direct admission. Creating a lease alone must not bypass that handoff.
     pub(super) fn enable(&self, state: &Arc<FlowState>, association: &Arc<Association>) {
         if let Some(path) = self.path.upgrade() {
-            path.uploads.insert(self.key, Cached { id: self.id, generation: self.generation,
+            let replaced = path.uploads.insert(self.key, Cached { id: self.id, generation: self.generation,
                 allow_quic: self.allow_quic.clone(), state: Arc::downgrade(state),
                 association: Arc::downgrade(association) });
-            path.revision.fetch_add(1, Ordering::Release);
+            if replaced.is_some() {
+                path.invalidate(self.key);
+            }
         }
     }
 }
 
 impl Drop for Registration {
     fn drop(&mut self) {
-        if let Some(path) = self.path.upgrade() {
-            path.uploads.remove_if(&self.key, |_, entry| entry.id == self.id);
-            path.revision.fetch_add(1, Ordering::Release);
+        if let Some(path) = self.path.upgrade()
+            && path.uploads.remove_if(&self.key, |_, entry| entry.id == self.id).is_some() {
+            path.invalidate(self.key);
         }
     }
 }

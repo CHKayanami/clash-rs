@@ -375,3 +375,98 @@ async fn unpublished_slot_falls_back_without_evicting_the_route() {
     assert_eq!(&buffer[..length], b"ready-owner");
     manager.close_all();
 }
+
+#[tokio::test]
+#[serial_test::serial(tun_network_changes)]
+async fn unrelated_flow_churn_keeps_warm_cache_entry_and_replaces_same_tuple() {
+    let manager = Manager::new();
+    let path = DirectPath::integrated(None);
+    let (target, _returned) = mpsc::channel(1);
+    let (incoming, _owner) = drive(path.clone(), target);
+    let (fallback, _fallback_rx) = replies::channel(16);
+    let (events, _closed) = mpsc::unbounded_channel();
+    let pool = UdpAssociationPool::new(AssociationConfig { replies: fallback, direct: Some(path.clone()),
+        closed_flows: events, manager: manager.clone(), allow_quic: Arc::new(AtomicBool::new(true)),
+        timeout: Duration::from_secs(60), capacity: Arc::new(Semaphore::new(64)) });
+    let outbound: ProtocolOutbound = Arc::new(Handler::new("DIRECT")).into();
+    let stable_server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let churn_server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let stable_sess = session(stable_server.local_addr().unwrap());
+    let mut churn_sess = session(churn_server.local_addr().unwrap());
+    churn_sess.source.set_port(24567);
+
+    let stable_flow = pool.connect(&outbound, &stable_sess, resolver(), Arc::new(TrackerInfo::new(&stable_sess, None))).await.unwrap();
+    stable_flow.enable_direct_upload();
+    let stable_key = (stable_sess.source, stable_server.local_addr().unwrap());
+    let churn_key = (churn_sess.source, churn_server.local_addr().unwrap());
+
+    let mut cache = UploadCache::default();
+    let first = path.upload_frame(Packet::from(packet(&stable_sess, b"warm")), &mut cache, Instant::now()).unwrap().unwrap();
+    assert_eq!(first.id, stable_flow.state.id);
+
+    // Churn an unrelated 4-tuple and verify the stable flow stays cached
+    // without touching DashMap (proven by removing stable_key from uploads).
+    let churn_flow = pool.connect(&outbound, &churn_sess, resolver(), Arc::new(TrackerInfo::new(&churn_sess, None))).await.unwrap();
+    churn_flow.enable_direct_upload();
+    assert!(path.upload_frame(Packet::from(packet(&churn_sess, b"churn")), &mut cache, Instant::now()).unwrap().is_some());
+    assert!(cache.entries.contains_key(&churn_key));
+    drop(churn_flow);
+
+    let removed_stable = path.uploads.remove(&stable_key);
+    let still_warm = path.upload_frame(Packet::from(packet(&stable_sess, b"still-warm")), &mut cache, Instant::now()).unwrap().unwrap();
+    assert_eq!(still_warm.id, stable_flow.state.id);
+    assert!(!cache.entries.contains_key(&churn_key));
+    let (_, cached) = removed_stable.unwrap();
+    path.uploads.insert(stable_key, cached);
+
+    // Replacing the same 4-tuple before the old flow is dropped invalidates the old cache entry.
+    let mut replacement_sess = stable_sess.clone();
+    replacement_sess.id = stable_flow.state.id + 1000;
+    let replacement = pool.connect(&outbound, &replacement_sess, resolver(), Arc::new(TrackerInfo::new(&replacement_sess, None))).await.unwrap();
+    replacement.enable_direct_upload();
+    assert_ne!(replacement.state.id, stable_flow.state.id);
+    let updated = path.upload_frame(Packet::from(packet(&stable_sess, b"replaced")), &mut cache, Instant::now()).unwrap().unwrap();
+    assert_eq!(updated.id, replacement.state.id);
+    incoming.send(updated).await.unwrap();
+
+    // Dropping the superseded flow must not evict the active replacement from cache.
+    drop(stable_flow);
+    let still_replacement = path.upload_frame(Packet::from(packet(&stable_sess, b"after-old-drop")), &mut cache, Instant::now()).unwrap().unwrap();
+    assert_eq!(still_replacement.id, replacement.state.id);
+    assert!(cache.entries.contains_key(&stable_key));
+    manager.close_all();
+}
+
+#[tokio::test]
+#[serial_test::serial(tun_network_changes)]
+async fn invalidation_overflow_falls_back_to_clearing_cache() {
+    let manager = Manager::new();
+    let path = DirectPath::integrated(None);
+    let (target, _returned) = mpsc::channel(1);
+    let (_incoming, _owner) = drive(path.clone(), target);
+    let (fallback, _fallback_rx) = replies::channel(16);
+    let (events, _closed) = mpsc::unbounded_channel();
+    let pool = UdpAssociationPool::new(AssociationConfig { replies: fallback, direct: Some(path.clone()),
+        closed_flows: events, manager: manager.clone(), allow_quic: Arc::new(AtomicBool::new(true)),
+        timeout: Duration::from_secs(60), capacity: Arc::new(Semaphore::new(64)) });
+    let outbound: ProtocolOutbound = Arc::new(Handler::new("DIRECT")).into();
+    let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let sess = session(server.local_addr().unwrap());
+    let flow = pool.connect(&outbound, &sess, resolver(), Arc::new(TrackerInfo::new(&sess, None))).await.unwrap();
+    flow.enable_direct_upload();
+    let key = (sess.source, server.local_addr().unwrap());
+    let mut cache = UploadCache::default();
+    assert!(path.upload_frame(Packet::from(packet(&sess, b"warm")), &mut cache, Instant::now()).unwrap().is_some());
+    assert!(cache.entries.contains_key(&key));
+
+    // Exceed INVALIDATION_LOG_CAP without syncing cache; stale entry removed from
+    // uploads directly must be cleared by the overflow fallback.
+    path.uploads.remove(&key);
+    let other_key: FlowKey = ("127.0.0.1:30000".parse().unwrap(), "127.0.0.1:30001".parse().unwrap());
+    for _ in 0..=INVALIDATION_LOG_CAP {
+        path.invalidate(other_key);
+    }
+    assert!(path.upload_frame(Packet::from(packet(&sess, b"missed")), &mut cache, Instant::now()).is_err());
+    assert!(cache.entries.is_empty());
+    manager.close_all();
+}
