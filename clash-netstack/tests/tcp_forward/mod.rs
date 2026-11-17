@@ -292,3 +292,4 @@ async fn handoff_after_write_shutdown_preserves_prefix_and_accepted_tx() {
 }
 
 mod half_close;
+mod pre_handshake;

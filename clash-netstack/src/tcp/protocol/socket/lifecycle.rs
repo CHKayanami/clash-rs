@@ -132,6 +132,7 @@ impl<'a> Socket<'a> {
     }
 
     /// Close the transmit half of the full-duplex connection.
+    /// A passive connection whose handshake is incomplete is reset instead.
     ///
     /// Note that there is no corresponding function for the receive half of the full-duplex
     /// connection; only the remote end can close it. If you no longer wish to receive any
@@ -143,9 +144,12 @@ impl<'a> Socket<'a> {
             // In the SYN-SENT state the remote endpoint is not yet synchronized and, upon
             // receiving an RST, will abort the connection.
             State::SynSent => self.set_state(State::Closed),
-            // In the SYN-RECEIVED, ESTABLISHED and CLOSE-WAIT states the transmit half
+            // Keep SYN sequence space out of FIN accounting. Retaining the
+            // tuple in CLOSED schedules a reset after any queued SYN|ACK.
+            State::SynReceived => self.set_state(State::Closed),
+            // In the ESTABLISHED and CLOSE-WAIT states the transmit half
             // of the connection is open, and needs to be explicitly closed with a FIN.
-            State::SynReceived | State::Established => self.set_state(State::FinWait1),
+            State::Established => self.set_state(State::FinWait1),
             State::CloseWait => self.set_state(State::LastAck),
             // In the FIN-WAIT-1, FIN-WAIT-2, CLOSING, LAST-ACK, TIME-WAIT and CLOSED states,
             // the transmit half of the connection is already closed, and no further

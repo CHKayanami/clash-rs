@@ -472,8 +472,19 @@ fn test_syn_received_window_scaling() {
 #[test]
 fn test_syn_received_close() {
     let mut s = socket_syn_received();
+    // This fixture has received SYN but has not emitted SYN|ACK yet.
     s.close();
-    assert_eq!(s.state, State::FinWait1);
+    assert_eq!(s.state, State::Closed);
+    recv!(
+        s,
+        [TcpRepr {
+            control: TcpControl::Rst,
+            seq_number: LOCAL_SEQ,
+            ack_number: Some(REMOTE_SEQ + 1),
+            ..RECV_TEMPL
+        }]
+    );
+    assert!(s.tuple.is_none());
 }
 
 #[test]
