@@ -68,7 +68,7 @@ impl Drop for TcpListener {
     fn drop(&mut self) {
         self.socket_stream.close();
         if let Some(task) = &self.task_handle { task.abort(); }
-        if let Some(ready) = &self.wake { ready.waker.wake(); }
+        if let Some(ready) = &self.wake { ready.wake(); }
     }
 }
 
@@ -79,9 +79,8 @@ impl TcpListener {
 
     pub fn new(inbound: mpsc::Receiver<Packet>, outbound: mpsc::Sender<Packet>, mtu: usize) -> Self {
         let (sender, socket_stream) = mpsc::channel(256);
-        let ready = Arc::new(ReadyQueue::default());
         let task_handle = tokio::spawn(async move {
-            if let Err(error) = Engine::new(outbound, ready, mtu).run(inbound, sender).await {
+            if let Err(error) = Engine::new(outbound, mtu).run(inbound, sender).await {
                 log::debug!("TCP stack stopped: {error}");
             }
         });

@@ -25,7 +25,7 @@ fn pure_window_growth_wakes_a_reader_without_acknowledging_new_data() {
     let (handle, ack) = established_with_data(&mut driver, &mut sockets, 49152, 80 * 1024);
     window(&mut driver, &mut sockets, handle, ack, 0);
     assert_eq!(Buffers::read_budget(sockets.get_mut(handle)), 0);
-    let queue = Arc::new(ReadyQueue::default());
+    let queue = Arc::new(ReadyQueue::with_waker());
     arm(&mut sockets, handle, &queue);
     window(&mut driver, &mut sockets, handle, ack, 1024);
     assert!(Buffers::read_budget(sockets.get_mut(handle)) > 0);
@@ -44,7 +44,7 @@ fn egress_resumes_read_ahead_after_sending_unsent_bytes_without_an_ack() {
     let (handle, ack) = established_with_data(&mut driver, &mut sockets, 49152, 80 * 1024);
     window(&mut driver, &mut sockets, handle, ack, 256);
     assert_eq!(Buffers::read_budget(sockets.get_mut(handle)), 0);
-    let queue = Arc::new(ReadyQueue::default());
+    let queue = Arc::new(ReadyQueue::with_waker());
     arm(&mut sockets, handle, &queue);
     let (output, mut received) = mpsc::channel(512);
     let mut device = NetstackDevice::new(output);

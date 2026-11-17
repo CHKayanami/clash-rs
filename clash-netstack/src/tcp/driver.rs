@@ -74,32 +74,39 @@ impl Driver {
             let flow = (SocketAddr::new(ip.src_addr().into(), repr.src_port),
                 SocketAddr::new(ip.dst_addr().into(), repr.dst_port));
             let handle = sockets.find(&flow);
-            let reply = match handle {
-                Some(handle) if sockets.get_mut(handle).accepts(&mut self.context, &ip, &repr) =>
-                    sockets.get_mut(handle).process(&mut self.context, &ip, &repr),
-                _ if repr.control != TcpControl::Rst => Some(Socket::rst_reply(&ip, &repr)),
-                _ => None,
-            };
-            if let Some(handle) = handle && sockets.get_mut(handle).state() == State::SynReceived {
-                sockets.mark_started(handle);
-            }
-            if let Some((ip, tcp)) = reply {
+            let mut reply = None;
+            if let Some(handle) = handle {
+                let entry = sockets.entry_mut(handle);
+                if entry.socket.accepts(&mut self.context, &ip, &repr) {
+                    reply = entry.socket.process(&mut self.context, &ip, &repr);
+                } else if repr.control != TcpControl::Rst {
+                    reply = Some(Socket::rst_reply(&ip, &repr));
+                }
+                let syn_received = entry.socket.state() == State::SynReceived;
+                if syn_received {
+                    entry.mark_started();
+                }
+                if let Some((ip, tcp)) = reply {
+                    let packet = reply_packet(ip, tcp);
+                    self.replies.send(packet, output);
+                } else if repr.control == TcpControl::Syn && syn_received {
+                    // Commit SYN transmission into the reserved local reply space.
+                    // Deferred SYN|ACK must precede application close/data output.
+                    let result: Result<(), Infallible> = entry.socket
+                        .dispatch(&mut self.context, |_, _, (ip, tcp)| {
+                            let packet = reply_packet(ip, tcp);
+                            self.replies.send(packet, output);
+                            Ok(())
+                        });
+                    result.expect("reserved SYN response capacity");
+                }
+                if !self.ingress_dirty.contains(&handle) {
+                    self.ingress_dirty.push(handle);
+                }
+            } else if repr.control != TcpControl::Rst {
+                let (ip, tcp) = Socket::rst_reply(&ip, &repr);
                 let packet = reply_packet(ip, tcp);
                 self.replies.send(packet, output);
-            } else if repr.control == TcpControl::Syn && let Some(handle) = handle
-                && sockets.get_mut(handle).state() == State::SynReceived {
-                // Commit SYN transmission into the reserved local reply space.
-                // Deferred SYN|ACK must precede application close/data output.
-                let result: Result<(), Infallible> = sockets.get_mut(handle)
-                    .dispatch(&mut self.context, |_, _, (ip, tcp)| {
-                        let packet = reply_packet(ip, tcp);
-                        self.replies.send(packet, output);
-                        Ok(())
-                    });
-                result.expect("reserved SYN response capacity");
-            }
-            if let Some(handle) = handle && !self.ingress_dirty.contains(&handle) {
-                self.ingress_dirty.push(handle);
             }
         }
         // Preserve first-seen order, including when output backpressure stops
@@ -146,8 +153,9 @@ impl Driver {
 
     pub fn refresh(&mut self, now: Instant, handle: SocketHandle, sockets: &mut SocketTable) {
         self.context.set_now(now);
-        let started = sockets.started(handle);
-        let socket = sockets.get_mut(handle);
+        let entry = sockets.entry_mut(handle);
+        let started = entry.started();
+        let socket = &mut entry.socket;
         if !socket.is_active() && socket.remote_endpoint().is_none()
             && (started || socket.state() != State::Listen) {
             self.schedule.complete(handle);
@@ -363,15 +371,23 @@ fn build_packet(mut ip: IpRepr, tcp: TcpRepr<'_>, segmentation: Option<u16>) -> 
         return encoded_segment(&header[..len], tcp.payload, size);
     }
     ip.set_payload_len(tcp.buffer_len());
-    let header_len = ip.header_len();
-    let mut bytes = vec![0; header_len + tcp.buffer_len()];
-    let checksums = ChecksumCapabilities::default();
+    let ip_len = ip.header_len();
+    let tcp_len = tcp.header_len();
+    let mut bytes = Vec::with_capacity(ip_len + tcp.buffer_len());
+    // Zero only the protocol headers (option padding), skipping the payload copy target.
+    bytes.resize(ip_len + tcp_len, 0);
+    let ip_checksums = ChecksumCapabilities::default();
     match ip {
-        IpRepr::Ipv4(repr) => repr.emit(&mut Ipv4Packet::new_unchecked(&mut bytes[..header_len]), &checksums),
-        IpRepr::Ipv6(repr) => repr.emit(&mut Ipv6Packet::new_unchecked(&mut bytes[..header_len])),
+        IpRepr::Ipv4(repr) => repr.emit(&mut Ipv4Packet::new_unchecked(&mut bytes[..ip_len]), &ip_checksums),
+        IpRepr::Ipv6(repr) => repr.emit(&mut Ipv6Packet::new_unchecked(&mut bytes[..ip_len])),
     }
-    tcp.emit(&mut TcpPacket::new_unchecked(&mut bytes[header_len..]),
-        &ip.src_addr(), &ip.dst_addr(), &checksums);
+    let mut tcp_checksums = ChecksumCapabilities::default();
+    tcp_checksums.tcp = Checksum::Rx;
+    let header = TcpRepr { payload: &[], ..tcp };
+    header.emit(&mut TcpPacket::new_unchecked(&mut bytes[ip_len..ip_len + tcp_len]),
+        &ip.src_addr(), &ip.dst_addr(), &tcp_checksums);
+    bytes.extend_from_slice(tcp.payload);
+    TcpPacket::new_unchecked(&mut bytes[ip_len..]).fill_checksum(&ip.src_addr(), &ip.dst_addr());
     Packet::new(bytes)
 }
 

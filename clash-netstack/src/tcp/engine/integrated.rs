@@ -1,8 +1,8 @@
 //! Synchronously driven TCP owner for a combined device/protocol event loop.
 use std::{io, pin::Pin, sync::Arc, task::{Context, Poll}, time::Duration};
 use tokio::{sync::mpsc, time::{Instant, Sleep, sleep}};
-use super::{Engine, Ready, ReadyQueue, SOCKET_BUDGET};
-use crate::{Packet, TcpListener, TcpStream, link::device::NetstackDevice};
+use super::{Engine, Ready, SOCKET_BUDGET};
+use crate::{Packet, TcpListener, TcpStream};
 
 pub struct TcpDriver {
     engine: Engine,
@@ -19,8 +19,7 @@ impl TcpDriver {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid TCP device limits"));
         }
         let (streams, incoming) = mpsc::channel(256);
-        let engine = Engine::with_device(NetstackDevice::local(output_packets),
-            Arc::new(ReadyQueue::default()), mtu);
+        let engine = Engine::local(output_packets, mtu);
         let listener = TcpListener::local(incoming, engine.ready.clone());
         Ok((Self { engine, streams, ready: Vec::with_capacity(SOCKET_BUDGET), timer: None }, listener))
     }
@@ -50,7 +49,7 @@ impl TcpDriver {
     pub fn poll_with_output(&mut self, cx: &mut Context<'_>,
         transmit: &mut dyn FnMut(&[u8], &[u8], Option<u16>) -> bool) -> Poll<io::Result<()>> {
         if self.streams.is_closed() { return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into())); }
-        self.engine.ready.waker.register(cx.waker());
+        self.engine.ready.register_waker(cx.waker());
         let (work, delay) = self.engine.step_with_output(&mut self.ready, transmit);
         if work { return Poll::Ready(Ok(())); }
         if let Some(delay) = delay {

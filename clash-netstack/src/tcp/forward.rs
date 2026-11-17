@@ -428,7 +428,7 @@ mod tests {
         });
         forward.download_done = true;
         forward.half_close = Some(Instant::now());
-        let ready = Ready::new(1, Arc::new(ReadyQueue::default()));
+        let ready = Ready::new(1, Arc::new(ReadyQueue::with_waker()));
         let (_stream, handle) = new_stream(
             "192.0.2.1:1234".parse().unwrap(),
             "198.51.100.1:80".parse().unwrap(),

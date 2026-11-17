@@ -8,10 +8,15 @@ pub(crate) type Flow = (SocketAddr, SocketAddr);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct SocketHandle(pub u64);
 
-struct Entry {
-    socket: Socket<'static>,
+pub(crate) struct Entry {
+    pub socket: Socket<'static>,
     flow: Flow,
     started: bool,
+}
+
+impl Entry {
+    pub fn started(&self) -> bool { self.started }
+    pub fn mark_started(&mut self) { self.started = true; }
 }
 
 pub(crate) struct SocketTable {
@@ -36,12 +41,12 @@ impl SocketTable {
         handle
     }
 
-    pub fn get_mut(&mut self, handle: SocketHandle) -> &mut Socket<'static> {
-        &mut self.entries.get_mut(&handle).expect("live TCP handle").socket
+    pub fn entry_mut(&mut self, handle: SocketHandle) -> &mut Entry {
+        self.entries.get_mut(&handle).expect("live TCP handle")
     }
 
-    pub fn mark_started(&mut self, handle: SocketHandle) {
-        self.entries.get_mut(&handle).expect("live TCP handle").started = true;
+    pub fn get_mut(&mut self, handle: SocketHandle) -> &mut Socket<'static> {
+        &mut self.entry_mut(handle).socket
     }
 
     pub fn started(&self, handle: SocketHandle) -> bool {

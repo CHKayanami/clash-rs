@@ -180,7 +180,7 @@ mod tests {
     use crate::tcp::ready::{Ready, ReadyQueue};
 
     fn build_stream() -> (TcpStream, Arc<ReadyQueue>) {
-        let queue = Arc::new(ReadyQueue::default());
+        let queue = Arc::new(ReadyQueue::with_waker());
         let ready = Ready::new(1, queue.clone());
         (TcpStream {
             local_addr: "127.0.0.1:12345".parse().unwrap(),

@@ -69,12 +69,12 @@ pub(crate) struct Engine {
 }
 
 impl Engine {
-    pub fn new(
-        outbound: mpsc::Sender<Packet>,
-        ready: Arc<ReadyQueue>,
-        mtu: usize,
-    ) -> Self {
-        Self::with_device(NetstackDevice::new(outbound), ready, mtu)
+    pub fn new(outbound: mpsc::Sender<Packet>, mtu: usize) -> Self {
+        Self::with_device(NetstackDevice::new(outbound), Arc::new(ReadyQueue::with_notify()), mtu)
+    }
+
+    pub(super) fn local(output_packets: usize, mtu: usize) -> Self {
+        Self::with_device(NetstackDevice::local(output_packets), Arc::new(ReadyQueue::with_waker()), mtu)
     }
 
     fn with_device(
@@ -132,7 +132,7 @@ impl Engine {
                     packet = value;
                     if packet.is_none() { return Ok(()); }
                 }
-                _ = self.ready.notify.notified() => {}
+                _ = self.ready.notified() => {}
                 // None means no protocol timer, not a request for a busy poll.
                 _ = timer.as_mut(), if timer_enabled => {}
                 permit = output.reserve(), if blocked_output => {
@@ -604,9 +604,9 @@ mod tests {
         SocketHandle,
         mpsc::Receiver<Packet>,
     ) {
-        let ready = Arc::new(ReadyQueue::default());
         let (output, receiver) = mpsc::channel(1);
-        let mut engine = Engine::new(output, ready.clone(), 1500);
+        let mut engine = Engine::new(output, 1500);
+        let ready = engine.ready.clone();
         let (buffers, mut socket) = Buffers::new();
         let flow = (
             "192.0.2.2:49152".parse().unwrap(),
@@ -746,7 +746,7 @@ mod tests {
         };
         socket.process(&mut cx, &ip, &synack);
         assert_eq!(socket.state(), tcp::State::Established);
-        let ready = Arc::new(ReadyQueue::default());
+        let ready = Arc::new(ReadyQueue::with_waker());
         let wake = Ready::new(1, ready.clone());
         let (_stream, handle) = new_stream(local, remote, wake);
         assert_eq!(handle.send().enqueue_slice(&[b'x'; 64]), 64);
@@ -768,9 +768,8 @@ mod tests {
 
     fn interleaved_engine(window: u16, shift: u8, queued: usize)
         -> (Engine, TcpStream, Arc<TcpStreamHandle>, Arc<ReadyQueue>, SocketHandle) {
-        let ready = Arc::new(ReadyQueue::default());
-        let mut engine =
-            Engine::with_device(NetstackDevice::local(32), ready.clone(), 1500);
+        let mut engine = Engine::local(32, 1500);
+        let ready = engine.ready.clone();
         engine.driver.enable_tcp_gso();
         let (buffers, mut socket) = Buffers::new();
         socket.grow_send_buffer(SocketBuffer::new(vec![0; 512 * 1024]));
