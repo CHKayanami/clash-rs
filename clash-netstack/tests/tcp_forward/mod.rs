@@ -117,7 +117,7 @@ async fn cancelled_native_handoff_releases_socket() {
 
 #[tokio::test]
 async fn native_handoff_half_close_deadline_releases_idle_peer() {
-    use std::time::Duration;
+    use std::{io::ErrorKind, time::Duration};
     use tokio::{io::AsyncReadExt, net::{TcpListener, TcpStream}};
 
     tokio::time::timeout(Duration::from_secs(3), async {
@@ -137,7 +137,15 @@ async fn native_handoff_half_close_deadline_releases_idle_peer() {
         assert_eq!(peer.read(&mut [0; 1]).await.unwrap(), 0);
         // Keep the peer's write half open. The relay must have its own timer
         // registration rather than relying on more network traffic to wake it.
-        assert_eq!(relay.await.unwrap().unwrap(), (0, 0));
+        let error = relay.await.unwrap().unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::TimedOut);
+        loop {
+            let packet = packets.next().await.unwrap().unwrap();
+            if common::is_rst(packet.data()) {
+                break;
+            }
+        }
+        drop(listener);
     }).await.expect("half-close timer did not wake the relay");
 }
 
