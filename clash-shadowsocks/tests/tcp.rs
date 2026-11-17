@@ -29,7 +29,7 @@ mod tests {
             let payload: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
             let send = async {
                 let n = client.write(&payload).await?;
-                assert_eq!(n, size.min(first_payload_limit));
+                assert_eq!(n, if method == CipherKind::NONE { size } else { size.min(first_payload_limit) });
                 client.write_all(&payload[n..]).await?;
                 client.shutdown().await
             };
@@ -46,6 +46,11 @@ mod tests {
             sent.unwrap();
             received.unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn plain_large_first_write_preserves_payload() {
+        large_first_write(CipherKind::NONE, "", 16383).await;
     }
 
     #[cfg(feature = "aead-cipher")]

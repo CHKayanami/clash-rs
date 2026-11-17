@@ -32,7 +32,7 @@ use crate::{
 #[derive(Debug)]
 enum ProxyClientStreamWriteState {
     Connect(Address),
-    Connecting { buffer: BytesMut, payload_len: usize },
+    Connecting { buffer: BytesMut, payload_len: usize, written: usize },
     Connected,
 }
 
@@ -211,7 +211,7 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     fn poll_write(self: Pin<&mut Self>, cx: &mut task::Context<'_>, buf: &[u8]) -> Poll<Result<usize, io::Error>> {
-        let this = self.project();
+        let mut this = self.project();
 
         loop {
             match this.writer_state {
@@ -223,15 +223,18 @@ where
                     //
                     // Proactor APIs like IOCP on Windows, pointers of buffers have to be kept alive
                     // before IO completion.
-                    *(this.writer_state) = ProxyClientStreamWriteState::Connecting { buffer, payload_len };
+                    *(this.writer_state) = ProxyClientStreamWriteState::Connecting { buffer, payload_len, written: 0 };
                 }
-                &mut ProxyClientStreamWriteState::Connecting { ref buffer, payload_len } => {
-                    let n = ready!(this.stream.poll_write_encrypted(cx, buffer))?;
-
-                    // The first packet fits in one encrypted chunk, including
-                    // the address and padding. Remaining payload is retried by
-                    // the caller according to the returned payload length.
-                    debug_assert!(n == buffer.len());
+                &mut ProxyClientStreamWriteState::Connecting { ref buffer, payload_len, ref mut written } => {
+                    while *written < buffer.len() {
+                        let n = ready!(this.stream.as_mut().poll_write_encrypted(cx, &buffer[*written..]))?;
+                        if n == 0 {
+                            return Poll::Ready(Err(io::Error::new(
+                                io::ErrorKind::WriteZero, "failed to write shadowsocks request",
+                            )));
+                        }
+                        *written += n;
+                    }
 
                     *(this.writer_state) = ProxyClientStreamWriteState::Connected;
 
