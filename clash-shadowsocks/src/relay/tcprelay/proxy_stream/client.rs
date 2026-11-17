@@ -51,6 +51,7 @@ pub struct ProxyClientStream<S> {
     stream: CryptoStream<S>,
     writer_state: ProxyClientStreamWriteState,
     reader_state: ProxyClientStreamReadState,
+    pending_payload_len: Option<usize>,
     context: SharedContext,
 }
 
@@ -88,6 +89,7 @@ impl<S> ProxyClientStream<S> {
             stream,
             writer_state: ProxyClientStreamWriteState::Connect(addr),
             reader_state,
+            pending_payload_len: None,
             context,
         }
     }
@@ -114,6 +116,10 @@ where
 {
     #[inline]
     fn poll_read(self: Pin<&mut Self>, cx: &mut task::Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+        if buf.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
+
         #[allow(unused_mut)]
         let mut this = self.project();
 
@@ -206,62 +212,78 @@ fn make_first_packet_buffer(method: CipherKind, addr: &Address, buf: &[u8]) -> (
     (buffer, payload_len)
 }
 
+impl<S> ProxyClientStream<S>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    /// Returns whether the target address header has not yet been fully written.
+    pub fn needs_handshake(&self) -> bool {
+        !matches!(self.writer_state, ProxyClientStreamWriteState::Connected)
+    }
+
+    /// Send the Shadowsocks request header without waiting for application payload and flush it.
+    pub fn poll_handshake(mut self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<io::Result<()>> {
+        ready!(self.as_mut().poll_request(cx, Some(&[])))?;
+        self.project().stream.poll_flush(cx).map_err(Into::into)
+    }
+
+    // None drains an existing request without starting one on an idle flush.
+    fn poll_request(
+        self: Pin<&mut Self>, cx: &mut task::Context<'_>, payload: Option<&[u8]>,
+    ) -> Poll<io::Result<()>> {
+        let mut this = self.project();
+        if let ProxyClientStreamWriteState::Connect(addr) = this.writer_state {
+            let Some(payload) = payload else { return Poll::Ready(Ok(())); };
+            let (buffer, payload_len) = make_first_packet_buffer(this.stream.method(), addr, payload);
+            *this.writer_state = ProxyClientStreamWriteState::Connecting { buffer, payload_len, written: 0 };
+        }
+        if let ProxyClientStreamWriteState::Connecting { buffer, payload_len, written } = this.writer_state {
+            while *written < buffer.len() {
+                let n = ready!(this.stream.as_mut().poll_write_encrypted(cx, &buffer[*written..]))?;
+                if n == 0 {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::WriteZero, "failed to write shadowsocks request",
+                    )));
+                }
+                *written += n;
+            }
+            // Flush/shutdown may complete a Pending write's request. Leave its
+            // payload count for poll_write to acknowledge without resending it.
+            if *payload_len > 0 {
+                *this.pending_payload_len = Some(*payload_len);
+            }
+            *this.writer_state = ProxyClientStreamWriteState::Connected;
+        }
+        Poll::Ready(Ok(()))
+    }
+}
+
 impl<S> AsyncWrite for ProxyClientStream<S>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    fn poll_write(self: Pin<&mut Self>, cx: &mut task::Context<'_>, buf: &[u8]) -> Poll<Result<usize, io::Error>> {
-        let mut this = self.project();
-
-        loop {
-            match this.writer_state {
-                &mut ProxyClientStreamWriteState::Connect(ref addr) => {
-                    let (buffer, payload_len) = make_first_packet_buffer(this.stream.method(), addr, buf);
-
-                    // Save the concatenated buffer before it is written successfully.
-                    // APIs require buffer to be kept alive before Poll::Ready
-                    //
-                    // Proactor APIs like IOCP on Windows, pointers of buffers have to be kept alive
-                    // before IO completion.
-                    *(this.writer_state) = ProxyClientStreamWriteState::Connecting { buffer, payload_len, written: 0 };
-                }
-                &mut ProxyClientStreamWriteState::Connecting { ref buffer, payload_len, ref mut written } => {
-                    while *written < buffer.len() {
-                        let n = ready!(this.stream.as_mut().poll_write_encrypted(cx, &buffer[*written..]))?;
-                        if n == 0 {
-                            return Poll::Ready(Err(io::Error::new(
-                                io::ErrorKind::WriteZero, "failed to write shadowsocks request",
-                            )));
-                        }
-                        *written += n;
-                    }
-
-                    *(this.writer_state) = ProxyClientStreamWriteState::Connected;
-
-                    // NOTE:
-                    // poll_write will return Ok(0) if buf.len() == 0
-                    // But for the first call, this function will eventually send the handshake packet (IV/Salt + ADDR) to the remote address.
-                    //
-                    // https://github.com/shadowsocks/shadowsocks-rust/issues/232
-                    //
-                    // For protocols that requires *Server Hello* message, like FTP, clients won't send anything to the server until server sends handshake messages.
-                    // This could be achieved by calling poll_write with an empty input buffer.
-                    return Ok(payload_len).into();
-                }
-                ProxyClientStreamWriteState::Connected => {
-                    return this.stream.poll_write_encrypted(cx, buf).map_err(Into::into);
-                }
-            }
+    fn poll_write(mut self: Pin<&mut Self>, cx: &mut task::Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+        let starting_request = !matches!(self.writer_state, ProxyClientStreamWriteState::Connected);
+        ready!(self.as_mut().poll_request(cx, Some(buf)))?;
+        if let Some(len) = self.as_mut().project().pending_payload_len.take() {
+            return Poll::Ready(Ok(len));
         }
+        // An empty first write sends ADDR; an application write following
+        // an already-sent header must still send its own payload.
+        if starting_request && buf.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+        self.project().stream.poll_write_encrypted(cx, buf).map_err(Into::into)
     }
 
-    #[inline]
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<Result<(), io::Error>> {
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<io::Result<()>> {
+        ready!(self.as_mut().poll_request(cx, None))?;
         self.project().stream.poll_flush(cx).map_err(Into::into)
     }
 
-    #[inline]
-    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<Result<(), io::Error>> {
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<io::Result<()>> {
+        ready!(self.as_mut().poll_request(cx, Some(&[])))?;
+        ready!(self.as_mut().project().stream.poll_flush(cx))?;
         self.project().stream.poll_shutdown(cx).map_err(Into::into)
     }
 }

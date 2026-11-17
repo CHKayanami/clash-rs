@@ -120,17 +120,13 @@ impl Handler {
 
         let cfg = self.server_config()?;
 
-        let mut stream = ProxyClientStream::from_stream(
+        let stream = ProxyClientStream::from_stream(
             self.ctx.clone(),
             stream,
             cfg,
             Address::from(&sess.destination),
         );
 
-        // An empty write sends the target header even for server-first protocols.
-        // write_all with an empty slice would skip poll_write entirely.
-        stream.write(&[]).await?;
-        stream.flush().await?;
         Ok(AnyStream::new(ShadowSocksStream(stream)))
     }
 

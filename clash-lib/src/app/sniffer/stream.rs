@@ -88,6 +88,18 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for PrefixedStream<S> {
 }
 
 impl<S: ProxyStream> ProxyStream for PrefixedStream<S> {
+    fn has_read_prefix(&self) -> bool {
+        self.prefix.is_some() || self.inner.has_read_prefix()
+    }
+
+    fn needs_handshake(&self) -> bool {
+        self.inner.needs_handshake()
+    }
+
+    fn poll_handshake(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.inner.poll_handshake(cx)
+    }
+
     #[cfg(all(target_os = "linux", feature = "zero_copy"))]
     fn underlying_socket(&mut self) -> Option<&mut tokio::net::TcpStream> {
         if self.prefix.is_none() {
@@ -126,6 +138,7 @@ mod tests {
         let mut prefix = SlideBuffer::new(64);
         prefix.extend_from_slice(b"hello ");
         let mut prefixed = PrefixedStream::new(prefix, client);
+        assert!(prefixed.has_read_prefix());
 
         tokio::spawn(async move {
             server.write_all(b"world").await.unwrap();
@@ -134,6 +147,7 @@ mod tests {
         let mut buf = vec![0u8; 11];
         prefixed.read_exact(&mut buf).await.unwrap();
         assert_eq!(&buf, b"hello world");
+        assert!(!prefixed.has_read_prefix());
         assert!(
             prefixed.prefix.is_none(),
             "drained prefix storage must be released"

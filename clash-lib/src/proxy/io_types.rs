@@ -264,6 +264,18 @@ impl AsyncWrite for AnyStream {
 }
 
 impl ProxyStream for AnyStream {
+    fn has_read_prefix(&self) -> bool {
+        dispatch_stream!(self, |inner| inner.has_read_prefix())
+    }
+
+    fn needs_handshake(&self) -> bool {
+        dispatch_stream!(self, |inner| inner.needs_handshake())
+    }
+
+    fn poll_handshake(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        dispatch_stream!(self, |inner| inner.poll_handshake(cx))
+    }
+
     #[cfg(all(target_os = "linux", feature = "zero_copy"))]
     fn underlying_socket(&mut self) -> Option<&mut TcpStream> {
         dispatch_stream!(self, |inner| inner.underlying_socket())

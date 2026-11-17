@@ -8,7 +8,9 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
     fmt::{Debug, Display},
-    io, future::Future,
+    future::Future,
+    io,
+    task::{Context, Poll},
 };
 
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -88,6 +90,33 @@ pub enum ProxyError {
 }
 
 pub trait ProxyStream: AsyncRead + AsyncWrite + Send + Unpin {
+    /// Whether the next read can consume a cached prefix without waiting for I/O.
+    /// Transparent wrappers must forward this capability.
+    fn has_read_prefix(&self) -> bool {
+        false
+    }
+
+    /// Returns `true` when this stream still has an outbound protocol header
+    /// deferred until first write.
+    ///
+    /// Transparent wrappers (`Box<T>`, `AnyStream`, `PrefixedStream<S>`) must
+    /// forward this method and `poll_handshake`; protocol layers that already
+    /// wrote to their inner stream before returning keep the default.
+    fn needs_handshake(&self) -> bool {
+        false
+    }
+
+    /// Flushes a deferred outbound protocol header when no client payload is
+    /// forthcoming.
+    ///
+    /// Callers that bypass `copy_bidirectional` and may `poll_read` before
+    /// writing (server-speaks-first protocols) must poll this to `Ready`
+    /// first. Client-speaks-first callers skip it so the header coalesces
+    /// with the first `poll_write`.
+    fn poll_handshake(&mut self, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
     #[cfg(all(target_os = "linux", feature = "zero_copy"))]
     fn underlying_socket(&mut self) -> Option<&mut tokio::net::TcpStream> {
         None
@@ -122,6 +151,18 @@ impl ProxyStream for hyper_util::rt::TokioIo<hyper::upgrade::Upgraded> {}
 impl ProxyStream for tokio_tfo::TfoStream {}
 
 impl<T: ProxyStream + ?Sized> ProxyStream for Box<T> {
+    fn has_read_prefix(&self) -> bool {
+        (**self).has_read_prefix()
+    }
+
+    fn needs_handshake(&self) -> bool {
+        (**self).needs_handshake()
+    }
+
+    fn poll_handshake(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        (**self).poll_handshake(cx)
+    }
+
     #[cfg(all(target_os = "linux", feature = "zero_copy"))]
     fn underlying_socket(&mut self) -> Option<&mut tokio::net::TcpStream> {
         (**self).underlying_socket()
