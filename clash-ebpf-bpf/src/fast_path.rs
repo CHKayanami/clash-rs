@@ -2,6 +2,7 @@
 //! the same gates and generation checks as the full-parser fallback.
 use aya_ebpf::{EbpfContext, bindings::{__sk_buff, TC_ACT_OK, TC_ACT_SHOT}, programs::TcContext};
 use aya_ebpf_bindings::helpers::bpf_ktime_get_ns;
+use clash_ebpf_bpf::policy::tcp_socket_policy_update;
 use clash_ebpf_common::{DaeParam, RedirectEntry, RedirectTuple, UdpReplyKey};
 use network_types::eth::EthHdr;
 use crate::{maps::FLOW_SCRATCH, tracking, udp_reply, do_redirect, packet_reverse_redirect_tuple,
@@ -56,7 +57,11 @@ pub fn forward(ctx: &TcContext, param: &DaeParam, link: usize, wan: bool, tcp_po
         let protocol = if packet.tuple.ip_version == 4 { ETH_P_IP } else { ETH_P_IPV6 };
         unsafe { do_redirect(ctx.as_ptr().cast::<__sk_buff>(), param, link, listener, protocol, wan) }
     };
-    if wan && tcp { unsafe { *tcp_policy = if verdict == TC_ACT_OK { 3 } else { 2 }; } }
+    if wan && tcp {
+        if let Some(policy) = tcp_socket_policy_update(verdict) {
+            unsafe { *tcp_policy = policy; }
+        }
+    }
     verdict
 }
 

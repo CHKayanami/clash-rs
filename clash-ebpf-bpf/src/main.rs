@@ -44,6 +44,7 @@ use aya_ebpf_bindings::helpers::{
     bpf_get_current_comm, bpf_get_socket_cookie, bpf_ktime_get_ns, bpf_sk_fullsock,
     bpf_sk_storage_get, bpf_skb_change_head, bpf_skb_store_bytes,
 };
+use clash_ebpf_bpf::policy::tcp_socket_policy_update;
 use clash_ebpf_common::{
     DAE_BYPASS_MARK, DAE_TPROXY_MARK, DaeEventType, GC_BATCH_SIZE, GC_FLOW, GC_UDP_REPLY,
     DaeParam, PIDName, RedirectEntry, RedirectTuple,
@@ -856,8 +857,8 @@ fn handle_wan_miss(tc_ctx: &TcContext, param: &DaeParam, link_h_len: usize,
         let decision = unsafe { *tcp_policy };
         let verdict =
             dispatch_wan(ctx, param, link_h_len, pkt, &(pid_pname, decision == 2, observed));
-        unsafe {
-            *tcp_policy = if verdict == TC_ACT_OK { 3 } else { 2 };
+        if let Some(policy) = tcp_socket_policy_update(verdict) {
+            unsafe { *tcp_policy = policy; }
         }
         return verdict;
     }

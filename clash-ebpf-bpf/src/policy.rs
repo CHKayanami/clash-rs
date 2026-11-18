@@ -1,5 +1,16 @@
+use aya_ebpf::bindings::{TC_ACT_OK, TC_ACT_REDIRECT};
 use clash_ebpf_common::{RedirectEntry, UdpReplyEntry};
 use network_types::ip::Ipv4Hdr;
+
+#[inline(always)]
+pub fn tcp_socket_policy_update(verdict: i32) -> Option<u32> {
+    match verdict {
+        TC_ACT_OK => Some(3),
+        TC_ACT_REDIRECT => Some(2),
+        // A dropped packet leaves the socket decision available for retransmission.
+        _ => None,
+    }
+}
 
 pub const UDP_CONN_TIMEOUT_NS: u64 = 120_000_000_000;
 
@@ -53,7 +64,15 @@ pub fn udp_reply_route(entry: &UdpReplyEntry, now: u64) -> Option<RedirectEntry>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aya_ebpf::bindings::TC_ACT_SHOT;
     use clash_ebpf_common::{RedirectTuple, UdpReplyKey};
+
+    #[test]
+    fn tcp_socket_policy_is_only_cached_for_pass_or_redirect() {
+        assert_eq!(tcp_socket_policy_update(TC_ACT_SHOT), None);
+        assert_eq!(tcp_socket_policy_update(TC_ACT_OK), Some(3));
+        assert_eq!(tcp_socket_policy_update(TC_ACT_REDIRECT), Some(2));
+    }
 
     #[test]
     fn udp_return_key_ignores_remote_but_preserves_client_socket_and_family() {
