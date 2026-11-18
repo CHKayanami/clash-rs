@@ -20,3 +20,6 @@ pub struct SimpleOBFSOption {
     pub mode: SimpleOBFSMode,
     pub host: String,
 }
+
+#[cfg(test)]
+mod tests;

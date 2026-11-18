@@ -9,6 +9,8 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use crate::proxy::{AnyStream, transport::Transport};
 
+pub(super) const MAX_RESPONSE_HEADER_SIZE: usize = 64 * 1024;
+
 pub struct Client {
     host: String,
     port: u16,
@@ -33,8 +35,7 @@ pub struct HTTPObfs {
 
     first_request: bool,
     first_response: bool,
-    // write-side: in-flight HTTP-wrapped buffer and how many source bytes it
-    // represents (> 0 while a first-request chunk is being drained)
+    // First-request buffer and the source byte count still owed to poll_write.
     write_buf: Vec<u8>,
     write_pos: usize,
     write_committed: usize,
@@ -149,7 +150,6 @@ impl AsyncWrite for HTTPObfs {
         let this = self.get_mut();
         // Drain any in-flight first-request write before flushing.
         ready!(drain_write_buf(this, cx))?;
-        this.write_committed = 0;
         Pin::new(&mut this.inner).poll_flush(cx)
     }
 
@@ -160,7 +160,6 @@ impl AsyncWrite for HTTPObfs {
         let this = self.get_mut();
         // Drain any in-flight first-request write before shutting down.
         ready!(drain_write_buf(this, cx))?;
-        this.write_committed = 0;
         Pin::new(&mut this.inner).poll_shutdown(cx)
     }
 }
@@ -171,65 +170,46 @@ impl AsyncRead for HTTPObfs {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        let this = self.get_mut();
-
-        // Deliver any leftover body bytes from a previous read first.
-        if !this.read_buf.is_empty() {
-            let to_read = std::cmp::min(buf.remaining(), this.read_buf.len());
-            // to_read > 0 because read_buf is non-empty and buf.remaining() > 0
-            // (the caller would not call poll_read with a full buffer).
-            let data = this.read_buf.split_to(to_read);
-            buf.put_slice(&data);
+        if buf.remaining() == 0 {
             return Poll::Ready(Ok(()));
         }
-
+        let this = self.get_mut();
         if this.first_response {
-            // Accumulate response bytes in `this.read_buf` until the HTTP
-            // response header terminator (\r\n\r\n) is found.  A single read
-            // may not contain the full header, so we loop until we either find
-            // the delimiter, hit an error, or the inner stream returns Pending.
-            let needle = b"\r\n\r\n";
+            let delimiter = b"\r\n\r\n";
             loop {
+                // Only newly appended bytes can complete the header delimiter.
+                let start = this.read_buf.len().saturating_sub(delimiter.len() - 1);
                 let mut tmp = [0u8; 4096];
-                let mut tmp_buf = ReadBuf::new(&mut tmp);
-                match Pin::new(&mut this.inner).poll_read(cx, &mut tmp_buf) {
-                    Poll::Ready(Ok(())) => {
-                        let filled = tmp_buf.filled();
-                        if filled.is_empty() {
-                            // Peer closed the connection before sending headers.
-                            return Poll::Ready(Err(io::Error::from(
-                                io::ErrorKind::UnexpectedEof,
-                            )));
-                        }
-                        this.read_buf.put_slice(filled);
-
-                        let idx = this
-                            .read_buf
-                            .windows(needle.len())
-                            .position(|w| w == needle);
-
-                        if let Some(idx) = idx {
-                            this.first_response = false;
-                            // Discard everything up to and including \r\n\r\n.
-                            let _ = this.read_buf.split_to(idx + needle.len());
-                            // Deliver what remains of the body to the caller.
-                            let to_read =
-                                std::cmp::min(buf.remaining(), this.read_buf.len());
-                            if to_read > 0 {
-                                let data = this.read_buf.split_to(to_read);
-                                buf.put_slice(&data);
-                            }
-                            return Poll::Ready(Ok(()));
-                        }
-                        // Delimiter not yet seen — read more.
-                    }
-                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                    Poll::Pending => return Poll::Pending,
+                let limit = (MAX_RESPONSE_HEADER_SIZE - this.read_buf.len()).min(tmp.len());
+                if limit == 0 {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "simple-obfs HTTP response header exceeds 64 KiB",
+                    )));
+                }
+                let mut tmp_buf = ReadBuf::new(&mut tmp[..limit]);
+                ready!(Pin::new(&mut this.inner).poll_read(cx, &mut tmp_buf))?;
+                if tmp_buf.filled().is_empty() {
+                    return Poll::Ready(Err(io::ErrorKind::UnexpectedEof.into()));
+                }
+                this.read_buf.put_slice(tmp_buf.filled());
+                if let Some(pos) = this.read_buf[start..]
+                    .windows(delimiter.len())
+                    .position(|window| window == delimiter)
+                {
+                    this.first_response = false;
+                    let _ = this.read_buf.split_to(start + pos + delimiter.len());
+                    break;
                 }
             }
-        } else {
-            Pin::new(&mut this.inner).poll_read(cx, buf)
         }
+
+        if this.read_buf.is_empty() {
+            return Pin::new(&mut this.inner).poll_read(cx, buf);
+        }
+        let to_read = this.read_buf.len().min(buf.remaining());
+        buf.put_slice(&this.read_buf.split_to(to_read));
+        Poll::Ready(Ok(()))
     }
 }
 

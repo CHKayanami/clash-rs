@@ -68,7 +68,7 @@ pub struct TLSObfs {
     first_request: bool,
     write_buf: Vec<u8>,
     write_pos: usize,
-    // src bytes represented by write_buf; > 0 while a chunk is in flight
+    // Source byte count still owed to poll_write, even if flush drained the chunk.
     write_committed: usize,
     read_state: ReadState,
 }
@@ -126,7 +126,6 @@ impl AsyncWrite for TLSObfs {
     ) -> Poll<Result<(), io::Error>> {
         let this = self.get_mut();
         ready!(drain_write_buf(this, cx))?;
-        this.write_committed = 0;
         Pin::new(&mut this.inner).poll_flush(cx)
     }
 
@@ -136,7 +135,6 @@ impl AsyncWrite for TLSObfs {
     ) -> Poll<Result<(), io::Error>> {
         let this = self.get_mut();
         ready!(drain_write_buf(this, cx))?;
-        this.write_committed = 0;
         Pin::new(&mut this.inner).poll_shutdown(cx)
     }
 }
@@ -166,6 +164,9 @@ impl AsyncRead for TLSObfs {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<Result<(), io::Error>> {
+        if buf.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
         let this = self.get_mut();
         let mut inner = Pin::new(&mut this.inner);
 
@@ -205,9 +206,11 @@ impl AsyncRead for TLSObfs {
                         ready!(inner.as_mut().poll_read(cx, &mut rb))?;
                         let n = rb.filled().len();
                         if n == 0 {
-                            return Poll::Ready(Err(io::Error::from(
-                                io::ErrorKind::UnexpectedEof,
-                            )));
+                            // EOF before a new record is a normal half-close.
+                            if *target != MAX_SKIP && *filled == 0 {
+                                return Poll::Ready(Ok(()));
+                            }
+                            return Poll::Ready(Err(io::ErrorKind::UnexpectedEof.into()));
                         }
                         *filled += n;
                     }
