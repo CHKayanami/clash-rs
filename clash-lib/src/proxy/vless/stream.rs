@@ -11,7 +11,7 @@ use tracing::{debug, error};
 
 use crate::{
     common::io::{ReadExactSlideBase, ReadExactSlideExt, SlideBuffer},
-    proxy::AnyStream,
+    proxy::{AnyStream, ProxyStream},
     session::SocksAddr,
 };
 
@@ -45,7 +45,18 @@ pub struct VlessStream {
     pending_first_payload: BytesMut,
 }
 
-impl crate::proxy::ProxyStream for VlessStream {}
+impl ProxyStream for VlessStream {
+    fn needs_handshake(&self) -> bool {
+        // This reports whether the header is still available for first-write
+        // coalescing. Once started, poll_handshake must be driven to Ready.
+        !self.handshake_sent
+    }
+
+    fn poll_handshake(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        futures::ready!(self.poll_send_pending_handshake(cx))?;
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+}
 
 impl VlessStream {
     #[cfg(test)]
@@ -215,12 +226,6 @@ impl AsyncRead for VlessStream {
             return Poll::Ready(Ok(()));
         }
 
-        // A payload buffered while waiting for the rest of a TLS ClientHello
-        // must not sit here forever: a client that writes a partial record and
-        // then waits for a reply would otherwise deadlock, since nothing has
-        // been sent to the server yet.
-        futures::ready!(this.poll_send_pending_handshake(cx))?;
-
         // Must receive response before reading
         if this.response_state != ResponseState::Done {
             loop {
@@ -284,12 +289,18 @@ impl AsyncWrite for VlessStream {
         let this = self.get_mut();
 
         // If a first write was previously buffered into write_buf (which returned Pending),
-        // we must finish flushing the handshake (whether here or completed concurrently by poll_read)
+        // we must finish flushing the handshake (possibly completed by poll_flush)
         // and return the length of that first write, rather than writing buf again to inner!
         if let Some(first_len) = this.first_write_len {
             futures::ready!(this.poll_send_pending_handshake(cx))?;
             this.first_write_len = None;
             return Poll::Ready(Ok(first_len));
+        }
+
+        // An explicit handshake or flush may have started sending a request
+        // without consuming any bytes from this write.
+        if !this.write_buf.is_empty() {
+            futures::ready!(this.poll_send_pending_handshake(cx))?;
         }
 
         // Send handshake with first write
@@ -321,7 +332,11 @@ impl AsyncWrite for VlessStream {
         cx: &mut Context<'_>,
     ) -> Poll<Result<(), io::Error>> {
         let this = self.get_mut();
-        futures::ready!(this.poll_send_pending_handshake(cx))?;
+        // Flush accepted payload, but keep an idle request available for
+        // coalescing with the first write (e.g. an HTTP probe).
+        if !this.write_buf.is_empty() || !this.pending_first_payload.is_empty() {
+            return this.poll_handshake(cx);
+        }
         Pin::new(&mut this.inner).poll_flush(cx)
     }
 
@@ -353,7 +368,35 @@ mod tests {
         Arc,
         atomic::{AtomicUsize, Ordering},
     };
-    use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+    use tokio::io::{AsyncRead, AsyncWrite, BufStream, DuplexStream, ReadBuf};
+
+    struct BufferedTransport(BufStream<DuplexStream>);
+
+    impl ProxyStream for BufferedTransport {}
+
+    impl AsyncRead for BufferedTransport {
+        fn poll_read(
+            mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.0).poll_read(cx, buf)
+        }
+    }
+
+    impl AsyncWrite for BufferedTransport {
+        fn poll_write(
+            mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Pin::new(&mut self.0).poll_write(cx, buf)
+        }
+
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.0).poll_flush(cx)
+        }
+
+        fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.0).poll_shutdown(cx)
+        }
+    }
 
     fn dummy_stream() -> AnyStream {
         let (client, _server) = tokio::io::duplex(1024);
@@ -572,11 +615,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_handshake_flow_server_speaks_first() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use futures::future::poll_fn;
+        use std::time::Duration;
+        use tokio::{io::{AsyncReadExt, AsyncWriteExt}, time::timeout};
 
         let (client_raw, mut server_raw) = tokio::io::duplex(1024);
         let mut client = VlessStream::new(
-            AnyStream::new(client_raw),
+            AnyStream::dynamic(BufferedTransport(BufStream::new(client_raw))),
             "5415d8e0-df92-3655-afa4-b79de66413f5",
             &tcp_dest(),
             VLESS_COMMAND_TCP,
@@ -587,6 +632,9 @@ mod tests {
         let banner = b"SSH-2.0-OpenSSH_9";
 
         let client_fut = async {
+            assert!(client.needs_handshake());
+            poll_fn(|cx| client.poll_handshake(cx)).await.unwrap();
+            assert!(!client.needs_handshake());
             let mut read_buf = vec![0u8; banner.len()];
             client.read_exact(&mut read_buf).await.unwrap();
             read_buf
@@ -602,19 +650,21 @@ mod tests {
             server_raw.write_all(banner).await.unwrap();
         };
 
-        let (read_buf, ()) = tokio::join!(client_fut, server_fut);
+        let (read_buf, ()) = timeout(Duration::from_secs(2), async {
+            tokio::join!(client_fut, server_fut)
+        }).await.unwrap();
         assert_eq!(&read_buf, banner);
     }
 
     #[tokio::test]
-    async fn test_no_duplicate_first_write_on_concurrent_read() {
+    async fn test_read_does_not_drive_pending_first_write() {
 
         let written_bytes = Arc::new(std::sync::Mutex::new(Vec::new()));
         let write_count = Arc::new(AtomicUsize::new(0));
 
         let mock = ChunkedStream {
             written: written_bytes.clone(),
-            write_count,
+            write_count: write_count.clone(),
             response: vec![0x00, 0x00], // Valid VLESS response
             resp_offset: 0,
         };
@@ -636,12 +686,15 @@ mod tests {
         let res1 = Pin::new(&mut client).poll_write(&mut cx, first_payload);
         assert!(res1.is_pending());
 
-        // 2. Concurrent read runs (e.g. from copy_bidirectional), flushing the rest of the handshake+payload
+        // A separately polled read must not replace the writer's I/O waker.
         let mut dummy_read_buf = [0u8; 16];
         let mut read_buf = ReadBuf::new(&mut dummy_read_buf);
         let _ = Pin::new(&mut client).poll_read(&mut cx, &mut read_buf);
+        assert_eq!(write_count.load(Ordering::SeqCst), 2);
 
-        // 3. Write task wakes up and polls write again with same buffer
+        // A flush finishes the first write, but its retry still has to report
+        // the original payload length without sending it again.
+        assert!(matches!(Pin::new(&mut client).poll_flush(&mut cx), Poll::Ready(Ok(()))));
         let res2 = Pin::new(&mut client).poll_write(&mut cx, first_payload);
         assert!(res2.is_ready());
         let written_len = res2.map(|r| r.unwrap());
@@ -659,6 +712,70 @@ mod tests {
             "first_payload must be sent exactly once, but appeared {} times",
             payload_occurrences
         );
+    }
+
+    #[test]
+    fn write_resumes_handshake_started_by_flush_or_explicit_handshake() {
+        let hello_prefix = b"\x16\x03\x01\x00\x20first";
+        for buffered in [false, true] {
+            for next in [&b"next"[..], &hello_prefix[..]] {
+                let written = Arc::new(std::sync::Mutex::new(Vec::new()));
+                let transport = ChunkedStream {
+                    written: written.clone(),
+                    write_count: Arc::new(AtomicUsize::new(0)),
+                    response: Vec::new(),
+                    resp_offset: 0,
+                };
+                let mut client = VlessStream::new(
+                    AnyStream::dynamic(transport), "5415d8e0-df92-3655-afa4-b79de66413f5",
+                    &tcp_dest(), VLESS_COMMAND_TCP, None,
+                ).unwrap();
+                let header = client.build_handshake_header(0);
+                let waker = futures::task::noop_waker();
+                let mut cx = Context::from_waker(&waker);
+                if buffered {
+                    assert!(matches!(
+                        Pin::new(&mut client).poll_write(&mut cx, hello_prefix),
+                        Poll::Ready(Ok(n)) if n == hello_prefix.len()
+                    ));
+                    assert!(Pin::new(&mut client).poll_flush(&mut cx).is_pending());
+                } else {
+                    assert!(client.poll_handshake(&mut cx).is_pending());
+                }
+                assert!(matches!(
+                    Pin::new(&mut client).poll_write(&mut cx, next),
+                    Poll::Ready(Ok(n)) if n == next.len()
+                ));
+                let mut expected = header.to_vec();
+                if buffered {
+                    expected.extend_from_slice(hello_prefix);
+                }
+                expected.extend_from_slice(next);
+                assert_eq!(*written.lock().unwrap(), expected);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn idle_read_and_flush_preserve_first_write_coalescing() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (raw, mut peer) = tokio::io::duplex(1024);
+        let mut client = VlessStream::new(
+            AnyStream::new(raw), "5415d8e0-df92-3655-afa4-b79de66413f5",
+            &tcp_dest(), VLESS_COMMAND_TCP, None,
+        ).unwrap();
+        let waker = futures::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut byte = [0; 1];
+        assert!(Pin::new(&mut client).poll_read(&mut cx, &mut ReadBuf::new(&mut byte)).is_pending());
+        client.flush().await.unwrap();
+        assert!(Pin::new(&mut peer).poll_read(&mut cx, &mut ReadBuf::new(&mut byte)).is_pending());
+
+        client.write_all(b"GET /").await.unwrap();
+        let mut request = [0; 31];
+        peer.read_exact(&mut request).await.unwrap();
+        assert_eq!(&request[26..], b"GET /");
     }
 
     #[tokio::test]

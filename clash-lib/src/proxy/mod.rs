@@ -98,6 +98,8 @@ pub trait ProxyStream: AsyncRead + AsyncWrite + Send + Unpin {
 
     /// Returns `true` when this stream still has an outbound protocol header
     /// deferred until first write.
+    /// Once started, `poll_handshake` must be polled to completion even if
+    /// this method returns `false` while the transport flush is pending.
     ///
     /// Transparent wrappers (`Box<T>`, `AnyStream`, `PrefixedStream<S>`) must
     /// forward this method and `poll_handshake`; protocol layers that already

@@ -14,7 +14,7 @@ use futures::ready;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio_util::io::poll_read_buf;
 
-use crate::proxy::{AnyStream, transport::VisionOptions};
+use crate::proxy::{AnyStream, ProxyStream, transport::VisionOptions};
 use rand::RngExt;
 
 /// Vision command bytes (first byte of each frame header).
@@ -360,7 +360,15 @@ pub struct VisionStream {
     write_splice_flag: Option<Arc<AtomicBool>>,
 }
 
-impl crate::proxy::ProxyStream for VisionStream {}
+impl ProxyStream for VisionStream {
+    fn needs_handshake(&self) -> bool {
+        self.inner.needs_handshake()
+    }
+
+    fn poll_handshake(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.inner.poll_handshake(cx)
+    }
+}
 
 impl VisionStream {
     #[cfg(test)]
@@ -747,6 +755,71 @@ mod tests {
             VisionStream::new(AnyStream::new(client), TEST_UUID_STR, None).unwrap(),
             server,
         )
+    }
+
+    #[tokio::test]
+    async fn forwarding_vision_completes_deferred_vless_handshake() {
+        use std::time::Duration;
+        use tokio::time::timeout;
+        use crate::{
+            app::{dispatcher::TrafficTracker, sniffer::PrefixedStream},
+            common::io::{SlideBuffer, copy_bidirectional},
+            proxy::vless::stream::{VLESS_COMMAND_TCP, VlessStream},
+        };
+
+        for cached in [false, true] {
+            let (raw, mut server) = duplex(8192);
+            let vless = VlessStream::new(
+                AnyStream::new(raw), TEST_UUID_STR, &"192.0.2.1:80".parse().unwrap(),
+                VLESS_COMMAND_TCP, Some("xtls-rprx-vision"),
+            ).unwrap();
+            let vision = VisionStream::new(AnyStream::new(vless), TEST_UUID_STR, None).unwrap();
+            assert!(vision.needs_handshake());
+
+            let (mut client, inbound) = duplex(1024);
+            let inbound = AnyStream::new(inbound);
+            let inbound = if cached {
+                let mut prefix = SlideBuffer::new(7);
+                prefix.extend_from_slice(b"request");
+                AnyStream::new(PrefixedStream::new(prefix, inbound))
+            } else {
+                inbound
+            };
+            let copy = copy_bidirectional(
+                inbound, AnyStream::new(vision), 1024, Duration::from_secs(5),
+                Duration::from_secs(5), TrafficTracker::noop(),
+            );
+            let serve = async {
+                let mut header = [0; 44];
+                server.read_exact(&mut header).await.unwrap();
+                assert_eq!(&header[1..17], &TEST_UUID);
+                if cached {
+                    let mut frame = [0; 21];
+                    server.read_exact(&mut frame).await.unwrap();
+                    assert_eq!(&frame[..16], &TEST_UUID);
+                    let len = u16::from_be_bytes([frame[17], frame[18]]) as usize;
+                    assert_eq!(len, 7);
+                    let padding = u16::from_be_bytes([frame[19], frame[20]]) as usize;
+                    let mut body = vec![0; len + padding];
+                    server.read_exact(&mut body).await.unwrap();
+                    assert_eq!(&body[..len], b"request");
+                }
+                server.write_all(&[0, 0]).await.unwrap();
+                server.write_all(&server_first_frame(&TEST_UUID, CMD_PADDING_END, b"hello", 0))
+                    .await.unwrap();
+                server.shutdown().await.unwrap();
+            };
+            let receive = async {
+                let mut reply = Vec::new();
+                client.read_to_end(&mut reply).await.unwrap();
+                assert_eq!(reply, b"hello");
+                client.shutdown().await.unwrap();
+            };
+            let (copied, _, _) = timeout(Duration::from_secs(2), async {
+                tokio::join!(copy, serve, receive)
+            }).await.unwrap();
+            assert_eq!(copied.unwrap(), (if cached { 7 } else { 0 }, 5));
+        }
     }
 
     fn make_vision_pair_with_splice_flags()
