@@ -50,7 +50,7 @@ pub fn forward(ctx: &TcContext, param: &DaeParam, link: usize, wan: bool, tcp_po
             }
             if scratch.result.is_direct() { return TC_ACT_OK; }
         }
-        if packet.tuple.proto == IPPROTO_UDP && !udp_reply::publish(&packet.tuple, route, now) {
+        if packet.tuple.proto == IPPROTO_UDP && !udp_reply::publish(&packet.tuple, &route, now) {
             return TC_ACT_SHOT;
         }
         let listener = if tcp { if pure_syn { IPPROTO_TCP } else { 0 } } else { IPPROTO_UDP };

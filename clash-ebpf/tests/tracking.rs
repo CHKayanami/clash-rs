@@ -216,13 +216,22 @@ fn client_socket_reply_route_refreshes_without_a_flow_and_expires() {
         "fresh client-socket reads do not acquire the writer gate");
     let mut routes = HashMap::<_, UdpReplyKey, UdpReplyEntry>::try_from(bpf.map_mut("UDP_REPLY_TRACK").unwrap()).unwrap();
     entry.last_seen_ns = now.saturating_sub(123_000_000_000);
-    let expired_stamp = entry.last_seen_ns;
     routes.insert(&key, &entry, 0).unwrap();
     let program: &mut SchedClassifier = bpf.program_mut("dae0_ingress_l2").unwrap().try_into().unwrap();
     assert_eq!(program.test_run(TestRunOptions { data_in: Some(&reply), ..TestRunOptions::new() })
         .unwrap().return_value, 0, "expired client socket cannot restore the reply");
     let routes = HashMap::<_, UdpReplyKey, UdpReplyEntry>::try_from(bpf.map("UDP_REPLY_TRACK").unwrap()).unwrap();
-    assert_eq!(routes.get(&key, 0).unwrap().last_seen_ns, expired_stamp);
+    assert_eq!(routes.get(&key, 0).unwrap(), entry);
+
+    // Keep the expired entry in the map and publish a different route for its key.
+    assert_eq!(run(&mut bpf, &packet(11)), 7);
+    let routes = HashMap::<_, UdpReplyKey, UdpReplyEntry>::try_from(bpf.map("UDP_REPLY_TRACK").unwrap()).unwrap();
+    let replacement = routes.get(&key, 0).unwrap();
+    let mut expected_route = entry.route;
+    expected_route.smac[5] = 11;
+    assert_eq!(replacement.route, expected_route);
+    assert_ne!(replacement.generation, entry.generation);
+    assert!(replacement.last_seen_ns >= now);
 }
 
 #[test]

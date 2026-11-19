@@ -23,41 +23,18 @@ pub fn ipv4_is_fragment(iph: &Ipv4Hdr) -> bool {
 pub const REDIRECT_REFRESH_NS: u64 = 1_000_000_000;
 
 #[inline(always)]
-pub fn udp_reply_expired(entry: &UdpReplyEntry, now: u64) -> bool {
-    now.saturating_sub(entry.last_seen_ns)
-        > UDP_CONN_TIMEOUT_NS + REDIRECT_REFRESH_NS
-}
-
-/// Separate packet routing metadata from per-target conntrack decisions.
-#[inline(always)]
-pub fn udp_reply_update(old: Option<&UdpReplyEntry>, route: RedirectEntry,
-    now: u64,
-) -> Option<UdpReplyEntry> {
-    let mut out = UdpReplyEntry::default();
-    udp_reply_update_into(old, route, now, &mut out).then_some(out)
+pub fn udp_reply_expired(last_seen_ns: u64, now: u64) -> bool {
+    now.saturating_sub(last_seen_ns) > UDP_CONN_TIMEOUT_NS + REDIRECT_REFRESH_NS
 }
 
 #[inline(always)]
-pub fn udp_reply_update_into(old: Option<&UdpReplyEntry>, route: RedirectEntry,
-    now: u64, out: &mut UdpReplyEntry,
-) -> bool {
-    // Keep this update from rewinding the timestamp it observed.
-    let now = old.map_or(now, |old| now.max(old.last_seen_ns));
-    let new = UdpReplyEntry { last_seen_ns: now, route, _pad: [0; 4], generation: 0 };
-    if let Some(old) = old.filter(|old| !udp_reply_expired(old, now)) {
-        // An active client socket has one publisher. Conflicts never replace its
-        // route or extend its lifetime; publication reports rejection upstream.
-        if old.route != route || now.saturating_sub(old.last_seen_ns) < REDIRECT_REFRESH_NS {
-            return false;
-        }
-    }
-    *out = new;
-    true
+pub fn udp_reply_refresh_due(last_seen_ns: u64, now: u64) -> bool {
+    now.saturating_sub(last_seen_ns) >= REDIRECT_REFRESH_NS
 }
 
 #[inline(always)]
 pub fn udp_reply_route(entry: &UdpReplyEntry, now: u64) -> Option<RedirectEntry> {
-    if udp_reply_expired(entry, now) { None }
+    if udp_reply_expired(entry.last_seen_ns, now) { None }
     else { Some(entry.route) }
 }
 
@@ -95,47 +72,26 @@ mod tests {
     }
 
     #[test]
-    fn udp_reply_activity_refreshes_client_route_without_a_target_flow() {
-        for from_wan in [0, 1] {
-            let route = RedirectEntry { ifindex: 3, from_wan, smac: [1; 6],
-                dmac: [2; 6], ..Default::default() };
-            let mut entry = udp_reply_update(None, route, 10).unwrap();
-            assert_eq!(udp_reply_route(&entry, 11), Some(entry.route));
-            assert!(udp_reply_update(Some(&entry), route, 11).is_none());
-            // Replies keep the association route alive beyond its original age.
-            for i in 1..=3 {
-                let now = 10 + i * UDP_CONN_TIMEOUT_NS;
-                let current = udp_reply_route(&entry, now).unwrap();
-                entry = udp_reply_update(Some(&entry), current, now).unwrap();
-            }
-            assert!(udp_reply_route(&entry,
-                entry.last_seen_ns + UDP_CONN_TIMEOUT_NS + REDIRECT_REFRESH_NS + 1).is_none());
-        }
+    fn udp_reply_refresh_is_due_at_the_refresh_interval() {
+        let last_seen = 10;
+        let boundary = last_seen + REDIRECT_REFRESH_NS;
+        assert!(!udp_reply_refresh_due(last_seen, boundary - 1));
+        assert!(udp_reply_refresh_due(last_seen, boundary));
     }
 
     #[test]
-    fn conflicting_publishers_do_not_replace_or_refresh_active_pairs() {
-        let route = RedirectEntry { ifindex: 3, from_wan: 1, ..Default::default() };
-        for conflicting in [RedirectEntry { ifindex: 4, ..route },
-            RedirectEntry { from_wan: 0, ..route },
-            RedirectEntry { smac: [3; 6], ..route }, RedirectEntry { dmac: [4; 6], ..route }] {
-            let first = udp_reply_update(None, route, 10).unwrap();
-            assert!(udp_reply_update(Some(&first), conflicting, 11).is_none());
-            assert_eq!(udp_reply_route(&first, 12), Some(route));
-            let now = 11 + UDP_CONN_TIMEOUT_NS + REDIRECT_REFRESH_NS + 1;
-            let replacement = udp_reply_update(Some(&first), conflicting, now).unwrap();
-            assert_eq!(udp_reply_route(&replacement, now), Some(conflicting));
-        }
+    fn udp_reply_route_expires_after_the_timeout_and_refresh_interval() {
+        let entry = UdpReplyEntry { last_seen_ns: 10, ..Default::default() };
+        let boundary = entry.last_seen_ns + UDP_CONN_TIMEOUT_NS + REDIRECT_REFRESH_NS;
+        assert_eq!(udp_reply_route(&entry, boundary), Some(entry.route));
+        assert_eq!(udp_reply_route(&entry, boundary + 1), None);
     }
 
     #[test]
     fn stale_packet_timestamps_cannot_expire_or_rewind_a_newer_route() {
-        let route = RedirectEntry { ifindex: 3, from_wan: 1, ..Default::default() };
-        let current = udp_reply_update(None, route, 2 * REDIRECT_REFRESH_NS).unwrap();
-        assert!(udp_reply_route(&current, REDIRECT_REFRESH_NS).is_some());
-        assert!(udp_reply_update(Some(&current), route, REDIRECT_REFRESH_NS).is_none());
-        assert!(udp_reply_update(Some(&current), RedirectEntry { ifindex: 4, ..route },
-            REDIRECT_REFRESH_NS).is_none());
+        let last_seen = 2 * REDIRECT_REFRESH_NS;
+        assert!(!udp_reply_expired(last_seen, REDIRECT_REFRESH_NS));
+        assert!(!udp_reply_refresh_due(last_seen, REDIRECT_REFRESH_NS));
     }
 
     #[test]

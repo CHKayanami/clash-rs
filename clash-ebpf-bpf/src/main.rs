@@ -46,8 +46,8 @@ use aya_ebpf_bindings::helpers::{
 };
 use clash_ebpf_bpf::policy::tcp_socket_policy_update;
 use clash_ebpf_common::{
-    DAE_BYPASS_MARK, DAE_TPROXY_MARK, DaeEventType, GC_BATCH_SIZE, GC_FLOW, GC_UDP_REPLY,
-    DaeParam, PIDName, RedirectEntry, RedirectTuple,
+    DAE_BYPASS_MARK, DAE_TPROXY_MARK, DaeEvent, DaeEventType, DaeParam, GC_BATCH_SIZE,
+    GC_FLOW, GC_UDP_REPLY, PIDName, RedirectEntry, RedirectTuple,
 };
 use core::{mem, ptr::NonNull};
 use maps::*;
@@ -89,30 +89,30 @@ pub fn send_dae_event(
         return;
     };
     let ptr = event.as_mut_ptr();
-    // Initialize every byte, including padding, before constructing a reference.
+    macro_rules! write_fields {
+        ($($field:ident: $value:expr),+ $(,)?) => {
+            // Require a write for each field without constructing a stack value.
+            const _: fn(DaeEvent) = |DaeEvent { $($field: _,)+ }| {};
+            $((*ptr).$field = $value;)+
+        };
+    }
+
+    // The reserved slot is writable, every field is plain data, and the
+    // shared ABI assertions guarantee there are no implicit padding bytes.
     unsafe {
-        core::ptr::write_bytes(
-            ptr.cast::<u8>(),
-            0,
-            mem::size_of::<clash_ebpf_common::DaeEvent>(),
-        )
-    };
-    let e = unsafe { &mut *ptr };
-    e.timestamp = unsafe { bpf_ktime_get_ns() };
-    e.type_ = type_;
-    e.pid = pid;
-    e.outbound = outbound;
-    e.l4proto = l4proto;
-    e.sport = sport;
-    e.dport = dport;
-    if let Some(p) = pname {
-        e.pname.copy_from_slice(p);
-    }
-    if let Some(s) = sip {
-        e.sip.copy_from_slice(s);
-    }
-    if let Some(d) = dip {
-        e.dip.copy_from_slice(d);
+        write_fields!(
+            timestamp: bpf_ktime_get_ns(),
+            type_: type_,
+            pid: pid,
+            pname: pname.copied().unwrap_or([0; 16]),
+            outbound: outbound,
+            l4proto: l4proto,
+            pad: [0; 2],
+            sip: sip.copied().unwrap_or([0; 4]),
+            dip: dip.copied().unwrap_or([0; 4]),
+            sport: sport,
+            dport: dport,
+        );
     }
     event.submit(0);
 }
@@ -357,38 +357,63 @@ unsafe fn do_redirect(
 }
 
 // ─────────────────────────────────────────────────────────────
-// 1. LAN Ingress (局域网转发流量处理)
+// 1. Shared Miss Classification & LAN Ingress (局域网转发流量处理)
 // ─────────────────────────────────────────────────────────────
 
 #[inline(always)]
-fn handle_lan_ipv4(
+fn handle_miss_flow(
     ctx: *mut __sk_buff,
     param: &DaeParam,
     link_h_len: usize,
     pkt: &ParsedPacket,
-    observed: bool,
+    wan: bool,
+    process: &(Option<&PIDName>, bool, bool),
 ) -> i32 {
-    let src_port = pkt.tuples.five.src_port;
-    let dst_port = pkt.tuples.five.dst_port;
+    let (ip_version, eth_proto) = if pkt.ethh.ether_type == ETH_P_IP.to_be() {
+        (4u8, ETH_P_IP)
+    } else if pkt.ethh.ether_type == ETH_P_IPV6.to_be() {
+        (6u8, ETH_P_IPV6)
+    } else {
+        return TC_ACT_OK;
+    };
 
+    let (pid_pname, socket_was_proxied, observed) = *process;
     let is_tcp = pkt.l4proto == IPPROTO_TCP;
     let is_udp = pkt.l4proto == IPPROTO_UDP;
     let is_pure_syn = is_tcp && (pkt.tcph.syn() != 0 && pkt.tcph.ack() == 0);
     let is_fin_rst = is_tcp && (pkt.tcph.fin() != 0 || pkt.tcph.rst() != 0);
 
     let mut tuple = RedirectTuple::default();
-    packet_redirect_tuple(pkt, 4, &mut tuple);
-    let Some(scratch) = FLOW_SCRATCH.get_ptr_mut(0) else { return TC_ACT_SHOT; };
+    packet_redirect_tuple(pkt, ip_version, &mut tuple);
+    let Some(scratch) = FLOW_SCRATCH.get_ptr_mut(0) else {
+        return TC_ACT_SHOT;
+    };
     let scratch = unsafe { &mut *scratch };
     let packet_now = if is_udp { unsafe { bpf_ktime_get_ns() } } else { 0 };
-    if !observed && tracking::lookup_into(&tuple, is_pure_syn, is_fin_rst, packet_now, &mut scratch.observed)
-        & tracking::BUSY != 0 { return TC_ACT_SHOT; }
+    if !observed
+        && tracking::lookup_into(
+            &tuple,
+            is_pure_syn,
+            is_fin_rst,
+            packet_now,
+            &mut scratch.observed,
+        ) & tracking::BUSY
+            != 0
+    {
+        return TC_ACT_SHOT;
+    }
     let tracked = &scratch.observed;
-    let is_redirected = tracked.is_redirect();
-    if !is_redirected && tracked.is_direct() { return TC_ACT_OK; }
-    if !is_redirected && routing::direct(param, link_h_len, pkt, false, None) {
-        if !tracking::publish_into(&tuple, tracked, None, &mut scratch.result) { return TC_ACT_SHOT; }
-        if scratch.result.is_direct() { return TC_ACT_OK; }
+    let is_redirected = tracked.is_redirect() || socket_was_proxied;
+    if !is_redirected && tracked.is_direct() {
+        return TC_ACT_OK;
+    }
+    if !is_redirected && routing::direct(param, link_h_len, pkt, wan, pid_pname) {
+        if !tracking::publish_into(&tuple, tracked, None, &mut scratch.result) {
+            return TC_ACT_SHOT;
+        }
+        if scratch.result.is_direct() {
+            return TC_ACT_OK;
+        }
     }
 
     let ifindex = unsafe { (*ctx).ifindex };
@@ -399,7 +424,7 @@ fn handle_lan_ipv4(
     };
     let entry = RedirectEntry {
         ifindex,
-        from_wan: 0,
+        from_wan: wan as u8,
         _pad0: [0; 3],
         smac,
         dmac,
@@ -407,116 +432,76 @@ fn handle_lan_ipv4(
     unsafe {
         let is_new_flow = tracked.activity == 0;
         if !tracked.matches_route(&entry) {
-            if !tracking::publish_into(&tuple, tracked, Some(&entry), &mut scratch.result) {
+            if !tracking::publish_into(&tuple, tracked, Some(&entry), &mut scratch.result)
+            {
                 return TC_ACT_SHOT;
             }
-            if scratch.result.is_direct() { return TC_ACT_OK; }
+            if scratch.result.is_direct() {
+                return TC_ACT_OK;
+            }
         }
-        if is_udp && !udp_reply::publish(&tuple, entry, packet_now) {
+        if is_udp && !udp_reply::publish(&tuple, &entry, packet_now) {
             return TC_ACT_SHOT;
         }
-        let l4proto = if pkt.l4proto == IPPROTO_TCP {
+        let l4proto = if is_tcp {
             pkt.listener_l4proto
         } else {
             IPPROTO_UDP
         };
 
         if is_new_flow && param.log_events != 0 {
-            let sip_u32 = [u32::from_be_bytes([tuple.src_ip[12], tuple.src_ip[13], tuple.src_ip[14], tuple.src_ip[15]]), 0, 0, 0];
-            let dip_u32 = [u32::from_be_bytes([tuple.dst_ip[12], tuple.dst_ip[13], tuple.dst_ip[14], tuple.dst_ip[15]]), 0, 0, 0];
-            send_dae_event(
-                DaeEventType::Redirected as u32,
-                0,
-                None,
-                0,
-                pkt.l4proto,
-                Some(&sip_u32),
-                Some(&dip_u32),
-                src_port,
-                dst_port,
-            );
-        }
-
-        do_redirect(ctx, param, link_h_len, l4proto, ETH_P_IP, false)
-    }
-}
-
-#[inline(always)]
-fn handle_lan_ipv6(
-    ctx: *mut __sk_buff,
-    param: &DaeParam,
-    link_h_len: usize,
-    pkt: &ParsedPacket,
-    observed: bool,
-) -> i32 {
-    let src_port = pkt.tuples.five.src_port;
-    let dst_port = pkt.tuples.five.dst_port;
-
-    let is_tcp = pkt.l4proto == IPPROTO_TCP;
-    let is_udp = pkt.l4proto == IPPROTO_UDP;
-    let is_pure_syn = is_tcp && (pkt.tcph.syn() != 0 && pkt.tcph.ack() == 0);
-    let is_fin_rst = is_tcp && (pkt.tcph.fin() != 0 || pkt.tcph.rst() != 0);
-
-    let mut tuple = RedirectTuple::default();
-    packet_redirect_tuple(pkt, 6, &mut tuple);
-    let Some(scratch) = FLOW_SCRATCH.get_ptr_mut(0) else { return TC_ACT_SHOT; };
-    let scratch = unsafe { &mut *scratch };
-    let packet_now = if is_udp { unsafe { bpf_ktime_get_ns() } } else { 0 };
-    if !observed && tracking::lookup_into(&tuple, is_pure_syn, is_fin_rst, packet_now, &mut scratch.observed)
-        & tracking::BUSY != 0 { return TC_ACT_SHOT; }
-    let tracked = &scratch.observed;
-    let is_redirected = tracked.is_redirect();
-    if !is_redirected && tracked.is_direct() { return TC_ACT_OK; }
-    if !is_redirected && routing::direct(param, link_h_len, pkt, false, None) {
-        if !tracking::publish_into(&tuple, tracked, None, &mut scratch.result) { return TC_ACT_SHOT; }
-        if scratch.result.is_direct() { return TC_ACT_OK; }
-    }
-
-    let ifindex = unsafe { (*ctx).ifindex };
-    let (smac, dmac) = if link_h_len >= EthHdr::LEN {
-        (pkt.ethh.src_addr, pkt.ethh.dst_addr)
-    } else {
-        ([0u8; 6], [0u8; 6])
-    };
-    let entry = RedirectEntry {
-        ifindex,
-        from_wan: 0,
-        _pad0: [0; 3],
-        smac,
-        dmac,
-    };
-    unsafe {
-        let is_new_flow = tracked.activity == 0;
-        if !tracked.matches_route(&entry) {
-            if !tracking::publish_into(&tuple, tracked, Some(&entry), &mut scratch.result) {
-                return TC_ACT_SHOT;
+            let pid = pid_pname.map(|p| p.pid).unwrap_or(0);
+            let pname = pid_pname.map(|p| &p.pname);
+            if ip_version == 4 {
+                let sip_u32 = [
+                    u32::from_be_bytes([
+                        tuple.src_ip[12],
+                        tuple.src_ip[13],
+                        tuple.src_ip[14],
+                        tuple.src_ip[15],
+                    ]),
+                    0,
+                    0,
+                    0,
+                ];
+                let dip_u32 = [
+                    u32::from_be_bytes([
+                        tuple.dst_ip[12],
+                        tuple.dst_ip[13],
+                        tuple.dst_ip[14],
+                        tuple.dst_ip[15],
+                    ]),
+                    0,
+                    0,
+                    0,
+                ];
+                send_dae_event(
+                    DaeEventType::Redirected as u32,
+                    pid,
+                    pname,
+                    wan as u8,
+                    pkt.l4proto,
+                    Some(&sip_u32),
+                    Some(&dip_u32),
+                    pkt.tuples.five.src_port,
+                    pkt.tuples.five.dst_port,
+                );
+            } else {
+                send_dae_event(
+                    DaeEventType::Redirected as u32,
+                    pid,
+                    pname,
+                    wan as u8,
+                    pkt.l4proto,
+                    Some(&pkt.tuples.five.src_ip.u6_addr32),
+                    Some(&pkt.tuples.five.dst_ip.u6_addr32),
+                    pkt.tuples.five.src_port,
+                    pkt.tuples.five.dst_port,
+                );
             }
-            if scratch.result.is_direct() { return TC_ACT_OK; }
-        }
-        if is_udp && !udp_reply::publish(&tuple, entry, packet_now) {
-            return TC_ACT_SHOT;
-        }
-        let l4proto = if pkt.l4proto == IPPROTO_TCP {
-            pkt.listener_l4proto
-        } else {
-            IPPROTO_UDP
-        };
-
-        if is_new_flow && param.log_events != 0 {
-            send_dae_event(
-                DaeEventType::Redirected as u32,
-                0,
-                None,
-                0,
-                pkt.l4proto,
-                Some(&pkt.tuples.five.src_ip.u6_addr32),
-                Some(&pkt.tuples.five.dst_ip.u6_addr32),
-                src_port,
-                dst_port,
-            );
         }
 
-        do_redirect(ctx, param, link_h_len, l4proto, ETH_P_IPV6, false)
+        do_redirect(ctx, param, link_h_len, l4proto, eth_proto, wan)
     }
 }
 
@@ -564,197 +549,12 @@ fn handle_lan_miss(tc_ctx: &TcContext, param: &DaeParam, link_h_len: usize, obse
         return TC_ACT_OK;
     }
 
-    if pkt.ethh.ether_type == ETH_P_IP.to_be() {
-        handle_lan_ipv4(ctx, param, link_h_len, pkt, observed)
-    } else if pkt.ethh.ether_type == ETH_P_IPV6.to_be() {
-        handle_lan_ipv6(ctx, param, link_h_len, pkt, observed)
-    } else {
-        TC_ACT_OK
-    }
+    handle_miss_flow(ctx, param, link_h_len, pkt, false, &(None, false, observed))
 }
 
 // ─────────────────────────────────────────────────────────────
 // 2. WAN Egress (本机出站流量处理)
 // ─────────────────────────────────────────────────────────────
-
-#[inline(always)]
-fn handle_wan_ipv4(
-    ctx: *mut __sk_buff,
-    param: &DaeParam,
-    link_h_len: usize,
-    pkt: &ParsedPacket,
-    process: &(Option<&PIDName>, bool, bool),
-) -> i32 {
-    let (pid_pname, socket_was_proxied, observed) = *process;
-    let src_port = pkt.tuples.five.src_port;
-    let dst_port = pkt.tuples.five.dst_port;
-
-    let is_tcp = pkt.l4proto == IPPROTO_TCP;
-    let is_udp = pkt.l4proto == IPPROTO_UDP;
-    let is_pure_syn = is_tcp && (pkt.tcph.syn() != 0 && pkt.tcph.ack() == 0);
-    let is_fin_rst = is_tcp && (pkt.tcph.fin() != 0 || pkt.tcph.rst() != 0);
-
-    let ip_be: [u8; 4] = [
-        pkt.tuples.five.dst_ip[12],
-        pkt.tuples.five.dst_ip[13],
-        pkt.tuples.five.dst_ip[14],
-        pkt.tuples.five.dst_ip[15],
-    ];
-    let src_ip_be: [u8; 4] = [
-        pkt.tuples.five.src_ip[12],
-        pkt.tuples.five.src_ip[13],
-        pkt.tuples.five.src_ip[14],
-        pkt.tuples.five.src_ip[15],
-    ];
-
-    let mut tuple = RedirectTuple::default();
-    packet_redirect_tuple(pkt, 4, &mut tuple);
-    let Some(scratch) = FLOW_SCRATCH.get_ptr_mut(0) else { return TC_ACT_SHOT; };
-    let scratch = unsafe { &mut *scratch };
-    let packet_now = if is_udp { unsafe { bpf_ktime_get_ns() } } else { 0 };
-    if !observed && tracking::lookup_into(&tuple, is_pure_syn, is_fin_rst, packet_now, &mut scratch.observed)
-        & tracking::BUSY != 0 { return TC_ACT_SHOT; }
-    let tracked = &scratch.observed;
-    let is_redirected = tracked.is_redirect() || socket_was_proxied;
-    if !is_redirected && tracked.is_direct() { return TC_ACT_OK; }
-    if !is_redirected && routing::direct(param, link_h_len, pkt, true, pid_pname) {
-        if !tracking::publish_into(&tuple, tracked, None, &mut scratch.result) { return TC_ACT_SHOT; }
-        if scratch.result.is_direct() { return TC_ACT_OK; }
-    }
-
-    let ifindex = unsafe { (*ctx).ifindex };
-    let (smac, dmac) = if link_h_len >= EthHdr::LEN {
-        (pkt.ethh.src_addr, pkt.ethh.dst_addr)
-    } else {
-        ([0u8; 6], [0u8; 6])
-    };
-    let entry = RedirectEntry {
-        ifindex,
-        from_wan: 1,
-        _pad0: [0; 3],
-        smac,
-        dmac,
-    };
-    unsafe {
-        let is_new_flow = tracked.activity == 0;
-        if !tracked.matches_route(&entry) {
-            if !tracking::publish_into(&tuple, tracked, Some(&entry), &mut scratch.result) {
-                return TC_ACT_SHOT;
-            }
-            if scratch.result.is_direct() { return TC_ACT_OK; }
-        }
-        if is_udp && !udp_reply::publish(&tuple, entry, packet_now) {
-            return TC_ACT_SHOT;
-        }
-        let l4proto = if pkt.l4proto == IPPROTO_TCP {
-            pkt.listener_l4proto
-        } else {
-            IPPROTO_UDP
-        };
-
-        if is_new_flow && param.log_events != 0 {
-            let pid = pid_pname.map(|p| p.pid).unwrap_or(0);
-            let pname = pid_pname.map(|p| &p.pname);
-            let sip_u32 = [u32::from_be_bytes(src_ip_be), 0, 0, 0];
-            let dip_u32 = [u32::from_be_bytes(ip_be), 0, 0, 0];
-            send_dae_event(
-                DaeEventType::Redirected as u32,
-                pid,
-                pname,
-                1,
-                pkt.l4proto,
-                Some(&sip_u32),
-                Some(&dip_u32),
-                src_port,
-                dst_port,
-            );
-        }
-
-        do_redirect(ctx, param, link_h_len, l4proto, ETH_P_IP, true)
-    }
-}
-
-#[inline(always)]
-fn handle_wan_ipv6(
-    ctx: *mut __sk_buff,
-    param: &DaeParam,
-    link_h_len: usize,
-    pkt: &ParsedPacket,
-    process: &(Option<&PIDName>, bool, bool),
-) -> i32 {
-    let (pid_pname, socket_was_proxied, observed) = *process;
-    let src_port = pkt.tuples.five.src_port;
-    let dst_port = pkt.tuples.five.dst_port;
-
-    let is_tcp = pkt.l4proto == IPPROTO_TCP;
-    let is_udp = pkt.l4proto == IPPROTO_UDP;
-    let is_pure_syn = is_tcp && (pkt.tcph.syn() != 0 && pkt.tcph.ack() == 0);
-    let is_fin_rst = is_tcp && (pkt.tcph.fin() != 0 || pkt.tcph.rst() != 0);
-
-    let mut tuple = RedirectTuple::default();
-    packet_redirect_tuple(pkt, 6, &mut tuple);
-    let Some(scratch) = FLOW_SCRATCH.get_ptr_mut(0) else { return TC_ACT_SHOT; };
-    let scratch = unsafe { &mut *scratch };
-    let packet_now = if is_udp { unsafe { bpf_ktime_get_ns() } } else { 0 };
-    if !observed && tracking::lookup_into(&tuple, is_pure_syn, is_fin_rst, packet_now, &mut scratch.observed)
-        & tracking::BUSY != 0 { return TC_ACT_SHOT; }
-    let tracked = &scratch.observed;
-    let is_redirected = tracked.is_redirect() || socket_was_proxied;
-    if !is_redirected && tracked.is_direct() { return TC_ACT_OK; }
-    if !is_redirected && routing::direct(param, link_h_len, pkt, true, pid_pname) {
-        if !tracking::publish_into(&tuple, tracked, None, &mut scratch.result) { return TC_ACT_SHOT; }
-        if scratch.result.is_direct() { return TC_ACT_OK; }
-    }
-
-    let ifindex = unsafe { (*ctx).ifindex };
-    let (smac, dmac) = if link_h_len >= EthHdr::LEN {
-        (pkt.ethh.src_addr, pkt.ethh.dst_addr)
-    } else {
-        ([0u8; 6], [0u8; 6])
-    };
-    let entry = RedirectEntry {
-        ifindex,
-        from_wan: 1,
-        _pad0: [0; 3],
-        smac,
-        dmac,
-    };
-    unsafe {
-        let is_new_flow = tracked.activity == 0;
-        if !tracked.matches_route(&entry) {
-            if !tracking::publish_into(&tuple, tracked, Some(&entry), &mut scratch.result) {
-                return TC_ACT_SHOT;
-            }
-            if scratch.result.is_direct() { return TC_ACT_OK; }
-        }
-        if is_udp && !udp_reply::publish(&tuple, entry, packet_now) {
-            return TC_ACT_SHOT;
-        }
-        let l4proto = if pkt.l4proto == IPPROTO_TCP {
-            pkt.listener_l4proto
-        } else {
-            IPPROTO_UDP
-        };
-
-        if is_new_flow && param.log_events != 0 {
-            let pid = pid_pname.map(|p| p.pid).unwrap_or(0);
-            let pname = pid_pname.map(|p| &p.pname);
-            send_dae_event(
-                DaeEventType::Redirected as u32,
-                pid,
-                pname,
-                1,
-                pkt.l4proto,
-                Some(&pkt.tuples.five.src_ip.u6_addr32),
-                Some(&pkt.tuples.five.dst_ip.u6_addr32),
-                src_port,
-                dst_port,
-            );
-        }
-
-        do_redirect(ctx, param, link_h_len, l4proto, ETH_P_IPV6, true)
-    }
-}
 
 #[inline(never)]
 fn handle_wan_egress_impl(tc_ctx: &TcContext, link_h_len: usize) -> i32 {
@@ -850,36 +650,29 @@ fn handle_wan_miss(tc_ctx: &TcContext, param: &DaeParam, link_h_len: usize,
     }
 
     // Only connect hooks grant active-open identity; no flow-LRU dependency.
-    if pkt.l4proto == IPPROTO_TCP {
+    let is_tcp = pkt.l4proto == IPPROTO_TCP;
+    let socket_was_proxied = if is_tcp {
         if tcp_policy.is_null() {
             return TC_ACT_OK;
         }
-        let decision = unsafe { *tcp_policy };
-        let verdict =
-            dispatch_wan(ctx, param, link_h_len, pkt, &(pid_pname, decision == 2, observed));
+        unsafe { *tcp_policy == 2 }
+    } else {
+        false
+    };
+    let verdict = handle_miss_flow(
+        ctx,
+        param,
+        link_h_len,
+        pkt,
+        true,
+        &(pid_pname, socket_was_proxied, observed),
+    );
+    if is_tcp {
         if let Some(policy) = tcp_socket_policy_update(verdict) {
             unsafe { *tcp_policy = policy; }
         }
-        return verdict;
     }
-    dispatch_wan(ctx, param, link_h_len, pkt, &(pid_pname, false, observed))
-}
-
-#[inline(always)]
-fn dispatch_wan(
-    ctx: *mut __sk_buff,
-    param: &DaeParam,
-    link_h_len: usize,
-    pkt: &ParsedPacket,
-    process: &(Option<&PIDName>, bool, bool),
-) -> i32 {
-    if pkt.ethh.ether_type == ETH_P_IP.to_be() {
-        handle_wan_ipv4(ctx, param, link_h_len, pkt, process)
-    } else if pkt.ethh.ether_type == ETH_P_IPV6.to_be() {
-        handle_wan_ipv6(ctx, param, link_h_len, pkt, process)
-    } else {
-        TC_ACT_OK
-    }
+    verdict
 }
 
 // ─────────────────────────────────────────────────────────────
