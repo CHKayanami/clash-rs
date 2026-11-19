@@ -30,8 +30,7 @@ async fn shutdown_handoff_drains_pending_adapter_writes_without_reading_new_down
         let accepted = vec![0xab; 64 * 1024];
         stream.write_all(&accepted).await.unwrap();
         stream.shutdown().await.unwrap();
-        let relay = tokio::spawn(stream.forward(native, prefix, Box::new(|_, _| {}),
-            Duration::from_secs(2), Duration::from_secs(2)));
+        let relay = tokio::spawn(stream.forward(native, prefix, Box::new(|_, _| {})));
         let mut delivered = Vec::new();
         loop {
             let packet = packets.next().await.unwrap().unwrap();

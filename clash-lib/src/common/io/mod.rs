@@ -69,6 +69,7 @@ impl From<std::io::Error> for CopyBidirectionalError {
 }
 
 pub const DEFAULT_BUF_SIZE: usize = 16 * 1024;
+// Keep in sync with IDLE_TIMEOUT in clash-netstack/src/tcp/forward.rs.
 const COPY_IDLE_TIMEOUT: Duration = Duration::from_secs(180);
 
 #[derive(Debug)]
@@ -239,17 +240,15 @@ impl CopyBuffer {
 pub(crate) use buffered::layout as copy_state_layout;
 
 /// Copies both directions, shutting down the opposing writer on EOF.
-/// Successful writes refresh the remaining direction's half-close timeout.
 #[cfg(any(test, feature = "allocation-tests"))]
-pub fn copy_buf_bidirectional_with_timeout<'a, A, B>(
-    a: &'a mut A, b: &'a mut B, size: usize,
-    upload_timeout: Duration, download_timeout: Duration, tracker: TrafficTracker,
+pub fn copy_buf_bidirectional<'a, A, B>(
+    a: &'a mut A, b: &'a mut B, size: usize, tracker: TrafficTracker,
 ) -> impl Future<Output = Result<(u64, u64), CopyBidirectionalError>> + 'a
 where
     A: AsyncRead + AsyncWrite + Unpin + ?Sized,
     B: AsyncRead + AsyncWrite + Unpin + ?Sized,
 {
-    buffered::BufferedCopy::new(a, b, size, upload_timeout, download_timeout, tracker)
+    buffered::BufferedCopy::new(a, b, size, tracker)
 }
 
 pub trait ReadExactBase {

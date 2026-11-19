@@ -22,7 +22,6 @@ use std::{
         Arc,
         atomic::{AtomicBool, AtomicU8, Ordering},
     },
-    time::Duration,
 };
 use tracing::{Instrument, debug, error, info, info_span, trace, warn};
 
@@ -229,8 +228,6 @@ impl Dispatcher {
                 lhs,
                 rhs,
                 self.tcp_buffer_size,
-                Duration::from_secs(10),
-                Duration::from_secs(10),
                 tracker,
             )
             .instrument(copy_span);

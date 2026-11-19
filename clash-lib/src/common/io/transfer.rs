@@ -1,7 +1,7 @@
 //! Shared direction state, accounting and shutdown for buffered and splice I/O.
-use std::{io::{Error, ErrorKind}, pin::Pin, task::{Context, Poll}, time::Duration};
+use std::{io::{Error, ErrorKind}, pin::Pin, task::{Context, Poll}};
 use tokio::io::{AsyncRead, AsyncWrite};
-use super::{CopyBidirectionalError, TrafficTracker, timeout::CopyTimeouts};
+use super::{CopyBidirectionalError, TrafficTracker, timeout::IdleTimeout};
 
 #[derive(Clone, Copy)]
 pub(super) enum Direction {
@@ -23,13 +23,6 @@ impl Direction {
             Self::Download => tracker.push_download(written),
         }
     }
-
-    fn opposite(self) -> Self {
-        match self {
-            Self::Upload => Self::Download,
-            Self::Download => Self::Upload,
-        }
-    }
 }
 
 pub(super) trait Buffer<R: ?Sized, W: ?Sized> {
@@ -47,7 +40,7 @@ pub(super) enum TransferState<C> {
 }
 
 struct DirectionContext<'a> {
-    timeouts: &'a mut CopyTimeouts,
+    idle_timeout: &'a mut IdleTimeout,
     tracker: &'a TrafficTracker,
     direction: Direction,
 }
@@ -55,54 +48,42 @@ struct DirectionContext<'a> {
 impl<C> TransferState<C> {
     fn poll<R, W>(
         &mut self, reader: &mut R, writer: &mut W, cx: &mut Context<'_>,
-        context: DirectionContext<'_>, opposite: &Self,
-    ) -> Result<bool, CopyBidirectionalError>
+        context: DirectionContext<'_>,
+    ) -> Result<(), CopyBidirectionalError>
     where
         C: Buffer<R, W>,
         R: ?Sized,
         W: AsyncWrite + Unpin + ?Sized,
     {
-        let DirectionContext { timeouts, tracker, direction } = context;
+        let DirectionContext { idle_timeout, tracker, direction } = context;
         loop {
             match self {
                 Self::Running(buffer) => {
                     let before = buffer.amount_transferred();
                     let mut active = false;
                     let result = buffer.poll_copy(cx, reader, writer, &mut active, direction);
-                    timeouts.record_activity(active);
+                    idle_timeout.record_activity(active);
                     let written = buffer.amount_transferred() - before;
                     // Account successful writes even if a later I/O operation
-                    // in the same poll fails. Reads never refresh half-close.
+                    // in the same poll fails.
                     if written > 0 {
                         direction.track(tracker, written as usize);
-                        timeouts.wrote(direction);
                     }
                     let count = match result {
                         Poll::Ready(Ok(count)) => count,
                         Poll::Ready(Err(error)) => return Err(error),
-                        Poll::Pending if timeouts.half_close_expired() => {
-                            buffer.amount_transferred()
-                        }
-                        Poll::Pending => return Ok(false),
+                        Poll::Pending => return Ok(()),
                     };
                     *self = Self::ShuttingDown(count);
-                    timeouts.stop_half_close();
                 }
                 Self::ShuttingDown(count) => {
                     match Pin::new(&mut *writer).poll_shutdown(cx) {
-                        Poll::Ready(Ok(())) => {
-                            *self = Self::Done(*count);
-                            if matches!(opposite, Self::Running(_)) {
-                                timeouts.start_half_close(direction.opposite());
-                                return Ok(true);
-                            }
-                            return Ok(false);
-                        }
+                        Poll::Ready(Ok(())) => *self = Self::Done(*count),
                         Poll::Ready(Err(error)) => return Err(direction.error(error)),
-                        Poll::Pending => return Ok(false),
+                        Poll::Pending => return Ok(()),
                     }
                 }
-                Self::Done(_) => return Ok(false),
+                Self::Done(_) => return Ok(()),
             }
         }
     }
@@ -111,42 +92,38 @@ impl<C> TransferState<C> {
 pub(super) struct CopyState<C> {
     upload: TransferState<C>,
     download: TransferState<C>,
-    timeouts: CopyTimeouts,
+    idle_timeout: IdleTimeout,
     tracker: TrafficTracker,
     download_first: bool,
 }
 
 impl<C> CopyState<C> {
-    pub(super) fn new(
-        upload: C, download: C, upload_timeout: Duration,
-        download_timeout: Duration, tracker: TrafficTracker,
-    ) -> Self {
+    pub(super) fn new(upload: C, download: C, tracker: TrafficTracker) -> Self {
         Self {
             upload: TransferState::Running(upload),
             download: TransferState::Running(download),
-            timeouts: CopyTimeouts::new(upload_timeout, download_timeout),
+            idle_timeout: IdleTimeout::new(),
             tracker,
             download_first: false,
         }
     }
 
-    /// Returns `true` if this poll started the opposite direction's half-close timer.
     fn poll_direction<R, W>(
         &mut self, a: &mut R, b: &mut W, cx: &mut Context<'_>, direction: Direction,
-    ) -> Result<bool, CopyBidirectionalError>
+    ) -> Result<(), CopyBidirectionalError>
     where
         C: Buffer<R, W> + Buffer<W, R>,
         R: AsyncRead + AsyncWrite + Unpin + ?Sized,
         W: AsyncRead + AsyncWrite + Unpin + ?Sized,
     {
         let context = DirectionContext {
-            timeouts: &mut self.timeouts,
+            idle_timeout: &mut self.idle_timeout,
             tracker: &self.tracker,
             direction,
         };
         match direction {
-            Direction::Upload => self.upload.poll(a, b, cx, context, &self.download),
-            Direction::Download => self.download.poll(b, a, cx, context, &self.upload),
+            Direction::Upload => self.upload.poll(a, b, cx, context),
+            Direction::Download => self.download.poll(b, a, cx, context),
         }
     }
 
@@ -158,9 +135,7 @@ impl<C> CopyState<C> {
         R: AsyncRead + AsyncWrite + Unpin + ?Sized,
         W: AsyncRead + AsyncWrite + Unpin + ?Sized,
     {
-        // Preserve idle-error priority, then allow ready I/O to refresh the
-        // half-close deadline before checking it, as with separate timers.
-        if self.timeouts.idle_expired() {
+        if self.idle_timeout.expired() {
             return Poll::Ready(Err(CopyBidirectionalError::Other(Error::new(
                 ErrorKind::TimedOut, "connection idle timeout",
             ))));
@@ -173,17 +148,13 @@ impl<C> CopyState<C> {
         };
         self.download_first = !self.download_first;
         self.poll_direction(a, b, cx, first)?;
-        if self.poll_direction(a, b, cx, second)? {
-            // The first direction was polled before its deadline was installed.
-            // Revisit it so zero-duration timeouts also finish immediately.
-            self.poll_direction(a, b, cx, first)?;
-        }
+        self.poll_direction(a, b, cx, second)?;
         if let (TransferState::Done(upload), TransferState::Done(download)) =
             (&self.upload, &self.download)
         {
             return Poll::Ready(Ok((*upload, *download)));
         }
-        self.timeouts.poll_wait(cx);
+        self.idle_timeout.poll_wait(cx);
         Poll::Pending
     }
 }

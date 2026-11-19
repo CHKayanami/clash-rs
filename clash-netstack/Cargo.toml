@@ -30,6 +30,7 @@ clash-common = { path = "../clash-common" }
 
 
 [dev-dependencies]
+tokio = { version = "1.52", features = ["test-util"] }
 tun-rs = { version = "2", features = ["async", "async_framed"] }
 ipnet = "2"
 socket2 = { version = "0.6", features = ["all"] }

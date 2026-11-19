@@ -256,8 +256,6 @@ mod tests {
                 AnyStream::new(inbound),
                 transport,
                 1024,
-                Duration::from_secs(2),
-                Duration::from_secs(2),
                 TrafficTracker::noop(),
             ));
             let roundtrip = async {

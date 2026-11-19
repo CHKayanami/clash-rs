@@ -22,14 +22,14 @@ use tokio::{
 
 pub type ForwardCounter = Box<dyn FnMut(usize, usize) + Send + Sync>;
 type ForwardResult = io::Result<(u64, u64)>;
+// Keep in sync with COPY_IDLE_TIMEOUT in clash-lib/src/common/io/mod.rs.
+const IDLE_TIMEOUT: Duration = Duration::from_secs(180);
 
 pub(crate) struct ForwardRequest {
     pub socket: NativeTcpStream,
     pub prefix: Vec<u8>,
     pub counter: ForwardCounter,
     pub done: oneshot::Sender<ForwardResult>,
-    pub upload_timeout: Duration,
-    pub download_timeout: Duration,
 }
 
 pub(crate) struct Forward {
@@ -40,7 +40,6 @@ pub(crate) struct Forward {
     upload_done: bool,
     download_done: bool,
     last_active: Instant,
-    half_close: Option<Instant>,
     timer: Pin<Box<Sleep>>,
 }
 
@@ -52,8 +51,6 @@ impl TcpStream {
         socket: NativeTcpStream,
         prefix: Vec<u8>,
         counter: ForwardCounter,
-        upload_timeout: Duration,
-        download_timeout: Duration,
     ) -> ForwardResult {
         let (done, result) = oneshot::channel();
         let mut guard = ForwardGuard {
@@ -70,8 +67,6 @@ impl TcpStream {
                 prefix,
                 counter,
                 done,
-                upload_timeout,
-                download_timeout,
             });
             guard
                 .stream
@@ -100,8 +95,7 @@ impl Drop for ForwardGuard {
 }
 
 impl Forward {
-    pub fn new(request: ForwardRequest) -> Self {
-        let last_active = Instant::now();
+    pub fn new(request: ForwardRequest, now: Instant) -> Self {
         Self {
             request,
             offset: 0,
@@ -109,9 +103,8 @@ impl Forward {
             download: 0,
             upload_done: false,
             download_done: false,
-            last_active,
-            half_close: None,
-            timer: Box::pin(sleep_until(last_active + Duration::from_secs(180))),
+            last_active: now,
+            timer: Box::pin(sleep_until(now + IDLE_TIMEOUT)),
         }
     }
 
@@ -150,7 +143,6 @@ impl Forward {
             // Handoff must preserve an earlier application write shutdown,
             // but only after draining every write accepted by the stream.
             self.download_done = true;
-            self.half_close = Some(now + self.request.upload_timeout);
             socket.close();
         }
         if past_handshake(socket) && !socket.may_send() && !self.download_done {
@@ -159,20 +151,15 @@ impl Forward {
         if self.upload_done && self.download_done {
             return Poll::Ready(Ok(()));
         }
-        if self.half_close.is_some_and(|deadline| now >= deadline) {
+        let deadline = self.last_active + IDLE_TIMEOUT;
+        if now >= deadline {
             return Poll::Ready(Err(io::ErrorKind::TimedOut.into()));
-        }
-        let idle = self.last_active + Duration::from_secs(180);
-        if now >= idle {
-            return Poll::Ready(Err(io::ErrorKind::TimedOut.into()));
-        }
-        let deadline = self.half_close.map_or(idle, |half| half.min(idle));
-        if deadline < self.timer.deadline() || self.timer.is_elapsed() {
-            self.timer.as_mut().reset(deadline);
         }
         if self.timer.as_mut().poll(cx).is_ready() {
             self.timer.as_mut().reset(deadline);
-            let _ = self.timer.as_mut().poll(cx);
+            if self.timer.as_mut().poll(cx).is_ready() {
+                cx.waker().wake_by_ref();
+            }
         }
         Poll::Pending
     }
@@ -253,7 +240,6 @@ impl Forward {
                 match Pin::new(&mut self.request.socket).poll_shutdown(cx) {
                     Poll::Ready(Ok(())) => {
                         self.upload_done = true;
-                        self.half_close = Some(now + self.request.download_timeout);
                     }
                     Poll::Ready(Err(error)) => return Err(error),
                     Poll::Pending => break,
@@ -331,7 +317,6 @@ impl Forward {
                 match read {
                     Poll::Ready(Ok(())) if n == 0 => {
                         self.download_done = true;
-                        self.half_close = Some(now + self.request.upload_timeout);
                         socket.close();
                     }
                     Poll::Ready(Ok(())) => {
@@ -374,14 +359,6 @@ impl Forward {
 
     fn count(&mut self, upload: usize, download: usize, now: Instant) {
         self.last_active = now;
-        if self.half_close.is_some() {
-            let timeout = if upload > 0 {
-                self.request.upload_timeout
-            } else {
-                self.request.download_timeout
-            };
-            self.half_close = Some(self.last_active + timeout);
-        }
         self.upload += upload as u64;
         self.download += download as u64;
     }
@@ -415,7 +392,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn half_close_timeout_is_an_abort_instead_of_graceful_completion() {
+    async fn half_closed_forward_expires_at_the_idle_deadline() {
         let (native, _peer) = native_pair().await;
         let (done, _result) = oneshot::channel();
         let mut forward = Forward::new(ForwardRequest {
@@ -423,11 +400,9 @@ mod tests {
             prefix: Vec::new(),
             counter: Box::new(|_, _| {}),
             done,
-            upload_timeout: Duration::ZERO,
-            download_timeout: Duration::ZERO,
-        });
+        }, Instant::now());
         forward.download_done = true;
-        forward.half_close = Some(Instant::now());
+        let idle_deadline = forward.last_active + IDLE_TIMEOUT;
         let ready = Ready::new(1, Arc::new(ReadyQueue::with_waker()));
         let (_stream, handle) = new_stream(
             "192.0.2.1:1234".parse().unwrap(),
@@ -442,7 +417,13 @@ mod tests {
         let waker = noop_waker();
         let mut cx = Context::from_waker(&waker);
         assert!(
-            matches!(forward.poll(&mut socket, &handle, &mut cx, Instant::now(), &mut |_| false),
+            forward.poll(
+                &mut socket, &handle, &mut cx, idle_deadline - Duration::from_millis(1),
+                &mut |_| false,
+            ).is_pending()
+        );
+        assert!(
+            matches!(forward.poll(&mut socket, &handle, &mut cx, idle_deadline, &mut |_| false),
             Poll::Ready(Err(error)) if error.kind() == io::ErrorKind::TimedOut)
         );
         assert!(!forward.upload_done);

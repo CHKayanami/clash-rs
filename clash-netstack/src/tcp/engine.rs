@@ -66,6 +66,7 @@ pub(crate) struct Engine {
     entries: HashMap<u64, Entry>,
     ready: Arc<ReadyQueue>,
     buffer_timers: Timers<Instant>,
+    clock_origin: Instant,
 }
 
 impl Engine {
@@ -90,6 +91,7 @@ impl Engine {
             entries: HashMap::new(),
             ready,
             buffer_timers: Timers::default(),
+            clock_origin: Instant::now(),
         }
     }
 
@@ -157,7 +159,9 @@ impl Engine {
         transmit: &mut dyn FnMut(&[u8], &[u8], Option<u16>) -> bool,
     ) -> (bool, Option<StackDuration>) {
         let now = Instant::now();
-        let stack_now = StackInstant::now();
+        // The protocol stack and Tokio timers advance on the same clock.
+        let stack_now = StackInstant::ZERO
+            + StackDuration::from(now.saturating_duration_since(self.clock_origin));
         self.expire_buffers(now);
         let ingress_status =
             self.driver
@@ -382,7 +386,7 @@ impl Engine {
         } else if started || socket.state() != tcp::State::Listen {
             if entry.handle.forward_pending.load(Ordering::Acquire) {
                 if let Some(request) = entry.handle.forward.lock().unwrap().take() {
-                    entry.forward = Some(Forward::new(request));
+                    entry.forward = Some(Forward::new(request, now));
                 }
                 entry.handle.forward_pending.store(false, Ordering::Relaxed);
             }
@@ -897,8 +901,7 @@ mod tests {
         let (done, _result) = oneshot::channel();
         engine.entries.get_mut(&handle.0).unwrap().forward = Some(Forward::new(ForwardRequest {
             socket: native, prefix: Vec::new(), counter: Box::new(|_, _| {}), done,
-            upload_timeout: Duration::from_secs(30), download_timeout: Duration::from_secs(30),
-        }));
+        }, Instant::now()));
         // Exhausted output makes flush fail after the full adapter batch, before
         // poll_read can register a native Pending wake. No ACK is injected.
         let mut egress = Egress { packets: OUTPUT_PACKETS, bytes: OUTPUT_BYTES };

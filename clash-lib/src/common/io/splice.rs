@@ -4,7 +4,6 @@ use std::{
     os::unix::io::{AsRawFd, RawFd},
     pin::Pin,
     task::{Context, Poll, ready},
-    time::Duration,
 };
 
 use libc;
@@ -375,14 +374,11 @@ pub trait Stream: AsyncRead + AsyncWrite + AsRawFd {
 /// This function returns a future that will read from both streams,
 /// writing any data read to the opposing stream.
 /// This happens in both directions concurrently.
-/// After one direction finishes, the remaining direction's timeout is reset
-/// whenever it successfully writes data. Reads alone do not extend the timeout.
 #[cfg(test)]
 pub(super) async fn zero_copy_bidirectional<A: Stream + Unpin, B: Stream + Unpin>(
     a: &mut A, b: &mut B, tracker: TrafficTracker,
-    upload_timeout: Duration, download_timeout: Duration,
 ) -> Result<(u64, u64)> {
-    let mut state = new(None, None, tracker, upload_timeout, download_timeout)?;
+    let mut state = new(None, None, tracker)?;
     poll_fn(|cx| state.poll(a, b, cx)).await
 }
 
@@ -418,13 +414,13 @@ pub(super) type CopyState = TransferCopyState<CopyBuffer>;
 
 pub(super) fn new(
     upload_prefix: Option<SlideBuffer>, download_prefix: Option<SlideBuffer>,
-    tracker: TrafficTracker, upload_timeout: Duration, download_timeout: Duration,
+    tracker: TrafficTracker,
 ) -> Result<CopyState> {
     let mut upload = CopyBuffer::new(Pipe::new()?);
     let mut download = CopyBuffer::new(Pipe::new()?);
     upload.prefix = upload_prefix.filter(|prefix| !prefix.is_empty());
     download.prefix = download_prefix.filter(|prefix| !prefix.is_empty());
-    Ok(CopyState::new(upload, download, upload_timeout, download_timeout, tracker))
+    Ok(CopyState::new(upload, download, tracker))
 }
 
 impl<R: Stream + Unpin, W: Stream + Unpin> Buffer<R, W> for CopyBuffer {

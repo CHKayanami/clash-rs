@@ -786,8 +786,7 @@ mod tests {
                 inbound
             };
             let copy = copy_bidirectional(
-                inbound, AnyStream::new(vision), 1024, Duration::from_secs(5),
-                Duration::from_secs(5), TrafficTracker::noop(),
+                inbound, AnyStream::new(vision), 1024, TrafficTracker::noop(),
             );
             let serve = async {
                 let mut header = [0; 44];

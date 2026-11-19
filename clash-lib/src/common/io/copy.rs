@@ -12,8 +12,6 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 struct Settings {
     size: usize,
-    upload_timeout: Duration,
-    download_timeout: Duration,
     tracker: TrafficTracker,
 }
 
@@ -34,14 +32,11 @@ impl Mode {
             tracing::trace!("using zero copy for bidirectional copy");
             return Ok(Self::Splice(splice::new(
                 upload_prefix, download_prefix, settings.tracker,
-                settings.upload_timeout, settings.download_timeout,
             )?));
         }
         #[cfg(not(all(target_os = "linux", feature = "zero_copy")))]
         let _ = (a, b);
-        Ok(Self::Buffered(buffered::new(
-            settings.size, settings.upload_timeout, settings.download_timeout, settings.tracker,
-        )))
+        Ok(Self::Buffered(buffered::new(settings.size, settings.tracker)))
     }
 
     fn poll<A: ProxyStream>(&mut self, a: &mut A, b: &mut AnyStream, cx: &mut Context<'_>)
@@ -200,8 +195,7 @@ impl Future for BidirectionalCopy {
 /// Own both endpoints and initialize resources only when first polled.
 /// Plain TCP inputs keep their concrete copy loop; other inputs use AnyStream.
 pub fn copy_bidirectional(
-    a: AnyStream, b: AnyStream, size: usize,
-    upload_timeout: Duration, download_timeout: Duration, tracker: TrafficTracker,
+    a: AnyStream, b: AnyStream, size: usize, tracker: TrafficTracker,
 ) -> impl Future<Output = CopyResult> + Send {
     #[cfg(feature = "tun")]
     // Bypasses StreamCopy (and poll_handshake) because `b` is plain `AnyStream::Tcp`.
@@ -215,7 +209,7 @@ pub fn copy_bidirectional(
                     tracker.push_download(download);
                 });
                 return BidirectionalCopy::Tun(Box::pin(async move {
-                    stream.forward(socket, prefix, counter, upload_timeout, download_timeout)
+                    stream.forward(socket, prefix, counter)
                         .await.map_err(CopyBidirectionalError::Other)
                 }));
             }
@@ -223,7 +217,7 @@ pub fn copy_bidirectional(
         },
         pair => pair,
     };
-    let settings = Settings { size, upload_timeout, download_timeout, tracker };
+    let settings = Settings { size, tracker };
     match a {
         AnyStream::Tcp(stream) => BidirectionalCopy::Tcp(StreamCopy::new(stream, b, settings)),
         stream => BidirectionalCopy::Other(StreamCopy::new(stream, b, settings)),
@@ -274,8 +268,7 @@ mod tests {
             shutdowns: shutdowns.clone(), fail: true,
         }));
         let mut task = tokio_test::task::spawn(copy_bidirectional(
-            stream(), stream(), 1024, Duration::from_secs(10),
-            Duration::from_secs(10), TrafficTracker::noop(),
+            stream(), stream(), 1024, TrafficTracker::noop(),
         ));
         assert!(matches!(
             task.poll(), Poll::Ready(Err(CopyBidirectionalError::LeftClosed(_)))
@@ -290,8 +283,7 @@ mod tests {
             shutdowns: shutdowns.clone(), fail: false,
         }));
         let counts = copy_bidirectional(
-            stream(), stream(), 1024, Duration::from_secs(10),
-            Duration::from_secs(10), TrafficTracker::noop(),
+            stream(), stream(), 1024, TrafficTracker::noop(),
         ).await.unwrap();
         assert_eq!(counts, (0, 0));
         assert_eq!(shutdowns.load(Ordering::Relaxed), 2);
@@ -384,8 +376,6 @@ mod tests {
             a,
             b,
             1024,
-            Duration::from_secs(5),
-            Duration::from_secs(5),
             TrafficTracker::noop(),
         ));
 
@@ -423,8 +413,6 @@ mod tests {
                 handshaked: Arc::new(AtomicUsize::new(0)),
             }),
             1024,
-            Duration::from_secs(5),
-            Duration::from_secs(5),
             TrafficTracker::noop(),
         )
         .await
@@ -447,8 +435,6 @@ mod tests {
                 handshaked: Arc::new(AtomicUsize::new(0)),
             }),
             1024,
-            Duration::from_secs(5),
-            Duration::from_secs(5),
             TrafficTracker::noop(),
         ));
         let right_err = match copy.poll() {
@@ -522,8 +508,6 @@ mod tests {
                     always_pending: !stall_left,
                 }),
                 1024,
-                Duration::from_secs(10),
-                Duration::from_secs(10),
                 TrafficTracker::noop(),
             ));
 
@@ -565,8 +549,6 @@ mod tests {
                 always_pending: true,
             }),
             1024,
-            Duration::from_secs(5),
-            Duration::from_secs(5),
             TrafficTracker::noop(),
         ));
         assert!(copy.poll().is_pending());

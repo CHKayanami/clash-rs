@@ -70,7 +70,7 @@ async fn direct_handoff_reads_native_socket_after_idle_and_drains_half_closes() 
         let native = TcpStream::connect(server.local_addr().unwrap()).await.unwrap();
         let (mut peer, _) = server.accept().await.unwrap();
         let relay = AbortOnDropHandle::new(tokio::spawn(stream.forward(native, b"prefix".to_vec(),
-            Box::new(|_, _| {}), Duration::from_secs(2), Duration::from_secs(2))));
+            Box::new(|_, _| {}))));
         input.send(ack(2, received_sequence, true)).await.unwrap();
         let peer = AbortOnDropHandle::new(tokio::spawn(async move {
             let mut prefix = Vec::new();

@@ -1,5 +1,5 @@
 //! Buffered I/O plugs into the shared copy and timeout state machine.
-use std::{pin::Pin, task::{Context, Poll}, time::Duration};
+use std::{pin::Pin, task::{Context, Poll}};
 #[cfg(any(test, feature = "allocation-tests"))]
 use std::{future::Future, mem::replace};
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -10,12 +10,10 @@ use super::transfer::TransferState;
 
 pub(super) type CopyState = TransferCopyState<CopyBuffer>;
 
-pub(super) fn new(
-    size: usize, upload_timeout: Duration, download_timeout: Duration, tracker: TrafficTracker,
-) -> CopyState {
+pub(super) fn new(size: usize, tracker: TrafficTracker) -> CopyState {
     CopyState::new(
         CopyBuffer::new_with_capacity(size), CopyBuffer::new_with_capacity(size),
-        upload_timeout, download_timeout, tracker,
+        tracker,
     )
 }
 
@@ -38,7 +36,7 @@ where
 /// Initialization and running state share storage; construction does no I/O.
 #[cfg(any(test, feature = "allocation-tests"))]
 enum Phase {
-    Initializing { size: usize, upload_timeout: Duration, download_timeout: Duration, tracker: TrafficTracker },
+    Initializing { size: usize, tracker: TrafficTracker },
     Running(CopyState),
     Failed,
 }
@@ -53,10 +51,9 @@ pub(super) struct BufferedCopy<'a, A: ?Sized, B: ?Sized> {
 #[cfg(any(test, feature = "allocation-tests"))]
 impl<'a, A: ?Sized, B: ?Sized> BufferedCopy<'a, A, B> {
     pub(super) fn new(
-        a: &'a mut A, b: &'a mut B, size: usize,
-        upload_timeout: Duration, download_timeout: Duration, tracker: TrafficTracker,
+        a: &'a mut A, b: &'a mut B, size: usize, tracker: TrafficTracker,
     ) -> Self {
-        Self { phase: Phase::Initializing { size, upload_timeout, download_timeout, tracker }, a, b }
+        Self { phase: Phase::Initializing { size, tracker }, a, b }
     }
 }
 
@@ -70,10 +67,10 @@ where
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
         if matches!(this.phase, Phase::Initializing { .. }) {
-            let Phase::Initializing { size, upload_timeout, download_timeout, tracker } =
+            let Phase::Initializing { size, tracker } =
                 replace(&mut this.phase, Phase::Failed)
             else { unreachable!(); };
-            this.phase = Phase::Running(new(size, upload_timeout, download_timeout, tracker));
+            this.phase = Phase::Running(new(size, tracker));
         }
         match &mut this.phase {
             Phase::Running(state) => state.poll(this.a, this.b, cx),

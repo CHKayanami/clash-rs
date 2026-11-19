@@ -1,5 +1,6 @@
 use super::*;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use futures::poll;
+use tokio::{io::{AsyncReadExt, AsyncWriteExt}, time::{advance, pause, resume, timeout}};
 
 #[cfg(all(target_os = "linux", feature = "zero_copy"))]
 use super::splice::zero_copy_bidirectional;
@@ -16,12 +17,10 @@ async fn buffered_statistics_include_writes_before_error() {
         .build();
     let info = Arc::new(TrackerInfo::default());
     let tracker = TrafficTracker::new(info.clone(), StatisticsManager::new());
-    let result = copy_buf_bidirectional_with_timeout(
+    let result = copy_buf_bidirectional(
         &mut a,
         &mut b,
         1024,
-        Duration::from_secs(10),
-        Duration::from_secs(10),
         tracker,
     )
     .await;
@@ -32,11 +31,10 @@ async fn buffered_statistics_include_writes_before_error() {
     assert_eq!(info.download_total(), 0);
 }
 
-async fn check_progress<S>(
+async fn check_delayed_reply<S>(
     copy: impl Future<Output = Result<(u64, u64), CopyBidirectionalError>>,
     mut source: S,
     mut sink: S,
-    timeout: Duration,
     reverse: bool,
 ) where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -49,142 +47,125 @@ async fn check_progress<S>(
         res = sink.read(&mut byte) => assert_eq!(res.unwrap(), 0),
     }
 
-    // Keep the remaining direction active for more than twice the original
-    // deadline. Each successful write must start a fresh inactivity timeout.
-    for value in 0..4 {
-        tokio::select! {
-            res = &mut copy => panic!("active half-closed connection ended: {res:?}"),
-            _ = async {
-                tokio::time::sleep(timeout * 3 / 5).await;
-                sink.write_all(&[value]).await.unwrap();
-                source.read_exact(&mut byte).await.unwrap();
-                assert_eq!(byte, [value]);
-            } => (),
-        }
-    }
+    // The reverse direction must stay open past the former 10-second limit.
+    pause();
+    advance(Duration::from_secs(30)).await;
+    assert!(poll!(&mut copy).is_pending());
+    resume();
 
+    sink.write_all(b"a").await.unwrap();
     sink.shutdown().await.unwrap();
-    let counts = tokio::time::timeout(timeout, copy)
-        .await
-        .expect("both EOFs should release the connection immediately")
-        .unwrap();
-    assert_eq!(counts, if reverse { (4, 0) } else { (0, 4) });
+    let counts = timeout(Duration::from_secs(3), async {
+        let receive = async {
+            source.read_exact(&mut byte).await.unwrap();
+            assert_eq!(byte, *b"a");
+            assert_eq!(source.read(&mut byte).await.unwrap(), 0);
+        };
+        let (counts, ()) = tokio::join!(copy, receive);
+        counts.unwrap()
+    })
+    .await
+    .expect("delayed reply or shutdown stalled");
+    assert_eq!(counts, if reverse { (1, 0) } else { (0, 1) });
 }
 
-#[tokio::test(start_paused = true)]
-async fn buffered_half_close_progress() {
+#[tokio::test]
+async fn buffered_half_close_allows_delayed_reply() {
     for reverse in [false, true] {
         let (client, mut a) = tokio::io::duplex(64);
         let (mut b, server) = tokio::io::duplex(64);
-        let timeout = Duration::from_secs(10);
-        let copy = copy_buf_bidirectional_with_timeout(
-            &mut a,
-            &mut b,
-            1024,
-            timeout,
-            timeout,
-            TrafficTracker::noop(),
-        );
-        let (source, sink) = if reverse {
-            (server, client)
-        } else {
-            (client, server)
-        };
-        check_progress(copy, source, sink, timeout, reverse).await;
+        let copy = copy_buf_bidirectional(&mut a, &mut b, 1024, TrafficTracker::noop());
+        let (source, sink) = if reverse { (server, client) } else { (client, server) };
+        check_delayed_reply(copy, source, sink, reverse).await;
     }
 }
 
-#[tokio::test(start_paused = true)]
-async fn owned_copy_half_close_progress() {
+#[tokio::test]
+async fn owned_copy_half_close_allows_delayed_reply() {
     use crate::proxy::AnyStream;
 
     for reverse in [false, true] {
         let (client, a) = tokio::io::duplex(64);
         let (b, server) = tokio::io::duplex(64);
-        let timeout = Duration::from_secs(10);
         let copy = copy_bidirectional(
-            AnyStream::dynamic(a),
-            AnyStream::dynamic(b),
-            1024,
-            timeout,
-            timeout,
-            TrafficTracker::noop(),
+            AnyStream::dynamic(a), AnyStream::dynamic(b), 1024, TrafficTracker::noop(),
         );
-        let (source, sink) = if reverse {
-            (server, client)
-        } else {
-            (client, server)
-        };
-        check_progress(copy, source, sink, timeout, reverse).await;
+        let (source, sink) = if reverse { (server, client) } else { (client, server) };
+        check_delayed_reply(copy, source, sink, reverse).await;
     }
 }
 
 #[tokio::test(start_paused = true)]
-async fn buffered_half_close_reads_do_not_extend_timeout() {
-    for reverse in [false, true] {
-        // Fill the remaining direction's destination, then read another byte
-        // into the relay buffer without being able to write it out.
-        let (client, mut a) = tokio::io::duplex(1);
-        let (mut b, server) = tokio::io::duplex(1);
-        let (mut source, mut sink) = if reverse {
-            (server, client)
-        } else {
-            (client, server)
-        };
-        source.shutdown().await.unwrap();
-        let timeout = Duration::from_secs(10);
-        let mut copy = tokio_test::task::spawn(copy_buf_bidirectional_with_timeout(
-            &mut a,
-            &mut b,
-            1024,
-            timeout,
-            timeout,
-            TrafficTracker::noop(),
-        ));
-        assert!(copy.poll().is_pending());
-        tokio::time::advance(Duration::from_secs(6)).await;
-        sink.write_all(b"a").await.unwrap();
-        assert!(copy.poll().is_pending());
-        tokio::time::advance(Duration::from_secs(6)).await;
-        sink.write_all(b"b").await.unwrap();
-        assert!(copy.poll().is_pending());
-        tokio::time::advance(Duration::from_secs(3)).await;
-        assert!(copy.poll().is_pending());
-        tokio::time::advance(Duration::from_secs(1)).await;
-        let Poll::Ready(Ok(counts)) = copy.poll() else {
-            panic!("reads without successful writes must not postpone release");
-        };
-        assert_eq!(counts, if reverse { (1, 0) } else { (0, 1) });
-    }
+async fn buffered_half_close_retains_pending_writes() {
+    let (mut client, mut a) = tokio::io::duplex(1);
+    let (mut b, mut server) = tokio::io::duplex(1);
+    let mut copy = tokio_test::task::spawn(copy_buf_bidirectional(
+        &mut a, &mut b, 1024, TrafficTracker::noop(),
+    ));
+    client.shutdown().await.unwrap();
+    assert!(copy.poll().is_pending());
+    server.write_all(b"a").await.unwrap();
+    assert!(copy.poll().is_pending());
+    server.write_all(b"b").await.unwrap();
+    assert!(copy.poll().is_pending());
+
+    advance(Duration::from_secs(30)).await;
+    assert!(copy.poll().is_pending());
+    let mut byte = [0];
+    client.read_exact(&mut byte).await.unwrap();
+    assert_eq!(byte, *b"a");
+    server.shutdown().await.unwrap();
+    assert!(matches!(copy.poll(), Poll::Ready(Ok((0, 2)))));
+    client.read_exact(&mut byte).await.unwrap();
+    assert_eq!(byte, *b"b");
 }
 
-#[tokio::test(start_paused = true)]
-async fn buffered_half_close_idle_timeout() {
-    for reverse in [false, true] {
-        let (mut client, mut a) = tokio::io::duplex(64);
-        let (mut b, mut server) = tokio::io::duplex(64);
-        if reverse {
-            server.shutdown().await.unwrap();
-        } else {
-            client.shutdown().await.unwrap();
-        }
-        let start = tokio::time::Instant::now();
-        let counts = copy_buf_bidirectional_with_timeout(
-            &mut a,
-            &mut b,
-            1024,
-            Duration::from_secs(7),
-            Duration::from_secs(10),
-            TrafficTracker::noop(),
-        )
-        .await
-        .unwrap();
-        assert_eq!(counts, (0, 0));
-        assert_eq!(
-            start.elapsed(),
-            Duration::from_secs(if reverse { 7 } else { 10 })
-        );
+async fn check_idle_timeout<S>(
+    copy: impl Future<Output = Result<(u64, u64), CopyBidirectionalError>>,
+    mut source: S,
+    mut sink: S,
+) where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    tokio::pin!(copy);
+    source.shutdown().await.unwrap();
+    let mut byte = [0];
+    tokio::select! {
+        res = &mut copy => panic!("copy ended before half-close: {res:?}"),
+        res = sink.read(&mut byte) => assert_eq!(res.unwrap(), 0),
     }
+
+    pause();
+    let remaining = Duration::from_secs(1);
+    advance(COPY_IDLE_TIMEOUT - remaining).await;
+    assert!(poll!(&mut copy).is_pending());
+    advance(remaining).await;
+    assert!(matches!(
+        poll!(&mut copy),
+        Poll::Ready(Err(CopyBidirectionalError::Other(error)))
+            if error.kind() == io::ErrorKind::TimedOut
+    ));
+    resume();
+}
+
+#[tokio::test]
+async fn buffered_half_close_uses_connection_idle_timeout() {
+    let (client, mut a) = tokio::io::duplex(64);
+    let (mut b, server) = tokio::io::duplex(64);
+    let copy = copy_buf_bidirectional(&mut a, &mut b, 1024, TrafficTracker::noop());
+    check_idle_timeout(copy, client, server).await;
+}
+
+#[tokio::test]
+async fn owned_copy_half_close_uses_connection_idle_timeout() {
+    use crate::proxy::AnyStream;
+
+    let (client, a) = tokio::io::duplex(64);
+    let (b, server) = tokio::io::duplex(64);
+    let copy = copy_bidirectional(
+        AnyStream::dynamic(a), AnyStream::dynamic(b), 1024, TrafficTracker::noop(),
+    );
+    check_idle_timeout(copy, client, server).await;
 }
 
 #[cfg(all(target_os = "linux", feature = "zero_copy"))]
@@ -199,54 +180,23 @@ async fn tcp_pair() -> (tokio::net::TcpStream, tokio::net::TcpStream) {
 
 #[cfg(all(target_os = "linux", feature = "zero_copy"))]
 #[tokio::test]
-async fn zero_copy_half_close_progress() {
+async fn zero_copy_half_close_allows_delayed_reply() {
     for reverse in [false, true] {
         let (client, mut a) = tcp_pair().await;
         let (mut b, server) = tcp_pair().await;
-        let timeout = Duration::from_millis(500);
-        let copy = zero_copy_bidirectional(
-            &mut a,
-            &mut b,
-            TrafficTracker::noop(),
-            timeout,
-            timeout,
-        );
-        let (source, sink) = if reverse {
-            (server, client)
-        } else {
-            (client, server)
-        };
-        check_progress(copy, source, sink, timeout, reverse).await;
+        let copy = zero_copy_bidirectional(&mut a, &mut b, TrafficTracker::noop());
+        let (source, sink) = if reverse { (server, client) } else { (client, server) };
+        check_delayed_reply(copy, source, sink, reverse).await;
     }
 }
 
 #[cfg(all(target_os = "linux", feature = "zero_copy"))]
 #[tokio::test]
-async fn zero_copy_half_close_idle_timeout() {
-    for reverse in [false, true] {
-        let (mut client, mut a) = tcp_pair().await;
-        let (mut b, mut server) = tcp_pair().await;
-        if reverse {
-            server.shutdown().await.unwrap();
-        } else {
-            client.shutdown().await.unwrap();
-        }
-        let duration = Duration::from_millis(100);
-        let counts = tokio::time::timeout(
-            Duration::from_secs(2),
-            zero_copy_bidirectional(
-                &mut a,
-                &mut b,
-                TrafficTracker::noop(),
-                duration,
-                duration,
-            ),
-        )
-        .await
-        .expect("an idle half-closed connection must be released")
-        .unwrap();
-        assert_eq!(counts, (0, 0));
-    }
+async fn zero_copy_half_close_uses_connection_idle_timeout() {
+    let (client, mut a) = tcp_pair().await;
+    let (mut b, server) = tcp_pair().await;
+    let copy = zero_copy_bidirectional(&mut a, &mut b, TrafficTracker::noop());
+    check_idle_timeout(copy, client, server).await;
 }
 
 #[cfg(all(target_os = "linux", feature = "zero_copy"))]
@@ -272,8 +222,6 @@ async fn zero_copy_forwards_nested_prefixes_and_counts_them() {
         AnyStream::Dynamic(Box::new(a)),
         AnyStream::Tcp(b),
         1024,
-        Duration::from_secs(10),
-        Duration::from_secs(10),
         tracker,
     );
     let peers = async {
@@ -316,8 +264,6 @@ async fn zero_copy_prefix_backpressure_does_not_block_replies() {
         AnyStream::Dynamic(Box::new(PrefixedStream::new(prefix, a))),
         AnyStream::Tcp(b),
         1024,
-        Duration::from_secs(10),
-        Duration::from_secs(10),
         TrafficTracker::noop(),
     );
     let (reply_seen, reply_seen_rx) = tokio::sync::oneshot::channel();

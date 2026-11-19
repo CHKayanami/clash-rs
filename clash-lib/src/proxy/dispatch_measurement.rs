@@ -7,7 +7,7 @@ use arc_swap::ArcSwap;
 use tokio::sync::{mpsc, Semaphore};
 use futures::future::BoxFuture;
 use crate::{
-    common::io::{copy_bidirectional, copy_buf_bidirectional_with_timeout, copy_state_layout},
+    common::io::{copy_bidirectional, copy_buf_bidirectional, copy_state_layout},
     app::{net::OutboundInterface, dns::{SystemResolver, ThreadSafeDNSResolver}, remote_content_manager::{ProxyManager, healthcheck::HealthCheck, providers::proxy_provider::PlainProvider}},
     config::internal::proxy::LoadBalanceStrategy,
     proxy::{
@@ -159,7 +159,7 @@ pub async fn measure_dispatch_futures(start: impl Fn(), finish: impl Fn(&str, us
         Arc::new(TrackerInfo::new(&sess, None)), StatisticsManager::new(),
     );
     measurement.measure("TCP bidirectional copy", || copy_bidirectional(
-        lhs.into(), rhs.into(), 1024, Duration::from_secs(10), Duration::from_secs(10), tracker,
+        lhs.into(), rhs.into(), 1024, tracker,
     ), 0);
 
     let (mut lhs, _) = tokio::io::duplex(64);
@@ -167,8 +167,8 @@ pub async fn measure_dispatch_futures(start: impl Fn(), finish: impl Fn(&str, us
     let tracker = TrafficTracker::new(
         Arc::new(TrackerInfo::new(&sess, None)), StatisticsManager::new(),
     );
-    measurement.measure("TCP buffered copy", || copy_buf_bidirectional_with_timeout(
-        &mut lhs, &mut rhs, 1024, Duration::from_secs(10), Duration::from_secs(10), tracker,
+    measurement.measure("TCP buffered copy", || copy_buf_bidirectional(
+        &mut lhs, &mut rhs, 1024, tracker,
     ), 0);
 
     measurement.measure("direct", || direct.connect_stream(&sess, resolver.clone()), 0);

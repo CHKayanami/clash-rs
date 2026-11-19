@@ -187,8 +187,6 @@ mod tests {
             inbound,
             ss_stream,
             1024,
-            Duration::from_secs(5),
-            Duration::from_secs(5),
             TrafficTracker::noop(),
         ));
 
@@ -230,8 +228,6 @@ mod tests {
             AnyStream::new(inbound),
             ss_stream,
             1024,
-            Duration::from_secs(5),
-            Duration::from_secs(5),
             TrafficTracker::noop(),
         ));
 
@@ -275,7 +271,7 @@ mod tests {
 
         let copy = copy_bidirectional(
             AnyStream::new(inbound), AnyStream::new(ShadowSocksStream(stream)),
-            1024, Duration::from_secs(5), Duration::from_secs(5),
+            1024,
             TrafficTracker::noop(),
         );
         let receive = async {

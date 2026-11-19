@@ -1,5 +1,5 @@
 //! Opt-in runtime allocation checks for each phase of forwarding.
-use std::{future::Future, pin::{Pin, pin}, task::{Context, Poll}, time::Duration};
+use std::{future::Future, pin::{Pin, pin}, task::{Context, Poll}};
 use futures::task::noop_waker_ref;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 use crate::proxy::AnyStream;
@@ -30,7 +30,7 @@ pub async fn measure_copy_runtime(
         let (mut source, mut sink) = if reverse { (server, client) } else { (client, server) };
         let mut copy = pin!(copy_bidirectional(
             AnyStream::from(a), AnyStream::from(b), 1024,
-            Duration::from_secs(10), Duration::from_secs(10), TrafficTracker::noop(),
+            TrafficTracker::noop(),
         ));
         start();
         let result = poll_once(copy.as_mut());
@@ -76,7 +76,7 @@ async fn measure_splice(
         let (mut source, mut sink) = if reverse { (server, client) } else { (client, server) };
         start();
         let mut copy = splice::new(
-            None, None, TrafficTracker::noop(), Duration::from_secs(10), Duration::from_secs(10),
+            None, None, TrafficTracker::noop(),
         ).unwrap();
         let result = copy.poll(&mut a, &mut b, &mut Context::from_waker(noop_waker_ref()));
         finish("splice copy initialization", 0, Some(1));

@@ -47,7 +47,7 @@ async fn native_handoff_preserves_prefix_buffered_bytes_and_half_close() {
         let relay = tokio::spawn(stream.forward(native, prefix, Box::new(move |u, d| {
             count_up.fetch_add(u, Ordering::Relaxed);
             count_down.fetch_add(d, Ordering::Relaxed);
-        }), Duration::from_secs(2), Duration::from_secs(2)));
+        })));
         let seq = 1 + upload.len() as u32;
 
         let mut received = Vec::new();
@@ -100,8 +100,7 @@ async fn cancelled_native_handoff_releases_socket() {
         let server = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let native = TcpStream::connect(server.local_addr().unwrap()).await.unwrap();
         let (mut peer, _) = server.accept().await.unwrap();
-        let relay = tokio::spawn(stream.forward(native, Vec::new(), Box::new(|_, _| {}),
-            Duration::from_secs(1), Duration::from_secs(1)));
+        let relay = tokio::spawn(stream.forward(native, Vec::new(), Box::new(|_, _| {})));
         tokio::task::yield_now().await;
         relay.abort();
         let _ = relay.await;
@@ -116,13 +115,17 @@ async fn cancelled_native_handoff_releases_socket() {
 }
 
 #[tokio::test]
-async fn native_handoff_half_close_deadline_releases_idle_peer() {
+async fn native_handoff_idle_timer_wakes_half_closed_relay() {
     use std::{io::ErrorKind, time::Duration};
-    use tokio::{io::AsyncReadExt, net::{TcpListener, TcpStream}};
+    use tokio::{
+        io::AsyncReadExt,
+        net::{TcpListener, TcpStream},
+        time::{Instant, advance, pause, resume, sleep_until, timeout},
+    };
 
-    tokio::time::timeout(Duration::from_secs(3), async {
-        let (stack, mut listener, _udp) = NetStack::new();
-        let (mut sink, mut packets) = stack.split();
+    let (stack, mut listener, _udp) = NetStack::new();
+    let (mut sink, mut packets) = stack.split();
+    let (relay, _peer, ack) = timeout(Duration::from_secs(3), async {
         sink.send(build_tcp_syn_packet().into()).await.unwrap();
         let reply = packets.next().await.unwrap().unwrap();
         let ack = parse_server_isn(reply.data()).wrapping_add(1);
@@ -131,22 +134,51 @@ async fn native_handoff_half_close_deadline_releases_idle_peer() {
         let server = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let native = TcpStream::connect(server.local_addr().unwrap()).await.unwrap();
         let (mut peer, _) = server.accept().await.unwrap();
-        let relay = tokio::spawn(stream.forward(native, Vec::new(), Box::new(|_, _| {}),
-            Duration::from_millis(20), Duration::from_millis(20)));
+        let relay = tokio::spawn(stream.forward(native, Vec::new(), Box::new(|_, _| {})));
         sink.send(client_segment(1, ack, 0x11, &[]).into()).await.unwrap();
         assert_eq!(peer.read(&mut [0; 1]).await.unwrap(), 0);
-        // Keep the peer's write half open. The relay must have its own timer
-        // registration rather than relying on more network traffic to wake it.
-        let error = relay.await.unwrap().unwrap_err();
-        assert_eq!(error.kind(), ErrorKind::TimedOut);
-        loop {
-            let packet = packets.next().await.unwrap().unwrap();
-            if common::is_rst(packet.data()) {
-                break;
+        (relay, peer, ack)
+    })
+    .await
+    .expect("relay did not propagate the FIN");
+    pause();
+    let idle_since = Instant::now();
+    // ACK each keepalive to keep TCP alive without forwarding application data.
+    // Six probes at 28 seconds leave the final interval idle on both sides.
+    for _ in 0..6 {
+        timeout(Duration::from_secs(30), async {
+            while let Some(packet) = packets.next().await {
+                if parse_tcp_data(packet.unwrap().data()) == Some((ack.wrapping_sub(1), 1)) {
+                    return;
+                }
+            }
+            panic!("packet stream closed before the keepalive probe");
+        })
+        .await
+        .expect("TCP stack did not send a keepalive probe");
+        sink.send(build_tcp_ack(2, ack, u16::MAX).into()).await.unwrap();
+    }
+    sleep_until(idle_since + Duration::from_secs(179)).await;
+    assert!(!relay.is_finished());
+    advance(Duration::from_secs(1)).await;
+    let error = timeout(Duration::from_secs(1), relay)
+        .await
+        .expect("idle timer did not wake the relay")
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::TimedOut);
+    resume();
+
+    timeout(Duration::from_secs(1), async {
+        while let Some(packet) = packets.next().await {
+            if common::is_rst(packet.unwrap().data()) {
+                return;
             }
         }
-        drop(listener);
-    }).await.expect("half-close timer did not wake the relay");
+        panic!("packet stream closed before the client received a reset");
+    })
+    .await
+    .expect("idle timeout did not send a reset to the client");
 }
 
 #[tokio::test]
@@ -185,8 +217,7 @@ async fn cancelled_pending_handoff_drops_prefix_and_sends_reset() {
         let native = TcpStream::connect(server.local_addr().unwrap()).await.unwrap();
         let (mut peer, _) = server.accept().await.unwrap();
         let mut relay = Box::pin(stream.forward(native, b"cancelled-prefix".to_vec(),
-            Box::new(|_, _| panic!("cancelled handoff must not forward data")),
-            Duration::from_secs(1), Duration::from_secs(1)));
+            Box::new(|_, _| panic!("cancelled handoff must not forward data"))));
         // Submit and cancel without yielding, so the engine cannot adopt it.
         assert!(futures::poll!(&mut relay).is_pending());
         drop(relay);
@@ -290,8 +321,7 @@ async fn handoff_after_write_shutdown_preserves_prefix_and_accepted_tx() {
         let server = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let native = TcpStream::connect(server.local_addr().unwrap()).await.unwrap();
         let (mut peer, _) = server.accept().await.unwrap();
-        let relay = tokio::spawn(stream.forward(native, prefix, Box::new(|_, _| {}),
-            Duration::from_secs(1), Duration::from_secs(1)));
+        let relay = tokio::spawn(stream.forward(native, prefix, Box::new(|_, _| {})));
         let mut uploaded = Vec::new();
         peer.read_to_end(&mut uploaded).await.unwrap();
         assert_eq!(uploaded, request);
