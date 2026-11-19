@@ -17,6 +17,10 @@ const OPCODE_MASK: u16 = 0x7800;
 const RA: u16 = 0x0080;
 const QUERY_ECHO_MASK: u16 = OPCODE_MASK | 0x0110;
 
+pub(crate) fn is_truncated_response(wire: &[u8]) -> bool {
+    read_u16(wire, 2).is_ok_and(|flags| flags & (QR | TC) == (QR | TC))
+}
+
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum ResponseError {
     #[error("DNS response is shorter than its header")]

@@ -198,19 +198,7 @@ impl<W: AsyncWrite + Send + Unpin + 'static> PipelinedSession<W> {
         state: Arc<Mutex<State>>,
         reader: &mut R,
     ) {
-        loop {
-            let mut len_buf = [0u8; 2];
-            if reader.read_exact(&mut len_buf).await.is_err() {
-                break;
-            }
-            let len = u16::from_be_bytes(len_buf) as usize;
-            if len < 12 {
-                break;
-            }
-            let mut msg_buf = vec![0u8; len];
-            if reader.read_exact(&mut msg_buf).await.is_err() {
-                break;
-            }
+        while let Ok(msg_buf) = read_dns_frame(reader).await {
             Self::handle_response(&state, &msg_buf);
         }
 
@@ -299,7 +287,17 @@ impl<W: AsyncWrite + Send + Unpin + 'static> PipelinedSession<W> {
     }
 }
 
-fn question_end(query: &[u8]) -> anyhow::Result<usize> {
+pub(super) async fn read_dns_frame(
+    reader: &mut (impl AsyncRead + Unpin),
+) -> anyhow::Result<Vec<u8>> {
+    let len = usize::from(reader.read_u16().await?);
+    anyhow::ensure!(len >= 12, "DNS frame is shorter than its header");
+    let mut wire = vec![0; len];
+    reader.read_exact(&mut wire).await?;
+    Ok(wire)
+}
+
+pub(super) fn question_end(query: &[u8]) -> anyhow::Result<usize> {
     let mut pos = 12;
     if !crate::app::dns::wire::skip_dns_name(query, &mut pos)
         || pos + 4 > query.len()

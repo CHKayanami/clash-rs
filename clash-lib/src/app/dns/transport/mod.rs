@@ -30,5 +30,6 @@ pub use pipelined::PipelinedSession;
 pub use quic::{SharedQuicEndpoint, dns_quic_config, quic_connect_endpoint};
 pub use retry::exchange_with_retry;
 pub use tcp_pool::TcpPool;
+pub(crate) use tcp_pool::retry_udp_over_tcp;
 pub use udp_pool::UdpPool;
 pub(crate) use udp_pool::{NETWORK_RETRY_DELAY, SocketFailure, network_error};

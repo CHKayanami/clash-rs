@@ -1,20 +1,57 @@
 //! Plain DNS-over-TCP (RFC 7766) with query pipelining multiplexing.
 
+use anyhow::Context;
 use crate::app::dns::query::QueryContext;
+use crate::app::dns::response::is_truncated_response;
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::time::Duration;
 
-use tokio::io::WriteHalf;
+use tokio::io::{AsyncWriteExt, WriteHalf};
+use tokio::time::timeout;
 
 use super::dial::DialContext;
 use super::lifecycle::LifecycleSlot;
-use super::pipelined::PipelinedSession;
+use super::pipelined::{PipelinedSession, question_end, read_dns_frame};
 use super::retry::exchange_with_retry;
 use crate::proxy::AnyStream;
 
 type TcpSession = PipelinedSession<WriteHalf<AnyStream>>;
+
+pub(crate) async fn retry_udp_over_tcp(
+    dial: &DialContext,
+    address: SocketAddr,
+    query: &QueryContext,
+) -> anyhow::Result<Vec<u8>> {
+    let query_len = u16::try_from(query.wire().len()).context("DNS query is too long")?;
+    let resolver = dial.connection_resolver()?;
+    let mut stream = timeout(dial.dial_timeout, dial.connect_tcp(address, resolver))
+        .await
+        .context("TCP DNS fallback dial timed out")??;
+    timeout(dial.query_timeout, async {
+        let mut wire = Vec::with_capacity(2 + usize::from(query_len));
+        wire.extend_from_slice(&query_len.to_be_bytes());
+        wire.extend_from_slice(query.wire());
+        stream.write_all(&wire).await?;
+        stream.flush().await?;
+        let response = read_dns_frame(&mut stream).await?;
+        let end = question_end(&response)?;
+        anyhow::ensure!(
+            response[..2] == query.txid().get().to_be_bytes()
+                && response[12..end] == query.shared_question_wire()[..],
+            "TCP DNS fallback response does not match the query"
+        );
+        anyhow::ensure!(
+            !is_truncated_response(&response),
+            "TCP DNS fallback response is truncated"
+        );
+        Ok(response)
+    })
+    .await
+    .context("TCP DNS fallback query timed out")?
+}
 
 /// Pipelined plain-TCP DNS client for one upstream multiplexing concurrent queries over a single TCP connection.
 pub struct TcpPool {
@@ -43,14 +80,14 @@ impl TcpPool {
         self: &Arc<Self>,
         query: &QueryContext,
     ) -> anyhow::Result<Vec<u8>> {
-        let timeout = self.dial.query_timeout + self.dial.dial_timeout;
-        tokio::time::timeout(
-            timeout,
+        let budget = self.dial.query_timeout + self.dial.dial_timeout;
+        timeout(
+            budget,
             exchange_with_retry("TCP DNS", || self.exchange_once(query)),
         )
         .await
         .map_err(|_| {
-            anyhow::anyhow!("TCP DNS query budget exhausted after {timeout:?}")
+            anyhow::anyhow!("TCP DNS query budget exhausted after {budget:?}")
         })?
     }
 

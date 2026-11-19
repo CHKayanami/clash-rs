@@ -12,9 +12,11 @@ use super::admission::AdmissionPermit;
 use super::entries::{UpstreamEntry, UpstreamState};
 use super::udp::UdpUpstream;
 use super::routes::ResolvedOutbound;
-use crate::app::dns::transport::UdpPool;
+use anyhow::Context;
+use crate::app::dns::transport::{UdpPool, retry_udp_over_tcp};
 use crate::app::dns::ecs::EcsQuery;
 use crate::app::dns::query::QueryContext;
+use crate::app::dns::response::is_truncated_response;
 
 impl UpstreamPool {
     pub(super) async fn udp_pool_selected(
@@ -59,16 +61,30 @@ impl UpstreamPool {
             .await;
             match result {
                 Ok(response) => {
-                    debug!(
-                        upstream = %entry.name,
-                        %address,
-                        outbound = ?outbound.name(),
-                        %domain,
-                        %qtype,
-                        attempt,
-                        "fixed UDP DNS query succeeded"
-                    );
-                    return Ok(response);
+                    let result = self
+                        .complete_udp_query(entry, address, outbound, query, response)
+                        .await;
+                    match &result {
+                        Ok(_) => debug!(
+                            upstream = %entry.name,
+                            %address,
+                            outbound = ?outbound.name(),
+                            %domain,
+                            %qtype,
+                            attempt,
+                            "fixed UDP DNS query succeeded"
+                        ),
+                        Err(error) => warn!(
+                            upstream = %entry.name,
+                            %address,
+                            outbound = ?outbound.name(),
+                            %domain,
+                            %qtype,
+                            attempt,
+                            "fixed UDP DNS query failed during TCP fallback: {error:#}"
+                        ),
+                    }
+                    return result;
                 }
                 Err(error) => {
                     warn!(
@@ -86,6 +102,31 @@ impl UpstreamPool {
         }
         Err(last_error
             .unwrap_or_else(|| anyhow::anyhow!("fixed UDP DNS query failed")))
+    }
+
+    async fn complete_udp_query(
+        &self,
+        entry: &UpstreamEntry,
+        address: SocketAddr,
+        outbound: &ResolvedOutbound,
+        query: &QueryContext,
+        response: Vec<u8>,
+    ) -> anyhow::Result<Vec<u8>> {
+        if !is_truncated_response(&response) {
+            return Ok(response);
+        }
+        debug!(
+            upstream = %entry.name,
+            %address,
+            outbound = ?outbound.name(),
+            domain = %query.qdomain().unwrap_or("<unknown>"),
+            qtype = %query.logged_qtype(),
+            "UDP DNS response truncated, retrying with TCP"
+        );
+        let dial = self.dial_context(entry, outbound.handler().cloned());
+        retry_udp_over_tcp(&dial, address, query)
+            .await
+            .with_context(|| format!("retry UDP DNS query to {address} over TCP"))
     }
 
     async fn build_udp_pool(
@@ -235,7 +276,13 @@ impl UpstreamPool {
                         continue;
                     }
                 };
-                match pool.exchange(outgoing_query).await {
+                let result = async {
+                    let response = pool.exchange(outgoing_query).await?;
+                    self.complete_udp_query(entry, address, outbound, outgoing_query, response)
+                        .await
+                }
+                .await;
+                match result {
                     Ok(response) => {
                         let elapsed = start.elapsed();
                         debug!(
@@ -262,7 +309,7 @@ impl UpstreamPool {
                             domain = %domain_str,
                             qtype = %qtype,
                             attempt = index + 1,
-                            "UDP DNS query to upstream address failed: {error}"
+                            "UDP DNS query to upstream address failed: {error:#}"
                         );
                         last_error = Some(error);
                     }
@@ -334,9 +381,12 @@ mod tests {
     use crate::app::dns::MockClashResolver;
     use crate::app::dns::config::{DNSNetMode, NameServer};
     use crate::app::dns::query::{DnsName, QType, build_dns_query_wire};
+    use crate::app::dns::response::{ResponseTemplate, build_dns_ip_response};
     use std::collections::HashMap;
+    use std::net::{IpAddr, Ipv4Addr};
     use std::time::Duration;
-    use tokio::net::UdpSocket;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, UdpSocket};
 
     fn pool() -> Arc<UpstreamPool> {
         UpstreamPool::new(
@@ -347,6 +397,74 @@ mod tests {
             None,
             None,
         )
+    }
+
+    #[tokio::test]
+    async fn truncated_udp_upstream_retries_over_tcp() {
+        for host in [
+            url::Host::Ipv4(Ipv4Addr::LOCALHOST),
+            url::Host::Domain("dns.example".into()),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let socket = UdpSocket::bind(address).await.unwrap();
+            let mut bootstrap = MockClashResolver::new();
+            bootstrap.expect_resolve_v4()
+                .returning(|_, _| Ok(Some(Ipv4Addr::LOCALHOST)));
+            bootstrap.expect_resolve_v6().returning(|_, _| Ok(None));
+            let ns = NameServer {
+                net: DNSNetMode::Udp,
+                host,
+                port: address.port(),
+                path: None,
+                proxy: None,
+                interface: None,
+            };
+            let entry = UpstreamEntry::from_nameserver(&ns, Some(Arc::new(bootstrap)))
+                .unwrap();
+            let pool = pool();
+            let query = QueryContext::parse(
+                Bytes::from(build_dns_query_wire(
+                    &DnsName::from_domain("truncated.test").unwrap(),
+                    QType::A,
+                )),
+                IngressProfile::Tcp,
+            )
+            .unwrap();
+            let ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
+            let server = async {
+                let mut buffer = [0; 512];
+                let (len, peer) = socket.recv_from(&mut buffer).await.unwrap();
+                buffer[2] |= 0x82;
+                socket.send_to(&buffer[..len], peer).await.unwrap();
+
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let len = usize::from(stream.read_u16().await.unwrap());
+                let mut wire = vec![0; len];
+                stream.read_exact(&mut wire).await.unwrap();
+                assert_eq!(wire, query.wire());
+                let request = QueryContext::parse(Bytes::from(wire), IngressProfile::Tcp)
+                    .unwrap();
+                let response = build_dns_ip_response(&request, &[ip], 60).unwrap();
+                stream.write_u16(response.len() as u16).await.unwrap();
+                stream.write_all(&response).await.unwrap();
+            };
+            let (response, ()) = tokio::time::timeout(Duration::from_secs(2), async {
+                tokio::join!(pool.query_entry(&entry, &query, None), server)
+            })
+            .await
+            .unwrap();
+            let response = response.unwrap();
+            assert_eq!(response[..2], query.wire()[..2]);
+            assert_eq!(
+                ResponseTemplate::validate(&query, &response)
+                    .unwrap()
+                    .answer_ips()
+                    .as_ref(),
+                &[ip],
+            );
+            entry.udp_state().unwrap().close().await;
+        }
     }
 
     #[tokio::test]

@@ -7,11 +7,12 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::app::dns::ClashResolver;
+use crate::app::dns::{ClashResolver, SystemResolver};
 use crate::app::dns::endpoint::DnsEndpoint;
 use crate::app::net::OutboundInterface;
 use crate::config::proxy::PROXY_DIRECT;
-use crate::proxy::{OutboundNode, AnyStream, OutboundHandler};
+use crate::proxy::direct::Handler as DirectHandler;
+use crate::proxy::{AnyOutboundDatagram, AnyStream, OutboundHandler, OutboundNode};
 use crate::session::{Network, Session, Type};
 
 /// Shared dial context for transports that may go direct or via a proxy handler.
@@ -27,10 +28,17 @@ pub struct DialContext {
 }
 
 impl DialContext {
+    pub(super) fn connection_resolver(&self) -> anyhow::Result<Arc<dyn ClashResolver>> {
+        match &self.resolver {
+            Some(resolver) => Ok(Arc::clone(resolver)),
+            None => Ok(Arc::new(SystemResolver::new(false)?)),
+        }
+    }
+
     pub(super) async fn dial_udp(
         &self,
         address: SocketAddr,
-    ) -> anyhow::Result<crate::proxy::AnyOutboundDatagram> {
+    ) -> anyhow::Result<AnyOutboundDatagram> {
         let outbound = self
             .outbound
             .as_ref()
@@ -52,10 +60,7 @@ impl DialContext {
             iface: self.iface.clone(),
             ..Default::default()
         };
-        let resolver = match &self.resolver {
-            Some(resolver) => Arc::clone(resolver),
-            None => Arc::new(crate::app::dns::SystemResolver::new(false)?),
-        };
+        let resolver = self.connection_resolver()?;
         Ok(outbound.connect_datagram(&session, resolver).await?)
     }
 
@@ -75,54 +80,43 @@ impl DialContext {
                     anyhow::anyhow!("DNS dial address resolution timed out")
                 })??;
 
-        let resolver = match &self.resolver {
-            Some(resolver) => Arc::clone(resolver),
-            None => Arc::new(crate::app::dns::SystemResolver::new(false)?),
-        };
-
-        let result =
-            dial_candidates(addresses, deadline, "TCP", |address, timeout| {
-                let this = self.clone();
-                let resolver = resolver.clone();
-                async move {
-                    let src: SocketAddr = if address.is_ipv4() {
-                        "0.0.0.0:0".parse().unwrap()
-                    } else {
-                        "[::]:0".parse().unwrap()
-                    };
-                    let sess = Session {
-                        source: src,
-                        network: Network::Tcp,
-                        typ: Type::Ignore,
-                        destination: address.into(),
-                        so_mark: this.so_mark,
-                        iface: this.iface.clone(),
-                        ..Default::default()
-                    };
-
-                    let stream = if let Some(ref outbound) = this.outbound {
-                        tokio::time::timeout(
-                            timeout,
-                            outbound.connect_stream(&sess, resolver),
-                        )
-                        .await??
-                    } else {
-                        let direct =
-                            crate::proxy::direct::Handler::new(PROXY_DIRECT);
-                        tokio::time::timeout(
-                            timeout,
-                            direct.connect_stream(&sess, resolver),
-                        )
-                        .await??
-                    };
-                    Ok(stream)
-                }
-            })
-            .await;
+        let resolver = self.connection_resolver()?;
+        let result = dial_candidates(addresses, deadline, "TCP", |address, _| {
+            self.connect_tcp(address, Arc::clone(&resolver))
+        })
+        .await;
         if result.is_err() {
             self.endpoint.invalidate_addresses();
         }
         result
+    }
+
+    pub(super) async fn connect_tcp(
+        &self,
+        address: SocketAddr,
+        resolver: Arc<dyn ClashResolver>,
+    ) -> anyhow::Result<AnyStream> {
+        let source = if address.is_ipv4() {
+            SocketAddr::from(([0; 4], 0))
+        } else {
+            SocketAddr::from(([0; 16], 0))
+        };
+        let session = Session {
+            source,
+            network: Network::Tcp,
+            typ: Type::Ignore,
+            destination: address.into(),
+            so_mark: self.so_mark,
+            iface: self.iface.clone(),
+            ..Default::default()
+        };
+        let stream = if let Some(outbound) = &self.outbound {
+            outbound.connect_stream(&session, resolver).await?
+        } else {
+            let direct = DirectHandler::new(PROXY_DIRECT);
+            direct.connect_stream(&session, resolver).await?
+        };
+        Ok(stream)
     }
 }
 
