@@ -3,12 +3,13 @@ use std::{future::Future, net::SocketAddr, pin::Pin, sync::Arc, task::{Context, 
 use bytes::Bytes;
 use thiserror::Error;
 
-use tokio::net::{TcpListener, UdpSocket};
+use tokio::net::UdpSocket;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio::task::JoinSet;
 use quinn::Endpoint;
 use crate::framing::serve_stream;
 use crate::encrypted::{EncryptedListeners, runtime::OwnedRuntime};
+use crate::socket::{bind_tcp, bind_udp};
 use tracing::{debug, error, info};
 
 use crate::{DNSListenAddr, DnsIngress, DnsMessageExchanger, PreparedDnsListener};
@@ -95,11 +96,13 @@ where
     let listen = &prepared.listen;
     // Bind everything before spawning so a partial startup cannot leave tasks.
     let udp = match listen.udp {
-        Some(addr) => Some(Arc::new(UdpSocket::bind(addr).await?)),
+        Some(addr) => Some(Arc::new(UdpSocket::from_std(
+            bind_udp(addr, listen.dual_stack.udp)?,
+        )?)),
         None => None,
     };
     let tcp = match listen.tcp {
-        Some(addr) => Some(TcpListener::bind(addr).await?),
+        Some(addr) => Some(bind_tcp(addr, listen.dual_stack.tcp).await?),
         None => None,
     };
     let encrypted = EncryptedListeners::bind(&prepared).await?;
@@ -134,7 +137,7 @@ where
                                     let socket = Arc::clone(&socket);
                                     inflight.push(async move {
                                         let _permit = permit;
-                                        match ex.exchange(req, Some(src.ip()), DnsIngress::Udp).await {
+                                        match ex.exchange(req, Some(src.ip().to_canonical()), DnsIngress::Udp).await {
                                             Ok(resp) => {
                                                 let _ = socket.send_to(&resp, src).await;
                                             }
@@ -221,7 +224,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::net::TcpStream;
+    use tokio::net::{TcpListener, TcpStream};
     use tokio::time::timeout;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use std::net::IpAddr;
@@ -260,9 +263,7 @@ mod tests {
         let listen = DNSListenAddr {
             udp: Some(udp_addr),
             tcp: Some(tcp_addr),
-            dot: None,
-            doh: None,
-            doh3: None,
+            ..Default::default()
         };
 
         let (sources, mut received_sources) = unbounded_channel();

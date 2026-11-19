@@ -686,6 +686,7 @@ pub struct Config {
     // and needs extra processing
     /// whether your network environment supports IPv6
     /// this will affect the DNS server response to AAAA questions
+    /// and enable dual-stack DNS listeners for `:port` addresses
     /// default is `false`
     pub ipv6: bool,
     /// whether to allow QUIC traffic (UDP port 443)
@@ -866,7 +867,7 @@ pub struct DotListenDef {
 
 /// Multi-protocol DNS listener definition.
 ///
-/// Used when `dns.listen` is a mapping rather than a plain UDP address string.
+/// Used when `dns.listen` or `dns2.listen` is a mapping.
 /// All fields are optional; only configured protocols will be started.
 ///
 /// # Example
@@ -903,7 +904,8 @@ pub struct DnsMultipleListenDef {
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(untagged)]
 pub enum DNSListen {
-    Udp(String),
+    /// A plain DNS address for UDP and TCP. `:port` follows the global IPv6 setting.
+    Address(String),
     Multiple(Box<DnsMultipleListenDef>),
 }
 

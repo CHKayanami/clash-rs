@@ -34,7 +34,7 @@ pub(crate) async fn serve_stream<S, X>(
             let mut req = vec![0; msg_len];
             stream.read_exact(&mut req).await?;
             let resp = exchanger.exchange(
-                Bytes::from(req), Some(peer.ip()), ingress,
+                Bytes::from(req), Some(peer.ip().to_canonical()), ingress,
             ).await?;
             let resp_len = u16::try_from(resp.len()).map_err(|_| {
                 DNSError::QueryFailed("DNS TCP response exceeds frame size".into())

@@ -5,7 +5,7 @@ mod write_deadline;
 mod h3;
 pub(crate) mod runtime;
 
-use std::{net::UdpSocket, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 use quinn::{Endpoint, EndpointConfig, ServerConfig as QuicConfig, TransportConfig, crypto::rustls::QuicServerConfig};
 use tokio::{net::TcpListener, sync::Semaphore, task::JoinSet, time::timeout};
 use tokio_rustls::TlsAcceptor;
@@ -15,6 +15,7 @@ use rustls::ServerConfig;
 use ::http::uri::Authority;
 use crate::framing::serve_stream;
 use crate::handler::{MAX_TCP_CONNECTIONS, TCP_REQUEST_TIMEOUT};
+use crate::socket::{bind_tcp, bind_udp};
 use self::http::Service;
 use runtime::OwnedRuntime;
 
@@ -83,17 +84,16 @@ impl EncryptedListeners {
         let listen = &prepared.listen;
         let tls = &prepared.encrypted;
         let dot = if let (Some(cfg), Some(config)) = (&listen.dot, &tls.dot) {
-            Some(TlsListener { listener: TcpListener::bind(cfg.addr).await?,
+            Some(TlsListener { listener: bind_tcp(cfg.addr, listen.dual_stack.dot).await?,
                 acceptor: TlsAcceptor::from(config.clone()), hostname: None })
         } else { None };
         let doh = if let (Some(cfg), Some(tls)) = (&listen.doh, &tls.doh) {
-            Some(TlsListener { listener: TcpListener::bind(cfg.addr).await?,
+            Some(TlsListener { listener: bind_tcp(cfg.addr, listen.dual_stack.doh).await?,
                 acceptor: TlsAcceptor::from(tls.config.clone()), hostname: tls.hostname.clone() })
         } else { None };
         // Construct the QUIC endpoint last, after all fallible TCP binding.
         let h3 = if let (Some(cfg), Some((quic, hostname))) = (&listen.doh3, &tls.h3) {
-            let socket = UdpSocket::bind(cfg.addr)?;
-            socket.set_nonblocking(true)?;
+            let socket = bind_udp(cfg.addr, listen.dual_stack.doh3)?;
             let runtime = Arc::new(OwnedRuntime::default());
             let endpoint = Endpoint::new(EndpointConfig::default(), Some(quic.clone()), socket, runtime.clone())?;
             Some((endpoint, runtime, hostname.clone()))

@@ -157,7 +157,7 @@ impl<X: DnsMessageExchanger> Service<X> {
         if query.len() < 12 || query.len() > MAX_DNS_SIZE || query[2] & 0x80 != 0 {
             return failure(StatusCode::BAD_REQUEST);
         }
-        match self.exchanger.exchange(query, Some(peer), ingress).await {
+        match self.exchanger.exchange(query, Some(peer.to_canonical()), ingress).await {
             Ok(body) if (12..=MAX_DNS_SIZE).contains(&body.len()) => {
                 let mut response = Response::new(Bytes::from(body));
                 response.headers_mut().insert(header::CONTENT_TYPE,

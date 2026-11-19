@@ -66,6 +66,7 @@ use std::{
 };
 use tracing::warn;
 use url::Url;
+use clash_dns::DnsListenerDualStack;
 pub use clash_dns::{DNSListenAddr, DoH3Config, DoHConfig, DoTConfig};
 
 #[derive(Clone, Debug)]
@@ -330,16 +331,14 @@ impl Config {
     }
 }
 
-fn parse_listen_addr(addr: &str) -> Result<SocketAddr, Error> {
-    if addr.starts_with(':') {
-        format!("0.0.0.0{addr}").parse().map_err(|_| {
-            Error::InvalidConfig(format!("invalid dns listen address: {addr}"))
-        })
+fn parse_listen_addr(addr: &str, ipv6: bool) -> Result<SocketAddr, Error> {
+    let parsed = if addr.starts_with(':') {
+        let wildcard = if ipv6 { "[::]" } else { "0.0.0.0" };
+        format!("{wildcard}{addr}").parse()
     } else {
-        addr.parse().map_err(|_| {
-            Error::InvalidConfig(format!("invalid dns listen address: {addr}"))
-        })
-    }
+        addr.parse()
+    };
+    parsed.map_err(|_| Error::InvalidConfig(format!("invalid dns listen address: {addr}")))
 }
 
 impl Config {
@@ -399,7 +398,7 @@ impl TryFrom<&crate::config::def::Config> for Config {
     fn try_from(c: &crate::config::def::Config) -> Result<Self, Self::Error> {
         if let Some(d2) = c.dns2.as_ref().filter(|d2| d2.enable) {
             let dns2 = RouterConfig::from_def(d2, c.ipv6)?;
-            let listen = parse_dns_listen(dns2.listen.as_ref()).map_err(|error| {
+            let listen = parse_dns_listen(dns2.listen.as_ref(), c.ipv6).map_err(|error| {
                 Error::InvalidConfig(format!("dns2.listen: {error}"))
             })?;
             return Ok(Self {
@@ -478,7 +477,7 @@ impl TryFrom<&crate::config::def::Config> for Config {
             nameserver: nameservers,
             fallback,
             fallback_filter: dc.fallback_filter.clone().into(),
-            listen: parse_dns_listen(dc.listen.as_ref())?,
+            listen: parse_dns_listen(dc.listen.as_ref(), c.ipv6)?,
             enhance_mode: dc.enhanced_mode.clone(),
             default_nameserver,
             proxy_server_nameserver,
@@ -531,34 +530,53 @@ impl TryFrom<&crate::config::def::Config> for Config {
     }
 }
 
-fn parse_dns_listen(listen: Option<&DNSListen>) -> Result<DNSListenAddr, Error> {
+fn parse_dns_listen(
+    listen: Option<&DNSListen>,
+    ipv6: bool,
+) -> Result<DNSListenAddr, Error> {
     let Some(listen) = listen.cloned() else {
         return Ok(DNSListenAddr::default());
     };
+    let parse_addr = |addr: &str| parse_listen_addr(addr, ipv6);
+    let requests_dual_stack = |addr: &str| ipv6 && addr.starts_with(':');
     let parsed: Result<DNSListenAddr, Error> = match listen {
-        DNSListen::Udp(u) => {
-            let addr = parse_listen_addr(&u)?;
+        DNSListen::Address(address) => {
+            let addr = parse_addr(&address)?;
+            let dual_stack = requests_dual_stack(&address);
             Ok(DNSListenAddr {
                 udp: Some(addr),
+                tcp: Some(addr),
+                dual_stack: DnsListenerDualStack {
+                    udp: dual_stack,
+                    tcp: dual_stack,
+                    ..Default::default()
+                },
                 ..Default::default()
             })
         }
         DNSListen::Multiple(m) => {
+            let dual_stack = DnsListenerDualStack {
+                udp: m.udp.as_deref().is_some_and(requests_dual_stack),
+                tcp: m.tcp.as_deref().is_some_and(requests_dual_stack),
+                doh: m.doh.as_ref().is_some_and(|c| requests_dual_stack(&c.addr)),
+                dot: m.dot.as_ref().is_some_and(|c| requests_dual_stack(&c.addr)),
+                doh3: m.doh3.as_ref().is_some_and(|c| requests_dual_stack(&c.addr)),
+            };
             let udp = m
                 .udp
                 .as_deref()
-                .map(parse_listen_addr)
+                .map(parse_addr)
                 .transpose()?;
             let tcp = m
                 .tcp
                 .as_deref()
-                .map(parse_listen_addr)
+                .map(parse_addr)
                 .transpose()?;
             // DoHConfig and DoH3Config have identical fields; helper
             // avoids duplication.
             let map_doh_fields =
                 |c: DohListenDef| {
-                    parse_listen_addr(&c.addr).map(|addr| {
+                    parse_addr(&c.addr).map(|addr| {
                         (addr, c.ca_cert, c.ca_key, c.hostname)
                     })
                 };
@@ -581,7 +599,7 @@ fn parse_dns_listen(listen: Option<&DNSListen>) -> Result<DNSListenAddr, Error> 
                 .dot
                 .map(|c| -> Result<DoTConfig, Error> {
                     Ok(DoTConfig {
-                        addr: parse_listen_addr(&c.addr)?,
+                        addr: parse_addr(&c.addr)?,
                         ca_cert: c.ca_cert,
                         ca_key: c.ca_key,
                     })
@@ -608,6 +626,7 @@ fn parse_dns_listen(listen: Option<&DNSListen>) -> Result<DNSListenAddr, Error> 
                 doh,
                 dot,
                 doh3,
+                dual_stack,
             })
         }
     };
@@ -675,14 +694,15 @@ ipv6: true
 dns2:
   enable: true
   ipv6: true
-  listen: 127.0.0.1:15353
+  listen: ":15353"
   default-nameserver: [192.0.2.53]
 "#).unwrap();
         assert!(!def.dns.enable);
         let cfg = Config::try_from(&def).unwrap();
         assert!(cfg.enable);
         assert!(cfg.ipv6);
-        assert_eq!(cfg.listen.udp, Some("127.0.0.1:15353".parse().unwrap()));
+        assert_eq!(cfg.listen.udp, Some("[::]:15353".parse().unwrap()));
+        assert_eq!(cfg.listen.tcp, cfg.listen.udp);
         let dns2 = cfg.dns2.unwrap();
         assert_eq!(dns2.default_nameserver[0].host.to_string(), "192.0.2.53");
     }
@@ -733,7 +753,7 @@ dns2:
         let mut def: DefConfig = yaml_serde::from_str(r#"
 dns:
   enable: true
-  listen: 127.0.0.1:15353
+  listen: ":15353"
   nameserver: [192.0.2.53]
 dns2:
   enable: false
@@ -742,10 +762,32 @@ dns2:
         let cfg = Config::try_from(&def).unwrap();
         assert!(cfg.enable);
         assert!(cfg.dns2.is_none());
-        assert_eq!(cfg.listen.udp, Some("127.0.0.1:15353".parse().unwrap()));
+        assert_eq!(cfg.listen.udp, Some("0.0.0.0:15353".parse().unwrap()));
+        assert_eq!(cfg.listen.tcp, cfg.listen.udp);
         def.dns.nameserver.clear();
         let error = Config::try_from(&def).err().unwrap().to_string();
         assert!(error.contains("dns enabled, no nameserver specified"));
+    }
+
+    #[test]
+    fn listener_shorthand_follows_global_ipv6_setting() {
+        for (yaml, shorthand, udp, tcp) in [
+            (r#"":1053""#, true, true, true),
+            (r#""[::]:1053""#, false, true, true),
+            (r#"{udp: ":1053"}"#, true, true, false),
+            (r#"{tcp: ":1053"}"#, true, false, true),
+        ] {
+            let listen: DNSListen = yaml_serde::from_str(yaml).unwrap();
+            for ipv6 in [false, true] {
+                let parsed = parse_dns_listen(Some(&listen), ipv6).unwrap();
+                let address = if shorthand && !ipv6 { "0.0.0.0:1053" } else { "[::]:1053" }
+                    .parse().unwrap();
+                assert_eq!(parsed.udp, udp.then_some(address));
+                assert_eq!(parsed.tcp, tcp.then_some(address));
+                assert_eq!(parsed.dual_stack.udp, shorthand && ipv6 && udp);
+                assert_eq!(parsed.dual_stack.tcp, shorthand && ipv6 && tcp);
+            }
+        }
     }
 
     #[test]

@@ -192,12 +192,15 @@ mod tests {
     use crate::{Config, setup_default_crypto_provider};
     use crate::app::net::{get_default_outbound_interface, get_tun_somark};
     use serial_test::serial;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream, UdpSocket};
     use tokio::time::{Duration, timeout};
-    use std::net::IpAddr;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
     use crate::app::dns::query::{DnsName, QType, QueryContext};
     use crate::app::dns::response::ResponseTemplate;
     use crate::app::dns::resolver::router::config::RequestAction;
+    use crate::proxy::utils::try_create_dualstack_socket;
+    use socket2::Type;
     use std::{io::ErrorKind, path::Path};
     use clash_dns::DNSError as ServerDNSError;
 
@@ -266,18 +269,22 @@ mod tests {
     async fn dns2_listener_starts_and_reloads_without_legacy_dns() {
         let _restore = RestoreNetwork(NetworkConfig::capture());
         let dir = tempfile::tempdir().unwrap();
-        let reservation = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let reservation = TcpListener::bind("[::]:0").await.unwrap();
         let address = reservation.local_addr().unwrap();
+        let port = address.port();
         drop(reservation);
+        let supports_dual_stack = [Type::STREAM, Type::DGRAM].into_iter().all(|kind| {
+            let (socket, _) = try_create_dualstack_socket(address, kind).unwrap();
+            !socket.only_v6().unwrap()
+        });
         let config = Config::Str(format!(r#"
 mode: direct
+ipv6: true
 tun:
   enable: false
 dns2:
   enable: true
-  listen:
-    udp: {address}
-    tcp: {address}
+  listen: ":{port}"
   hosts:
     dns2.example: 192.0.2.42
 "#)).try_parse().unwrap();
@@ -285,20 +292,39 @@ dns2:
         let query = QueryContext::new(
             DnsName::from_domain("dns2.example").unwrap(), QType::A,
         );
-        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let expected = [IpAddr::V4(Ipv4Addr::new(192, 0, 2, 42))];
         for attempt in 0..2 {
             if attempt != 0 {
                 runtime.reload(runtime.active_config.clone()).await.unwrap();
             }
             assert!(runtime.components.dns_enabled);
             assert_eq!(runtime.components.dns_listen.udp, Some(address));
-            drop(TcpStream::connect(address).await.unwrap());
-            socket.send_to(query.wire(), address).await.unwrap();
-            let mut response = [0u8; 512];
-            let (length, _) = timeout(Duration::from_secs(2), socket.recv_from(&mut response))
-                .await.unwrap().unwrap();
-            let response = ResponseTemplate::validate(&query, &response[..length]).unwrap();
-            assert_eq!(response.answer_ips().as_ref(), &["192.0.2.42".parse::<IpAddr>().unwrap()]);
+            assert_eq!(runtime.components.dns_listen.tcp, Some(address));
+            for ip in [IpAddr::V4(Ipv4Addr::LOCALHOST), IpAddr::V6(Ipv6Addr::LOCALHOST)] {
+                if ip.is_ipv4() && !supports_dual_stack {
+                    continue;
+                }
+                let destination = SocketAddr::new(ip, port);
+                timeout(Duration::from_secs(2), async {
+                    let socket = UdpSocket::bind(SocketAddr::new(ip, 0)).await.unwrap();
+                    socket.send_to(query.wire(), destination).await.unwrap();
+                    let mut response = [0u8; 512];
+                    let (length, _) = socket.recv_from(&mut response).await.unwrap();
+                    let response = ResponseTemplate::validate(&query, &response[..length])
+                        .unwrap();
+                    assert_eq!(response.answer_ips().as_ref(), &expected);
+
+                    let mut stream = TcpStream::connect(destination).await.unwrap();
+                    stream.write_u16(query.wire().len() as u16).await.unwrap();
+                    stream.write_all(query.wire()).await.unwrap();
+                    let length = usize::from(stream.read_u16().await.unwrap());
+                    let mut response = vec![0; length];
+                    stream.read_exact(&mut response).await.unwrap();
+                    let response = ResponseTemplate::validate(&query, &response)
+                        .unwrap();
+                    assert_eq!(response.answer_ips().as_ref(), &expected);
+                }).await.unwrap();
+            }
             assert!(fatal_rx.try_recv().is_err());
         }
 
@@ -309,7 +335,7 @@ dns2:
         let error = runtime.reload(invalid).await.unwrap_err();
         assert!(error.to_string().contains("unknown dns2 upstream 'missing'"));
         assert!(Arc::ptr_eq(&previous, &runtime.components.dns_resolver));
-        drop(TcpStream::connect(address).await.unwrap());
+        drop(TcpStream::connect((Ipv6Addr::LOCALHOST, port)).await.unwrap());
         assert!(fatal_rx.try_recv().is_err());
         drop(previous);
 

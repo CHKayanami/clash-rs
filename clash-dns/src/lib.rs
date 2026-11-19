@@ -11,6 +11,7 @@ mod handler;
 mod encrypted;
 mod framing;
 mod prepared;
+mod socket;
 
 pub use prepared::PreparedDnsListener;
 pub use handler::{DNSError, DnsListener, get_dns_listener};
@@ -51,6 +52,17 @@ pub struct DNSListenAddr {
     pub doh: Option<DoHConfig>,
     pub dot: Option<DoTConfig>,
     pub doh3: Option<DoH3Config>,
+    pub dual_stack: DnsListenerDualStack,
+}
+
+/// Listeners whose configuration requests IPv4-mapped connections on an IPv6 socket.
+#[derive(Debug, Default, Clone)]
+pub struct DnsListenerDualStack {
+    pub udp: bool,
+    pub tcp: bool,
+    pub doh: bool,
+    pub dot: bool,
+    pub doh3: bool,
 }
 
 impl DNSListenAddr {
