@@ -1,8 +1,41 @@
 use super::*;
-use std::io;
+use std::{cell::RefCell, io, task::Waker};
 use crate::common::io::{CopyBuffer, copy_buf_bidirectional_with_timeout};
 use futures::future::poll_fn;
 use tokio::{io::{AsyncReadExt, AsyncWriteExt, ReadBuf}, time::advance};
+
+struct RecordPolls<'a>(&'a RefCell<Vec<&'static str>>);
+
+impl<R: ?Sized, W: ?Sized> Buffer<R, W> for RecordPolls<'_> {
+    fn amount_transferred(&self) -> u64 { 0 }
+
+    fn poll_copy(
+        &mut self, _: &mut Context<'_>, _: &mut R, _: &mut W, _: &mut bool,
+        direction: Direction,
+    ) -> Poll<Result<u64, CopyBidirectionalError>> {
+        self.0.borrow_mut().push(match direction {
+            Direction::Upload => "upload",
+            Direction::Download => "download",
+        });
+        Poll::Pending
+    }
+}
+
+#[tokio::test]
+async fn polls_both_directions_with_alternating_priority() {
+    let (_client, mut a) = tokio::io::duplex(64);
+    let (mut b, _server) = tokio::io::duplex(64);
+    let polls = RefCell::new(Vec::new());
+    let mut copy = CopyState::new(
+        RecordPolls(&polls), RecordPolls(&polls),
+        Duration::ZERO, Duration::ZERO, TrafficTracker::noop(),
+    );
+    let mut cx = Context::from_waker(Waker::noop());
+    for expected in [["upload", "download"], ["download", "upload"], ["upload", "download"]] {
+        assert!(copy.poll(&mut a, &mut b, &mut cx).is_pending());
+        assert_eq!(polls.take(), expected);
+    }
+}
 
 #[tokio::test]
 async fn completed_shutdown_retains_counts() {
@@ -56,6 +89,20 @@ async fn zero_half_close_timeout_finishes_both_directions() {
         ).await.unwrap();
         assert_eq!(result, (0, 0));
     }
+}
+
+#[tokio::test(start_paused = true)]
+async fn zero_half_close_timeout_repolls_download_when_polled_first() {
+    let (mut client, mut a) = tokio::io::duplex(64);
+    let (mut b, _server) = tokio::io::duplex(64);
+    let mut copy = tokio_test::task::spawn(copy_buf_bidirectional_with_timeout(
+        &mut a, &mut b, 1024, Duration::ZERO, Duration::ZERO, TrafficTracker::noop(),
+    ));
+
+    // The first poll leaves both directions pending and makes download go next.
+    assert!(copy.poll().is_pending());
+    client.shutdown().await.unwrap();
+    assert!(matches!(copy.poll(), Poll::Ready(Ok((0, 0)))));
 }
 
 #[tokio::test(start_paused = true)]

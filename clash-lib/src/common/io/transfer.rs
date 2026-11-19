@@ -23,6 +23,13 @@ impl Direction {
             Self::Download => tracker.push_download(written),
         }
     }
+
+    fn opposite(self) -> Self {
+        match self {
+            Self::Upload => Self::Download,
+            Self::Download => Self::Upload,
+        }
+    }
 }
 
 pub(super) trait Buffer<R: ?Sized, W: ?Sized> {
@@ -46,13 +53,10 @@ struct DirectionContext<'a> {
 }
 
 impl<C> TransferState<C> {
-    fn is_running(&self) -> bool { matches!(self, Self::Running(_)) }
-    fn is_done(&self) -> bool { matches!(self, Self::Done(_)) }
-
     fn poll<R, W>(
         &mut self, reader: &mut R, writer: &mut W, cx: &mut Context<'_>,
-        context: DirectionContext<'_>,
-    ) -> Poll<Result<u64, CopyBidirectionalError>>
+        context: DirectionContext<'_>, opposite: &Self,
+    ) -> Result<bool, CopyBidirectionalError>
     where
         C: Buffer<R, W>,
         R: ?Sized,
@@ -75,25 +79,30 @@ impl<C> TransferState<C> {
                     }
                     let count = match result {
                         Poll::Ready(Ok(count)) => count,
-                        Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                        Poll::Ready(Err(error)) => return Err(error),
                         Poll::Pending if timeouts.half_close_expired() => {
                             buffer.amount_transferred()
                         }
-                        Poll::Pending => return Poll::Pending,
+                        Poll::Pending => return Ok(false),
                     };
                     *self = Self::ShuttingDown(count);
                     timeouts.stop_half_close();
                 }
                 Self::ShuttingDown(count) => {
                     match Pin::new(&mut *writer).poll_shutdown(cx) {
-                        Poll::Ready(Ok(())) => *self = Self::Done(*count),
-                        Poll::Ready(Err(error)) => {
-                            return Poll::Ready(Err(direction.error(error)));
+                        Poll::Ready(Ok(())) => {
+                            *self = Self::Done(*count);
+                            if matches!(opposite, Self::Running(_)) {
+                                timeouts.start_half_close(direction.opposite());
+                                return Ok(true);
+                            }
+                            return Ok(false);
                         }
-                        Poll::Pending => return Poll::Pending,
+                        Poll::Ready(Err(error)) => return Err(direction.error(error)),
+                        Poll::Pending => return Ok(false),
                     }
                 }
-                Self::Done(count) => return Poll::Ready(Ok(*count)),
+                Self::Done(_) => return Ok(false),
             }
         }
     }
@@ -104,6 +113,7 @@ pub(super) struct CopyState<C> {
     download: TransferState<C>,
     timeouts: CopyTimeouts,
     tracker: TrafficTracker,
+    download_first: bool,
 }
 
 impl<C> CopyState<C> {
@@ -116,6 +126,27 @@ impl<C> CopyState<C> {
             download: TransferState::Running(download),
             timeouts: CopyTimeouts::new(upload_timeout, download_timeout),
             tracker,
+            download_first: false,
+        }
+    }
+
+    /// Returns `true` if this poll started the opposite direction's half-close timer.
+    fn poll_direction<R, W>(
+        &mut self, a: &mut R, b: &mut W, cx: &mut Context<'_>, direction: Direction,
+    ) -> Result<bool, CopyBidirectionalError>
+    where
+        C: Buffer<R, W> + Buffer<W, R>,
+        R: AsyncRead + AsyncWrite + Unpin + ?Sized,
+        W: AsyncRead + AsyncWrite + Unpin + ?Sized,
+    {
+        let context = DirectionContext {
+            timeouts: &mut self.timeouts,
+            tracker: &self.tracker,
+            direction,
+        };
+        match direction {
+            Direction::Upload => self.upload.poll(a, b, cx, context, &self.download),
+            Direction::Download => self.download.poll(b, a, cx, context, &self.upload),
         }
     }
 
@@ -134,41 +165,26 @@ impl<C> CopyState<C> {
                 ErrorKind::TimedOut, "connection idle timeout",
             ))));
         }
-        loop {
-            let upload_was_done = self.upload.is_done();
-            if let Poll::Ready(Err(error)) = self.upload.poll(a, b, cx, DirectionContext {
-                timeouts: &mut self.timeouts,
-                tracker: &self.tracker,
-                direction: Direction::Upload,
-            }) {
-                return Poll::Ready(Err(error));
-            }
-            if !upload_was_done && self.upload.is_done() && self.download.is_running() {
-                self.timeouts.start_half_close(Direction::Download);
-            }
-
-            let download_was_done = self.download.is_done();
-            if let Poll::Ready(Err(error)) = self.download.poll(b, a, cx, DirectionContext {
-                timeouts: &mut self.timeouts,
-                tracker: &self.tracker,
-                direction: Direction::Download,
-            }) {
-                return Poll::Ready(Err(error));
-            }
-            if !download_was_done && self.download.is_done() && self.upload.is_running() {
-                self.timeouts.start_half_close(Direction::Upload);
-                // The upload was polled before this deadline was installed.
-                // Revisit it so zero-duration timeouts also finish immediately.
-                continue;
-            }
-            if let (TransferState::Done(upload), TransferState::Done(download)) =
-                (&self.upload, &self.download)
-            {
-                return Poll::Ready(Ok((*upload, *download)));
-            }
-            self.timeouts.poll_wait(cx);
-            return Poll::Pending;
+        // Both directions share the task's I/O budget. Alternate who gets it first.
+        let [first, second] = if self.download_first {
+            [Direction::Download, Direction::Upload]
+        } else {
+            [Direction::Upload, Direction::Download]
+        };
+        self.download_first = !self.download_first;
+        self.poll_direction(a, b, cx, first)?;
+        if self.poll_direction(a, b, cx, second)? {
+            // The first direction was polled before its deadline was installed.
+            // Revisit it so zero-duration timeouts also finish immediately.
+            self.poll_direction(a, b, cx, first)?;
         }
+        if let (TransferState::Done(upload), TransferState::Done(download)) =
+            (&self.upload, &self.download)
+        {
+            return Poll::Ready(Ok((*upload, *download)));
+        }
+        self.timeouts.poll_wait(cx);
+        Poll::Pending
     }
 }
 
