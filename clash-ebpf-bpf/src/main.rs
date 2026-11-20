@@ -408,6 +408,11 @@ fn handle_miss_flow(
         return TC_ACT_OK;
     }
     if !is_redirected && routing::direct(param, link_h_len, pkt, wan, pid_pname) {
+        // WAN TCP caches the verdict in socket storage. Subsequent packets,
+        // including FIN/RST, bypass FLOW_TRACK and cannot retire a direct entry.
+        if wan && is_tcp {
+            return TC_ACT_OK;
+        }
         if !tracking::publish_into(&tuple, tracked, None, &mut scratch.result) {
             return TC_ACT_SHOT;
         }

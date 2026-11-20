@@ -188,7 +188,7 @@ fn btf_maps_and_programs_load_without_attaching() {
 }
 
 #[test]
-#[ignore = "requires root and writable cgroup2; run with --test-threads=1"]
+#[ignore = "requires root, writable cgroup2 and iproute2; run with --test-threads=1"]
 fn cgroup_socket_identity_and_active_open_are_preserved() {
     use aya::{
         maps::{HashMap, SkStorage},
@@ -232,7 +232,8 @@ fn cgroup_socket_identity_and_active_open_are_preserved() {
         temporary,
         pid: std::process::id().to_string(),
     };
-    let mut bpf = aya::EbpfLoader::new().load(BYTECODE).unwrap();
+    let mut bpf = aya::EbpfLoader::new().map_max_entries("FLOW_TRACK", 1)
+        .load(BYTECODE).unwrap();
     let cgroup = fs::File::open(&membership.temporary).unwrap();
     for name in [
         "tproxy_wan_cg_sock_create",
@@ -316,4 +317,49 @@ fn cgroup_socket_identity_and_active_open_are_preserved() {
     assert_eq!(refreshed.pid, before.pid);
     assert_eq!(&refreshed.pname[..12], b"ebpf-refresh");
     assert_ne!(refreshed.pname, before.pname);
+
+    std::thread::spawn(move || check_wan_tcp_direct(&mut bpf)).join().unwrap();
+}
+
+fn check_wan_tcp_direct(bpf: &mut aya::Ebpf) {
+    use aya::{maps::{Array, HashMap, SkStorage}, programs::{SchedClassifier, TcAttachType, tc}};
+    use std::{io, net::{TcpListener, TcpStream}, process::Command, time::Duration};
+
+    // This worker's private namespace disappears with the thread and its sockets.
+    assert_eq!(unsafe { libc::unshare(libc::CLONE_NEWNET) }, 0, "{}", io::Error::last_os_error());
+    for args in [
+        &["link", "set", "lo", "up"][..],
+        &["addr", "add", "192.0.2.1/32", "dev", "lo"][..],
+    ] {
+        let output = Command::new("ip").args(args).output().unwrap();
+        assert!(output.status.success(), "{args:?}: {}", String::from_utf8_lossy(&output.stderr));
+    }
+
+    let listener = TcpListener::bind("192.0.2.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    Array::try_from(bpf.map_mut("DAE_PARAM").unwrap()).unwrap()
+        .set(0, &DaeParam { dae0_ifindex: 1, proxy_local: 1, ..DaeParam::default() }, 0).unwrap();
+    HashMap::<_, u16, u8>::try_from(bpf.map_mut("BYPASS_DST_PORTS").unwrap()).unwrap()
+        .insert(&addr.port(), &1, 0).unwrap();
+    tc::qdisc_add_clsact(c"lo").unwrap();
+    // Loopback emits an Ethernet header at TC egress.
+    let program: &mut SchedClassifier = bpf.program_mut("wan_egress_l2").unwrap().try_into().unwrap();
+    program.load().unwrap();
+    program.attach(c"lo", TcAttachType::Egress).unwrap();
+
+    let other_flow = RedirectTuple { src_port: 1, proto: 17, ip_version: 4, ..RedirectTuple::default() };
+    let mut flows = HashMap::<_, RedirectTuple, FlowTrackEntry>::try_from(bpf.take_map("FLOW_TRACK").unwrap()).unwrap();
+    let policy = SkStorage::<_, u32>::try_from(bpf.map("TCP_SOCKET_POLICY").unwrap()).unwrap();
+    let connect = || {
+        let client = TcpStream::connect_timeout(&addr, Duration::from_secs(2)).unwrap();
+        assert_eq!(policy.get(&client, 0).unwrap(), 3, "socket caches the direct verdict");
+        let _server = listener.accept().unwrap();
+    };
+
+    connect();
+    assert_eq!(flows.keys().count(), 0, "local TCP direct leaves no flow record");
+    let entry = FlowTrackEntry::default();
+    flows.insert(&other_flow, &entry, 0).unwrap();
+    connect();
+    assert_eq!(flows.get(&other_flow, 0).unwrap(), entry, "full table still permits local TCP direct");
 }
