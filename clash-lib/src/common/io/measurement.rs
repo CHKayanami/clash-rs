@@ -68,16 +68,16 @@ async fn measure_splice(
     start: &impl Fn(), finish: &impl Fn(&str, usize, Option<usize>) -> usize,
 ) {
     use tokio::net::UnixStream;
-    use super::splice;
+    use super::{DEFAULT_BUF_SIZE, splice};
 
     for reverse in [false, true] {
         let (client, mut a) = UnixStream::pair().unwrap();
         let (mut b, server) = UnixStream::pair().unwrap();
         let (mut source, mut sink) = if reverse { (server, client) } else { (client, server) };
         start();
-        let mut copy = splice::new(
-            None, None, TrafficTracker::noop(),
-        ).unwrap();
+        let mut copy = splice::Pipes::new().unwrap().into_copy(
+            None, None, DEFAULT_BUF_SIZE, TrafficTracker::noop(),
+        );
         let result = copy.poll(&mut a, &mut b, &mut Context::from_waker(noop_waker_ref()));
         finish("splice copy initialization", 0, Some(1));
         assert!(result.is_pending());

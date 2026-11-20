@@ -22,21 +22,25 @@ enum Mode {
 }
 
 impl Mode {
-    fn initialize<A: ProxyStream>(a: &mut A, b: &mut AnyStream, settings: Settings)
-        -> Result<Self, CopyBidirectionalError>
-    {
+    fn initialize<A: ProxyStream>(a: &mut A, b: &mut AnyStream, settings: Settings) -> Self {
         #[cfg(all(target_os = "linux", feature = "zero_copy"))]
         if a.zero_copy_socket().is_some() && b.zero_copy_socket().is_some() {
-            let upload_prefix = a.take_read_prefix();
-            let download_prefix = b.take_read_prefix();
-            tracing::trace!("using zero copy for bidirectional copy");
-            return Ok(Self::Splice(splice::new(
-                upload_prefix, download_prefix, settings.tracker,
-            )?));
+            match splice::Pipes::new() {
+                Ok(pipes) => {
+                    tracing::trace!("using zero copy for bidirectional copy");
+                    return Self::Splice(pipes.into_copy(
+                        a.take_read_prefix(), b.take_read_prefix(), settings.size,
+                        settings.tracker,
+                    ));
+                }
+                Err(error) => {
+                    tracing::debug!(%error, "could not create splice pipes, using buffered copy");
+                }
+            }
         }
         #[cfg(not(all(target_os = "linux", feature = "zero_copy")))]
         let _ = (a, b);
-        Ok(Self::Buffered(buffered::new(settings.size, settings.tracker)))
+        Self::Buffered(buffered::new(settings.size, settings.tracker))
     }
 
     fn poll<A: ProxyStream>(&mut self, a: &mut A, b: &mut AnyStream, cx: &mut Context<'_>)
@@ -152,10 +156,7 @@ impl<A: ProxyStream> Future for StreamCopy<A> {
                     }
                     let Phase::Handshaking { settings, .. } = replace(phase, Phase::Done)
                     else { unreachable!(); };
-                    *phase = match Mode::initialize(a, b, settings) {
-                        Ok(mode) => Phase::Copying(mode),
-                        Err(error) => return Poll::Ready(Err(error)),
-                    };
+                    *phase = Phase::Copying(Mode::initialize(a, b, settings));
                 }
                 Phase::Copying(mode) => match mode.poll(a, b, cx) {
                     Poll::Pending => return Poll::Pending,

@@ -1,6 +1,6 @@
 /// ref: https://github.com/Hanaasagi/tokio-splice & clash_lib/src/common/io/mod.rs
 use std::{
-    io::{Error, ErrorKind},
+    io::{self, Error, ErrorKind},
     os::unix::io::{AsRawFd, RawFd},
     pin::Pin,
     task::{Context, Poll, ready},
@@ -13,7 +13,9 @@ use tokio::io::{AsyncRead, AsyncWrite, Interest};
 
 use tokio::net::{TcpStream, UnixStream};
 
-use super::{CopyBidirectionalError, SlideBuffer, TrafficTracker};
+use super::{CopyBidirectionalError, CopyBuffer as BufferedCopy, SlideBuffer, TrafficTracker};
+#[cfg(test)]
+use super::DEFAULT_BUF_SIZE;
 
 use super::transfer::{Buffer, CopyState as TransferCopyState, Direction};
 
@@ -81,7 +83,7 @@ struct Pipe(RawFd, RawFd);
 
 impl Pipe {
     /// Create a pipe
-    fn new() -> Result<Self> {
+    fn new() -> io::Result<Self> {
         let mut pipe = std::mem::MaybeUninit::<[libc::c_int; 2]>::uninit();
         unsafe {
             // pipe() creates a pipe, a unidirectional data channel that can be used
@@ -114,7 +116,7 @@ impl Pipe {
                 libc::O_CLOEXEC | libc::O_NONBLOCK,
             ) < 0
             {
-                return Err(CopyBidirectionalError::Other(Error::last_os_error()));
+                return Err(Error::last_os_error());
             }
             let [r_fd, w_fd] = pipe.assume_init();
             libc::fcntl(w_fd, libc::F_SETPIPE_SZ, PIPE_SIZE);
@@ -131,6 +133,27 @@ impl Pipe {
     fn write_fd(&self) -> RawFd {
         self.1
     }
+
+    fn read_pending(&mut self, mut pending: &mut [u8]) -> io::Result<()> {
+        while !pending.is_empty() {
+            // The slice is valid for writes, and this direction exclusively owns
+            // the pipe. Its tracked pending length bounds the read.
+            let n = unsafe {
+                libc::read(self.read_fd(), pending.as_mut_ptr().cast(), pending.len())
+            };
+            if n > 0 {
+                pending = &mut pending[n as usize..];
+            } else if n == 0 {
+                return Err(Error::new(ErrorKind::UnexpectedEof, "splice pipe ended early"));
+            } else {
+                let error = Error::last_os_error();
+                if error.kind() != ErrorKind::Interrupted {
+                    return Err(error);
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 impl Drop for Pipe {
@@ -142,38 +165,52 @@ impl Drop for Pipe {
     }
 }
 
-pub(super) struct CopyBuffer {
+pub(super) enum CopyBuffer {
+    Splice(SpliceBuffer),
+    Buffered { buffer: BufferedCopy, already_written: u64 },
+}
+
+enum SpliceOutcome {
+    Complete(u64),
+    Buffered,
+}
+
+fn splice_unavailable(error: &Error) -> bool {
+    matches!(error.raw_os_error(), Some(libc::EINVAL | libc::ENOSYS))
+}
+
+pub(super) struct SpliceBuffer {
     read_done: bool,
+    read_from_socket: bool,
     need_flush: bool,
     pos: usize,
     cap: usize,
     amt: u64,
     buf: Pipe,
     prefix: Option<SlideBuffer>,
+    buffer_size: usize,
 }
 
-impl CopyBuffer {
-    fn new(buf: Pipe) -> Self {
+impl SpliceBuffer {
+    fn new(buf: Pipe, prefix: Option<SlideBuffer>, buffer_size: usize) -> Self {
         Self {
             read_done: false,
+            read_from_socket: false,
             need_flush: false,
             pos: 0,
             cap: 0,
             amt: 0,
             buf,
-            prefix: None,
+            prefix: prefix.filter(|prefix| !prefix.is_empty()),
+            buffer_size,
         }
-    }
-
-    fn amount_transferred(&self) -> u64 {
-        self.amt
     }
 
     fn poll_fill_buf<R: Stream + Unpin>(
         &mut self,
         cx: &mut Context<'_>,
         stream: &mut R,
-    ) -> Poll<Result<usize>> {
+    ) -> Poll<io::Result<usize>> {
         loop {
             ready!(stream.poll_read_ready_n(cx))?;
 
@@ -201,19 +238,13 @@ impl CopyBuffer {
                 });
 
             match res {
-                Ok(size) => {
-                    if self.cap == size {
-                        self.read_done = true;
-                    }
-                    self.cap = size;
-                    return Poll::Ready(Ok(size));
-                }
+                Ok(size) => return Poll::Ready(Ok(size)),
                 Err(e) => {
                     if e.kind() == ErrorKind::WouldBlock {
                         continue;
                     }
 
-                    return Poll::Ready(Err(e.into()));
+                    return Poll::Ready(Err(e));
                 }
             }
         }
@@ -223,7 +254,7 @@ impl CopyBuffer {
         &mut self,
         cx: &mut Context<'_>,
         stream: &mut W,
-    ) -> Poll<Result<usize>> {
+    ) -> Poll<io::Result<usize>> {
         loop {
             ready!(stream.poll_write_ready_n(cx)?);
 
@@ -255,7 +286,7 @@ impl CopyBuffer {
                         continue;
                     }
 
-                    return Poll::Ready(Err(e.into()));
+                    return Poll::Ready(Err(e));
                 }
             }
         }
@@ -268,16 +299,25 @@ impl CopyBuffer {
     ) -> Poll<Result<()>> {
         Pin::new(stream).poll_flush(cx).map_err(|e| e.into())
     }
+
+    fn recover_buffer(&mut self) -> io::Result<BufferedCopy> {
+        let pending = self.cap - self.pos;
+        let mut buffer = BufferedCopy::new_with_capacity(self.buffer_size.max(pending));
+        self.buf.read_pending(&mut buffer.buf[..pending])?;
+        buffer.cache_length = pending;
+        buffer.need_flush = self.need_flush;
+        Ok(buffer)
+    }
 }
 
-impl CopyBuffer {
+impl SpliceBuffer {
     fn poll_copy<R: Stream + Unpin, W: Stream + Unpin>(
         &mut self,
         cx: &mut Context<'_>,
         r: &mut R,
         w: &mut W,
         active: &mut bool,
-    ) -> Poll<Result<u64>> {
+    ) -> Poll<Result<SpliceOutcome>> {
         while let Some(prefix) = self.prefix.as_mut() {
             let size = ready!(Pin::new(&mut *w).poll_write(cx, prefix.as_slice()))?;
             if size == 0 {
@@ -303,10 +343,19 @@ impl CopyBuffer {
                 self.cap = 0;
 
                 match self.poll_fill_buf(cx, r) {
-                    Poll::Ready(Ok(_)) => {
+                    Poll::Ready(Ok(size)) => {
+                        self.cap = size;
+                        self.read_done = size == 0;
+                        self.read_from_socket |= size > 0;
                         *active = true;
                     }
-                    Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+                    Poll::Ready(Err(error)) => {
+                        if !self.read_from_socket && splice_unavailable(&error) {
+                            tracing::debug!(%error, "splice read unavailable, using buffered copy");
+                            return Poll::Ready(Ok(SpliceOutcome::Buffered));
+                        }
+                        return Poll::Ready(Err(error.into()));
+                    }
                     Poll::Pending => {
                         // Try flushing when the reader has no progress to avoid
                         // deadlock when the reader depends
@@ -322,7 +371,14 @@ impl CopyBuffer {
             }
 
             while self.pos < self.cap {
-                let size = ready!(self.poll_write_buf(cx, w))?;
+                let size = match ready!(self.poll_write_buf(cx, w)) {
+                    Ok(size) => size,
+                    Err(error) if splice_unavailable(&error) => {
+                        tracing::debug!(%error, "splice write unavailable, using buffered copy");
+                        return Poll::Ready(Ok(SpliceOutcome::Buffered));
+                    }
+                    Err(error) => return Poll::Ready(Err(error.into())),
+                };
 
                 if size == 0 {
                     return Poll::Ready(Err(CopyBidirectionalError::Other(
@@ -351,7 +407,7 @@ impl CopyBuffer {
             // data and finish the transfer.
             if self.pos == self.cap && self.read_done {
                 ready!(self.poll_flush_buf(cx, w))?;
-                return Poll::Ready(Ok(self.amt));
+                return Poll::Ready(Ok(SpliceOutcome::Complete(self.amt)));
             }
         }
     }
@@ -360,8 +416,8 @@ impl CopyBuffer {
 /// `AsyncRead` + `AsyncWrite` + `AsRawFd` Wrapper for stream.
 /// This trait is auto implemented for `TcpStream` and `UnixStream`.
 pub trait Stream: AsyncRead + AsyncWrite + AsRawFd {
-    fn poll_read_ready_n(&self, cx: &mut Context<'_>) -> Poll<Result<()>>;
-    fn poll_write_ready_n(&self, cx: &mut Context<'_>) -> Poll<Result<()>>;
+    fn poll_read_ready_n(&self, cx: &mut Context<'_>) -> Poll<io::Result<()>>;
+    fn poll_write_ready_n(&self, cx: &mut Context<'_>) -> Poll<io::Result<()>>;
     fn try_io_n<R>(
         &self,
         interest: Interest,
@@ -378,7 +434,7 @@ pub trait Stream: AsyncRead + AsyncWrite + AsRawFd {
 pub(super) async fn zero_copy_bidirectional<A: Stream + Unpin, B: Stream + Unpin>(
     a: &mut A, b: &mut B, tracker: TrafficTracker,
 ) -> Result<(u64, u64)> {
-    let mut state = new(None, None, tracker)?;
+    let mut state = Pipes::new()?.into_copy(None, None, DEFAULT_BUF_SIZE, tracker);
     poll_fn(|cx| state.poll(a, b, cx)).await
 }
 
@@ -386,13 +442,13 @@ macro_rules! impl_stream_for {
     ($stream:ident) => {
         impl Stream for $stream {
             #[inline]
-            fn poll_read_ready_n(&self, cx: &mut Context<'_>) -> Poll<Result<()>> {
-                self.poll_read_ready(cx).map_err(|e| e.into())
+            fn poll_read_ready_n(&self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                self.poll_read_ready(cx)
             }
 
             #[inline]
-            fn poll_write_ready_n(&self, cx: &mut Context<'_>) -> Poll<Result<()>> {
-                self.poll_write_ready(cx).map_err(|e| e.into())
+            fn poll_write_ready_n(&self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                self.poll_write_ready(cx)
             }
 
             #[inline]
@@ -412,24 +468,181 @@ impl_stream_for!(UnixStream);
 
 pub(super) type CopyState = TransferCopyState<CopyBuffer>;
 
-pub(super) fn new(
-    upload_prefix: Option<SlideBuffer>, download_prefix: Option<SlideBuffer>,
-    tracker: TrafficTracker,
-) -> Result<CopyState> {
-    let mut upload = CopyBuffer::new(Pipe::new()?);
-    let mut download = CopyBuffer::new(Pipe::new()?);
-    upload.prefix = upload_prefix.filter(|prefix| !prefix.is_empty());
-    download.prefix = download_prefix.filter(|prefix| !prefix.is_empty());
-    Ok(CopyState::new(upload, download, tracker))
+pub(super) struct Pipes(Pipe, Pipe);
+
+impl Pipes {
+    pub(super) fn new() -> io::Result<Self> {
+        Ok(Self(Pipe::new()?, Pipe::new()?))
+    }
+
+    pub(super) fn into_copy(
+        self, upload_prefix: Option<SlideBuffer>, download_prefix: Option<SlideBuffer>,
+        size: usize, tracker: TrafficTracker,
+    ) -> CopyState {
+        CopyState::new(
+            CopyBuffer::Splice(SpliceBuffer::new(self.0, upload_prefix, size)),
+            CopyBuffer::Splice(SpliceBuffer::new(self.1, download_prefix, size)),
+            tracker,
+        )
+    }
 }
 
 impl<R: Stream + Unpin, W: Stream + Unpin> Buffer<R, W> for CopyBuffer {
-    fn amount_transferred(&self) -> u64 { self.amount_transferred() }
+    fn amount_transferred(&self) -> u64 {
+        match self {
+            Self::Splice(buffer) => buffer.amt,
+            Self::Buffered { buffer, already_written } => {
+                already_written + buffer.amount_transferred()
+            }
+        }
+    }
 
     fn poll_copy(
         &mut self, cx: &mut Context<'_>, reader: &mut R, writer: &mut W,
-        active: &mut bool, _direction: Direction,
+        active: &mut bool, direction: Direction,
     ) -> Poll<Result<u64>> {
-        self.poll_copy(cx, reader, writer, active)
+        loop {
+            match self {
+                Self::Splice(buffer) => match ready!(buffer.poll_copy(cx, reader, writer, active))? {
+                    SpliceOutcome::Complete(count) => return Poll::Ready(Ok(count)),
+                    SpliceOutcome::Buffered => {
+                        // Preserve pending pipe bytes and the count of writes already accepted.
+                        *self = Self::Buffered {
+                            buffer: buffer.recover_buffer()?,
+                            already_written: buffer.amt,
+                        };
+                    }
+                },
+                Self::Buffered { buffer, already_written } => {
+                    let count = ready!(Buffer::poll_copy(
+                        buffer, cx, reader, writer, active, direction,
+                    ))?;
+                    return Poll::Ready(Ok(*already_written + count));
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{cell::Cell, time::Duration};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadBuf};
+    use tokio::time::timeout;
+
+    use super::*;
+
+    struct TestSocket {
+        socket: UnixStream,
+        unsupported: Option<(Interest, i32)>,
+        rejected: Cell<bool>,
+        flushed: bool,
+    }
+
+    impl TestSocket {
+        fn new(socket: UnixStream, unsupported: Option<(Interest, i32)>) -> Self {
+            Self { socket, unsupported, rejected: Cell::new(false), flushed: false }
+        }
+    }
+
+    impl AsRawFd for TestSocket {
+        fn as_raw_fd(&self) -> RawFd { self.socket.as_raw_fd() }
+    }
+
+    impl AsyncRead for TestSocket {
+        fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>)
+            -> Poll<io::Result<()>>
+        { Pin::new(&mut self.socket).poll_read(cx, buf) }
+    }
+
+    impl AsyncWrite for TestSocket {
+        fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8])
+            -> Poll<io::Result<usize>>
+        { Pin::new(&mut self.socket).poll_write(cx, buf) }
+
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            self.flushed = true;
+            Pin::new(&mut self.socket).poll_flush(cx)
+        }
+
+        fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.socket).poll_shutdown(cx)
+        }
+    }
+
+    impl Stream for TestSocket {
+        fn poll_read_ready_n(&self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            self.socket.poll_read_ready_n(cx)
+        }
+
+        fn poll_write_ready_n(&self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            self.socket.poll_write_ready_n(cx)
+        }
+
+        fn try_io_n<R>(&self, interest: Interest, f: impl FnOnce() -> io::Result<R>)
+            -> io::Result<R>
+        {
+            if let Some((unsupported, errno)) = self.unsupported
+                && interest == unsupported
+            {
+                self.rejected.set(true);
+                return Err(Error::from_raw_os_error(errno));
+            }
+            self.socket.try_io_n(interest, f)
+        }
+    }
+
+    #[tokio::test]
+    async fn unsupported_source_splice_falls_back_after_prefix() {
+        check_splice_fallback(Interest::READABLE, libc::EINVAL, b"upload").await;
+    }
+
+    #[tokio::test]
+    async fn unsupported_destination_splice_recovers_pending_pipe_bytes() {
+        let payload: Vec<_> = (0..8_192).map(|offset| (offset % 251) as u8).collect();
+        check_splice_fallback(Interest::WRITABLE, libc::EINVAL, &payload).await;
+    }
+
+    #[tokio::test]
+    async fn splice_fallback_flushes_prefix_without_socket_data() {
+        check_splice_fallback(Interest::READABLE, libc::ENOSYS, b"").await;
+    }
+
+    async fn check_splice_fallback(interest: Interest, errno: i32, payload: &[u8]) {
+        let (mut client, source) = UnixStream::pair().unwrap();
+        let (target, mut server) = UnixStream::pair().unwrap();
+        let mut source = TestSocket::new(
+            source, (interest == Interest::READABLE).then_some((interest, errno)),
+        );
+        let mut target = TestSocket::new(
+            target, (interest == Interest::WRITABLE).then_some((interest, errno)),
+        );
+        let mut prefix = SlideBuffer::new(6);
+        prefix.extend_from_slice(b"prefix");
+        let mut copy = Pipes::new().unwrap().into_copy(
+            Some(prefix), None, 1024, TrafficTracker::noop(),
+        );
+
+        client.write_all(payload).await.unwrap();
+        client.shutdown().await.unwrap();
+        // Reach the injected read failure before splice can flush while waiting.
+        source.socket.readable().await.unwrap();
+        server.write_all(b"reply").await.unwrap();
+        server.shutdown().await.unwrap();
+        let relay = poll_fn(|cx| copy.poll(&mut source, &mut target, cx));
+        let receive = async {
+            let mut upload = Vec::new();
+            server.read_to_end(&mut upload).await.unwrap();
+            assert_eq!(upload.strip_prefix(b"prefix"), Some(payload));
+            let mut reply = Vec::new();
+            client.read_to_end(&mut reply).await.unwrap();
+            assert_eq!(reply, b"reply");
+        };
+        let (counts, ()) = timeout(Duration::from_secs(3), async {
+            tokio::join!(relay, receive)
+        }).await.unwrap();
+        assert_eq!(counts.unwrap(), ((6 + payload.len()) as u64, 5));
+        assert!(source.rejected.get() || target.rejected.get());
+        assert!(target.flushed);
     }
 }

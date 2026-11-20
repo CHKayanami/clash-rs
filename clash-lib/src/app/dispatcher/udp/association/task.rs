@@ -41,11 +41,10 @@ impl Task {
             Self::Owned { cancel, .. } => cancel.cancel(),
         }
     }
-    #[cfg(test)]
+    #[cfg(all(test, feature = "tun"))]
     pub fn is_finished(&self) -> bool {
         match self {
             Self::Spawned(task) => task.is_finished(),
-            #[cfg(feature = "tun")]
             Self::Owned { finished, .. } => finished.load(Ordering::Acquire),
         }
     }
