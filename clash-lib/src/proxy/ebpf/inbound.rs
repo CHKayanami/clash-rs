@@ -8,8 +8,8 @@ use std::time::Duration;
 use tracing::{debug, error, info, warn};
 
 use super::offloader::{DirectOffloader, RoutingAction};
-use super::reply::relay as relay_replies;
 use super::utils::resolve_and_aggregate_ip_cidrs;
+use crate::proxy::utils::transparent_reply;
 use crate::app::dispatcher::Dispatcher;
 use crate::app::dns::{DnsResolutionHook, ThreadSafeDNSResolver};
 use crate::app::net::get_default_outbound_interface;
@@ -285,7 +285,10 @@ impl InboundHandlerTrait for EbpfInbound {
                 .await;
 
             let mut tasks = tokio::task::JoinSet::new();
-            tasks.spawn(relay_replies(listener.clone(), l_rx));
+            let reply_listener = listener.clone();
+            tasks.spawn(transparent_reply::relay(l_rx, move |source| {
+                reply_listener.create_reply_socket(source)
+            }));
 
             let v4_socket = listener.udp_socket_v4();
             tasks.spawn(udp_listener_loop(

@@ -11,6 +11,11 @@ pub(crate) mod dialer_route;
 pub use dialer_proxy::DialerProxyConnector;
 mod shared_handler;
 mod socket_helpers;
+#[cfg(any(
+    test,
+    all(target_os = "linux", any(feature = "tproxy", feature = "ebpf")),
+))]
+pub(crate) mod transparent_reply;
 mod udp_send;
 pub(crate) mod udp_batch;
 pub(crate) use udp_send::poll_send_to_vectored;

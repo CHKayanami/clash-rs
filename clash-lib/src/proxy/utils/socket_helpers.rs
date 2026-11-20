@@ -15,7 +15,7 @@ use crate::{
 
 use crate::config::def::TcpKeepaliveConfig;
 use futures::io;
-use socket2::{Domain, Protocol, Socket, TcpKeepalive, Type};
+use socket2::{Domain, Protocol, SockRef, Socket, TcpKeepalive, Type};
 
 use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
@@ -33,11 +33,10 @@ use tracing::{debug, error, instrument, trace};
 /// while still eliminating the 10s blackhole timeout.
 const HAPPY_EYEBALLS_DELAY: Duration = Duration::from_secs(1);
 
-pub fn apply_tcp_options(s: &TcpStream) -> std::io::Result<()> {
+pub fn apply_tcp_socket_options(socket: &Socket) -> std::io::Result<()> {
     #[cfg(not(target_os = "windows"))]
     {
-        let sock_ref = socket2::SockRef::from(s);
-        sock_ref.set_tcp_keepalive(
+        socket.set_tcp_keepalive(
             &TcpKeepalive::new()
                 .with_time(Duration::from_secs(10))
                 .with_interval(Duration::from_secs(1))
@@ -46,8 +45,7 @@ pub fn apply_tcp_options(s: &TcpStream) -> std::io::Result<()> {
     }
     #[cfg(target_os = "windows")]
     {
-        let sock_ref = socket2::SockRef::from(s);
-        sock_ref.set_tcp_keepalive(
+        socket.set_tcp_keepalive(
             &TcpKeepalive::new()
                 .with_time(Duration::from_secs(10))
                 .with_interval(Duration::from_secs(1)),
@@ -56,7 +54,12 @@ pub fn apply_tcp_options(s: &TcpStream) -> std::io::Result<()> {
     // Disable Nagle's algorithm so that small writes (e.g. HTTP response
     // headers arriving from the proxy side) are forwarded to the client
     // immediately without waiting for a full TCP segment.
-    s.set_nodelay(true)
+    socket.set_tcp_nodelay(true)
+}
+
+pub fn apply_tcp_options(s: &TcpStream) -> std::io::Result<()> {
+    let sock_ref = SockRef::from(s);
+    apply_tcp_socket_options(&sock_ref)
 }
 
 #[cfg(target_os = "linux")]

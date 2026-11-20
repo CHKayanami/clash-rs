@@ -1,6 +1,12 @@
 //! Batched transparent UDP receive. Every message has its own ancillary buffer.
-use std::{io, mem::{size_of, zeroed}, net::{SocketAddr, SocketAddrV6},
-    os::fd::AsRawFd, ptr};
+use std::{
+    array::from_fn,
+    io,
+    mem::{replace, size_of, zeroed},
+    net::{SocketAddr, SocketAddrV6},
+    os::fd::AsRawFd,
+    ptr,
+};
 use bytes::Bytes;
 use socket2::{SockAddr, SockAddrStorage};
 use tokio::{io::Interest, net::UdpSocket};
@@ -13,11 +19,30 @@ const CONTROL_WORDS: usize = 32;
 /// not allocate additional storage; dropping the loop releases the buffer.
 pub struct BatchReceiver {
     scratch: Box<[u8]>,
+    addresses: Box<[SockAddrStorage; MAX_BATCH]>,
+    controls: Box<[[usize; CONTROL_WORDS]; MAX_BATCH]>,
+    iovecs: Box<[libc::iovec; MAX_BATCH]>,
+    messages: Box<[libc::mmsghdr; MAX_BATCH]>,
 }
+
+// SAFETY: Descriptors only hold private scratch storage owned by this struct.
+// Before every `recvmmsg` call, active pointers are rebuilt from `&mut self`,
+// and no cached raw pointer is dereferenced across calls.
+unsafe impl Send for BatchReceiver {}
 
 impl Default for BatchReceiver {
     fn default() -> Self {
-        Self { scratch: vec![0; MAX_BATCH * MAX_PAYLOAD].into_boxed_slice() }
+        Self {
+            scratch: vec![0; MAX_BATCH * MAX_PAYLOAD].into_boxed_slice(),
+            addresses: Box::new(from_fn(|_| SockAddrStorage::zeroed())),
+            controls: Box::new([[0usize; CONTROL_WORDS]; MAX_BATCH]),
+            // SAFETY: zero is valid for scalar lengths and nullable raw pointers;
+            // active prefixes are initialized before every `recvmmsg` call.
+            iovecs: Box::new(unsafe { zeroed() }),
+            // SAFETY: zero is valid for scalar fields and nullable raw pointers;
+            // active prefixes are initialized before every `recvmmsg` call.
+            messages: Box::new(unsafe { zeroed() }),
+        }
     }
 }
 
@@ -48,72 +73,83 @@ impl BatchReceiver {
         let limit = limit.min(MAX_BATCH);
         if limit == 0 { return Ok(0); }
         socket.async_io(Interest::READABLE, || {
-            receive(socket, &mut self.scratch, packets, limit)
+            self.receive(socket, packets, limit)
         }).await
     }
-}
 
-fn receive(
-    socket: &UdpSocket, scratch: &mut [u8],
-    packets: &mut Vec<(Bytes, SocketAddr, SocketAddr)>, limit: usize,
-) -> io::Result<usize> {
-    let mut addresses = std::array::from_fn::<_, MAX_BATCH, _>(|_| SockAddrStorage::zeroed());
-    // usize alignment satisfies cmsghdr alignment on supported Linux ABIs.
-    let mut controls = [[0usize; CONTROL_WORDS]; MAX_BATCH];
-    let mut iovecs = std::array::from_fn::<_, MAX_BATCH, _>(|i| libc::iovec {
-        // SAFETY: slots are disjoint initialized writable ranges, stable for the syscall.
-        iov_base: unsafe { scratch.as_mut_ptr().add(i * MAX_PAYLOAD).cast() },
-        iov_len: MAX_PAYLOAD,
-    });
-    let mut messages = std::array::from_fn::<_, MAX_BATCH, _>(|i| {
-        // SAFETY: zero is valid for all lengths and nullable pointers.
-        let mut message: libc::mmsghdr = unsafe { zeroed() };
-        message.msg_hdr.msg_name = (&mut addresses[i] as *mut SockAddrStorage).cast();
-        message.msg_hdr.msg_namelen = addresses[i].size_of();
-        message.msg_hdr.msg_iov = &mut iovecs[i];
-        message.msg_hdr.msg_iovlen = 1;
-        message.msg_hdr.msg_control = controls[i].as_mut_ptr().cast();
-        message.msg_hdr.msg_controllen = size_of::<[usize; CONTROL_WORDS]>() as _;
-        message
-    });
-    let count = loop {
-        // SAFETY: initialized message prefix and all pointer targets remain
-        // exclusively borrowed and stationary until this nonblocking call returns.
-        let count = unsafe { libc::recvmmsg(socket.as_raw_fd(), messages.as_mut_ptr(),
-            limit as _, libc::MSG_DONTWAIT as _, ptr::null_mut()) };
-        if count >= 0 { break count as usize; }
-        let error = io::Error::last_os_error();
-        if error.kind() != io::ErrorKind::Interrupted { return Err(error); }
-    };
-    for i in 0..count {
-        let msg = &messages[i].msg_hdr;
-        if msg.msg_flags & (libc::MSG_TRUNC | libc::MSG_CTRUNC) != 0 { continue; }
-        let len = messages[i].msg_len as usize;
-        if len > MAX_PAYLOAD { continue; }
-        let storage = std::mem::replace(&mut addresses[i], SockAddrStorage::zeroed());
-        // SAFETY: kernel initialized the address and length in this returned message.
-        let Some(source) = (unsafe { SockAddr::new(storage, msg.msg_namelen) }).as_socket() else { continue; };
-        let (destination, stride) = ancillary(msg);
-        let Some(destination) = destination else { continue; };
-        // Independent kernel messages must not retain one another's payloads.
-        // Segments of a single GRO message still share its compact allocation.
-        let data = Bytes::copy_from_slice(&scratch[i * MAX_PAYLOAD..i * MAX_PAYLOAD + len]);
-        let source = canonical(source);
-        let destination = canonical(destination);
-        if len == 0 {
-            packets.push((data, source, destination));
-        } else {
-            let stride = if stride == 0 { len } else { stride };
-            let mut offset = 0;
-            while offset < len {
-                let next = (offset + stride).min(len);
-                packets.push((data.slice(offset..next), source, destination));
-                offset = next;
+    fn receive(
+        &mut self, socket: &UdpSocket,
+        packets: &mut Vec<(Bytes, SocketAddr, SocketAddr)>, limit: usize,
+    ) -> io::Result<usize> {
+        let addr_len = self.addresses[0].size_of();
+        let scratch_ptr = self.scratch.as_mut_ptr();
+        for i in 0..limit {
+            self.iovecs[i] = libc::iovec {
+                // SAFETY: slots are disjoint initialized writable ranges, stable for the syscall.
+                iov_base: unsafe { scratch_ptr.add(i * MAX_PAYLOAD).cast() },
+                iov_len: MAX_PAYLOAD,
+            };
+        }
+        let addr_ptr = self.addresses.as_mut_ptr();
+        let ctrl_ptr = self.controls.as_mut_ptr();
+        let iov_ptr = self.iovecs.as_mut_ptr();
+        for i in 0..limit {
+            // SAFETY: zero is valid for all lengths and nullable pointers.
+            let mut message: libc::mmsghdr = unsafe { zeroed() };
+            // SAFETY: pointer offsets stay within the allocated `MAX_BATCH` arrays
+            // and remain exclusively borrowed until `recvmmsg` returns.
+            unsafe {
+                message.msg_hdr.msg_name = addr_ptr.add(i).cast();
+                message.msg_hdr.msg_namelen = addr_len;
+                message.msg_hdr.msg_iov = iov_ptr.add(i);
+                message.msg_hdr.msg_iovlen = 1;
+                message.msg_hdr.msg_control = ctrl_ptr.add(i).cast();
+                message.msg_hdr.msg_controllen = size_of::<[usize; CONTROL_WORDS]>() as _;
+            }
+            self.messages[i] = message;
+        }
+        let count = loop {
+            // SAFETY: initialized message prefix and all pointer targets remain
+            // exclusively borrowed and stationary until this nonblocking call returns.
+            let count = unsafe { libc::recvmmsg(socket.as_raw_fd(), self.messages.as_mut_ptr(),
+                limit as _, libc::MSG_DONTWAIT as _, ptr::null_mut()) };
+            if count >= 0 { break count as usize; }
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::Interrupted { return Err(error); }
+        };
+        for i in 0..count {
+            let msg = &self.messages[i].msg_hdr;
+            if msg.msg_flags & (libc::MSG_TRUNC | libc::MSG_CTRUNC) != 0 { continue; }
+            let len = self.messages[i].msg_len as usize;
+            if len > MAX_PAYLOAD { continue; }
+            let storage = replace(&mut self.addresses[i], SockAddrStorage::zeroed());
+            // SAFETY: kernel initialized the address and length in this returned message.
+            let Some(source) = (unsafe { SockAddr::new(storage, msg.msg_namelen) }).as_socket() else { continue; };
+            let (destination, stride) = ancillary(msg);
+            let Some(destination) = destination else { continue; };
+            // Independent kernel messages must not retain one another's payloads.
+            // Segments of a single GRO message still share its compact allocation.
+            let data = Bytes::copy_from_slice(&self.scratch[i * MAX_PAYLOAD..i * MAX_PAYLOAD + len]);
+            let source = canonical(source);
+            let destination = canonical(destination);
+            if len == 0 {
+                packets.push((data, source, destination));
+            } else {
+                let stride = if stride == 0 { len } else { stride };
+                let mut offset = 0;
+                while offset < len {
+                    let next = (offset + stride).min(len);
+                    packets.push((data.slice(offset..next), source, destination));
+                    offset = next;
+                }
             }
         }
+        for i in 0..count {
+            self.controls[i].fill(0);
+        }
+        // Return consumed kernel messages, even if metadata validation discarded all.
+        Ok(count)
     }
-    // Return consumed kernel messages, even if metadata validation discarded all.
-    Ok(count)
 }
 
 fn ancillary(msg: &libc::msghdr) -> (Option<SocketAddr>, usize) {

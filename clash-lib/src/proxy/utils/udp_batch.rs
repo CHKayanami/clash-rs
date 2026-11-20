@@ -8,7 +8,9 @@ use crate::proxy::datagram::batch::{BatchResult, MAX_DIRECT_BATCH_PACKETS};
 #[cfg(any(target_os = "linux", target_os = "android"))]
 use std::{io, mem::zeroed, os::fd::AsRawFd};
 #[cfg(all(target_os = "linux", any(feature = "tproxy", feature = "ebpf", test)))]
-use std::sync::Arc;
+use std::{array::from_fn, sync::Arc};
+#[cfg(all(target_os = "linux", any(feature = "tproxy", feature = "ebpf", test)))]
+use super::ToCanonical;
 #[cfg(all(target_os = "linux", any(feature = "tproxy", feature = "ebpf", test)))]
 use crate::{proxy::datagram::UdpPacket, session::SocksAddr};
 #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -59,51 +61,76 @@ pub(crate) fn map_destination(destination: SocketAddr, ipv6: bool) -> SocketAddr
 #[cfg(all(target_os = "linux", any(feature = "tproxy", feature = "ebpf", test)))]
 pub(crate) async fn send_replies(
     packets: &[UdpPacket],
+    workspace: &mut SendWorkspace,
     mut get_socket: impl FnMut(SocketAddr) -> io::Result<Arc<UdpSocket>>,
 ) {
     use futures::future::poll_fn;
+    use tracing::warn;
     use crate::proxy::datagram::batch::MAX_BATCH_PACKETS;
-    assert!(packets.len() <= MAX_BATCH_PACKETS);
-    let mut done = [false; MAX_BATCH_PACKETS];
-    for first in 0..packets.len() {
-        if done[first] { continue; }
-        let SocksAddr::Ip(source) = &packets[first].src_addr else {
-            tracing::warn!("transparent UDP reply contains a non-IP source");
-            done[first] = true;
-            continue;
-        };
-        let source = *source;
-        let mut slices = std::array::from_fn::<_, MAX_BATCH_PACKETS, _>(|_| DatagramSlice {
-            header: &[], payload: &[], destination: source,
-        });
-        let mut count = 0;
-        for i in first..packets.len() {
-            if done[i] || packets[i].src_addr != SocksAddr::Ip(source) { continue; }
-            done[i] = true;
-            let SocksAddr::Ip(destination) = &packets[i].dst_addr else {
-                tracing::warn!("transparent UDP reply contains a non-IP destination");
+
+    for chunk in packets.chunks(MAX_BATCH_PACKETS) {
+        let mut done = [false; MAX_BATCH_PACKETS];
+        for first in 0..chunk.len() {
+            if done[first] {
+                continue;
+            }
+            let SocksAddr::Ip(source) = &chunk[first].src_addr else {
+                warn!("transparent UDP reply contains a non-IP source");
+                done[first] = true;
                 continue;
             };
-            slices[count] = DatagramSlice { header: &[], payload: &packets[i].data, destination: *destination };
-            count += 1;
-        }
-        if count == 0 { continue; }
-        let socket = match get_socket(source) {
-            Ok(socket) => socket,
-            Err(error) => { tracing::warn!("failed to create UDP reply socket for {source}: {error}"); continue; }
-        };
-        let ipv6 = match socket.local_addr() {
-            Ok(address) => address.is_ipv6(),
-            Err(error) => { tracing::warn!("failed to inspect UDP reply socket: {error}"); continue; }
-        };
-        let mut offset = 0;
-        while offset < count {
-            let result = poll_fn(|cx| poll_send_batch(&socket, ipv6, cx, &slices[offset..count])).await;
-            offset += result.sent;
-            if let Some(error) = result.error {
-                // A datagram error rejects the next packet, not its suffix.
-                tracing::warn!("failed to send UDP reply from {source}: {error}");
-                offset += 1;
+            let source = source.to_canonical();
+            let mut slices = from_fn::<_, MAX_BATCH_PACKETS, _>(|_| DatagramSlice {
+                header: &[],
+                payload: &[],
+                destination: source,
+            });
+            let mut count = 0;
+            for i in first..chunk.len() {
+                if done[i] {
+                    continue;
+                }
+                let SocksAddr::Ip(pkt_source) = &chunk[i].src_addr else {
+                    continue;
+                };
+                if pkt_source.to_canonical() != source {
+                    continue;
+                }
+                done[i] = true;
+                let SocksAddr::Ip(destination) = &chunk[i].dst_addr else {
+                    warn!("transparent UDP reply contains a non-IP destination");
+                    continue;
+                };
+                slices[count] = DatagramSlice {
+                    header: &[],
+                    payload: &chunk[i].data,
+                    destination: destination.to_canonical(),
+                };
+                count += 1;
+            }
+            if count == 0 {
+                continue;
+            }
+            let socket = match get_socket(source) {
+                Ok(socket) => socket,
+                Err(error) => {
+                    warn!("failed to create UDP reply socket for {source}: {error}");
+                    continue;
+                }
+            };
+            let ipv6 = source.is_ipv6();
+            let mut offset = 0;
+            while offset < count {
+                let result = poll_fn(|cx| {
+                    poll_send_with(&socket, ipv6, cx, &slices[offset..count], workspace)
+                })
+                .await;
+                offset += result.sent;
+                if let Some(error) = result.error {
+                    // A datagram error rejects the next packet, not its suffix.
+                    warn!("failed to send UDP reply from {source}: {error}");
+                    offset += 1;
+                }
             }
         }
     }
@@ -126,7 +153,8 @@ mod tests {
             UdpPacket::new(Bytes::from(vec![0; 70000]), source.into(), destination.into()),
             UdpPacket::new(Bytes::from_static(b"after"), source.into(), destination.into()),
         ];
-        send_replies(&packets, |_| Ok(socket.clone())).await;
+        let mut workspace = SendWorkspace::default();
+        send_replies(&packets, &mut workspace, |_| Ok(socket.clone())).await;
         timeout(Duration::from_secs(2), async {
             let mut buffer = [0; 16];
             for expected in [&b"before"[..], &b"after"[..]] {
@@ -152,7 +180,8 @@ mod tests {
             UdpPacket::new(Bytes::from_static(b"a2"), a.into(), client.into()),
         ];
         let mut lookups = Vec::new();
-        send_replies(&packets, |source| {
+        let mut workspace = SendWorkspace::default();
+        send_replies(&packets, &mut workspace, |source| {
             lookups.push(source);
             Ok(if source == a { source_a.clone() } else { source_b.clone() })
         }).await;
@@ -166,6 +195,45 @@ mod tests {
             let (len, source) = client_b.recv_from(&mut buffer).await.unwrap();
             assert_eq!((len, source), (0, a));
         }).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn batches_over_max_batch_packets_and_canonicalizes_mapped_sources() {
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let source = socket.local_addr().unwrap();
+        let mapped_source = match source {
+            SocketAddr::V4(v4) => SocketAddr::from((v4.ip().to_ipv6_mapped(), v4.port())),
+            SocketAddr::V6(_) => unreachable!(),
+        };
+        let destination = client.local_addr().unwrap();
+        let packets: Vec<_> = (0..20usize)
+            .map(|i| {
+                let src = if i % 2 == 0 { source } else { mapped_source };
+                UdpPacket::new(
+                    Bytes::from(vec![i as u8; 8]),
+                    src.into(),
+                    destination.into(),
+                )
+            })
+            .collect();
+        let mut lookups = Vec::new();
+        let mut workspace = SendWorkspace::default();
+        send_replies(&packets, &mut workspace, |resolved_source| {
+            lookups.push(resolved_source);
+            Ok(socket.clone())
+        })
+        .await;
+        assert_eq!(lookups, vec![source, source]);
+        timeout(Duration::from_secs(2), async {
+            let mut buffer = [0; 16];
+            for i in 0..20usize {
+                let (len, actual) = client.recv_from(&mut buffer).await.unwrap();
+                assert_eq!((&buffer[..len], actual), (&[i as u8; 8][..], source));
+            }
+        })
+        .await
+        .unwrap();
     }
 }
 

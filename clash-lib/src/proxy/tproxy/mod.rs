@@ -6,26 +6,34 @@ use super::{
 };
 use crate::{
     app::dispatcher::Dispatcher,
-    proxy::utils::{ToCanonical, apply_tcp_options, try_create_dualstack_socket},
+    proxy::utils::{
+        ToCanonical, apply_tcp_socket_options, transparent_reply,
+        try_create_dualstack_socket,
+    },
     session::{Network, Session, Type},
 };
 
 use async_trait::async_trait;
-use clash_common::udp::{BatchReceiver, enable_gro, MAX_BATCH};
-use crate::proxy::utils::udp_batch::send_replies;
+use clash_common::udp::{BatchReceiver, MAX_BATCH, enable_gro};
+use socket2::{Domain, Protocol, Socket, Type as SocketType};
 use std::{
     io,
-    net::SocketAddr,
+    mem::size_of_val,
+    net::{IpAddr, SocketAddr},
     os::fd::AsRawFd,
     sync::Arc,
-    time::Duration,
 };
-use tokio::net::{TcpListener, UdpSocket};
-use tracing::{debug, trace, warn};
+use tokio::{
+    net::{TcpListener, UdpSocket},
+    sync::{
+        mpsc::{self, error::TrySendError},
+        oneshot,
+    },
+};
+use tracing::{debug, info, trace, warn};
 
 pub struct TproxyInbound {
     addr: SocketAddr,
-    allow_lan: bool,
     udp: bool,
     dispatcher: Arc<Dispatcher>,
     fw_mark: Option<u32>,
@@ -65,9 +73,9 @@ impl TproxyInbound {
         dispatcher: Arc<Dispatcher>,
         fw_mark: Option<u32>,
     ) -> Self {
+        warn_allow_lan_unenforced(addr, allow_lan);
         Self {
             addr,
-            allow_lan,
             udp,
             dispatcher,
             fw_mark,
@@ -85,23 +93,23 @@ impl InboundHandlerTrait for TproxyInbound {
         self.udp
     }
 
-    async fn listen_tcp(&self, ready: ListenerReady) -> std::io::Result<()> {
-        warn_allow_lan_unenforced(self.addr, self.allow_lan);
-
+    async fn listen_tcp(&self, ready: ListenerReady) -> io::Result<()> {
         let (socket, dualstack) =
-            try_create_dualstack_socket(self.addr, socket2::Type::STREAM)?;
+            try_create_dualstack_socket(self.addr, SocketType::STREAM)?;
         if dualstack || self.addr.is_ipv4() {
             // set ipv4 transparent
             socket.set_ip_transparent_v4(true)?;
         }
         if self.addr.is_ipv6() {
-            set_ip_transparent_v6(&socket)?;
+            socket.set_ip_transparent_v6(true)?;
         }
         socket.set_nonblocking(true)?;
         // For fast restart, avoid Address In Use while old sockets linger in
         // TIME_WAIT — the shared `try_create_dualstack_tcplistener` does this
         // too, but tproxy builds its listener by hand.
         socket.set_reuse_address(true)?;
+        // Set keepalive & TCP_NODELAY on the listener so accepted sockets inherit them.
+        apply_tcp_socket_options(&socket)?;
         socket.bind(&self.addr.into())?;
         socket.listen(1024)?;
 
@@ -118,11 +126,6 @@ impl InboundHandlerTrait for TproxyInbound {
                 }
             };
             let src_addr = peer_addr.to_canonical();
-
-            if let Err(e) = apply_tcp_options(&socket) {
-                warn!("tproxy failed to apply tcp options for {src_addr}: {e}");
-                continue;
-            }
 
             // local_addr is getsockname
             let orig_dst = match socket.local_addr() {
@@ -153,11 +156,9 @@ impl InboundHandlerTrait for TproxyInbound {
         }
     }
 
-    async fn listen_udp(&self, ready: ListenerReady) -> std::io::Result<()> {
-        warn_allow_lan_unenforced(self.addr, self.allow_lan);
-
+    async fn listen_udp(&self, ready: ListenerReady) -> io::Result<()> {
         let (socket, dual_stack) =
-            try_create_dualstack_socket(self.addr, socket2::Type::DGRAM)?;
+            try_create_dualstack_socket(self.addr, SocketType::DGRAM)?;
         if dual_stack || self.addr.is_ipv4() {
             // set ipv4 transparent
             // IPv6 doesn't require this
@@ -165,11 +166,16 @@ impl InboundHandlerTrait for TproxyInbound {
         }
         if self.addr.is_ipv6() {
             // This might not be necessary
-            set_ip_transparent_v6(&socket)?;
+            socket.set_ip_transparent_v6(true)?;
         }
         socket.set_reuse_port(true)?;
         socket.set_nonblocking(true)?;
         socket.set_broadcast(true)?;
+        if let Err(error) = socket.set_recv_buffer_size(UDP_RECV_BUFFER_SIZE) {
+            debug!(
+                "TProxy UDP failed to set SO_RCVBUF to {UDP_RECV_BUFFER_SIZE}: {error}"
+            );
+        }
         set_ip_recv_orig_dstaddr(
             if self.addr.is_ipv4() {
                 libc::IPPROTO_IP
@@ -199,54 +205,35 @@ impl InboundHandlerTrait for TproxyInbound {
     }
 }
 
-/// Maximum number of cached `IP_TRANSPARENT` UDP sockets.
-///
-/// TPROXY source addresses are typically LAN device IPs with varying ports;
-/// 1024 entries comfortably cover active sessions without excessive fd consumption.
-const TRANSPARENT_SOCKET_CACHE_CAPACITY: u64 = 1024;
-
 /// Capacity for UDP packet dispatch channel between TPROXY listener and dispatcher.
 const UDP_CHANNEL_CAPACITY: usize = 1024;
 
-/// How long an idle cached socket stays alive before eviction.
-const TRANSPARENT_SOCKET_TTL: Duration = Duration::from_secs(60);
+/// Target receive socket buffer size for high-throughput UDP/QUIC traffic.
+const UDP_RECV_BUFFER_SIZE: usize = 8 << 20;
 
-/// Creates and returns a `moka` cache of `IP_TRANSPARENT` UDP sockets keyed by
-/// the spoofed source address.  Each socket is a regular `SOCK_DGRAM` socket
-/// that has been `bind()`-ed to the source address with `IP_TRANSPARENT` set,
-/// so that the kernel builds all headers, computes checksums, and handles
-/// Path-MTU / fragmentation for us.
-fn new_transparent_socket_cache() -> moka::sync::Cache<SocketAddr, Arc<tokio::net::UdpSocket>> {
-    moka::sync::Cache::builder()
-        .max_capacity(TRANSPARENT_SOCKET_CACHE_CAPACITY)
-        .time_to_idle(TRANSPARENT_SOCKET_TTL)
-        .build()
-}
+/// Pre-allocated batch vector capacity accommodating GRO-expanded datagrams.
+const UDP_RECV_VEC_CAPACITY: usize = MAX_BATCH * 4;
 
-/// Obtain (or create) a cached `IP_TRANSPARENT` UDP socket bound to `src`.
-fn get_or_create_transparent_socket(
-    cache: &moka::sync::Cache<SocketAddr, Arc<tokio::net::UdpSocket>>,
+/// Create an `IP_TRANSPARENT` UDP socket bound to `src` so the kernel builds
+/// headers, computes checksums, and handles Path-MTU / fragmentation.
+fn create_transparent_reply_socket(
     src: SocketAddr,
     fw_mark: Option<u32>,
-) -> io::Result<Arc<tokio::net::UdpSocket>> {
-    if let Some(sock) = cache.get(&src) {
-        return Ok(sock);
-    }
-
+) -> io::Result<UdpSocket> {
+    let src = src.to_canonical();
     let domain = if src.is_ipv4() {
-        socket2::Domain::IPV4
+        Domain::IPV4
     } else {
-        socket2::Domain::IPV6
+        Domain::IPV6
     };
 
-    let socket =
-        socket2::Socket::new(domain, socket2::Type::DGRAM, Some(socket2::Protocol::UDP))?;
+    let socket = Socket::new(domain, SocketType::DGRAM, Some(Protocol::UDP))?;
 
     // Allow binding to a non-local address.
     if src.is_ipv4() {
         socket.set_ip_transparent_v4(true)?;
     } else {
-        set_ip_transparent_v6(&socket)?;
+        socket.set_ip_transparent_v6(true)?;
     }
 
     socket.set_nonblocking(true)?;
@@ -259,9 +246,7 @@ fn get_or_create_transparent_socket(
 
     socket.bind(&src.into())?;
 
-    let udp_socket = Arc::new(tokio::net::UdpSocket::from_std(socket.into())?);
-    cache.insert(src, udp_socket.clone());
-    Ok(udp_socket)
+    UdpSocket::from_std(socket.into())
 }
 
 /// How many consecutive receive failures to tolerate before concluding the
@@ -274,12 +259,12 @@ async fn handle_inbound_datagram(
     fw_mark: Option<u32>,
     socket: Arc<UdpSocket>,
     dispatcher: Arc<Dispatcher>,
-) -> std::io::Result<()> {
+) -> io::Result<()> {
     // dispatcher <-> tproxy communications
-    let (l_tx, l_rx) = tokio::sync::mpsc::channel(UDP_CHANNEL_CAPACITY);
+    let (l_tx, l_rx) = mpsc::channel(UDP_CHANNEL_CAPACITY);
 
     // forward packets from tproxy to dispatcher
-    let (d_tx, d_rx) = tokio::sync::mpsc::channel(UDP_CHANNEL_CAPACITY);
+    let (d_tx, d_rx) = mpsc::channel(UDP_CHANNEL_CAPACITY);
 
     // for dispatcher - the dispatcher would receive packets from this channel,
     // which is from the stack and send back packets to this channel, which is
@@ -293,7 +278,7 @@ async fn handle_inbound_datagram(
         ..Default::default()
     };
 
-    let closer: tokio::sync::oneshot::Sender<u8> = dispatcher
+    let closer: oneshot::Sender<u8> = dispatcher
         .dispatch_datagram(sess, Box::new(udp_stream))
         .await;
 
@@ -303,7 +288,7 @@ async fn handle_inbound_datagram(
     // tproxy -> dispatcher
     let fut2 = async move {
         let mut receiver = BatchReceiver::default();
-        let mut packets = Vec::with_capacity(MAX_BATCH);
+        let mut packets = Vec::with_capacity(UDP_RECV_VEC_CAPACITY);
         let mut consecutive_errors = 0usize;
         let mut dropped = 0u64;
 
@@ -314,7 +299,10 @@ async fn handle_inbound_datagram(
                 Err(e) => {
                     consecutive_errors += 1;
                     if consecutive_errors >= MAX_CONSECUTIVE_RECV_ERRORS {
-                        warn!("tproxy udp recv failed {} times in a row: {}", consecutive_errors, e);
+                        warn!(
+                            "tproxy udp recv failed {} times in a row: {}",
+                            consecutive_errors, e
+                        );
                         break;
                     }
                     debug!("tproxy udp recv error (continuing): {}", e);
@@ -323,11 +311,15 @@ async fn handle_inbound_datagram(
             }
             for (data, source, destination) in packets.drain(..) {
                 if destination.ip().is_multicast()
-                    || matches!(destination.ip(), std::net::IpAddr::V4(ip) if ip.is_broadcast()) {
+                    || matches!(destination.ip(), IpAddr::V4(ip) if ip.is_broadcast())
+                {
                     continue;
                 }
                 let pkt = UdpPacket {
-                    data, src_addr: source.into(), dst_addr: destination.into(), inbound_user: None,
+                    data,
+                    src_addr: source.into(),
+                    dst_addr: destination.into(),
+                    inbound_user: None,
                 };
 
                 // Every client shares this channel, so awaiting a full one
@@ -336,7 +328,7 @@ async fn handle_inbound_datagram(
                 // loss — and keep serving the other flows.
                 match d_tx.try_send(pkt) {
                     Ok(()) => {}
-                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                    Err(TrySendError::Full(_)) => {
                         dropped += 1;
                         if dropped.is_power_of_two() {
                             warn!(
@@ -346,7 +338,7 @@ async fn handle_inbound_datagram(
                             );
                         }
                     }
-                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    Err(TrySendError::Closed(_)) => {
                         warn!("tproxy udp dispatch channel closed");
                         return;
                     }
@@ -357,22 +349,25 @@ async fn handle_inbound_datagram(
     };
 
     tokio::select! {
-    _ = fut1 => {
-        warn!("tproxy outbound (dispatcher -> tproxy) stream ended first");
-    }
-    _ = fut2 => {
-        warn!("tproxy inbound (tproxy -> dispatcher) stream ended first");
-    }
+        _ = fut1 => {
+            warn!("tproxy outbound (dispatcher -> tproxy) stream ended first");
+        }
+        _ = fut2 => {
+            warn!("tproxy inbound (tproxy -> dispatcher) stream ended first");
+        }
     }
 
     closer.send(0).ok();
 
+    // Inbound TCP and UDP listeners share a single `try_join_all` inside a
+    // critical task; return `Ok(())` so a UDP-only failure stops only UDP
+    // without cancelling TCP or triggering global shutdown.
     Ok(())
 }
 
 fn set_ip_recv_orig_dstaddr(
     level: libc::c_int,
-    socket: &socket2::Socket,
+    socket: &Socket,
 ) -> io::Result<()> {
     let opt = match level {
         libc::IPPROTO_IP => libc::IP_RECVORIGDSTADDR,
@@ -385,36 +380,23 @@ fn set_ip_recv_orig_dstaddr(
 }
 
 async fn handle_packet_from_dispatcher(
-    mut l_rx: tokio::sync::mpsc::Receiver<UdpPacket>,
+    l_rx: mpsc::Receiver<UdpPacket>,
     fw_mark: Option<u32>,
 ) {
-    let cache = new_transparent_socket_cache();
-    let mut reply_batch = Vec::with_capacity(MAX_BATCH);
-    while l_rx.recv_many(&mut reply_batch, MAX_BATCH).await > 0 {
-        send_replies(&reply_batch, |source| {
-            get_or_create_transparent_socket(&cache, source, fw_mark)
-        }).await;
-        reply_batch.clear();
-    }
+    transparent_reply::relay(l_rx, move |source| {
+        create_transparent_reply_socket(source, fw_mark)
+    })
+    .await;
 
     // reaching here means the dispatcher hung up; the outer `select!` tears the
     // rest of the tproxy session down
-    tracing::info!(
+    info!(
         "dispatcher channel to tproxy is closed, exiting outbound loop gracefully"
     );
 }
 
-// socket2 doesn't provide set_ip_transparent_v6
-// So we must implement it ourselves
-fn set_ip_transparent_v6(socket: &socket2::Socket) -> io::Result<()> {
-    let (opt, level) = (libc::IPV6_TRANSPARENT, libc::IPPROTO_IPV6);
-
-    let enable: libc::c_int = 1;
-    set_socket_option(socket, level, opt, enable)
-}
-
 fn set_socket_option(
-    socket: &socket2::Socket,
+    socket: &Socket,
     level: i32,
     opt: i32,
     val: i32,
@@ -423,13 +405,15 @@ fn set_socket_option(
 
     let enable: libc::c_int = val;
 
+    // SAFETY: `fd` belongs to a live `Socket`, and `enable` is a valid
+    // initialized `libc::c_int` matching the passed option length.
     unsafe {
         let ret = libc::setsockopt(
             fd,
             level,
             opt,
             &enable as *const _ as *const _,
-            std::mem::size_of_val(&enable) as libc::socklen_t,
+            size_of_val(&enable) as libc::socklen_t,
         );
 
         if ret != 0 {

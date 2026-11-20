@@ -2,7 +2,9 @@ use futures::{Sink, Stream};
 use super::UdpPacket;
 use std::io::{Error, ErrorKind};
 use tokio::sync::mpsc::{Receiver, Sender};
-use super::batch::{BatchResult, DatagramBatch, PacketBatch, poll_send_channel};
+use super::batch::{
+    BatchResult, DatagramBatch, MAX_BATCH_PACKETS, PacketBatch, poll_send_channel,
+};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio_util::sync::PollSender;
@@ -107,5 +109,23 @@ impl DatagramBatch for ChannelDatagram {
             Poll::Ready(Ok(())) => {}
         }
         poll_send_channel(&mut self.tx, cx, batch)
+    }
+
+    fn poll_recv_batch(
+        &mut self, cx: &mut Context<'_>, packets: &mut Vec<UdpPacket>,
+    ) -> Poll<Option<()>> {
+        let limit = MAX_BATCH_PACKETS.saturating_sub(packets.len());
+        if limit == 0 {
+            return Poll::Ready(Some(()));
+        }
+        match self.rx.poll_recv_many(cx, packets, limit) {
+            Poll::Pending => {
+                if packets.is_empty() { Poll::Pending } else { Poll::Ready(Some(())) }
+            }
+            Poll::Ready(0) => {
+                if packets.is_empty() { Poll::Ready(None) } else { Poll::Ready(Some(())) }
+            }
+            Poll::Ready(_) => Poll::Ready(Some(())),
+        }
     }
 }

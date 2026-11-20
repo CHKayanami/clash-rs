@@ -40,11 +40,11 @@ done
 
 # Bypass LAN data
 iptables -t mangle -A clash-rs-tproxy -m addrtype --dst-type LOCAL -j RETURN
-# Bypass sslocal's outbound data
+# Bypass clash-rs's outbound data
 iptables -t mangle -A clash-rs-tproxy -m mark --mark 0xff/0xff -j RETURN
-# UDP: TPROXY UDP to 60080
+# UDP: TPROXY UDP
 iptables -t mangle -A clash-rs-tproxy -p udp -j TPROXY --on-ip ${TPROXY_IP} --on-port ${TPROXY_PORT} --tproxy-mark 0x01/0x01
-# TCP: TPROXY TCP to 60080
+# TCP: TPROXY TCP
 iptables -t mangle -A clash-rs-tproxy -p tcp -j TPROXY --on-ip ${TPROXY_IP} --on-port ${TPROXY_PORT} --tproxy-mark 0x01/0x01
 
 
