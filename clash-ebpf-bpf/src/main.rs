@@ -564,7 +564,11 @@ fn handle_lan_miss(tc_ctx: &TcContext, param: &DaeParam, link_h_len: usize, obse
 #[inline(never)]
 fn handle_wan_egress_impl(tc_ctx: &TcContext, link_h_len: usize) -> i32 {
     let ctx = tc_ctx.as_ptr().cast::<__sk_buff>();
-    let mark = unsafe { (*ctx).mark };
+
+    // WAN egress 只处理本机出站，转发包直接放行。
+    if unsafe { (*ctx).ingress_ifindex } != 0 {
+        return TC_ACT_OK;
+    }
 
     let Some(param) = get_param() else {
         return TC_ACT_OK;
@@ -573,7 +577,8 @@ fn handle_wan_egress_impl(tc_ctx: &TcContext, link_h_len: usize) -> i32 {
         return TC_ACT_OK;
     }
 
-    // 1. Clash 自身发出的出站请求 (带 DAE_BYPASS_MARK 或配置的 dae_socket_mark 或配置的 bypass_fwmarks): 绝对放行防自环/绕过
+    // Clash 自身及配置为绕过的出站流量直接放行，避免自环。
+    let mark = unsafe { (*ctx).mark };
     if mark == DAE_BYPASS_MARK
         || (param.dae_socket_mark != 0 && mark == param.dae_socket_mark)
         || (param.has_bypass_fwmarks != 0
@@ -582,14 +587,8 @@ fn handle_wan_egress_impl(tc_ctx: &TcContext, link_h_len: usize) -> i32 {
         return TC_ACT_OK;
     }
 
-    // 2. 本机出站总开关: 若未开启本机代理，直接无条件放行
+    // 未开启本机代理时直接放行。
     if param.proxy_local == 0 {
-        return TC_ACT_OK;
-    }
-
-    // 3. 纯转发流量放行: 从 LAN 等网络接口进来的路由转发包 (ingress_ifindex != 0)
-    // 已经在 lan_ingress 中完成准入判定，在 WAN 出口必须放行直连，严禁被当作本机流量误劫持。
-    if unsafe { (*ctx).ingress_ifindex } != 0 {
         return TC_ACT_OK;
     }
 
