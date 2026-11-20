@@ -18,9 +18,9 @@ use crate::{
     proxy::{
         AnyOutboundDatagram, AnyStream, OutboundHandler,
         direct::pool::{DirectDatagramPool, DirectSocketKey},
-        utils::dial_tcp_with_happy_eyeballs,
+        utils::{dial_tcp_with_happy_eyeballs, new_tcp_stream},
     },
-    session::Session,
+    session::{Session, SocksAddr},
 };
 use erased_serde::Serialize as ErasedSerialize;
 use std::collections::HashMap;
@@ -84,16 +84,30 @@ impl OutboundHandler for Handler {
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
     ) -> std::io::Result<AnyStream> {
-        let stream = dial_tcp_with_happy_eyeballs(
-            sess.destination.host_cow().as_ref(),
-            sess.destination.port(),
-            &resolver,
-            sess.iface.as_deref(),
-            false,
-            #[cfg(target_os = "linux")]
-            sess.so_mark,
-        )
-        .await?;
+        let stream = match &sess.destination {
+            SocksAddr::Ip(addr) => {
+                new_tcp_stream(
+                    *addr,
+                    sess.iface.as_deref(),
+                    false,
+                    #[cfg(target_os = "linux")]
+                    sess.so_mark,
+                )
+                .await?
+            }
+            SocksAddr::Domain(host, port) => {
+                dial_tcp_with_happy_eyeballs(
+                    host,
+                    *port,
+                    &resolver,
+                    sess.iface.as_deref(),
+                    false,
+                    #[cfg(target_os = "linux")]
+                    sess.so_mark,
+                )
+                .await?
+            }
+        };
 
         sess.push_chain(self.name());
         Ok(stream)

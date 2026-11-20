@@ -233,7 +233,6 @@ impl InboundHandlerTrait for EbpfInbound {
                     }
 
                     // 2. Regular TCP proxy stream
-                    info!("[eBPF TCP] Intercepted: {} -> {}", session_info.source, dst);
                     let session = Session {
                         network: Network::Tcp,
                         typ: Type::Ebpf,

@@ -17,4 +17,4 @@ pub use config::{
 };
 pub use listener::EbpfListener;
 pub use manager::{EbpfError, EbpfManager};
-pub use session::{EbpfSession, TransportProtocol, get_original_dst};
+pub use session::{EbpfSession, TransportProtocol};

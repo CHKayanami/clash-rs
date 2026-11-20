@@ -1,6 +1,6 @@
 use crate::config::EbpfConfig;
 use crate::netns::DaeNs;
-use crate::session::{EbpfSession, TransportProtocol, get_original_dst};
+use crate::session::{EbpfSession, TransportProtocol};
 use arc_swap::ArcSwap;
 use clash_common::udp::enable_gro;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
@@ -42,6 +42,7 @@ impl EbpfListener {
             tcp_sock_v4.set_nonblocking(true)?;
             tcp_sock_v4.set_cloexec(true)?;
             tcp_sock_v4.set_reuse_address(true)?;
+            tcp_sock_v4.set_tcp_nodelay(true)?;
             tcp_sock_v4.set_ip_transparent_v4(true)?;
             let _ = nix::sys::socket::setsockopt(
                 &tcp_sock_v4,
@@ -61,6 +62,7 @@ impl EbpfListener {
                 tcp_sock_v6.set_cloexec(true)?;
                 tcp_sock_v6.set_reuse_address(true)?;
                 tcp_sock_v6.set_only_v6(true)?;
+                tcp_sock_v6.set_tcp_nodelay(true)?;
                 tcp_sock_v6.set_ip_transparent_v6(true)?;
                 let _ = nix::sys::socket::setsockopt(
                     &tcp_sock_v6,
@@ -364,7 +366,9 @@ impl EbpfListener {
 
         // Clear inherited SO_MARK on accepted socket (honk parity)
         let _ = nix::sys::socket::setsockopt(&stream, nix::sys::socket::sockopt::Mark, &0u32);
-        let dst_addr = get_original_dst(&stream)?;
+        // sk_lookup selects the listener without rewriting the destination
+        // tuple. The accepted socket's local endpoint is the original target.
+        let dst_addr = stream.local_addr()?;
 
         let session = EbpfSession {
             source: src_addr,

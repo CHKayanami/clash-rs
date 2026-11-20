@@ -1463,6 +1463,55 @@ async fn consume_dae_events(
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    #[ignore = "requires root, freshly built eBPF bytecode, and IPv6"]
+    async fn tcp_sk_lookup_preserves_destination_and_nodelay() {
+        use crate::{EbpfConfig, EbpfListener, netlink::NlSock, netns::DaeNs};
+        use std::{net::SocketAddr, time::Duration};
+        use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::TcpSocket, time::timeout};
+
+        let ns = DaeNs::new().unwrap();
+        ns.with_daens(|| {
+            let mut nl = NlSock::new().unwrap();
+            let (lo, _) = nl.get_link("lo").unwrap();
+            nl.set_link_up(lo, true).unwrap();
+        }).unwrap();
+        let config = EbpfConfig { tproxy_port: 12345, ..Default::default() };
+        let bypass = StaticBypass::new(&[], &[], &[], &[], config.tproxy_port).unwrap();
+        let listener = EbpfListener::bind(&ns, config).unwrap();
+        let mut manager = BpfProgramManager::new();
+        manager.bpf = Some(load_object(EMBEDDED_BPF_OBJECT, false, &bypass).unwrap());
+        manager.publish_listener_sockets(
+            listener.tcp_v4_raw_fd(),
+            Some(listener.tcp_v6_raw_fd().expect("IPv6 listener")),
+            listener.udp_v4_raw_fd(),
+            listener.udp_v6_raw_fd(),
+        ).unwrap();
+        manager.attach_sk_lookup(&ns).unwrap();
+
+        for target in ["127.0.0.1:8443", "[::1]:8443"] {
+            let target: SocketAddr = target.parse().unwrap();
+            let client = ns.with_daens(|| {
+                if target.is_ipv4() { TcpSocket::new_v4() } else { TcpSocket::new_v6() }
+            }).unwrap().unwrap();
+            timeout(Duration::from_secs(3), async {
+                let (mut client, (mut accepted, session)) =
+                    tokio::try_join!(client.connect(target), listener.accept_tcp()).unwrap();
+                assert_eq!(session.destination, target);
+                assert_eq!(session.source, client.local_addr().unwrap());
+                assert!(accepted.nodelay().unwrap());
+                client.write_all(b"ping").await.unwrap();
+                let mut request = [0; 4];
+                accepted.read_exact(&mut request).await.unwrap();
+                assert_eq!(&request, b"ping");
+                accepted.write_all(b"pong").await.unwrap();
+                let mut response = [0; 4];
+                client.read_exact(&mut response).await.unwrap();
+                assert_eq!(&response, b"pong");
+            }).await.unwrap();
+        }
+    }
+
     #[test]
     #[ignore = "requires root and freshly built eBPF bytecode"]
     fn process_tracking_capacity_follows_local_proxy_setting() {
