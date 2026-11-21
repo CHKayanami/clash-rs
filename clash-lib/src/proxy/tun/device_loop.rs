@@ -6,7 +6,8 @@ use bytes::BytesMut;
 use futures::{StreamExt, future::poll_fn};
 use tokio::{sync::OwnedSemaphorePermit, task::consume_budget, time::Instant};
 use tracing::{trace, warn};
-use clash_netstack::{Packet, StackSplitSink, StackSplitStream, TcpDriver, udp_payload_segments, UdpPayloadSegments};
+use clash_netstack::{Packet, StackSplitSink, StackSplitStream, TcpDriver, UdpPacket,
+    udp_payload_segments, UdpPayloadSegments};
 use crate::{Error, app::dispatcher::udp::association::direct::{engine::Engine as UdpEngine},
     proxy::datagram::batch::{MAX_BATCH_PACKETS, MAX_BATCH_BYTES}};
 use super::{device_io::{DEVICE_BATCH, recoverable_write_error}, packet::{Dispatch, PacketDispatcher}, packet_queue};
@@ -37,6 +38,7 @@ pub(super) struct DeviceLoop<I, F> {
     received: Vec<Packet>,
     input: VecDeque<Packet>,
     udp_input: Option<UdpPayloadSegments>,
+    udp_uploads: Vec<UdpPacket>,
     local: VecDeque<Bytes>,
     external: Vec<packet_queue::Packet>,
     output: Vec<Packet>,
@@ -54,6 +56,7 @@ impl<I: PacketIo, F: Fn(&[u8]) -> bool> DeviceLoop<I, F> {
         let udp = packets.direct.take_engine();
         Self { io, udp, protocols, packets, replies, intercept,
             received: Vec::with_capacity(DEVICE_BATCH), input: VecDeque::new(), udp_input: None,
+            udp_uploads: Vec::with_capacity(DEVICE_BATCH),
             local: VecDeque::with_capacity(DEVICE_BATCH), external: Vec::with_capacity(DEVICE_BATCH),
             output: Vec::with_capacity(DEVICE_BATCH), udp_output: VecDeque::new(),
             credits: Vec::with_capacity(DEVICE_BATCH), writing: false, source: 0, udp_burst: 0, udp_bytes: 0 }
@@ -92,39 +95,9 @@ impl<I: PacketIo, F: Fn(&[u8]) -> bool> DeviceLoop<I, F> {
                 Poll::Pending => {},
             }
         }
-        for _ in 0..DEVICE_BATCH {
-            if let Some(packet) = self.udp_input.as_mut().and_then(Iterator::next) {
-                self.protocols.sink.send_udp_payload(packet)?; progress = true; continue;
-            }
-            self.udp_input = None;
-            let Some(packet) = self.input.pop_front() else { break; };
-            progress = true;
-            if (self.intercept)(&packet) { continue; }
-            match self.packets.prepare_frame(packet, now) {
-                Dispatch::Drop => {},
-                Dispatch::Split(packet) => {
-                    let mut segments = udp_payload_segments(packet)?;
-                    if let Some(packet) = segments.next() {
-                        self.protocols.sink.send_udp_payload(packet)?;
-                    }
-                    self.udp_input = Some(segments);
-                },
-                Dispatch::Direct(upload) => {
-                    if let Some(udp) = &mut self.udp { udp.queue_upload(upload); }
-                },
-                Dispatch::Reply(packet) => {
-                    if self.local.len() < DEVICE_BATCH { self.local.push_back(packet.freeze()); }
-                    else { trace!("system TCP reply queue full, dropping packet"); }
-                }
-                Dispatch::Udp(packet) => self.protocols.sink.send_udp_payload(packet)?,
-                Dispatch::Stack(packet, protocol) => {
-                    let packet = match &mut self.protocols.tcp {
-                        Some(tcp) => tcp.receive(packet)?,
-                        None => Some(packet),
-                    };
-                    if let Some(packet) = packet { self.protocols.sink.send_checked_packet(packet, protocol)?; }
-                }
-            }
+        progress |= self.collect_input(now).inspect_err(|_| self.udp_uploads.clear())?;
+        if !self.udp_uploads.is_empty() {
+            self.protocols.sink.send_udp_payloads(self.udp_uploads.drain(..))?;
         }
         if let Some(udp) = &mut self.udp {
             udp.flush_ingress(cx, now);
@@ -164,6 +137,45 @@ impl<I: PacketIo, F: Fn(&[u8]) -> bool> DeviceLoop<I, F> {
         // per packet batch; park only after every event source has been armed.
         if let Some(udp) = &self.udp { progress |= udp.needs_poll(); }
         if progress { Poll::Ready(Ok(())) } else { self.prepare_wait(); Poll::Pending }
+    }
+
+    fn collect_input(&mut self, now: Instant) -> io::Result<bool> {
+        let mut progress = false;
+        for _ in 0..DEVICE_BATCH {
+            if let Some(packet) = self.udp_input.as_mut().and_then(Iterator::next) {
+                self.udp_uploads.push(packet); progress = true; continue;
+            }
+            self.udp_input = None;
+            let Some(packet) = self.input.pop_front() else { break; };
+            progress = true;
+            if (self.intercept)(&packet) { continue; }
+            match self.packets.prepare_frame(packet, now) {
+                Dispatch::Drop => {},
+                Dispatch::Split(packet) => {
+                    let mut segments = udp_payload_segments(packet)?;
+                    if let Some(packet) = segments.next() {
+                        self.udp_uploads.push(packet);
+                    }
+                    self.udp_input = Some(segments);
+                },
+                Dispatch::Direct(upload) => {
+                    if let Some(udp) = &mut self.udp { udp.queue_upload(upload); }
+                },
+                Dispatch::Reply(packet) => {
+                    if self.local.len() < DEVICE_BATCH { self.local.push_back(packet.freeze()); }
+                    else { trace!("system TCP reply queue full, dropping packet"); }
+                }
+                Dispatch::Udp(packet) => self.udp_uploads.push(packet),
+                Dispatch::Stack(packet, protocol) => {
+                    let packet = match &mut self.protocols.tcp {
+                        Some(tcp) => tcp.receive(packet)?,
+                        None => Some(packet),
+                    };
+                    if let Some(packet) = packet { self.protocols.sink.send_checked_packet(packet, protocol)?; }
+                }
+            }
+        }
+        Ok(progress)
     }
 
     fn finish_write(&mut self, cx: &mut Context<'_>) -> Result<bool, Error> {

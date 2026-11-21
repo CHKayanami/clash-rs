@@ -33,6 +33,39 @@ async fn saturated_tcp_queues_do_not_stop_udp_uploads() {
 }
 
 #[tokio::test]
+async fn ordinary_udp_batch_preserves_order_across_gro_budget_boundary() {
+    let (stack, _, udp) = NetStack::new_with_protocols(false, false);
+    let (sink, stream) = stack.split();
+    let (mut udp, _send) = udp.split();
+    let (_replies, receive) = packet_queue::channel();
+    let dispatcher = PacketDispatcher { enable_tcp: false, system_tcp: false, ipv4: None, ipv6: None,
+        nat: Arc::new(SystemTcpNat::new()), direct: datagram::direct_path(None), uploads: Default::default() };
+    let io = MockIo { input: VecDeque::new(), pending: Vec::new(), written: Arc::default(),
+        blocked: Arc::new(AtomicBool::new(false)), wake: Arc::new(AtomicWaker::new()) };
+    let mut driver = DeviceLoop::new(io, Protocols { tcp: None, sink, stream }, dispatcher, receive, |_| false);
+    let source = "192.0.2.2:53000".parse().unwrap();
+    let destination = "198.51.100.2:9000".parse().unwrap();
+    let packet = |payload| StackUdpPacket::from((Bytes::from(payload), source, destination));
+    let tail = (DEVICE_BATCH + 2) as u8;
+    driver.input.extend([
+        packet(vec![0]).encode().unwrap(),
+        packet((1..tail).collect::<Vec<_>>()).encode_segments(1).unwrap(),
+        packet(vec![tail]).encode().unwrap(),
+    ]);
+
+    let waker = noop_waker();
+    let mut cx = Context::from_waker(&waker);
+    for expected in [0..DEVICE_BATCH as u8, DEVICE_BATCH as u8..tail + 1] {
+        assert!(!matches!(driver.poll(&mut cx), Poll::Ready(Err(_))));
+        for value in expected {
+            let datagram = udp.recv().now_or_never().flatten().expect("ready UDP upload");
+            assert_eq!(datagram.data(), &[value]);
+        }
+        assert!(udp.recv().now_or_never().is_none());
+    }
+}
+
+#[tokio::test]
 async fn buffered_tcp_bursts_remain_bounded_without_polling() {
     let (mut tcp, _listener) = TcpDriver::new(1500, 1).unwrap();
     for port in 10000..10200 { tcp.receive(syn(port).into()).unwrap(); }

@@ -345,6 +345,26 @@ async fn proxy_udp_reply_preserves_payload_and_partial_checksum_through_stack_ou
 }
 
 #[test]
+fn split_udp_datagrams_larger_than_mtu_stay_independent() {
+    use std::net::SocketAddr;
+    use clash_netstack::UdpPacket as StackPacket;
+    let source: SocketAddr = "192.0.2.1:1".parse().unwrap();
+    let destination: SocketAddr = "192.0.2.2:2".parse().unwrap();
+    for partial in [false, true] {
+        let packets: Vec<_> = (0..2).map(|_| {
+            StackPacket::from((Bytes::from(vec![0; 1480]), source, destination))
+                .into_parts(None, partial).unwrap()
+        }).collect();
+        for index in 0..packets.len() {
+            let frame = write::WriteFrame::new(&packets[index..], true, 1500).unwrap();
+            assert_eq!(frame.count, 1);
+            assert_eq!(frame.vectors()[0][1], 0);
+            assert_eq!(frame.length(), HEADER_LEN + 28 + 1480);
+        }
+    }
+}
+
+#[test]
 fn merging_gro_groups_respects_the_logical_segment_limit() {
     use std::net::SocketAddr;
     use clash_netstack::UdpPacket as StackPacket;

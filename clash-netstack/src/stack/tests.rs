@@ -24,6 +24,29 @@ async fn recv_many_reuses_storage_and_returns_partial_ready_batches() {
 }
 
 #[tokio::test]
+async fn udp_ingress_batch_keeps_fifo_and_drops_only_the_unadmitted_suffix() {
+    let (sender, mut receiver) = mpsc::channel(3);
+    let mut sink = StackSplitSink::new(sender, None, None, false, 1500);
+    let source = "192.0.2.2:12345".parse().unwrap();
+    let target = "198.51.100.2:53".parse().unwrap();
+    let packet = |value| UdpPacket::from((Bytes::from(vec![value]), source, target));
+
+    sink.send_udp_payload(packet(0)).unwrap();
+    sink.send_udp_payloads((1..5).map(packet)).unwrap();
+    sink.send_udp_payloads((5..7).map(packet)).unwrap();
+    for value in 0..3 {
+        assert_eq!(receiver.try_recv().unwrap().data(), &[value]);
+    }
+    assert!(matches!(receiver.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
+    sink.send_udp_payloads((7..9).map(packet)).unwrap();
+    for value in 7..9 {
+        assert_eq!(receiver.try_recv().unwrap().data(), &[value]);
+    }
+    drop(receiver);
+    sink.send_udp_payloads((9..11).map(packet)).unwrap();
+}
+
+#[tokio::test]
 async fn protocol_switches_preserve_udp_and_control_local_icmp() {
     for (enable_tcp, enable_icmp) in [(false, false), (false, true), (true, true)] {
         let (stack, listener, udp) = NetStack::new_with_protocols(enable_tcp, enable_icmp);

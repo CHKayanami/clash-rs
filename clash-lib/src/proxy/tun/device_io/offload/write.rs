@@ -26,7 +26,7 @@ impl<'a> WriteFrame<'a> {
             let size = original.unwrap_or(payload.len());
             let mut length = payload.len();
             let mut segments = if size > 0 { length.div_ceil(size) } else { 0 };
-            if udp_gso && size > 0 && length % size == 0 {
+            if udp_gso && size > 0 && header.len() + size <= mtu && length % size == 0 {
                 for packet in &packets[1..] {
                     let Some((next, data)) = packet.parts() else { break; };
                     let next_size = packet.udp_segmentation().map(usize::from);

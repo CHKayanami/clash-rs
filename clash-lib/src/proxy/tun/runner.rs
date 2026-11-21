@@ -369,7 +369,12 @@ impl AsyncService for TunRunner {
         #[cfg(target_os = "linux")]
         let udp_socket = {
             let mut socket = udp_socket;
-            if !listeners.system && tun.udp_gso() { socket.enable_output_offload(); }
+            if !listeners.system && tun.udp_gso() {
+                socket.enable_output_offload();
+            } else if !listeners.system || (!tun.tcp_gso() && !tun.udp_gso()) {
+                // Split replies would steer a system TCP batch away from tun-rs GRO.
+                socket.enable_output_vectored();
+            }
             socket
         };
 

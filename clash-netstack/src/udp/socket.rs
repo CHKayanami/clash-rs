@@ -68,7 +68,22 @@ impl UdpPacket {
 pub struct UdpSocket {
     inbound: mpsc::Receiver<UdpPacket>,
     outbound: mpsc::Sender<Packet>,
-    output_offload: bool,
+    output: UdpOutput,
+}
+
+#[derive(Clone, Copy)]
+enum UdpOutput {
+    Contiguous,
+    Vectored { partial_checksum: bool },
+}
+
+impl UdpOutput {
+    fn encode(self, packet: UdpPacket) -> io::Result<Packet> {
+        match self {
+            Self::Contiguous => packet.encode(),
+            Self::Vectored { partial_checksum } => packet.into_parts(None, partial_checksum),
+        }
+    }
 }
 
 impl UdpSocket {
@@ -76,16 +91,23 @@ impl UdpSocket {
         inbound: mpsc::Receiver<UdpPacket>,
         outbound: mpsc::Sender<Packet>,
     ) -> Self {
-        Self { inbound, outbound, output_offload: false }
+        Self { inbound, outbound, output: UdpOutput::Contiguous }
+    }
+
+    /// Keep the header and payload separate with a complete UDP checksum.
+    pub fn enable_output_vectored(&mut self) {
+        self.output = UdpOutput::Vectored { partial_checksum: false };
     }
 
     /// Enable only when the final device writer preserves partial-checksum
     /// metadata. This changes final TUN encoding, never proxy wire framing.
-    pub fn enable_output_offload(&mut self) { self.output_offload = true; }
+    pub fn enable_output_offload(&mut self) {
+        self.output = UdpOutput::Vectored { partial_checksum: true };
+    }
     pub fn split(self) -> (SplitRead, SplitWrite) {
         let read = SplitRead { recv: self.inbound };
         let write = SplitWrite {
-            send: self.outbound, output_offload: self.output_offload,
+            send: self.outbound, output: self.output,
         };
         (read, write)
     }
@@ -131,7 +153,7 @@ pub struct UdpSendResult {
 #[derive(Clone)]
 pub struct SplitWrite {
     send: mpsc::Sender<Packet>,
-    output_offload: bool,
+    output: UdpOutput,
 }
 
 impl SplitWrite {
@@ -143,7 +165,7 @@ impl SplitWrite {
     /// The async signature is retained for compatibility and does not yield.
     /// A closed outbound channel returns `io::ErrorKind::BrokenPipe`.
     pub async fn send(&mut self, packet: UdpPacket) -> io::Result<()> {
-        let packet = if self.output_offload { packet.into_parts(None, true)? } else { packet.encode()? };
+        let packet = self.output.encode(packet)?;
         match self.send.try_send(packet) {
             Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => Ok(()),
             Err(mpsc::error::TrySendError::Closed(_)) => {
@@ -158,23 +180,22 @@ impl SplitWrite {
     pub fn send_batch(&self, packets: &[UdpPacket]) -> UdpSendResult {
         self.send_encoded_batch(packets.len(), |index| {
             let packet = &packets[index];
-            if self.output_offload {
-                UdpPacket::from((packet.data.clone(), packet.local_addr, packet.remote_addr))
-                    .into_parts(None, true)
-            } else {
-                packet.encode()
+            match self.output {
+                UdpOutput::Contiguous => packet.encode(),
+                UdpOutput::Vectored { .. } => self.output.encode(UdpPacket::from((
+                    packet.data.clone(), packet.local_addr, packet.remote_addr,
+                ))),
             }
         })
     }
 
     /// Map and encode each datagram after reserving its output slot.
-    /// The mapper may take ownership of payloads for device offload.
+    /// The mapper may take ownership of payloads for vectored device output.
     pub fn send_batch_mapped<T>(
         &self, packets: &mut [T], mut map: impl FnMut(&mut T) -> io::Result<UdpPacket>,
     ) -> UdpSendResult {
         self.send_encoded_batch(packets.len(), |index| {
-            let packet = map(&mut packets[index])?;
-            if self.output_offload { packet.into_parts(None, true) } else { packet.encode() }
+            self.output.encode(map(&mut packets[index])?)
         })
     }
 
@@ -421,8 +442,50 @@ fn compute_udp_checksum_v6(
 #[cfg(test)]
 mod batch_tests {
     use super::*;
+    use std::mem::take;
     use bytes::Bytes;
     use smoltcp::wire::{IpAddress, UdpPacket as WireUdpPacket};
+
+    #[tokio::test]
+    async fn vectored_udp_reuses_payload_with_complete_ipv4_and_ipv6_checksums() {
+        for (source, target, header_len) in [
+            ("127.0.0.1:1234", "127.0.0.2:5678", 20),
+            ("[::1]:1234", "[::2]:5678", 40),
+        ] {
+            let source: SocketAddr = source.parse().unwrap();
+            let target: SocketAddr = target.parse().unwrap();
+            let (_inbound, input) = mpsc::channel(1);
+            let (output, mut receive) = mpsc::channel(2);
+            let mut socket = UdpSocket::new(input, output);
+            socket.enable_output_vectored();
+            let (_, writer) = socket.split();
+            let mut payloads = [Bytes::from_static(b"odd"), Bytes::new()];
+            let pointer = payloads[0].as_ptr();
+            let result = writer.send_batch_mapped(&mut payloads, |payload| {
+                Ok((take(payload), source, target).into())
+            });
+            assert_eq!((result.sent, result.dropped), (2, 0));
+            assert!(result.error.is_none());
+            let check = |packet: Packet, expected: &[u8]| {
+                let (header, payload) = packet.parts().unwrap();
+                assert_eq!(header.len(), header_len + 8);
+                assert_eq!(payload, expected);
+                if !expected.is_empty() { assert_eq!(payload.as_ptr(), pointer); }
+                assert!(!packet.udp_checksum_partial());
+                assert_eq!(packet.udp_segmentation(), None);
+                if header_len == 20 { assert_eq!(compute_ipv4_checksum(&header[..20]), 0); }
+                let wire = WireUdpPacket::new_checked(&packet.data()[header_len..]).unwrap();
+                assert!(wire.verify_checksum(&IpAddress::from(source.ip()), &IpAddress::from(target.ip())));
+            };
+            for expected in [b"odd".as_slice(), b"".as_slice()] {
+                check(receive.try_recv().unwrap(), expected);
+            }
+            let result = writer.send_batch(&[UdpPacket::from((Bytes::from_static(b"odd"), source, target))]);
+            assert_eq!((result.sent, result.dropped), (1, 0));
+            assert!(result.error.is_none());
+            check(receive.try_recv().unwrap(), b"odd");
+        }
+    }
 
     #[tokio::test]
     async fn batches_preserve_empty_packets_addresses_and_checksums() {
@@ -433,7 +496,7 @@ mod batch_tests {
             let source: SocketAddr = source.parse().unwrap();
             let target: SocketAddr = target.parse().unwrap();
             let (send, mut receive) = mpsc::channel(4);
-            let writer = SplitWrite { send, output_offload: false };
+            let writer = SplitWrite { send, output: UdpOutput::Contiguous };
             let packets = [
                 UdpPacket::from((Bytes::new(), source, target)),
                 UdpPacket::from((Bytes::from_static(b"odd"), source, target)),
@@ -457,7 +520,7 @@ mod batch_tests {
     #[tokio::test]
     async fn batches_keep_packet_capacity_and_do_not_block_on_full_queue() {
         let (send, mut receive) = mpsc::channel(2);
-        let writer = SplitWrite { send, output_offload: false };
+        let writer = SplitWrite { send, output: UdpOutput::Contiguous };
         let packets: Vec<_> = (0..4).map(|i| UdpPacket::from((
             Bytes::from(vec![i]), "127.0.0.1:1".parse().unwrap(), "127.0.0.2:2".parse().unwrap(),
         ))).collect();
@@ -481,7 +544,7 @@ mod batch_tests {
         let (send, mut receive) = mpsc::channel(4);
         let competing = send.clone();
         let _held = competing.try_reserve_many(2).unwrap();
-        let writer = SplitWrite { send, output_offload: false };
+        let writer = SplitWrite { send, output: UdpOutput::Contiguous };
         let packets: Vec<_> = (0..4).map(|i| UdpPacket::from((
             Bytes::from(vec![i]), "127.0.0.1:1".parse().unwrap(), "127.0.0.2:2".parse().unwrap(),
         ))).collect();
@@ -499,7 +562,7 @@ mod batch_tests {
     #[tokio::test]
     async fn invalid_packet_does_not_discard_valid_batch_suffix() {
         let (send, mut receive) = mpsc::channel(2);
-        let writer = SplitWrite { send, output_offload: false };
+        let writer = SplitWrite { send, output: UdpOutput::Contiguous };
         let valid = || UdpPacket::from((Bytes::from_static(b"ok"),
             "127.0.0.1:1".parse().unwrap(), "127.0.0.2:2".parse().unwrap()));
         let invalid = UdpPacket::from((Bytes::new(),

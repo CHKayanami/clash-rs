@@ -2,7 +2,7 @@ mod headers;
 pub use headers::PacketHeaders;
 use bytes::Bytes;
 use futures::future::poll_fn;
-use std::io;
+use std::{io, iter::once};
 use futures::Stream;
 use log::debug;
 use tracing::{enabled, Level};
@@ -20,6 +20,7 @@ use crate::{
     link::icmp::IcmpResponder,
     link::output::Output,
     tcp::listener::TcpListener,
+    udp::socket::UdpPacket,
 };
 
 /// Thin `Stream` wrapper around a bounded `mpsc::Receiver`.
@@ -177,10 +178,56 @@ impl StackSplitSink {
 
     /// A logical datagram already validated by ingress parsing or GSO decoding.
     /// Admission keeps the existing bounded drop-on-full queue policy.
-    pub fn send_udp_payload(&mut self, packet: crate::udp::socket::UdpPacket) -> io::Result<()> {
+    pub fn send_udp_payload(&mut self, packet: UdpPacket) -> io::Result<()> {
+        self.send_udp_payloads(once(packet))
+    }
+
+    /// Reserve ingress slots for the ready prefix of a validated batch.
+    /// Each datagram uses one slot and the unadmitted suffix is dropped.
+    pub fn send_udp_payloads(
+        &mut self, packets: impl ExactSizeIterator<Item = UdpPacket>,
+    ) -> io::Result<()> {
         self.flush_pending()?;
-        self.packet_container = Some(PendingInbound::Udp(packet));
-        self.flush_pending()
+        let count = packets.len();
+        if count == 0 { return Ok(()); }
+        let permits = match self.udp_inbound.try_reserve_many(count) {
+            Err(mpsc::error::TrySendError::Full(())) => {
+                let available = self.udp_inbound.capacity().min(count);
+                if available == 0 {
+                    log::trace!("UDP inbound queue full, dropped {count} packets");
+                    return Ok(());
+                }
+                self.udp_inbound.try_reserve_many(available)
+            }
+            result => result,
+        };
+        match permits {
+            Ok(permits) => {
+                let mut sent = 0;
+                for (permit, packet) in permits.zip(packets) {
+                    permit.send(packet);
+                    sent += 1;
+                }
+                if sent < count { log::trace!("UDP inbound queue full, dropped {} packets", count - sent); }
+            }
+            Err(mpsc::error::TrySendError::Full(())) => {
+                // Another producer may have reserved some slots since the
+                // capacity snapshot. Keep submitting until the first miss.
+                for (index, packet) in packets.enumerate() {
+                    if let Err(error) = self.udp_inbound.try_send(packet) {
+                        match error {
+                            mpsc::error::TrySendError::Full(_) => log::trace!(
+                                "UDP inbound queue full, dropped {} packets", count - index,
+                            ),
+                            mpsc::error::TrySendError::Closed(_) => log::debug!("UDP inbound queue closed"),
+                        }
+                        break;
+                    }
+                }
+            }
+            Err(mpsc::error::TrySendError::Closed(())) => log::debug!("UDP inbound queue closed"),
+        }
+        Ok(())
     }
     fn enqueue_packet(&mut self, item: Packet) -> io::Result<()> {
         if item.udp_segmentation().is_some() {

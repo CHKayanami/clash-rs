@@ -52,7 +52,7 @@ async fn receive_error_after_progress_is_delivered_on_next_read() {
 
 /// Run with CAP_NET_ADMIN in an isolated network namespace. No default route
 /// or host interfaces are changed; dropping the device removes its routes.
-async fn kernel_udp_roundtrip(offload: bool) {
+async fn kernel_udp_roundtrip(offload: bool, partial_checksum: bool) {
     let device = DeviceBuilder::new().name(if offload { "crs-batch-gso" } else { "crs-batch-plain" })
         .ipv4("198.18.77.1", 24, None).ipv6("fd00:198:18::1", 64)
         .mtu(1500).offload(offload).enable(true).build_async().unwrap();
@@ -103,7 +103,9 @@ async fn kernel_udp_roundtrip(offload: bool) {
             assert_eq!((source, destination), (client.local_addr().unwrap(), target));
             assert_eq!(&packet[range], &[i as u8; 64]);
         }
-        let (stack, _, udp) = NetStack::new();
+        let (stack, _, mut udp) = NetStack::new();
+        if partial_checksum { udp.enable_output_offload(); }
+        else { udp.enable_output_vectored(); }
         let (_, mut stack_read) = stack.split();
         let (_, send) = udp.split();
         let replies: Vec<_> = (0..16).map(|i| UdpPacket::from((
@@ -114,7 +116,12 @@ async fn kernel_udp_roundtrip(offload: bool) {
         assert_eq!(result.dropped, 0);
         assert!(result.error.is_none());
         let mut outbound = Vec::new();
-        for _ in 0..16 { outbound.push(stack_read.next().await.unwrap().unwrap().into_bytes()); }
+        for _ in 0..16 {
+            let packet = stack_read.next().await.unwrap().unwrap();
+            assert!(packet.parts().is_some());
+            assert_eq!(packet.udp_checksum_partial(), partial_checksum);
+            outbound.push(packet);
+        }
         writer.send(&device, &mut outbound).await.unwrap();
         timeout(Duration::from_secs(5), async {
             let mut buffer = [0; 128];
@@ -129,11 +136,17 @@ async fn kernel_udp_roundtrip(offload: bool) {
 
 #[tokio::test]
 #[ignore = "requires Linux CAP_NET_ADMIN and an isolated network namespace"]
-async fn kernel_udp_roundtrip_plain() { kernel_udp_roundtrip(false).await; }
+async fn kernel_udp_roundtrip_plain() { kernel_udp_roundtrip(false, false).await; }
 
 #[tokio::test]
 #[ignore = "requires Linux CAP_NET_ADMIN and an isolated network namespace"]
-async fn kernel_udp_roundtrip_gso() { kernel_udp_roundtrip(true).await; }
+async fn kernel_udp_roundtrip_gso() { kernel_udp_roundtrip(true, true).await; }
+
+#[tokio::test]
+#[ignore = "requires Linux CAP_NET_ADMIN and an isolated network namespace"]
+async fn kernel_udp_roundtrip_gso_with_full_checksum() {
+    kernel_udp_roundtrip(true, false).await;
+}
 
 #[test]
 fn offload_validation_preserves_valid_neighbors() {
