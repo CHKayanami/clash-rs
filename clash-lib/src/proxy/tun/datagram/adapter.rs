@@ -1,23 +1,22 @@
-//! Direct netstack adapter: no TUN-to-dispatcher bridge tasks or packet queues.
-use std::{fmt, io, mem, pin::Pin, sync::Arc,
+//! Read netstack UDP batches and submit proxy replies to the device output.
+use std::{io, mem, sync::Arc,
     task::{Context, Poll}};
-use futures::{Sink, Stream, ready};
+use futures::ready;
 use ipnet::IpNet;
-use tokio::{sync::oneshot, task::JoinSet};
-use tracing::{debug, trace, warn};
+use tokio::task::JoinSet;
+use tracing::{debug, warn};
 use clash_netstack::{SplitRead, SplitWrite, UdpPacket as StackUdpPacket,
     UdpSocket};
 use crate::{
     app::dns::{ThreadSafeDNSResolver, exchange_with_resolver, query::IngressProfile},
     config::internal::config::DnsHijack,
-    proxy::datagram::{UdpPacket, batch::{BatchResult, DatagramBatch, PacketBatch,
-        MAX_BATCH_PACKETS}},
+    proxy::datagram::{UdpPacket, batch::MAX_BATCH_PACKETS},
     session::{Network, SocksAddr},
 };
 
 const MAX_PENDING_DNS: usize = 256;
 
-pub(super) struct TunDatagram {
+pub(crate) struct TunDatagram {
     reader: SplitRead,
     writer: SplitWrite,
     resolver: ThreadSafeDNSResolver,
@@ -26,29 +25,20 @@ pub(super) struct TunDatagram {
     exclude_routes: Arc<Vec<IpNet>>,
     dns: JoinSet<()>,
     incoming: Vec<StackUdpPacket>,
-    outgoing: Vec<StackUdpPacket>,
-    // Dropping the adapter wakes its owner, including on dispatcher failure.
-    _completion: oneshot::Sender<()>,
-}
-
-impl fmt::Debug for TunDatagram {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("TunDatagram").field("pending_dns", &self.dns.len()).finish()
-    }
 }
 
 impl TunDatagram {
-    pub(super) fn new(socket: UdpSocket, resolver: ThreadSafeDNSResolver,
-        dns_hijack: DnsHijack, strict_route: bool, exclude_routes: Arc<Vec<IpNet>>)
-        -> (Self, oneshot::Receiver<()>) {
+    pub(crate) fn new(socket: UdpSocket, resolver: ThreadSafeDNSResolver,
+        dns_hijack: DnsHijack, strict_route: bool, exclude_routes: Arc<Vec<IpNet>>) -> Self {
         let (reader, writer) = socket.split();
-        let (completion, finished) = oneshot::channel();
-        (Self {
+        Self {
             reader, writer, resolver, dns_hijack, strict_route, exclude_routes,
             dns: JoinSet::new(), incoming: Vec::with_capacity(MAX_BATCH_PACKETS),
-            outgoing: Vec::with_capacity(MAX_BATCH_PACKETS),
-            _completion: completion,
-        }, finished)
+        }
+    }
+
+    pub(crate) fn reply_writer(&self) -> SplitWrite {
+        self.writer.clone()
     }
 
     fn accept(&mut self, packet: StackUdpPacket) -> Option<UdpPacket> {
@@ -92,7 +82,7 @@ impl TunDatagram {
         cx.waker().wake_by_ref();
     }
 
-    fn receive(&mut self, cx: &mut Context<'_>, packets: &mut Vec<UdpPacket>) -> Poll<Option<()>> {
+    pub(crate) fn receive(&mut self, cx: &mut Context<'_>, packets: &mut Vec<UdpPacket>) -> Poll<Option<()>> {
         self.poll_dns(cx);
         let count = ready!(self.reader.poll_recv_many(cx, &mut self.incoming, MAX_BATCH_PACKETS));
         if count == 0 { return Poll::Ready(None); }
@@ -104,89 +94,36 @@ impl TunDatagram {
         self.incoming = incoming;
         if packets.len() > initial { Poll::Ready(Some(())) }
         else {
-            // A filtered/DNS-only batch still consumes an ingress budget. Give
-            // replies and control events a turn before reading another batch.
+            // Let DNS completions and close events run before reading again.
             cx.waker().wake_by_ref();
             Poll::Pending
         }
     }
+}
 
-    fn stack_packet(packet: &UdpPacket) -> io::Result<StackUdpPacket> {
-        match (&packet.src_addr, &packet.dst_addr) {
-            (SocksAddr::Ip(source), SocksAddr::Ip(destination)) =>
-                Ok((packet.data.clone(), *source, *destination).into()),
-            _ => Err(io::Error::new(io::ErrorKind::InvalidInput, "TUN UDP reply requires IP addresses")),
-        }
-    }
-
-    fn send_batch(&mut self, batch: &PacketBatch) -> BatchResult {
-        let mut mapping_error = None;
-        for packet in batch.packets() {
-            match Self::stack_packet(packet) {
-                Ok(packet) => self.outgoing.push(packet),
-                Err(error) => { mapping_error = Some(error); break; }
-            }
-        }
-        let result = self.writer.send_batch(&self.outgoing);
-        self.outgoing.clear();
+pub(crate) fn submit_udp_replies(writer: &SplitWrite, mut packets: &mut [UdpPacket]) -> io::Result<()> {
+    while !packets.is_empty() {
+        let result = writer.send_batch_mapped(packets, |packet| {
+            let (SocksAddr::Ip(source), SocksAddr::Ip(destination)) =
+                (&packet.src_addr, &packet.dst_addr)
+            else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput, "TUN UDP reply requires IP addresses",
+                ));
+            };
+            Ok((mem::take(&mut packet.data), *source, *destination).into())
+        });
         if result.dropped > 0 { debug!(dropped = result.dropped, "TUN UDP output queue full"); }
-        let error = result.error.or(mapping_error);
-        let fatal = error.as_ref().is_some_and(|error| error.kind() == io::ErrorKind::BrokenPipe);
-        // Congestion drops are consumed, not retried. An error belongs only to
-        // the next packet; later valid packets remain in the caller's batch.
-        BatchResult { sent: result.sent + result.dropped, error, fatal }
-    }
-}
-
-impl Stream for TunDatagram {
-    type Item = UdpPacket;
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<UdpPacket>> {
-        let this = self.get_mut();
-        this.poll_dns(cx);
-        for _ in 0..MAX_BATCH_PACKETS {
-            match ready!(this.reader.poll_recv(cx)) {
-                Some(packet) => if let Some(packet) = this.accept(packet) {
-                    return Poll::Ready(Some(packet));
-                },
-                None => return Poll::Ready(None),
-            }
-        }
-        cx.waker().wake_by_ref();
-        Poll::Pending
-    }
-}
-
-impl Sink<UdpPacket> for TunDatagram {
-    type Error = io::Error;
-    fn poll_ready(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Poll::Ready(Ok(()))
-    }
-    fn start_send(mut self: Pin<&mut Self>, packet: UdpPacket) -> io::Result<()> {
-        // The netstack writer never waits: submit or deliberately drop here,
-        // so a Sink error cannot be attributed to a later batch's first packet.
-        let packet = Self::stack_packet(&packet)?;
-        let result = self.writer.send_batch(&[packet]);
-        if result.dropped > 0 { trace!("TUN UDP output queue full, dropped reply"); }
         match result.error {
-            Some(error) => Err(error),
-            None => Ok(()),
+            Some(error) if error.kind() == io::ErrorKind::BrokenPipe => return Err(error),
+            Some(error) => {
+                debug!("failed to send TUN UDP reply: {error}");
+                packets = &mut packets[result.sent + 1..];
+            }
+            None => break,
         }
     }
-    fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Poll::Ready(Ok(()))
-    }
-    fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        self.poll_flush(cx)
-    }
-}
-
-impl DatagramBatch for TunDatagram {
-    fn poll_send_batch(&mut self, _: &mut Context<'_>, batch: &mut PacketBatch) -> Poll<BatchResult> {
-        Poll::Ready(self.send_batch(batch))
-    }
-    fn poll_recv_batch(&mut self, cx: &mut Context<'_>, packets: &mut Vec<UdpPacket>) -> Poll<Option<()>> {
-        self.receive(cx, packets)
-    }
+    Ok(())
 }
 
 #[cfg(test)]

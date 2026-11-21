@@ -8,12 +8,14 @@
 //! logical addresses and attribute traffic, independently of protocol policy.
 //! These local guarantees do not imply that an upstream server or outer NAT
 //! provides an endpoint-independent public mapping or filtering policy.
-use crate::proxy::datagram::batch::MAX_BATCH_PACKETS;
 use inbound::InboundIo;
 use replies::ReplyTarget;
 #[cfg(feature = "tun")]
 use association::direct::DirectPath;
-use futures::future::poll_fn as poll_batch;
+#[cfg(feature = "tun")]
+use crate::proxy::tun::TunDatagram;
+#[cfg(feature = "tun")]
+use tokio_util::sync::CancellationToken;
 pub(crate) mod association;
 mod routes;
 mod inbound;
@@ -223,15 +225,55 @@ impl Dispatcher {
         &self, sess: Session, udp_inbound: AnyInboundDatagram,
     ) -> impl Future<Output = tokio::sync::oneshot::Sender<u8>> + Send + '_ {
         let span = info_span!("dispatch_datagram", trace_id = sess.id);
-        self.dispatch_datagram_inner(sess, udp_inbound, #[cfg(feature = "tun")] None).instrument(span)
+        async move {
+            let (replies, reply_rx) = replies::channel(UDP_CHANNEL_CAPACITY);
+            let (ctx, closed_rx) =
+                self.udp_dispatch_context(&sess, replies.into(), #[cfg(feature = "tun")] None);
+            let (close_sender, mut close_receiver) = tokio::sync::oneshot::channel();
+            let sniffer = self.sniffer.clone();
+            let allow_quic = self.allow_quic.clone();
+            // A connected inbound already isolates one client; wide UDP listeners
+            // partition their route caches so different clients progress in parallel.
+            let sharded = sess.source.port() == 0;
+            tokio::spawn(async move {
+                let mut local = InboundIo::new(udp_inbound, reply_rx);
+                if !sharded {
+                    tokio::select! {
+                        _ = &mut close_receiver => {},
+                        _ = routes::run(sess, ctx, sniffer, allow_quic, local, closed_rx) => {},
+                    }
+                    return;
+                }
+                let shards = RouteShards::spawn(sess, ctx, sniffer, allow_quic, DEFAULT_QUEUE_LIMITS);
+                tokio::select! {
+                    _ = &mut close_receiver => {},
+                    _ = shards.receive(closed_rx, |cx, batch| local.poll_recv_batch(cx, batch)) => {},
+                }
+            }.instrument(tracing::Span::current()));
+            close_sender
+        }.instrument(span)
     }
 
     #[cfg(feature = "tun")]
     pub(crate) async fn dispatch_tun_datagram(&self, sess: Session,
-        udp_inbound: AnyInboundDatagram, direct: Arc<DirectPath>,
-    ) -> tokio::sync::oneshot::Sender<u8> {
+        mut inbound: TunDatagram, direct: Arc<DirectPath>,
+    ) {
         let span = info_span!("dispatch_datagram", trace_id = sess.id);
-        self.dispatch_datagram_inner(sess, udp_inbound, Some(direct)).instrument(span).await
+        async move {
+            let writer = inbound.reply_writer();
+            let closed = CancellationToken::new();
+            let _close_workers = closed.clone().drop_guard();
+            let replies = ReplyTarget::Tun { writer: writer.clone(), closed };
+            let (ctx, closed_flows) = self.udp_dispatch_context(&sess, replies, Some(direct));
+            let shards = RouteShards::spawn(
+                sess, ctx, self.sniffer.clone(), self.allow_quic.clone(), DEFAULT_QUEUE_LIMITS,
+            );
+            tokio::select! {
+                biased;
+                _ = writer.closed() => {},
+                _ = shards.receive(closed_flows, |cx, batch| inbound.receive(cx, batch)) => {},
+            }
+        }.instrument(span).await
     }
 
     fn udp_dispatch_context(
@@ -251,47 +293,6 @@ impl Dispatcher {
             replies, session_semaphore: self.udp_session_semaphore.clone(), associations,
         };
         (ctx, closed_rx)
-    }
-
-    async fn dispatch_datagram_inner(
-        &self, sess: Session, udp_inbound: AnyInboundDatagram,
-        #[cfg(feature = "tun")] direct: Option<Arc<DirectPath>>,
-    ) -> tokio::sync::oneshot::Sender<u8> {
-        let (replies, reply_rx) = replies::channel(UDP_CHANNEL_CAPACITY);
-        let (ctx, mut closed_rx) =
-            self.udp_dispatch_context(&sess, replies.into(), #[cfg(feature = "tun")] direct);
-        let (close_sender, mut close_receiver) = tokio::sync::oneshot::channel();
-        let sniffer = self.sniffer.clone();
-        let allow_quic = self.allow_quic.clone();
-        // A connected inbound already isolates one client; wide UDP listeners
-        // partition their route caches so different clients progress in parallel.
-        let sharded = sess.source.port() == 0;
-        tokio::spawn(async move {
-            let mut local = InboundIo::new(udp_inbound, reply_rx);
-            if !sharded {
-                tokio::select! {
-                    _ = &mut close_receiver => {},
-                    _ = routes::run(sess, ctx, sniffer, allow_quic, local, closed_rx) => {},
-                }
-                return;
-            }
-            let shards = RouteShards::spawn(sess, ctx, sniffer, allow_quic, DEFAULT_QUEUE_LIMITS);
-            let mut inbound_batch = Vec::with_capacity(MAX_BATCH_PACKETS);
-            loop {
-                tokio::select! {
-                    _ = &mut close_receiver => break,
-                    Some(closed) = closed_rx.recv() => {
-                        shards.flow_closed(closed);
-                    }
-                    result = poll_batch(|cx| local.poll_recv_batch(cx, &mut inbound_batch)) => {
-                        let Some(()) = result else { break; };
-                        if !shards.ingress.send_batch(inbound_batch.drain(..)) { break; }
-                        tokio::task::consume_budget().await;
-                    }
-                }
-            }
-        }.instrument(tracing::Span::current()));
-        close_sender
     }
 
 }

@@ -719,6 +719,65 @@ async fn proxy_shared_association_keeps_flow_fast_path_and_group_selection() {
     }
 }
 
+#[cfg(feature = "tun")]
+#[tokio::test]
+async fn tun_udp_proxy_replies_reach_netstack_and_close_with_either_side() {
+    use clash_netstack::{UdpSocket as StackUdpSocket, parse_udp_packet};
+    use tokio::{io::AsyncReadExt, spawn, sync::mpsc, time::{sleep, timeout}};
+    use crate::{config::internal::config::DnsHijack, proxy::tun::TunDatagram};
+    use super::association::tests::{outbound, reply, request};
+
+    for close_output in [true, false] {
+        timeout(Duration::from_secs(2), async {
+            let (leaf, _, mut servers) = outbound();
+            let dispatcher = test_dispatcher_with_leaf(
+                OutboundType::Direct, OutboundNode::Protocol(leaf),
+            ).await;
+            let (upload, reader) = mpsc::channel(4);
+            let (writer, mut output) = mpsc::channel(1);
+            let datagram = TunDatagram::new(
+                StackUdpSocket::new(reader, writer), dispatcher.resolver.clone(),
+                DnsHijack::Disabled, false, Arc::new(Vec::new()),
+            );
+            let sess = Session { network: Network::Udp, typ: Type::Tun, ..Session::default() };
+            let manager = dispatcher.manager.clone();
+            let task = AbortOnDropHandle::new(spawn(async move {
+                dispatcher.dispatch_tun_datagram(sess, datagram, DirectPath::integrated(None)).await;
+            }));
+
+            let client: SocketAddr = "192.0.2.1:12345".parse().unwrap();
+            let remote: SocketAddr = "198.51.100.1:30001".parse().unwrap();
+            upload.send((Bytes::from_static(b"upload"), client, remote).into()).await.unwrap();
+            let mut server = servers.recv().await.unwrap();
+            let sent = request(&mut server).await;
+            assert_eq!(sent.dst_addr, remote.into());
+            assert_eq!(sent.data, b"upload"[..]);
+
+            reply(&mut server, &remote.into(), b"download").await;
+            let packet = output.recv().await.unwrap();
+            let (source, destination, payload) = parse_udp_packet(packet.data()).unwrap();
+            assert_eq!((source, destination), (remote, client));
+            assert_eq!(&packet.data()[payload], b"download");
+
+            assert!(!manager.active_connections_snapshot().is_empty());
+            if close_output {
+                drop(output);
+                task.await.unwrap();
+                assert!(upload.is_closed());
+            } else {
+                drop(upload);
+                task.await.unwrap();
+                assert!(output.recv().await.is_none());
+            }
+            // The outbound transport belongs to the association worker.
+            assert_eq!(server.read(&mut [0]).await.unwrap(), 0);
+            while !manager.active_connections_snapshot().is_empty() {
+                sleep(Duration::from_millis(1)).await;
+            }
+        }).await.unwrap();
+    }
+}
+
 #[tokio::test]
 async fn nested_selector_direct_preserves_peer_source() {
     check_full_cone_relay(OutboundType::Selector).await;

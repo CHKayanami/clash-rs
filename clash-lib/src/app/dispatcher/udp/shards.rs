@@ -5,15 +5,17 @@ use std::{
 };
 
 use futures::stream::poll_fn;
+use futures::future::poll_fn as poll_batch;
 use tokio::sync::mpsc::{self, error::TrySendError};
+use tokio::task::consume_budget;
 use tokio_util::task::AbortOnDropHandle;
-use tracing::{Instrument, Span, debug};
+use tracing::{Instrument, Span, debug, warn};
 
 use super::{QueueDrops, UDP_ROUTE_SHARDS, UdpDispatchContext, UdpQueueLimits,
     association::FlowClosed, routes};
 use crate::{
     app::sniffer::ArcSniffer,
-    proxy::datagram::UdpPacket,
+    proxy::datagram::{UdpPacket, batch::MAX_BATCH_PACKETS},
     session::{Session, SocksAddr},
 };
 
@@ -185,6 +187,29 @@ impl RouteShards {
     pub(super) fn flow_closed(&self, flow: FlowClosed) {
         let _ = self.closed[route_shard(flow.source)].send(flow);
     }
+
+    pub(super) async fn receive(
+        &self, mut closed_flows: mpsc::UnboundedReceiver<FlowClosed>,
+        mut receive: impl FnMut(&mut Context<'_>, &mut Vec<UdpPacket>) -> Poll<Option<()>>,
+    ) {
+        let mut batch = Vec::with_capacity(MAX_BATCH_PACKETS);
+        loop {
+            tokio::select! {
+                flow = closed_flows.recv() => match flow {
+                    Some(flow) => self.flow_closed(flow),
+                    None => {
+                        warn!("UDP flow notifications closed");
+                        break;
+                    }
+                },
+                result = poll_batch(|cx| receive(cx, &mut batch)) => {
+                    let Some(()) = result else { break; };
+                    if !self.ingress.send_batch(batch.drain(..)) { break; }
+                    consume_budget().await;
+                }
+            }
+        }
+    }
 }
 
 fn route_shard(source: SocketAddr) -> usize {
@@ -203,6 +228,22 @@ mod tests {
     use futures::task::noop_waker_ref;
 
     use super::*;
+
+    #[tokio::test]
+    async fn receive_stops_when_flow_notifications_close_while_ingress_is_idle() {
+        use std::time::Duration;
+        use tokio::time::timeout;
+
+        let shards = RouteShards {
+            ingress: UdpRouteIngress { shards: Vec::new().into(), drops: None },
+            closed: Vec::new(),
+            _tasks: Vec::new(),
+        };
+        let (sender, receiver) = mpsc::unbounded_channel();
+        drop(sender);
+        timeout(Duration::from_secs(1), shards.receive(receiver, |_, _| Poll::Pending))
+            .await.unwrap();
+    }
 
     #[test]
     fn ingress_drops_full_shard_packets_without_stalling_others() {

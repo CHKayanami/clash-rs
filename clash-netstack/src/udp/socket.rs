@@ -135,6 +135,10 @@ pub struct SplitWrite {
 }
 
 impl SplitWrite {
+    pub async fn closed(&self) {
+        self.send.closed().await;
+    }
+
     /// Submit without waiting; a saturated queue deliberately drops the packet.
     /// The async signature is retained for compatibility and does not yield.
     /// A closed outbound channel returns `io::ErrorKind::BrokenPipe`.
@@ -151,21 +155,46 @@ impl SplitWrite {
     /// Submit a contiguous prefix, stopping at the first invalid packet.
     /// Queue saturation drops the unsubmitted suffix without blocking reads.
     /// `sent + dropped` packets are consumed; an error belongs to the next one.
-    pub fn send_batch(&mut self, packets: &[UdpPacket]) -> UdpSendResult {
+    pub fn send_batch(&self, packets: &[UdpPacket]) -> UdpSendResult {
+        self.send_encoded_batch(packets.len(), |index| {
+            let packet = &packets[index];
+            if self.output_offload {
+                UdpPacket::from((packet.data.clone(), packet.local_addr, packet.remote_addr))
+                    .into_parts(None, true)
+            } else {
+                packet.encode()
+            }
+        })
+    }
+
+    /// Map and encode each datagram after reserving its output slot.
+    /// The mapper may take ownership of payloads for device offload.
+    pub fn send_batch_mapped<T>(
+        &self, packets: &mut [T], mut map: impl FnMut(&mut T) -> io::Result<UdpPacket>,
+    ) -> UdpSendResult {
+        self.send_encoded_batch(packets.len(), |index| {
+            let packet = map(&mut packets[index])?;
+            if self.output_offload { packet.into_parts(None, true) } else { packet.encode() }
+        })
+    }
+
+    fn send_encoded_batch(
+        &self, count: usize, mut encode: impl FnMut(usize) -> io::Result<Packet>,
+    ) -> UdpSendResult {
         let mut result = UdpSendResult { sent: 0, dropped: 0, error: None };
         if self.send.is_closed() {
             result.error = Some(io::Error::new(io::ErrorKind::BrokenPipe, "packet outbound channel closed"));
             return result;
         }
-        if packets.is_empty() { return result; }
-        let mut permits = self.send.try_reserve_many(packets.len()).ok();
-        for (index, packet) in packets.iter().enumerate() {
+        if count == 0 { return result; }
+        let mut permits = self.send.try_reserve_many(count).ok();
+        for index in 0..count {
             let permit = match permits.as_mut().and_then(Iterator::next) {
                 Some(permit) => permit,
                 None => match self.send.try_reserve() {
                     Ok(permit) => permit,
                     Err(mpsc::error::TrySendError::Full(_)) => {
-                        result.dropped = packets.len() - index;
+                        result.dropped = count - index;
                         break;
                     }
                     Err(mpsc::error::TrySendError::Closed(_)) => {
@@ -174,10 +203,7 @@ impl SplitWrite {
                     }
                 },
             };
-            let encoded = if self.output_offload {
-                UdpPacket::from((packet.data.clone(), packet.local_addr, packet.remote_addr)).into_parts(None, true)
-            } else { packet.encode() };
-            match encoded {
+            match encode(index) {
                 Ok(packet) => { permit.send(packet); result.sent += 1; }
                 Err(error) => { result.error = Some(error); break; }
             }
@@ -407,7 +433,7 @@ mod batch_tests {
             let source: SocketAddr = source.parse().unwrap();
             let target: SocketAddr = target.parse().unwrap();
             let (send, mut receive) = mpsc::channel(4);
-            let mut writer = SplitWrite { send, output_offload: false };
+            let writer = SplitWrite { send, output_offload: false };
             let packets = [
                 UdpPacket::from((Bytes::new(), source, target)),
                 UdpPacket::from((Bytes::from_static(b"odd"), source, target)),
@@ -431,7 +457,7 @@ mod batch_tests {
     #[tokio::test]
     async fn batches_keep_packet_capacity_and_do_not_block_on_full_queue() {
         let (send, mut receive) = mpsc::channel(2);
-        let mut writer = SplitWrite { send, output_offload: false };
+        let writer = SplitWrite { send, output_offload: false };
         let packets: Vec<_> = (0..4).map(|i| UdpPacket::from((
             Bytes::from(vec![i]), "127.0.0.1:1".parse().unwrap(), "127.0.0.2:2".parse().unwrap(),
         ))).collect();
@@ -455,7 +481,7 @@ mod batch_tests {
         let (send, mut receive) = mpsc::channel(4);
         let competing = send.clone();
         let _held = competing.try_reserve_many(2).unwrap();
-        let mut writer = SplitWrite { send, output_offload: false };
+        let writer = SplitWrite { send, output_offload: false };
         let packets: Vec<_> = (0..4).map(|i| UdpPacket::from((
             Bytes::from(vec![i]), "127.0.0.1:1".parse().unwrap(), "127.0.0.2:2".parse().unwrap(),
         ))).collect();
@@ -473,7 +499,7 @@ mod batch_tests {
     #[tokio::test]
     async fn invalid_packet_does_not_discard_valid_batch_suffix() {
         let (send, mut receive) = mpsc::channel(2);
-        let mut writer = SplitWrite { send, output_offload: false };
+        let writer = SplitWrite { send, output_offload: false };
         let valid = || UdpPacket::from((Bytes::from_static(b"ok"),
             "127.0.0.1:1".parse().unwrap(), "127.0.0.2:2".parse().unwrap()));
         let invalid = UdpPacket::from((Bytes::new(),

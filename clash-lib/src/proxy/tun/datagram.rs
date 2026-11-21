@@ -2,7 +2,7 @@ mod adapter;
 mod direct;
 pub(super) use direct::encode as encode_direct_reply;
 use crate::app::dispatcher::udp::association::direct::DirectPath;
-use adapter::TunDatagram;
+pub(crate) use adapter::{TunDatagram, submit_udp_replies};
 use std::{sync::Arc, time::Duration};
 use ipnet::IpNet;
 use tracing::{debug, warn};
@@ -33,15 +33,11 @@ pub(crate) async fn handle_inbound_datagram(
         udp_timeout: udp_timeout.map(Duration::from_secs),
         ..Default::default()
     };
-    let (datagram, finished) = TunDatagram::new(
+    let datagram = TunDatagram::new(
         socket, resolver, dns_hijack, strict_route, exclude_routes,
     );
-    // The dispatcher owns both directions and the adapter's DNS tasks. Dropping
-    // the close sender on cancellation stops that entire inbound namespace.
-    let closer = dispatcher.dispatch_tun_datagram(sess, Box::new(datagram), direct).await;
     debug!("tun UDP ready");
-    let _ = finished.await;
-    let _ = closer.send(0);
+    dispatcher.dispatch_tun_datagram(sess, datagram, direct).await;
     warn!("TUN UDP dispatcher stopped");
 }
 

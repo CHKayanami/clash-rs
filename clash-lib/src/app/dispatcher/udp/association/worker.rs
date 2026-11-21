@@ -6,11 +6,17 @@ use crate::{common::io::datagram_relay::RelayContext,
     proxy::datagram::UdpPacket, session::SocksAddr};
 use super::{AssociationConfig, Outgoing, Registration, state::AssociationState};
 use super::super::replies::{ReplyTarget, Sender};
+#[cfg(feature = "tun")]
+use clash_netstack::SplitWrite;
+#[cfg(feature = "tun")]
+use crate::proxy::tun::submit_udp_replies;
 #[cfg(all(target_os = "linux", any(feature = "tproxy", feature = "ebpf")))]
 use crate::proxy::utils::transparent_reply::ReplyWriter;
 
 enum Replies {
     Queued(Sender),
+    #[cfg(feature = "tun")]
+    Tun(SplitWrite),
     #[cfg(all(target_os = "linux", any(feature = "tproxy", feature = "ebpf")))]
     Transparent(ReplyWriter),
 }
@@ -28,6 +34,8 @@ impl AssociationRelay {
     ) -> Self {
         let replies = match &config.replies {
             ReplyTarget::Queued(sender) => Replies::Queued(sender.clone()),
+            #[cfg(feature = "tun")]
+            ReplyTarget::Tun { writer, .. } => Replies::Tun(writer.clone()),
             #[cfg(all(target_os = "linux", any(feature = "tproxy", feature = "ebpf")))]
             ReplyTarget::Transparent { sockets, .. } => Replies::Transparent(ReplyWriter::new(sockets.clone())),
         };
@@ -45,6 +53,8 @@ impl RelayContext for AssociationRelay {
                 let _ = cx;
                 Poll::Ready(())
             }
+            #[cfg(feature = "tun")]
+            Replies::Tun(_) => Poll::Ready(()),
             #[cfg(all(target_os = "linux", any(feature = "tproxy", feature = "ebpf")))]
             Replies::Transparent(writer) => writer.poll_send(cx),
         }
@@ -67,6 +77,12 @@ impl RelayContext for AssociationRelay {
         packets.retain_mut(|packet| self.state.map_received(packet, self.now));
         match &mut self.replies {
             Replies::Queued(sender) => reply_result(sender.send_batch(mem::take(packets))),
+            #[cfg(feature = "tun")]
+            Replies::Tun(writer) => {
+                let result = submit_udp_replies(writer, packets);
+                packets.clear();
+                reply_result(result)
+            }
             #[cfg(all(target_os = "linux", any(feature = "tproxy", feature = "ebpf")))]
             Replies::Transparent(writer) => {
                 writer.submit(packets);

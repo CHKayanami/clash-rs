@@ -7,7 +7,9 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use crate::proxy::datagram::{UdpPacket, batch::{PacketBatch, MAX_BATCH_PACKETS}};
 #[cfg(all(target_os = "linux", any(feature = "tproxy", feature = "ebpf")))]
 use crate::proxy::utils::transparent_reply::ReplySockets;
-#[cfg(all(target_os = "linux", any(feature = "tproxy", feature = "ebpf")))]
+#[cfg(feature = "tun")]
+use clash_netstack::SplitWrite;
+#[cfg(any(feature = "tun", all(target_os = "linux", any(feature = "tproxy", feature = "ebpf"))))]
 use tokio_util::sync::CancellationToken;
 
 const MAX_PACKET_BYTES: usize = 65535;
@@ -15,6 +17,8 @@ const MAX_PACKET_BYTES: usize = 65535;
 #[derive(Clone)]
 pub(crate) enum ReplyTarget {
     Queued(Sender),
+    #[cfg(feature = "tun")]
+    Tun { writer: SplitWrite, closed: CancellationToken },
     #[cfg(all(target_os = "linux", any(feature = "tproxy", feature = "ebpf")))]
     Transparent { sockets: Arc<ReplySockets>, closed: CancellationToken },
 }
@@ -27,6 +31,8 @@ impl ReplyTarget {
     pub async fn closed(&self) {
         match self {
             Self::Queued(sender) => sender.closed().await,
+            #[cfg(feature = "tun")]
+            Self::Tun { closed, .. } => closed.cancelled().await,
             #[cfg(all(target_os = "linux", any(feature = "tproxy", feature = "ebpf")))]
             Self::Transparent { closed, .. } => closed.cancelled().await,
         }

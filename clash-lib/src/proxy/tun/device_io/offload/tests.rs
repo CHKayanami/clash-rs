@@ -319,15 +319,17 @@ fn adjacent_gro_groups_merge_only_before_the_first_short_tail() {
 async fn proxy_udp_reply_preserves_payload_and_partial_checksum_through_stack_output() {
     use std::net::SocketAddr;
     use futures::StreamExt;
-    use clash_netstack::{NetStack, UdpPacket as StackPacket};
+    use clash_netstack::NetStack;
+    use crate::proxy::{datagram::UdpPacket, tun::submit_udp_replies};
     let source: SocketAddr = "192.0.2.1:1234".parse().unwrap();
     let destination: SocketAddr = "192.0.2.2:4321".parse().unwrap();
     let payload = Bytes::from(vec![0x5a; 1200]);
     let (stack, _, mut udp) = NetStack::new_with_mtu(false, false, 1500).unwrap();
     udp.enable_output_offload();
-    let (_, mut output) = stack.split(); let (_, mut sender) = udp.split();
-    let result = sender.send_batch(&[StackPacket::from((payload.clone(), source, destination))]);
-    assert_eq!(result.sent, 1); assert!(result.error.is_none());
+    let (_, mut output) = stack.split(); let (_, sender) = udp.split();
+    let mut replies = [UdpPacket::new(payload.clone(), source.into(), destination.into())];
+    submit_udp_replies(&sender, &mut replies).unwrap();
+    assert!(replies[0].data.is_empty());
     let packet = output.next().await.unwrap().unwrap();
     assert!(packet.udp_checksum_partial());
     assert_eq!(packet.parts().unwrap().1.as_ptr(), payload.as_ptr(), "normal output tracing must not flatten the payload");

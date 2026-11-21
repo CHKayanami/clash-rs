@@ -5,6 +5,7 @@ mod mobile;
 #[cfg(any(target_os = "android", target_os = "linux", all(test, unix)))]
 mod icmp;
 mod datagram;
+pub(crate) use datagram::{TunDatagram, submit_udp_replies};
 mod device_io;
 mod device_loop;
 #[cfg(target_os = "macos")]

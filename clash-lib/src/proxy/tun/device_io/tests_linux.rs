@@ -105,7 +105,7 @@ async fn kernel_udp_roundtrip(offload: bool) {
         }
         let (stack, _, udp) = NetStack::new();
         let (_, mut stack_read) = stack.split();
-        let (_, mut send) = udp.split();
+        let (_, send) = udp.split();
         let replies: Vec<_> = (0..16).map(|i| UdpPacket::from((
             Bytes::from(vec![i; if i == 15 { 0 } else { 64 }]), target, client.local_addr().unwrap(),
         ))).collect();
