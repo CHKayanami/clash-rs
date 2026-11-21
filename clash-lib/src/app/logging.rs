@@ -1,26 +1,15 @@
 use crate::def::LogLevel;
 use anyhow::anyhow;
-#[cfg(feature = "telemetry")]
-use opentelemetry::trace::TracerProvider;
-#[cfg(feature = "telemetry")]
-use opentelemetry_otlp::{Protocol, WithExportConfig};
-#[cfg(feature = "telemetry")]
-use opentelemetry_semantic_conventions::{
-    SCHEMA_URL,
-    attribute::{DEPLOYMENT_ENVIRONMENT_NAME, SERVICE_VERSION},
-};
 use serde::Serialize;
 use std::{io::IsTerminal, sync::OnceLock};
 use tokio::sync::broadcast::Sender;
 use tracing::level_filters::LevelFilter;
 use tracing_log::LogTracer;
-#[cfg(feature = "telemetry")]
-use tracing_opentelemetry::OpenTelemetryLayer;
 #[cfg(target_os = "ios")]
 use tracing_oslog::OsLogger;
 use tracing_appender::non_blocking::{ErrorCounter, WorkerGuard};
 use tracing_subscriber::{
-    EnvFilter, Layer, filter::filter_fn, prelude::*, registry::Registry, reload,
+    EnvFilter, Layer, prelude::*, registry::Registry, reload,
 };
 
 impl From<LogLevel> for LevelFilter {
@@ -222,10 +211,6 @@ pub struct LoggingGuard {
     stdout_errors: ErrorCounter,
     _file_appender: Option<WorkerGuard>,
     _stdout_appender: WorkerGuard,
-    #[cfg(feature = "telemetry")]
-    _tracing_chrome: Option<tracing_chrome::FlushGuard>,
-    #[cfg(feature = "telemetry")]
-    _tracer_provider: Option<opentelemetry_sdk::trace::SdkTracerProvider>,
 }
 
 static LOG_FILTER: OnceLock<reload::Handle<EnvFilter, Registry>> = OnceLock::new();
@@ -239,18 +224,13 @@ pub fn set_log_level(level: LogLevel) -> anyhow::Result<()> {
 }
 
 fn log_filter(level: LogLevel) -> EnvFilter {
-    let filter = if matches!(level, LogLevel::Silent) {
+    if matches!(level, LogLevel::Silent) {
         EnvFilter::new("off")
     } else {
         EnvFilter::new(format!(
             "warn,clash={level},clash_shadowsocks={level},clash_dns={level},clash_netstack={level}"
         ))
-    };
-    #[cfg(all(feature = "telemetry", tokio_unstable))]
-    let filter = filter
-        .add_directive("tokio=trace".parse().unwrap())
-        .add_directive("runtime=trace".parse().unwrap());
-    filter
+    }
 }
 
 pub fn setup_logging(
@@ -278,12 +258,6 @@ impl LoggingGuard {
 
 impl Drop for LoggingGuard {
     fn drop(&mut self) {
-        #[cfg(feature = "telemetry")]
-        if let Some(provider) = self._tracer_provider.take() {
-            if let Err(e) = provider.shutdown() {
-                eprintln!("Failed to shut down telemetry: {e}");
-            }
-        }
         let (file_dropped, stdout_dropped) = self.dropped_lines();
         if file_dropped != 0 || stdout_dropped != 0 {
             eprintln!(
@@ -335,78 +309,8 @@ fn setup_logging_inner(
         (None, None)
     };
 
-    #[cfg(feature = "telemetry")]
-    let (tracing_chrome, tracing_chrome_g) = if cfg!(feature = "telemetry") {
-        let builder = tracing_chrome::ChromeLayerBuilder::new();
-        let (layer, guard) = builder.build();
-        (Some(layer), Some(guard))
-    } else {
-        (None, None)
-    };
-
-    #[cfg(feature = "telemetry")]
-    let exporter = opentelemetry_otlp::SpanExporter::builder()
-        .with_http()
-        .with_protocol(Protocol::HttpBinary)
-        .build()?;
-
-    #[cfg(feature = "telemetry")]
-    let tracer_provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
-        // Customize sampling strategy
-        .with_sampler(opentelemetry_sdk::trace::Sampler::ParentBased(Box::new(opentelemetry_sdk::trace::Sampler::TraceIdRatioBased(
-            if cfg!(debug_assertions) {
-                1.0 // 100% sampling in development
-            } else {
-                0.1 // 10% sampling in production
-            },
-        ))))
-        .with_id_generator(opentelemetry_sdk::trace::RandomIdGenerator::default())
-        .with_resource(opentelemetry_sdk::Resource::builder()
-            .with_service_name(env!("CARGO_PKG_NAME"))
-            .with_schema_url(
-                [
-                    opentelemetry::KeyValue::new(SERVICE_VERSION, env!("CARGO_PKG_VERSION")),
-                    opentelemetry::KeyValue::new(DEPLOYMENT_ENVIRONMENT_NAME,  if cfg!(debug_assertions) {
-                        "development"
-                    } else {
-                        "production"
-                    }),
-            ],
-            SCHEMA_URL,
-        )
-        .build())
-        .with_batch_exporter(exporter)
-        .build();
-    #[cfg(feature = "telemetry")]
-    let tracer = tracer_provider.tracer("tracing-otel-subscriber");
-
-    #[cfg(all(feature = "telemetry", tokio_unstable))]
-    let filter = filter
-        .add_directive("tokio=trace".parse().unwrap())
-        .add_directive("runtime=trace".parse().unwrap());
     let (filter, filter_handle) = reload::Layer::new(filter);
     let subscriber = tracing_subscriber::registry().with(filter).with(TraceIdLayer);
-
-    // Collect and expose data about the Tokio runtime (tasks, threads, resources,
-    // etc.) — gated on tokio_unstable because console_subscriber panics at
-    // runtime if Tokio was compiled without --cfg tokio_unstable. When tests
-    // are run with RUSTFLAGS="--cfg docker_test", that env-var overrides
-    // .cargo/config.toml, so tokio_unstable is absent and the gate correctly
-    // excludes this code.
-    #[cfg(all(feature = "telemetry", tokio_unstable))]
-    let subscriber = subscriber.with(console_subscriber::spawn());
-    let exclude = filter_fn(|metadata| {
-        #[cfg(all(feature = "telemetry", tokio_unstable))]
-        {
-            !metadata.target().contains("tokio")
-                && !metadata.target().contains("runtime")
-        }
-        #[cfg(not(all(feature = "telemetry", tokio_unstable)))]
-        {
-            let _ = metadata;
-            true
-        }
-    });
 
     let format = time::macros::format_description!(
         "[year repr:last_two]-[month]-[day] [hour]:[minute]:[second].[subsecond digits:3]"
@@ -430,7 +334,6 @@ fn setup_logging_inner(
                     .with_level(true),
             ))
             .with_writer(x)
-            .with_filter(exclude.clone())
     });
     let (stdout_writer, stdout_guard) =
         tracing_appender::non_blocking::NonBlockingBuilder::default()
@@ -451,27 +354,12 @@ fn setup_logging_inner(
                 .with_level(true)
                 .with_thread_ids(cfg!(debug_assertions)),
         ))
-        .with_writer(stdout_writer)
-        .with_filter(exclude.clone());
+        .with_writer(stdout_writer);
 
-    let subscriber = {
-        #[cfg(feature = "telemetry")]
-        {
-            subscriber
-        .with(tracing_chrome)
-        .with(OpenTelemetryLayer::new(tracer))
-        .with(collector.with_filter(exclude.clone()))
+    let subscriber = subscriber
+        .with(collector)
         .with(log_to_file_layer)
-        .with(log_stdout_layer)
-        }
-        #[cfg(not(feature = "telemetry"))]
-        {
-            subscriber
-        .with(collector.with_filter(exclude.clone()))
-        .with(log_to_file_layer)
-        .with(log_stdout_layer)
-        }
-    };
+        .with(log_stdout_layer);
 
     #[cfg(target_os = "ios")]
     let subscriber =
@@ -487,10 +375,6 @@ fn setup_logging_inner(
         stdout_errors,
         _stdout_appender: stdout_guard,
         _file_appender: guard,
-        #[cfg(feature = "telemetry")]
-        _tracing_chrome: tracing_chrome_g,
-        #[cfg(feature = "telemetry")]
-        _tracer_provider: Some(tracer_provider),
     })
 }
 

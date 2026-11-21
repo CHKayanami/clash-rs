@@ -41,11 +41,6 @@ jobs:
           sudo apt-get install -y cmake libclang-dev protobuf-compiler
 
       # Build the binary that the tests will spawn as a subprocess.
-      # Do NOT use --all-features here: the `telemetry` feature enables
-      # console_subscriber and OpenTelemetry threads that deadlock with the
-      # main thread during crypto initialization when multiple instances start
-      # concurrently.  Default features already include shadowsocks, tuic,
-      # wireguard, and everything else needed for these tests.
       - name: Build clash-rs binary (release)
         run: cargo build --release --bin clash-rs
 

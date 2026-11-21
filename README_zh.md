@@ -34,7 +34,6 @@
 - ⚙️ **丰富的出站协议支持**：AnyTLS / Hysteria2 / Shadowquic / Shadowsocks / HTTP(S) / Socks5(TCP/UDP) / SSH / Tailscale / Tor(onion) / Trojan / TUIC / VLESS / VMess / WireGuard(userspace)，各协议分别支持 TCP / HTTP / WebSocket / H2 / gRPC / XHTTP 传输及 TLS / REALITY 安全层。
 - 🔀 **多样化入站模式**：HTTP、SOCKS5、Mixed、Shadowsocks、AnyTLS、Redir、TProxy、eBPF 以及 TUN 透明代理。
 - 🌍 **动态远程规则/节点加载**：支持订阅与 Rule-Provider 动态更新。
-- 🎵 **分布式追踪**：集成 Jaeger Tracing。
 
 ## 📡 协议支持
 

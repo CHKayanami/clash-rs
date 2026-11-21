@@ -34,7 +34,6 @@ A custom protocol, rule based network proxy software.
 - ⚙️ **Outbound Protocol Support**: AnyTLS/Hysteria2/Shadowquic/Shadowsocks/HTTP(S)/Socks5(TCP/UDP)/SSH/Tailscale/Tor(onion)/Trojan/TUIC/VLESS/VMess/WireGuard(userspace) outbounds, with protocol-specific TCP/HTTP/WebSocket/H2/gRPC/XHTTP transports and TLS/REALITY security.
 - 🔀 Multiple inbound modes: HTTP, SOCKS5, Mixed, Shadowsocks, AnyTLS, Redir, TProxy, eBPF, and TUN for transparent proxying.
 - 🌍 Dynamic remote rule/proxy loader.
-- 🎵 Tracing with Jaeger
 
 ## 📡 Protocol Support
 
