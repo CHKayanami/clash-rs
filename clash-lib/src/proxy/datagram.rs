@@ -1,15 +1,9 @@
 pub mod batch;
 pub mod segments;
 pub(crate) mod framed;
-#[cfg(any(
-    test,
-    all(target_os = "linux", any(feature = "tproxy", feature = "ebpf")),
-))]
+#[cfg(test)]
 mod channel;
-#[cfg(any(
-    test,
-    all(target_os = "linux", any(feature = "tproxy", feature = "ebpf")),
-))]
+#[cfg(test)]
 pub use channel::ChannelDatagram;
 use crate::session::SocksAddr;
 use std::{

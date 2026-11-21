@@ -79,7 +79,7 @@ async fn direct_data_keeps_fullcone_mapping_and_releases_weak_upload_cache() {
     let (incoming, _owner) = drive(path.clone(), target);
     let (fallback, mut fallback_rx) = replies::channel(64);
     let (events, _closed) = mpsc::unbounded_channel();
-    let pool = UdpAssociationPool::new(AssociationConfig { replies: fallback, direct: Some(path.clone()),
+    let pool = UdpAssociationPool::new(AssociationConfig { replies: fallback.into(), direct: Some(path.clone()),
         closed_flows: events, manager: manager.clone(), allow_quic: Arc::new(AtomicBool::new(true)),
         timeout: Duration::from_secs(60), capacity: Arc::new(Semaphore::new(64)) });
     let outbound: ProtocolOutbound = Arc::new(Handler::new("DIRECT")).into();
@@ -145,7 +145,7 @@ async fn fake_ip_upload_and_reply_use_the_established_projection() {
     let (fallback, _fallback_rx) = replies::channel(64);
     let (events, _closed) = mpsc::unbounded_channel();
     let allow_quic = Arc::new(AtomicBool::new(true));
-    let pool = UdpAssociationPool::new(AssociationConfig { replies: fallback, direct: Some(path.clone()),
+    let pool = UdpAssociationPool::new(AssociationConfig { replies: fallback.into(), direct: Some(path.clone()),
         closed_flows: events, manager: manager.clone(), allow_quic: allow_quic.clone(),
         timeout: Duration::from_secs(60), capacity: Arc::new(Semaphore::new(64)) });
     let outbound: ProtocolOutbound = Arc::new(Handler::new("DIRECT")).into();
@@ -184,7 +184,7 @@ async fn segmented_upload_preserves_boundaries_and_counts_partial_progress_once(
     let (incoming, _owner) = drive(path.clone(), returned);
     let (fallback, _fallback) = replies::channel(64);
     let (events, _events) = mpsc::unbounded_channel();
-    let pool = UdpAssociationPool::new(AssociationConfig { replies: fallback, direct: Some(path.clone()),
+    let pool = UdpAssociationPool::new(AssociationConfig { replies: fallback.into(), direct: Some(path.clone()),
         closed_flows: events, manager: manager.clone(), allow_quic: Arc::new(AtomicBool::new(true)),
         timeout: Duration::from_secs(60), capacity: Arc::new(Semaphore::new(64)) });
     let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -220,7 +220,7 @@ async fn interleaved_upload_batch_preserves_peer_order_and_flow_totals() {
     let (incoming, _owner) = drive(path.clone(), returned);
     let (fallback, _fallback) = replies::channel(64);
     let (events, _events) = mpsc::unbounded_channel();
-    let pool = UdpAssociationPool::new(AssociationConfig { replies: fallback, direct: Some(path.clone()),
+    let pool = UdpAssociationPool::new(AssociationConfig { replies: fallback.into(), direct: Some(path.clone()),
         closed_flows: events, manager: manager.clone(), allow_quic: Arc::new(AtomicBool::new(true)),
         timeout: Duration::from_secs(60), capacity: Arc::new(Semaphore::new(64)) });
     let outbound: ProtocolOutbound = Arc::new(Handler::new("DIRECT")).into();
@@ -262,7 +262,7 @@ async fn warm_owner_cache_observes_policy_and_close_without_holding_a_flow_lease
     let (fallback, _fallback) = replies::channel(64);
     let (events, _events) = mpsc::unbounded_channel();
     let allow_quic = Arc::new(AtomicBool::new(true));
-    let pool = UdpAssociationPool::new(AssociationConfig { replies: fallback, direct: Some(path.clone()),
+    let pool = UdpAssociationPool::new(AssociationConfig { replies: fallback.into(), direct: Some(path.clone()),
         closed_flows: events, manager: manager.clone(), allow_quic: allow_quic.clone(),
         timeout: Duration::from_secs(60), capacity: Arc::new(Semaphore::new(64)) });
     let sess = session("127.0.0.1:443".parse().unwrap());
@@ -294,7 +294,7 @@ async fn interleaved_clients_keep_each_sessions_order_and_completion_owner() {
     let (incoming, _owner) = drive(path.clone(), returned);
     let (fallback, _fallback) = replies::channel(64);
     let (events, _closed) = mpsc::unbounded_channel();
-    let pool = UdpAssociationPool::new(AssociationConfig { replies: fallback, direct: Some(path.clone()),
+    let pool = UdpAssociationPool::new(AssociationConfig { replies: fallback.into(), direct: Some(path.clone()),
         closed_flows: events, manager: manager.clone(), allow_quic: Arc::new(AtomicBool::new(true)),
         timeout: Duration::from_secs(60), capacity: Arc::new(Semaphore::new(64)) });
     let outbound: ProtocolOutbound = Arc::new(Handler::new("DIRECT")).into();
@@ -336,7 +336,7 @@ async fn unpublished_slot_falls_back_without_evicting_the_route() {
     let (incoming, _owner) = drive(path.clone(), target);
     let (fallback, _fallback_rx) = replies::channel(16);
     let (events, _closed) = mpsc::unbounded_channel();
-    let pool = UdpAssociationPool::new(AssociationConfig { replies: fallback, direct: Some(path.clone()),
+    let pool = UdpAssociationPool::new(AssociationConfig { replies: fallback.into(), direct: Some(path.clone()),
         closed_flows: events, manager: manager.clone(), allow_quic: Arc::new(AtomicBool::new(true)),
         timeout: Duration::from_secs(60), capacity: Arc::new(Semaphore::new(16)) });
     let outbound: ProtocolOutbound = Arc::new(Handler::new("DIRECT")).into();
@@ -385,7 +385,7 @@ async fn unrelated_flow_churn_keeps_warm_cache_entry_and_replaces_same_tuple() {
     let (incoming, _owner) = drive(path.clone(), target);
     let (fallback, _fallback_rx) = replies::channel(16);
     let (events, _closed) = mpsc::unbounded_channel();
-    let pool = UdpAssociationPool::new(AssociationConfig { replies: fallback, direct: Some(path.clone()),
+    let pool = UdpAssociationPool::new(AssociationConfig { replies: fallback.into(), direct: Some(path.clone()),
         closed_flows: events, manager: manager.clone(), allow_quic: Arc::new(AtomicBool::new(true)),
         timeout: Duration::from_secs(60), capacity: Arc::new(Semaphore::new(64)) });
     let outbound: ProtocolOutbound = Arc::new(Handler::new("DIRECT")).into();
@@ -446,7 +446,7 @@ async fn invalidation_overflow_falls_back_to_clearing_cache() {
     let (_incoming, _owner) = drive(path.clone(), target);
     let (fallback, _fallback_rx) = replies::channel(16);
     let (events, _closed) = mpsc::unbounded_channel();
-    let pool = UdpAssociationPool::new(AssociationConfig { replies: fallback, direct: Some(path.clone()),
+    let pool = UdpAssociationPool::new(AssociationConfig { replies: fallback.into(), direct: Some(path.clone()),
         closed_flows: events, manager: manager.clone(), allow_quic: Arc::new(AtomicBool::new(true)),
         timeout: Duration::from_secs(60), capacity: Arc::new(Semaphore::new(64)) });
     let outbound: ProtocolOutbound = Arc::new(Handler::new("DIRECT")).into();

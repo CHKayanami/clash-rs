@@ -37,7 +37,7 @@ impl Fixture {
         let manager = Manager::new();
         let pool = UdpAssociationPool::new(AssociationConfig {
             #[cfg(feature = "tun")] direct: None,
-            replies, closed_flows, manager: manager.clone(), allow_quic: Arc::new(AtomicBool::new(true)),
+            replies: replies.into(), closed_flows, manager: manager.clone(), allow_quic: Arc::new(AtomicBool::new(true)),
             timeout, capacity: Arc::new(Semaphore::new(64)),
         });
         Self { pool, replies: rx, events, manager }

@@ -1,207 +1,365 @@
-use std::{io, net::SocketAddr, num::NonZeroUsize, sync::Arc, time::Duration};
-use lru::LruCache;
-use tokio::{net::UdpSocket, time::Instant};
-use super::ToCanonical;
+use std::{
+    array::from_fn, collections::{HashSet, hash_map::RandomState}, future::Future, hash::BuildHasher, io,
+    net::SocketAddr, num::NonZeroUsize, ops::Deref, sync::{Arc, atomic::{AtomicU64, Ordering}},
+    task::{Context, Poll, ready}, time::Duration,
+};
 
-#[cfg(all(target_os = "linux", any(feature = "tproxy", feature = "ebpf")))]
-use tokio::{sync::mpsc, time::interval_at};
-#[cfg(all(target_os = "linux", any(feature = "tproxy", feature = "ebpf")))]
-use crate::proxy::{
-    datagram::{UdpPacket, batch::MAX_BATCH_PACKETS},
-    utils::udp_batch::{SendWorkspace, send_replies},
+use lru::LruCache;
+use parking_lot::Mutex;
+use tokio::{
+    net::UdpSocket, sync::{OwnedSemaphorePermit, Semaphore, watch},
+    task::consume_budget, time::{Instant, timeout_at},
+};
+use futures::future::BoxFuture;
+use tracing::warn;
+
+use super::{ToCanonical, udp_batch::try_send_replies};
+use crate::{
+    proxy::datagram::{UdpPacket, batch::{BatchResult, MAX_DIRECT_BATCH_PACKETS}},
+    session::SocksAddr,
 };
 
 const MAX_REPLY_SOCKETS: usize = 1024;
 const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
-#[cfg(all(target_os = "linux", any(feature = "tproxy", feature = "ebpf")))]
-const SWEEP_INTERVAL: Duration = Duration::from_secs(10);
+pub(crate) const SWEEP_INTERVAL: Duration = Duration::from_secs(10);
 
 struct Entry {
-    socket: Arc<UdpSocket>,
+    socket: Arc<ReplyFd>,
     last_used: Instant,
 }
 
 struct ReplySocketCache {
     sockets: LruCache<SocketAddr, Entry>,
-}
-
-impl Default for ReplySocketCache {
-    fn default() -> Self {
-        Self {
-            sockets: LruCache::new(NonZeroUsize::new(MAX_REPLY_SOCKETS).unwrap()),
-        }
-    }
+    creating: HashSet<SocketAddr>,
 }
 
 impl ReplySocketCache {
-    fn get_or_create(
-        &mut self,
-        source: SocketAddr,
-        now: Instant,
-        create: impl FnOnce() -> io::Result<UdpSocket>,
-    ) -> io::Result<Arc<UdpSocket>> {
-        let source = source.to_canonical();
+    fn get(&mut self, source: SocketAddr, now: Instant) -> Option<Arc<ReplyFd>> {
         if let Some(entry) = self.sockets.get_mut(&source) {
-            if now.saturating_duration_since(entry.last_used) < IDLE_TIMEOUT {
+            if now.saturating_duration_since(entry.last_used) < IDLE_TIMEOUT
+                || Arc::strong_count(&entry.socket) > 1 {
                 entry.last_used = now;
-                return Ok(entry.socket.clone());
+                return Some(entry.socket.clone());
             }
             // Remove the expired descriptor before opening its replacement.
             self.sockets.pop(&source);
         }
-        let socket = Arc::new(create()?);
-        self.sockets.put(
-            source,
-            Entry {
-                socket: socket.clone(),
-                last_used: now,
-            },
-        );
-        Ok(socket)
+        None
     }
 
-    #[cfg(any(test, all(target_os = "linux", any(feature = "tproxy", feature = "ebpf"))))]
     fn expire(&mut self, now: Instant) {
         while self
             .sockets
             .peek_lru()
-            .is_some_and(|(_, entry)| now.saturating_duration_since(entry.last_used) >= IDLE_TIMEOUT)
+            .is_some_and(|(_, entry)| {
+                now.saturating_duration_since(entry.last_used) >= IDLE_TIMEOUT
+                    && Arc::strong_count(&entry.socket) == 1
+            })
         {
             self.sockets.pop_lru();
         }
     }
 }
 
-#[cfg(all(target_os = "linux", any(feature = "tproxy", feature = "ebpf")))]
-pub(crate) async fn relay(
-    mut packets: mpsc::Receiver<UdpPacket>,
-    mut create_socket: impl FnMut(SocketAddr) -> io::Result<UdpSocket>,
-) {
-    let mut sockets = ReplySocketCache::default();
-    let mut workspace = SendWorkspace::default();
-    let mut batch = Vec::with_capacity(MAX_BATCH_PACKETS);
-    let mut sweep = interval_at(Instant::now() + SWEEP_INTERVAL, SWEEP_INTERVAL);
-    loop {
-        let count = tokio::select! {
-            count = packets.recv_many(&mut batch, MAX_BATCH_PACKETS) => count,
-            _ = sweep.tick() => { sockets.expire(Instant::now()); continue; },
-        };
-        if count == 0 {
-            break;
+enum ReplySocket {
+    Ready(Arc<ReplyFd>),
+    Pending(watch::Receiver<()>),
+}
+
+struct ReplySocketShard {
+    cache: Mutex<ReplySocketCache>,
+    slots: Arc<Semaphore>,
+    created: watch::Sender<()>,
+}
+
+struct ReplyFd {
+    socket: UdpSocket,
+    // Fields drop in declaration order: close the socket before returning
+    // its descriptor credit. Writers can outlive the cache entry.
+    _permit: OwnedSemaphorePermit,
+}
+
+impl Deref for ReplyFd {
+    type Target = UdpSocket;
+
+    fn deref(&self) -> &Self::Target { &self.socket }
+}
+
+impl ReplySocketShard {
+    fn new(capacity: NonZeroUsize) -> Self {
+        Self {
+            cache: Mutex::new(ReplySocketCache {
+                sockets: LruCache::new(capacity), creating: HashSet::new(),
+            }),
+            slots: Arc::new(Semaphore::new(capacity.get())),
+            created: watch::Sender::new(()),
         }
-        let now = Instant::now();
-        send_replies(&batch, &mut workspace, |source| {
-            sockets.get_or_create(source, now, || create_socket(source))
-        })
-        .await;
-        batch.clear();
     }
+
+    fn socket(&self, source: SocketAddr, create: impl FnOnce() -> io::Result<UdpSocket>)
+        -> io::Result<ReplySocket>
+    {
+        let mut cache = self.cache.lock();
+        if let Some(socket) = cache.get(source, Instant::now()) {
+            return Ok(ReplySocket::Ready(socket));
+        }
+        if cache.creating.contains(&source) {
+            return Ok(ReplySocket::Pending(self.created.subscribe()));
+        }
+        let permit = self.reserve_fd(&mut cache)?;
+        cache.creating.insert(source);
+        drop(cache);
+
+        let reservation = SocketReservation { shard: self, source, active: true };
+        // Release the permit before notifying waiters if bind fails.
+        let permit = permit;
+        let socket = ReplyFd { socket: create()?, _permit: permit };
+        Ok(ReplySocket::Ready(reservation.publish(socket)))
+    }
+
+    fn reserve_fd(&self, cache: &mut ReplySocketCache) -> io::Result<OwnedSemaphorePermit> {
+        loop {
+            if let Ok(permit) = self.slots.clone().try_acquire_owned() {
+                return Ok(permit);
+            }
+            // Keep active sockets cached for reuse. Removing an idle socket
+            // returns its permit before any other creator can take it.
+            let Some(address) = cache.sockets.iter().rev()
+                .find(|(_, entry)| Arc::strong_count(&entry.socket) == 1)
+                .map(|(address, _)| *address)
+            else {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "UDP reply socket budget exhausted",
+                ));
+            };
+            cache.sockets.pop(&address);
+        }
+    }
+}
+
+struct SocketReservation<'a> {
+    shard: &'a ReplySocketShard,
+    source: SocketAddr,
+    active: bool,
+}
+
+impl SocketReservation<'_> {
+    fn publish(mut self, socket: ReplyFd) -> Arc<ReplyFd> {
+        let socket = Arc::new(socket);
+        let mut cache = self.shard.cache.lock();
+        debug_assert!(cache.sockets.len() < cache.sockets.cap().get());
+        cache.sockets.put(self.source, Entry {
+            socket: socket.clone(), last_used: Instant::now(),
+        });
+        cache.creating.remove(&self.source);
+        self.active = false;
+        drop(cache);
+        self.shard.created.send_modify(|_| {});
+        socket
+    }
+}
+
+impl Drop for SocketReservation<'_> {
+    fn drop(&mut self) {
+        if self.active {
+            self.shard.cache.lock().creating.remove(&self.source);
+            self.shard.created.send_modify(|_| {});
+        }
+    }
+}
+
+const CACHE_SHARDS: usize = 8;
+const WRITE_TIMEOUT: Duration = Duration::from_millis(100);
+
+pub(crate) struct ReplySockets {
+    shards: [ReplySocketShard; CACHE_SHARDS],
+    shard_hash: RandomState,
+    create: Box<dyn Fn(SocketAddr) -> io::Result<UdpSocket> + Send + Sync>,
+    timed_out_packets: AtomicU64,
+}
+
+impl ReplySockets {
+    pub(crate) fn new(
+        create: impl Fn(SocketAddr) -> io::Result<UdpSocket> + Send + Sync + 'static,
+    ) -> Self {
+        let capacity = NonZeroUsize::new(MAX_REPLY_SOCKETS / CACHE_SHARDS).unwrap();
+        Self {
+            shards: from_fn(|_| ReplySocketShard::new(capacity)),
+            shard_hash: RandomState::new(),
+            create: Box::new(create),
+            timed_out_packets: AtomicU64::new(0),
+        }
+    }
+
+    fn socket(&self, source: SocketAddr) -> io::Result<ReplySocket> {
+        let source = source.to_canonical();
+        let index = self.shard_hash.hash_one(source) as usize % CACHE_SHARDS;
+        self.shards[index].socket(source, || (self.create)(source))
+    }
+
+    pub(crate) fn sweep(&self) {
+        let now = Instant::now();
+        for shard in &self.shards { shard.cache.lock().expire(now); }
+    }
+
+    fn report_timeout(&self, dropped: usize) {
+        let previous = self.timed_out_packets.fetch_add(dropped as u64, Ordering::Relaxed);
+        let total = previous.wrapping_add(dropped as u64);
+        if total.leading_zeros() != previous.leading_zeros() {
+            warn!(dropped, total, "transparent UDP reply timed out waiting for socket");
+        }
+    }
+}
+
+/// Owned by a single UDP association. Only one receive batch can be in flight.
+pub(crate) struct ReplyWriter {
+    sockets: Arc<ReplySockets>,
+    pending: Option<BoxFuture<'static, ()>>,
+}
+
+impl ReplyWriter {
+    pub(crate) fn new(sockets: Arc<ReplySockets>) -> Self {
+        Self { sockets, pending: None }
+    }
+
+    pub(crate) fn submit(&mut self, packets: &mut Vec<UdpPacket>) {
+        debug_assert!(self.pending.is_none());
+        packets.retain_mut(|packet| {
+            if let (SocksAddr::Ip(source), SocksAddr::Ip(destination)) =
+                (&mut packet.src_addr, &mut packet.dst_addr) {
+                *source = source.to_canonical();
+                *destination = destination.to_canonical();
+                true
+            } else {
+                warn!("transparent UDP reply contains a non-IP address");
+                false
+            }
+        });
+        // Preserve receive order within a source while combining packets
+        // that use the same socket. Insertion keeps small batches in place.
+        for index in 1..packets.len() {
+            let source = reply_source(&packets[index]);
+            if reply_source(&packets[index - 1]) > source {
+                let position = packets[..index].partition_point(|packet| reply_source(packet) <= source);
+                packets[position..=index].rotate_right(1);
+            }
+        }
+        let mut cursor = ReplyCursor::default();
+        if cursor.try_send(&self.sockets, packets).is_pending() {
+            // Keep the relay's receive allocation; only the unsent suffix
+            // needs ownership across the readiness wait.
+            let pending = packets.split_off(cursor.offset);
+            cursor.group.as_mut().unwrap().end -= cursor.offset;
+            cursor.offset = 0;
+            self.pending = Some(Box::pin(send_pending(
+                self.sockets.clone(), pending, cursor, Instant::now() + WRITE_TIMEOUT,
+            )));
+        }
+        packets.clear();
+    }
+
+    pub(crate) fn poll_send(&mut self, cx: &mut Context<'_>) -> Poll<()> {
+        if let Some(pending) = &mut self.pending {
+            ready!(pending.as_mut().poll(cx));
+            self.pending = None;
+        }
+        Poll::Ready(())
+    }
+}
+
+fn reply_source(packet: &UdpPacket) -> SocketAddr {
+    let SocksAddr::Ip(source) = packet.src_addr else { unreachable!("validated reply source"); };
+    source
+}
+
+struct ReplyGroup {
+    source: SocketAddr,
+    end: usize,
+    socket: ReplySocket,
+}
+
+#[derive(Default)]
+struct ReplyCursor {
+    offset: usize,
+    group: Option<ReplyGroup>,
+}
+
+impl ReplyCursor {
+    fn try_send(&mut self, sockets: &ReplySockets, packets: &[UdpPacket]) -> Poll<()> {
+        while self.offset < packets.len() {
+            if self.group.is_none() {
+                let source = reply_source(&packets[self.offset]);
+                let count = packets[self.offset..].iter().take(MAX_DIRECT_BATCH_PACKETS)
+                    .take_while(|packet| reply_source(packet) == source).count();
+                let end = self.offset + count;
+                match sockets.socket(source) {
+                    Ok(socket) => self.group = Some(ReplyGroup { source, end, socket }),
+                    Err(error) => {
+                        warn!("failed to create UDP reply socket for {source}: {error}");
+                        self.offset = end;
+                        continue;
+                    }
+                }
+            }
+            let group = self.group.as_ref().unwrap();
+            let ReplySocket::Ready(socket) = &group.socket else { return Poll::Pending; };
+            let result = ready!(try_send_replies(
+                socket, group.source.is_ipv6(), &packets[self.offset..group.end],
+            ));
+            self.complete(result);
+        }
+        Poll::Ready(())
+    }
+
+    fn complete(&mut self, result: BatchResult) {
+        let group = self.group.as_ref().unwrap();
+        self.offset += result.sent;
+        if let Some(error) = result.error {
+            warn!("failed to send UDP reply from {}: {error}", group.source);
+            self.offset += 1;
+        }
+        if self.offset == group.end { self.group = None; }
+    }
+}
+
+async fn send_pending(
+    sockets: Arc<ReplySockets>, packets: Vec<UdpPacket>, mut cursor: ReplyCursor,
+    deadline: Instant,
+) {
+    loop {
+        let group = cursor.group.as_mut().unwrap();
+        let recreate_group = matches!(group.socket, ReplySocket::Pending(_));
+        // Each association registers its own waiter on a shared socket.
+        let result = match &mut group.socket {
+            ReplySocket::Ready(socket) => wait_until_ready(deadline, socket.writable()).await,
+            ReplySocket::Pending(created) => wait_until_ready(deadline, async {
+                created.changed().await.map_err(|_| io::ErrorKind::BrokenPipe.into())
+            }).await,
+        };
+        match result {
+            Some(Ok(())) if recreate_group => cursor.group = None,
+            Some(Ok(())) => {}
+            Some(Err(error)) => cursor.complete(BatchResult::failed(error)),
+            None => {
+                // The next source still gets an immediate send attempt,
+                // without restarting the batch's wait deadline.
+                sockets.report_timeout(group.end - cursor.offset);
+                cursor.offset = group.end;
+                cursor.group = None;
+            }
+        }
+        if cursor.try_send(&sockets, &packets).is_ready() { return; }
+        consume_budget().await;
+    }
+}
+
+async fn wait_until_ready(
+    deadline: Instant, writable: impl Future<Output = io::Result<()>>,
+) -> Option<io::Result<()>> {
+    if Instant::now() >= deadline { return None; }
+    timeout_at(deadline, writable).await.ok()
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::net::{Ipv4Addr, UdpSocket as StdUdpSocket};
-
-    fn socket() -> io::Result<UdpSocket> {
-        let socket = StdUdpSocket::bind("127.0.0.1:0")?;
-        socket.set_nonblocking(true)?;
-        UdpSocket::from_std(socket)
-    }
-
-    #[tokio::test]
-    async fn reply_socket_cache_enforces_capacity_and_reuses_recent_sources() {
-        let mut cache = ReplySocketCache {
-            sockets: LruCache::new(NonZeroUsize::new(2).unwrap()),
-        };
-        let a = SocketAddr::from(([192, 0, 2, 1], 1));
-        let b = SocketAddr::from(([192, 0, 2, 1], 2));
-        let c = SocketAddr::from(([192, 0, 2, 1], 3));
-        let first = cache
-            .get_or_create(a, Instant::now(), socket)
-            .unwrap()
-            .local_addr()
-            .unwrap();
-        cache.get_or_create(b, Instant::now(), socket).unwrap();
-        assert_eq!(
-            cache
-                .get_or_create(a, Instant::now(), || panic!("must reuse socket"))
-                .unwrap()
-                .local_addr()
-                .unwrap(),
-            first
-        );
-        cache.get_or_create(c, Instant::now(), socket).unwrap();
-        assert_eq!(cache.sockets.len(), 2);
-        assert!(cache.sockets.contains(&a));
-        assert!(!cache.sockets.contains(&b));
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn expired_hit_is_removed_even_if_replacement_fails() {
-        let mut cache = ReplySocketCache::default();
-        let source = SocketAddr::from(([192, 0, 2, 1], 1));
-        let old = cache.get_or_create(source, Instant::now(), socket).unwrap();
-        tokio::time::advance(IDLE_TIMEOUT).await;
-        assert!(
-            cache
-                .get_or_create(source, Instant::now(), || {
-                    Err(io::Error::other("replacement failed"))
-                })
-                .is_err()
-        );
-        assert!(!cache.sockets.contains(&source));
-        let new = cache.get_or_create(source, Instant::now(), socket).unwrap();
-        assert!(!Arc::ptr_eq(&old, &new));
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn idle_sockets_are_reclaimed_without_new_sources() {
-        let mut cache = ReplySocketCache::default();
-        let a = SocketAddr::from(([192, 0, 2, 1], 1));
-        let b = SocketAddr::from(([192, 0, 2, 1], 2));
-        cache.get_or_create(a, Instant::now(), socket).unwrap();
-        cache.get_or_create(b, Instant::now(), socket).unwrap();
-        tokio::time::advance(IDLE_TIMEOUT / 2).await;
-        cache
-            .get_or_create(b, Instant::now(), || panic!("must reuse socket"))
-            .unwrap();
-        tokio::time::advance(IDLE_TIMEOUT / 2).await;
-        cache.expire(Instant::now());
-        assert!(!cache.sockets.contains(&a));
-        assert!(cache.sockets.contains(&b));
-    }
-
-    #[tokio::test]
-    async fn canonicalizes_ipv4_mapped_ipv6_sources() {
-        let mut cache = ReplySocketCache::default();
-        let v4 = SocketAddr::from(([192, 0, 2, 1], 1));
-        let mapped = SocketAddr::from((Ipv4Addr::new(192, 0, 2, 1).to_ipv6_mapped(), 1));
-        let first = cache.get_or_create(mapped, Instant::now(), socket).unwrap();
-        let second = cache
-            .get_or_create(v4, Instant::now(), || panic!("must reuse canonical socket"))
-            .unwrap();
-        assert!(Arc::ptr_eq(&first, &second));
-        assert_eq!(cache.sockets.len(), 1);
-    }
-
-    #[tokio::test]
-    async fn failed_create_when_full_preserves_existing_entries() {
-        let mut cache = ReplySocketCache {
-            sockets: LruCache::new(NonZeroUsize::new(2).unwrap()),
-        };
-        let a = SocketAddr::from(([192, 0, 2, 1], 1));
-        let b = SocketAddr::from(([192, 0, 2, 1], 2));
-        let c = SocketAddr::from(([192, 0, 2, 1], 3));
-        cache.get_or_create(a, Instant::now(), socket).unwrap();
-        cache.get_or_create(b, Instant::now(), socket).unwrap();
-        assert!(
-            cache
-                .get_or_create(c, Instant::now(), || Err(io::Error::other("bind failed")))
-                .is_err()
-        );
-        assert_eq!(cache.sockets.len(), 2);
-        assert!(cache.sockets.contains(&a));
-        assert!(cache.sockets.contains(&b));
-    }
-}
+mod tests;

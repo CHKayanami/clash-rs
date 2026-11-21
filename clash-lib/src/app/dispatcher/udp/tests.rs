@@ -4,6 +4,7 @@ use crate::{common::io::datagram_relay::{relay, RelayContext},
 use tracing::warn;
 use crate::app::dns::ClashResolver;
 use futures::{Sink, Stream};
+use tokio_util::task::AbortOnDropHandle;
 use std::{io, task::{Context, Poll}};
 use super::*;
 use crate::app::dispatcher::udp::association::tests::inert_flow as test_flow;

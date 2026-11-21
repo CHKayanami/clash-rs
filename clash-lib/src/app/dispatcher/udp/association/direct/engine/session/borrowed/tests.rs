@@ -19,7 +19,7 @@ async fn synchronous_batch_borrows_payload_and_pending_copy_survives_owner_drop(
         tracker: Arc::new(TrackerInfo::new(&client, None)), activity: Arc::new(ReplyActivity::new()),
         closed: Arc::new(AtomicBool::new(false)), events: events.clone(), _guard: TrackGuard::new(1, manager.clone()) });
     let (sender, _receiver) = replies::channel(16);
-    let config = AssociationConfig { replies: sender, direct: None, closed_flows: events,
+    let config = AssociationConfig { replies: sender.into(), direct: None, closed_flows: events,
         manager, allow_quic: Arc::new(AtomicBool::new(true)), timeout: Duration::from_secs(60),
         capacity: Arc::new(Semaphore::new(1)) };
     let (commands, receiver) = mpsc::channel(1);

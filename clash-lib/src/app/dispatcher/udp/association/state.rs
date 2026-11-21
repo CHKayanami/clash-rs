@@ -237,7 +237,7 @@ mod tests {
         let a = flow(1);
         let b = flow(2);
         let (sender, _receiver) = replies::channel(16);
-        let config = AssociationConfig { replies: sender, direct: None, closed_flows: events,
+        let config = AssociationConfig { replies: sender.into(), direct: None, closed_flows: events,
             manager: manager.clone(), allow_quic: Arc::new(AtomicBool::new(true)),
             timeout: Duration::from_secs(60), capacity: Arc::new(Semaphore::new(1)) };
         let (_commands, commands) = mpsc::channel(1);

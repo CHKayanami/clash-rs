@@ -1,14 +1,13 @@
 use crate::runner::ListenerReady;
 use crate::proxy::AnyStream;
 use super::{
-    datagram::{ChannelDatagram, UdpPacket},
+    datagram::UdpPacket,
     inbound::InboundHandlerTrait,
 };
 use crate::{
     app::dispatcher::Dispatcher,
     proxy::utils::{
-        ToCanonical, apply_tcp_socket_options, transparent_reply,
-        try_create_dualstack_socket,
+        ToCanonical, apply_tcp_socket_options, try_create_dualstack_socket,
     },
     session::{Network, Session, Type},
 };
@@ -23,14 +22,8 @@ use std::{
     os::fd::AsRawFd,
     sync::Arc,
 };
-use tokio::{
-    net::{TcpListener, UdpSocket},
-    sync::{
-        mpsc::{self, error::TrySendError},
-        oneshot,
-    },
-};
-use tracing::{debug, info, trace, warn};
+use tokio::{net::{TcpListener, UdpSocket}, task::consume_budget};
+use tracing::{debug, trace, warn};
 
 pub struct TproxyInbound {
     addr: SocketAddr,
@@ -198,15 +191,12 @@ impl InboundHandlerTrait for TproxyInbound {
 
         handle_inbound_datagram(
             self.fw_mark,
-            Arc::new(listener),
+            listener,
             self.dispatcher.clone(),
         )
         .await
     }
 }
-
-/// Capacity for UDP packet dispatch channel between TPROXY listener and dispatcher.
-const UDP_CHANNEL_CAPACITY: usize = 1024;
 
 /// Target receive socket buffer size for high-throughput UDP/QUIC traffic.
 const UDP_RECV_BUFFER_SIZE: usize = 8 << 20;
@@ -257,20 +247,9 @@ const MAX_CONSECUTIVE_RECV_ERRORS: usize = 32;
 
 async fn handle_inbound_datagram(
     fw_mark: Option<u32>,
-    socket: Arc<UdpSocket>,
+    socket: UdpSocket,
     dispatcher: Arc<Dispatcher>,
 ) -> io::Result<()> {
-    // dispatcher <-> tproxy communications
-    let (l_tx, l_rx) = mpsc::channel(UDP_CHANNEL_CAPACITY);
-
-    // forward packets from tproxy to dispatcher
-    let (d_tx, d_rx) = mpsc::channel(UDP_CHANNEL_CAPACITY);
-
-    // for dispatcher - the dispatcher would receive packets from this channel,
-    // which is from the stack and send back packets to this channel, which is
-    // to the tproxy
-    let udp_stream = ChannelDatagram::new(l_tx, d_rx);
-
     let sess = Session {
         network: Network::Udp,
         typ: Type::Tproxy,
@@ -278,22 +257,12 @@ async fn handle_inbound_datagram(
         ..Default::default()
     };
 
-    let closer: oneshot::Sender<u8> = dispatcher
-        .dispatch_datagram(sess, Box::new(udp_stream))
-        .await;
-
-    // dispatcher -> tproxy
-    let fut1 = handle_packet_from_dispatcher(l_rx, fw_mark);
-
-    // tproxy -> dispatcher
-    let fut2 = async move {
+    dispatcher.dispatch_transparent_udp(sess, move |ingress| async move {
         let mut receiver = BatchReceiver::default();
         let mut packets = Vec::with_capacity(UDP_RECV_VEC_CAPACITY);
         let mut consecutive_errors = 0usize;
-        let mut dropped = 0u64;
 
         loop {
-            packets.clear();
             match receiver.recv_batch(&socket, &mut packets, MAX_BATCH).await {
                 Ok(_) => consecutive_errors = 0,
                 Err(e) => {
@@ -309,55 +278,21 @@ async fn handle_inbound_datagram(
                     continue;
                 }
             }
-            for (data, source, destination) in packets.drain(..) {
-                if destination.ip().is_multicast()
-                    || matches!(destination.ip(), IpAddr::V4(ip) if ip.is_broadcast())
-                {
-                    continue;
-                }
-                let pkt = UdpPacket {
-                    data,
-                    src_addr: source.into(),
-                    dst_addr: destination.into(),
-                    inbound_user: None,
-                };
-
-                // Every client shares this channel, so awaiting a full one
-                // would stall reads for all of them and overflow the kernel
-                // buffer anyway. Drop instead — UDP callers already tolerate
-                // loss — and keep serving the other flows.
-                match d_tx.try_send(pkt) {
-                    Ok(()) => {}
-                    Err(TrySendError::Full(_)) => {
-                        dropped += 1;
-                        if dropped.is_power_of_two() {
-                            warn!(
-                                "tproxy udp dispatch queue full, dropped {} \
-                                 packet(s) so far",
-                                dropped
-                            );
-                        }
-                    }
-                    Err(TrySendError::Closed(_)) => {
-                        warn!("tproxy udp dispatch channel closed");
-                        return;
-                    }
-                }
+            let incoming = packets.drain(..)
+                .filter(|(_, _, destination)| {
+                    !destination.ip().is_multicast()
+                        && !matches!(destination.ip(), IpAddr::V4(ip) if ip.is_broadcast())
+                })
+                .map(|(data, source, destination)| {
+                    UdpPacket::new(data, source.into(), destination.into())
+                });
+            if !ingress.send_batch(incoming) {
+                warn!("tproxy udp route queue closed");
+                break;
             }
+            consume_budget().await;
         }
-        warn!("tproxy udp listening ended");
-    };
-
-    tokio::select! {
-        _ = fut1 => {
-            warn!("tproxy outbound (dispatcher -> tproxy) stream ended first");
-        }
-        _ = fut2 => {
-            warn!("tproxy inbound (tproxy -> dispatcher) stream ended first");
-        }
-    }
-
-    closer.send(0).ok();
+    }, move |source| create_transparent_reply_socket(source, fw_mark)).await;
 
     // Inbound TCP and UDP listeners share a single `try_join_all` inside a
     // critical task; return `Ok(())` so a UDP-only failure stops only UDP
@@ -377,22 +312,6 @@ fn set_ip_recv_orig_dstaddr(
 
     let enable: libc::c_int = 1;
     set_socket_option(socket, level, opt, enable)
-}
-
-async fn handle_packet_from_dispatcher(
-    l_rx: mpsc::Receiver<UdpPacket>,
-    fw_mark: Option<u32>,
-) {
-    transparent_reply::relay(l_rx, move |source| {
-        create_transparent_reply_socket(source, fw_mark)
-    })
-    .await;
-
-    // reaching here means the dispatcher hung up; the outer `select!` tears the
-    // rest of the tproxy session down
-    info!(
-        "dispatcher channel to tproxy is closed, exiting outbound loop gracefully"
-    );
 }
 
 fn set_socket_option(

@@ -23,7 +23,7 @@ pub(crate) use traffic::UserTrafficCounters;
 pub(crate) use flow::{FlowClosed, ReplyActivity, UdpFlow};
 use flow::FlowState;
 use worker::AssociationRelay;
-use super::replies::Sender as ReplySender;
+use super::replies::ReplyTarget;
 #[cfg(feature = "tun")]
 use crate::app::net::{network_generation, subscribe_network_changes};
 use semantics::{FlowIsolation, IsolationReason};
@@ -60,7 +60,7 @@ struct AssociationKey {
 }
 
 pub(crate) struct AssociationConfig {
-    pub replies: ReplySender,
+    pub replies: ReplyTarget,
     #[cfg(feature = "tun")]
     pub direct: Option<Arc<DirectPath>>,
     pub closed_flows: mpsc::UnboundedSender<FlowClosed>,
@@ -299,12 +299,15 @@ impl UdpAssociationPool {
                 chain: sess.proxy_chain.snapshot(), task }));
         }
         let context = AssociationRelay::new(packets, commands, &self.config,
-            sess.source, sess.inbound_user.clone(), force_source, self.config.replies.clone(), native);
+            sess.source, sess.inbound_user.clone(), force_source, native);
+        let replies = self.config.replies.clone();
         let future: BoxFuture<'static, ()> = dispatch_datagram!(datagram, |inner| Box::pin(async move {
             let (_permit, _guard, _cleanup) = (permit, guard, cleanup);
             tokio::select! {
-                _ = relay(inner, context) => {},
+                biased;
+                _ = replies.closed() => {},
                 _ = close_rx => {},
+                _ = relay(inner, context) => {},
             }
         }));
         let task = tokio::spawn(future).into();

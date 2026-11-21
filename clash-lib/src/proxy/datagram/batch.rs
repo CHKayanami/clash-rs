@@ -1,11 +1,7 @@
 //! Bounded, opportunistic datagram batches. Queue capacity remains packet-based.
 use std::{collections::VecDeque, io, pin::Pin, task::{Context, Poll}};
 use futures::{Sink, Stream};
-#[cfg(any(
-    test,
-    feature = "shadowquic",
-    all(target_os = "linux", any(feature = "tproxy", feature = "ebpf")),
-))]
+#[cfg(any(test, feature = "shadowquic"))]
 use tokio_util::sync::PollSender;
 use super::{UdpPacket, segments::DatagramSegments};
 
@@ -133,11 +129,7 @@ pub(crate) fn poll_send_ready(
 
 /// Move ready packets into a packet-capacity channel without cloning payloads.
 /// The caller completes the returned prefix before polling the batch again.
-#[cfg(any(
-    test,
-    feature = "shadowquic",
-    all(target_os = "linux", any(feature = "tproxy", feature = "ebpf")),
-))]
+#[cfg(any(test, feature = "shadowquic"))]
 pub(crate) fn poll_send_channel(
     sender: &mut PollSender<UdpPacket>, cx: &mut Context<'_>, batch: &mut PacketBatch,
 ) -> Poll<BatchResult> {

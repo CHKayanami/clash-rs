@@ -73,7 +73,7 @@ pub(super) async fn run<S: Stream<Item = UdpPacket> + Unpin>(
     loop {
         tokio::select! {
             biased;
-            _ = routes.ctx.reply_sender.closed() => break,
+            _ = routes.ctx.replies.closed() => break,
             _ = async {
                 network_changes.as_mut().expect("enabled TUN subscription").changed().await
             }, if network_changes.is_some() => {
@@ -536,14 +536,14 @@ mod tests {
         let (closed_flows, _closed) = mpsc::unbounded_channel();
         let associations = UdpAssociationPool::new(AssociationConfig {
             #[cfg(feature = "tun")] direct: None,
-            replies: replies.clone(), closed_flows, manager: dispatcher.manager.clone(),
+            replies: replies.clone().into(), closed_flows, manager: dispatcher.manager.clone(),
             allow_quic: dispatcher.allow_quic.clone(), timeout: Duration::from_secs(60),
             capacity: dispatcher.udp_association_semaphore.clone(),
         });
         let ctx = UdpDispatchContext {
             outbound_manager: dispatcher.outbound_manager.clone(), router: dispatcher.router.clone(),
             resolver: dispatcher.resolver.clone(), mode: dispatcher.mode.clone(),
-            reply_sender: replies, session_semaphore: dispatcher.udp_session_semaphore.clone(), associations,
+            replies: replies.into(), session_semaphore: dispatcher.udp_session_semaphore.clone(), associations,
         };
         let (session_established_tx, mut established) = mpsc::channel(64);
         let mut routes = UdpRoutes {

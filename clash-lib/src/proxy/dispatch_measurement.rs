@@ -240,7 +240,7 @@ pub async fn measure_dispatch_futures(start: impl Fn(), finish: impl Fn(&str, us
     let (closed_flows, _closed_rx) = mpsc::unbounded_channel();
     let pool = UdpAssociationPool::new(AssociationConfig {
             #[cfg(feature = "tun")] direct: None,
-        replies, closed_flows, manager, timeout: Duration::from_secs(60),
+        replies: replies.into(), closed_flows, manager, timeout: Duration::from_secs(60),
         allow_quic: Arc::new(AtomicBool::new(true)),
         capacity: Arc::new(Semaphore::new(1)),
     });

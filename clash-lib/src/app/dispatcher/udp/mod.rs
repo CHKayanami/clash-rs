@@ -10,23 +10,29 @@
 //! provides an endpoint-independent public mapping or filtering policy.
 use crate::proxy::datagram::batch::MAX_BATCH_PACKETS;
 use inbound::InboundIo;
-use replies::Sender as ReplySender;
+use replies::ReplyTarget;
 #[cfg(feature = "tun")]
 use association::direct::DirectPath;
 use futures::future::poll_fn as poll_batch;
 pub(crate) mod association;
 mod routes;
 mod inbound;
+mod shards;
 pub(crate) mod replies;
+#[cfg(all(target_os = "linux", any(feature = "tproxy", feature = "ebpf")))]
+mod transparent;
+#[cfg(all(target_os = "linux", feature = "ebpf"))]
+pub(crate) use shards::UdpRouteIngress;
 #[cfg(test)]
 mod tests;
 
-use std::{collections::HashMap, future::Future, net::{IpAddr, SocketAddr}, sync::{Arc,
-    atomic::{AtomicBool, AtomicU8, Ordering}}, time::Duration};
-use futures::{StreamExt, stream::poll_fn};
-use tokio::{sync::mpsc::error::TrySendError, task::JoinHandle, time::Instant};
-use tokio_util::{task::AbortOnDropHandle, time::DelayQueue};
-use tracing::{Instrument, debug, error, info, info_span};
+use std::{collections::HashMap, future::Future, net::SocketAddr, sync::{Arc,
+    atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering}}, time::Duration};
+use futures::StreamExt;
+use shards::RouteShards;
+use tokio::{sync::mpsc::{self, error::TrySendError}, task::JoinHandle, time::Instant};
+use tokio_util::time::DelayQueue;
+use tracing::{Instrument, debug, error, info, info_span, warn};
 use crate::{
     app::{dns::ThreadSafeDNSResolver, outbound::manager::ThreadSafeOutboundManager,
         router::ArcRouter, sniffer::ArcSniffer},
@@ -36,7 +42,7 @@ use crate::{
 };
 use super::{Dispatcher, TrackerInfo};
 use super::dispatcher_impl::{decode_mode, effective_outbound_type, is_reject_error, reverse_lookup};
-use association::{AssociationConfig, ReplyActivity, UdpAssociationPool, UdpFlow, UdpConnectContext};
+use association::{AssociationConfig, FlowClosed, ReplyActivity, UdpAssociationPool, UdpFlow, UdpConnectContext};
 #[cfg(feature = "tun")]
 use crate::{app::net::get_default_outbound_interface, session::Type};
 
@@ -55,6 +61,30 @@ const PENDING_SNIFF_TIMEOUT: Duration = Duration::from_millis(100);
 const CONNECTING_SESSION_TIMEOUT: Duration = Duration::from_secs(10);
 const SHORT_FLOW_INIT_TIMEOUT: Duration = Duration::from_secs(5);
 const FAST_RESPONSE_TIMEOUT: Duration = Duration::from_secs(3);
+
+#[derive(Clone, Copy)]
+struct UdpQueueLimits {
+    per_route_shard: usize,
+    warn_on_drop: bool,
+}
+
+const DEFAULT_QUEUE_LIMITS: UdpQueueLimits = UdpQueueLimits {
+    per_route_shard: UDP_CHANNEL_CAPACITY,
+    warn_on_drop: false,
+};
+
+#[derive(Default)]
+struct QueueDrops(AtomicU64);
+
+impl QueueDrops {
+    fn report(&self, queue: &str, dropped: usize) {
+        let previous = self.0.fetch_add(dropped as u64, Ordering::Relaxed);
+        let total = previous.wrapping_add(dropped as u64);
+        if total.leading_zeros() != previous.leading_zeros() {
+            warn!(queue, dropped, total, "transparent UDP queue full");
+        }
+    }
+}
 
 #[inline]
 fn is_short_flow_port(port: u16) -> bool {
@@ -160,7 +190,7 @@ struct UdpDispatchContext {
     router: ArcRouter,
     resolver: ThreadSafeDNSResolver,
     mode: Arc<AtomicU8>,
-    reply_sender: ReplySender,
+    replies: ReplyTarget,
     session_semaphore: Arc<tokio::sync::Semaphore>,
     associations: Arc<UdpAssociationPool>,
 }
@@ -204,13 +234,11 @@ impl Dispatcher {
         self.dispatch_datagram_inner(sess, udp_inbound, Some(direct)).instrument(span).await
     }
 
-    async fn dispatch_datagram_inner(
-        &self, sess: Session, udp_inbound: AnyInboundDatagram,
+    fn udp_dispatch_context(
+        &self, sess: &Session, replies: ReplyTarget,
         #[cfg(feature = "tun")] direct: Option<Arc<DirectPath>>,
-    ) -> tokio::sync::oneshot::Sender<u8> {
-        let (replies, reply_rx) = replies::channel(UDP_CHANNEL_CAPACITY);
-        let (closed_flows, mut closed_rx) = tokio::sync::mpsc::unbounded_channel();
-        let (close_sender, mut close_receiver) = tokio::sync::oneshot::channel();
+    ) -> (UdpDispatchContext, mpsc::UnboundedReceiver<FlowClosed>) {
+        let (closed_flows, closed_rx) = mpsc::unbounded_channel();
         let associations = UdpAssociationPool::new(AssociationConfig {
             replies: replies.clone(), #[cfg(feature = "tun")] direct, closed_flows, manager: self.manager.clone(),
             allow_quic: self.allow_quic.clone(),
@@ -220,53 +248,44 @@ impl Dispatcher {
         let ctx = UdpDispatchContext {
             outbound_manager: self.outbound_manager.clone(), router: self.router.clone(),
             resolver: self.resolver.clone(), mode: self.mode.clone(),
-            reply_sender: replies, session_semaphore: self.udp_session_semaphore.clone(), associations,
+            replies, session_semaphore: self.udp_session_semaphore.clone(), associations,
         };
+        (ctx, closed_rx)
+    }
+
+    async fn dispatch_datagram_inner(
+        &self, sess: Session, udp_inbound: AnyInboundDatagram,
+        #[cfg(feature = "tun")] direct: Option<Arc<DirectPath>>,
+    ) -> tokio::sync::oneshot::Sender<u8> {
+        let (replies, reply_rx) = replies::channel(UDP_CHANNEL_CAPACITY);
+        let (ctx, mut closed_rx) =
+            self.udp_dispatch_context(&sess, replies.into(), #[cfg(feature = "tun")] direct);
+        let (close_sender, mut close_receiver) = tokio::sync::oneshot::channel();
         let sniffer = self.sniffer.clone();
         let allow_quic = self.allow_quic.clone();
         // A connected inbound already isolates one client; wide UDP listeners
         // partition their route caches so different clients progress in parallel.
-        let shard_count = if sess.source.port() == 0 { UDP_ROUTE_SHARDS } else { 1 };
+        let sharded = sess.source.port() == 0;
         tokio::spawn(async move {
             let mut local = InboundIo::new(udp_inbound, reply_rx);
-            if shard_count == 1 {
+            if !sharded {
                 tokio::select! {
                     _ = &mut close_receiver => {},
                     _ = routes::run(sess, ctx, sniffer, allow_quic, local, closed_rx) => {},
                 }
                 return;
             }
-            let mut shards = Vec::with_capacity(shard_count);
-            for _ in 0..shard_count {
-                let (packets, mut incoming) = tokio::sync::mpsc::channel(UDP_CHANNEL_CAPACITY);
-                let (closed, closed_rx) = tokio::sync::mpsc::unbounded_channel();
-                let task = AbortOnDropHandle::new(tokio::spawn(routes::run(
-                    sess.clone(), ctx.clone(), sniffer.clone(), allow_quic.clone(), poll_fn(move |cx| incoming.poll_recv(cx)), closed_rx,
-                ).instrument(tracing::Span::current())));
-                shards.push((packets, closed, task));
-            }
+            let shards = RouteShards::spawn(sess, ctx, sniffer, allow_quic, DEFAULT_QUEUE_LIMITS);
             let mut inbound_batch = Vec::with_capacity(MAX_BATCH_PACKETS);
-            'ingress: loop {
+            loop {
                 tokio::select! {
                     _ = &mut close_receiver => break,
                     Some(closed) = closed_rx.recv() => {
-                        let index = route_shard(closed.source, shard_count);
-                        let _ = shards[index].1.send(closed);
+                        shards.flow_closed(closed);
                     }
                     result = poll_batch(|cx| local.poll_recv_batch(cx, &mut inbound_batch)) => {
                         let Some(()) = result else { break; };
-                        for mut packet in inbound_batch.drain(..) {
-                            let source = match &mut packet.src_addr {
-                                SocksAddr::Ip(addr) => { addr.set_ip(addr.ip().to_canonical()); *addr }
-                                SocksAddr::Domain(..) => continue,
-                            };
-                            let index = route_shard(source, shard_count);
-                            match shards[index].0.try_send(packet) {
-                                Ok(()) => {},
-                                Err(TrySendError::Full(_)) => debug!("UDP route queue full, dropping packet"),
-                                Err(TrySendError::Closed(_)) => break 'ingress,
-                            }
-                        }
+                        if !shards.ingress.send_batch(inbound_batch.drain(..)) { break; }
                         tokio::task::consume_budget().await;
                     }
                 }
@@ -275,14 +294,6 @@ impl Dispatcher {
         close_sender
     }
 
-}
-
-fn route_shard(source: SocketAddr, count: usize) -> usize {
-    let ip = match source.ip() {
-        IpAddr::V4(ip) => u32::from(ip),
-        IpAddr::V6(ip) => ip.segments().iter().fold(0u32, |hash, value| hash.rotate_left(5) ^ u32::from(*value)),
-    };
-    (ip ^ u32::from(source.port())) as usize % count
 }
 
 fn start_connecting_session(

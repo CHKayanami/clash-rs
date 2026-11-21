@@ -27,7 +27,7 @@ impl Fixture {
         let (reply, _replies) = replies::channel(64);
         let (events, _events) = mpsc::unbounded_channel();
         let capacity = Arc::new(Semaphore::new(1));
-        let config = AssociationConfig { replies: reply, direct: None, closed_flows: events,
+        let config = AssociationConfig { replies: reply.into(), direct: None, closed_flows: events,
             manager: self.manager.clone(), allow_quic: Arc::new(AtomicBool::new(true)),
             timeout: Duration::from_secs(60), capacity: capacity.clone() };
         let state = AssociationState::new(commands, &config, "192.0.2.2:1234".parse().unwrap(), None, None, true);

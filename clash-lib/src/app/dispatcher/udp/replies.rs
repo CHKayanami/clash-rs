@@ -5,8 +5,33 @@ use futures::future::poll_fn;
 use tracing::debug;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use crate::proxy::datagram::{UdpPacket, batch::{PacketBatch, MAX_BATCH_PACKETS}};
+#[cfg(all(target_os = "linux", any(feature = "tproxy", feature = "ebpf")))]
+use crate::proxy::utils::transparent_reply::ReplySockets;
+#[cfg(all(target_os = "linux", any(feature = "tproxy", feature = "ebpf")))]
+use tokio_util::sync::CancellationToken;
 
 const MAX_PACKET_BYTES: usize = 65535;
+
+#[derive(Clone)]
+pub(crate) enum ReplyTarget {
+    Queued(Sender),
+    #[cfg(all(target_os = "linux", any(feature = "tproxy", feature = "ebpf")))]
+    Transparent { sockets: Arc<ReplySockets>, closed: CancellationToken },
+}
+
+impl From<Sender> for ReplyTarget {
+    fn from(sender: Sender) -> Self { Self::Queued(sender) }
+}
+
+impl ReplyTarget {
+    pub async fn closed(&self) {
+        match self {
+            Self::Queued(sender) => sender.closed().await,
+            #[cfg(all(target_os = "linux", any(feature = "tproxy", feature = "ebpf")))]
+            Self::Transparent { closed, .. } => closed.cancelled().await,
+        }
+    }
+}
 
 #[derive(Clone)]
 pub(crate) struct Sender {
@@ -50,11 +75,13 @@ impl Sender {
         if packets.len() > MAX_BATCH_PACKETS || packets.iter().any(|p| p.data.len() > MAX_PACKET_BYTES) {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "UDP receive batch exceeds bounds"));
         }
-        let permit = (1..=packets.len()).rev().find_map(|count|
+        let max = packets.len().min(self.credits.available_permits());
+        let permit = (1..=max).rev().find_map(|count|
             self.credits.clone().try_acquire_many_owned(count as u32).ok());
         let Some(permit) = permit else {
+            if self.is_closed() { return Err(io::ErrorKind::BrokenPipe.into()); }
             debug!(dropped = packets.len(), "UDP inbound reply queue full");
-            return if self.is_closed() { Err(io::ErrorKind::BrokenPipe.into()) } else { Ok(()) };
+            return Ok(());
         };
         let dropped = packets.len() - permit.num_permits();
         if dropped > 0 { debug!(dropped, "UDP inbound reply queue full"); }

@@ -5,18 +5,18 @@ use clash_common::udp::{BatchReceiver, MAX_BATCH};
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tracing::{debug, error, info, warn};
+use tokio::task::{JoinSet, consume_budget};
+use tracing::{Instrument, Span, debug, error, info, warn};
 
 use super::offloader::{DirectOffloader, RoutingAction};
 use super::utils::resolve_and_aggregate_ip_cidrs;
-use crate::proxy::utils::transparent_reply;
-use crate::app::dispatcher::Dispatcher;
+use crate::app::dispatcher::{Dispatcher, udp::UdpRouteIngress};
 use crate::app::dns::{DnsResolutionHook, ThreadSafeDNSResolver};
 use crate::app::net::get_default_outbound_interface;
 use crate::app::remote_content_manager::providers::rule_provider::CidrTrie;
 use crate::config::def::EbpfConfig;
 use crate::proxy::AnyStream;
-use crate::proxy::datagram::{ChannelDatagram, UdpPacket};
+use crate::proxy::datagram::UdpPacket;
 use crate::proxy::inbound::InboundHandlerTrait;
 
 pub struct EbpfInbound {
@@ -264,12 +264,6 @@ impl InboundHandlerTrait for EbpfInbound {
         ready.notify();
         info!("clash-ebpf UDP inbound worker running");
 
-        const UDP_CHANNEL_CAPACITY: usize = 1024;
-        let (l_tx, l_rx) = tokio::sync::mpsc::channel::<UdpPacket>(UDP_CHANNEL_CAPACITY);
-        let (d_tx, d_rx) = tokio::sync::mpsc::channel::<UdpPacket>(UDP_CHANNEL_CAPACITY);
-
-        let udp_stream = ChannelDatagram::new(l_tx, d_rx);
-
         let default_outbound = get_default_outbound_interface();
         let sess = Session {
             network: Network::Udp,
@@ -279,62 +273,56 @@ impl InboundHandlerTrait for EbpfInbound {
             ..Default::default()
         };
 
-            let _closer = self
-                .dispatcher
-                .dispatch_datagram(sess, Box::new(udp_stream))
-                .await;
-
-            let mut tasks = tokio::task::JoinSet::new();
-            let reply_listener = listener.clone();
-            tasks.spawn(transparent_reply::relay(l_rx, move |source| {
-                reply_listener.create_reply_socket(source)
-            }));
-
-            let v4_socket = listener.udp_socket_v4();
+        let reply_listener = listener.clone();
+        let resolver = self.dns_resolver.clone();
+        self.dispatcher.dispatch_transparent_udp(sess, move |ingress| async move {
+            let mut tasks = JoinSet::new();
             tasks.spawn(udp_listener_loop(
-                v4_socket,
+                listener.udp_socket_v4(),
                 "IPv4",
-                d_tx.clone(),
-                self.dns_resolver.clone(),
+                ingress.clone(),
+                resolver.clone(),
                 listener.clone(),
-            ));
+            ).instrument(Span::current()));
 
             if let Some(v6_socket) = listener.udp_socket_v6() {
                 tasks.spawn(udp_listener_loop(
                     v6_socket,
                     "IPv6",
-                    d_tx,
-                    self.dns_resolver.clone(),
-                    listener.clone(),
-                ));
+                    ingress,
+                    resolver,
+                    listener,
+                ).instrument(Span::current()));
             }
 
-            // Dropping JoinSet aborts all remaining UDP workers, including on cancellation.
-            let _ = tasks.join_next().await;
+            // Dropping JoinSet aborts the remaining listeners and their DNS work.
+            if let Some(Err(error)) = tasks.join_next().await {
+                warn!(%error, "eBPF UDP receive task failed");
+            }
+        }, move |source| reply_listener.create_reply_socket(source)).await;
 
-            Ok(())
-        }
+        Ok(())
     }
+}
 
 async fn udp_listener_loop(
     socket: Arc<tokio::net::UdpSocket>,
     family: &'static str,
-    d_tx: tokio::sync::mpsc::Sender<UdpPacket>,
+    ingress: UdpRouteIngress,
     resolver: ThreadSafeDNSResolver,
     listener_for_dns: Arc<clash_ebpf::EbpfListener>,
 ) {
     let mut receiver = BatchReceiver::default();
     let mut batch = Vec::with_capacity(MAX_BATCH);
-    let mut dns_tasks = tokio::task::JoinSet::new();
+    let mut dns_tasks = JoinSet::new();
     loop {
         while dns_tasks.try_join_next().is_some() {}
-        batch.clear();
         match receiver.recv_batch(&socket, &mut batch, MAX_BATCH).await {
             Ok(count) => {
                 if count == 0 {
                     continue;
                 }
-                for (payload, src, dst) in batch.drain(..) {
+                let incoming = batch.drain(..).filter_map(|(payload, src, dst)| {
                     // 1. Intercept UDP port 53 (DNS)
                     if dst.port() == 53 {
                         let req_bytes = payload;
@@ -379,27 +367,17 @@ async fn udp_listener_loop(
                                 }
                             }
                         });
-                        continue;
+                        return None;
                     }
 
-                    // 2. Regular UDP packet -> Dispatcher
                     debug!("[eBPF UDP] Intercepted: {} -> {}", src, dst);
-                    let packet = UdpPacket::new(payload, src.into(), dst.into());
-
-                    match d_tx.try_send(packet) {
-                        Ok(()) => {}
-                        Err(tokio::sync::mpsc::error::TrySendError::Full(packet)) => {
-                            if let Err(e) = d_tx.send(packet).await {
-                                warn!("failed to send udp packet to proxy: {}", e);
-                                return;
-                            }
-                        }
-                        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                            warn!("dispatcher channel closed, stopping ebpf -> dispatcher");
-                            return;
-                        }
-                    }
+                    Some(UdpPacket::new(payload, src.into(), dst.into()))
+                });
+                if !ingress.send_batch(incoming) {
+                    warn!("dispatcher route queue closed, stopping eBPF UDP listener");
+                    return;
                 }
+                consume_budget().await;
             }
             Err(err) => {
                 error!("eBPF {} UDP recv error: {err}", family);
