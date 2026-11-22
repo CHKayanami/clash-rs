@@ -113,6 +113,10 @@ impl RuleMatcher for GeoSiteMatcher {
     fn type_name(&self) -> &str {
         "GeoSite"
     }
+
+    fn has_domain_condition(&self) -> bool {
+        true
+    }
 }
 
 #[cfg(test)]

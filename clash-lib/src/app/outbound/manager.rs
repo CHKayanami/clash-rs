@@ -42,7 +42,7 @@ use crate::{
     },
     print_and_exit,
     proxy::{
-        OutboundNode, OutboundType, anytls,
+        OutboundNode, OutboundType, RouteChange, anytls,
         direct::{self},
         fallback,
         group::smart,
@@ -166,6 +166,15 @@ impl OutboundManager {
         self.registry.load().get(name).cloned()
     }
 
+    pub(crate) fn get_outbound_or_direct(&self, name: &str) -> OutboundNode {
+        let registry = self.registry.load();
+        if let Some(handler) = registry.get(name) {
+            return handler.clone();
+        }
+        debug!("unknown rule: {}, fallback to direct", name);
+        registry.get(PROXY_DIRECT).unwrap().clone()
+    }
+
     /// this doesn't populate history/liveness information
     pub fn get_proxy_provider(&self, name: &str) -> Option<ArcProxyProvider> {
         self.proxy_providers.get(name).cloned()
@@ -252,6 +261,30 @@ impl OutboundManager {
 
     pub fn get_proxy_providers(&self) -> HashMap<String, ArcProxyProvider> {
         self.proxy_providers.clone()
+    }
+
+    pub fn collect_group_route_changes(&self) -> Vec<RouteChange> {
+        let mut raw = Vec::new();
+        for node in self.registry.load().values() {
+            if let Some(group) = node.as_group() {
+                group.route_changes(&mut raw);
+            }
+        }
+        let mut seen = HashSet::with_capacity(raw.len());
+        raw.retain(|change| seen.insert(change.identity()));
+        raw
+    }
+
+    #[cfg(all(target_os = "linux", feature = "ebpf"))]
+    pub(crate) async fn direct_outbound_names(&self) -> HashSet<Arc<str>> {
+        let registry = self.registry.load_full();
+        let mut direct_outbounds = HashSet::new();
+        for (name, node) in registry.iter() {
+            if node.effective_outbound_type().await == OutboundType::Direct {
+                direct_outbounds.insert(Arc::from(name.as_str()));
+            }
+        }
+        direct_outbounds
     }
 
     #[cfg(test)]

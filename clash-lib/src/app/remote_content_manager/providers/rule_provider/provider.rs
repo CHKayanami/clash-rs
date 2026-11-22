@@ -16,7 +16,7 @@ use crate::{
             Provider, ProviderType, ProviderVehicleType, ThreadSafeProviderVehicle,
             fetcher::Fetcher,
         },
-        router::{Rule, RuleMatcher, map_rule_type},
+        router::{Rule, RuleMatcher, RuleOffloadKind, map_rule_type},
     },
     common::{
         errors::map_io_error, geodata::GeoDataLookup, mmdb::MmdbLookup,
@@ -109,6 +109,13 @@ pub trait RuleProvider: Provider {
     /// Whether matching needs [`Session::process_name`] populated. Only
     /// classical providers can carry PROCESS-NAME/PROCESS-PATH rules.
     fn should_resolve_process(&self) -> bool;
+    fn is_context_sensitive(&self) -> bool {
+        false
+    }
+    /// Classify the matched child of a classical provider, when available.
+    fn matched_classical_offload_kind(&self, _sess: &Session) -> Option<RuleOffloadKind> {
+        None
+    }
     /// Number of entries currently loaded, for the `/rules` API.
     fn count(&self) -> usize;
     /// Register `cb` to run right after this provider's contents are replaced,
@@ -379,6 +386,32 @@ impl RuleProvider for RuleProviderImpl {
             }
             _ => false,
         }
+    }
+
+    fn is_context_sensitive(&self) -> bool {
+        match self.behavior {
+            RuleSetBehavior::Domain | RuleSetBehavior::Ipcidr => false,
+            RuleSetBehavior::Classical => {
+                let content = self.content.load();
+                match &**content {
+                    RuleContent::Classical(rules) => rules.iter().any(|r| {
+                        matches!(r.offload_kind(), RuleOffloadKind::ContextSensitive)
+                    }),
+                    _ => false,
+                }
+            }
+        }
+    }
+
+    fn matched_classical_offload_kind(&self, sess: &Session) -> Option<RuleOffloadKind> {
+        let content = self.content.load();
+        let RuleContent::Classical(rules) = &**content else {
+            return None;
+        };
+        rules
+            .iter()
+            .find(|rule| rule.apply(sess))
+            .map(|rule| rule.matched_offload_kind(sess))
     }
 
     fn count(&self) -> usize {

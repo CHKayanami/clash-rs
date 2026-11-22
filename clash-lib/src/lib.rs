@@ -836,7 +836,7 @@ async fn create_components(
     let sniffer = config.sniffer.map(|c| Arc::new(Sniffer::new(c)));
 
     debug!("initializing dispatcher");
-    let dispatcher = Arc::new(Dispatcher::new(
+    let dispatcher = Dispatcher::new(
         outbound_manager.clone(),
         router.clone(),
         dns_resolver.clone(),
@@ -845,7 +845,18 @@ async fn create_components(
         config.experimental.and_then(|e| e.tcp_buffer_size),
         sniffer,
         config.general.quic,
-    ));
+    );
+    #[cfg(all(target_os = "linux", feature = "ebpf"))]
+    let dispatcher = if config
+        .ebpf
+        .as_ref()
+        .is_some_and(|c| c.enable && c.auto_direct_offload)
+    {
+        dispatcher.with_route_offload()
+    } else {
+        dispatcher
+    };
+    let dispatcher = Arc::new(dispatcher);
 
     debug!("initializing authenticator");
     let authenticator = Arc::new(auth::PlainAuthenticator::new(config.users));

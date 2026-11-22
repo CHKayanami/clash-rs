@@ -323,7 +323,7 @@ pub struct SnifferConfig {
     pub force_domain: Option<Vec<String>>,
 }
 
-#[derive(Serialize, Deserialize, Default, Copy, Clone)]
+#[derive(Serialize, Deserialize, Default, Debug, Copy, Clone, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum RunMode {
     #[serde(alias = "Global")]

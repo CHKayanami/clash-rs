@@ -48,6 +48,16 @@ pub(crate) fn ends_with_ignore_ascii_case(haystack: &str, suffix: &str) -> bool 
         && haystack[haystack.len() - suffix.len()..].eq_ignore_ascii_case(suffix)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuleOffloadKind {
+    /// Matches purely on destination domain or destination IP/GeoIP.
+    Destination,
+    /// Matches on session context (source IP, port, process, network protocol).
+    ContextSensitive,
+    /// Catch-all final rule (`MATCH`).
+    Final,
+}
+
 #[enum_dispatch]
 pub trait RuleMatcher: Send + Sync + Unpin + Display {
     /// check if the rule should apply to the session
@@ -61,6 +71,18 @@ pub trait RuleMatcher: Send + Sync + Unpin + Display {
 
     /// the type of the rule
     fn type_name(&self) -> &str;
+
+    fn offload_kind(&self) -> RuleOffloadKind {
+        RuleOffloadKind::Destination
+    }
+
+    fn matched_offload_kind(&self, _sess: &Session) -> RuleOffloadKind {
+        self.offload_kind()
+    }
+
+    fn has_domain_condition(&self) -> bool {
+        false
+    }
 
     fn should_resolve_ip(&self) -> bool {
         false

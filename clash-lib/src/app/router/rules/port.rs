@@ -1,4 +1,7 @@
-use crate::{app::router::rules::RuleMatcher, session::Session};
+use crate::{
+    app::router::rules::{RuleMatcher, RuleOffloadKind},
+    session::Session,
+};
 
 #[derive(Clone)]
 pub struct Port {
@@ -38,5 +41,9 @@ impl RuleMatcher for Port {
 
     fn type_name(&self) -> &str {
         "Port"
+    }
+
+    fn offload_kind(&self) -> RuleOffloadKind {
+        RuleOffloadKind::ContextSensitive
     }
 }

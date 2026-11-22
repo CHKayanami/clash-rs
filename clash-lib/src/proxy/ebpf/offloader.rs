@@ -1,12 +1,35 @@
-use std::collections::{HashMap, HashSet, hash_map::Entry};
+use std::collections::{HashMap, HashSet};
+use std::future::pending;
 use std::net::IpAddr;
 use std::sync::{Arc, Weak};
 use std::time::Duration;
-use tokio::time::Instant;
+
+use clash_ebpf::EbpfManager;
+use futures::future::select_all;
+use tokio::sync::{
+    mpsc::{self, UnboundedSender, WeakUnboundedSender},
+    watch,
+};
+use tokio::task::AbortHandle;
+use tokio::time::{Instant, sleep, sleep_until};
+use tracing::{debug, info, warn};
 
 use super::utils::is_reserved_ip;
+use crate::app::dispatcher::{
+    Dispatcher, RouteOffloadAction, RouteOffloadEvent, RouteOffloadObserver,
+};
 use crate::app::dns::{ClashResolver, ThreadSafeDNSResolver};
 use crate::app::remote_content_manager::providers::rule_provider::CidrTrie;
+use crate::common::domain::has_valid_domain_labels;
+use crate::config::def::RunMode;
+use crate::proxy::{OutboundType, RouteChange};
+
+mod state;
+
+use state::{
+    DnsObservation, Observation, OffloadDesiredState, RouteDomainObservation,
+    RouteIpObservation,
+};
 
 pub type DomainKey = Arc<str>;
 
@@ -16,528 +39,243 @@ pub enum RoutingAction {
     Proxy,
 }
 
-struct DomainOwner {
-    v4_ips: Vec<IpAddr>,
-    v6_ips: Vec<IpAddr>,
-    action: RoutingAction,
-    last_seen: u64,
-}
-
-#[derive(Default)]
-struct IpActionCounts {
-    // A count cannot exceed max_owners (8192).
-    direct: u16,
-    proxy: u16,
-}
-
-// Match DYNAMIC_BYPASS_DST_IPS and DYNAMIC_BYPASS_DST_IP6S map capacities.
-const DEFAULT_MAX_V4_IPS: usize = 16384;
-const DEFAULT_MAX_V6_IPS: usize = 16384;
-// Domains commonly own multiple IPs; keep a separate bound on owner metadata.
-const DEFAULT_MAX_OWNERS: usize = 8192;
-// Reserve one tenth of each capacity to avoid evicting on every new observation.
-const EVICTION_RESERVE_DIVISOR: usize = 10;
-
-fn eviction_batch(max_ips: usize) -> usize {
-    (max_ips / EVICTION_RESERVE_DIVISOR).max(1)
-}
-
-/// DNS observations replace the addresses of the observed family. An unobserved
-/// family keeps its last state. No DNS TTL is used to change kernel bypass state.
-pub struct OffloadDesiredState {
-    max_v4_ips: usize,
-    max_v6_ips: usize,
-    max_owners: usize,
-    sequence: u64,
-    owners: HashMap<DomainKey, DomainOwner>,
-    ip_action_counts: HashMap<IpAddr, IpActionCounts>,
-    tracked_v4: usize,
-    tracked_v6: usize,
-    // Trigger proactive reclaim only when free capacity crosses below the threshold.
-    reclaim_armed_v4: bool,
-    reclaim_armed_v6: bool,
-    desired: HashSet<IpAddr>,
-    applied: HashSet<IpAddr>,
-    dirty_ips: HashSet<IpAddr>,
-}
-
-impl OffloadDesiredState {
-    pub fn new() -> Self {
-        Self::with_capacity(
-            DEFAULT_MAX_V4_IPS,
-            DEFAULT_MAX_V6_IPS,
-            DEFAULT_MAX_OWNERS,
-        )
+pub fn normalize_domain(domain: &str) -> Option<DomainKey> {
+    let trimmed = domain.trim().trim_end_matches('.');
+    if trimmed.is_empty()
+        || trimmed.parse::<IpAddr>().is_ok()
+        || !has_valid_domain_labels(trimmed)
+    {
+        return None;
     }
-
-    fn with_capacity(
-        max_v4_ips: usize,
-        max_v6_ips: usize,
-        max_owners: usize,
-    ) -> Self {
-        Self {
-            max_v4_ips,
-            max_v6_ips,
-            max_owners,
-            sequence: 0,
-            owners: HashMap::new(),
-            ip_action_counts: HashMap::new(),
-            tracked_v4: 0,
-            tracked_v6: 0,
-            reclaim_armed_v4: true,
-            reclaim_armed_v6: true,
-            desired: HashSet::new(),
-            applied: HashSet::new(),
-            dirty_ips: HashSet::new(),
-        }
-    }
-
-    fn observe_batch(
-        &mut self,
-        observations: impl IntoIterator<Item = DnsObservation>,
-    ) {
-        let mut affected = HashSet::new();
-        for observation in observations {
-            self.observe_one(observation, &mut affected);
-        }
-        self.recompute_ips(affected);
-    }
-
-    fn observe_one(&mut self, obs: DnsObservation, affected: &mut HashSet<IpAddr>) {
-        let mut incoming_v4 = Vec::new();
-        let mut incoming_v6 = Vec::new();
-        for ip in obs.ips {
-            if ip.is_ipv4() {
-                incoming_v4.push(ip);
-            } else {
-                incoming_v6.push(ip);
-            }
-        }
-        incoming_v4.sort_unstable();
-        incoming_v4.dedup();
-        incoming_v6.sort_unstable();
-        incoming_v6.dedup();
-        let has_v4 = !incoming_v4.is_empty();
-        let has_v6 = !incoming_v6.is_empty();
-
-        if let Some(owner) = self.owners.get_mut(&obs.domain) {
-            if owner.action == obs.action
-                && (!has_v4 || owner.v4_ips == incoming_v4)
-                && (!has_v6 || owner.v6_ips == incoming_v6)
-            {
-                self.sequence = self.sequence.wrapping_add(1);
-                owner.last_seen = self.sequence;
-                return;
-            }
-        }
-
-        let previous = self.owners.remove(&obs.domain);
-        if let Some(old) = &previous {
-            for ip in old.v4_ips.iter().chain(&old.v6_ips) {
-                self.change_count(*ip, old.action, false);
-                affected.insert(*ip);
-            }
-        }
-        self.sequence = self.sequence.wrapping_add(1);
-        let owner = DomainOwner {
-            v4_ips: if has_v4 {
-                incoming_v4
-            } else {
-                previous
-                    .as_ref()
-                    .map(|old| old.v4_ips.clone())
-                    .unwrap_or_default()
-            },
-            v6_ips: if has_v6 {
-                incoming_v6
-            } else {
-                previous
-                    .as_ref()
-                    .map(|old| old.v6_ips.clone())
-                    .unwrap_or_default()
-            },
-            action: obs.action,
-            last_seen: self.sequence,
-        };
-        for ip in owner.v4_ips.iter().chain(&owner.v6_ips) {
-            self.change_count(*ip, owner.action, true);
-            affected.insert(*ip);
-        }
-        let domain = Arc::clone(&obs.domain);
-        self.owners.insert(obs.domain, owner);
-        if !self.enforce_capacity(&domain, affected) {
-            if let Some(old) = previous {
-                for ip in old.v4_ips.iter().chain(&old.v6_ips) {
-                    self.change_count(*ip, old.action, true);
-                    affected.insert(*ip);
-                }
-                self.owners.insert(domain, old);
-            }
-        }
-    }
-
-    fn change_count(&mut self, ip: IpAddr, action: RoutingAction, add: bool) {
-        let tracked = if ip.is_ipv4() {
-            &mut self.tracked_v4
-        } else {
-            &mut self.tracked_v6
-        };
-        match (add, self.ip_action_counts.entry(ip)) {
-            (true, Entry::Vacant(entry)) => {
-                let Some(next) = tracked.checked_add(1) else {
-                    tracing::warn!(
-                        "eBPF offloader tracked IP count overflow for {ip}"
-                    );
-                    return;
-                };
-                let counts = match action {
-                    RoutingAction::Direct => IpActionCounts {
-                        direct: 1,
-                        proxy: 0,
-                    },
-                    RoutingAction::Proxy => IpActionCounts {
-                        direct: 0,
-                        proxy: 1,
-                    },
-                };
-                entry.insert(counts);
-                *tracked = next;
-            }
-            (true, Entry::Occupied(mut entry)) => {
-                let counts = entry.get_mut();
-                let count = match action {
-                    RoutingAction::Direct => &mut counts.direct,
-                    RoutingAction::Proxy => &mut counts.proxy,
-                };
-                if let Some(next) = count.checked_add(1) {
-                    *count = next;
-                } else {
-                    tracing::warn!("eBPF offloader owner count overflow for {ip}");
-                }
-            }
-            (false, Entry::Vacant(_)) => {
-                tracing::warn!(
-                    "eBPF offloader tried to remove an unknown owner for {ip}"
-                );
-            }
-            (false, Entry::Occupied(mut entry)) => {
-                let counts = entry.get_mut();
-                let count = match action {
-                    RoutingAction::Direct => &mut counts.direct,
-                    RoutingAction::Proxy => &mut counts.proxy,
-                };
-                let Some(next) = count.checked_sub(1) else {
-                    tracing::warn!("eBPF offloader owner count underflow for {ip}");
-                    return;
-                };
-                *count = next;
-                if counts.direct == 0 && counts.proxy == 0 {
-                    entry.remove();
-                    if let Some(next) = tracked.checked_sub(1) {
-                        *tracked = next;
-                    } else {
-                        tracing::warn!(
-                            "eBPF offloader tracked IP count underflow for {ip}"
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    fn remove_owner(&mut self, domain: &DomainKey, affected: &mut HashSet<IpAddr>) {
-        if let Some(owner) = self.owners.remove(domain) {
-            for ip in owner.v4_ips.iter().chain(&owner.v6_ips) {
-                self.change_count(*ip, owner.action, false);
-                affected.insert(*ip);
-            }
-        }
-    }
-
-    /// Plan all evictions before changing existing owners. Shared IPs only free
-    /// capacity when their last owner is removed.
-    fn enforce_capacity(
-        &mut self,
-        observed: &DomainKey,
-        affected: &mut HashSet<IpAddr>,
-    ) -> bool {
-        let fits = |owners: usize, v4: usize, v6: usize| {
-            owners <= self.max_owners
-                && v4 <= self.max_v4_ips
-                && v6 <= self.max_v6_ips
-        };
-        if fits(self.owners.len(), self.tracked_v4, self.tracked_v6) {
-            return true;
-        }
-
-        let Some(new_owner) = self.owners.get(observed) else {
-            return false;
-        };
-        if self.max_owners == 0
-            || new_owner.v4_ips.len() > self.max_v4_ips
-            || new_owner.v6_ips.len() > self.max_v6_ips
-        {
-            self.remove_owner(observed, affected);
-            return false;
-        }
-
-        let excess_owners = self.owners.len().saturating_sub(self.max_owners);
-        let target_owners = if excess_owners > 0 {
-            excess_owners.max(eviction_batch(self.max_owners))
-        } else {
-            0
-        };
-        let excess_v4 = self.tracked_v4.saturating_sub(self.max_v4_ips);
-        let excess_v6 = self.tracked_v6.saturating_sub(self.max_v6_ips);
-        if excess_v4 == 0 && excess_v6 == 0 {
-            let mut candidates: Vec<_> = self
-                .owners
-                .iter()
-                .filter(|(domain, _)| *domain != observed)
-                .map(|(domain, owner)| (owner.last_seen, domain))
-                .collect();
-            if candidates.len() < target_owners {
-                self.remove_owner(observed, affected);
-                return false;
-            }
-            candidates
-                .select_nth_unstable_by_key(target_owners - 1, |(seen, _)| *seen);
-            let evictions: Vec<_> = candidates[..target_owners]
-                .iter()
-                .map(|(_, domain)| Arc::clone(domain))
-                .collect();
-            for domain in evictions {
-                self.remove_owner(&domain, affected);
-            }
-            return true;
-        }
-        let batch_v4 = eviction_batch(self.max_v4_ips);
-        let batch_v6 = eviction_batch(self.max_v6_ips);
-        let target_v4 = if excess_v4 > 0 {
-            excess_v4.max(batch_v4)
-        } else {
-            0
-        };
-        let target_v6 = if excess_v6 > 0 {
-            excess_v6.max(batch_v6)
-        } else {
-            0
-        };
-        let Some(evictions) =
-            self.plan_evictions(Some(observed), target_owners, target_v4, target_v6)
-        else {
-            self.remove_owner(observed, affected);
-            return false;
-        };
-        for domain in evictions {
-            self.remove_owner(&domain, affected);
-        }
-        true
-    }
-
-    fn plan_evictions(
-        &self,
-        protected: Option<&DomainKey>,
-        target_owners: usize,
-        target_v4: usize,
-        target_v6: usize,
-    ) -> Option<Vec<DomainKey>> {
-        let fits = |owners: usize, v4: usize, v6: usize| {
-            owners <= self.max_owners
-                && v4 <= self.max_v4_ips
-                && v6 <= self.max_v6_ips
-        };
-        let mut candidates: Vec<_> = self
-            .owners
-            .iter()
-            .filter(|(domain, _)| {
-                protected.is_none_or(|protected| *domain != protected)
-            })
-            .collect();
-        candidates.sort_unstable_by_key(|(_, owner)| owner.last_seen);
-
-        let mut remaining_owners = self.owners.len();
-        let mut remaining_v4 = self.tracked_v4;
-        let mut remaining_v6 = self.tracked_v6;
-        let mut remaining_counts = HashMap::<IpAddr, usize>::new();
-        let mut evictions = Vec::new();
-        loop {
-            let mut deferred = Vec::new();
-            let mut progressed = false;
-            for (domain, owner) in candidates.drain(..) {
-                let need_owner = evictions.len() < target_owners;
-                let need_v4 =
-                    self.tracked_v4.saturating_sub(remaining_v4) < target_v4;
-                let need_v6 =
-                    self.tracked_v6.saturating_sub(remaining_v6) < target_v6;
-                if fits(remaining_owners, remaining_v4, remaining_v6)
-                    && !need_owner
-                    && !need_v4
-                    && !need_v6
-                {
-                    break;
-                }
-                let frees_needed_ip = !need_owner
-                    && owner.v4_ips.iter().chain(&owner.v6_ips).any(|ip| {
-                        ((ip.is_ipv4() && need_v4) || (ip.is_ipv6() && need_v6))
-                            && remaining_counts.get(ip).copied().unwrap_or_else(
-                                || {
-                                    self.ip_action_counts
-                                        .get(ip)
-                                        .map(|counts| {
-                                            usize::from(counts.direct)
-                                                + usize::from(counts.proxy)
-                                        })
-                                        .unwrap_or(0)
-                                },
-                            ) == 1
-                    });
-                if !frees_needed_ip
-                    && !need_owner
-                    && remaining_owners <= self.max_owners
-                {
-                    deferred.push((domain, owner));
-                    continue;
-                }
-                for ip in owner.v4_ips.iter().chain(&owner.v6_ips) {
-                    let remaining =
-                        remaining_counts.entry(*ip).or_insert_with(|| {
-                            self.ip_action_counts
-                                .get(ip)
-                                .map(|counts| {
-                                    usize::from(counts.direct)
-                                        + usize::from(counts.proxy)
-                                })
-                                .unwrap_or(0)
-                        });
-                    if let Some(next) = remaining.checked_sub(1) {
-                        *remaining = next;
-                        if next == 0 {
-                            if ip.is_ipv4() {
-                                remaining_v4 = remaining_v4.saturating_sub(1);
-                            } else {
-                                remaining_v6 = remaining_v6.saturating_sub(1);
-                            }
-                        }
-                    }
-                }
-                remaining_owners = remaining_owners.saturating_sub(1);
-                evictions.push(Arc::clone(domain));
-                progressed = true;
-            }
-            if !progressed {
-                break;
-            }
-            candidates = deferred;
-        }
-
-        if fits(remaining_owners, remaining_v4, remaining_v6) {
-            Some(evictions)
-        } else {
-            None
-        }
-    }
-
-    /// Reclaim room after a successful kernel flush, outside DNS observation processing.
-    fn reclaim_headroom(&mut self) {
-        let batch_v4 = eviction_batch(self.max_v4_ips);
-        let batch_v6 = eviction_batch(self.max_v6_ips);
-        let free_v4 = self.max_v4_ips.saturating_sub(self.tracked_v4);
-        let free_v6 = self.max_v6_ips.saturating_sub(self.tracked_v6);
-        if free_v4 >= batch_v4 {
-            self.reclaim_armed_v4 = true;
-        }
-        if free_v6 >= batch_v6 {
-            self.reclaim_armed_v6 = true;
-        }
-        let target_v4 = if free_v4 < batch_v4 && self.reclaim_armed_v4 {
-            self.reclaim_armed_v4 = false;
-            batch_v4
-        } else {
-            0
-        };
-        let target_v6 = if free_v6 < batch_v6 && self.reclaim_armed_v6 {
-            self.reclaim_armed_v6 = false;
-            batch_v6
-        } else {
-            0
-        };
-        if target_v4 == 0 && target_v6 == 0 {
-            return;
-        }
-
-        // Keep the most recently observed domain so cleanup cannot undo its fresh update.
-        let protected = self
-            .owners
-            .iter()
-            .max_by_key(|(_, owner)| owner.last_seen)
-            .map(|(domain, _)| Arc::clone(domain));
-        let Some(evictions) =
-            self.plan_evictions(protected.as_ref(), 0, target_v4, target_v6)
-        else {
-            return;
-        };
-        let mut affected = HashSet::new();
-        for domain in evictions {
-            self.remove_owner(&domain, &mut affected);
-        }
-        self.recompute_ips(affected);
-        if self.max_v4_ips.saturating_sub(self.tracked_v4) >= batch_v4 {
-            self.reclaim_armed_v4 = true;
-        }
-        if self.max_v6_ips.saturating_sub(self.tracked_v6) >= batch_v6 {
-            self.reclaim_armed_v6 = true;
-        }
-    }
-
-    fn recompute_ips(&mut self, ips: HashSet<IpAddr>) {
-        for ip in ips {
-            let direct = self
-                .ip_action_counts
-                .get(&ip)
-                .is_some_and(|counts| counts.direct > 0 && counts.proxy == 0);
-            if direct != self.desired.contains(&ip) {
-                if direct {
-                    self.desired.insert(ip);
-                } else {
-                    self.desired.remove(&ip);
-                }
-                self.dirty_ips.insert(ip);
-            }
-        }
+    if trimmed.bytes().any(|b| b.is_ascii_uppercase()) {
+        Some(Arc::from(trimmed.to_ascii_lowercase()))
+    } else {
+        Some(Arc::from(trimmed))
     }
 }
 
 #[derive(Debug)]
-struct DnsObservation {
-    domain: DomainKey,
-    ips: Vec<IpAddr>,
-    action: RoutingAction,
+enum OffloadMessage {
+    Observe(Observation),
+    ModeChanged(RunMode),
+    GroupRouteChanged,
+}
+
+async fn wait_any_route_change(waits: &mut [(usize, watch::Receiver<()>)]) {
+    let futs = waits
+        .iter_mut()
+        .map(|(_, rx)| Box::pin(rx.changed()));
+    let _ = select_all(futs).await;
+}
+
+fn sync_route_waits(
+    waits: &mut Vec<(usize, watch::Receiver<()>)>,
+    changes: Vec<RouteChange>,
+) {
+    let wanted: HashSet<usize> = changes.iter().map(|c| c.identity()).collect();
+    waits.retain(|(id, _)| wanted.contains(id));
+    for change in changes {
+        let id = change.identity();
+        if !waits.iter().any(|(existing, _)| *existing == id) {
+            waits.push((id, change.subscribe()));
+        }
+    }
+}
+
+fn spawn_route_change_watcher(
+    dispatcher: Weak<Dispatcher>,
+    weak_tx: WeakUnboundedSender<OffloadMessage>,
+    mut route_waits: Vec<(usize, watch::Receiver<()>)>,
+) -> AbortHandle {
+    tokio::spawn(async move {
+        const ROUTE_CHANGE_DEBOUNCE: Duration = Duration::from_millis(50);
+        while !route_waits.is_empty() {
+            wait_any_route_change(&mut route_waits).await;
+            sleep(ROUTE_CHANGE_DEBOUNCE).await;
+            for (_, rx) in &mut route_waits {
+                let _ = rx.borrow_and_update();
+            }
+            let Some(disp) = dispatcher.upgrade() else {
+                break;
+            };
+            sync_route_waits(
+                &mut route_waits,
+                disp.outbound_manager().collect_group_route_changes(),
+            );
+            let Some(tx) = weak_tx.upgrade() else {
+                break;
+            };
+            if tx.send(OffloadMessage::GroupRouteChanged).is_err() {
+                break;
+            }
+        }
+    })
+    .abort_handle()
+}
+
+pub(crate) async fn evaluate_dns_offload(
+    dispatcher: &Dispatcher,
+    domain: &str,
+    ips: &[IpAddr],
+) -> (RoutingAction, Arc<str>, bool) {
+    let router = dispatcher.router();
+    let (sess, outbound, rule) = router.match_domain_probe(domain, ips).await;
+    let rule_offloadable = router.is_match_offloadable(&sess, rule, true);
+    let handler = dispatcher
+        .outbound_manager()
+        .get_outbound_or_direct(outbound);
+    let action = if rule_offloadable
+        && handler.effective_outbound_type().await == OutboundType::Direct
+    {
+        RoutingAction::Direct
+    } else {
+        RoutingAction::Proxy
+    };
+    (action, Arc::from(handler.name()), rule_offloadable)
+}
+
+async fn reconcile_group_routes(
+    state: &mut OffloadDesiredState,
+    dispatcher: &Weak<Dispatcher>,
+    direct_outbounds: &mut Option<HashSet<Arc<str>>>,
+) {
+    let Some(disp) = dispatcher.upgrade() else {
+        return;
+    };
+    let current = disp.outbound_manager().direct_outbound_names().await;
+    let Some(previous) = direct_outbounds.as_mut() else {
+        *direct_outbounds = Some(current);
+        return;
+    };
+    if current == *previous {
+        return;
+    }
+    let actions = current
+        .difference(previous)
+        .map(|name| (name.clone(), RoutingAction::Direct))
+        .chain(
+            previous
+                .difference(&current)
+                .map(|name| (name.clone(), RoutingAction::Proxy)),
+        )
+        .collect::<HashMap<_, _>>();
+    state.reconcile_outbounds(&actions);
+    *previous = current;
+}
+
+async fn reconcile_observation(
+    observation: &mut Observation,
+    state: &mut OffloadDesiredState,
+    affected: &mut HashSet<IpAddr>,
+    dispatcher: &Weak<Dispatcher>,
+    direct_outbounds: &mut Option<HashSet<Arc<str>>>,
+) {
+    let (Some(snapshot), Some((outbound, observed))) =
+        (direct_outbounds.as_ref(), observation.route_reconcile_key())
+    else {
+        return;
+    };
+    let was_direct = snapshot.contains(outbound);
+    if (observed == RoutingAction::Direct) == was_direct {
+        return;
+    }
+
+    let is_direct = if let Some(disp) = dispatcher.upgrade() {
+        match disp.outbound_manager().get_outbound(outbound) {
+            Some(handler) => {
+                handler.effective_outbound_type().await == OutboundType::Direct
+            }
+            None => false,
+        }
+    } else {
+        was_direct
+    };
+    let is_direct = if is_direct != was_direct {
+        state.recompute_ips(affected.drain());
+        reconcile_group_routes(state, dispatcher, direct_outbounds).await;
+        direct_outbounds.as_ref().is_some_and(|set| set.contains(outbound))
+    } else {
+        was_direct
+    };
+
+    let action = if is_direct {
+        RoutingAction::Direct
+    } else {
+        RoutingAction::Proxy
+    };
+    observation.set_action(action);
+}
+
+async fn process_message_batch(
+    state: &mut OffloadDesiredState,
+    active_mode: &mut RunMode,
+    dispatcher: &Weak<Dispatcher>,
+    direct_outbounds: &mut Option<HashSet<Arc<str>>>,
+    batch: impl IntoIterator<Item = OffloadMessage>,
+) {
+    let mut affected = HashSet::new();
+    for msg in batch {
+        match msg {
+            OffloadMessage::ModeChanged(next_mode) => {
+                state.recompute_ips(affected.drain());
+                DirectOffloader::apply_mode_transition(state, active_mode, next_mode);
+            }
+            OffloadMessage::GroupRouteChanged => {
+                state.recompute_ips(affected.drain());
+                reconcile_group_routes(state, dispatcher, direct_outbounds).await;
+            }
+            OffloadMessage::Observe(mut observation) => {
+                reconcile_observation(
+                    &mut observation, state, &mut affected, dispatcher, direct_outbounds,
+                )
+                .await;
+                state.observe(observation, &mut affected);
+            }
+        }
+    }
+    state.recompute_ips(affected);
 }
 
 #[derive(Clone)]
 pub struct DirectOffloader {
-    tx: tokio::sync::mpsc::UnboundedSender<DnsObservation>,
+    tx: UnboundedSender<OffloadMessage>,
     resolver: Weak<dyn ClashResolver>,
     bypass_dst_trie: Arc<CidrTrie>,
     proxy_dst_trie: Arc<CidrTrie>,
-    abort_handle: Arc<tokio::task::AbortHandle>,
+    abort_handle: Arc<AbortHandle>,
+    route_watch_abort: Arc<AbortHandle>,
 }
 
 impl DirectOffloader {
-    pub fn new(
-        manager: Weak<clash_ebpf::EbpfManager>,
+    pub async fn new(
+        manager: Weak<EbpfManager>,
         resolver: ThreadSafeDNSResolver,
         bypass_dst_trie: Arc<CidrTrie>,
         proxy_dst_trie: Arc<CidrTrie>,
+        dispatcher: Weak<Dispatcher>,
     ) -> Self {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<DnsObservation>();
+        let mut route_waits = Vec::new();
+        let mut direct_outbounds = None;
+        if let Some(disp) = dispatcher.upgrade() {
+            let outbound_manager = disp.outbound_manager();
+            // Subscribe before reading the initial snapshot so concurrent changes stay pending.
+            sync_route_waits(&mut route_waits, outbound_manager.collect_group_route_changes());
+            direct_outbounds = Some(outbound_manager.direct_outbound_names().await);
+        }
+        let (tx, mut rx) = mpsc::unbounded_channel::<OffloadMessage>();
+        let route_watch_abort = spawn_route_change_watcher(
+            dispatcher.clone(), tx.downgrade(), route_waits,
+        );
+
         let handle = tokio::spawn(async move {
             const INITIAL_RETRY_DELAY: Duration = Duration::from_secs(1);
             const MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
             let mut state = OffloadDesiredState::new();
+            let mut active_mode = RunMode::Rule;
             let mut retry_delay = INITIAL_RETRY_DELAY;
             let mut retry_at = None;
+            const MAX_BATCH_OBSERVATIONS: usize = 256;
+            let mut batch = Vec::with_capacity(MAX_BATCH_OBSERVATIONS);
 
             loop {
                 if !state.dirty_ips.is_empty()
@@ -548,11 +286,9 @@ impl DirectOffloader {
                     let mut del_v4 = Vec::new();
                     let mut del_v6 = Vec::new();
                     for ip in &state.dirty_ips {
-                        match (
-                            state.desired.contains(ip),
-                            state.applied.contains(ip),
-                            ip,
-                        ) {
+                        let desired_active =
+                            active_mode != RunMode::Global && state.desired.contains(ip);
+                        match (desired_active, state.applied.contains(ip), ip) {
                             (true, false, IpAddr::V4(v4)) => add_v4.push(*v4),
                             (true, false, IpAddr::V6(v6)) => add_v6.push(*v6),
                             (false, true, IpAddr::V4(v4)) => del_v4.push(*v4),
@@ -576,14 +312,14 @@ impl DirectOffloader {
                                 Ok(()) => {
                                     flush_succeeded = true;
                                     if !add_v4.is_empty() || !add_v6.is_empty() {
-                                        tracing::info!(
+                                        info!(
                                             "[eBPF DirectOffloader] Dynamic bypass added: IPv4={}, IPv6={}",
                                             add_v4.len(),
                                             add_v6.len()
                                         );
                                     }
                                     if !del_v4.is_empty() || !del_v6.is_empty() {
-                                        tracing::info!(
+                                        info!(
                                             "[eBPF DirectOffloader] Dynamic bypass removed: IPv4={}, IPv6={}",
                                             del_v4.len(),
                                             del_v6.len()
@@ -604,12 +340,12 @@ impl DirectOffloader {
                                         state.applied.remove(&ip);
                                     }
                                 }
-                                Err(e) => tracing::warn!(
+                                Err(e) => warn!(
                                     "eBPF dynamic bypass batch update failed: {e} (retrying in {retry_delay:?})"
                                 ),
                             }
                         } else {
-                            tracing::debug!(
+                            debug!(
                                 "eBPF manager not initialized yet, deferring dynamic bypass flush (retrying in {retry_delay:?})"
                             );
                         }
@@ -618,10 +354,10 @@ impl DirectOffloader {
                         state.dirty_ips.clear();
                         retry_at = None;
                         retry_delay = INITIAL_RETRY_DELAY;
-                        if has_updates {
+                        if has_updates && active_mode != RunMode::Global {
                             state.reclaim_headroom();
                             if !state.dirty_ips.is_empty() {
-                                // Flush cleanup immediately, even if no more DNS events arrive.
+                                // Flush cleanup immediately, even if no more events arrive.
                                 continue;
                             }
                         }
@@ -632,22 +368,24 @@ impl DirectOffloader {
                 }
 
                 tokio::select! {
-                    observation = rx.recv() => match observation {
-                        Some(obs) => {
-                            const MAX_BATCH_OBSERVATIONS: usize = 256;
-                            let batch = std::iter::once(obs).chain(
-                                std::iter::from_fn(|| rx.try_recv().ok())
-                                    .take(MAX_BATCH_OBSERVATIONS - 1),
-                            );
-                            state.observe_batch(batch);
+                    count = rx.recv_many(&mut batch, MAX_BATCH_OBSERVATIONS) => {
+                        if count == 0 {
+                            break;
                         }
-                        None => break,
+                        process_message_batch(
+                            &mut state,
+                            &mut active_mode,
+                            &dispatcher,
+                            &mut direct_outbounds,
+                            batch.drain(..),
+                        )
+                        .await;
                     },
                     _ = async {
                         if let Some(deadline) = retry_at {
-                            tokio::time::sleep_until(deadline).await;
+                            sleep_until(deadline).await;
                         } else {
-                            std::future::pending::<()>().await;
+                            pending::<()>().await;
                         }
                     } => {}
                 }
@@ -659,42 +397,119 @@ impl DirectOffloader {
             bypass_dst_trie,
             proxy_dst_trie,
             abort_handle: Arc::new(handle.abort_handle()),
+            route_watch_abort: Arc::new(route_watch_abort),
+        }
+    }
+
+    fn apply_mode_transition(
+        state: &mut OffloadDesiredState,
+        active_mode: &mut RunMode,
+        next_mode: RunMode,
+    ) {
+        if *active_mode == next_mode {
+            return;
+        }
+        let was_global = *active_mode == RunMode::Global;
+        *active_mode = next_mode;
+        if next_mode == RunMode::Global {
+            state.dirty_ips.extend(state.applied.iter().copied());
+        } else if was_global {
+            state.dirty_ips.extend(state.desired.iter().copied());
+            state.dirty_ips.extend(state.applied.iter().copied());
         }
     }
 
     pub fn stop(&self) {
+        self.route_watch_abort.abort();
         self.abort_handle.abort();
     }
 
-    pub async fn observe(
+    fn should_skip_ip(&self, ip: IpAddr) -> bool {
+        let is_fake_ip = self
+            .resolver
+            .upgrade()
+            .is_some_and(|resolver| resolver.is_fake_ip(ip));
+        is_reserved_ip(ip)
+            || is_fake_ip
+            || self.bypass_dst_trie.contains(ip)
+            || self.proxy_dst_trie.contains(ip)
+    }
+
+    fn build_dns_observation(
         &self,
-        domain: DomainKey,
+        domain: &str,
         mut ips: Vec<IpAddr>,
         action: RoutingAction,
-    ) {
-        let mut effective_action = action;
-        let resolver = self.resolver.upgrade();
-        ips.retain(|ip| {
-            let is_fake_ip = resolver
-                .as_ref()
-                .is_some_and(|resolver| resolver.is_fake_ip(*ip));
-            if is_reserved_ip(*ip) || is_fake_ip {
-                return false;
-            }
-            if self.proxy_dst_trie.contains(*ip) {
-                effective_action = RoutingAction::Proxy;
-            } else if self.bypass_dst_trie.contains(*ip) {
-                return false;
-            }
-            true
-        });
-        if !ips.is_empty() {
-            let _ = self.tx.send(DnsObservation {
-                domain,
-                ips,
-                action: effective_action,
-            });
+        outbound: Option<Arc<str>>,
+        rule_offloadable: bool,
+    ) -> Option<Observation> {
+        let domain = normalize_domain(domain)?;
+        ips.retain(|ip| !self.should_skip_ip(*ip));
+        if ips.is_empty() {
+            return None;
         }
+        Some(Observation::Dns(DnsObservation {
+            domain,
+            ips,
+            action,
+            outbound,
+            rule_offloadable,
+        }))
+    }
+
+    fn build_route_observation(&self, event: RouteOffloadEvent) -> Option<Observation> {
+        let ip = event.ip.to_canonical();
+        if self.should_skip_ip(ip) {
+            return None;
+        }
+        let action = match event.action {
+            RouteOffloadAction::Direct => RoutingAction::Direct,
+            RouteOffloadAction::Proxy => RoutingAction::Proxy,
+        };
+        if let Some(raw_domain) = event.domain {
+            let domain = normalize_domain(&raw_domain)?;
+            Some(Observation::RouteDomain(RouteDomainObservation {
+                domain,
+                ip,
+                action,
+                outbound: event.outbound,
+                rule_offloadable: event.rule_offloadable,
+            }))
+        } else {
+            Some(Observation::RouteIp(RouteIpObservation {
+                ip,
+                action,
+                outbound: event.outbound,
+                rule_offloadable: event.rule_offloadable,
+            }))
+        }
+    }
+
+    pub(super) fn observe_dns(
+        &self,
+        domain: &str,
+        ips: Vec<IpAddr>,
+        action: RoutingAction,
+        outbound: Arc<str>,
+        rule_offloadable: bool,
+    ) {
+        if let Some(observation) =
+            self.build_dns_observation(domain, ips, action, Some(outbound), rule_offloadable)
+        {
+            let _ = self.tx.send(OffloadMessage::Observe(observation));
+        }
+    }
+}
+
+impl RouteOffloadObserver for DirectOffloader {
+    fn on_route(&self, event: RouteOffloadEvent) {
+        if let Some(observation) = self.build_route_observation(event) {
+            let _ = self.tx.send(OffloadMessage::Observe(observation));
+        }
+    }
+
+    fn on_mode_change(&self, mode: RunMode) {
+        let _ = self.tx.send(OffloadMessage::ModeChanged(mode));
     }
 }
 
@@ -702,19 +517,6 @@ impl DirectOffloader {
 mod tests {
     use super::*;
     use crate::app::dns::{MockClashResolver, ThreadSafeDNSResolver};
-
-    fn observe(
-        state: &mut OffloadDesiredState,
-        domain: &str,
-        ips: &[IpAddr],
-        action: RoutingAction,
-    ) {
-        state.observe_batch(vec![DnsObservation {
-            domain: domain.into(),
-            ips: ips.to_vec(),
-            action,
-        }]);
-    }
 
     #[tokio::test]
     async fn direct_offloader_does_not_retain_resolver() {
@@ -725,7 +527,9 @@ mod tests {
             resolver.clone(),
             Arc::new(CidrTrie::new()),
             Arc::new(CidrTrie::new()),
-        );
+            Weak::new(),
+        )
+        .await;
         drop(resolver);
         assert!(weak_resolver.upgrade().is_none());
         drop(offloader);
@@ -733,459 +537,389 @@ mod tests {
     }
 
     #[test]
-    fn state_changes_only_when_direct_status_changes() {
+    fn mode_transition_global_clears_applied_and_rule_restores() {
         let mut state = OffloadDesiredState::new();
         let ip: IpAddr = "1.2.3.4".parse().unwrap();
-        observe(&mut state, "a.com", &[ip], RoutingAction::Direct);
+        let mut affected = HashSet::new();
+        state.observe(
+            Observation::Dns(DnsObservation {
+                domain: "a.com".into(),
+                ips: vec![ip],
+                action: RoutingAction::Direct,
+                outbound: None,
+                rule_offloadable: true,
+            }),
+            &mut affected,
+        );
+        state.recompute_ips(affected);
+        state.applied.insert(ip);
+        state.dirty_ips.clear();
+
+        let mut mode = RunMode::Rule;
+        DirectOffloader::apply_mode_transition(&mut state, &mut mode, RunMode::Global);
+        assert_eq!(mode, RunMode::Global);
+        assert!(state.dirty_ips.contains(&ip));
+        // Simulate kernel flush under Global mode: applied cleared, desired retained.
+        state.applied.clear();
+        state.dirty_ips.clear();
         assert!(state.desired.contains(&ip));
-        assert!(state.dirty_ips.remove(&ip));
-        observe(&mut state, "a.com", &[ip], RoutingAction::Direct);
-        assert!(state.dirty_ips.is_empty());
-        observe(&mut state, "b.com", &[ip], RoutingAction::Proxy);
-        assert!(!state.desired.contains(&ip));
-        assert!(state.dirty_ips.remove(&ip));
-        observe(&mut state, "b.com", &[ip], RoutingAction::Proxy);
-        assert!(state.dirty_ips.is_empty());
-        observe(&mut state, "b.com", &[ip], RoutingAction::Direct);
-        assert!(state.desired.contains(&ip));
+
+        DirectOffloader::apply_mode_transition(&mut state, &mut mode, RunMode::Rule);
+        assert_eq!(mode, RunMode::Rule);
         assert!(state.dirty_ips.contains(&ip));
     }
 
     #[test]
-    fn repeated_reordered_dns_answers_reuse_owner_state() {
-        let mut state = OffloadDesiredState::new();
-        let a: IpAddr = "1.1.1.1".parse().unwrap();
-        let b: IpAddr = "2.2.2.2".parse().unwrap();
-        observe(&mut state, "a.com", &[b, a, a], RoutingAction::Direct);
-        assert_eq!(state.tracked_v4, 2);
-        assert_eq!(state.ip_action_counts.get(&a).unwrap().direct, 1);
-        state.dirty_ips.clear();
-        let last_seen = state.owners.get("a.com").unwrap().last_seen;
-
-        observe(&mut state, "a.com", &[a, b], RoutingAction::Direct);
-        assert!(state.dirty_ips.is_empty());
-        assert_eq!(state.tracked_v4, 2);
-        assert_eq!(state.ip_action_counts.get(&a).unwrap().direct, 1);
-        assert!(state.owners.get("a.com").unwrap().last_seen > last_seen);
-    }
-
-    #[test]
-    fn address_changes_and_families_are_independent() {
-        let mut state = OffloadDesiredState::new();
-        let v4a: IpAddr = "1.2.3.4".parse().unwrap();
-        let v4b: IpAddr = "1.2.3.5".parse().unwrap();
-        let v6: IpAddr = "2001:db8::1".parse().unwrap();
-        observe(&mut state, "a.com", &[v4a], RoutingAction::Direct);
-        state.dirty_ips.clear();
-        observe(&mut state, "a.com", &[v6], RoutingAction::Direct);
-        assert!(state.desired.contains(&v4a));
-        assert!(state.desired.contains(&v6));
-        assert_eq!(state.dirty_ips, HashSet::from([v6]));
-        state.dirty_ips.clear();
-        observe(&mut state, "a.com", &[v4b], RoutingAction::Direct);
-        assert!(!state.desired.contains(&v4a));
-        assert!(state.desired.contains(&v4b));
-        assert!(state.desired.contains(&v6));
-        assert_eq!(state.dirty_ips, HashSet::from([v4a, v4b]));
-    }
-
-    #[test]
-    fn capacity_evicts_oldest_observation_without_ttl() {
-        let mut state = OffloadDesiredState::with_capacity(2, 2, 2);
-        let a: IpAddr = "1.1.1.1".parse().unwrap();
-        let b: IpAddr = "2.2.2.2".parse().unwrap();
-        let c: IpAddr = "3.3.3.3".parse().unwrap();
-        observe(&mut state, "a.com", &[a], RoutingAction::Direct);
-        observe(&mut state, "b.com", &[b], RoutingAction::Direct);
-        observe(&mut state, "a.com", &[a], RoutingAction::Direct);
-        state.dirty_ips.clear();
-        observe(&mut state, "c.com", &[c], RoutingAction::Direct);
-        assert!(state.desired.contains(&a));
-        assert!(!state.desired.contains(&b));
-        assert!(state.desired.contains(&c));
-        assert_eq!(state.dirty_ips, HashSet::from([b, c]));
-    }
-
-    #[test]
-    fn ipv6_capacity_is_independent_of_ipv4() {
-        let mut state = OffloadDesiredState::with_capacity(2, 1, 3);
-        let v4: IpAddr = "1.1.1.1".parse().unwrap();
-        let v6a: IpAddr = "2001:db8::1".parse().unwrap();
-        let v6b: IpAddr = "2001:db8::2".parse().unwrap();
-        observe(&mut state, "a.com", &[v6a], RoutingAction::Direct);
-        observe(&mut state, "b.com", &[v4], RoutingAction::Direct);
-        observe(&mut state, "c.com", &[v6b], RoutingAction::Direct);
-        assert!(!state.desired.contains(&v6a));
-        assert!(state.desired.contains(&v4));
-        assert!(state.desired.contains(&v6b));
-    }
-
-    #[test]
-    fn shared_ip_capacity_skips_oldest_owner_when_it_cannot_release_ip() {
-        let mut state = OffloadDesiredState::with_capacity(2, 2, 3);
-        let shared: IpAddr = "1.1.1.1".parse().unwrap();
-        let old_unique: IpAddr = "2.2.2.2".parse().unwrap();
-        let new_unique: IpAddr = "3.3.3.3".parse().unwrap();
-        observe(&mut state, "a.com", &[shared], RoutingAction::Direct);
-        observe(
-            &mut state,
-            "b.com",
-            &[shared, old_unique],
-            RoutingAction::Direct,
+    fn normalize_domain_handles_case_trailing_dot_and_ip_literals() {
+        assert_eq!(
+            normalize_domain("Example.COM.").as_deref(),
+            Some("example.com")
         );
-        state.dirty_ips.clear();
-
-        observe(&mut state, "c.com", &[new_unique], RoutingAction::Direct);
-        assert!(state.owners.contains_key("a.com"));
-        assert!(!state.owners.contains_key("b.com"));
-        assert!(state.owners.contains_key("c.com"));
-        assert!(state.desired.contains(&shared));
-        assert!(!state.desired.contains(&old_unique));
-        assert!(state.desired.contains(&new_unique));
-        assert_eq!(state.dirty_ips, HashSet::from([old_unique, new_unique]));
-        assert_eq!(state.tracked_v4, 2);
+        assert!(normalize_domain("1.2.3.4").is_none());
+        assert!(normalize_domain("   ").is_none());
     }
 
-    #[test]
-    fn shared_ip_capacity_rejects_new_owner_without_cascading() {
-        let mut state = OffloadDesiredState::with_capacity(1, 1, 3);
-        let shared: IpAddr = "1.1.1.1".parse().unwrap();
-        let new_ip: IpAddr = "2.2.2.2".parse().unwrap();
-        observe(&mut state, "a.com", &[shared], RoutingAction::Direct);
-        observe(&mut state, "b.com", &[shared], RoutingAction::Direct);
-        state.dirty_ips.clear();
+    #[tokio::test]
+    async fn static_bypass_and_proxy_tries_skip_offload_on_both_paths() {
+        let mut mock_resolver = MockClashResolver::new();
+        mock_resolver.expect_is_fake_ip().returning(|_| false);
+        let resolver: ThreadSafeDNSResolver = Arc::new(mock_resolver);
 
-        observe(&mut state, "c.com", &[new_ip], RoutingAction::Direct);
-        assert!(state.owners.contains_key("a.com"));
-        assert!(state.owners.contains_key("b.com"));
-        assert!(!state.owners.contains_key("c.com"));
-        assert_eq!(state.desired, HashSet::from([shared]));
-        assert!(state.dirty_ips.is_empty());
-        assert_eq!(state.tracked_v4, 1);
-    }
+        let mut bypass_trie = CidrTrie::new();
+        bypass_trie.insert("192.0.2.0/24");
+        let mut proxy_trie = CidrTrie::new();
+        proxy_trie.insert("198.51.100.0/24");
 
-    #[test]
-    fn missing_or_zero_action_count_does_not_underflow() {
-        let mut state = OffloadDesiredState::new();
-        let ip: IpAddr = "1.1.1.1".parse().unwrap();
-        state.change_count(ip, RoutingAction::Direct, false);
-        assert!(state.ip_action_counts.is_empty());
-        assert_eq!(state.tracked_v4, 0);
+        let offloader = DirectOffloader::new(
+            Weak::new(),
+            resolver,
+            Arc::new(bypass_trie),
+            Arc::new(proxy_trie),
+            Weak::new(),
+        )
+        .await;
 
-        state.change_count(ip, RoutingAction::Direct, true);
-        state.change_count(ip, RoutingAction::Proxy, false);
-        assert_eq!(state.ip_action_counts.get(&ip).unwrap().direct, 1);
-        assert_eq!(state.ip_action_counts.get(&ip).unwrap().proxy, 0);
-        assert_eq!(state.tracked_v4, 1);
+        let bypass_ip: IpAddr = "192.0.2.10".parse().unwrap();
+        let proxy_ip: IpAddr = "198.51.100.10".parse().unwrap();
+        let normal_ip: IpAddr = "203.0.113.10".parse().unwrap();
 
-        state.change_count(ip, RoutingAction::Direct, false);
-        assert!(state.ip_action_counts.is_empty());
-        assert_eq!(state.tracked_v4, 0);
-    }
-
-    #[test]
-    fn rejected_update_restores_existing_domain() {
-        let mut state = OffloadDesiredState::with_capacity(1, 1, 3);
-        let shared: IpAddr = "1.1.1.1".parse().unwrap();
-        let new_ip: IpAddr = "2.2.2.2".parse().unwrap();
-        observe(&mut state, "a.com", &[shared], RoutingAction::Direct);
-        observe(&mut state, "b.com", &[shared], RoutingAction::Direct);
-        state.dirty_ips.clear();
-
-        observe(
-            &mut state,
-            "b.com",
-            &[shared, new_ip],
+        let dns_msg = offloader.build_dns_observation(
+            "example.com",
+            vec![bypass_ip, proxy_ip, normal_ip],
             RoutingAction::Direct,
+            Some("DIRECT".into()),
+            true,
         );
-        assert_eq!(state.desired, HashSet::from([shared]));
-        assert!(state.owners.contains_key("a.com"));
-        assert!(state.owners.contains_key("b.com"));
-        assert!(!state.owners.get("b.com").unwrap().v4_ips.contains(&new_ip));
-        assert_eq!(state.tracked_v4, 1);
-        assert!(state.dirty_ips.is_empty());
-    }
-
-    #[test]
-    fn large_domain_can_replace_multiple_small_domains() {
-        let mut state = OffloadDesiredState::with_capacity(3, 3, 4);
-        let old: [IpAddr; 3] =
-            ["1.1.1.1", "1.1.1.2", "1.1.1.3"].map(|ip| ip.parse().unwrap());
-        let new: [IpAddr; 3] =
-            ["2.2.2.1", "2.2.2.2", "2.2.2.3"].map(|ip| ip.parse().unwrap());
-        for (domain, ip) in ["a.com", "b.com", "c.com"].into_iter().zip(old) {
-            observe(&mut state, domain, &[ip], RoutingAction::Direct);
+        match dns_msg {
+            Some(Observation::Dns(obs)) => {
+                assert_eq!(obs.ips, vec![normal_ip]);
+                assert_eq!(obs.action, RoutingAction::Direct);
+            }
+            other => panic!("unexpected dns message: {other:?}"),
         }
-        state.dirty_ips.clear();
 
-        observe(&mut state, "large.com", &new, RoutingAction::Direct);
-        assert_eq!(state.owners.len(), 1);
-        assert!(state.owners.contains_key("large.com"));
-        assert_eq!(state.desired, HashSet::from(new));
-        assert_eq!(state.tracked_v4, 3);
-        assert_eq!(state.dirty_ips.len(), 6);
-    }
-
-    #[test]
-    fn oversized_domain_is_rejected_without_evictions() {
-        let mut state = OffloadDesiredState::with_capacity(2, 2, 3);
-        let old: IpAddr = "1.1.1.1".parse().unwrap();
-        let new: [IpAddr; 3] =
-            ["2.2.2.1", "2.2.2.2", "2.2.2.3"].map(|ip| ip.parse().unwrap());
-        observe(&mut state, "old.com", &[old], RoutingAction::Direct);
-        state.dirty_ips.clear();
-
-        observe(&mut state, "large.com", &new, RoutingAction::Direct);
-        assert_eq!(state.owners.len(), 1);
-        assert!(state.owners.contains_key("old.com"));
-        assert_eq!(state.desired, HashSet::from([old]));
-        assert_eq!(state.tracked_v4, 1);
-        assert!(state.dirty_ips.is_empty());
-    }
-
-    #[test]
-    fn ip_capacity_evicts_oldest_before_newer_larger_owner() {
-        let mut state = OffloadDesiredState::with_capacity(4, 4, 5);
-        let old: IpAddr = "1.1.1.1".parse().unwrap();
-        let newer: [IpAddr; 2] =
-            ["2.2.2.1", "2.2.2.2"].map(|ip| ip.parse().unwrap());
-        let filler: IpAddr = "3.3.3.3".parse().unwrap();
-        let incoming: [IpAddr; 2] =
-            ["4.4.4.1", "4.4.4.2"].map(|ip| ip.parse().unwrap());
-        observe(&mut state, "old.com", &[old], RoutingAction::Direct);
-        observe(&mut state, "newer.com", &newer, RoutingAction::Direct);
-        observe(&mut state, "filler.com", &[filler], RoutingAction::Direct);
-
-        observe(&mut state, "incoming.com", &incoming, RoutingAction::Direct);
-        assert!(!state.owners.contains_key("old.com"));
-        assert!(!state.owners.contains_key("newer.com"));
-        assert!(state.owners.contains_key("filler.com"));
-        assert!(state.owners.contains_key("incoming.com"));
-    }
-
-    #[test]
-    fn ip_capacity_scales_batch_for_small_maps() {
-        let mut state = OffloadDesiredState::with_capacity(1024, 1, 1025);
-        for i in 0..1024u32 {
-            let ip = IpAddr::V4(std::net::Ipv4Addr::from(0x0a00_0000 + i));
-            observe(
-                &mut state,
-                &format!("d{i}.com"),
-                &[ip],
+        assert!(offloader
+            .build_dns_observation(
+                "proxy-only.example",
+                vec![proxy_ip],
                 RoutingAction::Direct,
-            );
-        }
-        let incoming = IpAddr::V4(std::net::Ipv4Addr::from(0x0b00_0000));
-        observe(
-            &mut state,
-            "incoming.com",
-            &[incoming],
-            RoutingAction::Direct,
+                Some("DIRECT".into()),
+                true,
+            )
+            .is_none());
+
+        assert!(offloader
+            .build_route_observation(RouteOffloadEvent {
+                ip: bypass_ip,
+                domain: Some("example.com".into()),
+                outbound: "DIRECT".into(),
+                action: RouteOffloadAction::Direct,
+                rule_offloadable: true,
+            })
+            .is_none());
+        assert!(offloader
+            .build_route_observation(RouteOffloadEvent {
+                ip: proxy_ip,
+                domain: Some("example.com".into()),
+                outbound: "DIRECT".into(),
+                action: RouteOffloadAction::Direct,
+                rule_offloadable: true,
+            })
+            .is_none());
+        assert!(offloader
+            .build_route_observation(RouteOffloadEvent {
+                ip: proxy_ip,
+                domain: None,
+                outbound: "PROXY".into(),
+                action: RouteOffloadAction::Proxy,
+                rule_offloadable: true,
+            })
+            .is_none());
+        assert!(offloader
+            .build_route_observation(RouteOffloadEvent {
+                ip: normal_ip,
+                domain: None,
+                outbound: "DIRECT".into(),
+                action: RouteOffloadAction::Direct,
+                rule_offloadable: true,
+            })
+            .is_some());
+
+        offloader.stop();
+    }
+
+    #[tokio::test]
+    async fn group_route_change_is_processed_in_queue_order_and_does_not_retain_dispatcher() {
+        use crate::app::{
+            dispatcher::StatisticsManager,
+            outbound::manager::OutboundManager,
+            router::Router,
+        };
+        use crate::proxy::{
+            OutboundNode,
+            direct::Handler as DirectHandler,
+            group::selector::{self, SelectorControl},
+            mocks::MockDummyProxyProvider,
+            reject::Handler as RejectHandler,
+        };
+
+        use std::{env::temp_dir, sync::atomic::{AtomicUsize, Ordering}};
+        use tokio::task::yield_now;
+        use tokio::time::timeout;
+
+        let direct = OutboundNode::protocol(Arc::new(DirectHandler::new("DIRECT")));
+        let reject = OutboundNode::protocol(Arc::new(RejectHandler::new("REJECT")));
+        let provider = |nodes: Vec<OutboundNode>, lookups: Option<Arc<AtomicUsize>>| {
+            let mut provider = MockDummyProxyProvider::new();
+            let proxies = Arc::new(nodes);
+            provider.expect_proxies().returning(move || {
+                if let Some(lookups) = &lookups {
+                    lookups.fetch_add(1, Ordering::Relaxed);
+                }
+                proxies.clone()
+            });
+            provider.expect_touch().return_const(());
+            provider.expect_route_changes().return_const(None);
+            Arc::new(provider)
+        };
+        let other_lookups = Arc::new(AtomicUsize::new(0));
+        let other = OutboundNode::group(Arc::new(
+            selector::Handler::new(
+                selector::HandlerOptions {
+                    name: "OTHER".into(),
+                    ..Default::default()
+                },
+                vec![provider(vec![reject.clone()], Some(other_lookups.clone()))],
+                None,
+            )
+            .await,
+        ));
+
+        let group = Arc::new(
+            selector::Handler::new(
+                selector::HandlerOptions {
+                    name: "INNER".into(),
+                    ..Default::default()
+                },
+                vec![provider(vec![direct.clone(), reject.clone(), other.clone()], None)],
+                Some("DIRECT".to_string()),
+            )
+            .await,
+        );
+        let inner = OutboundNode::group(group.clone());
+        let outer = Arc::new(
+            selector::Handler::new(
+                selector::HandlerOptions {
+                    name: "AUTO".into(),
+                    ..Default::default()
+                },
+                vec![provider(vec![inner.clone()], None)],
+                None,
+            )
+            .await,
         );
 
-        let scaled_batch = eviction_batch(1024);
-        assert_eq!(state.tracked_v4, 1025 - scaled_batch);
-        assert_eq!(state.owners.len(), 1025 - scaled_batch);
-        assert!(!state.owners.contains_key("d0.com"));
-        assert!(!state.owners.contains_key("d101.com"));
-        assert!(state.owners.contains_key("d102.com"));
-        assert!(state.owners.contains_key("incoming.com"));
-    }
+        let mut handlers = HashMap::new();
+        handlers.insert("DIRECT".to_string(), direct);
+        handlers.insert("REJECT".to_string(), reject);
+        handlers.insert("OTHER".to_string(), other);
+        handlers.insert("INNER".to_string(), inner);
+        handlers.insert("AUTO".to_string(), OutboundNode::group(outer));
+        let outbound_manager = Arc::new(OutboundManager::new_for_test(handlers));
 
-    #[test]
-    fn default_ip_capacity_evicts_ten_percent_as_a_batch() {
-        let mut state = OffloadDesiredState::with_capacity(DEFAULT_MAX_V4_IPS, 1, 3);
-        let batch = eviction_batch(DEFAULT_MAX_V4_IPS);
-        assert_eq!(batch, 1638);
-        let old: Vec<_> = (0..batch as u32)
-            .map(|i| IpAddr::V4(std::net::Ipv4Addr::from(0x0a00_0000 + i)))
-            .collect();
-        let recent: Vec<_> = (batch as u32..DEFAULT_MAX_V4_IPS as u32)
-            .map(|i| IpAddr::V4(std::net::Ipv4Addr::from(0x0a00_0000 + i)))
-            .collect();
-        observe(&mut state, "old.com", &old, RoutingAction::Direct);
-        observe(&mut state, "recent.com", &recent, RoutingAction::Direct);
-        let incoming = IpAddr::V4(std::net::Ipv4Addr::from(0x0b00_0000));
+        let mut mock_resolver = MockClashResolver::new();
+        mock_resolver.expect_is_fake_ip().returning(|_| false);
+        mock_resolver.expect_resolve().returning(|_, _| Ok(None));
+        let resolver: ThreadSafeDNSResolver = Arc::new(mock_resolver);
 
-        observe(
-            &mut state,
-            "incoming.com",
-            &[incoming],
-            RoutingAction::Direct,
+        let router = Arc::new(
+            Router::new(
+                vec![],
+                HashMap::new(),
+                resolver.clone(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                temp_dir().to_str().unwrap().to_string(),
+            )
+            .await
+            .unwrap(),
         );
-        assert!(!state.owners.contains_key("old.com"));
-        assert!(state.owners.contains_key("recent.com"));
-        assert!(state.owners.contains_key("incoming.com"));
-        assert_eq!(state.tracked_v4, DEFAULT_MAX_V4_IPS + 1 - batch);
-    }
 
-    #[test]
-    fn successful_flush_reclaims_headroom_before_ip_capacity_is_full() {
-        let mut state = OffloadDesiredState::with_capacity(64, 64, 64);
-        for i in 0..58u32 {
-            let ip = IpAddr::V4(std::net::Ipv4Addr::from(0x0a00_0000 + i));
-            observe(
-                &mut state,
-                &format!("d{i}.com"),
-                &[ip],
-                RoutingAction::Direct,
-            );
-        }
-        state.dirty_ips.clear();
-        state.reclaim_headroom();
-        assert_eq!(state.tracked_v4, 58);
-        assert!(state.dirty_ips.is_empty());
+        let dispatcher = Arc::new(Dispatcher::new(
+            outbound_manager,
+            router,
+            resolver.clone(),
+            RunMode::Rule,
+            StatisticsManager::new(),
+            None,
+            None,
+            true,
+        ));
+        let weak_disp = Arc::downgrade(&dispatcher);
 
-        let next = IpAddr::V4(std::net::Ipv4Addr::from(0x0a00_003a));
-        observe(&mut state, "d58.com", &[next], RoutingAction::Direct);
-        state.dirty_ips.clear();
-        state.reclaim_headroom();
-        assert_eq!(state.tracked_v4, 53);
-        assert_eq!(state.dirty_ips.len(), 6);
-        assert!(!state.owners.contains_key("d0.com"));
-        assert!(!state.owners.contains_key("d5.com"));
-        assert!(state.owners.contains_key("d6.com"));
-        assert!(state.owners.contains_key("d58.com"));
-    }
-
-    #[test]
-    fn default_capacity_reclaims_when_fewer_than_ten_percent_slots_remain() {
-        let mut state = OffloadDesiredState::with_capacity(DEFAULT_MAX_V4_IPS, 1, 3);
-        let batch = eviction_batch(DEFAULT_MAX_V4_IPS);
-        let old: Vec<_> = (0..batch as u32)
-            .map(|i| IpAddr::V4(std::net::Ipv4Addr::from(0x0a00_0000 + i)))
-            .collect();
-        let recent: Vec<_> = (batch as u32..(DEFAULT_MAX_V4_IPS - batch + 1) as u32)
-            .map(|i| IpAddr::V4(std::net::Ipv4Addr::from(0x0a00_0000 + i)))
-            .collect();
-        observe(&mut state, "old.com", &old, RoutingAction::Direct);
-        observe(&mut state, "recent.com", &recent, RoutingAction::Direct);
-        assert_eq!(state.tracked_v4, DEFAULT_MAX_V4_IPS - batch + 1);
-        state.dirty_ips.clear();
-
-        state.reclaim_headroom();
-        assert!(!state.owners.contains_key("old.com"));
-        assert!(state.owners.contains_key("recent.com"));
-        assert_eq!(state.tracked_v4, DEFAULT_MAX_V4_IPS - 2 * batch + 1);
-        assert_eq!(state.dirty_ips.len(), batch);
-    }
-
-    #[test]
-    fn incomplete_headroom_reclaim_does_not_repeat_until_capacity_recovers() {
-        let mut state = OffloadDesiredState::with_capacity(64, 64, 3);
-        let old: IpAddr = "1.1.1.1".parse().unwrap();
-        let recent: Vec<_> = (0..61u32)
-            .map(|i| IpAddr::V4(std::net::Ipv4Addr::from(0x0b00_0000 + i)))
-            .collect();
-        observe(&mut state, "old.com", &[old], RoutingAction::Direct);
-        observe(&mut state, "recent.com", &recent, RoutingAction::Direct);
-        state.dirty_ips.clear();
-
-        state.reclaim_headroom();
-        assert_eq!(state.tracked_v4, 61);
-        assert!(!state.reclaim_armed_v4);
-        assert_eq!(state.dirty_ips, HashSet::from([old]));
-
-        state.dirty_ips.clear();
-        state.reclaim_headroom();
-        assert_eq!(state.tracked_v4, 61);
-        assert!(state.dirty_ips.is_empty());
-
-        observe(
-            &mut state,
-            "recent.com",
-            &recent[..58],
-            RoutingAction::Direct,
-        );
-        state.reclaim_headroom();
-        assert!(state.reclaim_armed_v4);
-    }
-
-    #[test]
-    fn large_domain_replaces_shared_and_unique_small_domains() {
-        let mut state = OffloadDesiredState::with_capacity(3, 3, 4);
-        let shared: IpAddr = "1.1.1.1".parse().unwrap();
-        let second: IpAddr = "1.1.1.2".parse().unwrap();
-        let third: IpAddr = "1.1.1.3".parse().unwrap();
-        let new: [IpAddr; 3] =
-            ["2.2.2.1", "2.2.2.2", "2.2.2.3"].map(|ip| ip.parse().unwrap());
-        observe(&mut state, "a.com", &[shared], RoutingAction::Direct);
-        observe(
-            &mut state,
-            "b.com",
-            &[shared, second],
-            RoutingAction::Direct,
-        );
-        observe(&mut state, "c.com", &[third], RoutingAction::Direct);
-
-        observe(&mut state, "large.com", &new, RoutingAction::Direct);
-        assert_eq!(state.owners.len(), 1);
-        assert!(state.owners.contains_key("large.com"));
-        assert_eq!(state.desired, HashSet::from(new));
-        assert_eq!(state.tracked_v4, 3);
-    }
-
-    #[test]
-    fn default_owner_limit_evicts_ten_percent_as_a_batch() {
+        // Verify queue ordering: [RouteDomain(AUTO->Direct), GroupRouteChanged] after AUTO switches to REJECT.
         let mut state = OffloadDesiredState::new();
-        for i in 0..8193u32 {
-            let ip = IpAddr::V4(std::net::Ipv4Addr::from(0x0a00_0000 + i));
-            observe(
-                &mut state,
-                &format!("d{i}.com"),
-                &[ip],
-                RoutingAction::Direct,
-            );
-        }
-        let owner_batch = eviction_batch(DEFAULT_MAX_OWNERS);
-        assert_eq!(owner_batch, 819);
-        assert_eq!(state.owners.len(), 8193 - owner_batch);
-        assert_eq!(state.desired.len(), 8193 - owner_batch);
-        assert!(!state.owners.contains_key("d0.com"));
-        assert!(!state.owners.contains_key("d818.com"));
-        assert!(state.owners.contains_key("d819.com"));
-        assert!(state.owners.contains_key("d8192.com"));
-    }
+        let mut active_mode = RunMode::Rule;
+        let mut direct_outbounds = Some(dispatcher.outbound_manager().direct_outbound_names().await);
+        let expected_direct: HashSet<Arc<str>> =
+            HashSet::from([Arc::from("DIRECT"), Arc::from("AUTO"), Arc::from("INNER")]);
+        let direct_only: HashSet<Arc<str>> = HashSet::from([Arc::from("DIRECT")]);
+        assert_eq!(direct_outbounds.as_ref(), Some(&expected_direct));
+        let ip: IpAddr = "203.0.113.77".parse().unwrap();
 
-    #[test]
-    fn simultaneous_owner_and_ip_overflow_evicts_ten_percent() {
-        let mut state = OffloadDesiredState::with_capacity(100, 1, 100);
-        for i in 0..100u32 {
-            let ip = IpAddr::V4(std::net::Ipv4Addr::from(0x0a00_0000 + i));
-            observe(
-                &mut state,
-                &format!("d{i}.com"),
-                &[ip],
-                RoutingAction::Direct,
-            );
-        }
-        let incoming = IpAddr::V4(std::net::Ipv4Addr::from(0x0b00_0000));
-        observe(
+        group.select("REJECT").unwrap();
+        process_message_batch(
             &mut state,
-            "incoming.com",
-            &[incoming],
-            RoutingAction::Direct,
-        );
-        assert_eq!(state.owners.len(), 91);
-        assert_eq!(state.tracked_v4, 91);
-        assert!(!state.owners.contains_key("d9.com"));
-        assert!(state.owners.contains_key("d10.com"));
-        assert!(state.owners.contains_key("incoming.com"));
-    }
+            &mut active_mode,
+            &weak_disp,
+            &mut direct_outbounds,
+            [
+                OffloadMessage::Observe(Observation::RouteDomain(RouteDomainObservation {
+                    domain: "queued.example".into(),
+                    ip,
+                    action: RoutingAction::Direct,
+                    outbound: "AUTO".into(),
+                    rule_offloadable: true,
+                })),
+                OffloadMessage::GroupRouteChanged,
+            ],
+        )
+        .await;
+        assert!(!state.desired.contains(&ip));
+        assert_eq!(direct_outbounds.as_ref(), Some(&direct_only));
 
-    #[test]
-    fn owner_only_limit_evicts_oldest_when_capacity_is_small() {
-        let mut state = OffloadDesiredState::with_capacity(10, 10, 2);
-        let ip: IpAddr = "1.1.1.1".parse().unwrap();
-        observe(&mut state, "a.com", &[ip], RoutingAction::Direct);
-        observe(&mut state, "b.com", &[ip], RoutingAction::Direct);
+        // Stale Direct observation arriving AFTER GroupRouteChanged must be downgraded to Proxy.
+        let stale_direct_ip: IpAddr = "203.0.113.78".parse().unwrap();
+        let lookups_before = other_lookups.load(Ordering::Relaxed);
+        process_message_batch(
+            &mut state,
+            &mut active_mode,
+            &weak_disp,
+            &mut direct_outbounds,
+            [OffloadMessage::Observe(Observation::Dns(DnsObservation {
+                domain: "stale-direct.example".into(),
+                ips: vec![stale_direct_ip],
+                action: RoutingAction::Direct,
+                outbound: Some("AUTO".into()),
+                rule_offloadable: true,
+            }))],
+        )
+        .await;
+        assert!(!state.desired.contains(&stale_direct_ip));
+        assert_eq!(other_lookups.load(Ordering::Relaxed), lookups_before);
+
         state.dirty_ips.clear();
-
-        observe(&mut state, "c.com", &[ip], RoutingAction::Direct);
-        assert!(!state.owners.contains_key("a.com"));
-        assert!(state.owners.contains_key("b.com"));
-        assert!(state.owners.contains_key("c.com"));
-        assert_eq!(state.desired, HashSet::from([ip]));
+        group.select("OTHER").unwrap();
+        reconcile_group_routes(&mut state, &weak_disp, &mut direct_outbounds).await;
+        assert_eq!(direct_outbounds.as_ref(), Some(&direct_only));
         assert!(state.dirty_ips.is_empty());
+
+        // Verify watcher -> queue -> drop(dispatcher) does not leak strong reference.
+        let offloader = DirectOffloader::new(
+            Weak::new(),
+            resolver,
+            Arc::new(CidrTrie::new()),
+            Arc::new(CidrTrie::new()),
+            weak_disp.clone(),
+        )
+        .await;
+        let (watcher_tx, mut watcher_rx) = mpsc::unbounded_channel::<OffloadMessage>();
+        let mut route_waits = Vec::new();
+        sync_route_waits(
+            &mut route_waits,
+            dispatcher.outbound_manager().collect_group_route_changes(),
+        );
+        let watch_abort = spawn_route_change_watcher(
+            weak_disp.clone(), watcher_tx.downgrade(), route_waits,
+        );
+        group.select("DIRECT").unwrap();
+        let msg = timeout(Duration::from_secs(2), watcher_rx.recv())
+            .await
+            .expect("watcher should enqueue GroupRouteChanged")
+            .unwrap();
+        assert!(matches!(msg, OffloadMessage::GroupRouteChanged));
+        process_message_batch(
+            &mut state,
+            &mut active_mode,
+            &weak_disp,
+            &mut direct_outbounds,
+            [msg],
+        )
+        .await;
+        assert_eq!(direct_outbounds.as_ref(), Some(&expected_direct));
+        assert!(state.desired.contains(&ip));
+        assert!(state.desired.contains(&stale_direct_ip));
+
+        // Stale Proxy observation arriving AFTER AUTO switched back to DIRECT is promoted to Direct.
+        let stale_proxy_ip: IpAddr = "203.0.113.79".parse().unwrap();
+        process_message_batch(
+            &mut state,
+            &mut active_mode,
+            &weak_disp,
+            &mut direct_outbounds,
+            [OffloadMessage::Observe(Observation::Dns(DnsObservation {
+                domain: "stale-proxy.example".into(),
+                ips: vec![stale_proxy_ip],
+                action: RoutingAction::Proxy,
+                outbound: Some("AUTO".into()),
+                rule_offloadable: true,
+            }))],
+        )
+        .await;
+        assert!(state.desired.contains(&stale_proxy_ip));
+
+        // Fresh Proxy observation arriving BEFORE GroupRouteChanged (debounce window) immediately
+        // refreshes outbound state and withdraws existing AUTO direct IPs.
+        group.select("REJECT").unwrap();
+        let fresh_proxy_ip: IpAddr = "203.0.113.80".parse().unwrap();
+        process_message_batch(
+            &mut state,
+            &mut active_mode,
+            &weak_disp,
+            &mut direct_outbounds,
+            [OffloadMessage::Observe(Observation::RouteDomain(
+                RouteDomainObservation {
+                    domain: "fresh-proxy.example".into(),
+                    ip: fresh_proxy_ip,
+                    action: RoutingAction::Proxy,
+                    outbound: "AUTO".into(),
+                    rule_offloadable: true,
+                },
+            ))],
+        )
+        .await;
+        assert_eq!(direct_outbounds.as_ref(), Some(&direct_only));
+        assert!(!state.desired.contains(&ip));
+        assert!(!state.desired.contains(&fresh_proxy_ip));
+
+        watch_abort.abort();
+        offloader.stop();
+        drop(offloader);
+        drop(dispatcher);
+        yield_now().await;
+        assert!(weak_disp.upgrade().is_none());
     }
 }

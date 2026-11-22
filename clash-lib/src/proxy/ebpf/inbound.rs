@@ -14,9 +14,9 @@ use tokio::task::{JoinSet, consume_budget};
 use tracing::{Instrument, Span, debug, error, info, warn};
 
 use super::dns::handle_tcp_dns;
-use super::offloader::{DirectOffloader, RoutingAction};
+use super::offloader::{DirectOffloader, evaluate_dns_offload};
 use super::utils::resolve_and_aggregate_ip_cidrs;
-use crate::app::dispatcher::{Dispatcher, udp::UdpRouteIngress};
+use crate::app::dispatcher::{Dispatcher, RouteOffloadObserver, udp::UdpRouteIngress};
 use crate::app::dns::query::IngressProfile;
 use crate::app::dns::{DnsResolutionHook, ThreadSafeDNSResolver, exchange_with_resolver};
 use crate::app::net::get_default_outbound_interface;
@@ -32,6 +32,7 @@ pub struct EbpfInbound {
     manager: Arc<EbpfManager>,
     listener: Arc<EbpfListener>,
     offloader: Option<DirectOffloader>,
+    route_observer: Option<Arc<dyn RouteOffloadObserver>>,
 }
 
 impl EbpfInbound {
@@ -100,7 +101,7 @@ impl EbpfInbound {
             .map_err(io::Error::other)?;
         let manager = Arc::new(manager);
 
-        let offloader = if let Some((bypass_dst_ips, proxy_dst_ips)) = offload_ips {
+        let (offloader, route_observer) = if let Some((bypass_dst_ips, proxy_dst_ips)) = offload_ips {
             let mut bypass_trie = CidrTrie::new();
             for ip in &bypass_dst_ips {
                 bypass_trie.insert(ip);
@@ -114,30 +115,33 @@ impl EbpfInbound {
                 dns_resolver.clone(),
                 Arc::new(bypass_trie),
                 Arc::new(proxy_trie),
-            );
+                Arc::downgrade(&dispatcher),
+            )
+            .await;
             let hook_offloader = offloader.clone();
-            let router = dispatcher.router().clone();
+            let hook_dispatcher = Arc::downgrade(&dispatcher);
             let hook: DnsResolutionHook =
                 Arc::new(move |domain: &str, ips: &[IpAddr], _ttl: Duration| {
+                    let Some(dispatcher) = hook_dispatcher.upgrade() else {
+                        return;
+                    };
                     let offloader = hook_offloader.clone();
-                    let router = router.clone();
                     let domain: Arc<str> = Arc::from(domain);
                     let ips = ips.to_vec();
                     tokio::spawn(async move {
-                        let is_direct =
-                            router.is_domain_direct_with_ips(&domain, &ips).await;
-                        let action = if is_direct {
-                            RoutingAction::Direct
-                        } else {
-                            RoutingAction::Proxy
-                        };
-                        offloader.observe(domain, ips, action).await;
+                        let (action, outbound, rule_offloadable) =
+                            evaluate_dns_offload(&dispatcher, &domain, &ips).await;
+                        offloader.observe_dns(
+                            &domain, ips, action, outbound, rule_offloadable,
+                        );
                     });
                 });
             dns_resolver.register_resolution_hook(hook);
-            Some(offloader)
+            let route_observer: Arc<dyn RouteOffloadObserver> = Arc::new(offloader.clone());
+            dispatcher.register_route_offload_observer(route_observer.clone());
+            (Some(offloader), Some(route_observer))
         } else {
-            None
+            (None, None)
         };
 
         Ok(Self {
@@ -146,10 +150,14 @@ impl EbpfInbound {
             manager,
             listener,
             offloader,
+            route_observer,
         })
     }
 
     pub async fn stop(self) {
+        if let Some(observer) = &self.route_observer {
+            self.dispatcher.unregister_route_offload_observer(observer);
+        }
         if let Some(offloader) = &self.offloader {
             self.dns_resolver.clear_resolution_hook();
             offloader.stop();

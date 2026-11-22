@@ -43,7 +43,9 @@ use crate::{
     session::{Session, SocksAddr},
 };
 use super::{Dispatcher, TrackerInfo};
-use super::dispatcher_impl::{decode_mode, effective_outbound_type, is_reject_error, reverse_lookup};
+use super::dispatcher_impl::{decode_mode, is_reject_error, reverse_lookup};
+#[cfg(all(target_os = "linux", feature = "ebpf"))]
+use super::dispatcher_impl::{RouteOffloadSlot, outbound_type_with_offload};
 use association::{AssociationConfig, FlowClosed, ReplyActivity, UdpAssociationPool, UdpFlow, UdpConnectContext};
 #[cfg(feature = "tun")]
 use crate::{app::net::get_default_outbound_interface, session::Type};
@@ -195,6 +197,8 @@ struct UdpDispatchContext {
     replies: ReplyTarget,
     session_semaphore: Arc<tokio::sync::Semaphore>,
     associations: Arc<UdpAssociationPool>,
+    #[cfg(all(target_os = "linux", feature = "ebpf"))]
+    route_offload: Option<RouteOffloadSlot>,
 }
 
 fn make_udp_flow_session(
@@ -291,6 +295,8 @@ impl Dispatcher {
             outbound_manager: self.outbound_manager.clone(), router: self.router.clone(),
             resolver: self.resolver.clone(), mode: self.mode.clone(),
             replies, session_semaphore: self.udp_session_semaphore.clone(), associations,
+            #[cfg(all(target_os = "linux", feature = "ebpf"))]
+            route_offload: self.route_offload.clone(),
         };
         (ctx, closed_rx)
     }
@@ -423,19 +429,25 @@ async fn establish_outbound_session(
         RunMode::Direct => (PROXY_DIRECT, None),
     };
 
+    let handler = ctx.outbound_manager.get_outbound_or_direct(outbound_name);
+    #[cfg(all(target_os = "linux", feature = "ebpf"))]
+    let effective_proto = outbound_type_with_offload(
+        ctx.route_offload.as_ref(),
+        &ctx.router,
+        &sess,
+        if is_real_ip { orig_dst_ip } else { None },
+        mode,
+        rule,
+        &handler,
+    )
+    .await;
+    #[cfg(not(all(target_os = "linux", feature = "ebpf")))]
+    let effective_proto = handler.selected_outbound_type().await;
+
     if !override_dest && is_real_ip {
         sess.destination = orig_inbound_dst.clone();
     }
 
-    let handler = match ctx.outbound_manager.get_outbound(outbound_name) {
-        Some(h) => h,
-        None => {
-            debug!("unknown rule: {}, fallback to direct", outbound_name);
-            ctx.outbound_manager.get_outbound(PROXY_DIRECT).unwrap()
-        }
-    };
-
-    let effective_proto = effective_outbound_type(&handler).await;
     if matches!(effective_proto, OutboundType::Reject) {
         info!(
             "[UDP Short-Circuit] Drop packet immediately for sess: {}",

@@ -6,7 +6,7 @@ use std::{
 use crate::{
     app::{
         remote_content_manager::providers::rule_provider::ThreadSafeRuleProvider,
-        router::{Rule, RuleMatcher, map_rule_type},
+        router::{Rule, RuleMatcher, rules::RuleOffloadKind, map_rule_type},
     },
     common::{geodata::GeoDataLookup, mmdb::MmdbLookup},
     config::internal::rule::{RULE_PARAMS, RuleType, proto_supports_params},
@@ -71,6 +71,28 @@ impl RuleExpression {
                 exprs.iter().map(|e| e.leaf_count()).sum()
             }
             RuleExpression::Not(expr) => expr.leaf_count(),
+        }
+    }
+
+    fn is_context_sensitive(&self) -> bool {
+        match self {
+            RuleExpression::Rule(matcher) => {
+                matches!(matcher.offload_kind(), RuleOffloadKind::ContextSensitive)
+            }
+            RuleExpression::And(exprs) | RuleExpression::Or(exprs) => {
+                exprs.iter().any(|e| e.is_context_sensitive())
+            }
+            RuleExpression::Not(expr) => expr.is_context_sensitive(),
+        }
+    }
+
+    fn has_domain_condition(&self) -> bool {
+        match self {
+            RuleExpression::Rule(matcher) => matcher.has_domain_condition(),
+            RuleExpression::And(exprs) | RuleExpression::Or(exprs) => {
+                exprs.iter().any(|e| e.has_domain_condition())
+            }
+            RuleExpression::Not(expr) => expr.has_domain_condition(),
         }
     }
 }
@@ -432,6 +454,18 @@ impl RuleMatcher for CompositeRule {
 
     fn type_name(&self) -> &str {
         &self.operator
+    }
+
+    fn offload_kind(&self) -> RuleOffloadKind {
+        if self.expression.is_context_sensitive() {
+            RuleOffloadKind::ContextSensitive
+        } else {
+            RuleOffloadKind::Destination
+        }
+    }
+
+    fn has_domain_condition(&self) -> bool {
+        self.expression.has_domain_condition()
     }
 }
 

@@ -17,10 +17,15 @@ use crate::{
     },
     print_and_exit,
     proxy::utils::OutboundNodeRegistry,
-    session::Session,
+    session::{Session, SocksAddr, Type},
 };
 
-use std::{collections::HashMap, io, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap, io, net::{IpAddr, SocketAddr}, path::PathBuf, sync::Arc,
+    time::Duration,
+};
+#[cfg(any(test, all(target_os = "linux", feature = "ebpf")))]
+use std::sync::OnceLock;
 
 use futures::future::join_all;
 use hyper::Uri;
@@ -30,7 +35,7 @@ use tracing::{error, info, trace};
 mod rules;
 
 use crate::common::{geodata::GeoDataLookup, mmdb::MmdbLookup};
-pub use rules::{Rule, RuleMatcher};
+pub use rules::{Rule, RuleMatcher, RuleOffloadKind};
 pub use rules::geodata::GeoSiteMatcher;
 pub use super::remote_content_manager::providers::rule_provider::ThreadSafeRuleProvider;
 
@@ -42,6 +47,8 @@ pub struct Router {
     asn_mmdb: Option<MmdbLookup>,
     geodata: Option<GeoDataLookup>,
     rule_providers: HashMap<String, ThreadSafeRuleProvider>,
+    #[cfg(any(test, all(target_os = "linux", feature = "ebpf")))]
+    has_domain_rules: OnceLock<bool>,
 }
 
 pub type ArcRouter = Arc<Router>;
@@ -129,6 +136,8 @@ impl Router {
             asn_mmdb,
             geodata,
             rule_providers: rule_provider_registry,
+            #[cfg(any(test, all(target_os = "linux", feature = "ebpf")))]
+            has_domain_rules: OnceLock::new(),
         })
     }
 
@@ -146,24 +155,54 @@ impl Router {
     }
 
     /// Quick check if a domain routes to DIRECT, utilizing pre-resolved IPs to avoid redundant DNS lookups.
-    pub async fn is_domain_direct_with_ips(&self, domain: &str, ips: &[std::net::IpAddr]) -> bool {
-        let mut sess = Session {
-            id: 0,
-            typ: crate::session::Type::RouteProbe,
-            destination: crate::session::SocksAddr::Domain(domain.into(), 80),
-            resolved_ip: ips.first().copied(),
-            ..Default::default()
-        };
-        let (outbound, _) = self.match_route(&mut sess).await;
+    pub async fn is_domain_direct_with_ips(&self, domain: &str, ips: &[IpAddr]) -> bool {
+        let (_, outbound, _) = self.match_domain_probe(domain, ips).await;
         outbound.eq_ignore_ascii_case("DIRECT")
     }
 
-    /// Quick check if an IP address routes to DIRECT.
-    pub async fn is_ip_direct(&self, ip: std::net::IpAddr) -> bool {
+    pub(crate) async fn match_domain_probe(
+        &self,
+        domain: &str,
+        ips: &[IpAddr],
+    ) -> (Session, &str, Option<&Rule>) {
         let mut sess = Session {
             id: 0,
-            typ: crate::session::Type::RouteProbe,
-            destination: crate::session::SocksAddr::Ip(std::net::SocketAddr::new(ip, 80)),
+            typ: Type::RouteProbe,
+            destination: SocksAddr::Domain(domain.into(), 80),
+            resolved_ip: ips.first().copied(),
+            ..Default::default()
+        };
+        let (outbound, rule) = self.match_route(&mut sess).await;
+        (sess, outbound, rule)
+    }
+
+    #[cfg(any(test, all(target_os = "linux", feature = "ebpf")))]
+    pub(crate) fn is_match_offloadable(
+        &self,
+        sess: &Session,
+        rule: Option<&Rule>,
+        has_domain: bool,
+    ) -> bool {
+        let Some(rule) = rule else {
+            return false;
+        };
+        match rule.matched_offload_kind(sess) {
+            RuleOffloadKind::Destination => true,
+            RuleOffloadKind::ContextSensitive => false,
+            RuleOffloadKind::Final => {
+                has_domain || !self.has_domain_rules.get_or_init(|| {
+                    self.rules.iter().any(|rule| rule.has_domain_condition())
+                })
+            }
+        }
+    }
+
+    /// Quick check if an IP address routes to DIRECT.
+    pub async fn is_ip_direct(&self, ip: IpAddr) -> bool {
+        let mut sess = Session {
+            id: 0,
+            typ: Type::RouteProbe,
+            destination: SocksAddr::Ip(SocketAddr::new(ip, 80)),
             ..Default::default()
         };
         let (outbound, _) = self.match_route(&mut sess).await;
@@ -1068,5 +1107,165 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[tokio::test]
+    async fn test_is_match_offloadable_matrix() {
+        initialize();
+        let mut mock_resolver = MockClashResolver::new();
+        mock_resolver.expect_resolve().returning(|_, _| Ok(None));
+        let mock_resolver = Arc::new(mock_resolver);
+
+        let mut providers = HashMap::new();
+        providers.insert(
+            "classical_mixed".to_string(),
+            RuleProviderDef::Inline(InlineRuleProvider {
+                path: "classical_mixed".to_string(),
+                behavior: RuleSetBehavior::Classical,
+                inline_rules: vec![
+                    "DOMAIN,safe.example".to_string(),
+                    "DST-PORT,8080".to_string(),
+                ],
+            }),
+        );
+
+        let router_with_domains = super::Router::new(
+            vec![
+                RuleType::Domain {
+                    domain: "direct.example".to_string(),
+                    target: "DIRECT".to_string(),
+                },
+                RuleType::IpCidr {
+                    ipnet: "10.0.0.0/8".parse().unwrap(),
+                    target: "DIRECT".to_string(),
+                    no_resolve: false,
+                },
+                RuleType::SrcCidr {
+                    ipnet: "192.168.1.0/24".parse().unwrap(),
+                    target: "DIRECT".to_string(),
+                    no_resolve: false,
+                },
+                RuleType::DSTPort {
+                    port: 8443,
+                    target: "DIRECT".to_string(),
+                },
+                RuleType::Composite {
+                    operator: "AND".to_string(),
+                    expression: "((DOMAIN,combo.example),(NETWORK,TCP))".to_string(),
+                    target: "DIRECT".to_string(),
+                },
+                RuleType::RuleSet {
+                    rule_set: "classical_mixed".to_string(),
+                    target: "DIRECT".to_string(),
+                    no_resolve: false,
+                },
+                RuleType::Match {
+                    target: "DIRECT".to_string(),
+                },
+            ],
+            providers,
+            mock_resolver.clone(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            std::env::temp_dir().to_str().unwrap().to_string(),
+        )
+        .await
+        .unwrap();
+
+        // 1. Domain rule -> offloadable
+        let mut s_domain = Session {
+            destination: crate::session::SocksAddr::Domain("direct.example".into(), 443),
+            ..Default::default()
+        };
+        let (_, rule) = router_with_domains.match_route(&mut s_domain).await;
+        assert!(router_with_domains.is_match_offloadable(&s_domain, rule, true));
+
+        // 2. Destination IP-CIDR -> offloadable
+        let mut s_dst_ip = Session {
+            destination: crate::session::SocksAddr::Ip("10.1.2.3:443".parse().unwrap()),
+            ..Default::default()
+        };
+        let (_, rule) = router_with_domains.match_route(&mut s_dst_ip).await;
+        assert!(router_with_domains.is_match_offloadable(&s_dst_ip, rule, false));
+
+        // 3. SRC-IP-CIDR -> NOT offloadable
+        let mut s_src_ip = Session {
+            source: "192.168.1.10:12345".parse().unwrap(),
+            destination: crate::session::SocksAddr::Ip("1.2.3.4:443".parse().unwrap()),
+            ..Default::default()
+        };
+        let (_, rule) = router_with_domains.match_route(&mut s_src_ip).await;
+        assert!(!router_with_domains.is_match_offloadable(&s_src_ip, rule, false));
+
+        // 4. DST-PORT -> NOT offloadable
+        let mut s_port = Session {
+            destination: crate::session::SocksAddr::Ip("1.2.3.4:8443".parse().unwrap()),
+            ..Default::default()
+        };
+        let (_, rule) = router_with_domains.match_route(&mut s_port).await;
+        assert!(!router_with_domains.is_match_offloadable(&s_port, rule, false));
+
+        // 5. Composite with NETWORK -> NOT offloadable
+        let mut s_comp = Session {
+            network: crate::session::Network::Tcp,
+            destination: crate::session::SocksAddr::Domain("combo.example".into(), 443),
+            ..Default::default()
+        };
+        let (_, rule) = router_with_domains.match_route(&mut s_comp).await;
+        assert!(!router_with_domains.is_match_offloadable(&s_comp, rule, true));
+
+        // 6. Classical RuleSet matching destination sub-rule vs context-sensitive sub-rule
+        let mut s_rs_safe = Session {
+            destination: crate::session::SocksAddr::Domain("safe.example".into(), 443),
+            ..Default::default()
+        };
+        let (_, rule) = router_with_domains.match_route(&mut s_rs_safe).await;
+        assert!(router_with_domains.is_match_offloadable(&s_rs_safe, rule, true));
+
+        let mut s_rs_port = Session {
+            destination: crate::session::SocksAddr::Ip("1.2.3.4:8080".parse().unwrap()),
+            ..Default::default()
+        };
+        let (_, rule) = router_with_domains.match_route(&mut s_rs_port).await;
+        assert!(!router_with_domains.is_match_offloadable(&s_rs_port, rule, false));
+
+        // 7. Final (MATCH) with domain vs without domain when router has domain rules
+        let mut s_final_domain = Session {
+            destination: crate::session::SocksAddr::Domain("other.example".into(), 443),
+            ..Default::default()
+        };
+        let (_, rule) = router_with_domains.match_route(&mut s_final_domain).await;
+        assert!(router_with_domains.is_match_offloadable(&s_final_domain, rule, true));
+        assert!(router_with_domains.has_domain_rules.get().is_none());
+
+        let mut s_final_ip = Session {
+            destination: crate::session::SocksAddr::Ip("8.8.8.8:443".parse().unwrap()),
+            ..Default::default()
+        };
+        let (_, rule) = router_with_domains.match_route(&mut s_final_ip).await;
+        assert!(!router_with_domains.is_match_offloadable(&s_final_ip, rule, false));
+        assert_eq!(router_with_domains.has_domain_rules.get(), Some(&true));
+
+        // 8. Final without domain when router has NO domain rules -> offloadable
+        let router_ip_only = super::Router::new(
+            vec![RuleType::Match {
+                target: "DIRECT".to_string(),
+            }],
+            HashMap::new(),
+            mock_resolver,
+            None,
+            None,
+            None,
+            None,
+            None,
+            std::env::temp_dir().to_str().unwrap().to_string(),
+        )
+        .await
+        .unwrap();
+        let (_, rule) = router_ip_only.match_route(&mut s_final_ip).await;
+        assert!(router_ip_only.is_match_offloadable(&s_final_ip, rule, false));
     }
 }

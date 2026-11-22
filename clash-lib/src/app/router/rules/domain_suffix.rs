@@ -44,4 +44,8 @@ impl RuleMatcher for DomainSuffix {
     fn type_name(&self) -> &str {
         "DomainSuffix"
     }
+
+    fn has_domain_condition(&self) -> bool {
+        true
+    }
 }

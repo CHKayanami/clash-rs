@@ -1,5 +1,5 @@
 use crate::{
-    app::router::rules::RuleMatcher,
+    app::router::rules::{RuleMatcher, RuleOffloadKind},
     session::{Network, Session},
 };
 
@@ -30,5 +30,9 @@ impl RuleMatcher for NetworkRule {
 
     fn type_name(&self) -> &str {
         "Network"
+    }
+
+    fn offload_kind(&self) -> RuleOffloadKind {
+        RuleOffloadKind::ContextSensitive
     }
 }

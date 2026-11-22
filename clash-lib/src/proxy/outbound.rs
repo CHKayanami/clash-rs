@@ -136,6 +136,36 @@ impl OutboundNode {
     pub fn proto(&self) -> OutboundType {
         match self { Self::Protocol(handler) => handler.proto(), Self::Group(group) => group.proto() }
     }
+    pub(crate) async fn selected_outbound_type(&self) -> OutboundType {
+        if let Some(group) = self.as_group()
+            && let Some(active) = group.get_active_proxy().await
+        {
+            return active.proto();
+        }
+        self.proto()
+    }
+
+    #[cfg(all(target_os = "linux", feature = "ebpf"))]
+    pub(crate) async fn effective_outbound_type(&self) -> OutboundType {
+        let mut node = self.clone();
+        let mut visited = [0usize; 64];
+        for depth in 0..64 {
+            let id = node.identity();
+            if visited[..depth].contains(&id) {
+                return node.proto();
+            }
+            visited[depth] = id;
+            match &node {
+                Self::Protocol(handler) => return handler.proto(),
+                Self::Group(group) => match group.get_active_proxy().await {
+                    Some(selected) => node = selected,
+                    None => return group.proto(),
+                },
+            }
+        }
+        node.proto()
+    }
+
     pub fn server_name(&self) -> Option<&str> {
         match self { Self::Protocol(handler) => handler.server_name(), Self::Group(_) => None }
     }

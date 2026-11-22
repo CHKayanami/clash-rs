@@ -1,4 +1,7 @@
-use crate::{app::router::rules::RuleMatcher, session::Session};
+use crate::{
+    app::router::rules::{RuleMatcher, RuleOffloadKind},
+    session::Session,
+};
 
 #[derive(Clone)]
 pub struct IpCidr {
@@ -52,6 +55,14 @@ impl RuleMatcher for IpCidr {
             "SrcIPCIDR"
         } else {
             "IPCIDR"
+        }
+    }
+
+    fn offload_kind(&self) -> RuleOffloadKind {
+        if self.match_src {
+            RuleOffloadKind::ContextSensitive
+        } else {
+            RuleOffloadKind::Destination
         }
     }
 }

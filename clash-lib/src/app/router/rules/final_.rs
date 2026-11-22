@@ -1,4 +1,7 @@
-use crate::{app::router::rules::RuleMatcher, session::Session};
+use crate::{
+    app::router::rules::{RuleMatcher, RuleOffloadKind},
+    session::Session,
+};
 
 #[derive(Clone)]
 /// A final rule that matches all sessions
@@ -27,5 +30,9 @@ impl RuleMatcher for Final {
 
     fn type_name(&self) -> &str {
         "Match"
+    }
+
+    fn offload_kind(&self) -> RuleOffloadKind {
+        RuleOffloadKind::Final
     }
 }

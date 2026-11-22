@@ -544,6 +544,8 @@ mod tests {
             outbound_manager: dispatcher.outbound_manager.clone(), router: dispatcher.router.clone(),
             resolver: dispatcher.resolver.clone(), mode: dispatcher.mode.clone(),
             replies: replies.into(), session_semaphore: dispatcher.udp_session_semaphore.clone(), associations,
+            #[cfg(all(target_os = "linux", feature = "ebpf"))]
+            route_offload: dispatcher.route_offload.clone(),
         };
         let (session_established_tx, mut established) = mpsc::channel(64);
         let mut routes = UdpRoutes {

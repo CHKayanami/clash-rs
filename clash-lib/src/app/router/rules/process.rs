@@ -1,4 +1,4 @@
-use super::{RuleMatcher, contains_ignore_ascii_case};
+use super::{RuleMatcher, RuleOffloadKind, contains_ignore_ascii_case};
 
 pub struct Process {
     pub name: String,
@@ -47,6 +47,10 @@ impl RuleMatcher for Process {
 
     fn type_name(&self) -> &str {
         "Process"
+    }
+
+    fn offload_kind(&self) -> RuleOffloadKind {
+        RuleOffloadKind::ContextSensitive
     }
 }
 

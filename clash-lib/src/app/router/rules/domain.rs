@@ -32,4 +32,8 @@ impl RuleMatcher for Domain {
     fn type_name(&self) -> &str {
         "Domain"
     }
+
+    fn has_domain_condition(&self) -> bool {
+        true
+    }
 }

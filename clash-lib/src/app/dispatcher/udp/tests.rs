@@ -462,8 +462,8 @@ async fn selector_reject_is_detected_before_connecting() {
         None,
     ).await));
     assert_eq!(selector.proto(), OutboundType::Selector);
-    assert_eq!(effective_outbound_type(&selector).await, OutboundType::Reject);
-    assert_eq!(effective_outbound_type(&reject).await, OutboundType::Reject);
+    assert_eq!(selector.selected_outbound_type().await, OutboundType::Reject);
+    assert_eq!(reject.selected_outbound_type().await, OutboundType::Reject);
 }
 
 pub(super) async fn test_dispatcher(proto: OutboundType) -> Arc<Dispatcher> {

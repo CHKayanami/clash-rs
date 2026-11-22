@@ -1,7 +1,9 @@
 use crate::{
     app::{
-        remote_content_manager::providers::rule_provider::ThreadSafeRuleProvider,
-        router::rules::RuleMatcher,
+        remote_content_manager::providers::rule_provider::{
+            RuleSetBehavior, ThreadSafeRuleProvider,
+        },
+        router::rules::{RuleMatcher, RuleOffloadKind},
     },
     session::Session,
 };
@@ -67,6 +69,30 @@ impl RuleMatcher for RuleSet {
 
     fn type_name(&self) -> &str {
         "RuleSet"
+    }
+
+    fn offload_kind(&self) -> RuleOffloadKind {
+        if self.rule_provider.is_context_sensitive() {
+            RuleOffloadKind::ContextSensitive
+        } else {
+            RuleOffloadKind::Destination
+        }
+    }
+
+    fn matched_offload_kind(&self, sess: &Session) -> RuleOffloadKind {
+        if !matches!(self.rule_provider.behavior(), RuleSetBehavior::Classical) {
+            return RuleOffloadKind::Destination;
+        }
+        self.rule_provider
+            .matched_classical_offload_kind(sess)
+            .unwrap_or_else(|| self.offload_kind())
+    }
+
+    fn has_domain_condition(&self) -> bool {
+        matches!(
+            self.rule_provider.behavior(),
+            RuleSetBehavior::Domain | RuleSetBehavior::Classical
+        )
     }
 }
 
