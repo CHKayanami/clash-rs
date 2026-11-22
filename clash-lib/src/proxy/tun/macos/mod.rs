@@ -50,8 +50,8 @@ pub(super) async fn start(
         // dropped. This local is declared first, so it is dropped last, even
         // when setup fails or the packet pipeline exits concurrently.
         let _device = device;
-        // Publish the exclusion before installing any session-owned service;
-        // keep it through native DNS and route cleanup, including reload overlap.
+        // Publish the exclusion before installing any session-owned service
+        // and keep it through native DNS and route cleanup.
         let _interface = register_tun(name.clone());
         let setup = || -> io::Result<_> {
             let monitor = Monitor::new(wake_reader)?;

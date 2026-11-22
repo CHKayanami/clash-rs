@@ -52,7 +52,7 @@ pub type DnsResolutionHook = Arc<dyn Fn(&str, &[std::net::IpAddr], std::time::Du
 #[async_trait]
 pub trait ClashResolver: Sync + Send {
     fn register_resolution_hook(&self, _hook: DnsResolutionHook) {}
-    fn unregister_resolution_hook(&self, _hook: &DnsResolutionHook) {}
+    fn clear_resolution_hook(&self) {}
 
     async fn resolve(
         &self,

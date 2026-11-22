@@ -1,5 +1,9 @@
-use axum::response::IntoResponse;
+use std::sync::Arc;
+
+use axum::{Json, extract::State, response::IntoResponse};
 use serde_json::json;
+
+use crate::app::api::AppState;
 
 const VERSION: &str = env!("CLASH_VERSION_OVERRIDE");
 const TARGET_TRIPLE: &str = env!("CLASH_TARGET_TRIPLE");
@@ -8,7 +12,7 @@ const TARGET_ARCH: &str = env!("CLASH_TARGET_ARCH");
 const FORK_AUTHOR: &str = env!("CLASH_FORK_AUTHOR");
 const FEATURES: Option<&str> = option_env!("CLASH_FEATURES");
 
-pub async fn handle() -> impl IntoResponse {
+pub async fn handle(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let os = match TARGET_OS {
         "macos" => "darwin",
         other => other,
@@ -25,7 +29,7 @@ pub async fn handle() -> impl IntoResponse {
         _ => Vec::new(),
     };
 
-    axum::Json(json!({
+    Json(json!({
         "version": VERSION,
         "author": FORK_AUTHOR,
         "meta": false,
@@ -33,5 +37,6 @@ pub async fn handle() -> impl IntoResponse {
         "arch": arch,
         "target": TARGET_TRIPLE,
         "features": features,
+        "instance_id": state.instance_id,
     }))
 }

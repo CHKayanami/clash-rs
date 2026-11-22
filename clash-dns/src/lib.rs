@@ -13,7 +13,7 @@ mod framing;
 mod prepared;
 mod socket;
 
-pub use prepared::PreparedDnsListener;
+pub(crate) use prepared::PreparedDnsListener;
 pub use handler::{DNSError, DnsListener, get_dns_listener};
 
 #[derive(Debug, Deserialize, Clone)]

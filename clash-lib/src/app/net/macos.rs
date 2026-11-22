@@ -6,35 +6,34 @@ use super::{OutboundInterface, get_interface_by_name};
 #[cfg(feature = "tun")]
 use super::get_default_outbound_interface;
 #[cfg(feature = "tun")]
-use std::{collections::HashMap, sync::LazyLock};
-#[cfg(feature = "tun")]
 use parking_lot::RwLock;
 
 #[cfg(feature = "tun")]
-static OWN_TUNS: LazyLock<RwLock<HashMap<String, usize>>> =
-    LazyLock::new(|| RwLock::new(HashMap::new()));
+static OWN_TUN: RwLock<Option<String>> = RwLock::new(None);
 
 #[cfg(feature = "tun")]
 pub(crate) struct TunInterfaceGuard(String);
 
 #[cfg(feature = "tun")]
 pub(crate) fn register_tun(name: String) -> TunInterfaceGuard {
-    *OWN_TUNS.write().entry(name.clone()).or_default() += 1;
+    *OWN_TUN.write() = Some(name.clone());
     TunInterfaceGuard(name)
 }
 
 #[cfg(feature = "tun")]
 impl Drop for TunInterfaceGuard {
     fn drop(&mut self) {
-        let mut names = OWN_TUNS.write();
-        let count = names.get_mut(&self.0).expect("registered TUN interface");
-        *count -= 1;
-        if *count == 0 { names.remove(&self.0); }
+        let mut current = OWN_TUN.write();
+        if current.as_deref() == Some(self.0.as_str()) {
+            *current = None;
+        }
     }
 }
 
 #[cfg(feature = "tun")]
-fn is_own_tun(name: &str) -> bool { OWN_TUNS.read().contains_key(name) }
+fn is_own_tun(name: &str) -> bool {
+    OWN_TUN.read().as_deref() == Some(name)
+}
 
 /// configd's primary service follows the actual default network, including
 /// transitions between Wi-Fi and Ethernet. Do not guess from interface names.
@@ -82,15 +81,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn own_interface_exclusion_survives_overlapping_generations() {
+    fn own_interface_exclusion_clears_on_drop() {
         let name = "clash-test-tun-exclusion".to_owned();
-        let first = register_tun(name.clone());
-        let second = register_tun(name.clone());
+        let guard = register_tun(name.clone());
         assert!(is_own_tun(&name));
         assert!(!is_own_tun("another-vpn-utun"));
-        drop(first);
-        assert!(is_own_tun(&name));
-        drop(second);
+        drop(guard);
         assert!(!is_own_tun(&name));
     }
 }

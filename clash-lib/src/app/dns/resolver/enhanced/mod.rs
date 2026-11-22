@@ -661,11 +661,8 @@ impl ClashResolver for EnhancedResolver {
             .store(Some(Arc::new(DnsResolutionHookWrapper(hook))));
     }
 
-    fn unregister_resolution_hook(&self, hook: &DnsResolutionHook) {
-        self.resolution_hook.rcu(|current| match current {
-            Some(wrapper) if Arc::ptr_eq(&wrapper.0, hook) => None,
-            _ => current.clone(),
-        });
+    fn clear_resolution_hook(&self) {
+        self.resolution_hook.store(None);
     }
 
     async fn resolve(

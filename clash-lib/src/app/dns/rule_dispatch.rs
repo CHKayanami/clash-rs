@@ -20,7 +20,7 @@ pub type PendingOutboundManager = Arc<OnceLock<Weak<OutboundManager>>>;
 ///
 /// Both `OnceLock`s start empty and are filled exactly once during startup.
 /// The runtime owns these managers; weak references avoid keeping their DNS
-/// resolver alive through a reference cycle after a configuration reload.
+/// resolver alive through a reference cycle during shutdown.
 /// Until both are set, callers fall back to the static `outbound` handler —
 /// this keeps early DNS lookups (during startup before the rule engine
 /// exists) working.

@@ -251,6 +251,7 @@ anyhow = "1"
 sock2proc = { git = "https://github.com/Watfaq/sock2proc.git", rev = "9f9e630" }
 [target.'cfg(unix)'.dependencies]
 hyperlocal = { version = "0.9", features = ["client"] }
+signal-hook-registry = "1.4"
 
 [target.'cfg(target_os="linux")'.dependencies]
 clash-ebpf = { path = "../clash-ebpf", optional = true }

@@ -83,7 +83,6 @@ pub struct InboundManager {
     /// provider name -> provider (kept alive for lifecycle management)
     inbound_providers: Arc<RwLock<HashMap<String, Arc<InboundSetProvider>>>>,
 
-    cancellation_token: tokio_util::sync::CancellationToken,
     service_context: Arc<RwLock<Option<ServiceContext>>>,
 }
 
@@ -93,7 +92,7 @@ impl AsyncService for InboundManager {
         let inbound_handlers = self.inbound_handlers.clone();
         let dispatcher = self.dispatcher.clone();
         let authenticator = self.authenticator.clone();
-        let cancellation_token = self.cancellation_token.clone();
+        let cancellation_token = ctx.cancellation_token().clone();
         let ctx_clone = ctx.clone();
         *self.service_context.write() = Some(ctx.clone());
 
@@ -112,20 +111,15 @@ impl AsyncService for InboundManager {
         for provider in providers {
             provider.stop().await;
         }
-        self.shutdown();
         self.join_all_listeners().await
     }
 }
 
 impl InboundManager {
-    pub fn shutdown(&self) {
-        self.cancellation_token.cancel();
-    }
     pub async fn new(
         dispatcher: Arc<Dispatcher>,
         authenticator: ThreadSafeAuthenticator,
         inbounds_opt: HashSet<InboundOpts>,
-        cancellation_token: Option<tokio_util::sync::CancellationToken>,
     ) -> Self {
         Self {
             inbound_handlers: Arc::new(RwLock::new(
@@ -148,7 +142,6 @@ impl InboundManager {
             inbound_providers: Arc::new(RwLock::new(HashMap::new())),
             dispatcher,
             authenticator,
-            cancellation_token: cancellation_token.unwrap_or_default(),
             service_context: Arc::new(RwLock::new(None)),
         }
     }
@@ -207,7 +200,12 @@ impl InboundManager {
             let provider_handles = self.provider_handles.clone();
             let dispatcher = self.dispatcher.clone();
             let authenticator = self.authenticator.clone();
-            let cancellation_token = self.cancellation_token.clone();
+            let cancellation_token = self
+                .service_context
+                .read()
+                .as_ref()
+                .map(|ctx| ctx.cancellation_token().clone())
+                .unwrap_or_default();
             let provider_name = name.clone();
             let service_context = self.service_context.clone();
             let update_lock = Arc::new(tokio::sync::Mutex::new(()));
@@ -431,8 +429,11 @@ impl InboundManager {
         let inbound_handlers = self.inbound_handlers.clone();
         let dispatcher = self.dispatcher.clone();
         let authenticator = self.authenticator.clone();
-        let cancellation_token = self.cancellation_token.clone();
         let ctx = self.service_context.read().clone();
+        let cancellation_token = ctx
+            .as_ref()
+            .map(|c| c.cancellation_token().clone())
+            .unwrap_or_default();
         Self::start_all_listeners(
             dispatcher,
             authenticator,

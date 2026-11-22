@@ -17,8 +17,6 @@ impl PreparedDnsListener {
         Ok(Self { listen, encrypted })
     }
 
-    pub fn is_empty(&self) -> bool { self.listen.is_empty() }
-
     pub async fn bind<X: DnsMessageExchanger + Clone>(
         &self, exchanger: X,
     ) -> Result<DnsListener, DNSError> {

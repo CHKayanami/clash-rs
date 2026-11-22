@@ -9,7 +9,7 @@ use std::{
 /// Backward-compatible wrapper used by integration_tests.rs.
 #[allow(dead_code)]
 pub fn start_clash(options: clash_lib::Options) -> Result<(), clash_lib::Error> {
-    clash_lib::start_scaffold(options)
+    clash_lib::start_scaffold(options).map(|_| ())
 }
 
 /// Global port counter. Each test claims a contiguous block starting here.
@@ -92,7 +92,7 @@ fn wait_port_closed(port: u16) -> Result<(), clash_lib::Error> {
 #[allow(dead_code)]
 pub struct ClashInstance {
     ports: Vec<u16>,
-    handle: Option<std::thread::JoinHandle<()>>,
+    handle: Option<std::thread::JoinHandle<Result<clash_lib::RunExit, clash_lib::Error>>>,
     token: tokio_util::sync::CancellationToken,
 }
 
@@ -115,25 +115,41 @@ impl ClashInstance {
             token,
         })
     }
+
+    /// Wait for the instance to exit on its own (e.g. after a restart request),
+    /// verify all tracked ports are released, and return its exit reason.
+    #[allow(dead_code)]
+    pub fn wait_exit(mut self) -> Result<clash_lib::RunExit, clash_lib::Error> {
+        let result = self
+            .handle
+            .take()
+            .expect("instance handle already taken")
+            .join()
+            .expect("clash instance thread panicked");
+        for &port in &self.ports {
+            wait_port_closed(port)?;
+        }
+        result
+    }
 }
 
 impl Drop for ClashInstance {
     fn drop(&mut self) {
-        // Cancel only this instance — does not affect sibling instances.
-        self.token.cancel();
-
-        // Wait for all ports to be released.
-        for &port in &self.ports {
-            if let Err(e) = wait_port_closed(port) {
-                eprintln!(
-                    "Warning: Failed to wait for port {} to close: {}",
-                    port, e
-                );
-            }
-        }
-
-        // Join the thread to ensure it has fully exited.
         if let Some(handle) = self.handle.take() {
+            // Cancel only this instance — does not affect sibling instances.
+            self.token.cancel();
+
+            // Wait for all ports to be released.
+            for &port in &self.ports {
+                if let Err(e) = wait_port_closed(port) {
+                    eprintln!(
+                        "Warning: Failed to wait for port {} to close: {}",
+                        port, e
+                    );
+                }
+            }
+
+            // Join the thread to ensure it has fully exited.
             let _ = handle.join();
         }
     }

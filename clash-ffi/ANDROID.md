@@ -29,13 +29,13 @@ The workspace BoringSSL patch and Cargo.lock are required for reproducible build
    sending. This does not cover network operations performed by external SDKs.
 3. Transfer a unique, valid TUN descriptor to the core. Rust JNI hosts should
    call `clash_lib::android::register_tun_fd(owned_fd)` and retain its guard until
-   the core thread exits. The guard closes an unclaimed descriptor if startup or
-   reload fails before TUN initialization. On cancellation, `close_pending()` can
+   the core thread exits. The guard closes an unclaimed descriptor if startup
+   fails before TUN initialization. On cancellation, `close_pending()` can
    release an unclaimed interface immediately; later adoption then fails safely.
    Once adopted, `tun-rs` becomes the sole owner and closes it on device drop.
    Never close an adopted fd or reuse the same descriptor for two cores.
-   Initialize resources with TUN disabled before creating the VPN interface, then
-   reload the prepared config with the registered fd to minimize network outage.
+   When changing TUN descriptors or configuration, cancel and join the running
+   instance before starting a new one with the newly registered fd.
 4. Use this TUN configuration, with the actual descriptor and host MTU:
 
 ```yaml

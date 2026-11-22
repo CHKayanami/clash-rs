@@ -1,4 +1,3 @@
-use crate::config::EbpfConfig;
 use crate::netns::DaeNs;
 use crate::session::{EbpfSession, TransportProtocol};
 use arc_swap::ArcSwap;
@@ -25,14 +24,12 @@ pub struct EbpfListener {
     dns_reply_socket_v4: tokio::sync::OnceCell<ArcSwap<UdpSocket>>,
     dns_reply_socket_v6: tokio::sync::OnceCell<ArcSwap<UdpSocket>>,
     #[allow(dead_code)]
-    config: EbpfConfig,
-    #[allow(dead_code)]
     ns: Arc<DaeNs>,
 }
 
 impl EbpfListener {
     /// Binds the transparent proxy TCP/UDP sockets inside the daens network namespace for IPv4 and IPv6.
-    pub fn bind(ns: &DaeNs, config: EbpfConfig) -> Result<Self, ListenerError> {
+    pub fn bind(ns: &DaeNs, tproxy_port: u16) -> Result<Self, ListenerError> {
         let ns_clone = Arc::new(ns.try_clone()?);
         ns.with_daens(|| -> std::io::Result<Self> {
             use socket2::{Domain, Protocol, Socket, Type};
@@ -50,7 +47,7 @@ impl EbpfListener {
                 &(clash_ebpf_common::DAE_BYPASS_MARK as u32),
             );
             let addr_v4 =
-                SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, config.tproxy_port));
+                SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, tproxy_port));
             tcp_sock_v4.bind(&addr_v4.into())?;
             tcp_sock_v4.listen(1024)?;
             let tcp_listener_v4 = TcpListener::from_std(tcp_sock_v4.into())?;
@@ -71,7 +68,7 @@ impl EbpfListener {
                 );
                 let addr_v6 = SocketAddr::V6(SocketAddrV6::new(
                     Ipv6Addr::UNSPECIFIED,
-                    config.tproxy_port,
+                    tproxy_port,
                     0,
                     0,
                 ));
@@ -82,7 +79,7 @@ impl EbpfListener {
                 Ok(l) => {
                     tracing::info!(
                         "Bound TCP IPv6 transparent listener on port {}",
-                        config.tproxy_port
+                        tproxy_port
                     );
                     Some(l)
                 }
@@ -114,7 +111,7 @@ impl EbpfListener {
                 &(clash_ebpf_common::DAE_BYPASS_MARK as u32),
             );
             let udp_addr_v4 =
-                SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, config.tproxy_port));
+                SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, tproxy_port));
             udp_sock_v4.bind(&udp_addr_v4.into())?;
             let udp_socket_v4 = UdpSocket::from_std(udp_sock_v4.into())?;
             if let Err(error) = enable_gro(&udp_socket_v4) {
@@ -146,7 +143,7 @@ impl EbpfListener {
                 );
                 let udp_addr_v6 = SocketAddr::V6(SocketAddrV6::new(
                     Ipv6Addr::UNSPECIFIED,
-                    config.tproxy_port,
+                    tproxy_port,
                     0,
                     0,
                 ));
@@ -160,7 +157,7 @@ impl EbpfListener {
                 Ok(s) => {
                     tracing::info!(
                         "Bound UDP IPv6 transparent listener on port {}",
-                        config.tproxy_port
+                        tproxy_port
                     );
                     Some(s)
                 }
@@ -177,7 +174,6 @@ impl EbpfListener {
                 udp_socket_v6: udp_socket_v6.map(Arc::new),
                 dns_reply_socket_v4: tokio::sync::OnceCell::new(),
                 dns_reply_socket_v6: tokio::sync::OnceCell::new(),
-                config,
                 ns: ns_clone,
             })
         })?

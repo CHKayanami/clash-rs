@@ -190,23 +190,23 @@ mod tests {
     #[test]
     #[ignore = "changes global network configuration; run this test in isolation"]
     fn dns_inherits_the_current_runtime_interface() {
-        use crate::app::net::{NetworkConfig, OutboundInterface, get_default_outbound_interface};
         use crate::app::dns::config::Config as DnsConfig;
+        use crate::app::net::{
+            NetworkConfigGuard, OutboundInterface, apply_network_config,
+            get_default_outbound_interface,
+        };
+        use crate::config::def::TcpKeepaliveConfig;
 
-        struct Restore(NetworkConfig);
-        impl Drop for Restore {
-            fn drop(&mut self) { self.0.apply(); }
-        }
-        let _restore = Restore(NetworkConfig::capture());
-        NetworkConfig::resolve(None, false, None).apply();
+        let _restore = NetworkConfigGuard::capture();
+        apply_network_config(None, false, None, TcpKeepaliveConfig::default());
         let nameservers = DnsConfig::parse_nameserver(&["192.0.2.53".to_owned()]).unwrap();
         let mut entry = UpstreamEntry::from_nameserver(&nameservers[0], None).unwrap();
-        // Resolvers are prepared before runtime network configuration is
-        // committed. Selection must happen at dial time, not pool creation.
+        // Selection must happen at dial time so interface changes take effect
+        // without rebuilding the upstream pool.
         let mut pool = UpstreamPool::new(HashMap::new(),
             Arc::new(ArcSwap::from_pointee(HashMap::new())), None, None, None, None);
         assert!(pool.dial_context(&entry, None).iface.is_none());
-        NetworkConfig::resolve(Some("lo0"), false, None).apply();
+        apply_network_config(Some("lo0"), false, None, TcpKeepaliveConfig::default());
         let runtime = get_default_outbound_interface().unwrap();
         assert_eq!(runtime.name, "lo0");
         assert!(Arc::ptr_eq(&pool.dial_context(&entry, None).iface.unwrap(), &runtime));

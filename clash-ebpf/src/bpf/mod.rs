@@ -1466,7 +1466,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires root, freshly built eBPF bytecode, and IPv6"]
     async fn tcp_sk_lookup_preserves_destination_and_nodelay() {
-        use crate::{EbpfConfig, EbpfListener, netlink::NlSock, netns::DaeNs};
+        use crate::{EbpfListener, netlink::NlSock, netns::DaeNs};
         use std::{net::SocketAddr, time::Duration};
         use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::TcpSocket, time::timeout};
 
@@ -1476,9 +1476,9 @@ mod tests {
             let (lo, _) = nl.get_link("lo").unwrap();
             nl.set_link_up(lo, true).unwrap();
         }).unwrap();
-        let config = EbpfConfig { tproxy_port: 12345, ..Default::default() };
-        let bypass = StaticBypass::new(&[], &[], &[], &[], config.tproxy_port).unwrap();
-        let listener = EbpfListener::bind(&ns, config).unwrap();
+        let tproxy_port = 12345;
+        let bypass = StaticBypass::new(&[], &[], &[], &[], tproxy_port).unwrap();
+        let listener = EbpfListener::bind(&ns, tproxy_port).unwrap();
         let mut manager = BpfProgramManager::new();
         manager.bpf = Some(load_object(EMBEDDED_BPF_OBJECT, false, &bypass).unwrap());
         manager.publish_listener_sockets(

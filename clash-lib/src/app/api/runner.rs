@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use axum::{
     Router, middleware,
     response::Redirect,
-    routing::{get, post},
+    routing::get,
 };
 use http::{Method, header};
 use tokio::sync::broadcast::Sender;
@@ -15,18 +15,13 @@ use tower_http::{
     trace::TraceLayer,
 };
 use tracing::{error, info, warn};
+use uuid::Uuid;
 
 use super::context::RuntimeContext;
 use crate::{
-    GlobalState,
     app::{
         api::{AppState, handlers, ipc, middlewares, websocket},
-        dns::config::DNSListenAddr,
-        inbound::manager::InboundManager,
         logging::LogEvent,
-        outbound::manager::ThreadSafeOutboundManager,
-        profile::ThreadSafeCacheFile,
-        router::ArcRouter,
     },
     config::config::Controller,
     runner::{AsyncService, ServiceContext, prepare_service},
@@ -36,70 +31,19 @@ pub struct ApiRunner {
     controller_cfg: Controller,
     log_source: Sender<LogEvent>,
     ctx: RuntimeContext,
-    cancellation_token: tokio_util::sync::CancellationToken,
 }
 
 impl ApiRunner {
-    /// Modern constructor accepting an aggregated [`RuntimeContext`].
     pub fn from_context(
         controller_cfg: Controller,
         log_source: Sender<LogEvent>,
         ctx: RuntimeContext,
-        cancellation_token: Option<tokio_util::sync::CancellationToken>,
     ) -> Self {
         Self {
             controller_cfg,
             log_source,
             ctx,
-            cancellation_token: cancellation_token.unwrap_or_default(),
         }
-    }
-
-    /// Backwards-compatible constructor mapping legacy parameter lists into [`RuntimeContext`].
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        controller_cfg: Controller,
-        log_source: Sender<LogEvent>,
-        inbound_manager: Arc<InboundManager>,
-        dispatcher: Arc<crate::app::dispatcher::Dispatcher>,
-        global_state: Arc<tokio::sync::Mutex<GlobalState>>,
-        dns_resolver: crate::app::dns::ThreadSafeDNSResolver,
-        outbound_manager: ThreadSafeOutboundManager,
-        statistics_manager: Arc<crate::app::dispatcher::StatisticsManager>,
-        cache_store: ThreadSafeCacheFile,
-        router: ArcRouter,
-        cwd: String,
-        cancellation_token: Option<tokio_util::sync::CancellationToken>,
-        dns_listen_addr: DNSListenAddr,
-        dns_enabled: bool,
-    ) -> Self {
-        let ctx = RuntimeContext::new(
-            inbound_manager,
-            dispatcher,
-            global_state,
-            dns_resolver,
-            outbound_manager,
-            statistics_manager,
-            cache_store,
-            router,
-            cwd,
-            dns_listen_addr,
-            dns_enabled,
-        );
-        Self::from_context(controller_cfg, log_source, ctx, cancellation_token)
-    }
-
-    pub fn shutdown(&self) {
-        info!("Shutting down API server");
-        self.cancellation_token.cancel();
-    }
-
-    pub fn cancellation_token(&self) -> &tokio_util::sync::CancellationToken {
-        &self.cancellation_token
-    }
-
-    pub fn controller_config(&self) -> &Controller {
-        &self.controller_cfg
     }
 
     fn build_cors_layer(&self) -> CorsLayer {
@@ -154,8 +98,10 @@ impl AsyncService for ApiRunner {
         }
 
         let cors = self.build_cors_layer();
+        let instance_id = Uuid::new_v4().to_string();
         let samplers = Arc::new(crate::app::api::StreamSamplers::new());
         let app_state = Arc::new(AppState {
+            instance_id: instance_id.clone(),
             log_source_tx: self.log_source.clone(),
             statistics_manager: current_ctx.statistics_manager.clone(),
             samplers: samplers.clone(),
@@ -169,7 +115,10 @@ impl AsyncService for ApiRunner {
             .route("/version", get(handlers::version::handle))
             .route("/memory", get(handlers::memory::handle))
             .route("/memory/details", get(handlers::memory::details))
-            .route("/restart", post(handlers::restart::handle))
+            .merge(handlers::restart::routes(
+                current_ctx.restart.clone(),
+                instance_id,
+            ))
             .nest("/ws", websocket::routes(app_state.clone()))
             .nest(
                 "/configs",
@@ -283,29 +232,19 @@ impl AsyncService for ApiRunner {
             }).await?);
         }
 
-        let cancellation_token = self.cancellation_token.clone();
         let ctx_cancel = ctx.cancellation_token().clone();
-        let lifecycle_tokens = vec![cancellation_token.clone(), ctx_cancel.clone()];
-        ctx.spawn_critical_with_tokens("api_server", lifecycle_tokens, async move {
+        ctx.spawn_critical("api_server", async move {
             tokio::select! {
                 result = futures::future::try_join_all(listeners) => {
                     if let Err(e) = result {
                         error!("API server failed: {}", e);
                     }
                 }
-                _ = cancellation_token.cancelled() => {
-                    info!("API server closed gracefully");
-                }
                 _ = ctx_cancel.cancelled() => {
-                    info!("API server closed gracefully via context");
+                    info!("API server closed gracefully");
                 }
             }
         });
-        Ok(())
-    }
-
-    async fn stop(&self) -> Result<(), crate::Error> {
-        self.shutdown();
         Ok(())
     }
 }

@@ -116,21 +116,17 @@ async fn test_dns_resolution_hook_triggered() {
 }
 
 #[tokio::test]
-async fn unregistering_old_dns_hook_keeps_replacement() {
+async fn clearing_dns_hook_removes_registered_hook() {
     use crate::app::dns::DnsResolutionHook;
 
     let resolver = EnhancedResolver::new_default().await;
-    let old: DnsResolutionHook = Arc::new(|_, _, _| {});
-    let replacement: DnsResolutionHook = Arc::new(|_, _, _| {});
+    let hook: DnsResolutionHook = Arc::new(|_, _, _| {});
 
-    resolver.register_resolution_hook(old.clone());
-    resolver.register_resolution_hook(replacement.clone());
-    resolver.unregister_resolution_hook(&old);
-
+    resolver.register_resolution_hook(hook.clone());
     let active = resolver.inner.resolution_hook.load_full().unwrap();
-    assert!(Arc::ptr_eq(&active.0, &replacement));
+    assert!(Arc::ptr_eq(&active.0, &hook));
 
-    resolver.unregister_resolution_hook(&replacement);
+    resolver.clear_resolution_hook();
     assert!(resolver.inner.resolution_hook.load_full().is_none());
 }
 

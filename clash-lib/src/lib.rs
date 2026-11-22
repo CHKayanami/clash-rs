@@ -3,21 +3,21 @@
 #![feature(duration_millis_float)]
 
 use arc_swap::ArcSwap;
-use clash_dns::PreparedDnsListener;
-use tokio::task::spawn_blocking;
 
 #[cfg(feature = "tun")]
 use crate::proxy::tun;
 use crate::{
     app::{
+        api::{ApiRunner, RestartController, RuntimeContext},
         dispatcher::{Dispatcher, StatisticsManager},
         dns::{self, SystemResolver, ThreadSafeDNSResolver, config::DNSListenAddr},
         inbound::manager::InboundManager,
         logging::LogEvent,
-        net::NetworkConfig,
+        net::apply_network_config,
         outbound::manager::OutboundManager,
         profile,
         router::Router,
+        sniffer::Sniffer,
     },
     common::{
         auth, dashboard,
@@ -30,20 +30,24 @@ use crate::{
     config::{
         InternalConfig,
         def::{self, LogLevel},
-        internal::{proxy::OutboundProxy, listener::InboundProviderDef},
+        internal::{listener::InboundProviderDef, proxy::OutboundProxy},
     },
-    runner::{ArcService, AsyncService, CriticalTaskGuard, ServiceContext},
+    runner::{ArcService, AsyncService, ServiceContext},
 };
 
 use std::{
     collections::HashMap,
+    future::{Future, pending},
     io,
     path::PathBuf,
     sync::{Arc, OnceLock},
 };
 use thiserror::Error;
+#[cfg(unix)]
+use tokio::signal::unix::{Signal, SignalKind, signal};
 use tokio::sync::{Mutex, broadcast, mpsc, oneshot};
-use tracing::{debug, error, info, warn};
+use tokio_util::sync::CancellationToken;
+use tracing::{debug, info, warn};
 
 pub mod app;
 #[cfg(any(target_os = "android", all(test, unix)))]
@@ -52,9 +56,13 @@ pub mod config;
 
 mod common;
 mod proxy;
+#[cfg(unix)]
+mod restart_signal;
 mod runner;
-mod reload;
 mod session;
+
+#[cfg(unix)]
+pub use restart_signal::commit_process_restart;
 
 #[cfg(feature = "allocation-tests")]
 #[path = "proxy/dispatch_measurement.rs"]
@@ -91,15 +99,20 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 type ArcRunner = ArcService;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunExit {
+    Shutdown,
+    Restart,
+}
+
 pub struct Options {
     pub config: Config,
     pub cwd: Option<String>,
     pub rt: Option<TokioRuntime>,
     pub log_file: Option<String>,
-    /// The original config file path, used to support "reload current config"
-    /// from the dashboard. Set this when starting from a file; leave `None`
-    /// for string/inline configs (e.g. FFI).
-    pub config_path: Option<String>,
+    /// Allow `POST /restart` to trigger a graceful shutdown returning
+    /// [`RunExit::Restart`]. Keep `false` in embedded / FFI hosts.
+    pub enable_restart: bool,
 }
 
 pub enum TokioRuntime {
@@ -161,24 +174,15 @@ impl Config {
 
 pub struct GlobalState {
     log_level: LogLevel,
-    #[cfg(feature = "tun")]
-    tunnel_runner: ArcService,
-    dns_listener: ArcService,
-    reload_tx:
-        mpsc::Sender<(Config, oneshot::Sender<std::result::Result<(), String>>)>,
-    cwd: String,
-    /// Path to the config file used at startup. Used by the dashboard "Reload"
-    /// button which sends an empty path to mean "reload current config".
-    config_path: Option<String>,
 }
 
-pub fn start_scaffold(opts: Options) -> Result<()> {
+pub fn start_scaffold(opts: Options) -> Result<RunExit> {
     let Options {
         config,
         cwd,
         rt,
         log_file,
-        config_path,
+        enable_restart,
     } = opts;
 
     let rt = match rt.unwrap_or(TokioRuntime::MultiThread) {
@@ -189,13 +193,6 @@ pub fn start_scaffold(opts: Options) -> Result<()> {
             .enable_all()
             .build()?,
     };
-    let config_path = config_path.or_else(|| {
-        if let Config::File(p) = &config {
-            Some(p.clone())
-        } else {
-            None
-        }
-    });
     let config: InternalConfig = config.try_parse()?;
     let cwd = cwd.unwrap_or_else(|| ".".to_string());
     let (log_tx, _) = broadcast::channel(100);
@@ -209,18 +206,19 @@ pub fn start_scaffold(opts: Options) -> Result<()> {
         log_file,
     )?;
 
-    let shutdown_token = tokio_util::sync::CancellationToken::new();
+    let shutdown_token = CancellationToken::new();
     {
         let mut token_guard = SHUTDOWN_TOKEN.lock().unwrap();
+        token_guard.retain(|t| !t.is_cancelled());
         token_guard.push(shutdown_token.clone());
     }
-    rt.block_on(async {
+    let result = rt.block_on(async {
         match start(
             config,
             cwd,
-            config_path,
+            enable_restart,
             log_tx,
-            shutdown_token,
+            shutdown_token.clone(),
         )
         .await
         {
@@ -228,9 +226,15 @@ pub fn start_scaffold(opts: Options) -> Result<()> {
                 eprintln!("start error: {e}");
                 Err(e)
             }
-            Ok(_) => Ok(()),
+            Ok(exit) => Ok(exit),
         }
-    })
+    });
+    shutdown_token.cancel();
+    {
+        let mut token_guard = SHUTDOWN_TOKEN.lock().unwrap();
+        token_guard.retain(|t| !t.is_cancelled());
+    }
+    result
 }
 
 /// Start a Clash instance in a background thread with independent lifecycle.
@@ -239,30 +243,20 @@ pub fn start_scaffold(opts: Options) -> Result<()> {
 /// SHUTDOWN_TOKEN.
 pub fn start_scaffold_instance(
     opts: Options,
-) -> Result<(
-    std::thread::JoinHandle<()>,
-    tokio_util::sync::CancellationToken,
-)> {
+) -> Result<(std::thread::JoinHandle<Result<RunExit>>, CancellationToken)> {
     let Options {
         config,
         cwd,
         rt,
         log_file: _,
-        config_path,
+        enable_restart,
     } = opts;
 
-    let config_path = config_path.or_else(|| {
-        if let Config::File(p) = &config {
-            Some(p.clone())
-        } else {
-            None
-        }
-    });
     let config: InternalConfig = config.try_parse()?;
     let cwd = cwd.unwrap_or_else(|| ".".to_string());
     let rt_kind = rt.unwrap_or(TokioRuntime::MultiThread);
 
-    let token = tokio_util::sync::CancellationToken::new();
+    let token = CancellationToken::new();
     let token_clone = token.clone();
 
     let handle = std::thread::spawn(move || {
@@ -276,23 +270,25 @@ pub fn start_scaffold_instance(
         .build()
         .expect("Failed to build runtime");
 
-        let (log_tx, _) = tokio::sync::broadcast::channel(100);
+        let (log_tx, _) = broadcast::channel(100);
 
-        if let Err(e) = rt.block_on(start(
+        let result = rt.block_on(start(
             config,
             cwd,
-            config_path,
+            enable_restart,
             log_tx,
             token_clone,
-        )) {
+        ));
+        if let Err(e) = &result {
             eprintln!("Clash instance error: {}", e);
         }
+        result
     });
 
     Ok((handle, token))
 }
 
-static SHUTDOWN_TOKEN: std::sync::Mutex<Vec<tokio_util::sync::CancellationToken>> =
+static SHUTDOWN_TOKEN: std::sync::Mutex<Vec<CancellationToken>> =
     std::sync::Mutex::new(Vec::new());
 
 pub fn shutdown() -> bool {
@@ -324,13 +320,81 @@ pub fn setup_default_crypto_provider() {
     });
 }
 
+async fn wait_restart(rx: Option<oneshot::Receiver<()>>) {
+    match rx {
+        Some(rx) => match rx.await {
+            Ok(()) => {}
+            Err(_) => pending().await,
+        },
+        None => pending().await,
+    }
+}
+
+async fn wait_shutdown_signal(
+    shutdown_token: &CancellationToken,
+    #[cfg(unix)] sigterm: &mut Signal,
+    #[cfg(unix)] sigint: &mut Signal,
+) -> Result<()> {
+    #[cfg(unix)]
+    {
+        tokio::select! {
+            _ = sigterm.recv() => {
+                info!("received SIGTERM, shutting down gracefully");
+            }
+            _ = sigint.recv() => {
+                info!("received SIGINT, shutting down gracefully");
+            }
+            _ = shutdown_token.cancelled() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => {
+                result.map_err(Error::Io)?;
+            }
+            _ = shutdown_token.cancelled() => {}
+        }
+    }
+    Ok(())
+}
+
+async fn finalize_exit<F, S>(
+    mut exit_reason: RunExit,
+    stop: F,
+    shutdown_signal: S,
+) -> Result<RunExit>
+where
+    F: Future<Output = ()>,
+    S: Future<Output = Result<()>>,
+{
+    if exit_reason == RunExit::Restart {
+        tokio::pin!(stop);
+        tokio::select! {
+            biased;
+            result = shutdown_signal => {
+                info!(
+                    "received shutdown signal during restart cleanup, cancelling restart"
+                );
+                exit_reason = RunExit::Shutdown;
+                stop.await;
+                result?;
+            }
+            _ = &mut stop => {}
+        }
+    } else {
+        stop.await;
+    }
+    Ok(exit_reason)
+}
+
 pub async fn start(
     config: InternalConfig,
     cwd: String,
-    config_path: Option<String>,
+    enable_restart: bool,
     log_tx: broadcast::Sender<LogEvent>,
-    shutdown_token: tokio_util::sync::CancellationToken,
-) -> Result<()> {
+    shutdown_token: CancellationToken,
+) -> Result<RunExit> {
     setup_default_crypto_provider();
 
     let os = match env!("CLASH_TARGET_OS") {
@@ -378,157 +442,107 @@ pub async fn start(
     let controller_cfg = config.general.controller.clone();
     let log_level = config.general.log_level;
     let (fatal_tx, mut fatal_rx) = mpsc::channel(16);
-    let active_config = config.clone();
 
     // The mobile host may revoke the VPN while initial providers are loading.
     // Cancelling here drops pending initialization instead of waiting for every
     // remote resource before the shutdown loop becomes reachable.
     let components = tokio::select! {
         biased;
-        _ = shutdown_token.cancelled() => return Ok(()),
+        _ = shutdown_token.cancelled() => return Ok(RunExit::Shutdown),
         result = create_components(
-            cwd_path.clone(), config, None, Some(fatal_tx.clone()), None,
+            cwd_path,
+            config,
+            shutdown_token.child_token(),
+            Some(fatal_tx),
         ) => result?,
     };
 
-    let (reload_tx, mut reload_rx) = mpsc::channel(1);
+    let (restart_controller, restart_rx) = if enable_restart {
+        let (tx, rx) = oneshot::channel();
+        (Some(Arc::new(RestartController::new(tx))), Some(rx))
+    } else {
+        (None, None)
+    };
 
-    let global_state = Arc::new(Mutex::new(GlobalState {
-        log_level,
-        #[cfg(feature = "tun")]
-        tunnel_runner: components.tun_runner.clone(),
-        dns_listener: components.dns_listener.clone(),
-        reload_tx,
-        cwd: cwd.clone(),
-        config_path,
-    }));
+    let global_state = Arc::new(Mutex::new(GlobalState { log_level }));
 
-    let initial_runtime_ctx = app::api::RuntimeContext::new(
+    let runtime_ctx = RuntimeContext::new(
         components.inbound_manager.clone(),
         components.dispatcher.clone(),
-        global_state.clone(),
+        global_state,
         components.dns_resolver.clone(),
         components.outbound_manager.clone(),
         components.statistics_manager.clone(),
         components.cache_store.clone(),
         components.router.clone(),
-        cwd.clone(),
+        cwd,
         components.dns_listen.clone(),
         components.dns_enabled,
+        restart_controller,
     );
 
-    let api_listener = Arc::new(app::api::ApiRunner::from_context(
-        controller_cfg.clone(),
-        log_tx.clone(),
-        initial_runtime_ctx,
-        Some(shutdown_token.child_token()),
+    let api_listener = Arc::new(ApiRunner::from_context(
+        controller_cfg,
+        log_tx,
+        runtime_ctx,
     ));
 
-    let api_service_context = ServiceContext::with_fatal_tx(
-        shutdown_token.child_token(),
-        fatal_tx.clone(),
-    );
-    let previous_network = NetworkConfig::capture();
-    components.network_config.apply();
     if let Err(e) = components.start_all().await {
         components.stop_all().await;
-        previous_network.apply();
         return Err(e);
     }
-    if let Err(e) = api_listener.start(&api_service_context).await {
+    if let Err(e) = api_listener.start(&components.service_context).await {
         components.stop_all().await;
-        previous_network.apply();
         return Err(e);
     }
-
-    let mut runtime = reload::RuntimeState {
-        components,
-        api_listener,
-        api_service_context,
-        active_config,
-        global_state,
-        log_tx,
-        shutdown_token: shutdown_token.clone(),
-        fatal_tx: fatal_tx.clone(),
-    };
-    let shutdown_token_clone = shutdown_token.clone();
-    let reload_guard = CriticalTaskGuard::new(
-        "config_reloader",
-        shutdown_token.clone(),
-        fatal_tx.clone(),
-    );
-    let reload_handle = tokio::spawn(async move {
-        let _guard = reload_guard;
-        // Listen for config reload signal and reload config
-        loop {
-            tokio::select! {
-                res = reload_rx.recv() => {
-                    match res {
-                        Some((config, done)) => {
-                            info!("reloading config");
-                            let new_config = match config.try_parse() {
-                                Ok(c) => c,
-                                Err(e) => {
-                                    error!("failed to reload config: {}", e);
-                                    let _ = done.send(Err(e.to_string()));
-                                    continue;
-                                }
-                            };
-
-                            let result = runtime.reload(new_config).await;
-                            if let Err(e) = &result {
-                                error!("failed to reload config: {}", e);
-                            }
-                            let _ = done.send(result.map_err(|e| e.to_string()));
-                            if shutdown_token_clone.is_cancelled() {
-                                break;
-                            }
-                        }
-                        None => {
-                            break;
-                        }
-                    }
-                }
-                _ = shutdown_token_clone.cancelled() => {
-                    break;
-                }
-            }
-        }
-        runtime.stop().await;
-        Ok::<(), Error>(())
-    });
 
     #[cfg(unix)]
-    let mut sigterm =
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .map_err(Error::Io)?;
-
-    tokio::select! {
-        Some(fatal_err) = fatal_rx.recv() => {
-            tracing::error!("FATAL: critical task failed: {fatal_err}. Shutting down gracefully to prevent zombie state");
-            shutdown_token.cancel();
-        }
-        result = tokio::signal::ctrl_c() => {
-            shutdown_token.cancel();
-            result.map_err(Error::Io)?;
-        }
-        _ = async {
-            #[cfg(unix)]
-            {
-                sigterm.recv().await;
-            }
-            #[cfg(not(unix))]
-            {
-                std::future::pending::<()>().await;
-            }
-        } => {
-            tracing::info!("received SIGTERM, shutting down gracefully");
-            shutdown_token.cancel();
-        }
-        _ = shutdown_token.cancelled() => {}
+    let mut sigterm = signal(SignalKind::terminate()).map_err(Error::Io)?;
+    #[cfg(unix)]
+    let mut sigint = signal(SignalKind::interrupt()).map_err(Error::Io)?;
+    #[cfg(unix)]
+    if enable_restart && let Err(error) = restart_signal::install() {
+        components.stop_all().await;
+        return Err(error.into());
     }
-    let _ = reload_handle.await;
-    Ok(())
+
+    let exit_reason = tokio::select! {
+        Some(fatal_err) = fatal_rx.recv() => {
+            tracing::error!(
+                "FATAL: critical task failed: {fatal_err}. Shutting down gracefully to prevent zombie state"
+            );
+            RunExit::Shutdown
+        }
+        () = wait_restart(restart_rx) => {
+            info!("received graceful restart request, stopping services");
+            RunExit::Restart
+        }
+        result = wait_shutdown_signal(
+            &shutdown_token,
+            #[cfg(unix)]
+            &mut sigterm,
+            #[cfg(unix)]
+            &mut sigint,
+        ) => {
+            result?;
+            RunExit::Shutdown
+        }
+    };
+
+    let exit_reason = finalize_exit(
+        exit_reason,
+        components.stop_all(),
+        wait_shutdown_signal(
+            &shutdown_token,
+            #[cfg(unix)]
+            &mut sigterm,
+            #[cfg(unix)]
+            &mut sigint,
+        ),
+    )
+    .await?;
+    shutdown_token.cancel();
+    Ok(exit_reason)
 }
 
 struct RuntimeComponents {
@@ -546,19 +560,10 @@ struct RuntimeComponents {
     dns_listener: ArcService,
     inbound_manager: Arc<InboundManager>,
     dns_listen: DNSListenAddr,
-    dns_prepared: PreparedDnsListener,
     dns_enabled: bool,
     service_context: ServiceContext,
-    network_config: NetworkConfig,
     inbound_providers: HashMap<String, InboundProviderDef>,
     cwd: String,
-
-    country_mmdb: Option<MmdbLookup>,
-    country_mmdb_path: Option<PathBuf>,
-    asn_mmdb: Option<MmdbLookup>,
-    asn_mmdb_path: Option<PathBuf>,
-    geodata: Option<GeoDataLookup>,
-    geosite_path: Option<PathBuf>,
 }
 
 impl RuntimeComponents {
@@ -579,6 +584,7 @@ impl RuntimeComponents {
     }
 
     async fn stop_all(&self) {
+        self.service_context.cancellation_token().cancel();
         #[cfg(feature = "tun")]
         let _ = self.tun_runner.stop().await;
         #[cfg(all(target_os = "linux", feature = "ebpf"))]
@@ -594,21 +600,16 @@ impl RuntimeComponents {
 async fn create_components(
     cwd: PathBuf,
     config: InternalConfig,
-    old_components: Option<&RuntimeComponents>,
-    fatal_tx: Option<tokio::sync::mpsc::Sender<crate::Error>>,
-    dns_prepared: Option<PreparedDnsListener>,
+    cancellation_token: CancellationToken,
+    fatal_tx: Option<mpsc::Sender<Error>>,
 ) -> Result<RuntimeComponents> {
-    let dns_prepared = match dns_prepared {
-        Some(prepared) => prepared,
-        None => {
-            let mut listen = if config.dns.enable {
-                config.dns.listen.clone()
-            } else { DNSListenAddr::default() };
-            listen.resolve_certificate_paths(&cwd);
-            spawn_blocking(move || PreparedDnsListener::new(listen)).await
-                .map_err(|error| Error::Operation(format!("DNS listener preparation failed: {error}")))??
-        }
+    let mut dns_listen_resolved = if config.dns.enable {
+        config.dns.listen.clone()
+    } else {
+        DNSListenAddr::default()
     };
+    dns_listen_resolved.resolve_certificate_paths(&cwd);
+
     let explicit_iface = config.tun.enable.then(|| {
         config.general.interface.as_ref()
             .and_then(|i| i.clone().into_iface_name())
@@ -622,21 +623,21 @@ async fn create_components(
             .or(Some(clash_ebpf::DAE_BYPASS_MARK)),
         _ => so_mark,
     };
-    let network_config = NetworkConfig::resolve(
-        explicit_iface.as_deref(), detect_interface, so_mark,
-    ).with_tcp_keepalive(config.general.tcp_keepalive);
+    apply_network_config(
+        explicit_iface.as_deref(),
+        detect_interface,
+        so_mark,
+        config.general.tcp_keepalive,
+    );
 
-    let cancellation_token = tokio_util::sync::CancellationToken::new();
     let cwd_str = cwd.to_string_lossy().to_string();
 
     debug!("initializing cache store");
-    let cache_store = match old_components {
-        Some(old) => old.cache_store.with_store_selected(config.profile.store_selected),
-        None => profile::ThreadSafeCacheFile::new(
-            &cwd.join("cache.db").to_string_lossy(),
-            config.profile.store_selected,
-        ).map_err(|e| Error::ProfileError(e.to_string()))?,
-    };
+    let cache_store = profile::ThreadSafeCacheFile::new(
+        &cwd.join("cache.db").to_string_lossy(),
+        config.profile.store_selected,
+    )
+    .map_err(|e| Error::ProfileError(e.to_string()))?;
 
     let system_resolver = Arc::new(
         SystemResolver::new(config.dns.ipv6)
@@ -739,24 +740,16 @@ async fn create_components(
 
     debug!("initializing mmdb");
     let country_mmdb_path = country_mmdb_file.as_ref().map(|f| cwd.join(f));
-    let country_mmdb = if let Some(ref mmdb_path) = country_mmdb_path {
-        let mmdb = if let Some(old) = old_components
-            && old.country_mmdb_path.as_ref() == Some(mmdb_path)
-            && let Some(ref old_mmdb) = old.country_mmdb
-        {
-            debug!("reusing country mmdb from {:?}", mmdb_path);
-            old_mmdb.clone()
-        } else {
-            Arc::new(
-                mmdb::Mmdb::new(
-                    mmdb_path.clone(),
-                    country_mmdb_download_url
-                        .unwrap_or(DEFAULT_COUNTRY_MMDB_DOWNLOAD_URL.to_string()),
-                    client.clone(),
-                )
-                .await?,
-            ) as MmdbLookup
-        };
+    let country_mmdb = if let Some(mmdb_path) = country_mmdb_path {
+        let mmdb = Arc::new(
+            mmdb::Mmdb::new(
+                mmdb_path,
+                country_mmdb_download_url
+                    .unwrap_or(DEFAULT_COUNTRY_MMDB_DOWNLOAD_URL.to_string()),
+                client.clone(),
+            )
+            .await?,
+        ) as MmdbLookup;
         if let Some(pending) = &pending_country_mmdb
             && pending.set(mmdb.clone()).is_err()
         {
@@ -773,26 +766,18 @@ async fn create_components(
 
     debug!("initializing geosite");
     let geosite_path = config.general.geosite.as_ref().map(|f| cwd.join(f));
-    let geodata = if let Some(ref path) = geosite_path {
-        let gd = if let Some(old) = old_components
-            && old.geosite_path.as_ref() == Some(path)
-            && let Some(ref old_geodata) = old.geodata
-        {
-            debug!("reusing geosite from {:?}", path);
-            old_geodata.clone()
-        } else {
-            Arc::new(
-                geodata::GeoData::new(
-                    path.clone(),
-                    config
-                        .general
-                        .geosite_download_url
-                        .unwrap_or(DEFAULT_GEOSITE_DOWNLOAD_URL.to_string()),
-                    client.clone(),
-                )
-                .await?,
-            ) as GeoDataLookup
-        };
+    let geodata = if let Some(path) = geosite_path {
+        let gd = Arc::new(
+            geodata::GeoData::new(
+                path,
+                config
+                    .general
+                    .geosite_download_url
+                    .unwrap_or(DEFAULT_GEOSITE_DOWNLOAD_URL.to_string()),
+                client.clone(),
+            )
+            .await?,
+        ) as GeoDataLookup;
         Some(gd)
     } else {
         debug!("geosite not set, skipping");
@@ -801,26 +786,18 @@ async fn create_components(
 
     debug!("initializing country asn mmdb");
     let asn_mmdb_path = config.general.asn_mmdb.as_ref().map(|f| cwd.join(f));
-    let asn_mmdb = if let Some(ref path) = asn_mmdb_path {
-        let mmdb = if let Some(old) = old_components
-            && old.asn_mmdb_path.as_ref() == Some(path)
-            && let Some(ref old_asn_mmdb) = old.asn_mmdb
-        {
-            debug!("reusing asn mmdb from {:?}", path);
-            old_asn_mmdb.clone()
-        } else {
-            Arc::new(
-                mmdb::Mmdb::new(
-                    path.clone(),
-                    config
-                        .general
-                        .asn_mmdb_download_url
-                        .unwrap_or(DEFAULT_ASN_MMDB_DOWNLOAD_URL.to_string()),
-                    client.clone(),
-                )
-                .await?,
-            ) as MmdbLookup
-        };
+    let asn_mmdb = if let Some(path) = asn_mmdb_path {
+        let mmdb = Arc::new(
+            mmdb::Mmdb::new(
+                path,
+                config
+                    .general
+                    .asn_mmdb_download_url
+                    .unwrap_or(DEFAULT_ASN_MMDB_DOWNLOAD_URL.to_string()),
+                client.clone(),
+            )
+            .await?,
+        ) as MmdbLookup;
         Some(mmdb)
     } else {
         debug!("ASN mmdb not found and not configured for download, skipping");
@@ -835,9 +812,9 @@ async fn create_components(
             dns_resolver.clone(),
             Some(system_resolver.clone()),
             Some(outbound_registry.clone()),
-            country_mmdb.clone(),
-            asn_mmdb.clone(),
-            geodata.clone(),
+            country_mmdb,
+            asn_mmdb,
+            geodata,
             cwd_str.clone(),
         )
         .await?,
@@ -856,9 +833,7 @@ async fn create_components(
 
     let statistics_manager = StatisticsManager::new();
 
-    let sniffer = config
-        .sniffer
-        .map(|c| Arc::new(crate::app::sniffer::Sniffer::new(c)));
+    let sniffer = config.sniffer.map(|c| Arc::new(Sniffer::new(c)));
 
     debug!("initializing dispatcher");
     let dispatcher = Arc::new(Dispatcher::new(
@@ -881,7 +856,6 @@ async fn create_components(
             dispatcher.clone(),
             authenticator,
             config.listeners,
-            Some(cancellation_token.child_token()),
         )
         .await,
     );
@@ -892,7 +866,6 @@ async fn create_components(
         config.tun,
         dispatcher.clone(),
         dns_resolver.clone(),
-        Some(cancellation_token.child_token()),
         #[cfg(target_os = "linux")]
         router.get_rule_providers(),
     )?);
@@ -904,15 +877,13 @@ async fn create_components(
         config.ebpf.unwrap_or_default(),
         dispatcher.clone(),
         dns_resolver.clone(),
-        Some(cancellation_token.child_token()),
     ));
 
     debug!("initializing dns listener");
     let dns_listener: ArcRunner = Arc::new(dns::DnsRunner::new(
         dns_enable,
-        dns_prepared.clone(),
+        dns_listen_resolved,
         dns_resolver.clone(),
-        Some(cancellation_token.child_token()),
     ));
 
     info!("all components initialized");
@@ -935,25 +906,27 @@ async fn create_components(
         ebpf_runner,
         dns_listener,
         dns_listen,
-        dns_prepared,
         dns_enabled: dns_enable,
         service_context,
-        network_config,
         inbound_providers: config.inbound_providers,
         cwd: cwd_str,
-        country_mmdb,
-        country_mmdb_path,
-        asn_mmdb,
-        asn_mmdb_path,
-        geodata,
-        geosite_path,
     })
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::{Config, Options, shutdown, start_scaffold};
-    use std::{sync::Once, thread, time::Duration};
+    use super::finalize_exit;
+    use crate::{Config, Options, RunExit, shutdown, start_scaffold};
+    use std::{
+        future::pending,
+        sync::{
+            Arc, Once,
+            atomic::{AtomicBool, Ordering},
+        },
+        thread,
+        time::Duration,
+    };
+    use tokio::sync::Notify;
 
     static INIT: Once = Once::new();
 
@@ -962,6 +935,64 @@ mod tests {
             env_logger::init();
             crate::setup_default_crypto_provider();
         });
+    }
+
+    #[tokio::test]
+    async fn restart_cleanup_cancelled_by_shutdown_signal_finishes_cleanup() {
+        let stop_gate = Arc::new(Notify::new());
+        let shutdown_gate = Arc::new(Notify::new());
+        let stop_finished = Arc::new(AtomicBool::new(false));
+
+        let stop_gate_clone = stop_gate.clone();
+        let stop_finished_clone = stop_finished.clone();
+        let shutdown_gate_clone = shutdown_gate.clone();
+
+        let task = tokio::spawn(async move {
+            finalize_exit(
+                RunExit::Restart,
+                async move {
+                    stop_gate_clone.notified().await;
+                    stop_finished_clone.store(true, Ordering::SeqCst);
+                },
+                async move {
+                    shutdown_gate_clone.notified().await;
+                    Ok(())
+                },
+            )
+            .await
+        });
+
+        tokio::task::yield_now().await;
+        shutdown_gate.notify_one();
+        tokio::task::yield_now().await;
+        assert!(
+            !stop_finished.load(Ordering::SeqCst),
+            "cleanup should still be awaited before returning"
+        );
+
+        stop_gate.notify_one();
+        let exit = task.await.unwrap().unwrap();
+        assert!(stop_finished.load(Ordering::SeqCst));
+        assert_eq!(exit, RunExit::Shutdown);
+    }
+
+    #[tokio::test]
+    async fn restart_cleanup_without_shutdown_signal_returns_restart() {
+        let stop_finished = Arc::new(AtomicBool::new(false));
+        let stop_finished_clone = stop_finished.clone();
+
+        let exit = finalize_exit(
+            RunExit::Restart,
+            async move {
+                stop_finished_clone.store(true, Ordering::SeqCst);
+            },
+            pending(),
+        )
+        .await
+        .unwrap();
+
+        assert!(stop_finished.load(Ordering::SeqCst));
+        assert_eq!(exit, RunExit::Restart);
     }
 
     #[test]
@@ -981,7 +1012,7 @@ mod tests {
                 cwd: None,
                 rt: None,
                 log_file: None,
-                config_path: None,
+                enable_restart: false,
             })
             .unwrap()
         });
@@ -991,6 +1022,6 @@ mod tests {
             assert!(shutdown());
         });
 
-        handle.join().unwrap();
+        assert_eq!(handle.join().unwrap(), RunExit::Shutdown);
     }
 }

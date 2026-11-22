@@ -3,7 +3,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::{sync::Mutex, task::JoinHandle};
-use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 use tracing::debug;
@@ -67,7 +66,6 @@ pub struct TunRunner {
     cfg: TunConfig,
     dispatcher: Arc<Dispatcher>,
     resolver: ThreadSafeDNSResolver,
-    cancellation_token: CancellationToken,
     pipeline_task: Mutex<Option<JoinHandle<Result<(), Error>>>>,
 }
 
@@ -76,7 +74,6 @@ impl TunRunner {
         cfg: TunConfig,
         dispatcher: Arc<Dispatcher>,
         resolver: ThreadSafeDNSResolver,
-        cancellation_token: Option<CancellationToken>,
         #[cfg(target_os = "linux")] rule_providers: &HashMap<String, ThreadSafeRuleProvider>,
     ) -> Result<TunRunner, Error> {
         Ok(Self {
@@ -85,7 +82,6 @@ impl TunRunner {
             cfg,
             dispatcher,
             resolver,
-            cancellation_token: cancellation_token.unwrap_or_default(),
             pipeline_task: Mutex::new(None),
         })
     }
@@ -285,14 +281,6 @@ impl TunRunner {
 
         Ok((tun, manage_network))
     }
-
-    pub fn shutdown(&self) {
-        info!("shutting down tun runner");
-        self.cancellation_token.cancel();
-        // The pipeline owns external state and cleans nftables before routes.
-        // AsyncService::stop awaits it; this synchronous method only signals.
-
-    }
 }
 
 #[async_trait]
@@ -310,7 +298,7 @@ impl AsyncService for TunRunner {
         let dns_hijack = self.cfg.dns_hijack.clone();
         #[cfg(target_os = "linux")]
         let dns_hijack = super::auto_redirect::dns::hijack_config(&cfg, dns_hijack);
-        let cancellation_token = self.cancellation_token.clone();
+        let cancellation_token = ctx.cancellation_token().clone();
 
         let (tun, manage_network) = TunRunner::new_internal(&cfg)
             .await
@@ -446,8 +434,7 @@ impl AsyncService for TunRunner {
             });
         }
 
-        let lifecycle_token = cancellation_token.clone();
-        let task = ctx.spawn_critical_with_token("tun_packet_pipeline", lifecycle_token, async move {
+        let task = ctx.spawn_critical("tun_packet_pipeline", async move {
             #[cfg(target_os = "macos")]
             let _platform = platform;
             #[cfg(target_os = "linux")]
@@ -596,7 +583,7 @@ impl AsyncService for TunRunner {
     }
 
     async fn stop(&self) -> Result<(), Error> {
-        self.shutdown();
+        info!("shutting down tun runner");
         // Keep the handle in the slot while awaiting it: a cancelled stop
         // future must not orphan cleanup, and concurrent stops must also wait.
         let mut task = self.pipeline_task.lock().await;
@@ -685,12 +672,13 @@ mod shutdown_tests {
             Arc::new(OutboundManager::new_for_test(HashMap::new())), router,
             resolver.clone(), RunMode::Direct, StatisticsManager::new(), None, None, true,
         ));
-        let runner = TunRunner::new(cfg.clone(), dispatcher, resolver, None, &HashMap::new()).unwrap();
-        let token = runner.cancellation_token.clone();
+        let runner = TunRunner::new(cfg.clone(), dispatcher, resolver, &HashMap::new()).unwrap();
+        let token = tokio_util::sync::CancellationToken::new();
+        let task_token = token.clone();
         let (started_tx, started_rx) = oneshot::channel();
         let (release_tx, release_rx) = oneshot::channel();
         let task = tokio::spawn(async move {
-            token.cancelled().await;
+            task_token.cancelled().await;
             started_tx.send(()).unwrap();
             release_rx.await.unwrap();
             tokio::task::spawn_blocking(move || {
@@ -699,7 +687,7 @@ mod shutdown_tests {
             }).await.unwrap().map_err(Error::Io)
         });
         *runner.pipeline_task.lock().await = Some(task);
-        runner.shutdown();
+        token.cancel();
         started_rx.await.unwrap();
         // Hold pipeline drain open: synchronous shutdown must not remove the
         // lookup or strict blackhole while nftables can still mark packets.

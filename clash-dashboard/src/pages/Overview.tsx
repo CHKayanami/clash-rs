@@ -1,13 +1,14 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
-import { getMemory, getConfigs, patchConfigs, reloadConfigs } from '../lib/api';
+import { getMemory, getConfigs, getVersion, patchConfigs, restart } from '../lib/api';
+import { performRestart } from '../lib/restart';
 import { useTraffic } from '../hooks/useTraffic';
 import { TrafficChart } from '../components/TrafficChart';
 import { ProxyGroups } from '../components/ProxyGroups';
 import {
   ArrowUp, ArrowDown, Activity, HardDrive,
   Globe, Router, Sliders, Server, Wifi, FileText, Shield, Zap,
-  RefreshCw, ChevronDown, ChevronUp,
+  RefreshCw, Check, ChevronDown, ChevronUp,
 } from 'lucide-react';
 import type { PatchableConfig, ClashConfig } from '../lib/api';
 
@@ -176,10 +177,55 @@ export function Overview() {
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ['configs'] }),
   });
 
-  const reloadMutation = useMutation({
-    mutationFn: () => reloadConfigs(''),
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['configs'] }),
-  });
+  const [restartState, setRestartState] = useState<'idle' | 'restarting' | 'restarted'>('idle');
+  const [restartError, setRestartError] = useState<string | null>(null);
+  const unmountControllerRef = useRef<AbortController | null>(null);
+  const resetTimerRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    unmountControllerRef.current = controller;
+    return () => {
+      controller.abort();
+      unmountControllerRef.current = null;
+      if (resetTimerRef.current !== null) {
+        window.clearTimeout(resetTimerRef.current);
+      }
+    };
+  }, []);
+
+  async function handleRestart() {
+    if (restartState === 'restarting') return;
+    if (resetTimerRef.current !== null) {
+      window.clearTimeout(resetTimerRef.current);
+      resetTimerRef.current = null;
+    }
+
+    setRestartError(null);
+    setRestartState('restarting');
+
+    const unmountSignal = unmountControllerRef.current?.signal;
+    const result = await performRestart({
+      triggerRestart: (signal) => restart({ signal }),
+      fetchVersion: (signal) => getVersion({ signal }),
+      signal: unmountSignal,
+    });
+
+    if (result.status === 'aborted' || unmountSignal?.aborted) {
+      return;
+    }
+
+    if (result.status === 'restarted') {
+      setRestartState('restarted');
+      resetTimerRef.current = window.setTimeout(() => {
+        if (!unmountSignal?.aborted) setRestartState('idle');
+      }, 2000);
+      void queryClient.invalidateQueries();
+    } else {
+      setRestartState('idle');
+      setRestartError(result.message);
+    }
+  }
 
   function patch(fields: PatchableConfig) { patchMutation.mutate(fields); }
 
@@ -208,14 +254,30 @@ export function Overview() {
           {patchMutation.isPending && (
             <span className="text-[12px]" style={{ color: 'var(--color-text-secondary)' }}>Saving…</span>
           )}
+          {restartError && (
+            <span className="text-[12px] text-red-500 max-w-xs truncate" title={restartError}>
+              {restartError}
+            </span>
+          )}
           <button
-            onClick={() => reloadMutation.mutate()}
-            disabled={reloadMutation.isPending}
-            className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[13px] font-medium transition-colors disabled:opacity-50"
-            style={{ background: '#0071e3', color: 'white' }}
+            onClick={handleRestart}
+            disabled={restartState === 'restarting'}
+            className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[13px] font-medium cursor-pointer transition-all duration-150 hover:brightness-110 active:scale-95 disabled:opacity-75 disabled:cursor-wait disabled:active:scale-100"
+            style={{
+              background: restartState === 'restarted' ? '#34c759' : '#0071e3',
+              color: 'white',
+            }}
           >
-            <RefreshCw size={13} className={reloadMutation.isPending ? 'animate-spin' : ''} />
-            Reload Config
+            {restartState === 'restarted' ? (
+              <Check size={13} />
+            ) : (
+              <RefreshCw size={13} className={restartState === 'restarting' ? 'animate-spin' : ''} />
+            )}
+            {restartState === 'restarting'
+              ? 'Restarting…'
+              : restartState === 'restarted'
+                ? 'Restarted'
+                : 'Restart'}
           </button>
         </div>
       </div>

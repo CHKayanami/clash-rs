@@ -1,8 +1,8 @@
-use std::{path::PathBuf, sync::Arc};
+use std::sync::Arc;
 
 use axum::{
     Json, Router,
-    extract::{Query, State},
+    extract::State,
     response::IntoResponse,
     routing::get,
 };
@@ -18,8 +18,8 @@ use crate::{
         api::AppState,
         dispatcher,
         dns::{ThreadSafeDNSResolver, config::DNSListenAddr},
-        logging::set_log_level,
         inbound::manager::{InboundEndpoint, InboundManager, Ports},
+        logging::set_log_level,
     },
     config::{def, internal::config::BindAddress},
 };
@@ -140,86 +140,13 @@ async fn get_configs(State(state): State<ConfigState>) -> impl IntoResponse {
     })
 }
 
-#[derive(Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-struct UpdateConfigRequest {
-    path: Option<String>,
-    payload: Option<String>,
-}
-
-#[derive(Serialize, Deserialize)]
-struct UploadConfigQuery {
-    force: Option<bool>,
-}
-
-async fn update_configs(
-    _q: Query<UploadConfigQuery>,
-    State(state): State<ConfigState>,
-    Json(req): Json<UpdateConfigRequest>,
-) -> impl IntoResponse {
-    // Extract only what we need, then drop the lock before the async reload.
-    let (reload_tx, cwd, config_path) = {
-        let g = state.global_state.lock().await;
-        (g.reload_tx.clone(), g.cwd.clone(), g.config_path.clone())
-    };
-
-    let cfg = match (req.path.as_deref(), req.payload) {
-        (_, Some(payload)) => crate::Config::Str(payload),
-
-        // Non-empty explicit path: validate and reload from that file.
-        (Some(p), None) if !p.is_empty() => {
-            let mut path = p.to_string();
-            if !PathBuf::from(&path).is_absolute() {
-                path = PathBuf::from(&cwd).join(path).to_string_lossy().to_string();
-            }
-            if !PathBuf::from(&path).exists() {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    format!("config file {path} not found"),
-                )
-                    .into_response();
-            }
-            if PathBuf::from(&path).is_dir() {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    format!("config path {path} is a directory"),
-                )
-                    .into_response();
-            }
-            crate::Config::File(path)
-        }
-
-        // Empty path or no path: reload from the startup config file.
-        _ => match config_path {
-            Some(p) => crate::Config::File(p),
-            None => {
-                return (StatusCode::BAD_REQUEST, "no path or payload provided")
-                    .into_response();
-            }
-        },
-    };
-
-    let (done, wait) = tokio::sync::oneshot::channel();
-    match reload_tx.send((cfg, done)).await {
-        Ok(_) => match wait.await {
-            Ok(Ok(_)) => StatusCode::NO_CONTENT.into_response(),
-            Ok(Err(e)) => (
-                StatusCode::BAD_REQUEST,
-                format!("config reload failed: {e}"),
-            )
-                .into_response(),
-            Err(_) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "config reload did not complete",
-            )
-                .into_response(),
-        },
-        Err(_) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "could not signal config reload",
-        )
-            .into_response(),
-    }
+async fn update_configs() -> impl IntoResponse {
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        Json(json!({
+            "message": "config reload is not supported; edit the config file and restart clash-rs"
+        })),
+    )
 }
 
 #[derive(Serialize)]

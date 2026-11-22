@@ -37,12 +37,17 @@ static GLOBAL: MiMalloc = MiMalloc;
 extern crate clash_lib as clash;
 
 use clap::Parser;
-use clash::TokioRuntime;
+use clash::{RunExit, TokioRuntime};
 use sentry::ClientOptions;
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
+#[cfg(windows)]
+use std::process::Stdio;
 use std::{
+    fs,
     io::Write,
     path::{Path, PathBuf},
-    process::exit,
+    process::{Command, exit},
 };
 
 #[derive(Parser, Debug)]
@@ -200,11 +205,19 @@ fn main() -> anyhow::Result<()> {
         exit(0)
     }
 
-    let file = cli
-        .directory
-        .as_ref()
-        .unwrap_or(&std::env::current_dir().unwrap())
-        .join(cli.config)
+    let initial_cwd = std::env::current_dir()?;
+    let mut effective_dir = cli.directory.as_ref().map(|dir| {
+        if dir.is_absolute() {
+            dir.clone()
+        } else {
+            initial_cwd.join(dir)
+        }
+    });
+
+    let file = effective_dir
+        .as_deref()
+        .unwrap_or(&initial_cwd)
+        .join(&cli.config)
         .to_string_lossy()
         .to_string();
 
@@ -271,22 +284,16 @@ fn main() -> anyhow::Result<()> {
 
     let mut config = parse_config()?;
 
-    config.general.controller.external_controller_ipc = cli.controller_ipc;
+    config.general.controller.external_controller_ipc = cli.controller_ipc.clone();
     if cli.compatibility {
         println!(
             "Compatibility mode enabled. This may cause some issues, but it is \
              recommended to enable this if you are using clash verge."
         );
-        if let Some(dir) = &cli.directory {
-            // Canonicalize to an absolute path before changing the process cwd.
-            // If `dir` is relative (e.g. `./clash-bin/tests/data/config`),
-            // calling set_current_dir then passing the same relative string as
-            // `cwd` to start_scaffold would cause paths like
-            // `cwd.join("Country.mmdb")` to be resolved from the *new* process
-            // cwd, doubling the directory segments and producing a path that
-            // doesn't exist (os error 2).
-            let abs = std::fs::canonicalize(dir)?;
+        if let Some(dir) = &effective_dir {
+            let abs = fs::canonicalize(dir)?;
             std::env::set_current_dir(&abs)?;
+            effective_dir = Some(abs);
         }
         if config.general.mmdb.is_none() {
             config.general.mmdb = Some("Country.mmdb".to_string());
@@ -297,24 +304,55 @@ fn main() -> anyhow::Result<()> {
     }
 
     // When compatibility mode called set_current_dir the process cwd is
-    // already correct; pass None so start_scaffold uses "." (= the new cwd)
-    // rather than the original relative cli.directory which would be resolved
-    // from the wrong base.
-    let cwd = if cli.compatibility && cli.directory.is_some() {
+    // already the directory; pass None so start_scaffold uses ".".
+    let cwd = if cli.compatibility && effective_dir.is_some() {
         None
     } else {
-        cli.directory.map(|x| x.to_string_lossy().to_string())
+        effective_dir
+            .as_ref()
+            .map(|x| x.to_string_lossy().to_string())
     };
 
-    clash::start_scaffold(clash::Options {
+    let exit_reason = clash::start_scaffold(clash::Options {
         config: clash::Config::Internal(config),
         cwd,
         rt: Some(TokioRuntime::MultiThread),
-        log_file: cli.log_file,
-        config_path: Some(file),
+        log_file: cli.log_file.clone(),
+        enable_restart: true,
     })
     .inspect_err(|err| eprintln!("Failed to start clash: {err}"))?;
+
+    if exit_reason == RunExit::Restart {
+        drop(_guard);
+        exec_restart(&initial_cwd)?;
+    }
+
     Ok(())
+}
+
+fn exec_restart(initial_cwd: &Path) -> anyhow::Result<()> {
+    let exec = std::env::current_exe()?;
+    let mut cmd = Command::new(exec);
+    cmd.args(std::env::args_os().skip(1))
+        .envs(std::env::vars_os())
+        .current_dir(initial_cwd);
+
+    #[cfg(unix)]
+    {
+        if !clash::commit_process_restart() {
+            return Ok(());
+        }
+        let err = cmd.exec();
+        Err(anyhow::anyhow!("failed to exec restarted process: {err}"))
+    }
+    #[cfg(windows)]
+    {
+        cmd.stdin(Stdio::inherit())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .spawn()?;
+        exit(0);
+    }
 }
 
 

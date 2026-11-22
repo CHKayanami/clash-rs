@@ -5,10 +5,17 @@ use crate::netns::{DaeNs, NetNsError};
 use network_interface::NetworkInterfaceConfig;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
-use std::os::fd::AsRawFd;
-use std::sync::Arc;
+use std::net::{Ipv4Addr, Ipv6Addr};
+use std::os::fd::{AsRawFd, BorrowedFd};
+use std::sync::{Arc, Mutex};
 use thiserror::Error;
 use tracing::{Level, enabled, info};
+
+use crate::bpf::{BpfProgramManager, EMBEDDED_BPF_OBJECT};
+use crate::netlink::{
+    self, FAM_V4, FAM_V6, NlSock, PROTO_STATIC, ROUTE_LOCAL, ROUTE_UNICAST,
+    SCOPE_HOST, SCOPE_LINK, SCOPE_UNIVERSE,
+};
 
 const DAENS_HOST_IP: &str = "169.254.0.1";
 
@@ -72,7 +79,7 @@ pub enum EbpfError {
 struct EbpfRunningState {
     netns: Arc<DaeNs>,
     _listener: Arc<EbpfListener>,
-    bpf_manager: crate::bpf::BpfProgramManager,
+    bpf_manager: BpfProgramManager,
     _host_link: OwnedHostLink,
     _instance_lock: File,
 }
@@ -83,7 +90,6 @@ struct OwnedHostLink {
 
 impl Drop for OwnedHostLink {
     fn drop(&mut self) {
-        use crate::netlink::{self, NlSock};
         if netlink::ifindex_of("dae0").ok() == Some(self.ifindex) {
             if let Ok(mut nl) = NlSock::new() {
                 match nl.del_link(self.ifindex) {
@@ -104,31 +110,13 @@ impl Drop for EbpfRunningState {
 }
 
 pub struct EbpfManager {
-    #[allow(dead_code)]
-    config: EbpfConfig,
-    state: std::sync::Mutex<Option<EbpfRunningState>>,
+    state: Mutex<Option<EbpfRunningState>>,
 }
 
 impl EbpfManager {
-    pub fn new(config: EbpfConfig) -> Self {
-        Self {
-            config,
-            state: std::sync::Mutex::new(None),
-        }
-    }
-
     /// Initializes the eBPF datapath, veth topology, and transparent listener.
-    pub async fn start(&mut self) -> Result<Arc<EbpfListener>, EbpfError> {
-        if self.state.get_mut().unwrap().is_some() {
-            return Err(EbpfError::Bpf("eBPF datapath already running".to_string()));
-        }
-        self.config.lan.validate().map_err(EbpfError::Bpf)?;
-
-        use crate::netlink::{
-            self, FAM_V4, FAM_V6, NlSock, PROTO_STATIC, ROUTE_LOCAL, ROUTE_UNICAST,
-            SCOPE_HOST, SCOPE_LINK, SCOPE_UNIVERSE,
-        };
-        use std::net::{Ipv4Addr, Ipv6Addr};
+    pub async fn start(config: EbpfConfig) -> Result<(Self, Arc<EbpfListener>), EbpfError> {
+        config.lan.validate().map_err(EbpfError::Bpf)?;
 
         info!("Starting clash-ebpf datapath and isolation netns...");
         let instance_lock = lock_instance()?;
@@ -174,7 +162,7 @@ impl EbpfManager {
         // Move peer to daens
         let dae_fd = ns.dae_fd();
         // SAFETY: borrowing raw fd from owned fd inside daens
-        let borrowed_fd = unsafe { std::os::fd::BorrowedFd::borrow_raw(dae_fd) };
+        let borrowed_fd = unsafe { BorrowedFd::borrow_raw(dae_fd) };
         let owned_fd = borrowed_fd.try_clone_to_owned().map_err(EbpfError::Io)?;
         host_nl.set_link_netns_fd(peer_idx, &owned_fd)?;
 
@@ -281,19 +269,19 @@ impl EbpfManager {
         })??;
 
         // Bind transparent listener inside daens
-        let listener = Arc::new(EbpfListener::bind(&ns, self.config.clone())?);
+        let listener = Arc::new(EbpfListener::bind(&ns, config.tproxy_port)?);
 
         // Resolve effective WAN interface (handling "auto", OpenWrt PPPoE/VLAN, multi-metric routes)
-        let effective_wan = match self.config.wan_interface.as_deref() {
+        let effective_wan = match config.wan_interface.as_deref() {
             Some("auto") | None | Some("") => {
-                detect_default_wan_interface(&self.config.lan_interface)
+                detect_default_wan_interface(&config.lan_interface)
             }
             Some(w) => Some(w.to_string()),
         };
 
         // Resolve effective LAN interfaces (handling "auto", OpenWrt br-lan, multi-NIC and single-NIC setups)
         let effective_lan = detect_lan_interfaces(
-            &self.config.lan_interface,
+            &config.lan_interface,
             effective_wan.as_deref(),
         );
 
@@ -302,7 +290,7 @@ impl EbpfManager {
             effective_lan, effective_wan
         );
 
-        let mut all_dst_ips = self.config.target.bypass_dst_ips.clone();
+        let mut all_dst_ips = config.target.bypass_dst_ips.clone();
         let detected_ips =
             detect_interface_ips(&effective_lan, effective_wan.as_deref());
         let mut local_ip_u32 = 0u32;
@@ -315,60 +303,60 @@ impl EbpfManager {
                 all_dst_ips.push(ip.clone());
             }
             if local_ip_u32 == 0 {
-                if let Ok(v4) = ip.parse::<std::net::Ipv4Addr>() {
+                if let Ok(v4) = ip.parse::<Ipv4Addr>() {
                     local_ip_u32 = u32::from_ne_bytes(v4.octets());
                 }
             }
         }
         all_dst_ips = crate::config::aggregate_ip_cidrs(&all_dst_ips);
 
-        let has_proxy_src_ips = if !self.config.lan.proxy_src_ips.is_empty() {
+        let has_proxy_src_ips = if !config.lan.proxy_src_ips.is_empty() {
             1
         } else {
             0
         };
-        let has_proxy_src_macs = if !self.config.lan.proxy_src_macs.is_empty() {
+        let has_proxy_src_macs = if !config.lan.proxy_src_macs.is_empty() {
             1
         } else {
             0
         };
-        let has_proxy_dst_ips = if !self.config.target.proxy_dst_ips.is_empty() {
+        let has_proxy_dst_ips = if !config.target.proxy_dst_ips.is_empty() {
             1
         } else {
             0
         };
-        let has_proxy_src_ports = if !self.config.lan.proxy_src_ports.is_empty() {
+        let has_proxy_src_ports = if !config.lan.proxy_src_ports.is_empty() {
             1
         } else {
             0
         };
-        let has_proxy_dst_ports = if !self.config.target.proxy_dst_ports.is_empty() {
+        let has_proxy_dst_ports = if !config.target.proxy_dst_ports.is_empty() {
             1
         } else {
             0
         };
-        let direct_offload_enabled = if self.config.auto_direct_offload {
+        let direct_offload_enabled = if config.auto_direct_offload {
             1
         } else {
             0
         };
-        let proxy_local = if self.config.host.proxy_local { 1 } else { 0 };
-        let has_proxy_processes = if !self.config.host.proxy_processes.is_empty() {
+        let proxy_local = if config.host.proxy_local { 1 } else { 0 };
+        let has_proxy_processes = if !config.host.proxy_processes.is_empty() {
             1
         } else {
             0
         };
-        let has_bypass_processes = if !self.config.host.bypass_processes.is_empty() {
+        let has_bypass_processes = if !config.host.bypass_processes.is_empty() {
             1
         } else {
             0
         };
-        let has_bypass_dscps = if !self.config.bypass_dscps.is_empty() {
+        let has_bypass_dscps = if !config.bypass_dscps.is_empty() {
             1
         } else {
             0
         };
-        let has_bypass_fwmarks = if !self.config.bypass_fwmarks.is_empty() {
+        let has_bypass_fwmarks = if !config.bypass_fwmarks.is_empty() {
             1
         } else {
             0
@@ -376,14 +364,13 @@ impl EbpfManager {
 
         // Initialize eBPF programs and attach TC/cgroup hooks via Aya
         let bpf_param = clash_ebpf_common::DaeParam {
-            tproxy_port: self.config.tproxy_port as u32,
+            tproxy_port: config.tproxy_port as u32,
             dae0_ifindex: dae0_idx,
             wan_ifindex: 0,
             dae0peer_mac,
             use_redirect_peer: use_redirect_peer as u8,
             proxy_local,
-            dae_socket_mark: self
-                .config
+            dae_socket_mark: config
                 .routing_mark
                 .unwrap_or(clash_ebpf_common::DAE_BYPASS_MARK),
             control_plane_pid: std::process::id(),
@@ -403,25 +390,25 @@ impl EbpfManager {
             _pad1: [0; 1],
         };
 
-        let mut bpf_manager = crate::bpf::BpfProgramManager::new();
+        let mut bpf_manager = BpfProgramManager::new();
         if let Err(e) = bpf_manager.load_and_attach(
-            crate::bpf::EMBEDDED_BPF_OBJECT,
+            EMBEDDED_BPF_OBJECT,
             &bpf_param,
             &effective_lan,
             effective_wan.as_deref(),
-            &self.config.lan.bypass_src_ports,
-            &self.config.target.bypass_dst_ports,
-            &self.config.lan.bypass_src_ips,
+            &config.lan.bypass_src_ports,
+            &config.target.bypass_dst_ports,
+            &config.lan.bypass_src_ips,
             &all_dst_ips,
-            &self.config.lan.proxy_src_ports,
-            &self.config.target.proxy_dst_ports,
-            &self.config.lan.proxy_src_ips,
-            &self.config.lan.proxy_src_macs,
-            &self.config.target.proxy_dst_ips,
-            &self.config.host.proxy_processes,
-            &self.config.host.bypass_processes,
-            &self.config.bypass_dscps,
-            &self.config.bypass_fwmarks,
+            &config.lan.proxy_src_ports,
+            &config.target.proxy_dst_ports,
+            &config.lan.proxy_src_ips,
+            &config.lan.proxy_src_macs,
+            &config.target.proxy_dst_ips,
+            &config.host.proxy_processes,
+            &config.host.bypass_processes,
+            &config.bypass_dscps,
+            &config.bypass_fwmarks,
             Some(&ns),
             (
                 listener.tcp_v4_raw_fd(),
@@ -434,20 +421,22 @@ impl EbpfManager {
             return Err(EbpfError::Bpf(e));
         }
 
-        *self.state.get_mut().unwrap() = Some(EbpfRunningState {
-            netns: ns,
-            _listener: listener.clone(),
-            bpf_manager,
-            _host_link: host_link,
-            _instance_lock: instance_lock,
-        });
+        let manager = Self {
+            state: Mutex::new(Some(EbpfRunningState {
+                netns: ns,
+                _listener: listener.clone(),
+                bpf_manager,
+                _host_link: host_link,
+                _instance_lock: instance_lock,
+            })),
+        };
 
         info!(
             "clash-ebpf started: TProxy port {}, LAN interfaces: {:?}, WAN interface: {:?}",
-            self.config.tproxy_port, self.config.lan_interface, effective_wan
+            config.tproxy_port, config.lan_interface, effective_wan
         );
 
-        Ok(listener)
+        Ok((manager, listener))
     }
 
     /// Stops the eBPF datapath and cleans up all hooks, interfaces and namespaces.

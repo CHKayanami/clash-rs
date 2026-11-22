@@ -99,7 +99,7 @@ pub(super) async fn run_system_listener(
     tcp_listener: TcpListener, nat: Arc<SystemTcpNat>, context: Arc<TcpContext>,
 ) {
     // The listener owns its connection tasks; cancellation drops the set and
-    // aborts all relays instead of retaining an old runtime generation.
+    // aborts all relays on shutdown.
     let mut connections = JoinSet::new();
     loop {
         let accepted = tokio::select! {

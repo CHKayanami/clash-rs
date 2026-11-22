@@ -3,7 +3,10 @@ use bytes::Bytes;
 
 use async_trait::async_trait;
 use tracing::{error, info};
-use clash_dns::{DNSError, DnsIngress, DnsMessageExchanger as ServerMessageExchanger, PreparedDnsListener};
+use clash_dns::{
+    DNSListenAddr, DNSError, DnsIngress,
+    DnsMessageExchanger as ServerMessageExchanger, get_dns_listener,
+};
 use super::query::IngressProfile;
 
 use super::ThreadSafeDNSResolver;
@@ -38,46 +41,38 @@ impl ServerMessageExchanger for DnsMessageExchanger {
 
 pub struct DnsRunner {
     enable: bool,
-    listener: PreparedDnsListener,
+    listen: DNSListenAddr,
     resolver: ThreadSafeDNSResolver,
-    cancellation_token: tokio_util::sync::CancellationToken,
 }
 
 impl DnsRunner {
     pub fn new(
         enable: bool,
-        listen: PreparedDnsListener,
+        listen: DNSListenAddr,
         resolver: ThreadSafeDNSResolver,
-        cancellation_token: Option<tokio_util::sync::CancellationToken>,
     ) -> Self {
         Self {
             enable,
-            listener: listen,
+            listen,
             resolver,
-            cancellation_token: cancellation_token.unwrap_or_default(),
         }
-    }
-
-    pub fn shutdown(&self) {
-        self.cancellation_token.cancel();
     }
 }
 
 #[async_trait]
 impl AsyncService for DnsRunner {
     async fn start(&self, ctx: &ServiceContext) -> Result<(), crate::Error> {
-        if !self.enable || self.listener.is_empty() {
+        if !self.enable || self.listen.is_empty() {
             return Ok(());
         }
 
         let exchanger = DnsMessageExchanger {
             resolver: self.resolver.clone(),
         };
-        let cancellation_token = self.cancellation_token.clone();
-        let child_cancel = cancellation_token.child_token();
+        let cancel = ctx.cancellation_token().clone();
 
         let mut listener_fut =
-            match self.listener.bind(exchanger).await {
+            match get_dns_listener(self.listen.clone(), exchanger).await {
                 Ok(fut) => fut,
                 Err(e) => {
                     error!("failed to start DNS server: {}", e);
@@ -86,25 +81,16 @@ impl AsyncService for DnsRunner {
             };
 
         info!("DNS server started");
-        ctx.spawn_critical_with_token(
-            "dns_server",
-            cancellation_token,
-            async move {
-                tokio::select! {
-                    _ = &mut listener_fut => {},
-                    _ = child_cancel.cancelled() => {
-                        info!("DNS server is cancelled");
-                    }
+        ctx.spawn_critical("dns_server", async move {
+            tokio::select! {
+                _ = &mut listener_fut => {},
+                _ = cancel.cancelled() => {
+                    info!("DNS server is cancelled");
                 }
-                listener_fut.shutdown().await;
-            },
-        );
+            }
+            listener_fut.shutdown().await;
+        });
 
-        Ok(())
-    }
-
-    async fn stop(&self) -> Result<(), crate::Error> {
-        self.shutdown();
         Ok(())
     }
 }
@@ -120,7 +106,9 @@ mod tests {
     async fn enabled_resolver_without_listeners_does_not_spawn_server() {
         let ctx = ServiceContext::new(CancellationToken::new());
         let runner = DnsRunner::new(
-            true, PreparedDnsListener::default(), Arc::new(MockClashResolver::new()), None,
+            true,
+            DNSListenAddr::default(),
+            Arc::new(MockClashResolver::new()),
         );
         runner.start(&ctx).await.unwrap();
         assert_eq!(ctx.tracker().len(), 0);

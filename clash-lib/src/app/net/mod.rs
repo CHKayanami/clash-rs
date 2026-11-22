@@ -117,45 +117,51 @@ pub fn update_default_outbound_interface_if_changed(
     }
 }
 
-/// Network defaults belonging to one runtime generation. Resolving them does
-/// not mutate the running generation; apply only during the service switch.
-#[derive(Clone)]
-pub(crate) struct NetworkConfig {
+/// Resolve and apply process-wide network defaults for this runtime.
+pub(crate) fn apply_network_config(
+    explicit_iface: Option<&str>,
+    detect_interface: bool,
+    so_mark: Option<u32>,
+    tcp_keepalive: TcpKeepaliveConfig,
+) {
+    let explicit = explicit_iface.and_then(get_interface_by_name);
+    if explicit_iface.is_some() && explicit.is_none() {
+        warn!(
+            "configured explicit interface {:?} not found, falling back to auto-detected outbound interface",
+            explicit_iface
+        );
+    }
+    let is_explicit = explicit.is_some();
+    let interface = explicit
+        .or_else(|| {
+            (detect_interface || explicit_iface.is_some())
+                .then(get_outbound_interface)
+                .flatten()
+        })
+        .map(Arc::new);
+
+    let mut state = WRITE_MUTEX.lock().unwrap();
+    state.is_explicit = is_explicit;
+    DEFAULT_OUTBOUND_INTERFACE.store(interface.clone());
+    set_tun_somark(so_mark);
+    TCP_KEEPALIVE.store(Arc::new(tcp_keepalive));
+    drop(state);
+    trace!(
+        "default outbound interface: {:?}, tun somark: {:?}",
+        interface, so_mark
+    );
+}
+
+#[cfg(all(test, target_os = "macos"))]
+pub(crate) struct NetworkConfigGuard {
     tcp_keepalive: TcpKeepaliveConfig,
     interface: Option<Arc<OutboundInterface>>,
     is_explicit: bool,
     so_mark: Option<u32>,
 }
 
-impl NetworkConfig {
-    pub fn resolve(
-        explicit_iface: Option<&str>,
-        detect_interface: bool,
-        so_mark: Option<u32>,
-    ) -> Self {
-        let explicit = explicit_iface.and_then(get_interface_by_name);
-        if explicit_iface.is_some() && explicit.is_none() {
-            warn!(
-                "configured explicit interface {:?} not found, falling back to auto-detected outbound interface",
-                explicit_iface
-            );
-        }
-        let is_explicit = explicit.is_some();
-        let interface = explicit.or_else(|| {
-            (detect_interface || explicit_iface.is_some())
-                .then(get_outbound_interface).flatten()
-        }).map(Arc::new);
-        Self {
-            interface, is_explicit, so_mark,
-            tcp_keepalive: TcpKeepaliveConfig::default(),
-        }
-    }
-
-    pub fn with_tcp_keepalive(mut self, config: TcpKeepaliveConfig) -> Self {
-        self.tcp_keepalive = config;
-        self
-    }
-
+#[cfg(all(test, target_os = "macos"))]
+impl NetworkConfigGuard {
     pub fn capture() -> Self {
         let state = WRITE_MUTEX.lock().unwrap();
         Self {
@@ -165,18 +171,16 @@ impl NetworkConfig {
             so_mark: get_tun_somark(),
         }
     }
+}
 
-    pub fn apply(&self) {
+#[cfg(all(test, target_os = "macos"))]
+impl Drop for NetworkConfigGuard {
+    fn drop(&mut self) {
         let mut state = WRITE_MUTEX.lock().unwrap();
         state.is_explicit = self.is_explicit;
         DEFAULT_OUTBOUND_INTERFACE.store(self.interface.clone());
         set_tun_somark(self.so_mark);
         TCP_KEEPALIVE.store(Arc::new(self.tcp_keepalive));
-        drop(state);
-        trace!(
-            "default outbound interface: {:?}, tun somark: {:?}",
-            self.interface, self.so_mark
-        );
     }
 }
 

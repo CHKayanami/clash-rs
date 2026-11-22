@@ -54,27 +54,19 @@ where
 /// and prevent the system from becoming a deaf "zombie process".
 pub struct CriticalTaskGuard {
     name: Cow<'static, str>,
-    lifecycle_tokens: Vec<CancellationToken>,
+    lifecycle_token: CancellationToken,
     fatal_tx: tokio::sync::mpsc::Sender<crate::Error>,
 }
 
 impl CriticalTaskGuard {
     pub fn new(
         name: impl Into<Cow<'static, str>>,
-        token: CancellationToken,
-        fatal_tx: tokio::sync::mpsc::Sender<crate::Error>,
-    ) -> Self {
-        Self::new_with_tokens(name, vec![token], fatal_tx)
-    }
-
-    pub fn new_with_tokens(
-        name: impl Into<Cow<'static, str>>,
-        lifecycle_tokens: Vec<CancellationToken>,
+        lifecycle_token: CancellationToken,
         fatal_tx: tokio::sync::mpsc::Sender<crate::Error>,
     ) -> Self {
         Self {
             name: name.into(),
-            lifecycle_tokens,
+            lifecycle_token,
             fatal_tx,
         }
     }
@@ -82,11 +74,7 @@ impl CriticalTaskGuard {
 
 impl Drop for CriticalTaskGuard {
     fn drop(&mut self) {
-        if !self
-            .lifecycle_tokens
-            .iter()
-            .any(CancellationToken::is_cancelled)
-        {
+        if !self.lifecycle_token.is_cancelled() {
             let err = crate::Error::Operation(format!(
                 "critical background task '{}' exited unexpectedly",
                 self.name
@@ -154,10 +142,21 @@ impl ServiceContext {
         self.tracker.spawn(future)
     }
 
+    /// Spawns a critical task tied to the service context's cancellation token.
+    pub fn spawn_critical<F>(
+        &self,
+        name: impl Into<Cow<'static, str>>,
+        future: F,
+    ) -> tokio::task::JoinHandle<F::Output>
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        self.spawn_critical_with_token(name, self.cancellation_token.clone(), future)
+    }
+
     /// Spawns a critical task whose planned shutdown is controlled by
-    /// `lifecycle_token`. Services with their own stop token must use this
-    /// method so a normal service restart is not reported as a process-fatal
-    /// failure.
+    /// `lifecycle_token` (e.g. a per-listener stop token).
     pub fn spawn_critical_with_token<F>(
         &self,
         name: impl Into<Cow<'static, str>>,
@@ -168,24 +167,9 @@ impl ServiceContext {
         F: Future + Send + 'static,
         F::Output: Send + 'static,
     {
-        self.spawn_critical_with_tokens(name, vec![lifecycle_token], future)
-    }
-
-    /// Spawns a critical task that may stop normally when any registered
-    /// lifecycle token is cancelled.
-    pub fn spawn_critical_with_tokens<F>(
-        &self,
-        name: impl Into<Cow<'static, str>>,
-        lifecycle_tokens: Vec<CancellationToken>,
-        future: F,
-    ) -> tokio::task::JoinHandle<F::Output>
-    where
-        F: Future + Send + 'static,
-        F::Output: Send + 'static,
-    {
         let name = name.into();
         let guard = self.fatal_tx.as_ref().map(|tx| {
-            CriticalTaskGuard::new_with_tokens(name, lifecycle_tokens, tx.clone())
+            CriticalTaskGuard::new(name, lifecycle_token, tx.clone())
         });
 
         self.spawn(async move {
@@ -286,32 +270,6 @@ mod tests {
         assert!(
             fatal_rx.try_recv().is_err(),
             "planned service stop must not be fatal"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_critical_task_silent_when_any_lifecycle_is_cancelled() {
-        let service_token = CancellationToken::new();
-        let context_token = CancellationToken::new();
-        let (fatal_tx, mut fatal_rx) = mpsc::channel(1);
-        let ctx = ServiceContext::with_fatal_tx(context_token.clone(), fatal_tx);
-
-        let task_context_token = context_token.clone();
-        ctx.spawn_critical_with_tokens(
-            "test_multiple_lifecycles",
-            vec![service_token, context_token.clone()],
-            async move {
-                task_context_token.cancelled().await;
-            },
-        );
-
-        context_token.cancel();
-        ctx.tracker().close();
-        ctx.tracker().wait().await;
-
-        assert!(
-            fatal_rx.try_recv().is_err(),
-            "cancelling either lifecycle must be treated as a planned stop"
         );
     }
 }

@@ -83,7 +83,7 @@ pub type ThreadSafeOutboundManager = Arc<OutboundManager>;
 
 impl Drop for OutboundManager {
     fn drop(&mut self) {
-        // DNS and HTTP bootstrap clients share this generation's registry.
+        // DNS and HTTP bootstrap clients share the outbound registry.
         // Groups in it hold health checks which refer back to DNS. Release
         // the owned entries when the manager goes away to break that cycle.
         // Publish the empty registry before releasing the old snapshot, since

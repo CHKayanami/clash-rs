@@ -5,6 +5,12 @@ export interface Version {
   version: string;
   premium: boolean;
   meta: boolean;
+  instance_id: string;
+}
+
+export interface RestartResponse {
+  status: string;
+  instance_id: string;
 }
 
 export interface InboundEndpoint {
@@ -209,14 +215,11 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
 }
 
 // Version
-export const getVersion = () => request<Version>('/version');
+export const getVersion = (options?: { signal?: AbortSignal }) =>
+  request<Version>('/version', { signal: options?.signal, cache: 'no-store' });
 
 // Config
 export const getConfigs = () => request<ClashConfig>('/configs');
-export const updateConfigs = (config: Partial<ClashConfig>) =>
-  request<void>('/configs', { method: 'PUT', body: JSON.stringify(config) });
-export const reloadConfigs = (path: string) =>
-  request<void>('/configs', { method: 'PUT', body: JSON.stringify({ path }) });
 export const patchConfigs = (patch: PatchableConfig) =>
   request<void>('/configs', { method: 'PATCH', body: JSON.stringify(patch) });
 
@@ -326,7 +329,8 @@ export const deleteDnsCache = (upstream: string, pattern: string = '*') =>
 export const getMemory = () => request<MemoryData>('/memory');
 
 // Restart
-export const restart = () => request<void>('/restart', { method: 'POST' });
+export const restart = (options?: { signal?: AbortSignal }) =>
+  request<RestartResponse>('/restart', { method: 'POST', signal: options?.signal });
 
 // WebSocket URL helper
 export function getWsUrl(path: string): string {

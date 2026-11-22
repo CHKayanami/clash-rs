@@ -1,53 +1,81 @@
-#[cfg(unix)]
-use std::os::unix::process::CommandExt;
+use std::{sync::Arc, time::Duration};
 
-use axum::{Json, response::IntoResponse};
-use serde_json::Map;
+use axum::{Json, Router, extract::State, response::IntoResponse, routing::post};
+use http::StatusCode;
+use serde_json::{Map, json};
+use tokio::{
+    sync::{Mutex, oneshot},
+    time::sleep,
+};
+use tracing::info;
 
-pub async fn handle() -> impl IntoResponse {
-    match std::env::current_exe() {
-        Ok(exec) => {
+use crate::app::api::AppState;
+
+const RESTART_RESPONSE_GRACE: Duration = Duration::from_millis(150);
+
+/// Signals a graceful shutdown so the outer CLI process can `exec` a fresh
+/// instance with the current configuration.
+pub struct RestartController {
+    tx: Mutex<Option<oneshot::Sender<()>>>,
+}
+
+impl RestartController {
+    pub fn new(tx: oneshot::Sender<()>) -> Self {
+        Self {
+            tx: Mutex::new(Some(tx)),
+        }
+    }
+
+    async fn trigger(&self) -> Result<(), (StatusCode, &'static str)> {
+        let mut guard = self.tx.lock().await;
+        let Some(tx) = guard.take() else {
+            return Err((StatusCode::CONFLICT, "restart already in progress"));
+        };
+        info!("graceful process restart scheduled");
+        tokio::spawn(async move {
+            sleep(RESTART_RESPONSE_GRACE).await;
+            let _ = tx.send(());
+        });
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
+struct RestartState {
+    controller: Option<Arc<RestartController>>,
+    instance_id: String,
+}
+
+pub fn routes(
+    restart: Option<Arc<RestartController>>,
+    instance_id: String,
+) -> Router<Arc<AppState>> {
+    Router::new()
+        .route("/restart", post(handle))
+        .with_state(RestartState {
+            controller: restart,
+            instance_id,
+        })
+}
+
+async fn handle(State(state): State<RestartState>) -> impl IntoResponse {
+    let Some(restart) = state.controller else {
+        return (
+            StatusCode::NOT_IMPLEMENTED,
+            Json(json!({ "message": "restart is not supported in this runtime" })),
+        )
+            .into_response();
+    };
+
+    match restart.trigger().await {
+        Ok(()) => {
             let mut map = Map::new();
             map.insert("status".to_owned(), "ok".into());
-            tokio::spawn(async move {
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-
-                #[cfg(unix)]
-                {
-                    use tracing::info;
-
-                    let err = std::process::Command::new(exec)
-                        .args(std::env::args().skip(1))
-                        .envs(std::env::vars())
-                        .exec();
-                    info!("process restarted: {}", err);
-                }
-                #[cfg(windows)]
-                {
-                    use tracing::error;
-
-                    match std::process::Command::new(exec)
-                        .args(std::env::args().skip(1))
-                        .envs(std::env::vars())
-                        .stdin(std::process::Stdio::inherit())
-                        .stdout(std::process::Stdio::inherit())
-                        .stderr(std::process::Stdio::inherit())
-                        .spawn()
-                    {
-                        Ok(_) => {
-                            // exit the current process
-                            std::process::exit(0);
-                        }
-                        Err(e) => {
-                            error!("Failed to restart: {}", e);
-                        }
-                    }
-                }
-            });
+            map.insert("instance_id".to_owned(), state.instance_id.into());
             Json(map).into_response()
         }
-        Err(e) => {
-            (http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+        Err((status, message)) => {
+            (status, Json(json!({ "message": message }))).into_response()
         }
     }
 }

@@ -3,9 +3,9 @@ use crate::common::{
     wait_port_ready,
 };
 use bytes::{Buf, Bytes};
-use clash_lib::{Config, Options};
+use clash_lib::{Config, Options, RunExit};
 use http_body_util::BodyExt;
-use std::{fs, net::{TcpListener, UdpSocket}, path::PathBuf, time::Duration};
+use std::{path::PathBuf, time::Duration};
 
 mod common;
 
@@ -26,7 +26,7 @@ fn start_unique_client() -> (ClashInstance, u16) {
             cwd: Some(wd.to_string_lossy().to_string()),
             rt: None,
             log_file: None,
-            config_path: None,
+            enable_restart: false,
         },
         (port_base..port_base + CLIENT_PORT_BLOCK).collect(),
     )
@@ -76,7 +76,7 @@ async fn test_wildcard_cors_returns_any_origin_header() {
             cwd: Some(wd.to_string_lossy().to_string()),
             rt: None,
             log_file: None,
-            config_path: None,
+            enable_restart: false,
         },
         (port_base..port_base + CLIENT_PORT_BLOCK).collect(),
     )
@@ -104,320 +104,115 @@ async fn test_wildcard_cors_returns_any_origin_header() {
     );
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn test_config_reload_via_payload() {
-    let wd =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data/config/client");
-
-    // Allocate 8 ports: 7 for the initial instance + 1 for the reloaded controller
-    let port_base = alloc_ports(8);
-    let config_str = make_client_config_str(port_base);
-
-    // Start Clash instance with RAII guard - will auto-cleanup on drop
-    let _clash = ClashInstance::start(
-        Options {
-            config: Config::Str(config_str),
-            cwd: Some(wd.to_string_lossy().to_string()),
-            rt: None,
-            log_file: None,
-            config_path: None,
-        },
-        (port_base..port_base + CLIENT_PORT_BLOCK).collect(),
-    )
-    .expect("Failed to start clash");
-
-    // Initial config has allow-lan: true
-    assert!(
-        get_allow_lan(port_base).await,
-        "expected allow-lan=true before reload"
-    );
-
-    // Reload with a new payload that flips allow-lan to false
-    let new_payload = format!(
-        r#"
-socks-port: {}
-bind-address: 127.0.0.1
-allow-lan: false
-mode: direct
-log-level: info
-external-controller: :{}
-secret: clash-rs
-tun:
-  enable: false
-proxies:
-  - {{name: DIRECT_alias, type: direct}}
-  - {{name: REJECT_alias, type: reject}}
-"#,
-        port_base + 2,
-        port_base + 7
-    );
-    let body = serde_json::json!({ "payload": new_payload }).to_string();
-
-    let configs_url = format!("http://127.0.0.1:{}/configs", port_base);
-    let req = hyper::Request::builder()
-        .uri(&configs_url)
-        .header(hyper::header::AUTHORIZATION, "Bearer clash-rs")
-        .header(hyper::header::CONTENT_TYPE, "application/json")
-        .method(http::method::Method::PUT)
-        .body(body)
-        .expect("Failed to build request");
-
-    let res = send_http_request::<String>(configs_url.parse().unwrap(), req)
-        .await
-        .expect("Failed to send PUT /configs request");
-    assert_eq!(
-        res.status(),
-        http::StatusCode::NO_CONTENT,
-        "PUT /configs should return 204 No Content"
-    );
-
-    // Wait briefly for the reload to propagate
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
-    // allow-lan should now be false
-    assert!(
-        !get_allow_lan(port_base + 7).await,
-        "expected allow-lan=false after reload"
-    );
-}
-
-fn reload_config(api_port: u16, socks_port: u16) -> String {
-    format!(r#"bind-address: 127.0.0.1
+fn restart_test_config(api_port: u16, socks_port: u16, allow_lan: bool) -> String {
+    format!(
+        r#"bind-address: 127.0.0.1
 socks-port: {socks_port}
 external-controller: 127.0.0.1:{api_port}
 secret: clash-rs
 mode: direct
-allow-lan: false
+allow-lan: {allow_lan}
 tun:
   enable: false
-"#)
+"#
+    )
 }
 
-fn start_reload_client() -> (tempfile::TempDir, ClashInstance, u16, u16) {
-    let dir = tempfile::tempdir().unwrap();
-    let api_port = alloc_ports(2);
-    let socks_port = api_port + 1;
-    let instance = ClashInstance::start(
-        Options {
-            config: Config::Str(reload_config(api_port, socks_port)),
-            cwd: Some(dir.path().to_string_lossy().to_string()),
-            rt: None,
-            log_file: None,
-            config_path: None,
-        },
-        vec![api_port, socks_port],
-    ).unwrap();
-    wait_port_ready(socks_port).unwrap();
-    (dir, instance, api_port, socks_port)
-}
-
-fn occupy_tcp_port() -> (TcpListener, u16, String) {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let address = listener.local_addr().unwrap();
-    let error = TcpListener::bind(address).unwrap_err().to_string();
-    (listener, address.port(), error)
-}
-
-async fn send_reload(api_port: u16, payload: String) -> (http::StatusCode, String) {
+async fn send_put_configs(
+    api_port: u16,
+    body: serde_json::Value,
+) -> (http::StatusCode, String) {
     let url = format!("http://127.0.0.1:{api_port}/configs");
     let request = hyper::Request::builder()
         .uri(&url)
         .header(hyper::header::AUTHORIZATION, "Bearer clash-rs")
         .header(hyper::header::CONTENT_TYPE, "application/json")
         .method(http::method::Method::PUT)
-        .body(serde_json::json!({"payload": payload}).to_string())
+        .body(body.to_string())
         .unwrap();
     let response = send_http_request::<String>(url.parse().unwrap(), request)
-        .await.unwrap();
+        .await
+        .unwrap();
     let status = response.status();
-    let body = response.into_body().collect().await.unwrap().to_bytes();
-    (status, String::from_utf8(body.to_vec()).unwrap())
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    (status, String::from_utf8(bytes.to_vec()).unwrap())
+}
+
+async fn send_post_restart(api_port: u16) -> (http::StatusCode, String) {
+    let url = format!("http://127.0.0.1:{api_port}/restart");
+    let request = hyper::Request::builder()
+        .uri(&url)
+        .header(hyper::header::AUTHORIZATION, "Bearer clash-rs")
+        .method(http::method::Method::POST)
+        .body(http_body_util::Empty::<Bytes>::new())
+        .unwrap();
+    let response = send_http_request(url.parse().unwrap(), request)
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    (status, String::from_utf8(bytes.to_vec()).unwrap())
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn test_config_reload_single_protocol_tunnel() {
-    for network in ["tcp", "udp"] {
-        let dir = tempfile::tempdir().unwrap();
-        let api_port = alloc_ports(2);
-        let socks_port = api_port + 1;
-        // Occupy the disabled transport to verify it is never initialized.
-        let disabled_tcp = (network == "udp")
-            .then(|| TcpListener::bind("127.0.0.1:0").unwrap());
-        let disabled_udp = (network == "tcp")
-            .then(|| UdpSocket::bind("127.0.0.1:0").unwrap());
-        let address = if let Some(listener) = &disabled_tcp {
-            listener.local_addr().unwrap()
-        } else {
-            disabled_udp.as_ref().unwrap().local_addr().unwrap()
-        };
-        let payload = format!(r#"{}listeners:
-  - name: single-protocol-tunnel
-    type: tunnel
-    listen: 127.0.0.1
-    port: {}
-    network: [{network}]
-    target: 127.0.0.1:9
-"#, reload_config(api_port, socks_port), address.port());
-        let _clash = ClashInstance::start(
-            Options {
-                config: Config::Str(payload.clone()),
-                cwd: Some(dir.path().to_string_lossy().to_string()),
-                rt: None,
-                log_file: None,
-                config_path: None,
-            },
-            vec![api_port, socks_port],
-        ).unwrap();
-        for _ in 0..2 {
-            if network == "tcp" {
-                wait_port_ready(address.port()).unwrap();
-            } else {
-                assert!(UdpSocket::bind(address).is_err());
-            }
-            let (status, body) = send_reload(api_port, payload.clone()).await;
-            assert_eq!(status, http::StatusCode::NO_CONTENT, "{network}: {body}");
-        }
-    }
+async fn test_restart_disabled_and_put_configs_return_501() {
+    let dir = tempfile::tempdir().unwrap();
+    let api_port = alloc_ports(2);
+    let socks_port = api_port + 1;
+    let _clash = ClashInstance::start(
+        Options {
+            config: Config::Str(restart_test_config(api_port, socks_port, true)),
+            cwd: Some(dir.path().to_string_lossy().to_string()),
+            rt: None,
+            log_file: None,
+            enable_restart: false,
+        },
+        vec![api_port, socks_port],
+    )
+    .unwrap();
+
+    let (status, _) = send_post_restart(api_port).await;
+    assert_eq!(status, http::StatusCode::NOT_IMPLEMENTED);
+
+    let (status, _) = send_put_configs(api_port, serde_json::json!({"path": ""})).await;
+    assert_eq!(status, http::StatusCode::NOT_IMPLEMENTED);
+
+    assert!(get_allow_lan(api_port).await);
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn test_config_reload_repeatedly_reuses_cache() {
-    let (_dir, _clash, api_port, socks_port) = start_reload_client();
-    for store_selected in [false, true, false] {
-        let payload = format!(
-            "{}profile:\n  store-selected: {store_selected}\n",
-            reload_config(api_port, socks_port),
-        );
-        let (status, body) = send_reload(api_port, payload).await;
-        assert_eq!(status, http::StatusCode::NO_CONTENT, "{body}");
-        assert!(!get_allow_lan(api_port).await);
-        wait_port_ready(socks_port).unwrap();
-    }
-}
+async fn test_restart_endpoint_triggers_graceful_restart_and_put_configs_returns_501() {
+    let dir = tempfile::tempdir().unwrap();
+    let api_port = alloc_ports(2);
+    let socks_port = api_port + 1;
 
-#[tokio::test(flavor = "current_thread")]
-async fn test_config_reload_rolls_back_occupied_api_port() {
-    let (_dir, _clash, api_port, socks_port) = start_reload_client();
-    let (_occupied, occupied_port, expected_error) = occupy_tcp_port();
-    let new_socks_port = alloc_ports(1);
-    let payload = reload_config(occupied_port, new_socks_port);
-    let (status, body) = send_reload(api_port, payload).await;
-    assert_eq!(status, http::StatusCode::BAD_REQUEST, "{body}");
-    assert!(body.contains(&expected_error), "{body}");
-    assert!(!get_allow_lan(api_port).await);
+    let clash = ClashInstance::start(
+        Options {
+            config: Config::Str(restart_test_config(api_port, socks_port, false)),
+            cwd: Some(dir.path().to_string_lossy().to_string()),
+            rt: None,
+            log_file: None,
+            enable_restart: true,
+        },
+        vec![api_port, socks_port],
+    )
+    .unwrap();
     wait_port_ready(socks_port).unwrap();
-    // The new proxy listener started before API binding failed, and must close.
-    let _released = TcpListener::bind(("127.0.0.1", new_socks_port)).unwrap();
-    let (status, body) = send_reload(api_port, reload_config(api_port, socks_port)).await;
-    assert_eq!(status, http::StatusCode::NO_CONTENT, "{body}");
-}
 
-#[tokio::test(flavor = "current_thread")]
-async fn test_config_reload_rolls_back_occupied_inbound_port() {
-    let (_dir, _clash, api_port, socks_port) = start_reload_client();
-    let (_occupied, occupied_port, expected_error) = occupy_tcp_port();
-    let payload = reload_config(api_port, occupied_port);
-    let (status, body) = send_reload(api_port, payload).await;
-    assert_eq!(status, http::StatusCode::BAD_REQUEST, "{body}");
-    assert!(body.contains(&expected_error), "{body}");
-    assert!(!get_allow_lan(api_port).await);
-    wait_port_ready(socks_port).unwrap();
-    let (status, body) = send_reload(api_port, reload_config(api_port, socks_port)).await;
-    assert_eq!(status, http::StatusCode::NO_CONTENT, "{body}");
-}
+    // PUT /configs is unsupported even when process restart is enabled.
+    let (status, body) = send_put_configs(
+        api_port,
+        serde_json::json!({ "payload": restart_test_config(api_port, socks_port, true) }),
+    )
+    .await;
+    assert_eq!(status, http::StatusCode::NOT_IMPLEMENTED, "{body}");
 
-#[tokio::test(flavor = "current_thread")]
-async fn test_config_reload_rolls_back_partial_dns_startup() {
-    let (_dir, _clash, api_port, socks_port) = start_reload_client();
-    let (_occupied, occupied_port, expected_error) = occupy_tcp_port();
-    let dns_port = occupied_port;
-    let payload = format!(
-        "{}dns:\n  enable: true\n  listen:\n    udp: 127.0.0.1:{dns_port}\n    tcp: 127.0.0.1:{dns_port}\n  nameserver: [udp://127.0.0.1:9]\n",
-        reload_config(api_port, socks_port),
-    );
-    let (status, body) = send_reload(api_port, payload).await;
-    assert_eq!(status, http::StatusCode::BAD_REQUEST, "{body}");
-    assert!(body.contains(&expected_error), "{body}");
-    assert!(!get_allow_lan(api_port).await);
-    wait_port_ready(socks_port).unwrap();
-    // UDP binds before TCP; its socket must be released on TCP bind failure.
-    let _released = UdpSocket::bind(("127.0.0.1", dns_port)).unwrap();
-}
+    // POST /restart returns 200 and gracefully shuts down returning RunExit::Restart.
+    let (status, body) = send_post_restart(api_port).await;
+    assert_eq!(status, http::StatusCode::OK, "{body}");
 
-#[tokio::test(flavor = "current_thread")]
-async fn test_config_reload_rolls_back_occupied_shadowsocks_udp_port() {
-    let (_dir, _clash, api_port, socks_port) = start_reload_client();
-    let occupied = UdpSocket::bind("127.0.0.1:0").unwrap();
-    let address = occupied.local_addr().unwrap();
-    let expected_error = UdpSocket::bind(address).unwrap_err().to_string();
-    let payload = format!(r#"{}listeners:
-  - name: ss-local
-    type: shadowsocks
-    listen: 127.0.0.1
-    port: {}
-    cipher: aes-128-gcm
-    password: test-password
-    udp: true
-"#, reload_config(api_port, socks_port), address.port());
-    let (status, body) = send_reload(api_port, payload).await;
-    assert_eq!(status, http::StatusCode::BAD_REQUEST, "{body}");
-    assert!(body.contains(&expected_error), "{body}");
-    assert!(!get_allow_lan(api_port).await);
-    wait_port_ready(socks_port).unwrap();
-    // TCP initialized before UDP failed; its socket must also be released.
-    let _released = TcpListener::bind(address).unwrap();
-}
-
-#[tokio::test(flavor = "current_thread")]
-async fn test_config_reload_rebinds_provider_after_stopping_old_runtime() {
-    let (dir, _clash, api_port, socks_port) = start_reload_client();
-    let provider_port = alloc_ports(1);
-    let path = dir.path().join("inbounds.yaml");
-    fs::write(&path, format!(
-        "listeners:\n  - name: local\n    type: socks\n    listen: 127.0.0.1\n    port: {provider_port}\n",
-    )).unwrap();
-    let payload = format!(
-        "{}inbound-providers:\n  local:\n    type: file\n    path: {}\n    interval: 0\n",
-        reload_config(api_port, socks_port),
-        serde_json::to_string(path.to_str().unwrap()).unwrap(),
-    );
-    for _ in 0..2 {
-        let (status, body) = send_reload(api_port, payload.clone()).await;
-        assert_eq!(status, http::StatusCode::NO_CONTENT, "{body}");
-        wait_port_ready(provider_port).unwrap();
-    }
-}
-
-#[tokio::test(flavor = "current_thread")]
-async fn test_config_reload_cleans_up_partial_provider_startup() {
-    let (dir, _clash, api_port, socks_port) = start_reload_client();
-    let provider_port = alloc_ports(1);
-    let (_occupied, occupied_port, expected_error) = occupy_tcp_port();
-    let path = dir.path().join("inbounds.yaml");
-    fs::write(&path, format!(
-        r#"listeners:
-  - name: ready
-    type: socks
-    listen: 127.0.0.1
-    port: {provider_port}
-  - name: occupied
-    type: socks
-    listen: 127.0.0.1
-    port: {}
-"#,
-        occupied_port,
-    )).unwrap();
-    let payload = format!(
-        "{}inbound-providers:\n  local:\n    type: file\n    path: {}\n    interval: 0\n",
-        reload_config(api_port, socks_port),
-        serde_json::to_string(path.to_str().unwrap()).unwrap(),
-    );
-    let (status, body) = send_reload(api_port, payload).await;
-    assert_eq!(status, http::StatusCode::BAD_REQUEST, "{body}");
-    assert!(body.contains(&expected_error), "{body}");
-    assert!(!get_allow_lan(api_port).await);
-    wait_port_ready(socks_port).unwrap();
-    let _released = TcpListener::bind(("127.0.0.1", provider_port)).unwrap();
+    let exit = clash.wait_exit().expect("instance exited with error");
+    assert_eq!(exit, RunExit::Restart);
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -449,112 +244,6 @@ async fn test_get_set_allow_lan() {
     );
 
     // _clash will be dropped here, automatically cleaning up
-}
-
-#[tokio::test(flavor = "current_thread")]
-async fn test_config_reload_rejects_empty_or_directory_path_without_panicking() {
-    let (_clash, api_port) = start_unique_client();
-    let configs_url = format!("http://127.0.0.1:{}/configs", api_port);
-
-    let reload_req = hyper::Request::builder()
-        .uri(&configs_url)
-        .header(hyper::header::AUTHORIZATION, "Bearer clash-rs")
-        .header(hyper::header::CONTENT_TYPE, "application/json")
-        .method(http::method::Method::PUT)
-        .body("{\"path\":\"\"}".into())
-        .expect("Failed to build PUT /configs request");
-
-    let reload_res =
-        send_http_request::<String>(configs_url.parse().unwrap(), reload_req)
-            .await
-            .expect("Failed to send PUT /configs request");
-    assert_eq!(
-        reload_res.status(),
-        http::StatusCode::BAD_REQUEST,
-        "PUT /configs with empty path should be rejected"
-    );
-
-    let reload_dir_req = hyper::Request::builder()
-        .uri(&configs_url)
-        .header(hyper::header::AUTHORIZATION, "Bearer clash-rs")
-        .header(hyper::header::CONTENT_TYPE, "application/json")
-        .method(http::method::Method::PUT)
-        .body("{\"path\":\".\"}".into())
-        .expect("Failed to build PUT /configs request for directory path");
-
-    let reload_dir_res =
-        send_http_request::<String>(configs_url.parse().unwrap(), reload_dir_req)
-            .await
-            .expect("Failed to send PUT /configs request for directory path");
-    assert_eq!(
-        reload_dir_res.status(),
-        http::StatusCode::BAD_REQUEST,
-        "PUT /configs with directory path should be rejected"
-    );
-
-    // Ensure API is still alive after the rejected reload request.
-    let get_req = hyper::Request::builder()
-        .uri(&configs_url)
-        .header(hyper::header::AUTHORIZATION, "Bearer clash-rs")
-        .method(http::method::Method::GET)
-        .body(http_body_util::Empty::<Bytes>::new())
-        .expect("Failed to build GET /configs request");
-
-    let get_res = send_http_request(configs_url.parse().unwrap(), get_req)
-        .await
-        .expect("Failed to send GET /configs request");
-    assert_eq!(
-        get_res.status(),
-        http::StatusCode::OK,
-        "GET /configs should still succeed after invalid reload request"
-    );
-}
-
-#[tokio::test(flavor = "current_thread")]
-async fn test_config_reload_via_empty_path_uses_stored_config_path() {
-    let wd =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data/config/client");
-
-    let port_base = alloc_ports(CLIENT_PORT_BLOCK);
-    let config_str = make_client_config_str(port_base);
-
-    // Write config to a temp file so we can pass a real config_path.
-    let tmp = tempfile::NamedTempFile::new().expect("Failed to create temp file");
-    std::fs::write(tmp.path(), &config_str).expect("Failed to write config");
-    let config_file = tmp.path().to_string_lossy().to_string();
-
-    let _clash = ClashInstance::start(
-        Options {
-            config: Config::Str(config_str),
-            cwd: Some(wd.to_string_lossy().to_string()),
-            rt: None,
-            log_file: None,
-            config_path: Some(config_file),
-        },
-        (port_base..port_base + CLIENT_PORT_BLOCK).collect(),
-    )
-    .expect("Failed to start clash");
-
-    let configs_url = format!("http://127.0.0.1:{}/configs", port_base);
-
-    // PUT /configs with empty path should reload from the stored config_path
-    // and return 204 No Content (not 400).
-    let req = hyper::Request::builder()
-        .uri(&configs_url)
-        .header(hyper::header::AUTHORIZATION, "Bearer clash-rs")
-        .header(hyper::header::CONTENT_TYPE, "application/json")
-        .method(http::method::Method::PUT)
-        .body("{\"path\":\"\"}".into())
-        .expect("Failed to build PUT /configs request");
-
-    let res = send_http_request::<String>(configs_url.parse().unwrap(), req)
-        .await
-        .expect("Failed to send PUT /configs request");
-    assert_eq!(
-        res.status(),
-        http::StatusCode::NO_CONTENT,
-        "PUT /configs with empty path and a stored config_path should succeed"
-    );
 }
 
 #[cfg(feature = "shadowsocks")]
@@ -590,7 +279,7 @@ async fn test_connections_returns_proxy_chain_names() {
             cwd: Some(wd_server.to_string_lossy().to_string()),
             rt: None,
             log_file: None,
-            config_path: None,
+            enable_restart: false,
         },
         vec![server_base, server_base + 1],
     )
@@ -603,7 +292,7 @@ async fn test_connections_returns_proxy_chain_names() {
             cwd: Some(wd_client.to_string_lossy().to_string()),
             rt: None,
             log_file: None,
-            config_path: None,
+            enable_restart: false,
         },
         (client_base..client_base + CLIENT_PORT_BLOCK).collect(),
     )
@@ -826,23 +515,25 @@ async fn test_get_configs_lan_ips_when_allow_lan() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn test_get_configs_dns_listen_when_enabled() {
-    let (_clash, api_port) = start_unique_client();
+    let dir = tempfile::tempdir().unwrap();
+    let api_port = alloc_ports(3);
+    let mixed_port = api_port + 1;
+    let dns_port = api_port + 2;
 
-    // Reload with dns.enable: true so dns-listen is populated
-    let new_payload = format!(
+    let config_str = format!(
         r#"
-mixed-port: {}
+mixed-port: {mixed_port}
 allow-lan: true
 mode: direct
 log-level: info
-external-controller: :{}
+external-controller: :{api_port}
 secret: clash-rs
 dns:
   enable: true
   ipv6: false
   listen:
-    udp: 127.0.0.1:{}
-    tcp: 127.0.0.1:{}
+    udp: 127.0.0.1:{dns_port}
+    tcp: 127.0.0.1:{dns_port}
   default-nameserver:
     - 8.8.8.8
   nameserver:
@@ -851,30 +542,22 @@ tun:
   enable: false
 proxies:
   - {{name: DIRECT_alias, type: direct}}
-"#,
-        api_port + 3,
-        api_port,
-        api_port + 4,
-        api_port + 4,
+"#
     );
-    let body = serde_json::json!({ "payload": new_payload }).to_string();
-    let configs_url = format!("http://127.0.0.1:{}/configs", api_port);
-    let req = hyper::Request::builder()
-        .uri(&configs_url)
-        .header(hyper::header::AUTHORIZATION, "Bearer clash-rs")
-        .header(hyper::header::CONTENT_TYPE, "application/json")
-        .method(http::method::Method::PUT)
-        .body(body)
-        .expect("Failed to build request");
 
-    let res = send_http_request::<String>(configs_url.parse().unwrap(), req)
-        .await
-        .expect("Failed to send PUT /configs");
-    assert_eq!(res.status(), http::StatusCode::NO_CONTENT);
+    let _clash = ClashInstance::start(
+        Options {
+            config: Config::Str(config_str),
+            cwd: Some(dir.path().to_string_lossy().to_string()),
+            rt: None,
+            log_file: None,
+            enable_restart: false,
+        },
+        vec![api_port, mixed_port, dns_port],
+    )
+    .expect("Failed to start clash with DNS enabled");
 
-    // Wait briefly for the reload to propagate
-    tokio::time::sleep(Duration::from_millis(1000)).await;
-    wait_port_ready(api_port).expect("API port not ready after reload");
+    let configs_url = format!("http://127.0.0.1:{api_port}/configs");
     let req = hyper::Request::builder()
         .uri(&configs_url)
         .header(hyper::header::AUTHORIZATION, "Bearer clash-rs")
@@ -903,13 +586,13 @@ proxies:
         .get("udp")
         .and_then(|v| v.as_str())
         .expect("'dns-listen.udp' field missing");
-    assert_eq!(udp, format!("127.0.0.1:{}", api_port + 4));
+    assert_eq!(udp, format!("127.0.0.1:{dns_port}"));
 
     let tcp = dns_listen
         .get("tcp")
         .and_then(|v| v.as_str())
         .expect("'dns-listen.tcp' field missing");
-    assert_eq!(tcp, format!("127.0.0.1:{}", api_port + 4));
+    assert_eq!(tcp, format!("127.0.0.1:{dns_port}"));
 }
 
 async fn get_proxy_info(api_port: u16, proxy_name: &str) -> serde_json::Value {
@@ -1003,7 +686,7 @@ async fn test_user_stats_endpoint_empty_on_no_traffic() {
             cwd: Some(wd_server.to_string_lossy().to_string()),
             rt: None,
             log_file: None,
-            config_path: None,
+            enable_restart: false,
         },
         vec![server_base, server_base + 1],
     )
@@ -2172,7 +1855,7 @@ async fn test_group_delay_url_test() {
             cwd: Some(wd.to_string_lossy().to_string()),
             rt: None,
             log_file: None,
-            config_path: None,
+            enable_restart: false,
         },
         (api_port..api_port + CLIENT_PORT_BLOCK).collect(),
     )

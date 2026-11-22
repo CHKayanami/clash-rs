@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
+use super::RestartController;
 use crate::{
     GlobalState,
     app::{
@@ -14,9 +15,6 @@ use crate::{
 };
 
 /// Aggregated runtime context for API handlers and control plane services.
-///
-/// Encapsulates all dynamic components that can be updated during configuration reload,
-/// eliminating parameter explosion across the API and runner layers.
 #[derive(Clone)]
 pub struct RuntimeContext {
     pub inbound_manager: Arc<InboundManager>,
@@ -30,6 +28,7 @@ pub struct RuntimeContext {
     pub cwd: String,
     pub dns_listen_addr: DNSListenAddr,
     pub dns_enabled: bool,
+    pub restart: Option<Arc<RestartController>>,
 }
 
 impl RuntimeContext {
@@ -46,6 +45,7 @@ impl RuntimeContext {
         cwd: String,
         dns_listen_addr: DNSListenAddr,
         dns_enabled: bool,
+        restart: Option<Arc<RestartController>>,
     ) -> Self {
         Self {
             inbound_manager,
@@ -59,6 +59,7 @@ impl RuntimeContext {
             cwd,
             dns_listen_addr,
             dns_enabled,
+            restart,
         }
     }
 }

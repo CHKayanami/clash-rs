@@ -35,8 +35,8 @@ impl RouteAddressSets {
         let exclude = resolve(&cfg.route_exclude_address_set, "route-exclude-address-set", registry)?;
         let updates = Arc::new(watch::channel(0u64).0);
         for provider in include.iter().chain(&exclude) {
-            // Providers retain callbacks. A weak sender prevents old TUN
-            // generations and their provider snapshots from being retained.
+            // Providers retain callbacks. A weak sender prevents stopped TUN
+            // tasks and their provider snapshots from being retained.
             let weak = Arc::downgrade(&updates);
             provider.on_change(Arc::new(move || {
                 if let Some(updates) = weak.upgrade() {
