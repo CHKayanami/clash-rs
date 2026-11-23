@@ -7,15 +7,71 @@ use tracing::warn;
 
 use super::{DomainKey, RoutingAction};
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-enum OwnerKey {
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum EvictKey {
     Domain(DomainKey),
     DirectIp(IpAddr),
+}
+
+#[derive(Clone, Copy)]
+enum OwnerRef<'a> {
+    Domain(&'a str),
+    DirectIp(IpAddr),
+}
+
+enum EvictCandidate<'a> {
+    Domain(&'a DomainKey, &'a DomainOwner),
+    DirectIp(IpAddr, &'a DirectIpOwner),
+}
+
+impl EvictCandidate<'_> {
+    fn last_seen(&self) -> u64 {
+        match self {
+            Self::Domain(_, owner) => owner.last_seen,
+            Self::DirectIp(_, owner) => owner.last_seen,
+        }
+    }
+
+    fn to_evict_key(&self) -> EvictKey {
+        match self {
+            Self::Domain(domain, _) => EvictKey::Domain((*domain).clone()),
+            Self::DirectIp(ip, _) => EvictKey::DirectIp(*ip),
+        }
+    }
+
+    fn any_ip(&self, mut predicate: impl FnMut(IpAddr) -> bool) -> bool {
+        match self {
+            Self::Domain(_, owner) => owner
+                .v4_ips
+                .iter()
+                .chain(&owner.v6_ips)
+                .any(|&ip| predicate(ip)),
+            Self::DirectIp(ip, _) => predicate(*ip),
+        }
+    }
+
+    fn for_each_ip(&self, mut f: impl FnMut(IpAddr)) {
+        match self {
+            Self::Domain(_, owner) => {
+                for &ip in owner.v4_ips.iter().chain(&owner.v6_ips) {
+                    f(ip);
+                }
+            }
+            Self::DirectIp(ip, _) => f(*ip),
+        }
+    }
 }
 
 struct DomainOwner {
     v4_ips: Vec<IpAddr>,
     v6_ips: Vec<IpAddr>,
+    action: RoutingAction,
+    outbound: Option<Arc<str>>,
+    rule_offloadable: bool,
+    last_seen: u64,
+}
+
+struct DirectIpOwner {
     action: RoutingAction,
     outbound: Option<Arc<str>>,
     rule_offloadable: bool,
@@ -53,11 +109,11 @@ pub(super) struct OffloadDesiredState {
     max_owners: usize,
     max_direct_ip_owners: usize,
     sequence: u64,
-    owners: HashMap<OwnerKey, DomainOwner>,
+    domain_owners: HashMap<DomainKey, DomainOwner>,
+    direct_ip_owners: HashMap<IpAddr, DirectIpOwner>,
     ip_action_counts: HashMap<IpAddr, IpActionCounts>,
     tracked_v4: usize,
     tracked_v6: usize,
-    tracked_direct_ip_owners: usize,
     // Trigger proactive reclaim only when free capacity crosses below the threshold.
     reclaim_armed_v4: bool,
     reclaim_armed_v6: bool,
@@ -100,17 +156,21 @@ impl OffloadDesiredState {
             max_owners,
             max_direct_ip_owners,
             sequence: 0,
-            owners: HashMap::new(),
+            domain_owners: HashMap::new(),
+            direct_ip_owners: HashMap::new(),
             ip_action_counts: HashMap::new(),
             tracked_v4: 0,
             tracked_v6: 0,
-            tracked_direct_ip_owners: 0,
             reclaim_armed_v4: true,
             reclaim_armed_v6: true,
             desired: HashSet::new(),
             applied: HashSet::new(),
             dirty_ips: HashSet::new(),
         }
+    }
+
+    fn total_owners(&self) -> usize {
+        self.domain_owners.len() + self.direct_ip_owners.len()
     }
 
     pub(super) fn observe(
@@ -142,8 +202,7 @@ impl OffloadDesiredState {
         let has_v4 = !incoming_v4.is_empty();
         let has_v6 = !incoming_v6.is_empty();
 
-        let key = OwnerKey::Domain(obs.domain);
-        if let Some(owner) = self.owners.get_mut(&key) {
+        if let Some(owner) = self.domain_owners.get_mut(&obs.domain) {
             if owner.action == obs.action
                 && (!has_v4 || owner.v4_ips == incoming_v4)
                 && (!has_v6 || owner.v6_ips == incoming_v6)
@@ -165,7 +224,7 @@ impl OffloadDesiredState {
             rule_offloadable: obs.rule_offloadable,
             last_seen: self.sequence,
         };
-        self.update_domain_owner(key, owner, affected);
+        self.update_domain_owner(obs.domain, owner, affected);
     }
 
     fn observe_route_domain_one(
@@ -173,9 +232,8 @@ impl OffloadDesiredState {
         obs: RouteDomainObservation,
         affected: &mut HashSet<IpAddr>,
     ) {
-        let key = OwnerKey::Domain(obs.domain);
         let is_v4 = obs.ip.is_ipv4();
-        let ips = if let Some(owner) = self.owners.get_mut(&key) {
+        let ips = if let Some(owner) = self.domain_owners.get_mut(&obs.domain) {
             let list = if is_v4 { &owner.v4_ips } else { &owner.v6_ips };
             match list.binary_search(&obs.ip) {
                 Ok(_) if owner.action == obs.action => {
@@ -214,18 +272,18 @@ impl OffloadDesiredState {
             rule_offloadable: obs.rule_offloadable,
             last_seen: self.sequence,
         };
-        self.update_domain_owner(key, owner, affected);
+        self.update_domain_owner(obs.domain, owner, affected);
     }
 
     /// Empty incoming families retain their existing addresses.
     fn update_domain_owner(
         &mut self,
-        key: OwnerKey,
+        domain: DomainKey,
         mut owner: DomainOwner,
         affected: &mut HashSet<IpAddr>,
     ) {
-        let Some(mut previous) = self.owners.remove(&key) else {
-            self.insert_owner_checked(key, owner, None, affected);
+        let Some(mut previous) = self.domain_owners.remove(&domain) else {
+            self.insert_domain_owner_checked(domain, owner, None, affected);
             return;
         };
 
@@ -233,7 +291,7 @@ impl OffloadDesiredState {
         let keep_v6 = owner.v6_ips.is_empty();
         let action_changed = owner.action != previous.action;
         if action_changed {
-            self.change_owner_counts(&previous, false, affected);
+            self.change_domain_owner_counts(&previous, false, affected);
         } else {
             if !keep_v4 {
                 self.change_ip_list(&previous.v4_ips, &owner.v4_ips, owner.action, affected);
@@ -249,14 +307,14 @@ impl OffloadDesiredState {
             swap(&mut previous.v6_ips, &mut owner.v6_ips);
         }
         if action_changed {
-            self.change_owner_counts(&owner, true, affected);
+            self.change_domain_owner_counts(&owner, true, affected);
         }
 
-        self.owners.insert(key.clone(), owner);
-        if !self.enforce_capacity(&key, affected) {
+        self.domain_owners.insert(domain.clone(), owner);
+        if !self.enforce_capacity(OwnerRef::Domain(&domain), affected) {
             // Recover the unchanged families from the rejected owner before restoring.
             let mut rejected = self
-                .remove_owner_returning(&key, affected)
+                .remove_domain_owner_returning(&domain, affected)
                 .expect("capacity enforcement keeps the observed owner");
             if keep_v4 {
                 swap(&mut previous.v4_ips, &mut rejected.v4_ips);
@@ -264,7 +322,7 @@ impl OffloadDesiredState {
             if keep_v6 {
                 swap(&mut previous.v6_ips, &mut rejected.v6_ips);
             }
-            self.insert_owner(key, previous, affected);
+            self.insert_domain_owner(domain, previous, affected);
         }
     }
 
@@ -310,8 +368,7 @@ impl OffloadDesiredState {
         obs: RouteIpObservation,
         affected: &mut HashSet<IpAddr>,
     ) {
-        let key = OwnerKey::DirectIp(obs.ip);
-        if let Some(existing) = self.owners.get_mut(&key)
+        if let Some(existing) = self.direct_ip_owners.get_mut(&obs.ip)
             && existing.action == obs.action
         {
             self.sequence = self.sequence.wrapping_add(1);
@@ -321,52 +378,75 @@ impl OffloadDesiredState {
             return;
         }
 
-        let previous = self.remove_owner_returning(&key, affected);
+        let previous = self.remove_direct_ip_owner_returning(obs.ip, affected);
         // A proxy observation only vetoes an IP another owner still tracks.
         if obs.action == RoutingAction::Proxy && !self.ip_action_counts.contains_key(&obs.ip) {
             return;
         }
         self.sequence = self.sequence.wrapping_add(1);
-        let owner = build_single_ip_owner(
-            obs.ip,
-            obs.action,
-            Some(obs.outbound),
-            obs.rule_offloadable,
-            self.sequence,
-        );
-        self.insert_owner_checked(key, owner, previous, affected);
+        let owner = DirectIpOwner {
+            action: obs.action,
+            outbound: Some(obs.outbound),
+            rule_offloadable: obs.rule_offloadable,
+            last_seen: self.sequence,
+        };
+        self.insert_direct_ip_owner_checked(obs.ip, owner, previous, affected);
     }
 
-    fn insert_owner_checked(
+    fn insert_domain_owner_checked(
         &mut self,
-        key: OwnerKey,
+        domain: DomainKey,
         owner: DomainOwner,
         previous: Option<DomainOwner>,
         affected: &mut HashSet<IpAddr>,
     ) {
-        self.insert_owner(key.clone(), owner, affected);
-        if !self.enforce_capacity(&key, affected) {
-            self.remove_owner(&key, affected);
+        self.insert_domain_owner(domain.clone(), owner, affected);
+        if !self.enforce_capacity(OwnerRef::Domain(&domain), affected) {
+            self.remove_domain_owner(&domain, affected);
             if let Some(old) = previous {
-                self.insert_owner(key, old, affected);
+                self.insert_domain_owner(domain, old, affected);
             }
         }
     }
 
-    fn insert_owner(
+    fn insert_domain_owner(
         &mut self,
-        key: OwnerKey,
+        domain: DomainKey,
         owner: DomainOwner,
         affected: &mut HashSet<IpAddr>,
     ) {
-        self.change_owner_counts(&owner, true, affected);
-        if matches!(key, OwnerKey::DirectIp(_)) {
-            self.tracked_direct_ip_owners += 1;
-        }
-        self.owners.insert(key, owner);
+        self.change_domain_owner_counts(&owner, true, affected);
+        self.domain_owners.insert(domain, owner);
     }
 
-    fn change_owner_counts(
+    fn insert_direct_ip_owner_checked(
+        &mut self,
+        ip: IpAddr,
+        owner: DirectIpOwner,
+        previous: Option<DirectIpOwner>,
+        affected: &mut HashSet<IpAddr>,
+    ) {
+        self.insert_direct_ip_owner(ip, owner, affected);
+        if !self.enforce_capacity(OwnerRef::DirectIp(ip), affected) {
+            self.remove_direct_ip_owner(ip, affected);
+            if let Some(old) = previous {
+                self.insert_direct_ip_owner(ip, old, affected);
+            }
+        }
+    }
+
+    fn insert_direct_ip_owner(
+        &mut self,
+        ip: IpAddr,
+        owner: DirectIpOwner,
+        affected: &mut HashSet<IpAddr>,
+    ) {
+        self.change_count(ip, owner.action, true);
+        affected.insert(ip);
+        self.direct_ip_owners.insert(ip, owner);
+    }
+
+    fn change_domain_owner_counts(
         &mut self,
         owner: &DomainOwner,
         add: bool,
@@ -378,26 +458,48 @@ impl OffloadDesiredState {
         }
     }
 
-    fn remove_owner_returning(
+    fn remove_domain_owner_returning(
         &mut self,
-        key: &OwnerKey,
+        domain: &DomainKey,
         affected: &mut HashSet<IpAddr>,
     ) -> Option<DomainOwner> {
-        let owner = self.owners.remove(key)?;
-        if matches!(key, OwnerKey::DirectIp(_)) {
-            self.tracked_direct_ip_owners =
-                self.tracked_direct_ip_owners.saturating_sub(1);
-        }
-        self.change_owner_counts(&owner, false, affected);
+        let owner = self.domain_owners.remove(domain)?;
+        self.change_domain_owner_counts(&owner, false, affected);
         Some(owner)
+    }
+
+    fn remove_domain_owner(&mut self, domain: &DomainKey, affected: &mut HashSet<IpAddr>) {
+        let _ = self.remove_domain_owner_returning(domain, affected);
+    }
+
+    fn remove_direct_ip_owner_returning(
+        &mut self,
+        ip: IpAddr,
+        affected: &mut HashSet<IpAddr>,
+    ) -> Option<DirectIpOwner> {
+        let owner = self.direct_ip_owners.remove(&ip)?;
+        self.change_count(ip, owner.action, false);
+        affected.insert(ip);
+        Some(owner)
+    }
+
+    fn remove_direct_ip_owner(&mut self, ip: IpAddr, affected: &mut HashSet<IpAddr>) {
+        let _ = self.remove_direct_ip_owner_returning(ip, affected);
+    }
+
+    fn remove_evict_key(&mut self, key: &EvictKey, affected: &mut HashSet<IpAddr>) {
+        match key {
+            EvictKey::Domain(domain) => self.remove_domain_owner(domain, affected),
+            EvictKey::DirectIp(ip) => self.remove_direct_ip_owner(*ip, affected),
+        }
     }
 
     pub(super) fn reconcile_outbounds(
         &mut self,
         outbound_actions: &HashMap<Arc<str>, RoutingAction>,
     ) {
-        let mut updates = Vec::new();
-        for (key, owner) in &self.owners {
+        let mut domain_updates = Vec::new();
+        for (domain, owner) in &self.domain_owners {
             if !owner.rule_offloadable {
                 continue;
             }
@@ -408,52 +510,73 @@ impl OffloadDesiredState {
                 continue;
             };
             if new_action != owner.action {
-                updates.push((key.clone(), new_action));
+                domain_updates.push((domain.clone(), new_action));
             }
         }
-        if updates.is_empty() {
+
+        let mut ip_updates = Vec::new();
+        for (&ip, owner) in &self.direct_ip_owners {
+            if !owner.rule_offloadable {
+                continue;
+            }
+            let Some(outbound) = &owner.outbound else {
+                continue;
+            };
+            let Some(&new_action) = outbound_actions.get(outbound) else {
+                continue;
+            };
+            if new_action != owner.action {
+                ip_updates.push((ip, new_action));
+            }
+        }
+
+        if domain_updates.is_empty() && ip_updates.is_empty() {
             return;
         }
 
         let mut affected = HashSet::new();
-        for (key, new_action) in updates {
-            match (&key, new_action) {
-                (OwnerKey::DirectIp(ip), RoutingAction::Proxy) => {
-                    let ip = *ip;
-                    let old = self.remove_owner_returning(&key, &mut affected);
-                    if self.ip_action_counts.contains_key(&ip)
-                        && let Some(old) = old
-                    {
-                        self.sequence = self.sequence.wrapping_add(1);
-                        let proxy_owner = build_single_ip_owner(
-                            ip,
-                            RoutingAction::Proxy,
-                            old.outbound,
-                            old.rule_offloadable,
-                            self.sequence,
-                        );
-                        self.insert_owner_checked(
-                            key,
-                            proxy_owner,
-                            None,
-                            &mut affected,
-                        );
-                    }
+        for (domain, new_action) in domain_updates {
+            if let Some(mut owner) = self.domain_owners.remove(&domain) {
+                let old_action = owner.action;
+                for &ip in owner.v4_ips.iter().chain(&owner.v6_ips) {
+                    self.change_count(ip, old_action, false);
+                    self.change_count(ip, new_action, true);
+                    affected.insert(ip);
                 }
-                _ => {
-                    if let Some(mut owner) = self.owners.remove(&key) {
-                        let old_action = owner.action;
-                        for ip in owner.v4_ips.iter().chain(&owner.v6_ips) {
-                            self.change_count(*ip, old_action, false);
-                            self.change_count(*ip, new_action, true);
-                            affected.insert(*ip);
-                        }
-                        owner.action = new_action;
-                        self.owners.insert(key, owner);
-                    }
-                }
+                owner.action = new_action;
+                self.domain_owners.insert(domain, owner);
             }
         }
+
+        for (ip, new_action) in ip_updates {
+            if new_action == RoutingAction::Proxy {
+                let old = self.remove_direct_ip_owner_returning(ip, &mut affected);
+                if self.ip_action_counts.contains_key(&ip)
+                    && let Some(old) = old
+                {
+                    self.sequence = self.sequence.wrapping_add(1);
+                    let proxy_owner = DirectIpOwner {
+                        action: RoutingAction::Proxy,
+                        outbound: old.outbound,
+                        rule_offloadable: old.rule_offloadable,
+                        last_seen: self.sequence,
+                    };
+                    self.insert_direct_ip_owner_checked(
+                        ip,
+                        proxy_owner,
+                        None,
+                        &mut affected,
+                    );
+                }
+            } else if let Some(owner) = self.direct_ip_owners.get_mut(&ip) {
+                let old_action = owner.action;
+                owner.action = new_action;
+                self.change_count(ip, old_action, false);
+                self.change_count(ip, new_action, true);
+                affected.insert(ip);
+            }
+        }
+
         self.recompute_ips(affected);
     }
 
@@ -520,33 +643,33 @@ impl OffloadDesiredState {
         }
     }
 
-    fn remove_owner(&mut self, key: &OwnerKey, affected: &mut HashSet<IpAddr>) {
-        let _ = self.remove_owner_returning(key, affected);
-    }
-
     /// Plan shared-IP evictions before applying them. An IP only frees capacity
     /// when its last owner is removed. The caller rolls back a rejected owner.
     fn enforce_capacity(
         &mut self,
-        observed: &OwnerKey,
+        observed: OwnerRef<'_>,
         affected: &mut HashSet<IpAddr>,
     ) -> bool {
-        if matches!(observed, OwnerKey::DirectIp(_)) && self.max_direct_ip_owners == 0 {
+        if matches!(observed, OwnerRef::DirectIp(_)) && self.max_direct_ip_owners == 0 {
             return false;
         }
 
         let excess_direct_ip = self
-            .tracked_direct_ip_owners
+            .direct_ip_owners
+            .len()
             .saturating_sub(self.max_direct_ip_owners);
         if excess_direct_ip > 0 {
             let target_direct_ip =
                 excess_direct_ip.max(eviction_batch(self.max_direct_ip_owners));
+            let observed_ip = match observed {
+                OwnerRef::DirectIp(ip) => Some(ip),
+                OwnerRef::Domain(_) => None,
+            };
             let mut direct_candidates: Vec<_> = self
-                .owners
+                .direct_ip_owners
                 .iter()
-                .filter_map(|(key, owner)| match key {
-                    OwnerKey::DirectIp(ip) if key != observed => Some((owner.last_seen, *ip)),
-                    _ => None,
+                .filter_map(|(&ip, owner)| {
+                    (observed_ip != Some(ip)).then_some((owner.last_seen, ip))
                 })
                 .collect();
             let evict_count = target_direct_ip.min(direct_candidates.len());
@@ -554,9 +677,9 @@ impl OffloadDesiredState {
                 direct_candidates.select_nth_unstable_by_key(evict_count, |(seen, _)| *seen);
             }
             for (_, ip) in direct_candidates.into_iter().take(evict_count) {
-                self.remove_owner(&OwnerKey::DirectIp(ip), affected);
+                self.remove_direct_ip_owner(ip, affected);
             }
-            if self.tracked_direct_ip_owners > self.max_direct_ip_owners {
+            if self.direct_ip_owners.len() > self.max_direct_ip_owners {
                 return false;
             }
         }
@@ -566,21 +689,29 @@ impl OffloadDesiredState {
                 && v4 <= self.max_v4_ips
                 && v6 <= self.max_v6_ips
         };
-        if fits(self.owners.len(), self.tracked_v4, self.tracked_v6) {
+        if fits(self.total_owners(), self.tracked_v4, self.tracked_v6) {
             return true;
         }
 
-        let Some(new_owner) = self.owners.get(observed) else {
-            return false;
+        let (obs_v4, obs_v6) = match observed {
+            OwnerRef::Domain(domain) => {
+                let Some(owner) = self.domain_owners.get(domain) else {
+                    return false;
+                };
+                (owner.v4_ips.len(), owner.v6_ips.len())
+            }
+            OwnerRef::DirectIp(ip) => {
+                if !self.direct_ip_owners.contains_key(&ip) {
+                    return false;
+                }
+                if ip.is_ipv4() { (1, 0) } else { (0, 1) }
+            }
         };
-        if self.max_owners == 0
-            || new_owner.v4_ips.len() > self.max_v4_ips
-            || new_owner.v6_ips.len() > self.max_v6_ips
-        {
+        if self.max_owners == 0 || obs_v4 > self.max_v4_ips || obs_v6 > self.max_v6_ips {
             return false;
         }
 
-        let excess_owners = self.owners.len().saturating_sub(self.max_owners);
+        let excess_owners = self.total_owners().saturating_sub(self.max_owners);
         let target_owners = if excess_owners > 0 {
             excess_owners.max(eviction_batch(self.max_owners))
         } else {
@@ -590,10 +721,22 @@ impl OffloadDesiredState {
         let excess_v6 = self.tracked_v6.saturating_sub(self.max_v6_ips);
         if excess_v4 == 0 && excess_v6 == 0 {
             let mut candidates: Vec<_> = self
-                .owners
+                .domain_owners
                 .iter()
-                .filter(|(key, _)| *key != observed)
-                .map(|(key, owner)| (owner.last_seen, key))
+                .filter(|(domain, _)| {
+                    !matches!(observed, OwnerRef::Domain(obs) if obs == domain.as_ref())
+                })
+                .map(|(domain, owner)| (owner.last_seen, EvictCandidate::Domain(domain, owner)))
+                .chain(
+                    self.direct_ip_owners
+                        .iter()
+                        .filter(|(ip, _)| {
+                            !matches!(observed, OwnerRef::DirectIp(obs) if obs == **ip)
+                        })
+                        .map(|(&ip, owner)| {
+                            (owner.last_seen, EvictCandidate::DirectIp(ip, owner))
+                        }),
+                )
                 .collect();
             if candidates.len() < target_owners {
                 return false;
@@ -602,10 +745,10 @@ impl OffloadDesiredState {
                 .select_nth_unstable_by_key(target_owners - 1, |(seen, _)| *seen);
             let evictions: Vec<_> = candidates[..target_owners]
                 .iter()
-                .map(|(_, key)| (*key).clone())
+                .map(|(_, candidate)| candidate.to_evict_key())
                 .collect();
             for key in evictions {
-                self.remove_owner(&key, affected);
+                self.remove_evict_key(&key, affected);
             }
             return true;
         }
@@ -627,33 +770,42 @@ impl OffloadDesiredState {
             return false;
         };
         for key in evictions {
-            self.remove_owner(&key, affected);
+            self.remove_evict_key(&key, affected);
         }
         true
     }
 
     fn plan_evictions(
         &self,
-        protected: Option<&OwnerKey>,
+        protected: Option<OwnerRef<'_>>,
         target_owners: usize,
         target_v4: usize,
         target_v6: usize,
-    ) -> Option<Vec<OwnerKey>> {
+    ) -> Option<Vec<EvictKey>> {
         let fits = |owners: usize, v4: usize, v6: usize| {
             owners <= self.max_owners
                 && v4 <= self.max_v4_ips
                 && v6 <= self.max_v6_ips
         };
         let mut candidates: Vec<_> = self
-            .owners
+            .domain_owners
             .iter()
-            .filter(|(key, _)| {
-                protected.is_none_or(|protected| *key != protected)
+            .filter(|(domain, _)| {
+                !matches!(protected, Some(OwnerRef::Domain(prot)) if prot == domain.as_ref())
             })
+            .map(|(domain, owner)| EvictCandidate::Domain(domain, owner))
+            .chain(
+                self.direct_ip_owners
+                    .iter()
+                    .filter(|(ip, _)| {
+                        !matches!(protected, Some(OwnerRef::DirectIp(prot)) if prot == **ip)
+                    })
+                    .map(|(&ip, owner)| EvictCandidate::DirectIp(ip, owner)),
+            )
             .collect();
-        candidates.sort_unstable_by_key(|(_, owner)| owner.last_seen);
+        candidates.sort_unstable_by_key(EvictCandidate::last_seen);
 
-        let mut remaining_owners = self.owners.len();
+        let mut remaining_owners = self.total_owners();
         let mut remaining_v4 = self.tracked_v4;
         let mut remaining_v6 = self.tracked_v6;
         let mut remaining_counts = HashMap::<IpAddr, usize>::new();
@@ -661,7 +813,7 @@ impl OffloadDesiredState {
         loop {
             let mut deferred = Vec::new();
             let mut progressed = false;
-            for (key, owner) in candidates.drain(..) {
+            for candidate in candidates.drain(..) {
                 let need_owner = evictions.len() < target_owners;
                 let need_v4 =
                     self.tracked_v4.saturating_sub(remaining_v4) < target_v4;
@@ -675,12 +827,12 @@ impl OffloadDesiredState {
                     break;
                 }
                 let frees_needed_ip = !need_owner
-                    && owner.v4_ips.iter().chain(&owner.v6_ips).any(|ip| {
+                    && candidate.any_ip(|ip| {
                         ((ip.is_ipv4() && need_v4) || (ip.is_ipv6() && need_v6))
-                            && remaining_counts.get(ip).copied().unwrap_or_else(
+                            && remaining_counts.get(&ip).copied().unwrap_or_else(
                                 || {
                                     self.ip_action_counts
-                                        .get(ip)
+                                        .get(&ip)
                                         .map(|counts| {
                                             usize::from(counts.direct)
                                                 + usize::from(counts.proxy)
@@ -693,14 +845,14 @@ impl OffloadDesiredState {
                     && !need_owner
                     && remaining_owners <= self.max_owners
                 {
-                    deferred.push((key, owner));
+                    deferred.push(candidate);
                     continue;
                 }
-                for ip in owner.v4_ips.iter().chain(&owner.v6_ips) {
+                candidate.for_each_ip(|ip| {
                     let remaining =
-                        remaining_counts.entry(*ip).or_insert_with(|| {
+                        remaining_counts.entry(ip).or_insert_with(|| {
                             self.ip_action_counts
-                                .get(ip)
+                                .get(&ip)
                                 .map(|counts| {
                                     usize::from(counts.direct)
                                         + usize::from(counts.proxy)
@@ -717,9 +869,9 @@ impl OffloadDesiredState {
                             }
                         }
                     }
-                }
+                });
                 remaining_owners = remaining_owners.saturating_sub(1);
-                evictions.push(key.clone());
+                evictions.push(candidate.to_evict_key());
                 progressed = true;
             }
             if !progressed {
@@ -764,19 +916,30 @@ impl OffloadDesiredState {
         }
 
         // Keep the most recently observed owner so cleanup cannot undo its fresh update.
-        let protected = self
-            .owners
+        let latest_domain = self
+            .domain_owners
             .iter()
             .max_by_key(|(_, owner)| owner.last_seen)
-            .map(|(key, _)| key.clone());
+            .map(|(domain, owner)| (owner.last_seen, OwnerRef::Domain(domain.as_ref())));
+        let latest_ip = self
+            .direct_ip_owners
+            .iter()
+            .max_by_key(|(_, owner)| owner.last_seen)
+            .map(|(&ip, owner)| (owner.last_seen, OwnerRef::DirectIp(ip)));
+        let protected = match (latest_domain, latest_ip) {
+            (Some(d), Some(i)) => Some(if d.0 >= i.0 { d.1 } else { i.1 }),
+            (Some(d), None) => Some(d.1),
+            (None, Some(i)) => Some(i.1),
+            (None, None) => None,
+        };
         let Some(evictions) =
-            self.plan_evictions(protected.as_ref(), 0, target_v4, target_v6)
+            self.plan_evictions(protected, 0, target_v4, target_v6)
         else {
             return;
         };
         let mut affected = HashSet::new();
         for key in evictions {
-            self.remove_owner(&key, &mut affected);
+            self.remove_evict_key(&key, &mut affected);
         }
         self.recompute_ips(affected);
         if self.max_v4_ips.saturating_sub(self.tracked_v4) >= batch_v4 {
@@ -802,28 +965,6 @@ impl OffloadDesiredState {
                 self.dirty_ips.insert(ip);
             }
         }
-    }
-}
-
-fn build_single_ip_owner(
-    ip: IpAddr,
-    action: RoutingAction,
-    outbound: Option<Arc<str>>,
-    rule_offloadable: bool,
-    last_seen: u64,
-) -> DomainOwner {
-    let (v4_ips, v6_ips) = if ip.is_ipv4() {
-        (vec![ip], Vec::new())
-    } else {
-        (Vec::new(), vec![ip])
-    };
-    DomainOwner {
-        v4_ips,
-        v6_ips,
-        action,
-        outbound,
-        rule_offloadable,
-        last_seen,
     }
 }
 
@@ -899,8 +1040,8 @@ mod tests {
         }
     }
 
-    fn domain_key(domain: &str) -> OwnerKey {
-        OwnerKey::Domain(domain.into())
+    fn domain_key(domain: &str) -> DomainKey {
+        domain.into()
     }
 
     fn observe(
@@ -946,13 +1087,13 @@ mod tests {
         assert_eq!(state.tracked_v4, 2);
         assert_eq!(state.ip_action_counts.get(&a).unwrap().direct, 1);
         state.dirty_ips.clear();
-        let last_seen = state.owners.get(&domain_key("a.com")).unwrap().last_seen;
+        let last_seen = state.domain_owners.get(&domain_key("a.com")).unwrap().last_seen;
 
         observe(&mut state, "a.com", &[a, b], RoutingAction::Direct);
         assert!(state.dirty_ips.is_empty());
         assert_eq!(state.tracked_v4, 2);
         assert_eq!(state.ip_action_counts.get(&a).unwrap().direct, 1);
-        assert!(state.owners.get(&domain_key("a.com")).unwrap().last_seen > last_seen);
+        assert!(state.domain_owners.get(&domain_key("a.com")).unwrap().last_seen > last_seen);
     }
 
     #[test]
@@ -1022,9 +1163,9 @@ mod tests {
         state.dirty_ips.clear();
 
         observe(&mut state, "c.com", &[new_unique], RoutingAction::Direct);
-        assert!(state.owners.contains_key(&domain_key("a.com")));
-        assert!(!state.owners.contains_key(&domain_key("b.com")));
-        assert!(state.owners.contains_key(&domain_key("c.com")));
+        assert!(state.domain_owners.contains_key(&domain_key("a.com")));
+        assert!(!state.domain_owners.contains_key(&domain_key("b.com")));
+        assert!(state.domain_owners.contains_key(&domain_key("c.com")));
         assert!(state.desired.contains(&shared));
         assert!(!state.desired.contains(&old_unique));
         assert!(state.desired.contains(&new_unique));
@@ -1042,9 +1183,9 @@ mod tests {
         state.dirty_ips.clear();
 
         observe(&mut state, "c.com", &[new_ip], RoutingAction::Direct);
-        assert!(state.owners.contains_key(&domain_key("a.com")));
-        assert!(state.owners.contains_key(&domain_key("b.com")));
-        assert!(!state.owners.contains_key(&domain_key("c.com")));
+        assert!(state.domain_owners.contains_key(&domain_key("a.com")));
+        assert!(state.domain_owners.contains_key(&domain_key("b.com")));
+        assert!(!state.domain_owners.contains_key(&domain_key("c.com")));
         assert_eq!(state.desired, HashSet::from([shared]));
         assert!(state.dirty_ips.is_empty());
         assert_eq!(state.tracked_v4, 1);
@@ -1093,7 +1234,7 @@ mod tests {
 
         assert_eq!(affected, HashSet::from([shared, added]));
         assert_eq!(state.ip_action_counts[&shared].direct, 1);
-        let owner = &state.owners[&domain_key("a.com")];
+        let owner = &state.domain_owners[&domain_key("a.com")];
         assert_eq!(owner.v4_ips, [retained, added]);
         assert_eq!(owner.v6_ips, [v6]);
         state.recompute_ips(affected);
@@ -1117,10 +1258,10 @@ mod tests {
             RoutingAction::Direct,
         );
         assert_eq!(state.desired, HashSet::from([shared, v6]));
-        assert!(state.owners.contains_key(&domain_key("a.com")));
-        assert!(state.owners.contains_key(&domain_key("b.com")));
-        assert!(!state.owners.get(&domain_key("b.com")).unwrap().v4_ips.contains(&new_ip));
-        assert_eq!(state.owners[&domain_key("b.com")].v6_ips, [v6]);
+        assert!(state.domain_owners.contains_key(&domain_key("a.com")));
+        assert!(state.domain_owners.contains_key(&domain_key("b.com")));
+        assert!(!state.domain_owners.get(&domain_key("b.com")).unwrap().v4_ips.contains(&new_ip));
+        assert_eq!(state.domain_owners[&domain_key("b.com")].v6_ips, [v6]);
         assert_eq!(state.ip_action_counts[&shared].direct, 2);
         assert_eq!(state.ip_action_counts[&v6].direct, 1);
         assert_eq!(state.tracked_v4, 1);
@@ -1140,8 +1281,8 @@ mod tests {
         state.dirty_ips.clear();
 
         observe(&mut state, "large.com", &new, RoutingAction::Direct);
-        assert_eq!(state.owners.len(), 1);
-        assert!(state.owners.contains_key(&domain_key("large.com")));
+        assert_eq!(state.total_owners(), 1);
+        assert!(state.domain_owners.contains_key(&domain_key("large.com")));
         assert_eq!(state.desired, HashSet::from(new));
         assert_eq!(state.tracked_v4, 3);
         assert_eq!(state.dirty_ips.len(), 6);
@@ -1157,8 +1298,8 @@ mod tests {
         state.dirty_ips.clear();
 
         observe(&mut state, "large.com", &new, RoutingAction::Direct);
-        assert_eq!(state.owners.len(), 1);
-        assert!(state.owners.contains_key(&domain_key("old.com")));
+        assert_eq!(state.total_owners(), 1);
+        assert!(state.domain_owners.contains_key(&domain_key("old.com")));
         assert_eq!(state.desired, HashSet::from([old]));
         assert_eq!(state.tracked_v4, 1);
         assert!(state.dirty_ips.is_empty());
@@ -1178,10 +1319,10 @@ mod tests {
         observe(&mut state, "filler.com", &[filler], RoutingAction::Direct);
 
         observe(&mut state, "incoming.com", &incoming, RoutingAction::Direct);
-        assert!(!state.owners.contains_key(&domain_key("old.com")));
-        assert!(!state.owners.contains_key(&domain_key("newer.com")));
-        assert!(state.owners.contains_key(&domain_key("filler.com")));
-        assert!(state.owners.contains_key(&domain_key("incoming.com")));
+        assert!(!state.domain_owners.contains_key(&domain_key("old.com")));
+        assert!(!state.domain_owners.contains_key(&domain_key("newer.com")));
+        assert!(state.domain_owners.contains_key(&domain_key("filler.com")));
+        assert!(state.domain_owners.contains_key(&domain_key("incoming.com")));
     }
 
     #[test]
@@ -1206,11 +1347,11 @@ mod tests {
 
         let scaled_batch = eviction_batch(1024);
         assert_eq!(state.tracked_v4, 1025 - scaled_batch);
-        assert_eq!(state.owners.len(), 1025 - scaled_batch);
-        assert!(!state.owners.contains_key(&domain_key("d0.com")));
-        assert!(!state.owners.contains_key(&domain_key("d101.com")));
-        assert!(state.owners.contains_key(&domain_key("d102.com")));
-        assert!(state.owners.contains_key(&domain_key("incoming.com")));
+        assert_eq!(state.total_owners(), 1025 - scaled_batch);
+        assert!(!state.domain_owners.contains_key(&domain_key("d0.com")));
+        assert!(!state.domain_owners.contains_key(&domain_key("d101.com")));
+        assert!(state.domain_owners.contains_key(&domain_key("d102.com")));
+        assert!(state.domain_owners.contains_key(&domain_key("incoming.com")));
     }
 
     #[test]
@@ -1234,9 +1375,9 @@ mod tests {
             &[incoming],
             RoutingAction::Direct,
         );
-        assert!(!state.owners.contains_key(&domain_key("old.com")));
-        assert!(state.owners.contains_key(&domain_key("recent.com")));
-        assert!(state.owners.contains_key(&domain_key("incoming.com")));
+        assert!(!state.domain_owners.contains_key(&domain_key("old.com")));
+        assert!(state.domain_owners.contains_key(&domain_key("recent.com")));
+        assert!(state.domain_owners.contains_key(&domain_key("incoming.com")));
         assert_eq!(state.tracked_v4, DEFAULT_MAX_V4_IPS + 1 - batch);
     }
 
@@ -1263,10 +1404,10 @@ mod tests {
         state.reclaim_headroom();
         assert_eq!(state.tracked_v4, 53);
         assert_eq!(state.dirty_ips.len(), 6);
-        assert!(!state.owners.contains_key(&domain_key("d0.com")));
-        assert!(!state.owners.contains_key(&domain_key("d5.com")));
-        assert!(state.owners.contains_key(&domain_key("d6.com")));
-        assert!(state.owners.contains_key(&domain_key("d58.com")));
+        assert!(!state.domain_owners.contains_key(&domain_key("d0.com")));
+        assert!(!state.domain_owners.contains_key(&domain_key("d5.com")));
+        assert!(state.domain_owners.contains_key(&domain_key("d6.com")));
+        assert!(state.domain_owners.contains_key(&domain_key("d58.com")));
     }
 
     #[test]
@@ -1285,8 +1426,8 @@ mod tests {
         state.dirty_ips.clear();
 
         state.reclaim_headroom();
-        assert!(!state.owners.contains_key(&domain_key("old.com")));
-        assert!(state.owners.contains_key(&domain_key("recent.com")));
+        assert!(!state.domain_owners.contains_key(&domain_key("old.com")));
+        assert!(state.domain_owners.contains_key(&domain_key("recent.com")));
         assert_eq!(state.tracked_v4, DEFAULT_MAX_V4_IPS - 2 * batch + 1);
         assert_eq!(state.dirty_ips.len(), batch);
     }
@@ -1340,8 +1481,8 @@ mod tests {
         observe(&mut state, "c.com", &[third], RoutingAction::Direct);
 
         observe(&mut state, "large.com", &new, RoutingAction::Direct);
-        assert_eq!(state.owners.len(), 1);
-        assert!(state.owners.contains_key(&domain_key("large.com")));
+        assert_eq!(state.total_owners(), 1);
+        assert!(state.domain_owners.contains_key(&domain_key("large.com")));
         assert_eq!(state.desired, HashSet::from(new));
         assert_eq!(state.tracked_v4, 3);
     }
@@ -1360,12 +1501,12 @@ mod tests {
         }
         let owner_batch = eviction_batch(DEFAULT_MAX_OWNERS);
         assert_eq!(owner_batch, 819);
-        assert_eq!(state.owners.len(), 8193 - owner_batch);
+        assert_eq!(state.total_owners(), 8193 - owner_batch);
         assert_eq!(state.desired.len(), 8193 - owner_batch);
-        assert!(!state.owners.contains_key(&domain_key("d0.com")));
-        assert!(!state.owners.contains_key(&domain_key("d818.com")));
-        assert!(state.owners.contains_key(&domain_key("d819.com")));
-        assert!(state.owners.contains_key(&domain_key("d8192.com")));
+        assert!(!state.domain_owners.contains_key(&domain_key("d0.com")));
+        assert!(!state.domain_owners.contains_key(&domain_key("d818.com")));
+        assert!(state.domain_owners.contains_key(&domain_key("d819.com")));
+        assert!(state.domain_owners.contains_key(&domain_key("d8192.com")));
     }
 
     #[test]
@@ -1387,11 +1528,11 @@ mod tests {
             &[incoming],
             RoutingAction::Direct,
         );
-        assert_eq!(state.owners.len(), 91);
+        assert_eq!(state.total_owners(), 91);
         assert_eq!(state.tracked_v4, 91);
-        assert!(!state.owners.contains_key(&domain_key("d9.com")));
-        assert!(state.owners.contains_key(&domain_key("d10.com")));
-        assert!(state.owners.contains_key(&domain_key("incoming.com")));
+        assert!(!state.domain_owners.contains_key(&domain_key("d9.com")));
+        assert!(state.domain_owners.contains_key(&domain_key("d10.com")));
+        assert!(state.domain_owners.contains_key(&domain_key("incoming.com")));
     }
 
     #[test]
@@ -1403,9 +1544,9 @@ mod tests {
         state.dirty_ips.clear();
 
         observe(&mut state, "c.com", &[ip], RoutingAction::Direct);
-        assert!(!state.owners.contains_key(&domain_key("a.com")));
-        assert!(state.owners.contains_key(&domain_key("b.com")));
-        assert!(state.owners.contains_key(&domain_key("c.com")));
+        assert!(!state.domain_owners.contains_key(&domain_key("a.com")));
+        assert!(state.domain_owners.contains_key(&domain_key("b.com")));
+        assert!(state.domain_owners.contains_key(&domain_key("c.com")));
         assert_eq!(state.desired, HashSet::from([ip]));
         assert!(state.dirty_ips.is_empty());
     }
@@ -1442,7 +1583,7 @@ mod tests {
                 rule_offloadable: true,
             })]);
         }
-        let cap_owner = state.owners.get(&domain_key("cap.example")).unwrap();
+        let cap_owner = state.domain_owners.get(&domain_key("cap.example")).unwrap();
         assert_eq!(cap_owner.v4_ips.len(), MAX_ROUTE_IPS_PER_FAMILY);
         let previous_first_ip = cap_owner.v4_ips[0];
         let lower_ip = "9.255.255.255".parse().unwrap();
@@ -1453,7 +1594,7 @@ mod tests {
             outbound: "DIRECT".into(),
             rule_offloadable: true,
         })]);
-        let cap_owner = &state.owners[&domain_key("cap.example")];
+        let cap_owner = &state.domain_owners[&domain_key("cap.example")];
         assert_eq!(cap_owner.v4_ips.len(), MAX_ROUTE_IPS_PER_FAMILY);
         assert_eq!(cap_owner.v4_ips[0], lower_ip);
         assert!(!cap_owner.v4_ips.contains(&previous_first_ip));
@@ -1473,7 +1614,7 @@ mod tests {
             outbound: "PROXY".into(),
             rule_offloadable: true,
         })]);
-        assert!(!state.owners.contains_key(&OwnerKey::DirectIp(untracked_proxy_ip)));
+        assert!(!state.direct_ip_owners.contains_key(&untracked_proxy_ip));
 
         // Pure-IP direct route installs DirectIp owner.
         state.observe_batch([Observation::RouteIp(RouteIpObservation {
@@ -1509,10 +1650,10 @@ mod tests {
             })]);
         }
 
-        assert!(state.owners.contains_key(&domain_key("keep.example")));
-        assert!(!state.owners.contains_key(&OwnerKey::DirectIp(ip1)));
-        assert!(state.owners.contains_key(&OwnerKey::DirectIp(ip2)));
-        assert!(state.owners.contains_key(&OwnerKey::DirectIp(ip3)));
+        assert!(state.domain_owners.contains_key(&domain_key("keep.example")));
+        assert!(!state.direct_ip_owners.contains_key(&ip1));
+        assert!(state.direct_ip_owners.contains_key(&ip2));
+        assert!(state.direct_ip_owners.contains_key(&ip3));
     }
 
     #[test]
@@ -1555,7 +1696,7 @@ mod tests {
         state.reconcile_outbounds(&to_proxy);
         assert!(!state.desired.contains(&dom_ip));
         assert!(!state.desired.contains(&raw_ip));
-        assert!(!state.owners.contains_key(&OwnerKey::DirectIp(raw_ip)));
+        assert!(!state.direct_ip_owners.contains_key(&raw_ip));
         assert_eq!(state.dirty_ips, HashSet::from([dom_ip, raw_ip]));
         state.dirty_ips.clear();
 
@@ -1566,5 +1707,70 @@ mod tests {
         assert!(state.desired.contains(&dom_ip));
         assert!(!state.desired.contains(&unsafe_ip));
         assert_eq!(state.dirty_ips, HashSet::from([dom_ip]));
+    }
+
+    #[test]
+    fn global_capacity_evicts_across_domain_and_direct_ip_owners_by_last_seen() {
+        let mut state = OffloadDesiredState::with_limits(2, 2, 2, 2);
+        let shared: IpAddr = "1.1.1.1".parse().unwrap();
+        let ip_a: IpAddr = "2.2.2.2".parse().unwrap();
+        let ip_b: IpAddr = "3.3.3.3".parse().unwrap();
+
+        // Oldest owner is a DirectIp, followed by a domain owner.
+        state.observe_batch([Observation::RouteIp(RouteIpObservation {
+            ip: ip_a,
+            action: RoutingAction::Direct,
+            outbound: "DIRECT".into(),
+            rule_offloadable: true,
+        })]);
+        observe(&mut state, "mid.example", &[shared], RoutingAction::Direct);
+
+        // Adding a third owner (DirectIp) exceeds both max_owners and max_v4_ips;
+        // oldest DirectIp (ip_a) is evicted while mid.example and ip_b stay.
+        state.observe_batch([Observation::RouteIp(RouteIpObservation {
+            ip: ip_b,
+            action: RoutingAction::Direct,
+            outbound: "DIRECT".into(),
+            rule_offloadable: true,
+        })]);
+        assert!(!state.direct_ip_owners.contains_key(&ip_a));
+        assert!(state.domain_owners.contains_key(&domain_key("mid.example")));
+        assert!(state.direct_ip_owners.contains_key(&ip_b));
+        assert_eq!(state.total_owners(), 2);
+        assert_eq!(state.tracked_v4, 2);
+    }
+
+    #[test]
+    fn owner_only_limit_evicts_oldest_domain_before_newer_direct_ip() {
+        let mut state = OffloadDesiredState::with_limits(10, 10, 2, 2);
+        let dom_ip: IpAddr = "1.1.1.1".parse().unwrap();
+        let raw_ip_a: IpAddr = "2.2.2.2".parse().unwrap();
+        let raw_ip_b: IpAddr = "3.3.3.3".parse().unwrap();
+
+        // Oldest owner is a domain, followed by a newer DirectIp.
+        observe(&mut state, "old.example", &[dom_ip], RoutingAction::Direct);
+        state.observe_batch([Observation::RouteIp(RouteIpObservation {
+            ip: raw_ip_a,
+            action: RoutingAction::Direct,
+            outbound: "DIRECT".into(),
+            rule_offloadable: true,
+        })]);
+
+        // Adding another DirectIp exceeds only max_owners (not max_v4_ips);
+        // the oldest domain owner must be evicted while both DirectIps remain.
+        state.observe_batch([Observation::RouteIp(RouteIpObservation {
+            ip: raw_ip_b,
+            action: RoutingAction::Direct,
+            outbound: "DIRECT".into(),
+            rule_offloadable: true,
+        })]);
+        assert!(!state.domain_owners.contains_key(&domain_key("old.example")));
+        assert!(state.direct_ip_owners.contains_key(&raw_ip_a));
+        assert!(state.direct_ip_owners.contains_key(&raw_ip_b));
+        assert_eq!(state.total_owners(), 2);
+        assert_eq!(state.tracked_v4, 2);
+        assert!(!state.desired.contains(&dom_ip));
+        assert!(state.desired.contains(&raw_ip_a));
+        assert!(state.desired.contains(&raw_ip_b));
     }
 }
