@@ -8,6 +8,10 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url))
 
 export default defineConfig({
   base: './',
+  build: {
+    // The LAN dashboard ships as a single entry bundle.
+    chunkSizeWarningLimit: 800,
+  },
   plugins: [
     react(),
     tailwindcss(),

@@ -16,12 +16,6 @@ const variantStyles: Record<string, string> = {
   red: 'bg-[#ff3b30]/10 text-[#ff3b30]',
 }
 
-export const badgeVariants = ({ variant = 'default' }: { variant?: string } = {}) =>
-  cn(
-    'inline-flex items-center text-[11px] font-semibold px-2 py-0.5 rounded-full',
-    variantStyles[variant] ?? variantStyles.default
-  )
-
 interface BadgeProps extends React.ComponentProps<"span"> {
   variant?: keyof typeof variantStyles;
 }

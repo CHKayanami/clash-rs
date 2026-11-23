@@ -32,7 +32,8 @@ function IconBadge({ bg, children }: { bg: string; children: React.ReactNode }) 
 export function Connections() {
   const [search, setSearch] = useState('');
   const wsUrl = getWsUrl('/ws/connections?interval=2');
-  const { lastMessage } = useWebSocket<ConnectionsData>(wsUrl);
+  const [lastMessage, setLastMessage] = useState<ConnectionsData | null>(null);
+  useWebSocket<ConnectionsData>(wsUrl, setLastMessage);
 
   const connections = lastMessage?.connections ?? [];
   const downloadTotal = lastMessage?.downloadTotal ?? 0;

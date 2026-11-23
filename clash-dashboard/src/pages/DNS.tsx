@@ -110,21 +110,17 @@ export function DNS() {
     count?: number;
   } | null>(null);
 
-  async function fetchUpstreams() {
-    try {
-      const res = await getDnsUpstreams();
-      if (res.upstreams && res.upstreams.length > 0) {
-        setUpstreams(res.upstreams);
-        setSelectedUpstream(res.upstreams[0].tag);
-      }
-    } catch (e) {
-      console.error('Failed to load DNS upstreams', e);
-    }
-  }
-
-  // Fetch available upstreams on mount
   useEffect(() => {
-    void fetchUpstreams();
+    let active = true;
+    void getDnsUpstreams().then(({ upstreams }) => {
+      if (active && upstreams?.length) {
+        setUpstreams(upstreams);
+        setSelectedUpstream(upstreams[0].tag);
+      }
+    }).catch((error) => {
+      if (active) console.error('Failed to load DNS upstreams', error);
+    });
+    return () => { active = false; };
   }, []);
 
   // Lookup handler

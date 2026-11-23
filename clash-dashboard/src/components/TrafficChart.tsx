@@ -26,9 +26,6 @@ export function TrafficChart({ timestamps, up, down }: TrafficChartProps) {
   const chartRef = useRef<uPlot | null>(null);
   const dataRef = useRef({ timestamps, up, down });
 
-  // Keep dataRef current so resize observer always uses latest data.
-  dataRef.current = { timestamps, up, down };
-
   function buildChart(width: number) {
     if (!containerRef.current) return;
     chartRef.current?.destroy();
@@ -92,10 +89,10 @@ export function TrafficChart({ timestamps, up, down }: TrafficChartProps) {
       chartRef.current?.destroy();
       chartRef.current = null;
     };
-  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   useEffect(() => {
+    dataRef.current = { timestamps, up, down };
     if (chartRef.current) {
       chartRef.current.setData([timestamps, up, down]);
     }

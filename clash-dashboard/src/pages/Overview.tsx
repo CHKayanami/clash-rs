@@ -99,9 +99,18 @@ function ToggleSwitch({ value, onChange }: { value: boolean; onChange: (v: boole
   );
 }
 
+function useInputDraft(value: string) {
+  const [source, setSource] = useState(value);
+  const [draft, setDraft] = useState(value);
+  if (source !== value) {
+    setSource(value);
+    setDraft(value);
+  }
+  return [source === value ? draft : value, setDraft] as const;
+}
+
 function PortInput({ value, onCommit }: { value: number | undefined; onCommit: (v: number | null) => void }) {
-  const [local, setLocal] = useState<string>(value != null && value !== 0 ? String(value) : '');
-  useEffect(() => { setLocal(value != null && value !== 0 ? String(value) : ''); }, [value]);
+  const [local, setLocal] = useInputDraft(value != null && value !== 0 ? String(value) : '');
   return (
     <input
       type="number" min="0" max="65535" value={local}
@@ -115,8 +124,7 @@ function PortInput({ value, onCommit }: { value: number | undefined; onCommit: (
 }
 
 function TextInput({ value, onCommit }: { value: string | undefined; onCommit: (v: string) => void }) {
-  const [local, setLocal] = useState<string>(value ?? '');
-  useEffect(() => { setLocal(value ?? ''); }, [value]);
+  const [local, setLocal] = useInputDraft(value ?? '');
   return (
     <input
       type="text" value={local}

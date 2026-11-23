@@ -26,8 +26,6 @@ interface TimestampedLog extends LogEntry {
   ts: string;
 }
 
-let logId = 0;
-
 function WsStatus({ state }: { state: string }) {
   const isOpen = state === 'OPEN';
   const isConnecting = state === 'CONNECTING';
@@ -49,17 +47,14 @@ export function Logs() {
   const [hoverPaused, setHoverPaused] = useState(false);
   const effectivePaused = userPaused || hoverPaused;
   const bottomRef = useRef<HTMLDivElement>(null);
+  const nextLogId = useRef(0);
 
   const wsUrl = getWsUrl('/ws/logs');
-  const { lastMessage, readyState } = useWebSocket<LogEntry>(wsUrl);
-
-  useEffect(() => {
-    if (!lastMessage) return;
-    setLogs((prev) => [
-      ...prev,
-      { ...lastMessage, id: ++logId, ts: new Date().toLocaleTimeString() },
-    ].slice(-500));
-  }, [lastMessage]);
+  const readyState = useWebSocket<LogEntry>(wsUrl, (message) => {
+    if (!message) return;
+    const entry = { ...message, id: ++nextLogId.current, ts: new Date().toLocaleTimeString() };
+    setLogs((prev) => [...prev, entry].slice(-500));
+  });
 
   useEffect(() => {
     if (!effectivePaused) {

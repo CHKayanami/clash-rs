@@ -22,7 +22,7 @@ const sizeStyles: Record<string, string> = {
   'icon-lg': 'size-9',
 }
 
-export const buttonVariants = ({
+const buttonVariants = ({
   variant = 'default',
   size = 'default',
 }: { variant?: string; size?: string } = {}) =>
