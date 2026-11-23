@@ -478,6 +478,7 @@ pub async fn start(
         cwd,
         components.dns_listen.clone(),
         components.dns_enabled,
+        components.ebpf_inspect.clone(),
         restart_controller,
     );
 
@@ -561,6 +562,7 @@ struct RuntimeComponents {
     inbound_manager: Arc<InboundManager>,
     dns_listen: DNSListenAddr,
     dns_enabled: bool,
+    ebpf_inspect: app::api::EbpfInspectHandle,
     service_context: ServiceContext,
     inbound_providers: HashMap<String, InboundProviderDef>,
     cwd: String,
@@ -882,13 +884,21 @@ async fn create_components(
     )?);
 
     #[cfg(all(target_os = "linux", feature = "ebpf"))]
-    debug!("initializing ebpf runner");
-    #[cfg(all(target_os = "linux", feature = "ebpf"))]
-    let ebpf_runner: ArcRunner = Arc::new(proxy::ebpf::EbpfRunner::new(
-        config.ebpf.unwrap_or_default(),
-        dispatcher.clone(),
-        dns_resolver.clone(),
-    ));
+    let (ebpf_runner, ebpf_inspect): (ArcService, app::api::EbpfInspectHandle) = {
+        debug!("initializing ebpf runner");
+        let ebpf_cfg = config.ebpf.unwrap_or_default();
+        let inspect =
+            app::api::EbpfInspectHandle::new(ebpf_cfg.enable, ebpf_cfg.auto_direct_offload);
+        let runner: ArcService = Arc::new(proxy::ebpf::EbpfRunner::new(
+            ebpf_cfg,
+            dispatcher.clone(),
+            dns_resolver.clone(),
+            inspect.clone(),
+        ));
+        (runner, inspect)
+    };
+    #[cfg(not(all(target_os = "linux", feature = "ebpf")))]
+    let ebpf_inspect = app::api::EbpfInspectHandle::disabled();
 
     debug!("initializing dns listener");
     let dns_listener: ArcRunner = Arc::new(dns::DnsRunner::new(
@@ -918,6 +928,7 @@ async fn create_components(
         dns_listener,
         dns_listen,
         dns_enabled: dns_enable,
+        ebpf_inspect,
         service_context,
         inbound_providers: config.inbound_providers,
         cwd: cwd_str,

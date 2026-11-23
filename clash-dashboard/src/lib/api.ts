@@ -325,6 +325,88 @@ export const deleteDnsCache = (upstream: string, pattern: string = '*') =>
     { method: 'DELETE' }
   );
 
+// eBPF Direct Offload Observability
+export interface EbpfOffloadCounts {
+  domain_owners: number;
+  direct_ip_owners: number;
+  max_domain_owners: number;
+  max_direct_ip_owners: number;
+  tracked_v4: number;
+  tracked_v6: number;
+  max_v4_ips: number;
+  max_v6_ips: number;
+  desired: number;
+  applied: number;
+  dirty: number;
+}
+
+export interface EbpfStatusResponse {
+  enabled: boolean;
+  auto_direct_offload: boolean;
+  ready: boolean;
+  active_mode?: string;
+  counts?: EbpfOffloadCounts;
+}
+
+export interface EbpfDomainIpStatus {
+  ip: string;
+  family: 'v4' | 'v6';
+  direct_count: number;
+  proxy_count: number;
+  desired: boolean;
+  applied: boolean;
+  dirty: boolean;
+  status: string;
+}
+
+export interface EbpfDomainOwnerDetail {
+  action: 'direct' | 'proxy';
+  outbound?: string;
+  rule_offloadable: boolean;
+  last_seen: number;
+  ips: EbpfDomainIpStatus[];
+}
+
+export interface EbpfDomainQueryResponse {
+  query: string;
+  normalized: string;
+  found: boolean;
+  active_mode: string;
+  owner?: EbpfDomainOwnerDetail;
+}
+
+export interface EbpfDirectIpOwnerDetail {
+  action: 'direct' | 'proxy';
+  outbound?: string;
+  rule_offloadable: boolean;
+  last_seen: number;
+}
+
+export interface EbpfIpQueryResponse {
+  ip: string;
+  family: 'v4' | 'v6';
+  active_mode: string;
+  static_match: string;
+  effective_status: string;
+  desired: boolean;
+  applied: boolean;
+  dirty: boolean;
+  counts: {
+    direct: number;
+    proxy: number;
+  };
+  domain_owner_count: number;
+  direct_ip_owner?: EbpfDirectIpOwnerDetail;
+}
+
+export const getEbpfStatus = () => request<EbpfStatusResponse>('/ebpf/status');
+
+export const queryEbpfDomain = (name: string) =>
+  request<EbpfDomainQueryResponse>(`/ebpf/offload/domain?name=${encodeURIComponent(name)}`);
+
+export const queryEbpfIp = (ip: string) =>
+  request<EbpfIpQueryResponse>(`/ebpf/offload/ip?ip=${encodeURIComponent(ip)}`);
+
 // Memory
 export const getMemory = () => request<MemoryData>('/memory');
 

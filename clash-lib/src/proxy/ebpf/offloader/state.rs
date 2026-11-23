@@ -6,6 +6,11 @@ use std::sync::Arc;
 use tracing::warn;
 
 use super::{DomainKey, RoutingAction};
+use crate::app::api::handlers::ebpf::{
+    DirectIpOwnerDetail, DomainIpStatus, DomainOwnerDetail, IpActionCountsDetail,
+    IpQueryResponse, OffloadStatusCounts,
+};
+use crate::config::def::RunMode;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum EvictKey {
@@ -13,7 +18,7 @@ enum EvictKey {
     DirectIp(IpAddr),
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum OwnerRef<'a> {
     Domain(&'a str),
     DirectIp(IpAddr),
@@ -25,6 +30,13 @@ enum EvictCandidate<'a> {
 }
 
 impl EvictCandidate<'_> {
+    fn owner_ref(&self) -> OwnerRef<'_> {
+        match self {
+            Self::Domain(domain, _) => OwnerRef::Domain(domain.as_ref()),
+            Self::DirectIp(ip, _) => OwnerRef::DirectIp(*ip),
+        }
+    }
+
     fn last_seen(&self) -> u64 {
         match self {
             Self::Domain(_, owner) => owner.last_seen,
@@ -80,7 +92,7 @@ struct DirectIpOwner {
 
 #[derive(Default)]
 struct IpActionCounts {
-    // A count cannot exceed max_owners (8192).
+    // A count cannot exceed max_domain_owners + 1 (8193).
     direct: u16,
     proxy: u16,
 }
@@ -88,10 +100,9 @@ struct IpActionCounts {
 // Match DYNAMIC_BYPASS_DST_IPS and DYNAMIC_BYPASS_DST_IP6S map capacities.
 const DEFAULT_MAX_V4_IPS: usize = 16384;
 const DEFAULT_MAX_V6_IPS: usize = 16384;
-// Domains commonly own multiple IPs; keep a separate bound on owner metadata.
-const DEFAULT_MAX_OWNERS: usize = 8192;
-// Reserve separate headroom for pure-IP route owners so P2P/IP traffic cannot starve domain owners.
-const DEFAULT_MAX_DIRECT_IP_OWNERS: usize = DEFAULT_MAX_OWNERS / 2;
+// Domains and pure-IP routes each have an independent owner quota.
+const DEFAULT_MAX_DOMAIN_OWNERS: usize = 8192;
+const DEFAULT_MAX_DIRECT_IP_OWNERS: usize = DEFAULT_MAX_DOMAIN_OWNERS / 2;
 // Cap incremental route-discovered IPs per family for a single domain.
 const MAX_ROUTE_IPS_PER_FAMILY: usize = 16;
 // Reserve one tenth of each capacity to avoid evicting on every new observation.
@@ -106,7 +117,7 @@ fn eviction_batch(max_ips: usize) -> usize {
 pub(super) struct OffloadDesiredState {
     max_v4_ips: usize,
     max_v6_ips: usize,
-    max_owners: usize,
+    max_domain_owners: usize,
     max_direct_ip_owners: usize,
     sequence: u64,
     domain_owners: HashMap<DomainKey, DomainOwner>,
@@ -127,33 +138,33 @@ impl OffloadDesiredState {
         Self::with_capacity(
             DEFAULT_MAX_V4_IPS,
             DEFAULT_MAX_V6_IPS,
-            DEFAULT_MAX_OWNERS,
+            DEFAULT_MAX_DOMAIN_OWNERS,
         )
     }
 
     fn with_capacity(
         max_v4_ips: usize,
         max_v6_ips: usize,
-        max_owners: usize,
+        max_domain_owners: usize,
     ) -> Self {
         Self::with_limits(
             max_v4_ips,
             max_v6_ips,
-            max_owners,
-            (max_owners / 2).max(1).min(DEFAULT_MAX_DIRECT_IP_OWNERS),
+            max_domain_owners,
+            (max_domain_owners / 2).max(1).min(DEFAULT_MAX_DIRECT_IP_OWNERS),
         )
     }
 
     fn with_limits(
         max_v4_ips: usize,
         max_v6_ips: usize,
-        max_owners: usize,
+        max_domain_owners: usize,
         max_direct_ip_owners: usize,
     ) -> Self {
         Self {
             max_v4_ips,
             max_v6_ips,
-            max_owners,
+            max_domain_owners,
             max_direct_ip_owners,
             sequence: 0,
             domain_owners: HashMap::new(),
@@ -169,6 +180,7 @@ impl OffloadDesiredState {
         }
     }
 
+    #[cfg(test)]
     fn total_owners(&self) -> usize {
         self.domain_owners.len() + self.direct_ip_owners.len()
     }
@@ -643,53 +655,23 @@ impl OffloadDesiredState {
         }
     }
 
-    /// Plan shared-IP evictions before applying them. An IP only frees capacity
-    /// when its last owner is removed. The caller rolls back a rejected owner.
+    /// Apply owner and address evictions only after both quotas can be satisfied.
     fn enforce_capacity(
         &mut self,
         observed: OwnerRef<'_>,
         affected: &mut HashSet<IpAddr>,
     ) -> bool {
-        if matches!(observed, OwnerRef::DirectIp(_)) && self.max_direct_ip_owners == 0 {
+        let (owners, max_owners) = match observed {
+            OwnerRef::Domain(_) => (self.domain_owners.len(), self.max_domain_owners),
+            OwnerRef::DirectIp(_) => (self.direct_ip_owners.len(), self.max_direct_ip_owners),
+        };
+        if max_owners == 0 {
             return false;
         }
 
-        let excess_direct_ip = self
-            .direct_ip_owners
-            .len()
-            .saturating_sub(self.max_direct_ip_owners);
-        if excess_direct_ip > 0 {
-            let target_direct_ip =
-                excess_direct_ip.max(eviction_batch(self.max_direct_ip_owners));
-            let observed_ip = match observed {
-                OwnerRef::DirectIp(ip) => Some(ip),
-                OwnerRef::Domain(_) => None,
-            };
-            let mut direct_candidates: Vec<_> = self
-                .direct_ip_owners
-                .iter()
-                .filter_map(|(&ip, owner)| {
-                    (observed_ip != Some(ip)).then_some((owner.last_seen, ip))
-                })
-                .collect();
-            let evict_count = target_direct_ip.min(direct_candidates.len());
-            if evict_count < direct_candidates.len() {
-                direct_candidates.select_nth_unstable_by_key(evict_count, |(seen, _)| *seen);
-            }
-            for (_, ip) in direct_candidates.into_iter().take(evict_count) {
-                self.remove_direct_ip_owner(ip, affected);
-            }
-            if self.direct_ip_owners.len() > self.max_direct_ip_owners {
-                return false;
-            }
-        }
-
-        let fits = |owners: usize, v4: usize, v6: usize| {
-            owners <= self.max_owners
-                && v4 <= self.max_v4_ips
-                && v6 <= self.max_v6_ips
-        };
-        if fits(self.total_owners(), self.tracked_v4, self.tracked_v6) {
+        let excess_v4 = self.tracked_v4.saturating_sub(self.max_v4_ips);
+        let excess_v6 = self.tracked_v6.saturating_sub(self.max_v6_ips);
+        if owners <= max_owners && excess_v4 == 0 && excess_v6 == 0 {
             return true;
         }
 
@@ -707,170 +689,209 @@ impl OffloadDesiredState {
                 if ip.is_ipv4() { (1, 0) } else { (0, 1) }
             }
         };
-        if self.max_owners == 0 || obs_v4 > self.max_v4_ips || obs_v6 > self.max_v6_ips {
+        if obs_v4 > self.max_v4_ips || obs_v6 > self.max_v6_ips {
             return false;
         }
 
-        let excess_owners = self.total_owners().saturating_sub(self.max_owners);
-        let target_owners = if excess_owners > 0 {
-            excess_owners.max(eviction_batch(self.max_owners))
-        } else {
-            0
-        };
-        let excess_v4 = self.tracked_v4.saturating_sub(self.max_v4_ips);
-        let excess_v6 = self.tracked_v6.saturating_sub(self.max_v6_ips);
-        if excess_v4 == 0 && excess_v6 == 0 {
-            let mut candidates: Vec<_> = self
-                .domain_owners
-                .iter()
-                .filter(|(domain, _)| {
-                    !matches!(observed, OwnerRef::Domain(obs) if obs == domain.as_ref())
-                })
-                .map(|(domain, owner)| (owner.last_seen, EvictCandidate::Domain(domain, owner)))
-                .chain(
-                    self.direct_ip_owners
-                        .iter()
-                        .filter(|(ip, _)| {
-                            !matches!(observed, OwnerRef::DirectIp(obs) if obs == **ip)
-                        })
-                        .map(|(&ip, owner)| {
-                            (owner.last_seen, EvictCandidate::DirectIp(ip, owner))
-                        }),
-                )
-                .collect();
-            if candidates.len() < target_owners {
+        // Only the table containing the observed owner can have exceeded its quota.
+        let quota_evictions = if owners > max_owners {
+            let target = (owners - max_owners).max(eviction_batch(max_owners));
+            let Some(evictions) = self.plan_owner_evictions(observed, target) else {
                 return false;
-            }
-            candidates
-                .select_nth_unstable_by_key(target_owners - 1, |(seen, _)| *seen);
-            let evictions: Vec<_> = candidates[..target_owners]
-                .iter()
-                .map(|(_, candidate)| candidate.to_evict_key())
-                .collect();
-            for key in evictions {
-                self.remove_evict_key(&key, affected);
-            }
-            return true;
-        }
-        let batch_v4 = eviction_batch(self.max_v4_ips);
-        let batch_v6 = eviction_batch(self.max_v6_ips);
-        let target_v4 = if excess_v4 > 0 {
-            excess_v4.max(batch_v4)
+            };
+            evictions
         } else {
-            0
+            Vec::new()
         };
-        let target_v6 = if excess_v6 > 0 {
-            excess_v6.max(batch_v6)
+
+        let address_evictions = if excess_v4 > 0 || excess_v6 > 0 {
+            let target_v4 = if excess_v4 > 0 {
+                excess_v4.max(eviction_batch(self.max_v4_ips))
+            } else {
+                0
+            };
+            let target_v6 = if excess_v6 > 0 {
+                excess_v6.max(eviction_batch(self.max_v6_ips))
+            } else {
+                0
+            };
+            let Some(evictions) = self.plan_address_evictions(
+                Some(observed),
+                &quota_evictions,
+                target_v4,
+                target_v6,
+            ) else {
+                return false;
+            };
+            evictions
         } else {
-            0
+            Vec::new()
         };
-        let Some(evictions) =
-            self.plan_evictions(Some(observed), target_owners, target_v4, target_v6)
-        else {
-            return false;
-        };
-        for key in evictions {
+
+        for key in quota_evictions.into_iter().chain(address_evictions) {
             self.remove_evict_key(&key, affected);
         }
         true
     }
 
-    fn plan_evictions(
+    fn plan_owner_evictions(
+        &self,
+        observed: OwnerRef<'_>,
+        target: usize,
+    ) -> Option<Vec<EvictKey>> {
+        if target == 0 {
+            return Some(Vec::new());
+        }
+
+        match observed {
+            OwnerRef::Domain(observed) => {
+                let mut candidates: Vec<_> = self
+                    .domain_owners
+                    .iter()
+                    .filter(|(domain, _)| domain.as_ref() != observed)
+                    .map(|(domain, owner)| (owner.last_seen, domain))
+                    .collect();
+                if target < candidates.len() {
+                    candidates.select_nth_unstable_by_key(target, |(seen, _)| *seen);
+                }
+                Some(
+                    candidates.get(..target)?
+                        .iter()
+                        .map(|(_, domain)| EvictKey::Domain((*domain).clone()))
+                        .collect(),
+                )
+            }
+            OwnerRef::DirectIp(observed) => {
+                let mut candidates: Vec<_> = self
+                    .direct_ip_owners
+                    .iter()
+                    .filter(|(ip, _)| **ip != observed)
+                    .map(|(&ip, owner)| (owner.last_seen, ip))
+                    .collect();
+                if target < candidates.len() {
+                    candidates.select_nth_unstable_by_key(target, |(seen, _)| *seen);
+                }
+                Some(
+                    candidates.get(..target)?
+                        .iter()
+                        .map(|&(_, ip)| EvictKey::DirectIp(ip))
+                        .collect(),
+                )
+            }
+        }
+    }
+
+    fn plan_address_evictions(
         &self,
         protected: Option<OwnerRef<'_>>,
-        target_owners: usize,
+        quota_evictions: &[EvictKey],
         target_v4: usize,
         target_v6: usize,
     ) -> Option<Vec<EvictKey>> {
-        let fits = |owners: usize, v4: usize, v6: usize| {
-            owners <= self.max_owners
-                && v4 <= self.max_v4_ips
-                && v6 <= self.max_v6_ips
+        let fits = |v4, v6| v4 <= self.max_v4_ips && v6 <= self.max_v6_ips;
+        let needs_reclaim = |remaining_v4, remaining_v6| {
+            (
+                self.tracked_v4.saturating_sub(remaining_v4) < target_v4,
+                self.tracked_v6.saturating_sub(remaining_v6) < target_v6,
+            )
         };
+        let owner_count = |ip: IpAddr| {
+            self.ip_action_counts.get(&ip).map_or(0, |counts| {
+                usize::from(counts.direct) + usize::from(counts.proxy)
+            })
+        };
+        let simulate_removal = |candidate: &EvictCandidate<'_>,
+                                remaining_counts: &mut HashMap<IpAddr, usize>,
+                                remaining_v4: &mut usize,
+                                remaining_v6: &mut usize| {
+            candidate.for_each_ip(|ip| {
+                let remaining =
+                    remaining_counts.entry(ip).or_insert_with(|| owner_count(ip));
+                if let Some(next) = remaining.checked_sub(1) {
+                    *remaining = next;
+                    if next == 0 {
+                        if ip.is_ipv4() {
+                            *remaining_v4 = remaining_v4.saturating_sub(1);
+                        } else {
+                            *remaining_v6 = remaining_v6.saturating_sub(1);
+                        }
+                    }
+                }
+            });
+        };
+
+        let mut remaining_v4 = self.tracked_v4;
+        let mut remaining_v6 = self.tracked_v6;
+        let mut remaining_counts = HashMap::new();
+        let mut excluded = HashSet::new();
+        for key in quota_evictions {
+            let candidate = match key {
+                EvictKey::Domain(domain) => {
+                    let owner = self.domain_owners.get(domain)?;
+                    excluded.insert(OwnerRef::Domain(domain.as_ref()));
+                    EvictCandidate::Domain(domain, owner)
+                }
+                EvictKey::DirectIp(ip) => {
+                    let owner = self.direct_ip_owners.get(ip)?;
+                    excluded.insert(OwnerRef::DirectIp(*ip));
+                    EvictCandidate::DirectIp(*ip, owner)
+                }
+            };
+            simulate_removal(
+                &candidate,
+                &mut remaining_counts,
+                &mut remaining_v4,
+                &mut remaining_v6,
+            );
+        }
+        let (need_v4, need_v6) = needs_reclaim(remaining_v4, remaining_v6);
+        if fits(remaining_v4, remaining_v6) && !need_v4 && !need_v6 {
+            return Some(Vec::new());
+        }
+
         let mut candidates: Vec<_> = self
             .domain_owners
             .iter()
-            .filter(|(domain, _)| {
-                !matches!(protected, Some(OwnerRef::Domain(prot)) if prot == domain.as_ref())
-            })
             .map(|(domain, owner)| EvictCandidate::Domain(domain, owner))
             .chain(
                 self.direct_ip_owners
                     .iter()
-                    .filter(|(ip, _)| {
-                        !matches!(protected, Some(OwnerRef::DirectIp(prot)) if prot == **ip)
-                    })
                     .map(|(&ip, owner)| EvictCandidate::DirectIp(ip, owner)),
             )
+            .filter(|candidate| {
+                let owner = candidate.owner_ref();
+                protected != Some(owner) && !excluded.contains(&owner)
+            })
             .collect();
         candidates.sort_unstable_by_key(EvictCandidate::last_seen);
 
-        let mut remaining_owners = self.total_owners();
-        let mut remaining_v4 = self.tracked_v4;
-        let mut remaining_v6 = self.tracked_v6;
-        let mut remaining_counts = HashMap::<IpAddr, usize>::new();
         let mut evictions = Vec::new();
         loop {
             let mut deferred = Vec::new();
             let mut progressed = false;
             for candidate in candidates.drain(..) {
-                let need_owner = evictions.len() < target_owners;
-                let need_v4 =
-                    self.tracked_v4.saturating_sub(remaining_v4) < target_v4;
-                let need_v6 =
-                    self.tracked_v6.saturating_sub(remaining_v6) < target_v6;
-                if fits(remaining_owners, remaining_v4, remaining_v6)
-                    && !need_owner
-                    && !need_v4
-                    && !need_v6
-                {
+                let (need_v4, need_v6) = needs_reclaim(remaining_v4, remaining_v6);
+                if fits(remaining_v4, remaining_v6) && !need_v4 && !need_v6 {
                     break;
                 }
-                let frees_needed_ip = !need_owner
-                    && candidate.any_ip(|ip| {
-                        ((ip.is_ipv4() && need_v4) || (ip.is_ipv6() && need_v6))
-                            && remaining_counts.get(&ip).copied().unwrap_or_else(
-                                || {
-                                    self.ip_action_counts
-                                        .get(&ip)
-                                        .map(|counts| {
-                                            usize::from(counts.direct)
-                                                + usize::from(counts.proxy)
-                                        })
-                                        .unwrap_or(0)
-                                },
-                            ) == 1
-                    });
-                if !frees_needed_ip
-                    && !need_owner
-                    && remaining_owners <= self.max_owners
-                {
+                let frees_needed_ip = candidate.any_ip(|ip| {
+                    ((ip.is_ipv4() && need_v4) || (ip.is_ipv6() && need_v6))
+                        && remaining_counts
+                            .get(&ip)
+                            .copied()
+                            .unwrap_or_else(|| owner_count(ip))
+                            == 1
+                });
+                if !frees_needed_ip {
                     deferred.push(candidate);
                     continue;
                 }
-                candidate.for_each_ip(|ip| {
-                    let remaining =
-                        remaining_counts.entry(ip).or_insert_with(|| {
-                            self.ip_action_counts
-                                .get(&ip)
-                                .map(|counts| {
-                                    usize::from(counts.direct)
-                                        + usize::from(counts.proxy)
-                                })
-                                .unwrap_or(0)
-                        });
-                    if let Some(next) = remaining.checked_sub(1) {
-                        *remaining = next;
-                        if next == 0 {
-                            if ip.is_ipv4() {
-                                remaining_v4 = remaining_v4.saturating_sub(1);
-                            } else {
-                                remaining_v6 = remaining_v6.saturating_sub(1);
-                            }
-                        }
-                    }
-                });
-                remaining_owners = remaining_owners.saturating_sub(1);
+                simulate_removal(
+                    &candidate,
+                    &mut remaining_counts,
+                    &mut remaining_v4,
+                    &mut remaining_v6,
+                );
                 evictions.push(candidate.to_evict_key());
                 progressed = true;
             }
@@ -880,11 +901,7 @@ impl OffloadDesiredState {
             candidates = deferred;
         }
 
-        if fits(remaining_owners, remaining_v4, remaining_v6) {
-            Some(evictions)
-        } else {
-            None
-        }
+        fits(remaining_v4, remaining_v6).then_some(evictions)
     }
 
     /// Reclaim room after a successful kernel flush, outside DNS observation processing.
@@ -933,7 +950,7 @@ impl OffloadDesiredState {
             (None, None) => None,
         };
         let Some(evictions) =
-            self.plan_evictions(protected, 0, target_v4, target_v6)
+            self.plan_address_evictions(protected, &[], target_v4, target_v6)
         else {
             return;
         };
@@ -965,6 +982,127 @@ impl OffloadDesiredState {
                 self.dirty_ips.insert(ip);
             }
         }
+    }
+
+    pub(super) fn status_counts(&self) -> OffloadStatusCounts {
+        OffloadStatusCounts {
+            domain_owners: self.domain_owners.len(),
+            direct_ip_owners: self.direct_ip_owners.len(),
+            max_domain_owners: self.max_domain_owners,
+            max_direct_ip_owners: self.max_direct_ip_owners,
+            tracked_v4: self.tracked_v4,
+            tracked_v6: self.tracked_v6,
+            max_v4_ips: self.max_v4_ips,
+            max_v6_ips: self.max_v6_ips,
+            desired: self.desired.len(),
+            applied: self.applied.len(),
+            dirty: self.dirty_ips.len(),
+        }
+    }
+
+    pub(super) fn query_domain(
+        &self,
+        domain: &str,
+        active_mode: RunMode,
+    ) -> Option<DomainOwnerDetail> {
+        let owner = self.domain_owners.get(domain)?;
+        let mut ips = Vec::with_capacity(owner.v4_ips.len() + owner.v6_ips.len());
+        for &ip in owner.v4_ips.iter().chain(&owner.v6_ips) {
+            let counts = self.ip_action_counts.get(&ip);
+            let direct_count = counts.map_or(0, |c| c.direct);
+            let proxy_count = counts.map_or(0, |c| c.proxy);
+            let desired = self.desired.contains(&ip);
+            let applied = self.applied.contains(&ip);
+            let dirty = self.dirty_ips.contains(&ip);
+            let status = classify_dynamic_status(
+                active_mode,
+                desired,
+                applied,
+                direct_count,
+                proxy_count,
+            );
+            ips.push(DomainIpStatus {
+                ip,
+                family: if ip.is_ipv4() { "v4" } else { "v6" },
+                direct_count,
+                proxy_count,
+                desired,
+                applied,
+                dirty,
+                status,
+            });
+        }
+        Some(DomainOwnerDetail {
+            action: owner.action.as_str(),
+            outbound: owner.outbound.as_deref().map(str::to_owned),
+            rule_offloadable: owner.rule_offloadable,
+            last_seen: owner.last_seen,
+            ips,
+        })
+    }
+
+    pub(super) fn query_ip(
+        &self,
+        ip: IpAddr,
+        active_mode: RunMode,
+        static_match: &'static str,
+    ) -> IpQueryResponse {
+        let counts = self.ip_action_counts.get(&ip);
+        let direct = counts.map_or(0, |c| c.direct);
+        let proxy = counts.map_or(0, |c| c.proxy);
+        let desired = self.desired.contains(&ip);
+        let applied = self.applied.contains(&ip);
+        let dirty = self.dirty_ips.contains(&ip);
+        let direct_ip_owner = self.direct_ip_owners.get(&ip).map(|owner| DirectIpOwnerDetail {
+            action: owner.action.as_str(),
+            outbound: owner.outbound.as_deref().map(str::to_owned),
+            rule_offloadable: owner.rule_offloadable,
+            last_seen: owner.last_seen,
+        });
+        let direct_ip_count = u16::from(direct_ip_owner.is_some());
+        let domain_owner_count = direct.saturating_add(proxy).saturating_sub(direct_ip_count);
+        let effective_status = if static_match != "none" {
+            static_match
+        } else {
+            classify_dynamic_status(active_mode, desired, applied, direct, proxy)
+        };
+        IpQueryResponse {
+            ip,
+            family: if ip.is_ipv4() { "v4" } else { "v6" },
+            active_mode: super::run_mode_str(active_mode).to_owned(),
+            static_match,
+            effective_status,
+            desired,
+            applied,
+            dirty,
+            counts: IpActionCountsDetail { direct, proxy },
+            domain_owner_count,
+            direct_ip_owner,
+        }
+    }
+}
+
+fn classify_dynamic_status(
+    active_mode: RunMode,
+    desired: bool,
+    applied: bool,
+    direct_count: u16,
+    proxy_count: u16,
+) -> &'static str {
+    if applied {
+        "applied"
+    } else if desired {
+        if active_mode == RunMode::Global {
+            "paused_global"
+        } else {
+            "pending_sync"
+        }
+    } else if direct_count > 0 && proxy_count > 0 {
+        "vetoed"
+    } else if proxy_count > 0 {
+        "proxy"
+    } else {
+        "not_tracked"
     }
 }
 
@@ -1499,7 +1637,7 @@ mod tests {
                 RoutingAction::Direct,
             );
         }
-        let owner_batch = eviction_batch(DEFAULT_MAX_OWNERS);
+        let owner_batch = eviction_batch(DEFAULT_MAX_DOMAIN_OWNERS);
         assert_eq!(owner_batch, 819);
         assert_eq!(state.total_owners(), 8193 - owner_batch);
         assert_eq!(state.desired.len(), 8193 - owner_batch);
@@ -1710,7 +1848,7 @@ mod tests {
     }
 
     #[test]
-    fn global_capacity_evicts_across_domain_and_direct_ip_owners_by_last_seen() {
+    fn shared_address_capacity_evicts_across_owner_types_by_last_seen() {
         let mut state = OffloadDesiredState::with_limits(2, 2, 2, 2);
         let shared: IpAddr = "1.1.1.1".parse().unwrap();
         let ip_a: IpAddr = "2.2.2.2".parse().unwrap();
@@ -1725,7 +1863,7 @@ mod tests {
         })]);
         observe(&mut state, "mid.example", &[shared], RoutingAction::Direct);
 
-        // Adding a third owner (DirectIp) exceeds both max_owners and max_v4_ips;
+        // Adding another DirectIp exceeds the shared IPv4 limit;
         // oldest DirectIp (ip_a) is evicted while mid.example and ip_b stay.
         state.observe_batch([Observation::RouteIp(RouteIpObservation {
             ip: ip_b,
@@ -1741,36 +1879,215 @@ mod tests {
     }
 
     #[test]
-    fn owner_only_limit_evicts_oldest_domain_before_newer_direct_ip() {
+    fn domain_and_direct_ip_owner_quotas_are_independent() {
         let mut state = OffloadDesiredState::with_limits(10, 10, 2, 2);
-        let dom_ip: IpAddr = "1.1.1.1".parse().unwrap();
-        let raw_ip_a: IpAddr = "2.2.2.2".parse().unwrap();
-        let raw_ip_b: IpAddr = "3.3.3.3".parse().unwrap();
+        let dom_ip_a: IpAddr = "1.1.1.1".parse().unwrap();
+        let dom_ip_b: IpAddr = "1.1.1.2".parse().unwrap();
+        let dom_ip_c: IpAddr = "1.1.1.3".parse().unwrap();
+        let raw_ip_a: IpAddr = "2.2.2.1".parse().unwrap();
+        let raw_ip_b: IpAddr = "2.2.2.2".parse().unwrap();
 
-        // Oldest owner is a domain, followed by a newer DirectIp.
-        observe(&mut state, "old.example", &[dom_ip], RoutingAction::Direct);
-        state.observe_batch([Observation::RouteIp(RouteIpObservation {
-            ip: raw_ip_a,
-            action: RoutingAction::Direct,
-            outbound: "DIRECT".into(),
-            rule_offloadable: true,
-        })]);
+        // Fill both domain quota (2) and direct-IP quota (2) independently.
+        observe(&mut state, "d1.example", &[dom_ip_a], RoutingAction::Direct);
+        observe(&mut state, "d2.example", &[dom_ip_b], RoutingAction::Direct);
+        for ip in [raw_ip_a, raw_ip_b] {
+            state.observe_batch([Observation::RouteIp(RouteIpObservation {
+                ip,
+                action: RoutingAction::Direct,
+                outbound: "DIRECT".into(),
+                rule_offloadable: true,
+            })]);
+        }
+        assert_eq!(state.domain_owners.len(), 2);
+        assert_eq!(state.direct_ip_owners.len(), 2);
 
-        // Adding another DirectIp exceeds only max_owners (not max_v4_ips);
-        // the oldest domain owner must be evicted while both DirectIps remain.
-        state.observe_batch([Observation::RouteIp(RouteIpObservation {
-            ip: raw_ip_b,
-            action: RoutingAction::Direct,
-            outbound: "DIRECT".into(),
-            rule_offloadable: true,
-        })]);
-        assert!(!state.domain_owners.contains_key(&domain_key("old.example")));
+        // Exceeding domain quota evicts only the oldest domain, leaving direct IPs untouched.
+        observe(&mut state, "d3.example", &[dom_ip_c], RoutingAction::Direct);
+        assert!(!state.domain_owners.contains_key(&domain_key("d1.example")));
+        assert!(state.domain_owners.contains_key(&domain_key("d2.example")));
+        assert!(state.domain_owners.contains_key(&domain_key("d3.example")));
         assert!(state.direct_ip_owners.contains_key(&raw_ip_a));
         assert!(state.direct_ip_owners.contains_key(&raw_ip_b));
-        assert_eq!(state.total_owners(), 2);
-        assert_eq!(state.tracked_v4, 2);
-        assert!(!state.desired.contains(&dom_ip));
-        assert!(state.desired.contains(&raw_ip_a));
-        assert!(state.desired.contains(&raw_ip_b));
+        assert_eq!(state.domain_owners.len(), 2);
+        assert_eq!(state.direct_ip_owners.len(), 2);
+    }
+
+    #[test]
+    fn domain_quota_eviction_can_also_satisfy_the_shared_ip_limit() {
+        let mut state = OffloadDesiredState::with_limits(2, 2, 1, 1);
+        let raw_ip = "1.1.1.1".parse().unwrap();
+        let old_ip = "2.2.2.2".parse().unwrap();
+        let new_ip = "3.3.3.3".parse().unwrap();
+
+        state.observe_batch([Observation::RouteIp(RouteIpObservation {
+            ip: raw_ip,
+            action: RoutingAction::Direct,
+            outbound: "DIRECT".into(),
+            rule_offloadable: true,
+        })]);
+        observe(&mut state, "old.example", &[old_ip], RoutingAction::Direct);
+        state.dirty_ips.clear();
+
+        observe(&mut state, "new.example", &[new_ip], RoutingAction::Direct);
+
+        assert!(!state.domain_owners.contains_key("old.example"));
+        assert!(state.domain_owners.contains_key("new.example"));
+        assert!(state.direct_ip_owners.contains_key(&raw_ip));
+        assert_eq!(state.desired, HashSet::from([raw_ip, new_ip]));
+        assert_eq!(state.dirty_ips, HashSet::from([old_ip, new_ip]));
+    }
+
+    #[test]
+    fn direct_ip_quota_eviction_counts_toward_the_address_eviction_batch() {
+        let mut state = OffloadDesiredState::with_limits(20, 1, 20, 1);
+        let old_ip = IpAddr::from([192, 0, 2, 1]);
+        let new_ip = IpAddr::from([192, 0, 2, 2]);
+        let route_ip = |ip| {
+            Observation::RouteIp(RouteIpObservation {
+                ip,
+                action: RoutingAction::Direct,
+                outbound: "DIRECT".into(),
+                rule_offloadable: true,
+            })
+        };
+
+        state.observe_batch([route_ip(old_ip)]);
+        for i in 1..20 {
+            let ip = IpAddr::from([198, 51, 100, i]);
+            observe(&mut state, &format!("d{i}.example"), &[ip], RoutingAction::Direct);
+        }
+        state.dirty_ips.clear();
+
+        state.observe_batch([route_ip(new_ip)]);
+
+        let oldest_domain_ip = IpAddr::from([198, 51, 100, 1]);
+        assert_eq!(state.tracked_v4, 21 - eviction_batch(20));
+        assert!(!state.direct_ip_owners.contains_key(&old_ip));
+        assert!(state.direct_ip_owners.contains_key(&new_ip));
+        assert!(!state.domain_owners.contains_key("d1.example"));
+        assert!(state.domain_owners.contains_key("d2.example"));
+        assert_eq!(state.dirty_ips, HashSet::from([old_ip, oldest_domain_ip, new_ip]));
+    }
+
+    #[test]
+    fn eviction_plans_reject_missing_candidates() {
+        let state = OffloadDesiredState::new();
+        let domain = "missing.example";
+        let ip = IpAddr::from([192, 0, 2, 1]);
+        assert_eq!(state.plan_owner_evictions(OwnerRef::Domain(domain), 0), Some(vec![]));
+        assert_eq!(state.plan_owner_evictions(OwnerRef::Domain(domain), 1), None);
+        assert_eq!(state.plan_owner_evictions(OwnerRef::DirectIp(ip), 1), None);
+        assert_eq!(
+            state.plan_address_evictions(None, &[EvictKey::Domain(domain.into())], 1, 0),
+            None,
+        );
+        assert_eq!(
+            state.plan_address_evictions(None, &[EvictKey::DirectIp(ip)], 1, 0),
+            None,
+        );
+    }
+
+    #[test]
+    fn rejected_direct_ip_preserves_owner_selected_for_quota_eviction() {
+        let mut state = OffloadDesiredState::with_limits(1, 2, 2, 1);
+        let shared_v4 = "1.1.1.1".parse().unwrap();
+        let old_v6 = "2001:db8::1".parse().unwrap();
+        let new_v4 = "2.2.2.2".parse().unwrap();
+
+        observe(&mut state, "a.example", &[shared_v4], RoutingAction::Direct);
+        observe(&mut state, "b.example", &[shared_v4], RoutingAction::Direct);
+        let route_ip = |ip| {
+            Observation::RouteIp(RouteIpObservation {
+                ip,
+                action: RoutingAction::Direct,
+                outbound: "DIRECT".into(),
+                rule_offloadable: true,
+            })
+        };
+        state.observe_batch([route_ip(old_v6)]);
+        state.dirty_ips.clear();
+
+        state.observe_batch([route_ip(new_v4)]);
+
+        assert!(state.direct_ip_owners.contains_key(&old_v6));
+        assert!(!state.direct_ip_owners.contains_key(&new_v4));
+        assert_eq!(state.domain_owners.len(), 2);
+        assert_eq!(state.desired, HashSet::from([shared_v4, old_v6]));
+        assert!(state.dirty_ips.is_empty());
+    }
+
+    #[test]
+    fn query_domain_and_ip_report_exact_offload_states() {
+        let mut state = OffloadDesiredState::new();
+        let applied_ip: IpAddr = "1.1.1.1".parse().unwrap();
+        let pending_ip: IpAddr = "2001:db8::1".parse().unwrap();
+        let vetoed_ip: IpAddr = "2.2.2.2".parse().unwrap();
+        let raw_ip: IpAddr = "3.3.3.3".parse().unwrap();
+
+        state.observe_batch([
+            Observation::Dns(DnsObservation {
+                domain: "direct.example".into(),
+                ips: vec![applied_ip, pending_ip, vetoed_ip],
+                action: RoutingAction::Direct,
+                outbound: Some("DIRECT".into()),
+                rule_offloadable: true,
+            }),
+            Observation::Dns(DnsObservation {
+                domain: "proxy.example".into(),
+                ips: vec![vetoed_ip],
+                action: RoutingAction::Proxy,
+                outbound: Some("PROXY".into()),
+                rule_offloadable: true,
+            }),
+            Observation::RouteIp(RouteIpObservation {
+                ip: raw_ip,
+                action: RoutingAction::Direct,
+                outbound: "DIRECT".into(),
+                rule_offloadable: true,
+            }),
+        ]);
+        state.applied.insert(applied_ip);
+        state.dirty_ips.remove(&applied_ip);
+
+        let detail = state
+            .query_domain("direct.example", RunMode::Rule)
+            .expect("domain should exist");
+        assert_eq!(detail.action, "direct");
+        assert_eq!(detail.outbound.as_deref(), Some("DIRECT"));
+        assert!(detail.rule_offloadable);
+        assert_eq!(detail.ips.len(), 3);
+        let status_of = |ip: IpAddr| {
+            detail
+                .ips
+                .iter()
+                .find(|item| item.ip == ip)
+                .unwrap()
+                .status
+        };
+        assert_eq!(status_of(applied_ip), "applied");
+        assert_eq!(status_of(pending_ip), "pending_sync");
+        assert_eq!(status_of(vetoed_ip), "vetoed");
+        assert!(state.query_domain("missing.example", RunMode::Rule).is_none());
+
+        let vetoed_resp = state.query_ip(vetoed_ip, RunMode::Rule, "none");
+        assert_eq!(vetoed_resp.effective_status, "vetoed");
+        assert_eq!(vetoed_resp.counts.direct, 1);
+        assert_eq!(vetoed_resp.counts.proxy, 1);
+        assert_eq!(vetoed_resp.domain_owner_count, 2);
+        assert!(vetoed_resp.direct_ip_owner.is_none());
+
+        let raw_resp = state.query_ip(raw_ip, RunMode::Rule, "none");
+        assert_eq!(raw_resp.effective_status, "pending_sync");
+        assert_eq!(raw_resp.domain_owner_count, 0);
+        assert_eq!(
+            raw_resp.direct_ip_owner.as_ref().map(|o| o.action),
+            Some("direct")
+        );
+
+        let global_resp = state.query_ip(pending_ip, RunMode::Global, "none");
+        assert_eq!(global_resp.effective_status, "paused_global");
+
+        let static_resp = state.query_ip(raw_ip, RunMode::Rule, "static_bypass");
+        assert_eq!(static_resp.effective_status, "static_bypass");
     }
 }

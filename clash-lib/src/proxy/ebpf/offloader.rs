@@ -7,14 +7,18 @@ use std::time::Duration;
 use clash_ebpf::EbpfManager;
 use futures::future::select_all;
 use tokio::sync::{
+    OwnedSemaphorePermit, Semaphore,
     mpsc::{self, UnboundedSender, WeakUnboundedSender},
-    watch,
+    oneshot, watch,
 };
 use tokio::task::AbortHandle;
-use tokio::time::{Instant, sleep, sleep_until};
+use tokio::time::{Instant, sleep, sleep_until, timeout};
 use tracing::{debug, info, warn};
 
 use super::utils::is_reserved_ip;
+use crate::app::api::handlers::ebpf::{
+    DomainOwnerDetail, DomainQueryResponse, IpQueryResponse, OffloadStatusCounts,
+};
 use crate::app::dispatcher::{
     Dispatcher, RouteOffloadAction, RouteOffloadEvent, RouteOffloadObserver,
 };
@@ -39,6 +43,23 @@ pub enum RoutingAction {
     Proxy,
 }
 
+impl RoutingAction {
+    pub(super) fn as_str(self) -> &'static str {
+        match self {
+            Self::Direct => "direct",
+            Self::Proxy => "proxy",
+        }
+    }
+}
+
+pub(super) fn run_mode_str(mode: RunMode) -> &'static str {
+    match mode {
+        RunMode::Rule => "rule",
+        RunMode::Global => "global",
+        RunMode::Direct => "direct",
+    }
+}
+
 pub fn normalize_domain(domain: &str) -> Option<DomainKey> {
     let trimmed = domain.trim().trim_end_matches('.');
     if trimmed.is_empty()
@@ -54,11 +75,33 @@ pub fn normalize_domain(domain: &str) -> Option<DomainKey> {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OffloadQueryError {
+    InvalidDomain,
+    QueueBusy,
+    TimedOut,
+    NotReady,
+}
+
 enum OffloadMessage {
     Observe(Observation),
     ModeChanged(RunMode),
     GroupRouteChanged,
+    QueryStatus {
+        reply: oneshot::Sender<(&'static str, OffloadStatusCounts)>,
+        _permit: OwnedSemaphorePermit,
+    },
+    QueryDomain {
+        domain: DomainKey,
+        reply: oneshot::Sender<(&'static str, Option<DomainOwnerDetail>)>,
+        _permit: OwnedSemaphorePermit,
+    },
+    QueryIp {
+        ip: IpAddr,
+        static_match: &'static str,
+        reply: oneshot::Sender<IpQueryResponse>,
+        _permit: OwnedSemaphorePermit,
+    },
 }
 
 async fn wait_any_route_change(waits: &mut [(usize, watch::Receiver<()>)]) {
@@ -231,14 +274,45 @@ async fn process_message_batch(
                 .await;
                 state.observe(observation, &mut affected);
             }
+            OffloadMessage::QueryStatus { reply, .. } => {
+                if reply.is_closed() {
+                    continue;
+                }
+                state.recompute_ips(affected.drain());
+                let _ = reply.send((run_mode_str(*active_mode), state.status_counts()));
+            }
+            OffloadMessage::QueryDomain { domain, reply, .. } => {
+                if reply.is_closed() {
+                    continue;
+                }
+                state.recompute_ips(affected.drain());
+                let detail = state.query_domain(domain.as_ref(), *active_mode);
+                let _ = reply.send((run_mode_str(*active_mode), detail));
+            }
+            OffloadMessage::QueryIp {
+                ip,
+                static_match,
+                reply,
+                ..
+            } => {
+                if reply.is_closed() {
+                    continue;
+                }
+                state.recompute_ips(affected.drain());
+                let _ = reply.send(state.query_ip(ip, *active_mode, static_match));
+            }
         }
     }
     state.recompute_ips(affected);
 }
 
+const MAX_INFLIGHT_QUERIES: usize = 16;
+const QUERY_TIMEOUT: Duration = Duration::from_secs(2);
+
 #[derive(Clone)]
 pub struct DirectOffloader {
     tx: UnboundedSender<OffloadMessage>,
+    query_permits: Arc<Semaphore>,
     resolver: Weak<dyn ClashResolver>,
     bypass_dst_trie: Arc<CidrTrie>,
     proxy_dst_trie: Arc<CidrTrie>,
@@ -393,6 +467,7 @@ impl DirectOffloader {
         });
         Self {
             tx,
+            query_permits: Arc::new(Semaphore::new(MAX_INFLIGHT_QUERIES)),
             resolver: Arc::downgrade(&resolver),
             bypass_dst_trie,
             proxy_dst_trie,
@@ -424,15 +499,102 @@ impl DirectOffloader {
         self.abort_handle.abort();
     }
 
-    fn should_skip_ip(&self, ip: IpAddr) -> bool {
-        let is_fake_ip = self
+    fn classify_static_ip(&self, ip: IpAddr) -> &'static str {
+        if is_reserved_ip(ip) {
+            return "reserved";
+        }
+        if self
             .resolver
             .upgrade()
-            .is_some_and(|resolver| resolver.is_fake_ip(ip));
-        is_reserved_ip(ip)
-            || is_fake_ip
-            || self.bypass_dst_trie.contains(ip)
-            || self.proxy_dst_trie.contains(ip)
+            .is_some_and(|resolver| resolver.is_fake_ip(ip))
+        {
+            return "fake_ip";
+        }
+        if self.bypass_dst_trie.contains(ip) {
+            return "static_bypass";
+        }
+        if self.proxy_dst_trie.contains(ip) {
+            return "static_proxy";
+        }
+        "none"
+    }
+
+    fn should_skip_ip(&self, ip: IpAddr) -> bool {
+        self.classify_static_ip(ip) != "none"
+    }
+
+    async fn send_query_with_timeout<T>(
+        &self,
+        wait: Duration,
+        build: impl FnOnce(oneshot::Sender<T>, OwnedSemaphorePermit) -> OffloadMessage,
+    ) -> Result<T, OffloadQueryError> {
+        let permit = self
+            .query_permits
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| OffloadQueryError::QueueBusy)?;
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.tx
+            .send(build(reply_tx, permit))
+            .map_err(|_| OffloadQueryError::NotReady)?;
+        timeout(wait, reply_rx)
+            .await
+            .map_err(|_| OffloadQueryError::TimedOut)?
+            .map_err(|_| OffloadQueryError::NotReady)
+    }
+
+    pub async fn status(
+        &self,
+    ) -> Result<(&'static str, OffloadStatusCounts), OffloadQueryError> {
+        self.send_query_with_timeout(QUERY_TIMEOUT, |reply, permit| {
+            OffloadMessage::QueryStatus {
+                reply,
+                _permit: permit,
+            }
+        })
+        .await
+    }
+
+    pub async fn query_domain(
+        &self,
+        raw: &str,
+    ) -> Result<DomainQueryResponse, OffloadQueryError> {
+        let normalized =
+            normalize_domain(raw).ok_or(OffloadQueryError::InvalidDomain)?;
+        let domain_for_msg = normalized.clone();
+        let (active_mode, owner) = self
+            .send_query_with_timeout(QUERY_TIMEOUT, |reply, permit| {
+                OffloadMessage::QueryDomain {
+                    domain: domain_for_msg,
+                    reply,
+                    _permit: permit,
+                }
+            })
+            .await?;
+        Ok(DomainQueryResponse {
+            query: raw.to_owned(),
+            normalized: normalized.as_ref().to_owned(),
+            found: owner.is_some(),
+            active_mode: active_mode.to_owned(),
+            owner,
+        })
+    }
+
+    pub async fn query_ip(
+        &self,
+        ip: IpAddr,
+    ) -> Result<IpQueryResponse, OffloadQueryError> {
+        let ip = ip.to_canonical();
+        let static_match = self.classify_static_ip(ip);
+        self.send_query_with_timeout(QUERY_TIMEOUT, |reply, permit| {
+            OffloadMessage::QueryIp {
+                ip,
+                static_match,
+                reply,
+                _permit: permit,
+            }
+        })
+        .await
     }
 
     fn build_dns_observation(
@@ -921,5 +1083,124 @@ mod tests {
         drop(dispatcher);
         yield_now().await;
         assert!(weak_disp.upgrade().is_none());
+    }
+
+    #[tokio::test]
+    async fn offloader_actor_queries_status_domain_and_ip() {
+        let mut mock_resolver = MockClashResolver::new();
+        let fake_ip: IpAddr = "198.18.0.10".parse().unwrap();
+        mock_resolver
+            .expect_is_fake_ip()
+            .returning(move |ip| ip == fake_ip);
+        let resolver: ThreadSafeDNSResolver = Arc::new(mock_resolver);
+
+        let mut bypass_trie = CidrTrie::new();
+        bypass_trie.insert("192.0.2.0/24");
+
+        let offloader = DirectOffloader::new(
+            Weak::new(),
+            resolver.clone(),
+            Arc::new(bypass_trie),
+            Arc::new(CidrTrie::new()),
+            Weak::new(),
+        )
+        .await;
+
+        let normal_ip: IpAddr = "203.0.113.20".parse().unwrap();
+        let static_ip: IpAddr = "192.0.2.42".parse().unwrap();
+        offloader.observe_dns(
+            "Example.COM.",
+            vec![normal_ip],
+            RoutingAction::Direct,
+            Arc::from("DIRECT"),
+            true,
+        );
+
+        let (mode, counts) = offloader.status().await.expect("status should succeed");
+        assert_eq!(mode, "rule");
+        assert_eq!(counts.domain_owners, 1);
+        assert_eq!(counts.desired, 1);
+
+        let domain_resp = offloader
+            .query_domain("Example.COM.")
+            .await
+            .expect("domain query should succeed");
+        assert!(domain_resp.found);
+        assert_eq!(domain_resp.normalized, "example.com");
+        assert_eq!(domain_resp.owner.as_ref().unwrap().ips.len(), 1);
+        assert_eq!(domain_resp.owner.as_ref().unwrap().ips[0].ip, normal_ip);
+
+        assert_eq!(
+            offloader.query_domain("1.2.3.4").await.unwrap_err(),
+            OffloadQueryError::InvalidDomain
+        );
+
+        let static_resp = offloader.query_ip(static_ip).await.unwrap();
+        assert_eq!(static_resp.static_match, "static_bypass");
+        assert_eq!(static_resp.effective_status, "static_bypass");
+
+        let fake_resp = offloader.query_ip(fake_ip).await.unwrap();
+        assert_eq!(fake_resp.static_match, "fake_ip");
+        assert_eq!(fake_resp.effective_status, "fake_ip");
+
+        let normal_resp = offloader.query_ip(normal_ip).await.unwrap();
+        assert_eq!(normal_resp.static_match, "none");
+        assert_eq!(normal_resp.domain_owner_count, 1);
+        assert!(normal_resp.desired);
+
+        // Exhaust query permits to verify backpressure rejects excess queries immediately.
+        let held = offloader
+            .query_permits
+            .try_acquire_many(MAX_INFLIGHT_QUERIES as u32)
+            .expect("all permits should be available");
+        assert_eq!(offloader.status().await.unwrap_err(), OffloadQueryError::QueueBusy);
+        assert_eq!(
+            offloader.query_domain("example.com").await.unwrap_err(),
+            OffloadQueryError::QueueBusy
+        );
+        assert_eq!(
+            offloader.query_ip(normal_ip).await.unwrap_err(),
+            OffloadQueryError::QueueBusy
+        );
+        drop(held);
+        assert!(offloader.status().await.is_ok());
+
+        offloader.stop();
+    }
+
+    #[tokio::test]
+    async fn timed_out_query_retains_permit_until_message_is_dequeued() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<OffloadMessage>();
+        let offloader = DirectOffloader {
+            tx,
+            query_permits: Arc::new(Semaphore::new(1)),
+            resolver: Weak::<MockClashResolver>::new(),
+            bypass_dst_trie: Arc::new(CidrTrie::new()),
+            proxy_dst_trie: Arc::new(CidrTrie::new()),
+            abort_handle: Arc::new(tokio::spawn(pending::<()>()).abort_handle()),
+            route_watch_abort: Arc::new(tokio::spawn(pending::<()>()).abort_handle()),
+        };
+
+        // Actor is not draining `rx`: first query times out, and its queued message
+        // must keep holding the single permit until dequeued.
+        let err = offloader
+            .send_query_with_timeout(Duration::from_millis(10), |reply, permit| {
+                OffloadMessage::QueryStatus {
+                    reply,
+                    _permit: permit,
+                }
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(err, OffloadQueryError::TimedOut);
+        assert_eq!(offloader.query_permits.available_permits(), 0);
+        assert_eq!(offloader.status().await.unwrap_err(), OffloadQueryError::QueueBusy);
+
+        // Once the actor dequeues and drops the closed query message, the permit is freed.
+        let msg = rx.recv().await.expect("queued query should remain in channel");
+        assert!(matches!(msg, OffloadMessage::QueryStatus { ref reply, .. } if reply.is_closed()));
+        drop(msg);
+        assert_eq!(offloader.query_permits.available_permits(), 1);
+        offloader.stop();
     }
 }

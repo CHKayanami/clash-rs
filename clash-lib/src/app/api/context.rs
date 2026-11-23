@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-use super::RestartController;
+use super::{EbpfInspectHandle, RestartController};
 use crate::{
     GlobalState,
     app::{
@@ -28,6 +28,7 @@ pub struct RuntimeContext {
     pub cwd: String,
     pub dns_listen_addr: DNSListenAddr,
     pub dns_enabled: bool,
+    pub ebpf: EbpfInspectHandle,
     pub restart: Option<Arc<RestartController>>,
 }
 
@@ -45,6 +46,7 @@ impl RuntimeContext {
         cwd: String,
         dns_listen_addr: DNSListenAddr,
         dns_enabled: bool,
+        ebpf: EbpfInspectHandle,
         restart: Option<Arc<RestartController>>,
     ) -> Self {
         Self {
@@ -59,6 +61,7 @@ impl RuntimeContext {
             cwd,
             dns_listen_addr,
             dns_enabled,
+            ebpf,
             restart,
         }
     }

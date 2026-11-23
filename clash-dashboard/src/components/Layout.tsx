@@ -1,14 +1,22 @@
 import { NavLink, Outlet } from 'react-router-dom';
 import { useQuery } from '@tanstack/react-query';
-import { getVersion } from '../lib/api';
+import { getEbpfStatus, getVersion } from '../lib/api';
 import {
   LayoutDashboard, Activity, Filter, Terminal,
-  Server, SlidersHorizontal, GitBranch, Shield,
+  Server, SlidersHorizontal, GitBranch, Shield, Cpu,
+  type LucideIcon,
 } from 'lucide-react';
 import logoUrl from '../assets/logo.png';
 import { ThemeToggle } from './ThemeToggle';
 
-const navItems = [
+interface NavItem {
+  to: string;
+  label: string;
+  icon: LucideIcon;
+  end?: boolean;
+}
+
+const baseNavItems: NavItem[] = [
   { to: '/', label: 'Overview', icon: LayoutDashboard, end: true },
   { to: '/flows', label: 'Flows', icon: GitBranch },
   { to: '/connections', label: 'Connections', icon: Activity },
@@ -19,6 +27,8 @@ const navItems = [
   { to: '/settings', label: 'Settings', icon: SlidersHorizontal },
 ];
 
+const ebpfNavItem: NavItem = { to: '/ebpf', label: 'eBPF', icon: Cpu };
+
 export function Layout() {
   const { data: version, error } = useQuery({
     queryKey: ['version'],
@@ -26,7 +36,16 @@ export function Layout() {
     refetchInterval: 10000,
     retry: 0,
   });
+  const { data: ebpfStatus } = useQuery({
+    queryKey: ['ebpf-status'],
+    queryFn: getEbpfStatus,
+    staleTime: 30000,
+    retry: 0,
+  });
   const isConnected = !!version && !error;
+  const navItems = ebpfStatus?.enabled
+    ? [...baseNavItems.slice(0, 6), ebpfNavItem, ...baseNavItems.slice(6)]
+    : baseNavItems;
 
   return (
     <div className="flex flex-col h-screen overflow-hidden">

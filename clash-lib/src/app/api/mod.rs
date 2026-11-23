@@ -7,7 +7,7 @@ use super::{dispatcher::StatisticsManager, logging::LogEvent};
 pub mod context;
 #[cfg(feature = "dashboard")]
 mod embedded_dashboard;
-mod handlers;
+pub(crate) mod handlers;
 mod ipc;
 mod middlewares;
 mod runner;
@@ -16,6 +16,7 @@ mod tcp;
 mod websocket;
 
 pub use context::RuntimeContext;
+pub use handlers::ebpf::EbpfInspectHandle;
 pub use handlers::restart::RestartController;
 pub use runner::ApiRunner;
 pub use stream_samplers::StreamSamplers;

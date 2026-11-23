@@ -9,6 +9,7 @@ import { Flows } from './pages/Flows';
 import { Rules } from './pages/Rules';
 import { Logs } from './pages/Logs';
 import { DNS } from './pages/DNS';
+import { Ebpf } from './pages/Ebpf';
 import { Settings } from './pages/Settings';
 
 const queryClient = new QueryClient({
@@ -39,6 +40,7 @@ export default function App() {
             <Route path="rules" element={<Rules />} />
             <Route path="logs" element={<Logs />} />
             <Route path="dns" element={<DNS />} />
+            <Route path="ebpf" element={<Ebpf />} />
             <Route path="settings" element={<Settings />} />
           </Route>
         </Routes>

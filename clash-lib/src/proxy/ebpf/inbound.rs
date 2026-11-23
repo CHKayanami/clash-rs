@@ -154,6 +154,10 @@ impl EbpfInbound {
         })
     }
 
+    pub fn offloader(&self) -> Option<DirectOffloader> {
+        self.offloader.clone()
+    }
+
     pub async fn stop(self) {
         if let Some(observer) = &self.route_observer {
             self.dispatcher.unregister_route_offload_observer(observer);

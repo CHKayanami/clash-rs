@@ -4,7 +4,7 @@ use tracing::{error, info};
 
 use crate::{
     Error,
-    app::{dispatcher::Dispatcher, dns::ThreadSafeDNSResolver},
+    app::{api::EbpfInspectHandle, dispatcher::Dispatcher, dns::ThreadSafeDNSResolver},
     config::def::EbpfConfig,
     proxy::ebpf::EbpfInbound,
     runner::{AsyncService, ServiceContext},
@@ -14,6 +14,7 @@ pub struct EbpfRunner {
     cfg: EbpfConfig,
     dispatcher: Arc<Dispatcher>,
     dns_resolver: ThreadSafeDNSResolver,
+    inspect: EbpfInspectHandle,
 }
 
 impl EbpfRunner {
@@ -21,11 +22,13 @@ impl EbpfRunner {
         cfg: EbpfConfig,
         dispatcher: Arc<Dispatcher>,
         dns_resolver: ThreadSafeDNSResolver,
+        inspect: EbpfInspectHandle,
     ) -> Self {
         Self {
             cfg,
             dispatcher,
             dns_resolver,
+            inspect,
         }
     }
 }
@@ -49,6 +52,8 @@ impl AsyncService for EbpfRunner {
             Error::Operation(format!("failed to init ebpf inbound: {e}"))
         })?;
 
+        self.inspect.set_offloader(inbound.offloader());
+        let inspect = self.inspect.clone();
         let cancel = ctx.cancellation_token().clone();
         ctx.spawn_critical("ebpf_inbound", async move {
             tokio::select! {
@@ -62,6 +67,7 @@ impl AsyncService for EbpfRunner {
                     error!("eBPF UDP inbound unexpectedly terminated");
                 }
             }
+            inspect.clear_offloader();
             inbound.stop().await;
         });
 

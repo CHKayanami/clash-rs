@@ -166,6 +166,10 @@ impl AsyncService for ApiRunner {
                 "/dns",
                 handlers::dns::routes(current_ctx.dns_resolver.clone()),
             )
+            .nest(
+                "/ebpf",
+                handlers::ebpf::routes(current_ctx.ebpf.clone()),
+            )
             .layer(middleware::from_fn(
                 middlewares::fix_json_content_type::fix_content_type,
             ))
