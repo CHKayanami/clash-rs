@@ -5,19 +5,25 @@
 //! and ECH GREASE.
 
 use std::io;
+use std::net::IpAddr;
 use std::sync::LazyLock;
 
 use anyhow::Context as _;
 use super::{encode_alpn, load_cert_and_key, parse_fingerprint_sha256};
 use boring::error::ErrorStack;
+use boring::hash::MessageDigest;
 use boring::pkey::PKey;
 use boring::ssl::{
-    CertificateCompressionAlgorithm, CertificateCompressor, ConnectConfiguration, SslConnector,
-    SslContextBuilder, SslMethod, SslVerifyMode, SslVersion,
+    CertificateCompressionAlgorithm, CertificateCompressor, Ssl, SslAlert, SslContext,
+    SslContextBuilder, SslMethod, SslMode, SslOptions, SslRef, SslVerifyError, SslVerifyMode,
+    SslVersion,
 };
 use boring::x509::X509;
 use boring::x509::store::{X509Store, X509StoreBuilder};
+use boring::x509::verify::X509CheckFlags;
 use foreign_types::ForeignTypeRef;
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio_boring::{SslStream as AsyncSslStream, SslStreamBuilder};
 
 // Chrome's TLS 1.3 signature-algorithm list (order matters).
 pub const CHROME_SIGALGS: &str = "ecdsa_secp256r1_sha256:rsa_pss_rsae_sha256:rsa_pkcs1_sha256:\
@@ -35,6 +41,10 @@ pub const CHROME_CIPHER_LIST: &str = "ECDHE-ECDSA-AES128-GCM-SHA256:\
      ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:\
      ECDHE-RSA-CHACHA20-POLY1305:ECDHE-RSA-AES128-SHA:ECDHE-RSA-AES256-SHA:\
      AES128-GCM-SHA256:AES256-GCM-SHA384:AES128-SHA:AES256-SHA";
+
+/// Default client TLS 1.2 cipher list (matches boring's `SslConnector::builder`).
+const DEFAULT_CIPHER_LIST: &str =
+    "DEFAULT:!aNULL:!eNULL:!MD5:!3DES:!DES:!RC4:!IDEA:!SEED:!aDSS:!SRP:!PSK";
 
 // BoringSSL group IDs (ssl.h) for SSL_set1_client_key_shares: Chrome sends
 // exactly two shares, MLKEM hybrid then X25519.
@@ -80,8 +90,7 @@ fn build_root_store() -> Result<X509Store, ErrorStack> {
 }
 
 /// Chrome sends two key shares: X25519MLKEM768 and X25519, in that order.
-fn set_chrome_key_shares(cfg: &mut ConnectConfiguration) -> anyhow::Result<()> {
-    let ssl: &boring::ssl::SslRef = cfg;
+fn set_chrome_key_shares(ssl: &mut SslRef) -> anyhow::Result<()> {
     let shares = [SSL_GROUP_X25519_MLKEM768, SSL_GROUP_X25519];
     let ok = unsafe {
         boring_sys::SSL_set1_client_key_shares(ssl.as_ptr(), shares.as_ptr(), shares.len())
@@ -94,8 +103,7 @@ fn set_chrome_key_shares(cfg: &mut ConnectConfiguration) -> anyhow::Result<()> {
 
 /// Chrome sends ALPS for h2 with an empty settings payload whenever ALPN
 /// offers h2. Chrome uses the old ALPS codepoint (0x4469) on TCP+h2.
-fn add_chrome_alps(cfg: &mut ConnectConfiguration) -> anyhow::Result<()> {
-    let ssl: &boring::ssl::SslRef = cfg;
+pub(crate) fn add_chrome_alps(ssl: &mut SslRef) -> anyhow::Result<()> {
     let ok = unsafe {
         boring_sys::SSL_set_alps_use_new_codepoint(ssl.as_ptr(), 0);
         boring_sys::SSL_add_application_settings(
@@ -115,19 +123,16 @@ fn add_chrome_alps(cfg: &mut ConnectConfiguration) -> anyhow::Result<()> {
 /// Custom verify callback matching the peer leaf certificate's SHA-256
 pub fn pin_sha256_custom_verify(
     pin: [u8; 32],
-) -> impl Fn(&mut boring::ssl::SslRef) -> Result<(), boring::ssl::SslVerifyError> + Send + Sync + 'static
-{
+) -> impl Fn(&mut SslRef) -> Result<(), SslVerifyError> + Send + Sync + 'static {
     move |ssl| {
         let matches = ssl
             .peer_certificate()
-            .and_then(|cert| cert.digest(boring::hash::MessageDigest::sha256()).ok())
+            .and_then(|cert| cert.digest(MessageDigest::sha256()).ok())
             .is_some_and(|digest| digest.as_ref() == pin);
         if matches {
             Ok(())
         } else {
-            Err(boring::ssl::SslVerifyError::Invalid(
-                boring::ssl::SslAlert::BAD_CERTIFICATE,
-            ))
+            Err(SslVerifyError::Invalid(SslAlert::BAD_CERTIFICATE))
         }
     }
 }
@@ -141,47 +146,85 @@ pub fn apply_chrome_ctx(builder: &mut SslContextBuilder) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub fn add_chrome_alps_public(cfg: &mut ConnectConfiguration) -> anyhow::Result<()> {
-    add_chrome_alps(cfg)
+pub fn configure_client_server_identity(
+    ssl: &mut SslRef,
+    domain: &str,
+) -> Result<(), ErrorStack> {
+    match domain.parse::<IpAddr>() {
+        Ok(ip) => {
+            let param = ssl.param_mut();
+            param.set_hostflags(X509CheckFlags::NO_PARTIAL_WILDCARDS);
+            param.set_ip(ip)?;
+        }
+        Err(_) => {
+            ssl.set_hostname(domain)?;
+            let param = ssl.param_mut();
+            param.set_hostflags(X509CheckFlags::NO_PARTIAL_WILDCARDS);
+            param.set_host(domain)?;
+        }
+    }
+    Ok(())
 }
 
-pub fn build_reality_connector(chrome: bool) -> anyhow::Result<SslConnector> {
-    let mut builder = SslConnector::builder(SslMethod::tls())?;
-    builder.set_min_proto_version(Some(SslVersion::TLS1_2))?;
-    builder.set_max_proto_version(Some(SslVersion::TLS1_3))?;
+pub fn build_reality_context(chrome: bool) -> anyhow::Result<SslContext> {
+    let mut builder = build_client_context_builder()?;
     builder.set_verify(SslVerifyMode::NONE);
     if chrome {
         apply_chrome_ctx(&mut builder)?;
-        builder.set_cipher_list(CHROME_CIPHER_LIST)?;
         builder.set_alpn_protos(CHROME_ALPN_WIRE)?;
         builder.enable_ocsp_stapling();
         builder.enable_signed_cert_timestamps();
+    } else {
+        builder.set_cipher_list(DEFAULT_CIPHER_LIST)?;
     }
     Ok(builder.build())
 }
 
-static REALITY_CONNECTOR_CHROME: LazyLock<anyhow::Result<SslConnector>> =
-    LazyLock::new(|| build_reality_connector(true));
+static REALITY_CONTEXT_CHROME: LazyLock<anyhow::Result<SslContext>> =
+    LazyLock::new(|| build_reality_context(true));
 
-static REALITY_CONNECTOR_PLAIN: LazyLock<anyhow::Result<SslConnector>> =
-    LazyLock::new(|| build_reality_connector(false));
+static REALITY_CONTEXT_PLAIN: LazyLock<anyhow::Result<SslContext>> =
+    LazyLock::new(|| build_reality_context(false));
 
-pub fn get_reality_connector(chrome: bool) -> anyhow::Result<&'static SslConnector> {
+pub fn get_reality_context(chrome: bool) -> anyhow::Result<&'static SslContext> {
     if chrome {
-        REALITY_CONNECTOR_CHROME
+        REALITY_CONTEXT_CHROME
             .as_ref()
             .map_err(|e| anyhow::anyhow!("{e}"))
     } else {
-        REALITY_CONNECTOR_PLAIN
+        REALITY_CONTEXT_PLAIN
             .as_ref()
             .map_err(|e| anyhow::anyhow!("{e}"))
     }
+}
+
+/// Builds a client `SslContextBuilder` with secure TLS options and I/O modes
+/// without loading system root CAs via `set_default_verify_paths`.
+fn build_client_context_builder() -> Result<SslContextBuilder, ErrorStack> {
+    let mut builder = SslContextBuilder::new(SslMethod::tls())?;
+    let mut opts = SslOptions::ALL
+        | SslOptions::NO_COMPRESSION
+        | SslOptions::NO_SSLV2
+        | SslOptions::NO_SSLV3
+        | SslOptions::SINGLE_DH_USE
+        | SslOptions::SINGLE_ECDH_USE;
+    opts &= !SslOptions::DONT_INSERT_EMPTY_FRAGMENTS;
+    builder.set_options(opts);
+    builder.set_mode(
+        SslMode::AUTO_RETRY
+            | SslMode::ACCEPT_MOVING_WRITE_BUFFER
+            | SslMode::ENABLE_PARTIAL_WRITE
+            | SslMode::RELEASE_BUFFERS,
+    );
+    builder.set_min_proto_version(Some(SslVersion::TLS1_2))?;
+    builder.set_max_proto_version(Some(SslVersion::TLS1_3))?;
+    Ok(builder)
 }
 
 /// BoringSSL connector carrying Chrome fingerprint settings and certificate options.
 #[derive(Clone)]
 pub struct BoringTlsConnector {
-    connector: SslConnector,
+    context: SslContext,
     chrome: bool,
     alps: bool,
 }
@@ -195,9 +238,7 @@ impl BoringTlsConnector {
         tls_cert: Option<&str>,
         tls_key: Option<&str>,
     ) -> anyhow::Result<Self> {
-        let mut builder = SslConnector::builder(SslMethod::tls())?;
-        builder.set_min_proto_version(Some(SslVersion::TLS1_2))?;
-        builder.set_max_proto_version(Some(SslVersion::TLS1_3))?;
+        let mut builder = build_client_context_builder()?;
 
         let pin = match fingerprint {
             Some(s) => Some(parse_fingerprint_sha256(s).ok_or_else(|| {
@@ -210,7 +251,7 @@ impl BoringTlsConnector {
             builder.set_verify(SslVerifyMode::NONE);
         } else {
             builder.set_verify(SslVerifyMode::PEER);
-            builder.set_verify_cert_store(root_store()?)?;
+            builder.set_cert_store(root_store()?);
         }
 
         if let Some(pin) = pin {
@@ -235,7 +276,10 @@ impl BoringTlsConnector {
 
         if chrome {
             apply_chrome_ctx(&mut builder)?;
+        } else {
+            builder.set_cipher_list(DEFAULT_CIPHER_LIST)?;
         }
+
         let offers_h2 = if let Some(protocols) = alpn {
             builder.set_alpn_protos(&encode_alpn(protocols)?)?;
             protocols.iter().any(|protocol| protocol == "h2")
@@ -247,50 +291,73 @@ impl BoringTlsConnector {
         };
 
         Ok(Self {
-            connector: builder.build(),
+            context: builder.build(),
             chrome,
             alps: chrome && offers_h2,
         })
     }
 
-    fn configuration(&self) -> anyhow::Result<ConnectConfiguration> {
-        let mut cfg = self.connector.configure()?;
+    fn configure_ssl(&self, domain: &str) -> anyhow::Result<Ssl> {
+        let mut ssl = Ssl::new(&self.context)?;
+        configure_client_server_identity(&mut ssl, domain)?;
         if self.chrome {
-            cfg.set_permute_extensions(true);
-            set_chrome_key_shares(&mut cfg)?;
+            ssl.set_permute_extensions(true);
+            set_chrome_key_shares(&mut ssl)?;
             if self.alps {
-                add_chrome_alps(&mut cfg)?;
+                add_chrome_alps(&mut ssl)?;
             }
-            cfg.set_enable_ech_grease(true);
+            ssl.set_enable_ech_grease(true);
         }
-        Ok(cfg)
+        Ok(ssl)
     }
 
     pub async fn connect<S>(
         &self,
         domain: &str,
         stream: S,
-    ) -> io::Result<tokio_boring::SslStream<S>>
+    ) -> io::Result<AsyncSslStream<S>>
     where
-        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+        S: AsyncRead + AsyncWrite + Unpin,
     {
-        let cfg = self
-            .configuration()
+        let ssl = self
+            .configure_ssl(domain)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
 
-        tokio_boring::connect(cfg, domain, stream).await.map_err(|e| {
-            let kind = e.as_io_error().map_or_else(
-                || if e.code().is_none() {
-                    io::ErrorKind::InvalidInput
-                } else {
-                    io::ErrorKind::InvalidData
-                },
-                io::Error::kind,
-            );
-            io::Error::new(
-                kind,
-                format!("BoringSSL TLS handshake with {domain} failed: {e}"),
-            )
+        SslStreamBuilder::new(ssl, stream)
+            .connect()
+            .await
+            .map_err(|e| {
+                let kind = e.as_io_error().map_or_else(
+                    || {
+                        if e.code().is_none() {
+                            io::ErrorKind::InvalidInput
+                        } else {
+                            io::ErrorKind::InvalidData
+                        }
+                    },
+                    io::Error::kind,
+                );
+                io::Error::new(
+                    kind,
+                    format!("BoringSSL TLS handshake with {domain} failed: {e}"),
+                )
+            })
+    }
+    #[cfg(test)]
+    fn new_with_store(chrome: bool, store: X509Store) -> anyhow::Result<Self> {
+        let mut builder = build_client_context_builder()?;
+        builder.set_verify(SslVerifyMode::PEER);
+        builder.set_cert_store(store);
+        if chrome {
+            apply_chrome_ctx(&mut builder)?;
+            builder.set_alpn_protos(CHROME_ALPN_WIRE)?;
+        } else {
+            builder.set_cipher_list(DEFAULT_CIPHER_LIST)?;
+        }
+        Ok(Self {
+            context: builder.build(),
+            chrome,
+            alps: chrome,
         })
     }
 }
@@ -302,10 +369,17 @@ mod mtls_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use boring::ssl::{SslAcceptor, SslStream};
+    use boring::ssl::{NameType, SslAcceptor, SslStream};
+    use boring::stack::StackRef;
+    use boring::x509::X509Object;
+    use rcgen::{
+        BasicConstraints, CertificateParams, DistinguishedName, DnType, IsCa, Issuer, KeyPair,
+        KeyUsagePurpose,
+    };
     use std::net::TcpListener;
     use std::thread;
     use tokio::io::{duplex, AsyncWriteExt};
+    use tokio_boring::accept;
 
     fn generate_test_cert() -> (String, String, [u8; 32]) {
         let mut params = rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
@@ -425,5 +499,117 @@ mod tests {
         drop(server);
         let error = connector.connect("localhost", client).await.err().unwrap();
         assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+    }
+
+    #[test]
+    fn reuses_shared_mozilla_root_store_without_loading_system_cas() {
+        let shared = root_store().unwrap();
+        let c1 = BoringTlsConnector::new(false, false, None, None, None, None).unwrap();
+        let c2 = BoringTlsConnector::new(true, false, None, None, None, None).unwrap();
+        let skip = BoringTlsConnector::new(false, true, None, None, None, None).unwrap();
+        let pin = "11".repeat(32);
+        let pinned = BoringTlsConnector::new(true, false, Some(&pin), None, None, None).unwrap();
+
+        unsafe {
+            assert_eq!(
+                boring_sys::SSL_CTX_get_cert_store(c1.context.as_ptr()),
+                shared.as_ptr()
+            );
+            assert_eq!(
+                boring_sys::SSL_CTX_get_cert_store(c2.context.as_ptr()),
+                shared.as_ptr()
+            );
+
+            for context in [
+                &skip.context,
+                &pinned.context,
+                get_reality_context(true).unwrap(),
+                get_reality_context(false).unwrap(),
+            ] {
+                let store = boring_sys::SSL_CTX_get_cert_store(context.as_ptr());
+                assert!(!store.is_null());
+                let objects = boring_sys::X509_STORE_get0_objects(store);
+                assert_eq!(StackRef::<X509Object>::from_ptr(objects).len(), 0);
+            }
+        }
+    }
+
+    fn generate_ca_and_leaf(san: &str) -> (X509Store, SslAcceptor) {
+        let mut ca_params = CertificateParams::default();
+        ca_params.distinguished_name.push(DnType::CommonName, "test-ca");
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        ca_params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+        let ca_key = KeyPair::generate().unwrap();
+        let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+
+        let mut leaf_params = CertificateParams::new(vec![san.to_string()]).unwrap();
+        leaf_params.distinguished_name = DistinguishedName::new();
+        let leaf_key = KeyPair::generate().unwrap();
+        let leaf_cert = leaf_params
+            .signed_by(&leaf_key, &Issuer::from_params(&ca_params, &ca_key))
+            .unwrap();
+
+        let mut store_builder = X509StoreBuilder::new().unwrap();
+        store_builder
+            .add_cert(X509::from_der(ca_cert.der()).unwrap())
+            .unwrap();
+
+        let mut acceptor = SslAcceptor::mozilla_intermediate(SslMethod::tls()).unwrap();
+        acceptor
+            .set_certificate(&X509::from_der(leaf_cert.der()).unwrap())
+            .unwrap();
+        let pkey = PKey::private_key_from_pem(leaf_key.serialize_pem().as_bytes()).unwrap();
+        acceptor.set_private_key(&pkey).unwrap();
+
+        (store_builder.build(), acceptor.build())
+    }
+
+    #[tokio::test]
+    async fn verifies_dns_sni_and_hostname() {
+        let (store, acceptor) = generate_ca_and_leaf("example.test");
+        let connector = BoringTlsConnector::new_with_store(true, store).unwrap();
+
+        let (client_io, server_io) = duplex(65536);
+        let (client, server) = tokio::join!(
+            connector.connect("example.test", client_io),
+            accept(&acceptor, server_io),
+        );
+        let _client = client.unwrap();
+        let server = server.unwrap();
+        assert_eq!(
+            server.ssl().servername(NameType::HOST_NAME),
+            Some("example.test")
+        );
+
+        let (client_io, server_io) = duplex(65536);
+        let (client, _server) = tokio::join!(
+            connector.connect("wrong.test", client_io),
+            accept(&acceptor, server_io),
+        );
+        let err = client.err().expect("hostname mismatch must fail");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn verifies_ip_cert_without_sni() {
+        let (store, acceptor) = generate_ca_and_leaf("127.0.0.1");
+        let connector = BoringTlsConnector::new_with_store(false, store).unwrap();
+
+        let (client_io, server_io) = duplex(65536);
+        let (client, server) = tokio::join!(
+            connector.connect("127.0.0.1", client_io),
+            accept(&acceptor, server_io),
+        );
+        let _client = client.unwrap();
+        let server = server.unwrap();
+        assert_eq!(server.ssl().servername(NameType::HOST_NAME), None);
+
+        let (client_io, server_io) = duplex(65536);
+        let (client, _server) = tokio::join!(
+            connector.connect("127.0.0.2", client_io),
+            accept(&acceptor, server_io),
+        );
+        let err = client.err().expect("IP mismatch must fail");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 }

@@ -14,7 +14,7 @@ use std::{
 };
 
 
-use crate::{common::tls::validate_alpn,
+use crate::{common::tls::encode_alpn,
     proxy::{AnyStream, transport::{SplicableTlsStream, Transport, VisionOptions}}};
 
 use handshake::reality_connect;
@@ -32,8 +32,11 @@ struct RealityConfig {
     short_id: [u8; 8],
     /// SNI sent in the ClientHello.
     server_name: String,
-    /// Explicit ALPN override; `None` keeps the fingerprint defaults.
-    alpn: Option<Vec<String>>,
+    /// Pre-encoded ALPN wire bytes; `None` keeps the fingerprint defaults,
+    /// while `Some(vec![])` explicitly disables ALPN.
+    alpn_wire: Option<Vec<u8>>,
+    /// Whether Chrome ALPS should be attached for h2.
+    alps: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -56,15 +59,25 @@ impl Client {
         chrome: bool,
         alpn: Option<Vec<String>>,
     ) -> io::Result<Self> {
-        if let Some(protocols) = &alpn {
-            validate_alpn(protocols)?;
-        }
+        let (alpn_wire, offers_h2) = match &alpn {
+            Some(protocols) => (
+                Some(encode_alpn(protocols)?),
+                protocols.iter().any(|protocol| protocol == "h2"),
+            ),
+            None => (None, chrome),
+        };
         if sni.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput, "SNI hostname cannot be empty",
             ));
         }
-        let config = RealityConfig { public_key, short_id, server_name: sni, alpn };
+        let config = RealityConfig {
+            public_key,
+            short_id,
+            server_name: sni,
+            alpn_wire,
+            alps: chrome && offers_h2,
+        };
         Ok(Self(Arc::new(ClientInner {
             config,
             chrome,

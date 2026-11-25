@@ -1,5 +1,6 @@
 use super::*;
 use super::super::Client;
+use crate::common::tls::encode_alpn;
 use base64::{Engine as _, engine::general_purpose};
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
@@ -14,6 +15,39 @@ fn reality_client_rejects_empty_sni_before_connecting() {
     assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
 }
 
+#[test]
+fn reality_client_preencodes_alpn_and_alps_flag() {
+    let default_chrome = Client::new("localhost".into(), [7; 32], [0; 8], true, None).unwrap();
+    assert_eq!(default_chrome.0.config.alpn_wire, None);
+    assert!(default_chrome.0.config.alps);
+
+    let empty_chrome = Client::new("localhost".into(), [7; 32], [0; 8], true, Some(vec![])).unwrap();
+    assert_eq!(empty_chrome.0.config.alpn_wire, Some(Vec::new()));
+    assert!(!empty_chrome.0.config.alps);
+
+    let h1_chrome = Client::new(
+        "localhost".into(),
+        [7; 32],
+        [0; 8],
+        true,
+        Some(vec!["http/1.1".into()]),
+    )
+    .unwrap();
+    assert_eq!(h1_chrome.0.config.alpn_wire, Some(b"\x08http/1.1".to_vec()));
+    assert!(!h1_chrome.0.config.alps);
+
+    let h2_plain = Client::new(
+        "localhost".into(),
+        [7; 32],
+        [0; 8],
+        false,
+        Some(vec!["h2".into()]),
+    )
+    .unwrap();
+    assert_eq!(h2_plain.0.config.alpn_wire, Some(b"\x02h2".to_vec()));
+    assert!(!h2_plain.0.config.alps);
+}
+
 #[tokio::test]
 async fn reality_alpn_is_present_in_client_hello() {
     for chrome in [false, true] {
@@ -25,10 +59,14 @@ async fn reality_alpn_is_present_in_client_hello() {
                 None if chrome => b"\x02h2\x08http/1.1".to_vec(),
                 None => Vec::new(),
             };
-            let config = RealityConfig {
-                server_name: "localhost".to_owned(), public_key: [7; 32],
-                short_id: [0; 8], alpn: protocols,
-            };
+            let client_cfg = Client::new(
+                "localhost".to_owned(),
+                [7; 32],
+                [0; 8],
+                chrome,
+                protocols,
+            )
+            .unwrap();
             let (client, mut server) = tokio::io::duplex(8192);
             let capture = async move {
                 let mut header = [0; 5];
@@ -65,7 +103,7 @@ async fn reality_alpn_is_present_in_client_hello() {
             };
             let (result, offered) = timeout(
                 Duration::from_secs(5), async {
-                    tokio::join!(reality_connect(client, &config, chrome), capture)
+                    tokio::join!(reality_connect(client, &client_cfg.0.config, chrome), capture)
                 },
             ).await.unwrap();
             assert!(result.is_err()); // The capture peer does not complete TLS.
@@ -135,4 +173,21 @@ fn session_id_binds_full_client_hello() {
     let (sid_b, _) =
         reality_session_id(&eph_priv, &server_pub, &client_random, &short_id, 1, &msg).unwrap();
     assert_ne!(sid_a, sid_b);
+}
+
+#[test]
+fn extract_auth_key_rejects_missing_state_and_underived_key() {
+    let context = get_reality_context(false).unwrap();
+    let ssl = Ssl::new(context).unwrap();
+
+    let missing_err = extract_auth_key(&ssl).unwrap_err();
+    assert_eq!(missing_err.kind(), io::ErrorKind::InvalidData);
+    assert!(missing_err.to_string().contains("state missing"));
+
+    let client = Client::new("localhost".into(), [7; 32], [0; 8], false, None).unwrap();
+    setup_reality_ssl(&ssl, &client.0.config).unwrap();
+
+    let underived_err = extract_auth_key(&ssl).unwrap_err();
+    assert_eq!(underived_err.kind(), io::ErrorKind::InvalidData);
+    assert!(underived_err.to_string().contains("not derived"));
 }

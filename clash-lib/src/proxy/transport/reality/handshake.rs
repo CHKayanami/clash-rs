@@ -10,14 +10,17 @@ use std::{
 use anyhow::Context as _;
 use boring::error::ErrorStack;
 use boring::pkey::Id;
-use boring::ssl::SslRef;
+use boring::ssl::{Ssl, SslRef};
 use foreign_types::ForeignTypeRef as _;
 use hkdf::Hkdf;
 use hmac::{Hmac, KeyInit, Mac};
 use sha2::{Sha256, Sha512};
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio_boring::{SslStream, SslStreamBuilder};
 
-use crate::common::tls::{encode_alpn,
-    boring::{add_chrome_alps_public, get_reality_connector}};
+use crate::common::tls::boring::{
+    add_chrome_alps, configure_client_server_identity, get_reality_context,
+};
 use super::RealityConfig;
 
 const SSL_GROUP_X25519: u16 = 29;
@@ -30,36 +33,37 @@ pub(super) async fn reality_connect<S>(
     stream: S,
     config: &RealityConfig,
     chrome: bool,
-) -> io::Result<tokio_boring::SslStream<S>>
+) -> io::Result<SslStream<S>>
 where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    S: AsyncRead + AsyncWrite + Unpin,
 {
-    let connector = get_reality_connector(chrome)
+    let context = get_reality_context(chrome)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
-    let mut cfg = connector
-        .configure()
+    let mut ssl = Ssl::new(context)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
 
-    if let Some(protocols) = &config.alpn {
-        cfg.set_alpn_protos(&encode_alpn(protocols)?)
+    configure_client_server_identity(&mut ssl, &config.server_name)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
+
+    if let Some(alpn_wire) = &config.alpn_wire {
+        ssl.set_alpn_protos(alpn_wire)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
     }
 
     if chrome {
-        cfg.set_permute_extensions(true);
-        cfg.set_enable_ech_grease(true);
-        if config.alpn.as_ref().is_none_or(|protocols| {
-            protocols.iter().any(|protocol| protocol == "h2")
-        }) {
-            add_chrome_alps_public(&mut cfg)
+        ssl.set_permute_extensions(true);
+        ssl.set_enable_ech_grease(true);
+        if config.alps {
+            add_chrome_alps(&mut ssl)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
         }
     }
 
-    setup_reality_ssl(&cfg, config)
+    setup_reality_ssl(&ssl, config)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
 
-    let tls = tokio_boring::connect(cfg, &config.server_name, stream)
+    let tls = SslStreamBuilder::new(ssl, stream)
+        .connect()
         .await
         .map_err(|e| {
             io::Error::new(
@@ -68,9 +72,16 @@ where
             )
         })?;
 
+    let auth_key = extract_auth_key(tls.ssl())?;
+    verify_server_certificate(tls.ssl(), &auth_key)
+        .map_err(|e| io::Error::new(io::ErrorKind::PermissionDenied, e.to_string()))?;
+
+    Ok(tls)
+}
+
+fn extract_auth_key(ssl: &SslRef) -> io::Result<[u8; 32]> {
     let state = unsafe {
-        boring_sys::SSL_get_ex_data(tls.ssl().as_ptr(), reality_ex_index())
-            .cast::<RealityHandshake>()
+        boring_sys::SSL_get_ex_data(ssl.as_ptr(), reality_ex_index()).cast::<RealityHandshake>()
     };
     if state.is_null() {
         return Err(io::Error::new(
@@ -78,11 +89,12 @@ where
             "REALITY ClientHello fixup state missing",
         ));
     }
-    let auth_key = unsafe { (*state).auth_key };
-    verify_server_certificate(tls.ssl(), &auth_key)
-        .map_err(|e| io::Error::new(io::ErrorKind::PermissionDenied, e.to_string()))?;
-
-    Ok(tls)
+    unsafe { (*state).auth_key }.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "REALITY authentication key was not derived",
+        )
+    })
 }
 
 fn reality_session_id(
@@ -124,7 +136,7 @@ struct RealityHandshake {
     eph_priv: [u8; 32],
     server_pub: [u8; 32],
     short_id: [u8; 8],
-    auth_key: [u8; 32],
+    auth_key: Option<[u8; 32]>,
 }
 
 fn reality_ex_index() -> c_int {
@@ -182,7 +194,7 @@ extern "C" fn reality_fixup_cb(ssl: *mut boring_sys::SSL, msg: *mut u8, msg_len:
             Some((session_id, auth_key)) => {
                 msg[SESSION_ID_OFFSET..SESSION_ID_OFFSET + SESSION_ID_LEN]
                     .copy_from_slice(&session_id);
-                state.auth_key = auth_key;
+                state.auth_key = Some(auth_key);
                 1
             }
             None => 0,
@@ -201,7 +213,7 @@ ecdsa_secp384r1_sha384:rsa_pss_rsae_sha384:rsa_pkcs1_sha384:rsa_pss_rsae_sha512:
         eph_priv: [0u8; 32],
         server_pub: config.public_key,
         short_id: config.short_id,
-        auth_key: [0u8; 32],
+        auth_key: None,
     });
     let ok = unsafe { boring_sys::RAND_bytes(state.eph_priv.as_mut_ptr(), state.eph_priv.len()) };
     if ok != 1 {
