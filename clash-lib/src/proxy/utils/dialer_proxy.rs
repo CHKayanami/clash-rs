@@ -108,8 +108,17 @@ impl DialerProxyConnector {
 
 impl DialerProxyConnector {
     pub fn outbound_dependency(&self) -> Option<OutboundNode> {
-        self.local.as_ref().and_then(Weak::upgrade)
-            .and_then(|registry| registry.load().entries.get(self.name.as_ref()).cloned())
+        self.local
+            .as_ref()
+            .and_then(Weak::upgrade)
+            .and_then(|registry| {
+                registry.load().entries.get(self.name.as_ref()).cloned()
+            })
+            .or_else(|| {
+                self.registry
+                    .upgrade()
+                    .and_then(|registry| registry.load().get(self.name.as_ref()).cloned())
+            })
     }
     pub fn clone_connector(&self) -> Arc<RemoteConnector> {
         let mut connector = self.clone();

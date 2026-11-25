@@ -139,6 +139,34 @@ pub struct Config {
 }
 
 impl Config {
+    pub(crate) fn referenced_outbounds(&self) -> HashSet<String> {
+        if let Some(ref d2) = self.dns2
+            && d2.enable
+        {
+            return d2.referenced_outbounds();
+        }
+        let mut out = HashSet::new();
+        let collect = |list: &[NameServer], out: &mut HashSet<String>| {
+            for ns in list {
+                if let Some(proxy) = ns.proxy.as_deref()
+                    && !proxy.is_empty()
+                {
+                    out.insert(proxy.to_owned());
+                }
+            }
+        };
+        collect(&self.nameserver, &mut out);
+        collect(&self.fallback, &mut out);
+        collect(&self.default_nameserver, &mut out);
+        if let Some(ref proxy_ns) = self.proxy_server_nameserver {
+            collect(proxy_ns, &mut out);
+        }
+        for nss in self.nameserver_policy.values() {
+            collect(nss, &mut out);
+        }
+        out
+    }
+
     pub fn parse_nameserver(servers: &[String]) -> Result<Vec<NameServer>, Error> {
         let mut nameservers = vec![];
 

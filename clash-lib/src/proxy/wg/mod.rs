@@ -15,6 +15,7 @@ use crate::{
     impl_default_connector,
     session::Session,
 };
+use arc_swap::ArcSwapOption;
 use erased_serde::Serialize as ErasedSerialize;
 use futures::TryFutureExt;
 use ipnet::IpNet;
@@ -23,9 +24,15 @@ use std::{
     collections::HashMap,
     io,
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
-    sync::Arc,
+    sync::{
+        Arc, Weak,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
 };
-use tokio::sync::OnceCell;
+use tokio::{
+    sync::{Mutex, mpsc},
+    task::JoinHandle,
+};
 
 mod device;
 mod events;
@@ -53,12 +60,120 @@ pub struct HandlerOptions {
     pub reserved_bits: Option<Vec<u8>>,
 }
 
-struct Inner {
+const WG_CLOSING_BIT: usize = 1usize << (usize::BITS - 1);
+
+pub(super) struct Inner {
     device_manager: Arc<device::DeviceManager>,
     #[allow(unused)]
-    wg_handle: tokio::task::JoinHandle<()>,
+    wg_handle: JoinHandle<()>,
     #[allow(unused)]
-    device_manager_handle: tokio::task::JoinHandle<()>,
+    device_manager_handle: JoinHandle<()>,
+    active_streams: AtomicUsize,
+    keep_idle: Arc<AtomicBool>,
+    cache_slot: Weak<ArcSwapOption<Inner>>,
+}
+
+impl Inner {
+    fn try_acquire_lease(self: &Arc<Self>) -> Option<StreamLease> {
+        self.active_streams
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |val| {
+                if val & WG_CLOSING_BIT != 0 {
+                    None
+                } else {
+                    Some(val + 1)
+                }
+            })
+            .ok()
+            .map(|_| StreamLease(self.clone()))
+    }
+
+    fn evict_from_cache(self: &Arc<Self>) {
+        if let Some(slot) = self.cache_slot.upgrade() {
+            let _ = slot.rcu(|current| match current {
+                Some(cached) if Arc::ptr_eq(cached, self) => None,
+                _ => current.clone(),
+            });
+        }
+    }
+
+    fn release_lease(self: &Arc<Self>) {
+        let keep_idle = self.keep_idle.load(Ordering::SeqCst);
+        let mut evict = false;
+        let mut became_zero = false;
+        let _ = self.active_streams.try_update(
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+            |val| {
+                let closing = (val & WG_CLOSING_BIT) != 0;
+                let count = (val & !WG_CLOSING_BIT).saturating_sub(1);
+                let next_closing = closing || (!keep_idle && count == 0);
+                evict = !closing && next_closing;
+                became_zero = !next_closing && count == 0;
+                Some(if next_closing {
+                    WG_CLOSING_BIT | count
+                } else {
+                    count
+                })
+            },
+        );
+        if evict {
+            self.evict_from_cache();
+        } else if became_zero && !self.keep_idle.load(Ordering::SeqCst) {
+            self.close_if_idle();
+        }
+    }
+
+    fn close_if_idle(self: &Arc<Self>) {
+        if self
+            .active_streams
+            .compare_exchange(
+                0,
+                WG_CLOSING_BIT,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_ok()
+        {
+            self.evict_from_cache();
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn new_for_test(
+        device_manager: Arc<device::DeviceManager>,
+        wg_handle: JoinHandle<()>,
+        device_manager_handle: JoinHandle<()>,
+        keep_idle: Arc<AtomicBool>,
+        cache_slot: Weak<ArcSwapOption<Inner>>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            device_manager,
+            wg_handle,
+            device_manager_handle,
+            active_streams: AtomicUsize::new(0),
+            keep_idle,
+            cache_slot,
+        })
+    }
+
+    #[cfg(test)]
+    pub(super) fn is_closing(&self) -> bool {
+        (self.active_streams.load(Ordering::Acquire) & WG_CLOSING_BIT) != 0
+    }
+}
+
+pub(crate) struct StreamLease(Arc<Inner>);
+
+impl std::fmt::Debug for StreamLease {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StreamLease").finish()
+    }
+}
+
+impl Drop for StreamLease {
+    fn drop(&mut self) {
+        self.0.release_lease();
+    }
 }
 
 impl Drop for Inner {
@@ -70,7 +185,9 @@ impl Drop for Inner {
 
 pub struct Handler {
     opts: HandlerOptions,
-    inner: OnceCell<Inner>,
+    inner: Arc<ArcSwapOption<Inner>>,
+    init_lock: Mutex<()>,
+    keep_idle: Arc<AtomicBool>,
 
     connector: Option<Arc<RemoteConnector>>,
 }
@@ -85,6 +202,15 @@ impl std::fmt::Debug for Handler {
 
 impl_default_connector!(Handler);
 
+impl Drop for Handler {
+    fn drop(&mut self) {
+        self.keep_idle.store(false, Ordering::SeqCst);
+        if let Some(inner) = self.inner.swap(None) {
+            inner.close_if_idle();
+        }
+    }
+}
+
 impl Handler {
     pub fn new(
         opts: HandlerOptions,
@@ -92,148 +218,160 @@ impl Handler {
     ) -> Self {
         Self {
             opts,
-            inner: OnceCell::new(),
+            inner: Arc::new(ArcSwapOption::empty()),
+            init_lock: Mutex::new(()),
+            keep_idle: Arc::new(AtomicBool::new(true)),
             connector,
         }
     }
 
-    /// this is a one time initialization, however in theory sess.so_mark
-    /// and sess.iface should be all the same
-    /// ideally we move the so_mark and iface to a global context
+    /// Initialize or return the cached WireGuard tunnel and smoltcp device
+    /// manager together with a stream lease that covers the full dial path.
     async fn initialize_inner(
         &self,
         resolver: ThreadSafeDNSResolver,
         sess: &Session,
-    ) -> Result<&Inner, Error> {
-        self.inner
-            .get_or_try_init(|| async {
-                let recv_pair = tokio::sync::mpsc::channel(1024);
-                let send_pair = tokio::sync::mpsc::channel(1024);
-                let server_ip = resolver
-                    .resolve(&self.opts.server, false)
-                    .await
-                    .map_err(map_io_error)?
-                    .ok_or(new_io_error(
-                        format!("invalid remote server: {}", self.opts.server)
-                            .as_str(),
-                    ))?;
-                let allowed_ips = self
+    ) -> Result<(Arc<Inner>, StreamLease), Error> {
+        if let Some(inner) = self.inner.load_full()
+            && let Some(lease) = inner.try_acquire_lease()
+        {
+            return Ok((inner, lease));
+        }
+        let _guard = self.init_lock.lock().await;
+        if let Some(inner) = self.inner.load_full()
+            && let Some(lease) = inner.try_acquire_lease()
+        {
+            return Ok((inner, lease));
+        }
+
+        let recv_pair = mpsc::channel(1024);
+        let send_pair = mpsc::channel(1024);
+        let server_ip = resolver
+            .resolve(&self.opts.server, false)
+            .await
+            .map_err(map_io_error)?
+            .ok_or(new_io_error(
+                format!("invalid remote server: {}", self.opts.server).as_str(),
+            ))?;
+        let allowed_ips = self
+            .opts
+            .allowed_ips
+            .as_ref()
+            .map(|ips| {
+                ips.iter()
+                    .map(|ip| {
+                        ip.parse::<IpNet>().map_err(|e| {
+                            new_io_error(format!("invalid allowed ip: {e}").as_str())
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .transpose()?
+            .unwrap_or_default();
+
+        let wg = wireguard::WireguardTunnel::new(
+            Config {
+                private_key: self
                     .opts
-                    .allowed_ips
+                    .private_key
+                    .parse::<KeyBytes>()
+                    .map_err(|e| Error::InvalidConfig(format!("invalid WireGuard private key: {e}")))?
+                    .0
+                    .into(),
+                endpoint_public_key: self
+                    .opts
+                    .public_key
+                    .parse::<KeyBytes>()
+                    .map_err(|e| Error::InvalidConfig(format!("invalid WireGuard public key: {e}")))?
+                    .0
+                    .into(),
+                pre_shared_key: self
+                    .opts
+                    .pre_shared_key
                     .as_ref()
-                    .map(|ips| {
-                        ips.iter()
-                            .map(|ip| {
-                                ip.parse::<IpNet>().map_err(|e| {
-                                    new_io_error(
-                                        format!("invalid allowed ip: {e}").as_str(),
-                                    )
-                                })
+                    .map(|s| {
+                        s.parse::<KeyBytes>()
+                            .map(|key| key.0.into())
+                            .map_err(|e| Error::InvalidConfig(format!("invalid WireGuard pre-shared key: {e}")))
+                    })
+                    .transpose()?,
+                remote_endpoint: (server_ip, self.opts.port).into(),
+                source_peer_ip: self.opts.ip,
+                source_peer_ipv6: self.opts.ipv6,
+                keepalive_seconds: Some(10),
+                allowed_ips,
+                reserved_bits: match &self.opts.reserved_bits {
+                    Some(bits) if bits.len() >= 3 => [bits[0], bits[1], bits[2]],
+                    _ => [0, 0, 0],
+                },
+            },
+            recv_pair.0,
+            send_pair.1,
+            resolver.clone(),
+            self.connector.clone(),
+            sess,
+        )
+        .await
+        .map_err(map_io_error)?;
+
+        let wg_handle = tokio::spawn(async move {
+            wg.start_polling().await;
+        });
+
+        // use to notify the device manager to poll sockets
+        let packet_notifier = tokio::sync::mpsc::channel(1024);
+
+        let device = device::VirtualIpDevice::new(
+            send_pair.0,
+            recv_pair.1,
+            packet_notifier.0,
+            self.opts.mtu.unwrap_or(1420) as usize,
+        );
+
+        let device_manager = Arc::new(device::DeviceManager::new(
+            self.opts.ip,
+            self.opts.ipv6,
+            resolver,
+            if self.opts.remote_dns_resolve {
+                self.opts
+                    .dns
+                    .as_ref()
+                    .map(|server| {
+                        server
+                            .iter()
+                            .map(|s| {
+                                s.parse::<IpAddr>()
+                                    .map(|ip| (ip, 53).into())
+                                    .map_err(|e| Error::InvalidConfig(format!("invalid WireGuard DNS server {s}: {e}")))
                             })
                             .collect::<Result<Vec<_>, _>>()
                     })
                     .transpose()?
-                    .unwrap_or_default();
+                    .unwrap_or_default()
+            } else {
+                vec![]
+            },
+            packet_notifier.1,
+        ));
 
-                let wg = wireguard::WireguardTunnel::new(
-                    Config {
-                        private_key: self
-                            .opts
-                            .private_key
-                            .parse::<KeyBytes>()
-                            .map_err(|e| Error::InvalidConfig(format!("invalid WireGuard private key: {e}")))?
-                            .0
-                            .into(),
-                        endpoint_public_key: self
-                            .opts
-                            .public_key
-                            .parse::<KeyBytes>()
-                            .map_err(|e| Error::InvalidConfig(format!("invalid WireGuard public key: {e}")))?
-                            .0
-                            .into(),
-                        pre_shared_key: self
-                            .opts
-                            .pre_shared_key
-                            .as_ref()
-                            .map(|s| {
-                                s.parse::<KeyBytes>()
-                                    .map(|key| key.0.into())
-                                    .map_err(|e| Error::InvalidConfig(format!("invalid WireGuard pre-shared key: {e}")))
-                            })
-                            .transpose()?,
-                        remote_endpoint: (server_ip, self.opts.port).into(),
-                        source_peer_ip: self.opts.ip,
-                        source_peer_ipv6: self.opts.ipv6,
-                        keepalive_seconds: Some(10),
-                        allowed_ips,
-                        reserved_bits: match &self.opts.reserved_bits {
-                            Some(bits) if bits.len() >= 3 => {
-                                [bits[0], bits[1], bits[2]]
-                            }
-                            _ => [0, 0, 0],
-                        },
-                    },
-                    recv_pair.0,
-                    send_pair.1,
-                    resolver.clone(),
-                    self.connector.clone(),
-                    sess,
-                )
-                .await
-                .map_err(map_io_error)?;
+        let device_manager_clone = device_manager.clone();
+        let device_manager_handle = tokio::spawn(async move {
+            device_manager_clone.poll_sockets(device).await;
+        });
 
-                let wg_handle = tokio::spawn(async move {
-                    wg.start_polling().await;
-                });
-
-                // use to notify the device manager to poll sockets
-                let packet_notifier = tokio::sync::mpsc::channel(1024);
-
-                let device = device::VirtualIpDevice::new(
-                    send_pair.0,
-                    recv_pair.1,
-                    packet_notifier.0,
-                    self.opts.mtu.unwrap_or(1420) as usize,
-                );
-
-                let device_manager = Arc::new(device::DeviceManager::new(
-                    self.opts.ip,
-                    self.opts.ipv6,
-                    resolver,
-                    if self.opts.remote_dns_resolve {
-                        self.opts
-                            .dns
-                            .as_ref()
-                            .map(|server| {
-                                server
-                                    .iter()
-                                    .map(|s| {
-                                        s.parse::<IpAddr>()
-                                            .map(|ip| (ip, 53).into())
-                                            .map_err(|e| Error::InvalidConfig(format!("invalid WireGuard DNS server {s}: {e}")))
-                                    })
-                                    .collect::<Result<Vec<_>, _>>()
-                            })
-                            .transpose()?
-                            .unwrap_or_default()
-                    } else {
-                        vec![]
-                    },
-                    packet_notifier.1,
-                ));
-
-                let device_manager_clone = device_manager.clone();
-                let device_manager_handle = tokio::spawn(async move {
-                    device_manager_clone.poll_sockets(device).await;
-                });
-
-                Ok(Inner {
-                    device_manager,
-                    wg_handle,
-                    device_manager_handle,
-                })
-            })
-            .await
+        let inner = Arc::new(Inner {
+            device_manager,
+            wg_handle,
+            device_manager_handle,
+            active_streams: AtomicUsize::new(0),
+            keep_idle: self.keep_idle.clone(),
+            cache_slot: Arc::downgrade(&self.inner),
+        });
+        let lease = inner
+            .try_acquire_lease()
+            .expect("fresh wireguard tunnel must accept initial lease");
+        self.inner.store(Some(inner.clone()));
+        Ok((inner, lease))
     }
 }
 
@@ -260,7 +398,7 @@ impl OutboundHandler for Handler {
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
     ) -> io::Result<AnyStream> {
-        let inner = self
+        let (inner, lease) = self
             .initialize_inner(resolver.clone(), sess)
             .await
             .map_err(map_io_error)?;
@@ -301,7 +439,10 @@ impl OutboundHandler for Handler {
             ));
         }
 
-        let socket = inner.device_manager.new_tcp_socket(remote).await;
+        let socket = inner
+            .device_manager
+            .new_tcp_socket_with_lease(remote, lease)
+            .await;
         sess.push_chain(self.name());
         Ok(AnyStream::new(socket))
     }
@@ -312,17 +453,32 @@ impl OutboundHandler for Handler {
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
     ) -> io::Result<AnyOutboundDatagram> {
-        let inner = self
+        let (inner, lease) = self
             .initialize_inner(resolver, sess)
             .await
             .map_err(map_io_error)?;
 
-        let socket = inner.device_manager.new_udp_socket().await;
+        let socket = inner
+            .device_manager
+            .new_udp_socket()
+            .await
+            .with_lease(lease);
         sess.push_chain(self.name());
         Ok(AnyOutboundDatagram::new(socket))
     }
 
+    fn set_keep_idle(&self, keep: bool) {
+        self.keep_idle.store(keep, Ordering::SeqCst);
+        if !keep {
+            self.close_idle_connections();
+        }
+    }
 
+    fn close_idle_connections(&self) {
+        if let Some(inner) = self.inner.load_full() {
+            inner.close_if_idle();
+        }
+    }
 
 }
 

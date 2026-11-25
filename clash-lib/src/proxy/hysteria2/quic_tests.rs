@@ -1,4 +1,11 @@
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    sync::{
+        Arc, Weak,
+        atomic::{AtomicBool, AtomicUsize},
+    },
+    time::Duration,
+};
 
 use bytes::{Bytes, BytesMut};
 use futures::{SinkExt, StreamExt, future::poll_fn};
@@ -88,7 +95,13 @@ async fn hysteria_native_batch_roundtrip_and_close() {
 async fn hysteria_native_batch_validation_preserves_prefix_and_suffix() {
     let (_client, _server, raw, peer) = pair().await;
     let conn = Arc::new(HysteriaConnection {
-        conn: Arc::new(raw), udp_sessions: Arc::new(Mutex::new(HashMap::new())),
+        conn: Arc::new(raw),
+        _preface: None,
+        udp_sessions: Arc::new(Mutex::new(HashMap::new())),
+        active_streams: AtomicUsize::new(0),
+        keep_idle: Arc::new(AtomicBool::new(true)),
+        evicted: AtomicBool::new(false),
+        cache_slot: Weak::new(),
         udp_mtu: Some(40),
     });
     let mut udp = HysteriaDatagramOutbound::new(10, conn.clone(), SocksAddr::any_ipv4());
@@ -127,7 +140,14 @@ async fn hysteria_native_batch_validation_preserves_prefix_and_suffix() {
 async fn hysteria_native_send_failure_removes_session() {
     let (_client, _server, raw, _peer) = pair().await;
     let conn = Arc::new(HysteriaConnection {
-        conn: Arc::new(raw), udp_sessions: Arc::new(Mutex::new(HashMap::new())), udp_mtu: None,
+        conn: Arc::new(raw),
+        _preface: None,
+        udp_sessions: Arc::new(Mutex::new(HashMap::new())),
+        active_streams: AtomicUsize::new(0),
+        keep_idle: Arc::new(AtomicBool::new(true)),
+        evicted: AtomicBool::new(false),
+        cache_slot: Weak::new(),
+        udp_mtu: None,
     });
     let mut udp = HysteriaDatagramOutbound::new(9, conn.clone(), SocksAddr::any_ipv4());
     conn.conn.close(0u32.into(), b"test closed");
@@ -144,9 +164,7 @@ mod tuic {
     use super::*;
     use futures::FutureExt;
     use std::io::ErrorKind;
-    use std::{sync::atomic::AtomicU16, thread};
-    use parking_lot::RwLock;
-    use uuid::Uuid;
+    use std::thread;
     use crate::proxy::tuic::{
         TuicDatagramOutbound,
         proto::{decode_packet_frame, encode_dissociate, fragment::FragmentReassembler},
@@ -154,13 +172,7 @@ mod tuic {
     };
 
     fn connection(raw: Connection, mode: UdpRelayMode) -> Arc<TuicConnection> {
-        Arc::new(TuicConnection {
-            conn: raw, uuid: Uuid::nil(), password: Arc::from([]),
-            udp_relay_mode: mode,
-            udp_sessions: Arc::new(RwLock::new(HashMap::new())),
-            next_pkt_id: AtomicU16::new(u16::MAX),
-            fragments: Mutex::new(FragmentReassembler::default()),
-        })
+        TuicConnection::new_for_test(raw, mode, u16::MAX)
     }
 
     #[tokio::test]
@@ -297,5 +309,172 @@ mod tuic {
             assert_eq!(stream.read_to_end(32).await.unwrap(), encode_dissociate(6));
         }).await.unwrap();
         assert!(!conn.udp_sessions.read().contains_key(&6));
+    }
+
+    #[tokio::test]
+    async fn quic_udp_mode_drains_queued_packets_before_idle_close() {
+        let (_client, _server, raw, peer) = pair().await;
+        let conn = connection(raw, UdpRelayMode::Quic);
+        let mut udp = TuicDatagramOutbound::new(15, conn.clone(), SocksAddr::any_ipv4());
+        conn.set_keep_idle_for_test(false);
+
+        let dst: SocksAddr = "127.0.0.1:5353".parse().unwrap();
+        let payloads: Vec<Bytes> = (0u8..4)
+            .map(|i| Bytes::from(format!("tuic-quic-udp-queued-packet-{i}")))
+            .collect();
+        for payload in &payloads {
+            udp.send(UdpPacket {
+                data: payload.clone(),
+                dst_addr: dst.clone(),
+                ..UdpPacket::default()
+            })
+            .await
+            .unwrap();
+        }
+        // Drop immediately after queueing multiple packets; the background
+        // sender task owns the lease and must drain all uni-streams and
+        // dissociate before closing the idle QUIC connection.
+        drop(udp);
+
+        timeout(Duration::from_secs(5), async {
+            let mut received_payloads = Vec::new();
+            let mut saw_dissociate = false;
+            for _ in 0..(payloads.len() + 1) {
+                let mut stream = peer.accept_uni().await.unwrap();
+                let wire = stream.read_to_end(65536).await.unwrap();
+                if wire == encode_dissociate(15) {
+                    saw_dissociate = true;
+                } else {
+                    let packet = decode_packet_frame(Bytes::from(wire)).unwrap();
+                    assert_eq!(packet.assoc_id, 15);
+                    received_payloads.push(packet.payload);
+                }
+            }
+            assert!(saw_dissociate, "expected dissociate frame");
+            received_payloads.sort();
+            let mut expected = payloads.clone();
+            expected.sort();
+            assert_eq!(received_payloads, expected);
+            conn.conn.closed().await;
+        })
+        .await
+        .expect("all queued UDP packets and dissociate must drain before idle close");
+        assert!(conn.conn.close_reason().is_some());
+    }
+
+    #[tokio::test]
+    async fn quic_udp_blocked_dissociate_times_out_and_closes_idle_conn() {
+        let (_client, _server, raw, _peer) = pair().await;
+        let conn = connection(raw, UdpRelayMode::Quic);
+        conn.set_drain_timeout_for_test(Duration::from_millis(120));
+        let udp = TuicDatagramOutbound::new(16, conn.clone(), SocksAddr::any_ipv4());
+        conn.set_keep_idle_for_test(false);
+
+        // Exhaust uni-stream credit so `send_dissociate`'s `open_uni().await`
+        // blocks; the cleanup timeout must still release the lease and close
+        // the idle connection without manual intervention.
+        let mut streams = Vec::new();
+        for _ in 0..256 {
+            match conn.conn.open_uni().now_or_never() {
+                Some(stream) => streams.push(stream.unwrap()),
+                None => break,
+            }
+        }
+        assert!(conn.conn.open_uni().now_or_never().is_none());
+
+        drop(udp);
+
+        timeout(Duration::from_secs(2), conn.conn.closed())
+            .await
+            .expect("blocked dissociate must time out and release the last lease");
+        assert!(!conn.udp_sessions.read().contains_key(&16));
+        assert!(conn.conn.close_reason().is_some());
+    }
+
+    #[tokio::test]
+    async fn quic_udp_blocked_send_packet_times_out_and_closes_idle_conn() {
+        let (_client, _server, raw, _peer) = pair().await;
+        let conn = connection(raw, UdpRelayMode::Quic);
+        conn.set_drain_timeout_for_test(Duration::from_millis(120));
+        let mut udp = TuicDatagramOutbound::new(17, conn.clone(), SocksAddr::any_ipv4());
+        conn.set_keep_idle_for_test(false);
+
+        // Exhaust uni-stream credit BEFORE queueing a packet so the background
+        // task blocks inside `send_stream_packet().await` (`open_uni().await`).
+        let mut streams = Vec::new();
+        for _ in 0..256 {
+            match conn.conn.open_uni().now_or_never() {
+                Some(stream) => streams.push(stream.unwrap()),
+                None => break,
+            }
+        }
+        assert!(conn.conn.open_uni().now_or_never().is_none());
+
+        udp.send(UdpPacket {
+            data: Bytes::from_static(b"blocked-on-open-uni"),
+            dst_addr: "127.0.0.1:5353".parse().unwrap(),
+            ..UdpPacket::default()
+        })
+        .await
+        .unwrap();
+        // Give the background task a turn to pull the packet and block in send_stream_packet.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        drop(udp);
+
+        timeout(Duration::from_secs(2), conn.conn.closed())
+            .await
+            .expect("blocked send_stream_packet must time out after UDP drop");
+        assert!(!conn.udp_sessions.read().contains_key(&17));
+        assert!(conn.conn.close_reason().is_some());
+    }
+
+    #[tokio::test]
+    async fn udp_keep_idle_switch_during_teardown_still_drains_packets() {
+        let (_client, _server, raw, peer) = pair().await;
+        let conn = connection(raw, UdpRelayMode::Quic);
+        let mut udp = TuicDatagramOutbound::new(18, conn.clone(), SocksAddr::any_ipv4());
+        // Keep `keep_idle == true` when dropping UDP, then immediately switch
+        // policy to `false`. The teardown task must still await ACKs and grace
+        // before releasing the last lease.
+        let payload = Bytes::from_static(b"packet-during-policy-switch");
+        udp.send(UdpPacket {
+            data: payload.clone(),
+            dst_addr: "127.0.0.1:5353".parse().unwrap(),
+            ..UdpPacket::default()
+        })
+        .await
+        .unwrap();
+        drop(udp);
+        conn.set_keep_idle_for_test(false);
+
+        // Delay peer reads to prove the grace window stays active even though
+        // `keep_idle` was `true` when teardown began.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(
+            conn.conn.close_reason().is_none(),
+            "connection must not close before peer reads packet and dissociate"
+        );
+
+        timeout(Duration::from_secs(5), async {
+            let mut got_packet = false;
+            let mut got_dissociate = false;
+            for _ in 0..2 {
+                let mut stream = peer.accept_uni().await.unwrap();
+                let wire = stream.read_to_end(65536).await.unwrap();
+                if wire == encode_dissociate(18) {
+                    got_dissociate = true;
+                } else {
+                    let pkt = decode_packet_frame(Bytes::from(wire)).unwrap();
+                    assert_eq!(pkt.assoc_id, 18);
+                    assert_eq!(pkt.payload, payload);
+                    got_packet = true;
+                }
+            }
+            assert!(got_packet && got_dissociate);
+            conn.conn.closed().await;
+        })
+        .await
+        .expect("teardown must drain even when keep_idle flips during cleanup");
     }
 }

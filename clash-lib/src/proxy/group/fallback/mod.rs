@@ -11,9 +11,9 @@ use crate::{
         ProxyManager, providers::proxy_provider::ArcProxyProvider,
     },
     proxy::{
-        OutboundNode, HandlerCommonOptions, OutboundType,
+        HandlerCommonOptions, OutboundNode, OutboundType,
         group::GroupProxyAPIResponse,
-        utils::provider_helper::Providers,
+        utils::provider_helper::{MemberUrls, Providers},
     },
     session::Session,
 };
@@ -42,11 +42,43 @@ impl Debug for Handler {
 impl Handler {
     pub(crate) fn select_cached(&self) -> Option<OutboundNode> { self.find_alive_proxy(false) }
 
+    pub(crate) fn peek_selected_from(
+        &self,
+        proxies: &[OutboundNode],
+        urls: &MemberUrls,
+    ) -> Option<OutboundNode> {
+        self.find_alive_proxy_in(proxies, urls)
+    }
+
+    pub(crate) fn providers(&self) -> &Providers {
+        &self.providers
+    }
+
+    pub(crate) fn route_changes_from(
+        &self,
+        proxies: &[OutboundNode],
+        urls: &MemberUrls,
+        sources: &mut Vec<RouteChange>,
+    ) {
+        self.providers.route_changes(sources);
+        let fallback_url = self.opts.common_opts.url.as_deref();
+        sources.extend(proxies.iter().enumerate().map(|(index, node)| {
+            self.proxy_manager.route_changes_for(
+                node,
+                urls.url_at(index, fallback_url),
+                false,
+            )
+        }));
+    }
+
     pub fn new(
         opts: HandlerOptions,
         providers: Vec<ArcProxyProvider>,
         proxy_manager: ProxyManager,
     ) -> Self {
+        if let Some(url) = opts.common_opts.url.as_deref() {
+            proxy_manager.register_probe_url(url);
+        }
         Self {
             opts,
             providers: Providers::new(providers),
@@ -59,9 +91,19 @@ impl Handler {
     }
 
     fn find_alive_proxy(&self, touch: bool) -> Option<OutboundNode> {
-        let proxies = self.get_proxies(touch);
-        for proxy in proxies.iter() {
-            if self.proxy_manager.alive(proxy.name()) {
+        let (proxies, urls) = self.providers.get_members(touch);
+        self.find_alive_proxy_in(&proxies, &urls)
+    }
+
+    fn find_alive_proxy_in(
+        &self,
+        proxies: &[OutboundNode],
+        urls: &MemberUrls,
+    ) -> Option<OutboundNode> {
+        let fallback_url = self.opts.common_opts.url.as_deref();
+        for (index, proxy) in proxies.iter().enumerate() {
+            let probe_url = urls.url_at(index, fallback_url);
+            if self.proxy_manager.alive_for(proxy, probe_url) {
                 debug!("`{}` fallback to `{}`", self.name(), proxy.name());
                 return Some(proxy.clone());
             }
@@ -72,10 +114,8 @@ impl Handler {
 
 impl GroupHandler for Handler {
     fn route_changes(&self, sources: &mut Vec<RouteChange>) {
-        self.providers.route_changes(sources);
-        sources.extend(self.providers.get_proxies(false).iter().map(|node|
-            self.proxy_manager.route_changes(node.name(), false),
-        ));
+        let (proxies, urls) = self.providers.get_members(false);
+        self.route_changes_from(&proxies, &urls, sources);
     }
 
     fn name(&self) -> &str {

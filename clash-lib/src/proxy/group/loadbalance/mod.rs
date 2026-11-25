@@ -13,7 +13,7 @@ use crate::{
     },
     config::internal::proxy::LoadBalanceStrategy,
     proxy::{
-        OutboundNode, HandlerCommonOptions, OutboundType,
+        HandlerCommonOptions, OutboundNode, OutboundType, RouteChange,
         group::GroupProxyAPIResponse,
         utils::provider_helper::Providers,
     },
@@ -50,6 +50,9 @@ impl Handler {
         providers: Vec<ArcProxyProvider>,
         proxy_manager: ProxyManager,
     ) -> Self {
+        if let Some(url) = opts.common_opts.url.as_deref() {
+            proxy_manager.register_probe_url(url);
+        }
         let strategy_fn = match opts.strategy {
             LoadBalanceStrategy::ConsistentHashing => strategy_consistent_hashring(),
             LoadBalanceStrategy::RoundRobin => strategy_rr(),
@@ -65,24 +68,33 @@ impl Handler {
         }
     }
 
+    pub(crate) fn providers(&self) -> &Providers {
+        &self.providers
+    }
+
     fn get_proxies(&self, touch: bool) -> Arc<Vec<OutboundNode>> {
         self.providers.get_proxies(touch)
     }
 
     /// Run the configured strategy over the group's current members.
     fn pick(&self, sess: &Session) -> io::Result<OutboundNode> {
-        let proxies = self.get_proxies(false);
+        let (proxies, urls) = self.providers.get_members(false);
         if proxies.is_empty() {
             return Err(io::Error::other(format!(
                 "no proxy available for {}",
                 self.name()
             )));
         }
-        self.strategy_fn.pick(proxies, sess)
+        self.strategy_fn
+            .pick(proxies, &urls, self.opts.common_opts.url.as_deref(), sess)
     }
 }
 
 impl GroupHandler for Handler {
+    fn route_changes(&self, sources: &mut Vec<RouteChange>) {
+        self.providers.route_changes(sources);
+    }
+
     fn name(&self) -> &str {
         &self.opts.name
     }

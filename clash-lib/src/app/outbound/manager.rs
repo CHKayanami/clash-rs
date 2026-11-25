@@ -1,5 +1,7 @@
 #[cfg(test)]
 use arc_swap::ArcSwap;
+#[cfg(test)]
+use crate::proxy::utils::provider_helper::MemberUrls;
 use super::{
     dependencies::{validate, validate_plain},
     utils::proxy_groups_dag_sort,
@@ -31,7 +33,7 @@ use crate::{
                 http_vehicle,
                 proxy_provider::{
                     ArcProxyProvider, FilteredProxyProvider, PlainProvider,
-                    ProxySetProvider,
+                    ProxySetProvider, provider_identity,
                 },
             },
         },
@@ -263,6 +265,47 @@ impl OutboundManager {
         self.proxy_providers.clone()
     }
 
+    pub(crate) fn registry_snapshot(&self) -> Arc<HashMap<String, OutboundNode>> {
+        self.registry.load_full()
+    }
+
+    pub(crate) fn capture_provider_snapshots(
+        &self,
+    ) -> HashMap<usize, Arc<Vec<OutboundNode>>> {
+        self.proxy_providers
+            .values()
+            .map(|provider| (provider_identity(provider), provider.proxies()))
+            .collect()
+    }
+
+    pub(crate) fn invalidate_stale_provider_caches(&self) {
+        for provider in self.proxy_providers.values() {
+            provider.invalidate_stale_cache();
+        }
+        for node in self.registry.load().values() {
+            if let Some(group) = node.as_group() {
+                group.invalidate_stale_provider_caches();
+            }
+        }
+        self.proxy_manager.prune_dead_targets();
+    }
+
+    pub fn collect_provider_route_changes(&self) -> Vec<RouteChange> {
+        let mut raw: Vec<RouteChange> = self
+            .proxy_providers
+            .values()
+            .filter_map(|provider| provider.route_changes())
+            .collect();
+        for node in self.registry.load().values() {
+            if let Some(group) = node.as_group() {
+                group.provider_route_changes(&mut raw);
+            }
+        }
+        let mut seen = HashSet::with_capacity(raw.len());
+        raw.retain(|change| seen.insert(change.identity()));
+        raw
+    }
+
     pub fn collect_group_route_changes(&self) -> Vec<RouteChange> {
         let mut raw = Vec::new();
         for node in self.registry.load().values() {
@@ -273,6 +316,94 @@ impl OutboundManager {
         let mut seen = HashSet::with_capacity(raw.len());
         raw.retain(|change| seen.insert(change.identity()));
         raw
+    }
+
+    /// Computes both the active protocol outbound IDs and the full protocol
+    /// outbound set from a single fixed provider snapshot generation, using
+    /// read-only group selection inspection so tracking never mutates sticky
+    /// group state (such as `url-test` hysteresis).
+    #[cfg(test)]
+    pub(crate) fn snapshot_idle_keep_state(
+        &self,
+        root_targets: &[String],
+    ) -> (HashSet<usize>, Vec<OutboundNode>) {
+        let registry = self.registry.load_full();
+        let provider_snapshots = self.capture_provider_snapshots();
+
+        let mut seen = HashSet::new();
+        let mut all_protocols = Vec::new();
+        let mut record_protocol = |node: &OutboundNode| {
+            if node.as_protocol().is_some() && seen.insert(node.identity()) {
+                all_protocols.push(node.clone());
+            }
+        };
+
+        for node in registry.values() {
+            record_protocol(node);
+        }
+        for snapshot in provider_snapshots.values() {
+            for node in snapshot.iter() {
+                record_protocol(node);
+            }
+        }
+
+        let mut group_members: HashMap<usize, (Arc<Vec<OutboundNode>>, MemberUrls)> =
+            HashMap::new();
+        for node in registry.values() {
+            if let Some(group) = node.as_group() {
+                let (members, urls) =
+                    group.members_from_snapshots(&provider_snapshots);
+                for member in members.iter() {
+                    record_protocol(member);
+                }
+                group_members.insert(node.identity(), (members, urls));
+            }
+        }
+
+        let mut queue: Vec<OutboundNode> = root_targets
+            .iter()
+            .filter_map(|name| registry.get(name).cloned())
+            .collect();
+        let mut visited = HashSet::with_capacity(queue.len());
+        let mut active_protocols = HashSet::new();
+
+        while let Some(node) = queue.pop() {
+            if !visited.insert(node.identity()) {
+                continue;
+            }
+            match &node {
+                OutboundNode::Protocol(_) => {
+                    let id = node.identity();
+                    active_protocols.insert(id);
+                    record_protocol(&node);
+                    if let Some(dep) = node.dialer_dependency().or_else(|| {
+                        node.support_dialer()
+                            .and_then(|name| registry.get(name).cloned())
+                    }) {
+                        queue.push(dep);
+                    }
+                }
+                OutboundNode::Group(group) => {
+                    let Some((members, urls)) = group_members.get(&node.identity())
+                    else {
+                        continue;
+                    };
+                    if group.stable_selection() {
+                        if let Some(selected) =
+                            group.peek_selected_from(members, urls)
+                        {
+                            queue.push(selected);
+                        }
+                    } else {
+                        for member in members.iter() {
+                            queue.push(member.clone());
+                        }
+                    }
+                }
+            }
+        }
+
+        (active_protocols, all_protocols)
     }
 
     #[cfg(all(target_os = "linux", feature = "ebpf"))]
@@ -289,8 +420,19 @@ impl OutboundManager {
 
     #[cfg(test)]
     pub fn new_for_test(handlers: HashMap<String, OutboundNode>) -> Self {
+        let proxy_manager = ProxyManager::new(
+            Arc::new(crate::app::dns::MockClashResolver::new()),
+            None,
+        );
+        Self::new_for_test_with_proxy_manager(handlers, proxy_manager)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_for_test_with_proxy_manager(
+        handlers: HashMap<String, OutboundNode>,
+        proxy_manager: ProxyManager,
+    ) -> Self {
         let registry = Arc::new(ArcSwap::from_pointee(handlers));
-        let proxy_manager = ProxyManager::new(Arc::new(crate::app::dns::MockClashResolver::new()), None);
         Self {
             registry,
             proxy_providers: HashMap::new(),

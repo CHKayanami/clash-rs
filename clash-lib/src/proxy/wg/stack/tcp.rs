@@ -1,17 +1,23 @@
-use std::fmt::Debug;
+use std::{
+    cmp::min,
+    fmt::Debug,
+    io,
+    pin::Pin,
+    task::{Context, Poll},
+};
 
 use bytes::{Bytes, BytesMut};
-
 use tokio::{
-    io::{AsyncRead, AsyncWrite},
+    io::{AsyncRead, AsyncWrite, ReadBuf},
     sync::mpsc::{Receiver, Sender},
 };
+use tokio_util::sync::PollSender;
 use tracing::trace;
 
 #[derive(Debug)]
 pub struct SocketPair {
     pub read: Receiver<Bytes>,
-    pub write: Sender<Bytes>,
+    write: PollSender<Bytes>,
 
     read_buf: BytesMut,
 }
@@ -20,7 +26,7 @@ impl SocketPair {
     pub fn new(read: Receiver<Bytes>, write: Sender<Bytes>) -> Self {
         Self {
             read,
-            write,
+            write: PollSender::new(write),
             read_buf: BytesMut::new(),
         }
     }
@@ -30,24 +36,24 @@ impl crate::proxy::ProxyStream for SocketPair {}
 
 impl AsyncRead for SocketPair {
     fn poll_read(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &mut tokio::io::ReadBuf<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
         if !self.read_buf.is_empty() {
-            let len = std::cmp::min(self.read_buf.len(), buf.remaining());
+            let len = min(self.read_buf.len(), buf.remaining());
             buf.put_slice(&self.read_buf.split_to(len));
             trace!(
                 "reusing cached data sent {}, left {}",
                 len,
                 self.read_buf.len()
             );
-            return std::task::Poll::Ready(Ok(()));
+            return Poll::Ready(Ok(()));
         }
 
         match self.read.poll_recv(cx) {
-            std::task::Poll::Ready(Some(data)) => {
-                let len = std::cmp::min(data.len(), buf.remaining());
+            Poll::Ready(Some(data)) => {
+                let len = min(data.len(), buf.remaining());
                 buf.put_slice(&data[..len]);
                 self.read_buf.extend_from_slice(&data[len..]);
                 trace!(
@@ -56,37 +62,56 @@ impl AsyncRead for SocketPair {
                     len,
                     self.read_buf.len()
                 );
-                std::task::Poll::Ready(Ok(()))
+                Poll::Ready(Ok(()))
             }
-            std::task::Poll::Ready(None) => std::task::Poll::Ready(Ok(())),
-            std::task::Poll::Pending => std::task::Poll::Pending,
+            Poll::Ready(None) => Poll::Ready(Ok(())),
+            Poll::Pending => Poll::Pending,
         }
     }
 }
 
 impl AsyncWrite for SocketPair {
     fn poll_write(
-        self: std::pin::Pin<&mut Self>,
-        _cx: &mut std::task::Context<'_>,
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
         buf: &[u8],
-    ) -> std::task::Poll<Result<usize, std::io::Error>> {
-        match self.write.try_send(buf.to_owned().into()) {
-            Ok(_) => std::task::Poll::Ready(Ok(buf.len())),
-            Err(_) => std::task::Poll::Pending,
+    ) -> Poll<Result<usize, io::Error>> {
+        if buf.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+        match self.write.poll_reserve(cx) {
+            Poll::Ready(Ok(())) => {
+                if self.write.send_item(Bytes::copy_from_slice(buf)).is_ok() {
+                    Poll::Ready(Ok(buf.len()))
+                } else {
+                    Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "wireguard tcp socket closed",
+                    )))
+                }
+            }
+            Poll::Ready(Err(_)) => Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "wireguard tcp socket closed",
+            ))),
+            Poll::Pending => Poll::Pending,
         }
     }
 
     fn poll_flush(
-        self: std::pin::Pin<&mut Self>,
-        _cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Result<(), std::io::Error>> {
-        std::task::Poll::Ready(Ok(()))
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+    ) -> Poll<Result<(), io::Error>> {
+        Poll::Ready(Ok(()))
     }
 
     fn poll_shutdown(
-        self: std::pin::Pin<&mut Self>,
-        _cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Result<(), std::io::Error>> {
-        std::task::Poll::Ready(Ok(()))
+        mut self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+    ) -> Poll<Result<(), io::Error>> {
+        // Closing the write channel lets the forwarding task drain every
+        // previously accepted payload before signaling graceful TCP FIN.
+        self.write.close();
+        Poll::Ready(Ok(()))
     }
 }

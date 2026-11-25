@@ -21,7 +21,10 @@ use smoltcp::{
     time::Instant,
     wire::IpCidr,
 };
-use tokio::sync::mpsc::{Receiver, Sender};
+use tokio::{
+    sync::mpsc::{Receiver, Sender, error::TrySendError},
+    time::Instant as TokioInstant,
+};
 use tracing::{Instrument, debug, error, trace, trace_span, warn};
 
 use crate::{
@@ -29,6 +32,7 @@ use crate::{
 };
 
 use super::{
+    StreamLease,
     events::PortProtocol,
     ports::PortPool,
     stack::{
@@ -37,6 +41,14 @@ use super::{
     },
 };
 
+/// Upper bound for draining a dropped WireGuard TCP socket so an unresponsive
+/// peer cannot hold the final tunnel lease indefinitely.
+const WG_TCP_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
+/// Short grace window once the peer has ACKed our FIN (`FinWait2`) so a peer
+/// that keeps its send side open after reading our upload does not pin the
+/// tunnel for the full drain timeout.
+const WG_TCP_FIN_WAIT2_GRACE: Duration = Duration::from_secs(1);
+
 #[allow(clippy::large_enum_variant)]
 enum Socket {
     Tcp(
@@ -44,6 +56,7 @@ enum Socket {
         SocketAddr,
         Sender<Bytes>,
         Receiver<Bytes>,
+        Option<StreamLease>,
     ),
     Udp(udp::Socket<'static>, Sender<UdpPacket>, Receiver<UdpPacket>),
 }
@@ -53,8 +66,20 @@ enum Transfer {
     Udp(SocketHandle, UdpPacket, bool),
 }
 
+struct TcpSocketEntry {
+    sender: Sender<Bytes>,
+    /// Kept alive until smoltcp finishes transmitting queued writes and
+    /// closing the virtual TCP socket (or the bounded drain timeout expires).
+    _lease: Option<StreamLease>,
+    /// Set only once the ordered forwarding task delivers the write-EOF marker
+    /// (`active == false`), guaranteeing every write accepted before shutdown
+    /// or drop has already been enqueued into `tcp_queue`.
+    write_eof_received: bool,
+    drain_deadline: Option<TokioInstant>,
+}
+
 enum SenderType {
-    Tcp(Sender<Bytes>),
+    Tcp(TcpSocketEntry),
     Udp(Sender<UdpPacket>),
 }
 
@@ -75,6 +100,8 @@ pub struct DeviceManager {
     receivers: Mutex<Option<DeviceReceivers>>,
 
     socket_notifier: Sender<Socket>,
+    tcp_drain_timeout: Duration,
+    tcp_fin_wait2_grace: Duration,
 }
 
 impl DeviceManager {
@@ -105,18 +132,48 @@ impl DeviceManager {
                 packet_notifier, socket_notifier_receiver,
             })),
             socket_notifier,
+            tcp_drain_timeout: WG_TCP_DRAIN_TIMEOUT,
+            tcp_fin_wait2_grace: WG_TCP_FIN_WAIT2_GRACE,
         }
     }
 
+    #[cfg(test)]
+    pub(super) fn with_tcp_drain_timeouts(
+        mut self,
+        drain_timeout: Duration,
+        fin_wait2_grace: Duration,
+    ) -> Self {
+        self.tcp_drain_timeout = drain_timeout;
+        self.tcp_fin_wait2_grace = fin_wait2_grace;
+        self
+    }
+
+    #[cfg(test)]
     pub async fn new_tcp_socket(&self, remote: SocketAddr) -> SocketPair {
+        self.new_tcp_socket_inner(remote, None).await
+    }
+
+    pub(super) async fn new_tcp_socket_with_lease(
+        &self,
+        remote: SocketAddr,
+        lease: StreamLease,
+    ) -> SocketPair {
+        self.new_tcp_socket_inner(remote, Some(lease)).await
+    }
+
+    async fn new_tcp_socket_inner(
+        &self,
+        remote: SocketAddr,
+        lease: Option<StreamLease>,
+    ) -> SocketPair {
         let socket = Self::new_client_socket();
         let read_pair = tokio::sync::mpsc::channel(1024);
         let write_pair = tokio::sync::mpsc::channel(1024);
 
-        self.socket_notifier
-            .send(Socket::Tcp(socket, remote, read_pair.0, write_pair.1))
-            .await
-            .unwrap();
+        let _ = self
+            .socket_notifier
+            .send(Socket::Tcp(socket, remote, read_pair.0, write_pair.1, lease))
+            .await;
         SocketPair::new(read_pair.1, write_pair.0)
     }
 
@@ -249,7 +306,7 @@ impl DeviceManager {
                     trace!("got new socket, notifying to poll sockets");
 
                     match socket {
-                        Socket::Tcp(mut socket, remote, sender, mut receiver) => {
+                        Socket::Tcp(mut socket, remote, sender, mut receiver, lease) => {
                             socket
                             .connect(
                                 iface.context(),
@@ -273,16 +330,29 @@ impl DeviceManager {
                                         }
                                     };
                                     trace!("sending {} bytes", data.len());
-                                    device_sender.send(Transfer::Tcp(handle, data, true)).await.unwrap();
+                                    if device_sender
+                                        .send(Transfer::Tcp(handle, data, true))
+                                        .await
+                                        .is_err()
+                                    {
+                                        return;
+                                    }
                                 }
                                 trace!("socket {} closed, sending close signal", handle);
-                                device_sender
+                                let _ = device_sender
                                     .send(Transfer::Tcp(handle, Vec::new().into(), false))
-                                    .await
-                                    .unwrap();
+                                    .await;
                             });
 
-                            socket_pairs.insert(handle, SenderType::Tcp(sender));
+                            socket_pairs.insert(
+                                handle,
+                                SenderType::Tcp(TcpSocketEntry {
+                                    sender,
+                                    _lease: lease,
+                                    write_eof_received: false,
+                                    drain_deadline: None,
+                                }),
+                            );
                             tcp_queue.insert(handle, VecDeque::new());
                         }
                         Socket::Udp(socket, sender, mut receiver) => {
@@ -298,17 +368,19 @@ impl DeviceManager {
                                         }
                                     };
 
-                                    device_sender
+                                    if device_sender
                                         .send(Transfer::Udp(handle, data, true))
                                         .await
-                                        .unwrap();
+                                        .is_err()
+                                    {
+                                        return;
+                                    }
                                 }
 
                                 trace!("socket {} closed, sending close signal", handle);
-                                device_sender
-                                    .send(Transfer::Udp(handle, UdpPacket::default() , false))
-                                    .await
-                                    .unwrap();
+                                let _ = device_sender
+                                    .send(Transfer::Udp(handle, UdpPacket::default(), false))
+                                    .await;
                             });
 
                             socket_pairs.insert(handle, SenderType::Udp(sender));
@@ -328,6 +400,12 @@ impl DeviceManager {
                 Some(transfer) = device_receiver.recv() => {
                     match transfer {
                         Transfer::Tcp(handle, data, active) => {
+                            if !active
+                                && let Some(SenderType::Tcp(entry)) =
+                                    socket_pairs.get_mut(&handle)
+                            {
+                                entry.write_eof_received = true;
+                            }
                             if let Some(queue) = tcp_queue.get_mut(&handle) {
                                 queue.push_back((data, active));
                                 next_poll = None;
@@ -368,25 +446,38 @@ impl DeviceManager {
                     let _ = trace_span!("poll_sockets").enter();
 
                     let timestamp = Instant::now();
+                    let now = TokioInstant::now();
                     iface.poll(timestamp, &mut device, &mut sockets);
+
+                    let mut need_immediate_poll = false;
+                    let mut earliest_drain_deadline: Option<TokioInstant> = None;
 
                     for (handle, sender) in socket_pairs.iter_mut() {
                         match sender {
-                            SenderType::Tcp(sender) => {
+                            SenderType::Tcp(entry) => {
                                 let socket = sockets.get_mut::<tcp::Socket>(*handle);
                                 if socket.may_recv() {
                                     match socket.recv(|data| (data.len(), data.to_owned())) {
-                                        Ok(data) if !data.is_empty() => match sender.try_send(data.into()) {
-                                            Ok(_) => {}
-                                            Err(_) => {
-                                                trace!("socket {} closed from remote(?), aboring connection", handle);
-                                                socket.abort();
+                                        Ok(data) if !data.is_empty() => {
+                                            if !entry.sender.is_closed() {
+                                                match entry.sender.try_send(data.into()) {
+                                                    Ok(_) => {}
+                                                    Err(TrySendError::Closed(_)) => {
+                                                        // Local stream dropped while draining; discard
+                                                        // downlink bytes without aborting so pending
+                                                        // outbound data and FIN still complete.
+                                                    }
+                                                    Err(TrySendError::Full(_)) => {
+                                                        trace!("socket {} rx channel full, aborting connection", handle);
+                                                        socket.abort();
+                                                        need_immediate_poll = true;
+                                                    }
+                                                }
                                             }
-                                        },
+                                        }
                                         Ok(_) => {}
                                         Err(RecvError::Finished) => {
                                             warn!("tcp socket finished");
-                                            continue;
                                         }
                                         Err(e) => {
                                             warn!("failed to receive tcp packet: {:?}", e);
@@ -395,36 +486,81 @@ impl DeviceManager {
                                 }
 
                                 if socket.may_send()
-                                    && let Some(queue) = tcp_queue.get_mut(handle) {
-                                        let data = queue.pop_front();
-                                        match data { Some((to_transfer_slice, active)) => {
-                                            if !active {
-                                                trace!("socket {} closed from local(?), aboring socket", handle);
-                                                socket.abort();
-                                            } else {
-                                                let total = to_transfer_slice.len();
-                                                trace!("socket {} sending {} bytes", handle, total);
-                                                match socket.send_slice(&to_transfer_slice) {
-                                                    Ok(sent) => {
-                                                        if sent < total {
-                                                            // Sometimes only a subset is sent, so the rest needs to be sent on the next poll
-                                                            let tx_extra = Vec::from(&to_transfer_slice[sent..total]);
-                                                            queue.push_front((tx_extra.into(), true));
-                                                        }
-                                                    }
-                                                    Err(e) => {
-                                                        error!(
-                                                            "Failed to send slice via virtual client socket: {:?}",
-                                                            e
-                                                        );
-                                                    }
+                                    && let Some(queue) = tcp_queue.get_mut(handle)
+                                {
+                                    while let Some((to_transfer_slice, active)) = queue.pop_front() {
+                                        if !active {
+                                            trace!("socket {} local write closed, initiating graceful TCP close", handle);
+                                            socket.close();
+                                            need_immediate_poll = true;
+                                            break;
+                                        }
+                                        let total = to_transfer_slice.len();
+                                        trace!("socket {} sending {} bytes", handle, total);
+                                        match socket.send_slice(&to_transfer_slice) {
+                                            Ok(sent) => {
+                                                if sent > 0 {
+                                                    need_immediate_poll = true;
+                                                }
+                                                if sent < total {
+                                                    // Only a subset fit into the TCP send buffer; keep the rest for the next poll.
+                                                    let tx_extra = to_transfer_slice.slice(sent..total);
+                                                    queue.push_front((tx_extra, true));
+                                                    break;
                                                 }
                                             }
-                                        } _ => {
-                                            // the local side has closed, but we don't know if the remote should be closed
-                                            // let the dispatcher timeout to close the connection
-                                        }}
+                                            Err(e) => {
+                                                error!(
+                                                    "Failed to send slice via virtual client socket: {:?}",
+                                                    e
+                                                );
+                                                break;
+                                            }
+                                        }
                                     }
+                                }
+
+                                if entry.sender.is_closed() {
+                                    let deadline = *entry
+                                        .drain_deadline
+                                        .get_or_insert_with(|| now + self.tcp_drain_timeout);
+                                    let deadline = if socket.state() == tcp::State::FinWait2 {
+                                        let capped = deadline.min(now + self.tcp_fin_wait2_grace);
+                                        entry.drain_deadline = Some(capped);
+                                        capped
+                                    } else {
+                                        deadline
+                                    };
+
+                                    // Only abort during `SynSent` once the forwarding task has
+                                    // delivered the ordered write-EOF marker and confirmed no
+                                    // accepted payload bytes are waiting for the handshake.
+                                    let has_pending_writes = tcp_queue
+                                        .get(handle)
+                                        .is_some_and(|queue| {
+                                            queue
+                                                .iter()
+                                                .any(|(data, active)| *active && !data.is_empty())
+                                        });
+                                    let abort_unwritten_syn =
+                                        socket.state() == tcp::State::SynSent
+                                            && entry.write_eof_received
+                                            && !has_pending_writes;
+                                    if abort_unwritten_syn || now >= deadline {
+                                        trace!(
+                                            "socket {} drain finished or timed out in state {:?}, aborting",
+                                            handle,
+                                            socket.state()
+                                        );
+                                        socket.abort();
+                                        need_immediate_poll = true;
+                                    } else {
+                                        earliest_drain_deadline = Some(match earliest_drain_deadline {
+                                            Some(prev) => prev.min(deadline),
+                                            None => deadline,
+                                        });
+                                    }
+                                }
                             }
                             SenderType::Udp(sender) => {
                                 let socket = sockets.get_mut::<udp::Socket>(*handle);
@@ -503,7 +639,9 @@ impl DeviceManager {
                                                 }
 
                                                 match socket.send_slice(&pkt.data, (ip, pkt.dst_addr.port())) {
-                                                    Ok(_) => {}
+                                                    Ok(_) => {
+                                                        need_immediate_poll = true;
+                                                    }
                                                     Err(e) => {
                                                         error!(
                                                             "Failed to send slice via virtual client socket: {:?}",
@@ -527,9 +665,11 @@ impl DeviceManager {
 
                     socket_pairs.retain(|handle, sender_type| {
                         match sender_type {
-                            SenderType::Tcp(_) => {
+                            SenderType::Tcp(entry) => {
                                 let socket = sockets.get::<tcp::Socket>(*handle);
-                                if socket.is_active() {
+                                let drained_time_wait = entry.sender.is_closed()
+                                    && socket.state() == tcp::State::TimeWait;
+                                if socket.is_active() && !drained_time_wait {
                                     true
                                 } else {
                                     if let Some(port) = socket.local_endpoint().map(|x| x.port) {
@@ -571,13 +711,27 @@ impl DeviceManager {
                         self.release_ephemeral_udp_port(port).await;
                     }
 
-                    next_poll = match iface.poll_delay(timestamp, &sockets) {
-                        Some(smoltcp::time::Duration::ZERO) => None,
-                        Some(delay) => {
-                            trace!("device poll delay: {:?}", delay);
-                            Some(delay.into())
+                    next_poll = if need_immediate_poll {
+                        None
+                    } else {
+                        let smoltcp_delay = match iface.poll_delay(timestamp, &sockets) {
+                            Some(smoltcp::time::Duration::ZERO) => Some(Duration::ZERO),
+                            Some(delay) => {
+                                trace!("device poll delay: {:?}", delay);
+                                Some(delay.into())
+                            }
+                            None => None,
+                        };
+                        let drain_delay = earliest_drain_deadline
+                            .map(|deadline| deadline.saturating_duration_since(TokioInstant::now()));
+                        match (smoltcp_delay, drain_delay) {
+                            (Some(d), _) if d.is_zero() => None,
+                            (_, Some(d)) if d.is_zero() => None,
+                            (Some(a), Some(b)) => Some(a.min(b)),
+                            (Some(a), None) => Some(a),
+                            (None, Some(b)) => Some(b),
+                            (None, None) => Some(Duration::from_secs(3600)),
                         }
-                        None => None,
                     };
                 }
             }
@@ -646,7 +800,9 @@ impl VirtualIpDevice {
 
                 match packet_receiver.recv().instrument(span).await {
                     Some((proto, data)) => {
-                        inner_packet_sender.send((proto, data)).await.unwrap();
+                        if inner_packet_sender.send((proto, data)).await.is_err() {
+                            break;
+                        }
                         let _ = packet_notifier.try_send(());
                     }
                     _ => {

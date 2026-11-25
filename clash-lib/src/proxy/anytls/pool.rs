@@ -1,14 +1,17 @@
 //! Configurable TLS Connection Pool (SessionPool) for AnyTLS outbound
 
 use parking_lot::RwLock;
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::Duration;
 
 use super::session::AnyTlsClientSession;
 
 #[derive(Debug, Clone)]
 pub struct SessionPoolConfig {
-    /// Core connections (minimum sessions kept alive)
+    /// Core connections (minimum sessions kept alive when `keep_idle` is enabled)
     pub min_connections: usize,
     /// Maximum connections allowed in pool
     pub max_connections: usize,
@@ -41,29 +44,93 @@ impl Default for SessionPoolConfig {
     }
 }
 
-struct SessionPoolInner {
+pub(super) struct SessionPoolInner {
     config: SessionPoolConfig,
     sessions: RwLock<Vec<Arc<AnyTlsClientSession>>>,
+    keep_idle: AtomicBool,
+    cleanup_running: AtomicBool,
+}
+
+impl Drop for SessionPoolInner {
+    fn drop(&mut self) {
+        // Trigger graceful drain on idle sessions when the pool itself is
+        // discarded (e.g. on config reload) so a writer task already blocked
+        // on transport I/O still enters `drain_timeout` and cannot leak.
+        let sessions = std::mem::take(self.sessions.get_mut());
+        for session in sessions {
+            if session.try_claim_idle_close() {
+                session.begin_graceful_close();
+            }
+        }
+    }
 }
 
 impl SessionPoolInner {
-    /// Prune closed sessions and idle sessions exceeding idle_timeout when pool size > min_connections
-    fn prune_sessions(&self) {
-        let mut sessions = self.sessions.write();
-        let mut i = 0;
-        while i < sessions.len() {
-            let session = &sessions[i];
-            let is_closed = session.is_closed();
-            let should_prune_idle = sessions.len() > self.config.min_connections
-                && session.idle_duration().is_some_and(|idle| {
-                    idle >= self.config.idle_timeout
-                });
+    pub(super) fn keep_idle(&self) -> bool {
+        self.keep_idle.load(Ordering::SeqCst)
+    }
 
-            if is_closed || should_prune_idle {
-                sessions.swap_remove(i);
-            } else {
-                i += 1;
+    /// Prune closed sessions and idle sessions exceeding idle_timeout when pool
+    /// size > effective min_connections (0 when `keep_idle` is false).
+    fn prune_sessions(&self) {
+        let keep_idle = self.keep_idle();
+        let min_connections = if keep_idle {
+            self.config.min_connections
+        } else {
+            0
+        };
+        let mut to_close = Vec::new();
+        {
+            let mut sessions = self.sessions.write();
+            let mut i = 0;
+            while i < sessions.len() {
+                let session = &sessions[i];
+                let is_closed = session.is_closed();
+                let should_prune_idle = if !keep_idle {
+                    session.total_streams_count() == 0
+                } else {
+                    sessions.len() > min_connections
+                        && session.idle_duration().is_some_and(|idle| {
+                            idle >= self.config.idle_timeout
+                        })
+                };
+
+                if is_closed {
+                    sessions.swap_remove(i);
+                } else if should_prune_idle && session.try_claim_idle_close() {
+                    to_close.push(sessions.swap_remove(i));
+                } else {
+                    i += 1;
+                }
             }
+        }
+        for session in to_close {
+            session.begin_graceful_close();
+        }
+    }
+
+    pub(super) fn prune_closed_sessions(&self) {
+        let mut sessions = self.sessions.write();
+        sessions.retain(|s| !s.is_closed());
+    }
+
+    fn close_idle_sessions(&self) {
+        let mut to_close = Vec::new();
+        {
+            let mut sessions = self.sessions.write();
+            let mut i = 0;
+            while i < sessions.len() {
+                if sessions[i].is_closed() {
+                    sessions.swap_remove(i);
+                } else if sessions[i].try_claim_idle_close() {
+                    to_close.push(sessions.swap_remove(i));
+                } else {
+                    i += 1;
+                }
+            }
+        }
+        for session in to_close {
+            session.begin_graceful_close();
         }
     }
 }
@@ -78,24 +145,53 @@ impl SessionPool {
         let inner = Arc::new(SessionPoolInner {
             config,
             sessions: RwLock::new(Vec::new()),
-        });
-
-        // Spawn periodic active cleanup task
-        let inner_weak = Arc::downgrade(&inner);
-        let check_interval = inner.config.idle_session_check_interval;
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(check_interval);
-            loop {
-                interval.tick().await;
-                let inner = match inner_weak.upgrade() {
-                    Some(i) => i,
-                    None => break, // Exit cleanly when SessionPool is dropped
-                };
-                inner.prune_sessions();
-            }
+            keep_idle: AtomicBool::new(true),
+            cleanup_running: AtomicBool::new(false),
         });
 
         Self { inner }
+    }
+
+    fn ensure_cleanup_task(&self) {
+        if self
+            .inner
+            .cleanup_running
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+
+        let inner_weak = Arc::downgrade(&self.inner);
+        let check_interval = self.inner.config.idle_session_check_interval;
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(check_interval);
+            interval.tick().await;
+            loop {
+                interval.tick().await;
+                let Some(inner) = inner_weak.upgrade() else {
+                    break;
+                };
+                inner.prune_sessions();
+                let sessions = inner.sessions.write();
+                if sessions.is_empty() {
+                    inner.cleanup_running.store(false, Ordering::Release);
+                    drop(sessions);
+                    break;
+                }
+            }
+        });
+    }
+
+    pub fn set_keep_idle(&self, keep: bool) {
+        self.inner.keep_idle.store(keep, Ordering::SeqCst);
+        if !keep {
+            self.close_idle_sessions();
+        }
+    }
+
+    pub fn close_idle_sessions(&self) {
+        self.inner.close_idle_sessions();
     }
 
     #[allow(dead_code)]
@@ -146,8 +242,9 @@ impl SessionPool {
                 .filter(|session| !session.is_closed())
                 .min_by_key(|session| session.total_streams_count())
             {
-                session.force_reserve_stream();
-                return Some(Arc::clone(session));
+                if session.force_reserve_stream() {
+                    return Some(Arc::clone(session));
+                }
             }
         }
 
@@ -157,18 +254,22 @@ impl SessionPool {
     /// Add a newly created session to the pool
     pub async fn add_session(&self, session: Arc<AnyTlsClientSession>) {
         self.inner.prune_sessions();
-        let mut guard = self.inner.sessions.write();
-        // Backstop for the cap. `get_available_session` enforces it on the read
-        // path, but nothing stopped concurrent creators from pushing past it.
-        if guard.len() >= self.inner.config.max_connections {
-            tracing::debug!(
-                "anytls session pool at capacity ({}), dropping the extra \
-                 session",
-                self.inner.config.max_connections
-            );
-            return;
+        session.attach_pool(Arc::downgrade(&self.inner));
+        {
+            let mut guard = self.inner.sessions.write();
+            // Backstop for the cap. `get_available_session` enforces it on the read
+            // path, but nothing stopped concurrent creators from pushing past it.
+            if guard.len() >= self.inner.config.max_connections {
+                tracing::debug!(
+                    "anytls session pool at capacity ({}), dropping the extra \
+                     session",
+                    self.inner.config.max_connections
+                );
+                return;
+            }
+            guard.push(session);
         }
-        guard.push(session);
+        self.ensure_cleanup_task();
     }
 }
 
@@ -350,6 +451,440 @@ mod tests {
         advance(Duration::from_secs(60)).await;
         pool.prune_sessions();
         assert!(pool.inner.sessions.read().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_disable_keep_idle_closes_immediately_on_last_stream_drop() {
+        let pool = SessionPool::new(SessionPoolConfig {
+            min_connections: 2,
+            ..SessionPoolConfig::default()
+        });
+        pool.set_keep_idle(false);
+
+        let (client, _server) = duplex(65536);
+        let session = AnyTlsClientSession::new(
+            AnyStream::new(client),
+            "secret",
+            PaddingFactory::default_factory(),
+        )
+        .await
+        .unwrap();
+        session.force_reserve_stream();
+        pool.add_session(Arc::clone(&session)).await;
+
+        let dest = SocksAddr::try_from(("example.com".to_owned(), 80)).unwrap();
+        let stream = session.open_stream(&dest).await.unwrap();
+        assert!(!session.is_closed());
+        assert_eq!(pool.inner.sessions.read().len(), 1);
+
+        drop(stream);
+        assert!(session.is_closed());
+        assert!(pool.inner.sessions.read().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_set_keep_idle_false_evicts_existing_idle_sessions() {
+        let pool = SessionPool::new(SessionPoolConfig {
+            min_connections: 1,
+            ..SessionPoolConfig::default()
+        });
+        let (client, _server) = duplex(65536);
+        let session = AnyTlsClientSession::new(
+            AnyStream::new(client),
+            "secret",
+            PaddingFactory::default_factory(),
+        )
+        .await
+        .unwrap();
+        pool.add_session(Arc::clone(&session)).await;
+        assert_eq!(pool.inner.sessions.read().len(), 1);
+
+        pool.set_keep_idle(false);
+        assert!(session.is_closed());
+        assert!(pool.inner.sessions.read().is_empty());
+        assert!(!session.try_reserve_stream(8));
+        assert!(!session.force_reserve_stream());
+    }
+
+    #[tokio::test]
+    async fn test_peer_fin_and_synack_reject_do_not_deadlock_when_keep_idle_disabled() {
+        use crate::proxy::anytls::types::{Command, Frame};
+
+        // Case 1: peer sends FIN for the last active stream.
+        let pool = SessionPool::new(SessionPoolConfig::default());
+        pool.set_keep_idle(false);
+        let (client, mut server) = duplex(65536);
+        let session = AnyTlsClientSession::new(
+            AnyStream::new(client),
+            "secret",
+            PaddingFactory::default_factory(),
+        )
+        .await
+        .unwrap();
+        assert!(session.force_reserve_stream());
+        pool.add_session(Arc::clone(&session)).await;
+
+        let dest = SocksAddr::try_from(("example.com".to_owned(), 80)).unwrap();
+        let _stream = session.open_stream(&dest).await.unwrap();
+
+        let mut fin_bytes = bytes::BytesMut::new();
+        Frame::control(Command::Fin, 1).encode_into(&mut fin_bytes);
+        server.write_all(&fin_bytes).await.unwrap();
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !session.is_closed() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("peer FIN must close idle session without deadlocking");
+        assert!(pool.inner.sessions.read().is_empty());
+
+        // Case 2: peer sends SynAck rejection for the last active stream.
+        let pool2 = SessionPool::new(SessionPoolConfig::default());
+        pool2.set_keep_idle(false);
+        let (client2, mut server2) = duplex(65536);
+        let session2 = AnyTlsClientSession::new(
+            AnyStream::new(client2),
+            "secret",
+            PaddingFactory::default_factory(),
+        )
+        .await
+        .unwrap();
+        assert!(session2.force_reserve_stream());
+        pool2.add_session(Arc::clone(&session2)).await;
+
+        let _stream2 = session2.open_stream(&dest).await.unwrap();
+
+        let mut rej_bytes = bytes::BytesMut::new();
+        Frame::with_data(
+            Command::SynAck,
+            1,
+            bytes::Bytes::from_static(b"rejected"),
+        )
+        .encode_into(&mut rej_bytes);
+        server2.write_all(&rej_bytes).await.unwrap();
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !session2.is_closed() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("peer SynAck rejection must close idle session without deadlocking");
+        assert!(pool2.inner.sessions.read().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_graceful_close_drains_queued_data_and_fin() {
+        use crate::proxy::anytls::types::{Command, FrameCodec};
+
+        let pool = SessionPool::new(SessionPoolConfig::default());
+        pool.set_keep_idle(false);
+
+        let (client, mut server) = duplex(65536);
+        let session = AnyTlsClientSession::new(
+            AnyStream::new(client),
+            "secret",
+            PaddingFactory::default_factory(),
+        )
+        .await
+        .unwrap();
+        assert!(session.force_reserve_stream());
+        pool.add_session(Arc::clone(&session)).await;
+
+        let dest = SocksAddr::try_from(("example.com".to_owned(), 80)).unwrap();
+        let mut stream = session.open_stream(&dest).await.unwrap();
+
+        let payload = b"queued-payload-before-shutdown-and-drop";
+        stream.write_all(payload).await.unwrap();
+        stream.shutdown().await.unwrap();
+        // Immediately drop both the last stream and our local Arc so only the
+        // graceful-drain keepalive holds the session until the writer flushes.
+        drop(stream);
+        drop(session);
+
+        // Read everything the writer sends until transport EOF.
+        let mut wire = Vec::new();
+        tokio::time::timeout(Duration::from_secs(2), server.read_to_end(&mut wire))
+            .await
+            .expect("writer must drain and shut down transport")
+            .unwrap();
+
+        // Skip auth header: 32-byte sha256 + 2-byte padding_len + padding.
+        assert!(wire.len() >= 34);
+        let auth_pad_len = u16::from_be_bytes([wire[32], wire[33]]) as usize;
+        let mut buf = bytes::BytesMut::from(&wire[34 + auth_pad_len..]);
+
+        let mut received_payload = Vec::new();
+        let mut saw_fin = false;
+        while let Some(frame) = FrameCodec::decode(&mut buf).unwrap() {
+            match frame.cmd {
+                Command::Psh if frame.stream_id == 1 => {
+                    received_payload.extend_from_slice(&frame.data);
+                }
+                Command::Fin if frame.stream_id == 1 => {
+                    saw_fin = true;
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            received_payload.ends_with(payload),
+            "expected queued payload to be flushed before session teardown"
+        );
+        assert!(saw_fin, "expected FIN frame to be flushed before session teardown");
+    }
+
+    #[tokio::test]
+    async fn test_blocked_writer_respects_graceful_drain_timeout_and_releases_session() {
+        let pool = SessionPool::new(SessionPoolConfig::default());
+        pool.set_keep_idle(false);
+
+        // Tiny duplex buffer: once the server stops reading, the writer task
+        // blocks inside `write_outgoing_message().await`.
+        let (client, _server) = duplex(128);
+        let session = AnyTlsClientSession::new(
+            AnyStream::new(client),
+            "secret",
+            PaddingFactory::default_factory(),
+        )
+        .await
+        .unwrap();
+        session.set_drain_timeout_for_test(Duration::from_millis(120));
+        assert!(session.force_reserve_stream());
+        pool.add_session(Arc::clone(&session)).await;
+
+        let dest = SocksAddr::try_from(("example.com".to_owned(), 80)).unwrap();
+        let mut stream = session.open_stream(&dest).await.unwrap();
+        stream.write_all(&vec![0xAB; 512]).await.unwrap();
+        // Give writer_loop a moment to pick up the frame and block on the full duplex.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let weak_session = Arc::downgrade(&session);
+        drop(stream);
+        drop(session);
+
+        // Even though the writer was already blocked before graceful close
+        // began, the drain timeout must abort it and drop `drain_keepalive`.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while weak_session.upgrade().is_some() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("blocked writer must time out and release the session Arc");
+        assert!(pool.inner.sessions.read().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_full_outgoing_queue_keeps_slot_until_fin_enqueued() {
+        use crate::proxy::anytls::types::{Command, FrameCodec};
+
+        let pool = SessionPool::new(SessionPoolConfig::default());
+        pool.set_keep_idle(false);
+
+        let (client, mut server) = duplex(256);
+        let session = AnyTlsClientSession::new(
+            AnyStream::new(client),
+            "secret",
+            PaddingFactory::default_factory(),
+        )
+        .await
+        .unwrap();
+        assert!(session.force_reserve_stream());
+        pool.add_session(Arc::clone(&session)).await;
+
+        let dest = SocksAddr::try_from(("example.com".to_owned(), 80)).unwrap();
+        let mut stream = session.open_stream(&dest).await.unwrap();
+
+        // Fill both the tiny duplex and the bounded `outgoing_tx` channel so
+        // `try_send(Fin)` in `AnyTlsStream::drop` hits `TrySendError::Full`.
+        for _ in 0..140 {
+            let chunk = vec![0x5A; 64];
+            if tokio::time::timeout(Duration::from_millis(5), stream.write_all(&chunk))
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+
+        // Drop without calling `shutdown()` so `Drop` must enqueue FIN while full.
+        drop(stream);
+        drop(session);
+
+        // Wait briefly, then let the peer drain everything until transport EOF.
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let mut wire = Vec::new();
+        tokio::time::timeout(Duration::from_secs(3), server.read_to_end(&mut wire))
+            .await
+            .expect("writer must drain all queued frames + deferred FIN")
+            .unwrap();
+
+        assert!(wire.len() >= 34);
+        let auth_pad_len = u16::from_be_bytes([wire[32], wire[33]]) as usize;
+        let mut buf = bytes::BytesMut::from(&wire[34 + auth_pad_len..]);
+        let mut saw_fin = false;
+        while let Some(frame) = FrameCodec::decode(&mut buf).unwrap() {
+            if frame.cmd == Command::Fin && frame.stream_id == 1 {
+                saw_fin = true;
+            }
+        }
+        assert!(saw_fin, "deferred FIN on full queue must reach peer before close");
+    }
+
+    #[tokio::test]
+    async fn test_dropping_pool_tears_down_idle_session_without_leak() {
+        let pool = SessionPool::new(SessionPoolConfig::default());
+        let (client, mut server) = duplex(4096);
+        let session = AnyTlsClientSession::new(
+            AnyStream::new(client),
+            "secret",
+            PaddingFactory::default_factory(),
+        )
+        .await
+        .unwrap();
+        let weak_session = Arc::downgrade(&session);
+        pool.add_session(session).await;
+
+        // Let the writer task settle into `outgoing_rx.recv()`.
+        tokio::task::yield_now().await;
+
+        // Dropping the pool (e.g. on config reload) while the peer keeps the
+        // transport open must tear down the idle session and close transport.
+        drop(pool);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while weak_session.upgrade().is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("writer task must not pin an idle session after its pool is dropped");
+
+        let mut buf = Vec::new();
+        tokio::time::timeout(Duration::from_secs(2), server.read_to_end(&mut buf))
+            .await
+            .expect("peer should observe EOF after idle session is dropped")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_dropping_pool_times_out_blocked_idle_writer() {
+        // Keep default `keep_idle == true`: the last stream unregisters
+        // without triggering drain while the writer is blocked on a full pipe.
+        let pool = SessionPool::new(SessionPoolConfig::default());
+        let (client, _server) = duplex(128);
+        let session = AnyTlsClientSession::new(
+            AnyStream::new(client),
+            "secret",
+            PaddingFactory::default_factory(),
+        )
+        .await
+        .unwrap();
+        session.set_drain_timeout_for_test(Duration::from_millis(120));
+        assert!(session.force_reserve_stream());
+        let weak_session = Arc::downgrade(&session);
+        pool.add_session(Arc::clone(&session)).await;
+
+        let dest = SocksAddr::try_from(("example.com".to_owned(), 80)).unwrap();
+        let mut stream = session.open_stream(&dest).await.unwrap();
+        stream.write_all(&vec![0xCD; 512]).await.unwrap();
+        // Let the writer pick up the frame and block on the full duplex.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        // Drop the last stream while keep_idle is still enabled, then drop the
+        // pool (simulating config reload).
+        drop(stream);
+        drop(session);
+        drop(pool);
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while weak_session.upgrade().is_some() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("dropping pool must start drain timeout for blocked idle writer");
+    }
+
+    #[test]
+    fn test_runtime_shutdown_then_drop_pool_does_not_leak_session() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (pool, weak_session, _server) = rt.block_on(async {
+            let pool = SessionPool::new(SessionPoolConfig::default());
+            let (client, server) = duplex(4096);
+            let session = AnyTlsClientSession::new(
+                AnyStream::new(client),
+                "secret",
+                PaddingFactory::default_factory(),
+            )
+            .await
+            .unwrap();
+            let weak_session = Arc::downgrade(&session);
+            pool.add_session(session).await;
+            tokio::task::yield_now().await;
+            (pool, weak_session, server)
+        });
+
+        // Shut down the runtime first (cancelling the writer task), then drop
+        // the pool. `WriterExitGuard` must have marked `writer_exited` / closed
+        // so `SessionPoolInner::drop` does not leave a self-reference cycle.
+        rt.shutdown_timeout(Duration::from_secs(1));
+        drop(pool);
+        assert!(
+            weak_session.upgrade().is_none(),
+            "dropping pool after runtime shutdown must not leak the session"
+        );
+    }
+
+    #[test]
+    fn test_runtime_shutdown_during_blocked_drain_does_not_leak_session() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (weak_session, _server) = rt.block_on(async {
+            let pool = SessionPool::new(SessionPoolConfig::default());
+            let (client, server) = duplex(128);
+            let session = AnyTlsClientSession::new(
+                AnyStream::new(client),
+                "secret",
+                PaddingFactory::default_factory(),
+            )
+            .await
+            .unwrap();
+            session.set_drain_timeout_for_test(Duration::from_secs(60));
+            assert!(session.force_reserve_stream());
+            let weak_session = Arc::downgrade(&session);
+            pool.add_session(Arc::clone(&session)).await;
+
+            let dest = SocksAddr::try_from(("example.com".to_owned(), 80)).unwrap();
+            let mut stream = session.open_stream(&dest).await.unwrap();
+            stream.write_all(&vec![0xEF; 512]).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+
+            // Enter graceful drain (self-reference stored in `drain_keepalive`)
+            // while the writer is blocked and drain timeout is still far away.
+            drop(stream);
+            drop(session);
+            drop(pool);
+            tokio::task::yield_now().await;
+            assert!(weak_session.upgrade().is_some());
+            (weak_session, server)
+        });
+
+        // Runtime shuts down mid-drain and cancels the writer task.
+        // `WriterExitGuard::drop` must clear `drain_keepalive` so the session
+        // is freed instead of leaking via self-reference.
+        rt.shutdown_timeout(Duration::from_secs(1));
+        assert!(
+            weak_session.upgrade().is_none(),
+            "runtime shutdown during active drain must release drain_keepalive"
+        );
     }
 
 }

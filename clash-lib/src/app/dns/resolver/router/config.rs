@@ -125,6 +125,33 @@ impl Default for RouterConfig {
 }
 
 impl RouterConfig {
+    pub(crate) fn referenced_outbounds(&self) -> HashSet<String> {
+        let mut out = HashSet::new();
+        let collect_ns = |list: &[NameServer], out: &mut HashSet<String>| {
+            for ns in list {
+                if let Some(proxy) = ns.proxy.as_deref()
+                    && !proxy.is_empty()
+                {
+                    out.insert(proxy.to_owned());
+                }
+            }
+        };
+        collect_ns(&self.default_nameserver, &mut out);
+        collect_ns(&self.proxy_server_nameserver, &mut out);
+        for upstream in &self.upstreams {
+            if upstream.upstream_type != UpstreamType::Remote {
+                continue;
+            }
+            if let Some(proxy) = upstream.proxy.as_deref()
+                && !proxy.is_empty()
+            {
+                out.insert(proxy.to_owned());
+            }
+            collect_ns(&upstream.servers, &mut out);
+        }
+        out
+    }
+
     pub fn validate(&self) -> Result<(), Error> {
         for ns in &self.default_nameserver {
             if matches!(ns.host, Host::Domain(_)) {

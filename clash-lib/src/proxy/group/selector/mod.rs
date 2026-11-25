@@ -3,7 +3,10 @@ use crate::proxy::RouteChange;
 use super::UdpPolicy;
 use std::collections::HashSet;
 use super::GroupHandler;
-use std::{io, sync::Arc};
+use std::{
+    io,
+    sync::{Arc, Weak},
+};
 
 use arc_swap::ArcSwapOption;
 use tracing::warn;
@@ -12,7 +15,7 @@ use crate::{
     Error,
     app::remote_content_manager::providers::proxy_provider::ArcProxyProvider,
     proxy::{
-        OutboundNode, HandlerCommonOptions, OutboundType,
+        HandlerCommonOptions, OutboundNode, OutboundType, WeakOutboundNode,
         group::GroupProxyAPIResponse,
         utils::provider_helper::Providers,
     },
@@ -36,8 +39,10 @@ pub struct HandlerOptions {
 
 struct ActiveSelection {
     name: String,
-    snapshot: Arc<Vec<OutboundNode>>,
-    handler: OutboundNode,
+    /// Weak references ensure a stale selector cache never pins a replaced
+    /// provider snapshot or prevents retired protocol handlers from dropping.
+    snapshot: Weak<Vec<OutboundNode>>,
+    handler: WeakOutboundNode,
 }
 
 #[derive(Clone)]
@@ -59,6 +64,25 @@ impl std::fmt::Debug for Handler {
 impl Handler {
     pub(crate) fn select_cached(&self) -> Option<OutboundNode> { self.selected_proxy(false) }
 
+    /// Read-only inspection of the currently selected proxy without rewriting
+    /// the cached snapshot entry.
+    pub(crate) fn peek_selected_from(
+        &self,
+        proxies: &[OutboundNode],
+    ) -> Option<OutboundNode> {
+        let cached_guard = self.cached_active.load();
+        if let Some(active) = cached_guard.as_deref() {
+            if let Some(proxy) = proxies.iter().find(|p| p.name() == active.name) {
+                return Some(proxy.clone());
+            }
+        }
+        proxies.first().cloned()
+    }
+
+    pub(crate) fn providers(&self) -> &Providers {
+        &self.providers
+    }
+
     pub async fn new(
         opts: HandlerOptions,
         providers: Vec<ArcProxyProvider>,
@@ -79,8 +103,8 @@ impl Handler {
                 .find(|p| p.name() == name)
                 .map(|p| Arc::new(ActiveSelection {
                     name: name.clone(),
-                    snapshot: proxies.clone(),
-                    handler: p.clone(),
+                    snapshot: Arc::downgrade(&proxies),
+                    handler: p.downgrade(),
                 }))
         });
 
@@ -98,10 +122,14 @@ impl Handler {
 
         // Fast path: if the cached selection is valid and the provider snapshot
         // pointer has not changed, return the cached handler directly in O(1).
-        if let Some(active) = cached_guard.as_deref() {
-            if Arc::ptr_eq(&active.snapshot, &proxies) {
-                return Some(active.handler.clone());
-            }
+        if let Some(active) = cached_guard.as_deref()
+            && active
+                .snapshot
+                .upgrade()
+                .is_some_and(|snap| Arc::ptr_eq(&snap, &proxies))
+            && let Some(handler) = active.handler.upgrade()
+        {
+            return Some(handler);
         }
 
         // Slow path: resolve selection from current proxies list (e.g. subscription refreshed)
@@ -126,8 +154,8 @@ impl Handler {
         if let Some(ref proxy) = found_proxy {
             self.cached_active.store(Some(Arc::new(ActiveSelection {
                 name: proxy.name().to_string(),
-                snapshot: proxies.clone(),
-                handler: proxy.clone(),
+                snapshot: Arc::downgrade(&proxies),
+                handler: proxy.downgrade(),
             })));
         }
 
@@ -141,8 +169,8 @@ impl SelectorControl for Handler {
         if let Some(proxy) = proxies.iter().find(|x| x.name() == name) {
             self.cached_active.store(Some(Arc::new(ActiveSelection {
                 name: name.to_owned(),
-                snapshot: proxies.clone(),
-                handler: proxy.clone(),
+                snapshot: Arc::downgrade(&proxies),
+                handler: proxy.downgrade(),
             })));
             self.changes.notify();
             Ok(())
@@ -287,5 +315,64 @@ mod tests {
         assert_eq!(selector_control.current(), "<none>".to_owned());
         assert!(handler.selected_proxy(false).is_none());
         assert!(selector_control.select("provider1").is_err());
+    }
+
+    #[tokio::test]
+    async fn selector_weak_cache_does_not_pin_replaced_provider_snapshot() {
+        use arc_swap::ArcSwap;
+
+        let make_node = |name: &str| {
+            let mut mock = MockDummyOutboundHandler::new();
+            mock.expect_name().return_const(name.to_owned());
+            OutboundNode::protocol(Arc::new(mock))
+        };
+
+        let old_node = make_node("hk-1");
+        let old_weak = old_node.downgrade();
+        let slot = Arc::new(ArcSwap::from_pointee(vec![old_node]));
+
+        let mut p1 = MockDummyProxyProvider::new();
+        p1.expect_proxies().returning({
+            let slot = slot.clone();
+            move || slot.load_full()
+        });
+
+        let static_node = make_node("static-1");
+        let static_snap = Arc::new(vec![static_node]);
+        let mut p2 = MockDummyProxyProvider::new();
+        p2.expect_proxies().returning({
+            let static_snap = static_snap.clone();
+            move || static_snap.clone()
+        });
+
+        // Multi-provider selector (like GLOBAL) exercises both ActiveSelection
+        // and Providers::cached_merged.
+        let handler = super::Handler::new(
+            super::HandlerOptions {
+                name: "GLOBAL".to_owned(),
+                ..Default::default()
+            },
+            vec![Arc::new(p1), Arc::new(p2)],
+            Some("hk-1".to_owned()),
+        )
+        .await;
+
+        assert!(old_weak.upgrade().is_some());
+
+        // Replace provider snapshot; even without calling selected_proxy again,
+        // invalidating stale merged cache must drop the old handler immediately.
+        let new_node = make_node("hk-1");
+        let new_id = new_node.identity();
+        slot.store(Arc::new(vec![new_node]));
+        handler.providers().invalidate_stale_cache();
+
+        assert!(
+            old_weak.upgrade().is_none(),
+            "weak selector cache and invalidated merged cache must not pin replaced handler"
+        );
+
+        let members = handler.providers().get_proxies(false);
+        let peeked = handler.peek_selected_from(&members).unwrap();
+        assert_eq!(peeked.identity(), new_id);
     }
 }

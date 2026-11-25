@@ -21,7 +21,7 @@ use crate::{
 };
 
 use std::{
-    collections::HashMap, io, net::{IpAddr, SocketAddr}, path::PathBuf, sync::Arc,
+    collections::{HashMap, HashSet}, io, net::{IpAddr, SocketAddr}, path::PathBuf, sync::Arc,
     time::Duration,
 };
 #[cfg(any(test, all(target_os = "linux", feature = "ebpf")))]
@@ -143,6 +143,13 @@ impl Router {
 
     pub fn get_rule_providers(&self) -> &HashMap<String, ThreadSafeRuleProvider> {
         &self.rule_providers
+    }
+
+    pub fn referenced_outbounds(&self) -> HashSet<String> {
+        self.rules
+            .iter()
+            .map(|rule| rule.target().to_owned())
+            .collect()
     }
 
     pub fn geodata(&self) -> Option<&GeoDataLookup> {

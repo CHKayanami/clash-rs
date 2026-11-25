@@ -43,6 +43,7 @@ impl EnhancedResolver {
                 fixed_domain_ttl: None,
                 resolution_hook: ArcSwapOption::new(None),
                 qtype_filter: HashSet::new(),
+                referenced_outbounds: HashSet::new(),
             }),
         }
     }
@@ -199,6 +200,7 @@ async fn test_dns_resolution_hook_end_to_end_on_exchange() {
             fixed_domain_ttl: None,
             resolution_hook: ArcSwapOption::new(None),
             qtype_filter: HashSet::new(),
+            referenced_outbounds: HashSet::new(),
         }),
     };
 
@@ -266,6 +268,7 @@ async fn test_fake_ip_exchange() {
             fixed_domain_ttl: None,
             resolution_hook: ArcSwapOption::new(None),
             qtype_filter: HashSet::new(),
+            referenced_outbounds: HashSet::new(),
         }),
     };
 
@@ -515,6 +518,7 @@ async fn test_qtype_filter_exchange() {
             fixed_domain_ttl: None,
             resolution_hook: ArcSwapOption::new(None),
             qtype_filter: filter_set,
+            referenced_outbounds: HashSet::new(),
         }),
     };
 

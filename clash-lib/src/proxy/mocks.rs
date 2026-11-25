@@ -72,6 +72,9 @@ mock! {
             resolver: ThreadSafeDNSResolver,
         ) -> io::Result<AnyOutboundDatagram>;
 
+        fn set_keep_idle(&self, keep: bool);
+        fn close_idle_connections(&self);
+
     }
 
     impl DialWithConnector for DummyOutboundHandler {}

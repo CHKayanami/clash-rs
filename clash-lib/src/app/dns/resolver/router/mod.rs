@@ -9,7 +9,7 @@ mod tests;
 #[cfg(test)]
 mod regression_tests;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net;
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::sync::Arc;
@@ -521,6 +521,10 @@ impl RouterResolver {
 
 #[async_trait]
 impl ClashResolver for RouterResolver {
+    fn referenced_outbounds(&self) -> HashSet<String> {
+        self.cfg.referenced_outbounds()
+    }
+
     fn register_resolution_hook(&self, hook: DnsResolutionHook) {
         self.resolution_hook
             .store(Some(Arc::new(DnsResolutionHookWrapper(hook))));

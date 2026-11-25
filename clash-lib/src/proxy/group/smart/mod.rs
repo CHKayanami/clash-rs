@@ -20,7 +20,7 @@ use crate::{
         ProxyManager, providers::proxy_provider::ArcProxyProvider,
     },
     proxy::{
-        OutboundNode, HandlerCommonOptions, OutboundType,
+        HandlerCommonOptions, OutboundNode, OutboundType, RouteChange,
         utils::provider_helper::Providers,
     },
     session::Session,
@@ -107,6 +107,9 @@ impl Handler {
                 group_name
             );
         }
+        if let Some(url) = opts.common_opts.url.as_deref() {
+            proxy_manager.register_probe_url(url);
+        }
         let smart_state = SmartState::new_with_imported_data(stored_data);
 
         let handler = Self {
@@ -135,6 +138,10 @@ impl Handler {
         });
 
         handler
+    }
+
+    pub(crate) fn providers(&self) -> &Providers {
+        &self.providers
     }
 
     /// Get all available proxies from providers
@@ -168,7 +175,7 @@ impl Handler {
         sess: &Session,
         excluded: Option<&HashSet<String>>,
     ) -> Option<OutboundNode> {
-        let proxies = self.get_proxies(false);
+        let (proxies, urls) = self.providers.get_members(false);
         if proxies.is_empty() {
             debug!("{} no proxies available", self.name());
             return None;
@@ -207,10 +214,11 @@ impl Handler {
                 )
             };
             proxies.iter()
-                .filter(|proxy| {
+                .enumerate()
+                .filter(|(_, proxy)| {
                     !excluded.is_some_and(|names| names.contains(proxy.name()))
                 })
-                .map(|proxy| {
+                .map(|(index, proxy)| {
                     let name = proxy.name();
                     let site_stats = state.get_site_stats(name, &site).map(summary);
                     let ip_stats = dest_ip.as_ref()
@@ -218,22 +226,28 @@ impl Handler {
                         .map(summary);
                     let penalty = state.get_penalty(name)
                         .map_or(0.0, |p| p.value());
-                    (proxy.clone(), site_stats, ip_stats, penalty)
+                    (index, proxy.clone(), site_stats, ip_stats, penalty)
                 })
                 .collect::<Vec<_>>()
         };
 
         let mut best: Option<(f64, OutboundNode)> = None;
+        let fallback_url = self.opts.common_opts.url.as_deref();
 
-        for (proxy, site_stats, ip_stats, penalty_score) in histories {
+        for (index, proxy, site_stats, ip_stats, penalty_score) in histories {
             let name = proxy.name();
+            let probe_url = urls.url_at(index, fallback_url);
 
             // Get basic metrics from proxy manager
-            let (alive, last_delay) = self.proxy_manager.alive_and_last_delay(name);
+            let (alive, last_delay) = self
+                .proxy_manager
+                .alive_and_last_delay_for(&proxy, probe_url);
             let delay = if alive { last_delay } else { None }
                 .map(|d| d.as_millis_f64())
                 .unwrap_or(9999.0);
-            let (packet_loss, rtt) = self.proxy_manager.delay_metrics(name)
+            let (packet_loss, rtt) = self
+                .proxy_manager
+                .delay_metrics_for(&proxy, probe_url)
                 .unwrap_or((1.0, 9999.0));
 
             debug!(
@@ -392,6 +406,10 @@ impl Handler {
 }
 
 impl GroupHandler for Handler {
+    fn route_changes(&self, sources: &mut Vec<RouteChange>) {
+        self.providers.route_changes(sources);
+    }
+
     fn name(&self) -> &str {
         &self.opts.name
     }

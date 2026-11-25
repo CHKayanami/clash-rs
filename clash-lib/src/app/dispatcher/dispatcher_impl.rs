@@ -10,7 +10,7 @@ use crate::{
         internal::proxy::{PROXY_DIRECT, PROXY_GLOBAL},
     },
     proxy::{
-        AnyStream, OutboundType,
+        AnyStream, OutboundType, RouteChange,
     },
     session::{Session, SocksAddr},
 };
@@ -75,6 +75,7 @@ pub struct Dispatcher {
     pub(super) router: ArcRouter,
     pub(super) resolver: ThreadSafeDNSResolver,
     pub(super) mode: Arc<AtomicU8>,
+    pub(super) mode_changes: RouteChange,
     pub(super) allow_quic: Arc<AtomicBool>,
     pub(super) manager: Arc<Manager>,
     pub(super) sniffer: Option<ArcSniffer>,
@@ -107,6 +108,7 @@ impl Dispatcher {
             router,
             resolver,
             mode: Arc::new(AtomicU8::new(mode as u8)),
+            mode_changes: RouteChange::default(),
             allow_quic: Arc::new(AtomicBool::new(allow_quic)),
             manager,
             sniffer,
@@ -131,7 +133,10 @@ impl Dispatcher {
     pub fn set_mode(&self, mode: RunMode) {
         info!("run mode switched to {}", mode);
 
-        self.mode.store(mode as u8, Ordering::Relaxed);
+        let prev = self.mode.swap(mode as u8, Ordering::Relaxed);
+        if prev != mode as u8 {
+            self.mode_changes.notify();
+        }
         #[cfg(all(target_os = "linux", feature = "ebpf"))]
         if let Some(slot) = &self.route_offload
             && let Some(observer) = slot.load().as_ref()
@@ -142,6 +147,10 @@ impl Dispatcher {
 
     pub fn get_mode(&self) -> RunMode {
         decode_mode(self.mode.load(Ordering::Relaxed))
+    }
+
+    pub(crate) fn mode_changes(&self) -> RouteChange {
+        self.mode_changes.clone()
     }
 
     pub fn set_quic(&self, allow: bool) {

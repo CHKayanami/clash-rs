@@ -9,7 +9,7 @@ use super::{
         encode_dissociate, encode_heartbeat, encode_single_packet, packet_fragments,
     },
     stream::TuicStream,
-    types::{TuicConnection, UdpRelayMode},
+    types::{TuicConnection, TuicStreamLease, UdpRelayMode},
 };
 
 impl TuicConnection {
@@ -63,7 +63,11 @@ impl TuicConnection {
         }
     }
 
-    pub async fn connect_tcp(&self, addr: Address) -> Result<TuicStream> {
+    pub async fn connect_tcp(
+        self: &Arc<Self>,
+        addr: Address,
+        lease: TuicStreamLease,
+    ) -> Result<TuicStream> {
         let addr_display = addr.to_string();
         tracing::info!("[tcp] {addr_display}");
 
@@ -80,7 +84,7 @@ impl TuicConnection {
             anyhow!(e)
         })?;
 
-        Ok(TuicStream::new(send, recv))
+        Ok(TuicStream::new(send, recv, lease))
     }
 
     pub async fn send_stream_packet(
@@ -88,7 +92,7 @@ impl TuicConnection {
         pkt: Bytes,
         addr: Address,
         assoc_id: u16,
-    ) -> Result<()> {
+    ) -> Result<quinn::SendStream> {
         let pkt_id = self.get_next_pkt_id();
         tracing::debug!("[udp] [{assoc_id:#06x}] [to-quic] {addr}");
         let wire_pkt = encode_single_packet(assoc_id, pkt_id, &addr, &pkt)?;
@@ -102,7 +106,7 @@ impl TuicConnection {
             .await
             .map_err(|err| anyhow!(err))?;
         let _ = send.finish();
-        Ok(())
+        Ok(send)
     }
 
     pub fn send_native_packet(
@@ -185,19 +189,12 @@ impl TuicConnection {
         self.fragments.lock().remove_association(assoc_id);
     }
 
-    pub async fn dissociate(&self, assoc_id: u16) -> Result<()> {
-        tracing::info!("[udp] [dissociate] [{assoc_id:#06x}]");
-        self.remove_udp_session(assoc_id);
-        if self.conn.close_reason().is_some() { return Ok(()); }
-        self.send_dissociate(assoc_id).await
-    }
-
-    pub async fn send_dissociate(&self, assoc_id: u16) -> Result<()> {
+    pub async fn send_dissociate(&self, assoc_id: u16) -> Result<quinn::SendStream> {
         let buf = encode_dissociate(assoc_id);
         let mut send = self.conn.open_uni().await?;
         send.write_all(&buf).await?;
         let _ = send.finish();
-        Ok(())
+        Ok(send)
     }
 
     async fn heartbeat(&self) -> Result<()> {
@@ -222,6 +219,7 @@ impl TuicConnection {
         gc.tick().await;
         loop {
             tokio::select! {
+                err = self.conn.closed() => return err.into(),
                 _ = interval.tick() => {
                     if let Err(err) = self.heartbeat().await {
                         return err;

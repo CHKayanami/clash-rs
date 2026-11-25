@@ -175,6 +175,16 @@ impl OutboundNode {
     pub fn dialer_dependency(&self) -> Option<OutboundNode> {
         match self { Self::Protocol(handler) => handler.dialer_dependency(), Self::Group(_) => None }
     }
+    pub fn set_keep_idle(&self, keep: bool) {
+        if let Self::Protocol(handler) = self {
+            handler.set_keep_idle(keep);
+        }
+    }
+    pub fn close_idle_connections(&self) {
+        if let Self::Protocol(handler) = self {
+            handler.close_idle_connections();
+        }
+    }
     pub fn as_group(&self) -> Option<&ProxyGroup> {
         match self { Self::Group(group) => Some(group), Self::Protocol(_) => None }
     }

@@ -83,6 +83,7 @@ pub struct EnhancedResolverInner {
     fixed_domain_ttl: Option<trie::StringTrie<u32>>,
     resolution_hook: ArcSwapOption<DnsResolutionHookWrapper>,
     qtype_filter: HashSet<QType>,
+    referenced_outbounds: HashSet<String>,
 }
 
 impl EnhancedResolver {
@@ -93,6 +94,7 @@ impl EnhancedResolver {
         outbounds: OutboundNodeRegistry,
         rule_dispatch: Option<Arc<RuleDispatch>>,
     ) -> Self {
+        let referenced_outbounds = cfg.referenced_outbounds();
         let mut entries = HashMap::new();
 
         let register_upstream = |ns: &NameServer, entries: &mut HashMap<String, UpstreamEntry>| -> Option<String> {
@@ -289,6 +291,7 @@ impl EnhancedResolver {
             fixed_domain_ttl,
             resolution_hook: ArcSwapOption::new(None),
             qtype_filter: cfg.qtype_filter,
+            referenced_outbounds,
         });
 
         Self { inner }
@@ -656,6 +659,10 @@ impl EnhancedResolver {
 
 #[async_trait]
 impl ClashResolver for EnhancedResolver {
+    fn referenced_outbounds(&self) -> HashSet<String> {
+        self.referenced_outbounds.clone()
+    }
+
     fn register_resolution_hook(&self, hook: DnsResolutionHook) {
         self.resolution_hook
             .store(Some(Arc::new(DnsResolutionHookWrapper(hook))));

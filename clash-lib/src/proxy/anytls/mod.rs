@@ -311,6 +311,14 @@ impl OutboundHandler for Handler {
         Ok(AnyOutboundDatagram::new(datagram))
     }
 
+    fn set_keep_idle(&self, keep: bool) {
+        self.session_pool.set_keep_idle(keep);
+    }
+
+    fn close_idle_connections(&self) {
+        self.session_pool.close_idle_sessions();
+    }
+
 }
 
 impl PlainProxyAPIResponse for Handler {

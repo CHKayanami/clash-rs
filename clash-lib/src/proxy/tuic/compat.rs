@@ -14,7 +14,10 @@ use crate::{
         batch::{BatchResult, DatagramBatch, PacketBatch, poll_send_ready, poll_send_stream},
     },
 };
-use super::{TuicDatagramOutbound, types::SocketAdderTrans};
+use super::{
+    TuicDatagramOutbound,
+    types::{SocketAdderTrans, TUIC_HALF_CLOSED_DRAIN_GRACE},
+};
 
 impl Sink<UdpPacket> for TuicDatagramOutbound {
     type Error = io::Error;
@@ -65,7 +68,13 @@ impl Sink<UdpPacket> for TuicDatagramOutbound {
         if let Some(tx) = self.send_tx.as_mut() {
             match tx.poll_close_unpin(cx) {
                 Poll::Pending => return Poll::Pending,
-                Poll::Ready(result) => { self.closed = true; return Poll::Ready(result.map_err(new_io_error)); }
+                Poll::Ready(result) => {
+                    self.closed = true;
+                    if let Some(cancel) = &self.cancel {
+                        cancel.cancel();
+                    }
+                    return Poll::Ready(result.map_err(new_io_error));
+                }
             }
         }
         self.close_native();
@@ -109,17 +118,41 @@ impl TuicDatagramOutbound {
         self.closed = true;
         self.recv_rx.close();
         self.conn.remove_udp_session(self.assoc_id);
+        let lease = self._lease.take();
         if self.conn.conn.close_reason().is_some() { return; }
         // Dissociation opens a QUIC stream and must complete asynchronously.
         // Only teardown needs a task; native packet sends stay on the relay.
         let conn = self.conn.clone();
         let assoc_id = self.assoc_id;
-        self.runtime.spawn(async move { let _ = conn.send_dissociate(assoc_id).await; });
+        self.runtime.spawn(async move {
+            let _lease = lease;
+            let _ = tokio::time::timeout(conn.drain_timeout(), async {
+                if let Ok(send) = conn.send_dissociate(assoc_id).await {
+                    let _ = send.stopped().await;
+                    if conn.conn.close_reason().is_none() {
+                        tokio::select! {
+                            _ = tokio::time::sleep(TUIC_HALF_CLOSED_DRAIN_GRACE) => {}
+                            _ = conn.conn.closed() => {}
+                        }
+                    }
+                }
+            })
+            .await;
+        });
     }
 }
 
 impl Drop for TuicDatagramOutbound {
-    fn drop(&mut self) { self.close_native(); }
+    fn drop(&mut self) {
+        if self.send_tx.take().is_some() {
+            if let Some(cancel) = &self.cancel {
+                cancel.cancel();
+            }
+        } else {
+            self.close_native();
+        }
+        self._lease.take();
+    }
 }
 
 impl DatagramBatch for TuicDatagramOutbound {

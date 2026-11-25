@@ -321,6 +321,16 @@ pub trait OutboundHandler: Sync + Send + Unpin + DialWithConnector + Debug {
         }
     }
 
+    /// Controls whether this outbound should keep idle pooled/multiplexed
+    /// connections alive. When set to `false`, implementations should close
+    /// currently idle connections immediately and release new ones once no
+    /// active streams remain.
+    fn set_keep_idle(&self, _keep: bool) {}
+
+    /// Closes any currently idle pooled/cached connections without disrupting
+    /// active streams.
+    fn close_idle_connections(&self) {}
+
 }
 pub use outbound::{OutboundNode, WeakOutboundNode};
 

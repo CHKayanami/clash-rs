@@ -11,9 +11,9 @@ use crate::{
         ProxyManager, providers::proxy_provider::ArcProxyProvider,
     },
     proxy::{
-        OutboundNode, HandlerCommonOptions, OutboundType,
+        HandlerCommonOptions, OutboundNode, OutboundType,
         group::GroupProxyAPIResponse,
-        utils::provider_helper::Providers,
+        utils::provider_helper::{MemberUrls, Providers},
     },
     session::Session,
 };
@@ -35,6 +35,7 @@ pub struct Handler {
     /// Tracking a list position instead silently retargeted the selection
     /// whenever a provider refresh reordered the members.
     current_fastest: parking_lot::RwLock<Option<String>>,
+    selection_changes: RouteChange,
 }
 
 impl std::fmt::Debug for Handler {
@@ -48,18 +49,54 @@ impl std::fmt::Debug for Handler {
 impl Handler {
     pub(crate) fn select_cached(&self) -> Option<OutboundNode> { self.fastest(false, true) }
 
+    /// Read-only inspection of the current effective proxy without mutating
+    /// sticky tolerance state.
+    pub(crate) fn peek_selected_from(
+        &self,
+        proxies: &[OutboundNode],
+        urls: &MemberUrls,
+    ) -> Option<OutboundNode> {
+        self.fastest_in(proxies, urls, false)
+    }
+
+    pub(crate) fn providers(&self) -> &Providers {
+        &self.providers
+    }
+
+    pub(crate) fn route_changes_from(
+        &self,
+        proxies: &[OutboundNode],
+        urls: &MemberUrls,
+        sources: &mut Vec<RouteChange>,
+    ) {
+        sources.push(self.selection_changes.clone());
+        self.providers.route_changes(sources);
+        let fallback_url = self.opts.common_opts.url.as_deref();
+        sources.extend(proxies.iter().enumerate().map(|(index, node)| {
+            self.proxy_manager.route_changes_for(
+                node,
+                urls.url_at(index, fallback_url),
+                true,
+            )
+        }));
+    }
+
     pub fn new(
         opts: HandlerOptions,
         tolerance: u16,
         providers: Vec<ArcProxyProvider>,
         proxy_manager: ProxyManager,
     ) -> Self {
+        if let Some(url) = opts.common_opts.url.as_deref() {
+            proxy_manager.register_probe_url(url);
+        }
         Self {
             opts,
             tolerance,
             providers: Providers::new(providers),
             proxy_manager,
             current_fastest: parking_lot::RwLock::new(None),
+            selection_changes: RouteChange::default(),
         }
     }
 
@@ -78,22 +115,32 @@ impl Handler {
         touch: bool,
         commit: bool,
     ) -> Option<OutboundNode> {
-        let proxy_manager = self.proxy_manager.clone();
+        let (proxies, urls) = self.providers.get_members(touch);
+        self.fastest_in(&proxies, &urls, commit)
+    }
 
-        let proxies = self.get_proxies(touch);
+    fn fastest_in(
+        &self,
+        proxies: &[OutboundNode],
+        urls: &MemberUrls,
+        commit: bool,
+    ) -> Option<OutboundNode> {
         if proxies.is_empty() {
             return None;
         }
 
         let current_name = self.current_fastest.read().clone();
+        let fallback_url = self.opts.common_opts.url.as_deref();
 
         let mut fastest: Option<(usize, Duration)> = None;
         let mut current_alive = false;
         let mut current_delay = Duration::MAX;
         for (index, proxy) in proxies.iter().enumerate() {
             let is_current = current_name.as_deref() == Some(proxy.name());
-            let (alive, delay) =
-                proxy_manager.alive_and_last_delay(proxy.name());
+            let probe_url = urls.url_at(index, fallback_url);
+            let (alive, delay) = self
+                .proxy_manager
+                .alive_and_last_delay_for(proxy, probe_url);
             if is_current {
                 current_alive = alive;
             }
@@ -138,7 +185,13 @@ impl Handler {
         let selected = &proxies[selected_index];
 
         if commit {
-            *self.current_fastest.write() = Some(selected.name().to_owned());
+            let mut current = self.current_fastest.write();
+            let next = selected.name();
+            if current.as_deref() != Some(next) {
+                *current = Some(next.to_owned());
+                drop(current);
+                self.selection_changes.notify();
+            }
         }
 
         let selected_delay = if selected_index == fastest_index {
@@ -160,10 +213,8 @@ impl Handler {
 
 impl GroupHandler for Handler {
     fn route_changes(&self, sources: &mut Vec<RouteChange>) {
-        self.providers.route_changes(sources);
-        sources.extend(self.providers.get_proxies(false).iter().map(|node|
-            self.proxy_manager.route_changes(node.name(), true),
-        ));
+        let (proxies, urls) = self.providers.get_members(false);
+        self.route_changes_from(&proxies, &urls, sources);
     }
 
     fn name(&self) -> &str {
@@ -291,5 +342,193 @@ mod tests {
             .report_delay("b", false, Duration::from_millis(50))
             .await;
         assert_eq!(handler.fastest(false, true).unwrap().name(), "a");
+    }
+
+    #[tokio::test]
+    async fn same_named_nodes_and_distinct_urls_do_not_cross_contaminate_selection() {
+        use crate::{
+            app::remote_content_manager::{
+                healthcheck::HealthCheck,
+                providers::proxy_provider::PlainProvider,
+            },
+            proxy::{
+                AnyStream,
+                group::fallback,
+                mocks::MockDummyOutboundHandler,
+            },
+        };
+        use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
+
+        let make_http_node = |name: &str, ok_for_host: Option<&'static str>, delay_ms: u64| {
+            let mut mock = MockDummyOutboundHandler::new();
+            mock.expect_name().return_const(name.to_owned());
+            mock.expect_connect_stream().returning(move |sess, _| {
+                let host = sess.destination.host();
+                let should_succeed = ok_for_host.is_some_and(|ok| host == ok);
+                if !should_succeed {
+                    return Err(std::io::Error::other("probe rejected"));
+                }
+                let (client, mut server) = duplex(1024);
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 512];
+                    let _ = server.read(&mut buf).await;
+                    if delay_ms > 0 {
+                        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                    }
+                    let _ = server
+                        .write_all(
+                            b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        )
+                        .await;
+                    let _ = server.shutdown().await;
+                });
+                Ok(AnyStream::new(client))
+            });
+            OutboundNode::protocol(Arc::new(mock))
+        };
+
+        let pm = ProxyManager::new(Arc::new(NoopResolver), None);
+
+        // Scenario 1: Two distinct providers each contain a node named "HK-1".
+        // Provider A's "HK-1" is healthy (fast); Provider B's "HK-1" fails.
+        let hk_good = make_http_node("HK-1", Some("probe-a.example"), 5);
+        let backup_a = make_http_node("BACKUP-A", Some("probe-a.example"), 60);
+        let hk_bad = make_http_node("HK-1", None, 0);
+        let backup_b = make_http_node("BACKUP-B", Some("probe-a.example"), 5);
+
+        let url_a = "http://probe-a.example/generate_204";
+        let prov_a = Arc::new(
+            PlainProvider::new(
+                "prov-a".to_owned(),
+                vec![hk_good.clone(), backup_a.clone()],
+                HealthCheck::new(
+                    vec![hk_good.clone(), backup_a.clone()],
+                    url_a.to_owned(),
+                    0,
+                    true,
+                    pm.clone(),
+                ),
+            )
+            .unwrap(),
+        );
+        let prov_b = Arc::new(
+            PlainProvider::new(
+                "prov-b".to_owned(),
+                vec![hk_bad.clone(), backup_b.clone()],
+                HealthCheck::new(
+                    vec![hk_bad.clone(), backup_b.clone()],
+                    url_a.to_owned(),
+                    0,
+                    true,
+                    pm.clone(),
+                ),
+            )
+            .unwrap(),
+        );
+
+        let group_a = super::Handler::new(
+            super::HandlerOptions {
+                name: "GROUP-A".to_owned(),
+                ..Default::default()
+            },
+            0,
+            vec![prov_a.clone()],
+            pm.clone(),
+        );
+        let group_b = fallback::Handler::new(
+            fallback::HandlerOptions {
+                name: "GROUP-B".to_owned(),
+                ..Default::default()
+            },
+            vec![prov_b.clone()],
+            pm.clone(),
+        );
+
+        // Probe healthy prov_a first, then failing prov_b (same node name "HK-1").
+        pm.check(&vec![hk_good.clone(), backup_a.clone()], url_a, Some(Duration::from_secs(2)))
+            .await;
+        pm.check(&vec![hk_bad.clone(), backup_b.clone()], url_a, Some(Duration::from_secs(2)))
+            .await;
+
+        assert_eq!(
+            group_a.get_active_proxy().await.unwrap().identity(),
+            hk_good.identity(),
+            "failing same-named node from another provider must not mark healthy instance dead"
+        );
+        assert_eq!(
+            group_b.get_active_proxy().await.unwrap().identity(),
+            backup_b.identity(),
+            "group B must fall back away from its own dead HK-1 instance"
+        );
+
+        // Scenario 2: Same node instance probed on two distinct URLs.
+        // Succeeds on url_b, fails on url_fail.
+        let shared = make_http_node("SHARED", Some("probe-b.example"), 5);
+        let slow_other = make_http_node("OTHER", Some("probe-b.example"), 60);
+        let url_b = "http://probe-b.example/generate_204";
+        let url_fail = "http://probe-fail.example/generate_204";
+
+        let prov_url_b = Arc::new(
+            PlainProvider::new(
+                "prov-url-b".to_owned(),
+                vec![shared.clone(), slow_other.clone()],
+                HealthCheck::new(
+                    vec![shared.clone(), slow_other.clone()],
+                    url_b.to_owned(),
+                    0,
+                    true,
+                    pm.clone(),
+                ),
+            )
+            .unwrap(),
+        );
+        let prov_url_fail = Arc::new(
+            PlainProvider::new(
+                "prov-url-fail".to_owned(),
+                vec![shared.clone(), backup_b.clone()],
+                HealthCheck::new(
+                    vec![shared.clone(), backup_b.clone()],
+                    url_fail.to_owned(),
+                    0,
+                    true,
+                    pm.clone(),
+                ),
+            )
+            .unwrap(),
+        );
+
+        let group_url_b = super::Handler::new(
+            super::HandlerOptions {
+                name: "GROUP-URL-B".to_owned(),
+                ..Default::default()
+            },
+            0,
+            vec![prov_url_b],
+            pm.clone(),
+        );
+        let group_url_fail = fallback::Handler::new(
+            fallback::HandlerOptions {
+                name: "GROUP-URL-FAIL".to_owned(),
+                ..Default::default()
+            },
+            vec![prov_url_fail],
+            pm.clone(),
+        );
+
+        pm.check(&vec![shared.clone(), slow_other.clone()], url_b, Some(Duration::from_secs(2)))
+            .await;
+        pm.check(&vec![shared.clone()], url_fail, Some(Duration::from_secs(2)))
+            .await;
+
+        assert_eq!(
+            group_url_b.get_active_proxy().await.unwrap().identity(),
+            shared.identity(),
+            "failure on another probe URL must not contaminate url_b selection"
+        );
+        assert_eq!(
+            group_url_fail.get_active_proxy().await.unwrap().identity(),
+            backup_b.identity(),
+            "group probing url_fail must observe shared node as failed"
+        );
     }
 }

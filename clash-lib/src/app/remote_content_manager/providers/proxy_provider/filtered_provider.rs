@@ -5,6 +5,7 @@ use arc_swap::ArcSwapOption;
 use async_trait::async_trait;
 use erased_serde::Serialize;
 use fancy_regex::Regex;
+use parking_lot::Mutex;
 
 use crate::{
     app::remote_content_manager::providers::{
@@ -27,6 +28,7 @@ pub struct FilteredProxyProvider {
     filter: Arc<Regex>,
     empty_fallback: Option<OutboundNode>,
     cache: Arc<ArcSwapOption<FilteredSnapshot>>,
+    publish_lock: Mutex<()>,
 }
 
 impl FilteredProxyProvider {
@@ -40,7 +42,24 @@ impl FilteredProxyProvider {
             filter,
             empty_fallback,
             cache: Arc::new(ArcSwapOption::new(None)),
+            publish_lock: Mutex::new(()),
         }
+    }
+
+    fn filter_nodes(&self, raw: &[OutboundNode]) -> Arc<Vec<OutboundNode>> {
+        let mut filtered: Vec<OutboundNode> = raw
+            .iter()
+            .filter(|p| self.filter.is_match(p.name()).unwrap_or(false))
+            .cloned()
+            .collect();
+
+        if filtered.is_empty()
+            && let Some(fb) = &self.empty_fallback
+        {
+            filtered.push(fb.clone());
+        }
+
+        Arc::new(filtered)
     }
 }
 
@@ -75,37 +94,68 @@ impl Provider for FilteredProxyProvider {
 impl ProxyProvider for FilteredProxyProvider {
     fn proxies(&self) -> Arc<Vec<OutboundNode>> {
         let current = self.inner.proxies();
-        let cached_guard = self.cache.load();
-
-        if let Some(cached) = cached_guard.as_deref() {
-            if Arc::ptr_eq(&cached.raw_snapshot, &current) {
-                return cached.filtered_snapshot.clone();
-            }
+        if let Some(cached) = self.cache.load().as_deref()
+            && Arc::ptr_eq(&cached.raw_snapshot, &current)
+        {
+            return cached.filtered_snapshot.clone();
         }
 
-        let mut filtered: Vec<OutboundNode> = current
-            .iter()
-            .filter(|p| self.filter.is_match(p.name()).unwrap_or(false))
-            .cloned()
-            .collect();
+        let filtered_arc = self.filter_nodes(&current);
 
-        if filtered.is_empty() {
-            if let Some(fb) = &self.empty_fallback {
-                filtered.push(fb.clone());
-            }
+        // Validate under `publish_lock` so a concurrent provider refresh +
+        // cache invalidation can never be overwritten with a superseded snapshot.
+        let _guard = self.publish_lock.lock();
+        if let Some(cached) = self.cache.load().as_deref()
+            && Arc::ptr_eq(&cached.raw_snapshot, &current)
+        {
+            return cached.filtered_snapshot.clone();
         }
-
-        let filtered_arc = Arc::new(filtered);
-        self.cache.store(Some(Arc::new(FilteredSnapshot {
-            raw_snapshot: current,
-            filtered_snapshot: filtered_arc.clone(),
-        })));
+        if self.inner.is_snapshot_current(&current) {
+            self.cache.store(Some(Arc::new(FilteredSnapshot {
+                raw_snapshot: current,
+                filtered_snapshot: filtered_arc.clone(),
+            })));
+        }
 
         filtered_arc
     }
 
     fn route_changes(&self) -> Option<RouteChange> {
         self.inner.route_changes()
+    }
+
+    fn healthcheck_url(&self) -> Option<&str> {
+        self.inner.healthcheck_url()
+    }
+
+    fn proxies_from_snapshots(
+        &self,
+        snapshots: &HashMap<usize, Arc<Vec<OutboundNode>>>,
+    ) -> Arc<Vec<OutboundNode>> {
+        let current = self.inner.proxies_from_snapshots(snapshots);
+        if let Some(cached) = self.cache.load().as_deref()
+            && Arc::ptr_eq(&cached.raw_snapshot, &current)
+        {
+            return cached.filtered_snapshot.clone();
+        }
+        self.filter_nodes(&current)
+    }
+
+    fn is_snapshot_current(&self, snapshot: &Arc<Vec<OutboundNode>>) -> bool {
+        self.cache.load().as_deref().is_some_and(|cached| {
+            Arc::ptr_eq(&cached.filtered_snapshot, snapshot)
+                && self.inner.is_snapshot_current(&cached.raw_snapshot)
+        })
+    }
+
+    fn invalidate_stale_cache(&self) {
+        self.inner.invalidate_stale_cache();
+        let _guard = self.publish_lock.lock();
+        if let Some(cached) = self.cache.load().as_deref()
+            && !self.inner.is_snapshot_current(&cached.raw_snapshot)
+        {
+            self.cache.store(None);
+        }
     }
 
     fn touch(&self) {
@@ -226,5 +276,78 @@ mod tests {
         let res_lb = filtered_provider_lb.proxies();
         assert_eq!(res_lb.len(), 1);
         assert_eq!(res_lb[0].name(), "HK 01");
+    }
+
+    #[test]
+    fn concurrent_refresh_during_filter_does_not_cache_stale_snapshot() {
+        use arc_swap::ArcSwap;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct AdvancingProvider {
+            current: ArcSwap<Vec<OutboundNode>>,
+            next: Arc<Vec<OutboundNode>>,
+            advanced: AtomicBool,
+        }
+
+        #[async_trait]
+        impl Provider for AdvancingProvider {
+            fn name(&self) -> &str { "advancing" }
+            fn vehicle_type(&self) -> ProviderVehicleType { ProviderVehicleType::Http }
+            fn typ(&self) -> ProviderType { ProviderType::Proxy }
+            async fn initialize(&self) -> io::Result<()> { Ok(()) }
+            async fn update(&self) -> io::Result<()> { Ok(()) }
+            async fn as_map(&self) -> HashMap<String, Box<dyn ESerialize + Send>> {
+                HashMap::new()
+            }
+        }
+
+        #[async_trait]
+        impl ProxyProvider for AdvancingProvider {
+            fn proxies(&self) -> Arc<Vec<OutboundNode>> {
+                let snap = self.current.load_full();
+                // Simulate a provider refresh occurring immediately after the
+                // reader grabbed the old snapshot and before cache publish.
+                if !self.advanced.swap(true, Ordering::SeqCst) {
+                    self.current.store(self.next.clone());
+                }
+                snap
+            }
+            fn is_snapshot_current(&self, snapshot: &Arc<Vec<OutboundNode>>) -> bool {
+                Arc::ptr_eq(snapshot, &self.current.load_full())
+            }
+            fn touch(&self) {}
+            async fn healthcheck(&self) {}
+        }
+
+        let old_node = OutboundNode::protocol(Arc::new(direct::Handler::new("HK 01")));
+        let old_weak = old_node.downgrade();
+        let new_node = OutboundNode::protocol(Arc::new(direct::Handler::new("HK 02")));
+        let new_id = new_node.identity();
+
+        let inner = Arc::new(AdvancingProvider {
+            current: ArcSwap::from_pointee(vec![old_node]),
+            next: Arc::new(vec![new_node]),
+            advanced: AtomicBool::new(false),
+        });
+        let filtered = FilteredProxyProvider::new(
+            inner,
+            Arc::new(Regex::new(r"HK.*").unwrap()),
+            None,
+        );
+
+        let stale_result = filtered.proxies();
+        assert_eq!(stale_result.len(), 1);
+        assert_eq!(stale_result[0].name(), "HK 01");
+        drop(stale_result);
+
+        assert!(
+            old_weak.upgrade().is_none(),
+            "stale filtered snapshot must not be written back into cache after refresh"
+        );
+
+        let fresh_1 = filtered.proxies();
+        let fresh_2 = filtered.proxies();
+        assert_eq!(fresh_1[0].identity(), new_id);
+        assert!(Arc::ptr_eq(&fresh_1, &fresh_2));
     }
 }

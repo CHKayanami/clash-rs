@@ -25,7 +25,11 @@ use self::{
 use super::{
     DialWithConnector, OutboundHandler, OutboundType,
     PlainProxyAPIResponse, converters::hysteria2::PortGenerator,
-    datagram::UdpPacket, utils::new_udp_socket,
+    datagram::UdpPacket,
+    utils::{
+        new_udp_socket,
+        quic_stream::{QuicBidiStream, QuicStreamLease},
+    },
 };
 use crate::{
     app::dns::ThreadSafeDNSResolver,
@@ -39,6 +43,7 @@ use codec::Fragments;
 use erased_serde::Serialize as ErasedSerialize;
 use futures::SinkExt;
 use arc_swap::ArcSwapOption;
+use parking_lot::Mutex as SyncMutex;
 use quinn::{
     ClientConfig, Connection, TokioRuntime, crypto::rustls::QuicClientConfig,
 };
@@ -46,18 +51,21 @@ use quinn_proto::TransportConfig;
 use std::{
     collections::HashMap,
     fmt::{Debug, Formatter},
-    io::{Error as IoError, ErrorKind},
+    io::{self, Error as IoError, ErrorKind},
     net::SocketAddr,
     num::ParseIntError,
     path::PathBuf,
     pin::Pin,
     str::FromStr,
-    sync::{Arc, atomic::{AtomicBool, AtomicU32, Ordering}},
+    sync::{
+        Arc, Weak,
+        atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
+    },
     task::{Context, Poll},
 };
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
-    sync::Mutex,
+    sync::{Mutex, mpsc::error::TrySendError},
 };
 
 #[derive(Clone)]
@@ -118,20 +126,12 @@ impl FromStr for CcRx {
 
 type H3Preface = (quinn::SendStream, quinn::SendStream, quinn::SendStream);
 
-struct CachedConn {
-    conn: Arc<HysteriaConnection>,
-    /// H3 client preface streams (control + QPACK encoder/decoder). Held
-    /// open for the life of the connection: dropping the send half finishes
-    /// the stream, and closing a critical H3 stream is a connection error.
-    #[allow(dead_code)]
-    _preface: Arc<H3Preface>,
-}
-
 pub struct Handler {
     opts: HystOption,
     ep_config: quinn::EndpointConfig,
     client_config: quinn::ClientConfig,
-    conn: ArcSwapOption<CachedConn>,
+    conn: Arc<ArcSwapOption<HysteriaConnection>>,
+    keep_idle: Arc<AtomicBool>,
     reconnect_lock: Mutex<()>,
     next_session_id: AtomicU32,
     // support udp is decided by server
@@ -141,6 +141,15 @@ pub struct Handler {
 impl Debug for Handler {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("HystClient").finish()
+    }
+}
+
+impl Drop for Handler {
+    fn drop(&mut self) {
+        self.keep_idle.store(false, Ordering::SeqCst);
+        if let Some(conn) = self.conn.swap(None) {
+            conn.mark_evicted();
+        }
     }
 }
 
@@ -159,24 +168,28 @@ impl Handler {
         // Retry against the current snapshot so a stale failure cannot evict
         // a replacement connection. Keep side effects outside the retry loop.
         let previous = self.conn.rcu(|current| match current {
-            Some(cached) if Arc::ptr_eq(&cached.conn, failed) => None,
+            Some(cached) if Arc::ptr_eq(cached, failed) => None,
             _ => current.clone(),
         });
-        if previous.as_ref().is_some_and(|cached| Arc::ptr_eq(&cached.conn, failed)) {
+        if previous
+            .as_ref()
+            .is_some_and(|cached| Arc::ptr_eq(cached, failed))
+        {
             tracing::warn!(
                 "hysteria2 connection to {} failed, actively evicting from cache",
                 self.opts.addr
             );
+            failed.mark_evicted();
         }
     }
 
-    pub fn new(opts: HystOption) -> std::io::Result<Self> {
+    pub fn new(opts: HystOption) -> io::Result<Self> {
         // Fail closed. Warning and carrying on validated the server against the
         // default root store instead of the CA the user pinned — the opposite
         // of what configuring `ca` asks for, and silently so.
         if opts.ca.is_some() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
+            return Err(IoError::new(
+                ErrorKind::InvalidInput,
                 "hysteria2: `ca` is not supported yet; remove it, or use \
                  `fingerprint` to pin the server certificate",
             ));
@@ -190,7 +203,7 @@ impl Handler {
             opts.tls_cert.as_deref(),
             opts.tls_key.as_deref(),
         )
-        .map_err(|e| std::io::Error::new(e.kind(), format!("hysteria2 TLS: {e}")))?;
+        .map_err(|e| IoError::new(e.kind(), format!("hysteria2 TLS: {e}")))?;
 
         // should set alpn_protocol `h3` default
         tls_config.alpn_protocols = if opts.alpn.is_empty() {
@@ -206,8 +219,8 @@ impl Handler {
         }
         let receive_window = |value: Option<u64>, default: u64, name: &str| {
             quinn::VarInt::from_u64(value.unwrap_or(default)).map_err(|_| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
+                IoError::new(
+                    ErrorKind::InvalidInput,
                     format!("hysteria2: `{name}` exceeds the QUIC maximum"),
                 )
             })
@@ -237,8 +250,8 @@ impl Handler {
         transport.keep_alive_interval(Some(Self::DEFAULT_KEEP_ALIVE_INTERVAL));
 
         let quic_config: QuicClientConfig = tls_config.try_into().map_err(|e| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
+            IoError::new(
+                ErrorKind::InvalidInput,
                 format!("hysteria2: TLS config is not QUIC-compatible: {e}"),
             )
         })?;
@@ -251,7 +264,8 @@ impl Handler {
             ep_config,
             client_config,
             next_session_id: AtomicU32::new(0),
-            conn: ArcSwapOption::empty(),
+            conn: Arc::new(ArcSwapOption::empty()),
+            keep_idle: Arc::new(AtomicBool::new(true)),
             reconnect_lock: Mutex::new(()),
             support_udp: AtomicBool::new(true),
         })
@@ -463,61 +477,63 @@ impl Handler {
         &self,
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
-    ) -> std::io::Result<Arc<HysteriaConnection>> {
-        // Fast path: read the cached connection snapshot without async Mutex
-        if let Some(conn) = self
-            .conn
-            .load()
-            .as_ref()
-            .filter(|s| s.conn.conn.close_reason().is_none())
-            .map(|s| s.conn.clone())
+    ) -> io::Result<(Arc<HysteriaConnection>, HystStreamLease)> {
+        // Fast path: atomically acquire a stream lease on the cached connection
+        // before returning so idle reclamation cannot race with stream setup.
+        if let Some(cached) = self.conn.load().as_ref()
+            && cached.conn.close_reason().is_none()
+            && let Some(lease) = cached.try_acquire_lease()
         {
             tracing::trace!(
                 "hysteria2 reusing active QUIC connection to {}",
                 self.opts.addr
             );
-            return Ok(conn);
+            return Ok((cached.clone(), lease));
         }
 
         // Slow path: acquire async reconnect_lock for double-checked locking & reconnect
         let _reconnect_guard = self.reconnect_lock.lock().await;
 
         // Double check after acquiring lock
-        if let Some(conn) = self
-            .conn
-            .load()
-            .as_ref()
-            .filter(|s| match s.conn.conn.close_reason() {
+        if let Some(cached) = self.conn.load().as_ref() {
+            match cached.conn.close_reason() {
                 Some(reason) => {
                     tracing::debug!("old connection closed: {:?}", reason);
-                    false
                 }
-                None => true,
-            })
-            .map(|s| s.conn.clone())
-        {
-            return Ok(conn);
+                None => {
+                    if let Some(lease) = cached.try_acquire_lease() {
+                        return Ok((cached.clone(), lease));
+                    }
+                }
+            }
         }
 
         let (session, preface) = self
             .new_authed_connection_inner(sess, resolver)
             .await
             .map_err(|e| {
-                std::io::Error::other(format!(
+                IoError::other(format!(
                     "connect to {} failed: {}",
                     self.opts.addr, e
                 ))
             })?;
         let session = Arc::new(session);
-        let hyst_conn =
-            HysteriaConnection::new_with_task_loop(session, self.opts.udp_mtu);
+        let hyst_conn = HysteriaConnection::new_managed(
+            session,
+            Some(Arc::new(preface)),
+            self.opts.udp_mtu,
+            self.keep_idle.clone(),
+            Arc::downgrade(&self.conn),
+        );
+        let lease = hyst_conn
+            .try_acquire_lease()
+            .expect("fresh hysteria2 connection must accept initial lease");
 
-        self.conn.store(Some(Arc::new(CachedConn {
-            conn: hyst_conn.clone(),
-            _preface: Arc::new(preface),
-        })));
+        if let Some(old) = self.conn.swap(Some(hyst_conn.clone())) {
+            old.mark_evicted();
+        }
 
-        Ok(hyst_conn)
+        Ok((hyst_conn, lease))
     }
 }
 
@@ -544,11 +560,12 @@ impl OutboundHandler for Handler {
         &self,
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
-    ) -> std::io::Result<AnyStream> {
+    ) -> io::Result<AnyStream> {
         let mut retry = true;
         loop {
-            let authed_conn = self.new_authed_connection(sess, resolver.clone()).await?;
-            match authed_conn.connect_tcp(sess).await {
+            let (authed_conn, lease) =
+                self.new_authed_connection(sess, resolver.clone()).await?;
+            match authed_conn.connect_tcp(sess, lease).await {
                 Ok(hy_stream) => {
                     sess.push_chain(self.name());
                     return Ok(AnyStream::new(hy_stream));
@@ -556,7 +573,7 @@ impl OutboundHandler for Handler {
                 Err(e) => {
                     // 如果错误是业务层的 ConnectionRefused（即服务端正常回应拒绝，如目标域名不存在、端口拒绝），
                     // 证明底层 QUIC 连接完全健康，绝不能驱逐连接，更不能盲目重试！
-                    if e.kind() == std::io::ErrorKind::ConnectionRefused {
+                    if e.kind() == ErrorKind::ConnectionRefused {
                         return Err(e);
                     }
                     self.evict_connection(&authed_conn);
@@ -580,14 +597,28 @@ impl OutboundHandler for Handler {
         &self,
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
-    ) -> std::io::Result<AnyOutboundDatagram> {
-        let authed_conn = self.new_authed_connection(sess, resolver.clone()).await?;
+    ) -> io::Result<AnyOutboundDatagram> {
+        let (authed_conn, lease) =
+            self.new_authed_connection(sess, resolver.clone()).await?;
         let next_session_id = self
             .next_session_id
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let hy_datagram = authed_conn.connect_udp(sess, next_session_id);
+            .fetch_add(1, Ordering::Relaxed);
+        let hy_datagram = authed_conn.connect_udp(sess, next_session_id, lease);
         sess.push_chain(self.name());
         Ok(AnyOutboundDatagram::new(hy_datagram))
+    }
+
+    fn set_keep_idle(&self, keep: bool) {
+        self.keep_idle.store(keep, Ordering::SeqCst);
+        if !keep {
+            self.close_idle_connections();
+        }
+    }
+
+    fn close_idle_connections(&self) {
+        if let Some(cached) = self.conn.load_full() {
+            cached.close_if_idle();
+        }
     }
 
 }
@@ -627,9 +658,45 @@ impl PlainProxyAPIResponse for Handler {
     }
 }
 
+/// Highest bit of `active_streams`: once set, the connection is closing
+/// and must not accept any new stream leases.
+const HY2_CLOSING_BIT: usize = 1usize << (usize::BITS - 1);
+
+pub struct HystStreamLease {
+    conn: Arc<HysteriaConnection>,
+}
+
+impl Drop for HystStreamLease {
+    fn drop(&mut self) {
+        self.conn.release_lease();
+    }
+}
+
+impl QuicStreamLease for HystStreamLease {
+    fn may_close_on_release(&self) -> bool {
+        !self.conn.should_keep_idle()
+    }
+
+    async fn wait_closed(&self) {
+        let _ = self.conn.conn.closed().await;
+    }
+}
+
 pub struct HysteriaConnection {
-    pub conn: Arc<quinn::Connection>,
-    pub udp_sessions: Arc<parking_lot::Mutex<HashMap<u32, UdpSession>>>,
+    pub conn: Arc<Connection>,
+    /// H3 client preface streams (control + QPACK encoder/decoder). Held
+    /// open for the life of the connection (including stream drain): dropping
+    /// the send half finishes the stream, and closing a critical H3 stream is
+    /// a connection error.
+    #[allow(dead_code)]
+    _preface: Option<Arc<H3Preface>>,
+    pub udp_sessions: Arc<SyncMutex<HashMap<u32, UdpSession>>>,
+    active_streams: AtomicUsize,
+    keep_idle: Arc<AtomicBool>,
+    /// Set once evicted from the handler cache so the connection closes as
+    /// soon as all active streams finish, even when `keep_idle` is enabled.
+    evicted: AtomicBool,
+    cache_slot: Weak<ArcSwapOption<HysteriaConnection>>,
 
     // config
     pub udp_mtu: Option<usize>,
@@ -637,17 +704,124 @@ pub struct HysteriaConnection {
 
 impl HysteriaConnection {
     pub fn new_with_task_loop(
-        conn: Arc<quinn::Connection>,
+        conn: Arc<Connection>,
         udp_mtu: Option<u32>,
+    ) -> Arc<Self> {
+        Self::new_managed(
+            conn,
+            None,
+            udp_mtu,
+            Arc::new(AtomicBool::new(true)),
+            Weak::new(),
+        )
+    }
+
+    fn new_managed(
+        conn: Arc<Connection>,
+        preface: Option<Arc<H3Preface>>,
+        udp_mtu: Option<u32>,
+        keep_idle: Arc<AtomicBool>,
+        cache_slot: Weak<ArcSwapOption<HysteriaConnection>>,
     ) -> Arc<Self> {
         let s = Arc::new(Self {
             conn,
-            udp_sessions: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            _preface: preface,
+            udp_sessions: Arc::new(SyncMutex::new(HashMap::new())),
+            active_streams: AtomicUsize::new(0),
+            keep_idle,
+            evicted: AtomicBool::new(false),
+            cache_slot,
             udp_mtu: udp_mtu.map(|x| x as usize),
         });
         tokio::spawn(Self::spawn_tasks(s.clone()));
 
         s
+    }
+
+    pub(super) fn try_acquire_lease(self: &Arc<Self>) -> Option<HystStreamLease> {
+        self.active_streams
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |val| {
+                if val & HY2_CLOSING_BIT != 0 {
+                    None
+                } else {
+                    Some(val + 1)
+                }
+            })
+            .ok()
+            .map(|_| HystStreamLease { conn: self.clone() })
+    }
+
+    #[cfg(test)]
+    pub(super) fn is_closing(&self) -> bool {
+        (self.active_streams.load(Ordering::Acquire) & HY2_CLOSING_BIT) != 0
+    }
+
+    fn evict_from_cache(self: &Arc<Self>) {
+        if let Some(cache_slot) = self.cache_slot.upgrade() {
+            let _ = cache_slot.rcu(|current| match current {
+                Some(cached) if Arc::ptr_eq(cached, self) => None,
+                _ => current.clone(),
+            });
+        }
+    }
+
+    fn should_keep_idle(&self) -> bool {
+        self.keep_idle.load(Ordering::SeqCst) && !self.evicted.load(Ordering::SeqCst)
+    }
+
+    pub(super) fn mark_evicted(self: &Arc<Self>) {
+        self.evicted.store(true, Ordering::SeqCst);
+        self.close_if_idle();
+    }
+
+    fn release_lease(self: &Arc<Self>) {
+        let keep_idle = self.should_keep_idle();
+        let mut closed_now = false;
+        let mut became_zero = false;
+        let _ = self.active_streams.try_update(
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+            |val| {
+                let closing = (val & HY2_CLOSING_BIT) != 0;
+                let count = (val & !HY2_CLOSING_BIT).saturating_sub(1);
+                let next_closing = closing || (!keep_idle && count == 0);
+                closed_now = !closing && next_closing;
+                became_zero = !next_closing && count == 0;
+                Some(if next_closing {
+                    HY2_CLOSING_BIT | count
+                } else {
+                    count
+                })
+            },
+        );
+        if closed_now {
+            self.evict_from_cache();
+            if self.conn.close_reason().is_none() {
+                self.conn.close(0u32.into(), b"idle");
+            }
+        } else if became_zero && !self.should_keep_idle() {
+            // Re-check `keep_idle` / `evicted` after publishing zero (SeqCst)
+            // so a concurrent `set_keep_idle(false)` or eviction cannot miss.
+            self.close_if_idle();
+        }
+    }
+
+    pub(super) fn close_if_idle(self: &Arc<Self>) {
+        if self
+            .active_streams
+            .compare_exchange(
+                0,
+                HY2_CLOSING_BIT,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_ok()
+        {
+            self.evict_from_cache();
+            if self.conn.close_reason().is_none() {
+                self.conn.close(0u32.into(), b"idle");
+            }
+        }
     }
 
     async fn spawn_tasks(self: Arc<Self>) {
@@ -662,15 +836,19 @@ impl HysteriaConnection {
                     self.clone().recv_packet(pkt).await
                 }
                 Err(e) => {
-                    tracing::error!("hysteria2 read datagram error: {}", e);
+                    tracing::debug!("hysteria2 read datagram stopped: {}", e);
                     break e;
                 }
             }
         };
-        tracing::warn!("hysteria2 connection error: {:?}", err);
+        tracing::debug!("hysteria2 connection closed: {:?}", err);
     }
 
-    pub async fn connect_tcp(&self, sess: &Session) -> std::io::Result<HystStream> {
+    pub async fn connect_tcp(
+        self: &Arc<Self>,
+        sess: &Session,
+        lease: HystStreamLease,
+    ) -> io::Result<HystStream> {
         tracing::debug!(
             "hysteria2 opening stream to destination: {}",
             sess.destination
@@ -702,7 +880,7 @@ impl HysteriaConnection {
                 sess.destination,
                 e
             );
-            std::io::Error::other(format!("hysteria2 response decode error: {}", e))
+            IoError::other(format!("hysteria2 response decode error: {}", e))
         })?;
 
         if resp.status != 0x00 {
@@ -712,8 +890,8 @@ impl HysteriaConnection {
                 resp.status,
                 resp.msg
             );
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::ConnectionRefused,
+            return Err(IoError::new(
+                ErrorKind::ConnectionRefused,
                 format!("server response error, msg: {:?}", resp.msg),
             ));
         } else {
@@ -725,30 +903,32 @@ impl HysteriaConnection {
             );
         }
 
-        Ok(HystStream { send: tx, recv: rx })
+        Ok(HystStream::new(tx, rx, lease))
     }
 
     pub fn connect_udp(
         self: Arc<Self>,
         sess: &Session,
         session_id: u32,
+        lease: HystStreamLease,
     ) -> HysteriaDatagramOutbound {
         tracing::trace!(
             "hysteria connect udp, sess: {:?}, session_id: {}",
             sess,
             session_id
         );
-        HysteriaDatagramOutbound::new(
+        HysteriaDatagramOutbound::new_with_lease(
             session_id,
             self,
             sess.destination.clone(),
+            Some(lease),
         )
     }
 
-    pub fn max_fragment_size(&self) -> std::io::Result<usize> {
+    pub fn max_fragment_size(&self) -> io::Result<usize> {
         self.conn.max_datagram_size()
             .map(|limit| self.udp_mtu.map_or(limit, |mtu| mtu.min(limit)))
-            .ok_or_else(|| std::io::Error::other("hysteria2 QUIC datagrams unavailable"))
+            .ok_or_else(|| IoError::other("hysteria2 QUIC datagrams unavailable"))
     }
 
     pub fn send_packet(
@@ -758,7 +938,7 @@ impl HysteriaConnection {
         session_id: u32,
         pkt_id: u16,
         max_frag_size: usize,
-    ) -> std::io::Result<()> {
+    ) -> io::Result<()> {
         let fragments = Fragments::new(session_id, pkt_id, addr, max_frag_size, pkt)
             .map_err(|e| IoError::new(ErrorKind::InvalidInput, e.to_string()))?;
         let mut frag_count = 0;
@@ -771,7 +951,7 @@ impl HysteriaConnection {
             );
             self.conn
                 .send_datagram(frag)
-                .map_err(std::io::Error::other)?;
+                .map_err(IoError::other)?;
         }
         tracing::trace!(
             "hysteria2 sent {} fragments for session_id={}",
@@ -831,13 +1011,13 @@ impl HysteriaConnection {
                 inbound_user: None,
             }) {
                 Ok(()) => {}
-                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                Err(TrySendError::Full(_)) => {
                     tracing::debug!(
                         "hysteria2 udp session {} queue full, dropping packet",
                         session_id
                     );
                 }
-                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                Err(TrySendError::Closed(_)) => {
                     tracing::debug!(
                         "hysteria2 udp session {} receiver gone, dropping packet",
                         session_id
@@ -849,8 +1029,19 @@ impl HysteriaConnection {
 }
 
 pub struct HystStream {
-    send: quinn::SendStream,
-    recv: quinn::RecvStream,
+    inner: QuicBidiStream<HystStreamLease>,
+}
+
+impl HystStream {
+    fn new(
+        send: quinn::SendStream,
+        recv: quinn::RecvStream,
+        lease: HystStreamLease,
+    ) -> Self {
+        Self {
+            inner: QuicBidiStream::new(send, recv, lease),
+        }
+    }
 }
 
 impl crate::proxy::ProxyStream for HystStream {}
@@ -866,8 +1057,8 @@ impl AsyncRead for HystStream {
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.get_mut().recv).poll_read(cx, buf)
+    ) -> Poll<io::Result<()>> {
+        self.get_mut().inner.poll_read_inner(cx, buf)
     }
 }
 
@@ -887,31 +1078,35 @@ impl AsyncWrite for HystStream {
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &[u8],
-    ) -> Poll<std::io::Result<usize>> {
-        Pin::new(&mut self.get_mut().send)
-            .poll_write(cx, buf)
-            .map_err(|e| {
-                if is_normal_write_closure(&e) {
-                    tracing::debug!("hysteria2 write closed: {}", e);
-                } else {
-                    tracing::error!("hysteria2 write error: {}", e);
-                }
-                e.into()
-            })
+    ) -> Poll<io::Result<usize>> {
+        let Some(poll) = self.get_mut().inner.poll_write_raw(cx, buf) else {
+            return Poll::Ready(Err(IoError::new(
+                ErrorKind::BrokenPipe,
+                "hysteria2 stream closed",
+            )));
+        };
+        poll.map_err(|e| {
+            if is_normal_write_closure(&e) {
+                tracing::debug!("hysteria2 write closed: {}", e);
+            } else {
+                tracing::error!("hysteria2 write error: {}", e);
+            }
+            e.into()
+        })
     }
 
     fn poll_flush(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.get_mut().send).poll_flush(cx)
+    ) -> Poll<io::Result<()>> {
+        self.get_mut().inner.poll_flush_io(cx)
     }
 
     fn poll_shutdown(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.get_mut().send).poll_shutdown(cx)
+    ) -> Poll<io::Result<()>> {
+        self.get_mut().inner.poll_shutdown_io(cx)
     }
 }
 
@@ -948,34 +1143,39 @@ mod unit_tests {
             })
         }).await.unwrap();
         let connection = Arc::new(connection.unwrap());
-        let make_connection = || Arc::new(HysteriaConnection {
-            conn: connection.clone(),
-            udp_sessions: Arc::new(parking_lot::Mutex::new(HashMap::new())),
-            udp_mtu: None,
-        });
-        let failed = make_connection();
-        let replacement = make_connection();
         let preface = Arc::new((
             connection.open_uni().await.unwrap(),
             connection.open_uni().await.unwrap(),
             connection.open_uni().await.unwrap(),
         ));
         let weak_preface = Arc::downgrade(&preface);
+        let make_connection = |preface| Arc::new(HysteriaConnection {
+            conn: connection.clone(),
+            _preface: preface,
+            udp_sessions: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            active_streams: AtomicUsize::new(0),
+            keep_idle: Arc::new(AtomicBool::new(true)),
+            evicted: AtomicBool::new(false),
+            cache_slot: Weak::new(),
+            udp_mtu: None,
+        });
+        let failed = make_connection(None);
+        let replacement = make_connection(Some(preface));
         let options: OutboundHysteria2 = yaml_serde::from_str(
             "name: cache-test\nserver: localhost\nport: 443\npassword: test-only",
         ).unwrap();
         let handler = Handler::try_from(options).unwrap();
-        handler.conn.store(Some(Arc::new(CachedConn {
-            conn: replacement.clone(), _preface: preface,
-        })));
+        handler.conn.store(Some(replacement.clone()));
         let snapshot = handler.conn.load_full();
 
         handler.evict_connection(&failed);
         assert!(Arc::ptr_eq(
-            &handler.conn.load().as_ref().unwrap().conn, &replacement,
+            handler.conn.load().as_ref().unwrap(), &replacement,
         ));
         handler.evict_connection(&replacement);
         assert!(handler.conn.load().is_none());
+        assert!(weak_preface.upgrade().is_some());
+        drop(replacement);
         assert!(weak_preface.upgrade().is_some());
         drop(snapshot);
         assert!(weak_preface.upgrade().is_none());
@@ -991,6 +1191,589 @@ mod unit_tests {
 
         let err_nonzero = quinn::WriteError::Stopped(quinn::VarInt::from_u32(1));
         assert!(!is_normal_write_closure(&err_nonzero));
+    }
+
+    #[tokio::test]
+    async fn test_disable_keep_idle_drains_tail_and_preserves_preface() {
+        use tokio::io::AsyncWriteExt;
+
+        crate::setup_default_crypto_provider();
+        let CertifiedKey { cert, signing_key } =
+            generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
+        let server_config = ServerConfig::with_single_cert(
+            vec![cert.der().clone()],
+            signing_key.into(),
+        )
+        .unwrap();
+        let server =
+            Endpoint::server(server_config, "127.0.0.1:0".parse().unwrap()).unwrap();
+        let mut roots = RootCertStore::empty();
+        roots.add(cert.der().clone()).unwrap();
+        let mut client = Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        client.set_default_client_config(
+            ClientConfig::with_root_certificates(Arc::new(roots)).unwrap(),
+        );
+        let connecting =
+            client.connect(server.local_addr().unwrap(), "localhost").unwrap();
+        let (connection, peer) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(connecting, async {
+                server.accept().await.unwrap().await.unwrap()
+            })
+        })
+        .await
+        .unwrap();
+        let connection = Arc::new(connection.unwrap());
+
+        let options: OutboundHysteria2 = yaml_serde::from_str(
+            "name: idle-test\nserver: localhost\nport: 443\npassword: test-only",
+        )
+        .unwrap();
+        let handler = Handler::try_from(options).unwrap();
+
+        let preface = Arc::new((
+            connection.open_uni().await.unwrap(),
+            connection.open_uni().await.unwrap(),
+            connection.open_uni().await.unwrap(),
+        ));
+        let weak_preface = Arc::downgrade(&preface);
+        let managed = Arc::new(HysteriaConnection {
+            conn: connection.clone(),
+            _preface: Some(preface),
+            udp_sessions: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            active_streams: AtomicUsize::new(0),
+            keep_idle: handler.keep_idle.clone(),
+            evicted: AtomicBool::new(false),
+            cache_slot: Arc::downgrade(&handler.conn),
+            udp_mtu: None,
+        });
+        handler.conn.store(Some(managed.clone()));
+
+        let lease = managed
+            .try_acquire_lease()
+            .expect("open connection accepts lease");
+        let (tx, rx) = connection.open_bi().await.unwrap();
+        let mut stream = HystStream::new(tx, rx, lease);
+        let payload = b"tail-bytes-must-not-be-truncated";
+        stream.write_all(payload).await.unwrap();
+
+        // Disable keep_idle while stream is active: must stay open and cached.
+        handler.set_keep_idle(false);
+        assert!(handler.conn.load().is_some());
+        assert!(connection.close_reason().is_none());
+        assert!(weak_preface.upgrade().is_some());
+
+        // Drop the stream and delay the peer application read so `send.stopped()`
+        // completes well before the peer app accepts/reads the stream.
+        drop(stream);
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(
+            connection.close_reason().is_none(),
+            "connection must not close before peer finishes reading buffered tail data"
+        );
+
+        let (mut peer_tx, mut peer_rx) =
+            tokio::time::timeout(Duration::from_secs(2), peer.accept_bi())
+                .await
+                .unwrap()
+                .unwrap();
+        let received = tokio::time::timeout(
+            Duration::from_secs(2),
+            peer_rx.read_to_end(1024),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(received, payload);
+
+        // Once the peer app finishes its side of the stream, the drain task
+        // releases the lease and closes the idle QUIC connection promptly.
+        let _ = peer_tx.finish();
+        drop(peer_tx);
+
+        tokio::time::timeout(Duration::from_secs(2), connection.closed())
+            .await
+            .expect("connection should close after peer completes stream");
+        assert!(managed.is_closing());
+        assert!(managed.try_acquire_lease().is_none());
+        assert!(handler.conn.load().is_none());
+        assert!(connection.close_reason().is_some());
+
+        drop(managed);
+        assert!(weak_preface.upgrade().is_none());
+        peer.close(0u32.into(), b"test complete");
+    }
+
+    #[tokio::test]
+    async fn test_evict_healthy_connection_closes_and_stops_datagram_task() {
+        crate::setup_default_crypto_provider();
+        let CertifiedKey { cert, signing_key } =
+            generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
+        let server_config = ServerConfig::with_single_cert(
+            vec![cert.der().clone()],
+            signing_key.into(),
+        )
+        .unwrap();
+        let server =
+            Endpoint::server(server_config, "127.0.0.1:0".parse().unwrap()).unwrap();
+        let mut roots = RootCertStore::empty();
+        roots.add(cert.der().clone()).unwrap();
+        let mut client = Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        client.set_default_client_config(
+            ClientConfig::with_root_certificates(Arc::new(roots)).unwrap(),
+        );
+        let connecting =
+            client.connect(server.local_addr().unwrap(), "localhost").unwrap();
+        let (connection, peer) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(connecting, async {
+                server.accept().await.unwrap().await.unwrap()
+            })
+        })
+        .await
+        .unwrap();
+        let connection = Arc::new(connection.unwrap());
+
+        let options: OutboundHysteria2 = yaml_serde::from_str(
+            "name: evict-test\nserver: localhost\nport: 443\npassword: test-only",
+        )
+        .unwrap();
+        let handler = Handler::try_from(options).unwrap();
+        let preface = Arc::new((
+            connection.open_uni().await.unwrap(),
+            connection.open_uni().await.unwrap(),
+            connection.open_uni().await.unwrap(),
+        ));
+        let weak_preface = Arc::downgrade(&preface);
+        let managed = HysteriaConnection::new_managed(
+            connection.clone(),
+            Some(preface),
+            None,
+            handler.keep_idle.clone(),
+            Arc::downgrade(&handler.conn),
+        );
+        handler.conn.store(Some(managed.clone()));
+
+        // Keep keep_idle enabled (default): evicting a healthy connection must
+        // close it once idle so its datagram receive loop and preface exit.
+        let lease = managed.try_acquire_lease().unwrap();
+        handler.evict_connection(&managed);
+        assert!(handler.conn.load().is_none());
+        assert!(connection.close_reason().is_none());
+
+        drop(lease);
+        drop(managed);
+
+        tokio::time::timeout(Duration::from_secs(2), connection.closed())
+            .await
+            .expect("evicted connection must close once last lease drops");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while weak_preface.upgrade().is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("datagram task must exit and release preface streams");
+        peer.close(0u32.into(), b"test complete");
+    }
+
+    #[tokio::test]
+    async fn test_half_closed_peer_fin_still_grants_upload_grace() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        crate::setup_default_crypto_provider();
+        let CertifiedKey { cert, signing_key } =
+            generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
+        let server_config = ServerConfig::with_single_cert(
+            vec![cert.der().clone()],
+            signing_key.into(),
+        )
+        .unwrap();
+        let server =
+            Endpoint::server(server_config, "127.0.0.1:0".parse().unwrap()).unwrap();
+        let mut roots = RootCertStore::empty();
+        roots.add(cert.der().clone()).unwrap();
+        let mut client = Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        client.set_default_client_config(
+            ClientConfig::with_root_certificates(Arc::new(roots)).unwrap(),
+        );
+        let connecting =
+            client.connect(server.local_addr().unwrap(), "localhost").unwrap();
+        let (connection, peer) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(connecting, async {
+                server.accept().await.unwrap().await.unwrap()
+            })
+        })
+        .await
+        .unwrap();
+        let connection = Arc::new(connection.unwrap());
+
+        let options: OutboundHysteria2 = yaml_serde::from_str(
+            "name: half-close-test\nserver: localhost\nport: 443\npassword: test-only",
+        )
+        .unwrap();
+        let handler = Handler::try_from(options).unwrap();
+        let managed = Arc::new(HysteriaConnection {
+            conn: connection.clone(),
+            _preface: None,
+            udp_sessions: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            active_streams: AtomicUsize::new(0),
+            keep_idle: handler.keep_idle.clone(),
+            evicted: AtomicBool::new(false),
+            cache_slot: Arc::downgrade(&handler.conn),
+            udp_mtu: None,
+        });
+        handler.conn.store(Some(managed.clone()));
+
+        let lease = managed.try_acquire_lease().unwrap();
+        handler.set_keep_idle(false);
+        let (tx, rx) = connection.open_bi().await.unwrap();
+        let mut stream = HystStream::new(tx, rx, lease);
+        let payload = b"upload-after-peer-already-sent-banner-and-fin";
+        stream.write_all(payload).await.unwrap();
+
+        // Peer accepts stream and immediately sends unrelated downlink data +
+        // FIN BEFORE reading our upload payload.
+        let (mut peer_tx, mut peer_rx) =
+            tokio::time::timeout(Duration::from_secs(2), peer.accept_bi())
+                .await
+                .unwrap()
+                .unwrap();
+        peer_tx
+            .write_all(b"unrelated-peer-banner-and-more-downlink-data")
+            .await
+            .unwrap();
+        let _ = peer_tx.finish();
+        drop(peer_tx);
+
+        // Local side reads part of the downlink data (and leaves the rest + FIN
+        // for background drain). Neither local reads nor background drain reads
+        // may cancel the upload grace window.
+        let mut banner_prefix = [0u8; 9];
+        stream.read_exact(&mut banner_prefix).await.unwrap();
+        assert_eq!(&banner_prefix, b"unrelated");
+
+        drop(stream);
+
+        // Peer delays reading the upload; connection must stay open during the
+        // half-close grace window so the upload payload is not truncated.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            connection.close_reason().is_none(),
+            "unrelated downlink data + FIN must not skip upload grace window"
+        );
+        let received = tokio::time::timeout(
+            Duration::from_secs(2),
+            peer_rx.read_to_end(1024),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(received, payload);
+
+        // After the grace window expires, connection closes cleanly.
+        tokio::time::timeout(Duration::from_secs(3), connection.closed())
+            .await
+            .expect("connection should close after grace window expires");
+        peer.close(0u32.into(), b"test complete");
+    }
+
+    #[tokio::test]
+    async fn test_drop_outside_runtime_still_drains_tail() {
+        use tokio::io::AsyncWriteExt;
+
+        crate::setup_default_crypto_provider();
+        let CertifiedKey { cert, signing_key } =
+            generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
+        let server_config = ServerConfig::with_single_cert(
+            vec![cert.der().clone()],
+            signing_key.into(),
+        )
+        .unwrap();
+        let server =
+            Endpoint::server(server_config, "127.0.0.1:0".parse().unwrap()).unwrap();
+        let mut roots = RootCertStore::empty();
+        roots.add(cert.der().clone()).unwrap();
+        let mut client = Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        client.set_default_client_config(
+            ClientConfig::with_root_certificates(Arc::new(roots)).unwrap(),
+        );
+        let connecting =
+            client.connect(server.local_addr().unwrap(), "localhost").unwrap();
+        let (connection, peer) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(connecting, async {
+                server.accept().await.unwrap().await.unwrap()
+            })
+        })
+        .await
+        .unwrap();
+        let connection = Arc::new(connection.unwrap());
+
+        let options: OutboundHysteria2 = yaml_serde::from_str(
+            "name: drop-thread-test\nserver: localhost\nport: 443\npassword: test-only",
+        )
+        .unwrap();
+        let handler = Handler::try_from(options).unwrap();
+        let managed = Arc::new(HysteriaConnection {
+            conn: connection.clone(),
+            _preface: None,
+            udp_sessions: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            active_streams: AtomicUsize::new(0),
+            keep_idle: handler.keep_idle.clone(),
+            evicted: AtomicBool::new(false),
+            cache_slot: Arc::downgrade(&handler.conn),
+            udp_mtu: None,
+        });
+        handler.conn.store(Some(managed.clone()));
+
+        let lease = managed.try_acquire_lease().unwrap();
+        handler.set_keep_idle(false);
+        let (tx, rx) = connection.open_bi().await.unwrap();
+        let mut stream = HystStream::new(tx, rx, lease);
+        let payload = b"tail-bytes-dropped-on-plain-os-thread";
+        stream.write_all(payload).await.unwrap();
+
+        // Drop the stream on a plain OS thread outside any Tokio runtime.
+        std::thread::spawn(move || drop(stream)).join().unwrap();
+
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(
+            connection.close_reason().is_none(),
+            "dropping stream outside Tokio runtime must still spawn drain task"
+        );
+
+        let (mut peer_tx, mut peer_rx) =
+            tokio::time::timeout(Duration::from_secs(2), peer.accept_bi())
+                .await
+                .unwrap()
+                .unwrap();
+        let received = tokio::time::timeout(
+            Duration::from_secs(2),
+            peer_rx.read_to_end(1024),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(received, payload);
+        let _ = peer_tx.finish();
+        drop(peer_tx);
+
+        tokio::time::timeout(Duration::from_secs(3), connection.closed())
+            .await
+            .expect("connection should close once drain completes");
+        peer.close(0u32.into(), b"test complete");
+    }
+
+    #[tokio::test]
+    async fn test_drop_bidi_stream_sends_stop_sending_and_skips_downlink_drain() {
+        use tokio::io::AsyncWriteExt;
+
+        crate::setup_default_crypto_provider();
+        let CertifiedKey { cert, signing_key } =
+            generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
+        let server_config = ServerConfig::with_single_cert(
+            vec![cert.der().clone()],
+            signing_key.into(),
+        )
+        .unwrap();
+        let server =
+            Endpoint::server(server_config, "127.0.0.1:0".parse().unwrap()).unwrap();
+        let mut roots = RootCertStore::empty();
+        roots.add(cert.der().clone()).unwrap();
+        let mut client = Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        client.set_default_client_config(
+            ClientConfig::with_root_certificates(Arc::new(roots)).unwrap(),
+        );
+        let connecting =
+            client.connect(server.local_addr().unwrap(), "localhost").unwrap();
+        let (connection, peer) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(connecting, async {
+                server.accept().await.unwrap().await.unwrap()
+            })
+        })
+        .await
+        .unwrap();
+        let connection = Arc::new(connection.unwrap());
+
+        let options: OutboundHysteria2 = yaml_serde::from_str(
+            "name: stop-sending-test\nserver: localhost\nport: 443\npassword: test-only",
+        )
+        .unwrap();
+        let handler = Handler::try_from(options).unwrap();
+        let managed = Arc::new(HysteriaConnection {
+            conn: connection.clone(),
+            _preface: None,
+            udp_sessions: Arc::new(SyncMutex::new(HashMap::new())),
+            active_streams: AtomicUsize::new(0),
+            keep_idle: handler.keep_idle.clone(),
+            evicted: AtomicBool::new(false),
+            cache_slot: Arc::downgrade(&handler.conn),
+            udp_mtu: None,
+        });
+        handler.conn.store(Some(managed.clone()));
+
+        // keep_idle stays enabled; client writes an HTTP-like request then drops
+        // the stream while the peer is still open for downlink transmission.
+        let lease = managed.try_acquire_lease().unwrap();
+        let (tx, rx) = connection.open_bi().await.unwrap();
+        let mut stream = HystStream::new(tx, rx, lease);
+        let payload = b"GET /large-file HTTP/1.1\r\n\r\n";
+        stream.write_all(payload).await.unwrap();
+
+        let (mut peer_tx, mut peer_rx) =
+            tokio::time::timeout(Duration::from_secs(2), peer.accept_bi())
+                .await
+                .unwrap()
+                .unwrap();
+        // Peer writes downlink data without finishing its send stream.
+        peer_tx.write_all(&[0xAB; 4096]).await.unwrap();
+
+        // Client aborts/drops the stream without reading the downlink.
+        drop(stream);
+
+        // Peer must immediately observe STOP_SENDING(0) instead of being kept
+        // open for a 10-second background downlink drain.
+        let stopped = tokio::time::timeout(
+            Duration::from_millis(500),
+            peer_tx.stopped(),
+        )
+        .await
+        .expect("dropping stream must promptly send STOP_SENDING")
+        .unwrap();
+        assert_eq!(stopped, Some(quinn::VarInt::from_u32(0)));
+
+        // Upload payload must still arrive intact on peer_rx.
+        let received = tokio::time::timeout(
+            Duration::from_secs(2),
+            peer_rx.read_to_end(1024),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(received, payload);
+
+        // Because keep_idle == true, the lease must release promptly right
+        // after send.stopped() without waiting the 1-second closing grace.
+        tokio::time::timeout(Duration::from_millis(500), async {
+            while managed.active_streams.load(Ordering::Acquire) != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("kept-idle stream must release lease without waiting 1s closing grace");
+        assert!(connection.close_reason().is_none());
+
+        connection.close(0u32.into(), b"test complete");
+        peer.close(0u32.into(), b"test complete");
+    }
+
+    #[tokio::test]
+    async fn test_dropping_handler_retires_kept_idle_and_active_connections() {
+        crate::setup_default_crypto_provider();
+        let CertifiedKey { cert, signing_key } =
+            generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
+        let server_config = ServerConfig::with_single_cert(
+            vec![cert.der().clone()],
+            signing_key.into(),
+        )
+        .unwrap();
+        let server =
+            Endpoint::server(server_config, "127.0.0.1:0".parse().unwrap()).unwrap();
+        let mut roots = RootCertStore::empty();
+        roots.add(cert.der().clone()).unwrap();
+        let mut client = Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        client.set_default_client_config(
+            ClientConfig::with_root_certificates(Arc::new(roots)).unwrap(),
+        );
+
+        let connect_pair = || async {
+            let connecting =
+                client.connect(server.local_addr().unwrap(), "localhost").unwrap();
+            let (connection, peer) = tokio::time::timeout(Duration::from_secs(5), async {
+                tokio::join!(connecting, async {
+                    server.accept().await.unwrap().await.unwrap()
+                })
+            })
+            .await
+            .unwrap();
+            (Arc::new(connection.unwrap()), peer)
+        };
+
+        // 1. Idle connection with keep_idle = true closes immediately when handler drops.
+        let (idle_conn, idle_peer) = connect_pair().await;
+        let options: OutboundHysteria2 = yaml_serde::from_str(
+            "name: retire-idle\nserver: localhost\nport: 443\npassword: test-only",
+        )
+        .unwrap();
+        let idle_handler = Handler::try_from(options).unwrap();
+        let idle_preface = Arc::new((
+            idle_conn.open_uni().await.unwrap(),
+            idle_conn.open_uni().await.unwrap(),
+            idle_conn.open_uni().await.unwrap(),
+        ));
+        let weak_idle_preface = Arc::downgrade(&idle_preface);
+        let idle_managed = HysteriaConnection::new_managed(
+            idle_conn.clone(),
+            Some(idle_preface),
+            None,
+            idle_handler.keep_idle.clone(),
+            Arc::downgrade(&idle_handler.conn),
+        );
+        idle_handler.conn.store(Some(idle_managed));
+        drop(idle_handler);
+
+        tokio::time::timeout(Duration::from_secs(2), idle_conn.closed())
+            .await
+            .expect("dropping handler must close idle connection even when keep_idle=true");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while weak_idle_preface.upgrade().is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("datagram task must exit and drop H3 preface streams");
+        idle_peer.close(0u32.into(), b"done");
+
+        // 2. Active connection stays open until its final lease drops, then closes.
+        let (active_conn, active_peer) = connect_pair().await;
+        let options: OutboundHysteria2 = yaml_serde::from_str(
+            "name: retire-active\nserver: localhost\nport: 443\npassword: test-only",
+        )
+        .unwrap();
+        let active_handler = Handler::try_from(options).unwrap();
+        let active_preface = Arc::new((
+            active_conn.open_uni().await.unwrap(),
+            active_conn.open_uni().await.unwrap(),
+            active_conn.open_uni().await.unwrap(),
+        ));
+        let weak_active_preface = Arc::downgrade(&active_preface);
+        let active_managed = HysteriaConnection::new_managed(
+            active_conn.clone(),
+            Some(active_preface),
+            None,
+            active_handler.keep_idle.clone(),
+            Arc::downgrade(&active_handler.conn),
+        );
+        active_handler.conn.store(Some(active_managed.clone()));
+        let lease = active_managed.try_acquire_lease().unwrap();
+        drop(active_managed);
+        drop(active_handler);
+
+        assert!(
+            active_conn.close_reason().is_none(),
+            "dropping handler must not interrupt active stream"
+        );
+        drop(lease);
+
+        tokio::time::timeout(Duration::from_secs(2), active_conn.closed())
+            .await
+            .expect("retired active connection must close once last lease drops");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while weak_active_preface.upgrade().is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("retired active connection's datagram task must exit");
+        active_peer.close(0u32.into(), b"done");
     }
 }
 

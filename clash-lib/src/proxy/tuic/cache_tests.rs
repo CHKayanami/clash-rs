@@ -44,11 +44,11 @@ async fn concurrent_connects_share_cache_and_cached_reads_skip_reconnect_lock() 
         async { server.accept().await.unwrap().await.unwrap() },
     );
     let connections: Vec<_> = connections.into_iter().map(Result::unwrap).collect();
-    let first = &connections[0];
-    assert!(connections.iter().all(|conn| Arc::ptr_eq(conn, first)));
+    let first = &connections[0].0;
+    assert!(connections.iter().all(|(conn, _)| Arc::ptr_eq(conn, first)));
 
     let reconnect = handler.reconnect.lock().await;
-    let cached = tokio::time::timeout(
+    let (cached, _cached_lease) = tokio::time::timeout(
         Duration::from_millis(100), handler.get_conn(&resolver, &session),
     ).await.unwrap().unwrap();
     assert!(Arc::ptr_eq(&cached, first));
@@ -62,11 +62,55 @@ async fn concurrent_connects_share_cache_and_cached_reads_skip_reconnect_lock() 
         handler.get_conn(&resolver, &session),
         async { server.accept().await.unwrap().await.unwrap() },
     );
-    let replacement = replacement.unwrap();
+    let (replacement, _replacement_lease) = replacement.unwrap();
     assert!(!Arc::ptr_eq(first, &replacement));
     assert!(replacement.check_open().is_ok());
     replacement.conn.close(0_u32.into(), b"done");
     remote.close(0_u32.into(), b"done");
     next_remote.close(0_u32.into(), b"done");
+    server.close(0_u32.into(), b"done");
+}
+
+#[tokio::test]
+async fn dropping_handler_retires_connection_and_stops_heartbeat() {
+    let (server, _) = quic_test_support::server(b"tuic");
+    let handler = Handler::new(options(server.local_addr().unwrap().port()));
+    let resolver: ThreadSafeDNSResolver = Arc::new(NoopResolver);
+    let session = Session::default();
+
+    let (conn_res, remote) = tokio::join!(
+        handler.get_conn(&resolver, &session),
+        async { server.accept().await.unwrap().await.unwrap() },
+    );
+    let (conn, lease) = conn_res.unwrap();
+    let weak_conn = Arc::downgrade(&conn);
+    let quic_conn = conn.conn.clone();
+
+    // Handler stays in keep_idle=true (default) and is dropped as if replaced
+    // by a provider refresh or config reload while a stream is still active.
+    drop(handler);
+    assert!(
+        quic_conn.close_reason().is_none(),
+        "dropping handler must not cut active stream"
+    );
+
+    // Once the final stream finishes, the retired connection must close
+    // immediately and all background tasks (including the 60s heartbeat loop)
+    // must exit so the Arc<TuicConnection> is released.
+    drop(lease);
+    drop(conn);
+
+    tokio::time::timeout(Duration::from_secs(2), quic_conn.closed())
+        .await
+        .expect("retired TUIC connection must close once active streams finish");
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while weak_conn.upgrade().is_some() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("TUIC background tasks including heartbeat must exit promptly");
+
+    remote.close(0_u32.into(), b"done");
     server.close(0_u32.into(), b"done");
 }

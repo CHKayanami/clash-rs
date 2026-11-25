@@ -389,27 +389,12 @@ impl AsyncWrite for AnyTlsStream {
 
 impl Drop for AnyTlsStream {
     fn drop(&mut self) {
-        // 确保从 session 中注销流并释放 active_streams 容量
-        self.session.unregister_stream(self.id);
-
-        // 如果写端尚未发送 FIN 且远端尚未发送 FIN，向对端发送 FIN
-        if !self.write_closed
+        let send_fin = !self.write_closed
             && !self.session_closed.load(Ordering::Relaxed)
-            && !self.peer_closed.load(Ordering::Acquire)
-        {
+            && !self.peer_closed.load(Ordering::Acquire);
+        if send_fin {
             self.write_closed = true;
-            if let Some(sender) = self.outgoing_tx.get_ref().cloned() {
-                let stream_id = self.id;
-                match sender.try_send(OutgoingMessage::Fin { stream_id }) {
-                    Ok(()) => {}
-                    Err(mpsc::error::TrySendError::Full(msg)) => {
-                        tokio::spawn(async move {
-                            let _ = sender.send(msg).await;
-                        });
-                    }
-                    Err(mpsc::error::TrySendError::Closed(_)) => {}
-                }
-            }
         }
+        self.session.enqueue_fin_and_unregister(self.id, send_fin);
     }
 }

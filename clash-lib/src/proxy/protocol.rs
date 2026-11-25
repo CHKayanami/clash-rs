@@ -82,6 +82,8 @@ impl ProtocolOutbound {
     pub fn support_udp(&self) -> bool { dispatch!(self, h, OutboundHandler::support_udp(h.as_ref())) }
     pub fn support_dialer(&self) -> Option<&str> { dispatch!(self, h, DialWithConnector::support_dialer(h.as_ref())) }
     pub fn dialer_dependency(&self) -> Option<OutboundNode> { dispatch!(self, h, DialWithConnector::dialer_dependency(h.as_ref())) }
+    pub fn set_keep_idle(&self, keep: bool) { dispatch!(self, h, OutboundHandler::set_keep_idle(h.as_ref(), keep)) }
+    pub fn close_idle_connections(&self) { dispatch!(self, h, OutboundHandler::close_idle_connections(h.as_ref())) }
 
     // Box each concrete protocol future, rather than an async match that would
     // reserve the largest protocol state in every connection and its callers.

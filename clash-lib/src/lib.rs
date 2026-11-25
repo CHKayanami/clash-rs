@@ -582,6 +582,21 @@ impl RuntimeComponents {
                 self.dns_resolver.clone(),
             ).await?;
         }
+        let outbound_manager = self.outbound_manager.clone();
+        let router = self.router.clone();
+        let dispatcher = self.dispatcher.clone();
+        let dns_resolver = self.dns_resolver.clone();
+        let cancel = self.service_context.cancellation_token().clone();
+        self.service_context.tracker().spawn(async move {
+            app::outbound::reference::run_reference_tracker(
+                outbound_manager,
+                router,
+                dispatcher,
+                dns_resolver,
+                cancel,
+            )
+            .await;
+        });
         Ok(())
     }
 

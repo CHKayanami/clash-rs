@@ -19,7 +19,7 @@ use serde_json::json;
 
 use crate::{
     app::{
-        api::{AppState, handlers::utils::DelayRequest},
+        api::AppState,
         outbound::manager::ThreadSafeOutboundManager,
         remote_content_manager::providers::proxy_provider::ArcProxyProvider,
         router::ArcRouter,
@@ -180,16 +180,35 @@ async fn get_proxy(
     axum::response::Json(outbound_manager.get_proxy(&proxy).await)
 }
 
+#[derive(Deserialize)]
+struct ProviderProxyDelayRequest {
+    #[serde(default)]
+    url: String,
+    timeout: u16,
+}
+
 async fn get_proxy_delay(
     State(state): State<ProviderState>,
+    Extension(provider): Extension<ArcProxyProvider>,
     Extension(proxy): Extension<OutboundNode>,
-    Query(q): Query<DelayRequest>,
+    Query(q): Query<ProviderProxyDelayRequest>,
 ) -> impl IntoResponse {
     let outbound_manager = state.outbound_manager.clone();
     let timeout = Duration::from_millis(q.timeout.into());
     let n = proxy.name().to_owned();
+    let url = if !q.url.is_empty() {
+        q.url.as_str()
+    } else if let Some(configured) = provider.healthcheck_url() {
+        configured
+    } else {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!("missing delay test url for {n}"),
+        )
+            .into_response();
+    };
     let result = outbound_manager
-        .url_test(&vec![proxy], &q.url, timeout)
+        .url_test(&vec![proxy], url, timeout)
         .await;
     match result.first() {
         Some(Ok((actual, overall))) => {

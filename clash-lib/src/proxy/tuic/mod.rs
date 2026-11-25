@@ -11,6 +11,7 @@ use crate::{
 };
 use anyhow::Result;
 use arc_swap::ArcSwapOption;
+use futures::{StreamExt, stream::FuturesUnordered};
 
 use quinn::{
     ClientConfig as QuinnConfig, Endpoint as QuinnEndpoint, EndpointConfig,
@@ -26,7 +27,7 @@ use std::{
     net::{Ipv4Addr, Ipv6Addr},
     sync::{
         Arc,
-        atomic::{AtomicU16, Ordering},
+        atomic::{AtomicBool, AtomicU16, Ordering},
     },
     time::Duration,
 };
@@ -45,10 +46,18 @@ use crate::{
 use crate::session::SocksAddr as ClashSocksAddr;
 use tokio::{
     runtime::Handle,
-    sync::{Mutex as AsyncMutex, OnceCell},
+    sync::{
+        Mutex as AsyncMutex, OnceCell,
+        mpsc::{self, Receiver as MpscReceiver, error::TryRecvError},
+    },
+    time::{Instant, sleep, sleep_until, timeout_at},
 };
+use tokio_util::sync::{CancellationToken, PollSender};
 
-use self::types::{CongestionControl, TuicConnection, UdpRelayMode, UdpSession};
+use self::types::{
+    CongestionControl, TUIC_HALF_CLOSED_DRAIN_GRACE, TuicConnection,
+    TuicStreamLease, UdpRelayMode, UdpSession,
+};
 
 use super::{
     HandlerCommonOptions, OutboundHandler, OutboundType,
@@ -95,7 +104,8 @@ pub struct HandlerOptions {
 pub struct Handler {
     opts: HandlerOptions,
     ep: OnceCell<TuicEndpoint>,
-    conn: ArcSwapOption<TuicConnection>,
+    conn: Arc<ArcSwapOption<TuicConnection>>,
+    keep_idle: Arc<AtomicBool>,
     reconnect: AsyncMutex<()>,
     next_assoc_id: AtomicU16,
 }
@@ -149,7 +159,18 @@ impl OutboundHandler for Handler {
         })
     }
 
+    fn set_keep_idle(&self, keep: bool) {
+        self.keep_idle.store(keep, Ordering::SeqCst);
+        if !keep {
+            self.close_idle_connections();
+        }
+    }
 
+    fn close_idle_connections(&self) {
+        if let Some(conn) = self.conn.load_full() {
+            conn.close_if_idle();
+        }
+    }
 
 }
 
@@ -184,12 +205,22 @@ impl PlainProxyAPIResponse for Handler {
     }
 }
 
+impl Drop for Handler {
+    fn drop(&mut self) {
+        self.keep_idle.store(false, Ordering::SeqCst);
+        if let Some(conn) = self.conn.swap(None) {
+            conn.mark_evicted();
+        }
+    }
+}
+
 impl Handler {
     pub fn new(opts: HandlerOptions) -> Self {
         Self {
             opts,
             ep: OnceCell::new(),
-            conn: ArcSwapOption::empty(),
+            conn: Arc::new(ArcSwapOption::empty()),
+            keep_idle: Arc::new(AtomicBool::new(true)),
             reconnect: AsyncMutex::new(()),
             next_assoc_id: AtomicU16::new(0),
         }
@@ -302,7 +333,7 @@ impl Handler {
         &self,
         resolver: &ThreadSafeDNSResolver,
         sess: &Session,
-    ) -> Result<Arc<TuicConnection>> {
+    ) -> Result<(Arc<TuicConnection>, TuicStreamLease)> {
         let endpoint = self
             .ep
             .get_or_try_init(|| {
@@ -313,19 +344,33 @@ impl Handler {
         let fut = async {
             if let Some(conn) = self.conn.load().as_ref()
                 && conn.check_open().is_ok()
+                && let Some(lease) = conn.try_acquire_lease()
             {
-                return Ok(conn.clone());
+                return Ok((conn.clone(), lease));
             }
             let _reconnect = self.reconnect.lock().await;
             let existing = self.conn.load_full();
             if let Some(conn) = &existing
                 && conn.check_open().is_ok()
+                && let Some(lease) = conn.try_acquire_lease()
             {
-                return Ok(conn.clone());
+                return Ok((conn.clone(), lease));
             }
-            let conn = endpoint.connect(resolver, existing.is_some()).await?;
-            self.conn.store(Some(conn.clone()));
-            Ok(conn)
+            let conn = endpoint
+                .connect(
+                    resolver,
+                    existing.is_some(),
+                    self.keep_idle.clone(),
+                    Arc::downgrade(&self.conn),
+                )
+                .await?;
+            let lease = conn
+                .try_acquire_lease()
+                .expect("fresh tuic connection must accept initial lease");
+            if let Some(old) = self.conn.swap(Some(conn.clone())) {
+                old.mark_evicted();
+            }
+            Ok((conn, lease))
         };
 
         tokio::time::timeout(self.opts.request_timeout, fut).await?
@@ -336,9 +381,9 @@ impl Handler {
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
     ) -> Result<AnyStream> {
-        let conn = self.get_conn(&resolver, sess).await?;
+        let (conn, lease) = self.get_conn(&resolver, sess).await?;
         let dest = sess.destination.clone().into_tuic();
-        let tuic_tcp = conn.connect_tcp(dest).await?;
+        let tuic_tcp = conn.connect_tcp(dest, lease).await?;
         sess.push_chain(self.name());
         Ok(AnyStream::new(tuic_tcp))
     }
@@ -348,30 +393,48 @@ impl Handler {
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
     ) -> Result<AnyOutboundDatagram> {
-        let conn = self.get_conn(&resolver, sess).await?;
+        let (conn, lease) = self.get_conn(&resolver, sess).await?;
         let assos_id = self.next_assoc_id.fetch_add(1, Ordering::SeqCst);
-        let quic_udp = TuicDatagramOutbound::new(assos_id, conn, sess.source.into());
+        let quic_udp = TuicDatagramOutbound::new_with_lease(
+            assos_id,
+            conn,
+            sess.source.into(),
+            Some(lease),
+        );
         sess.push_chain(self.name());
         Ok(AnyOutboundDatagram::new(quic_udp))
     }
 }
 
 pub struct TuicDatagramOutbound {
-    send_tx: Option<tokio_util::sync::PollSender<UdpPacket>>,
+    send_tx: Option<PollSender<UdpPacket>>,
+    cancel: Option<CancellationToken>,
     conn: Arc<TuicConnection>,
     runtime: Handle,
     assoc_id: u16,
     closed: bool,
-    recv_rx: tokio::sync::mpsc::Receiver<UdpPacket>,
+    recv_rx: MpscReceiver<UdpPacket>,
+    _lease: Option<TuicStreamLease>,
 }
 
 impl TuicDatagramOutbound {
+    #[cfg(test)]
     pub fn new(
         assoc_id: u16,
         conn: Arc<TuicConnection>,
         local_addr: ClashSocksAddr,
     ) -> Self {
-        let (recv_tx, recv_rx) = tokio::sync::mpsc::channel::<UdpPacket>(32);
+        let lease = conn.try_acquire_lease();
+        Self::new_with_lease(assoc_id, conn, local_addr, lease)
+    }
+
+    pub fn new_with_lease(
+        assoc_id: u16,
+        conn: Arc<TuicConnection>,
+        local_addr: ClashSocksAddr,
+        lease: Option<TuicStreamLease>,
+    ) -> Self {
+        let (recv_tx, recv_rx) = mpsc::channel::<UdpPacket>(32);
         conn.udp_sessions.write().insert(
             assoc_id,
             UdpSession {
@@ -379,38 +442,141 @@ impl TuicDatagramOutbound {
                 local_addr,
             },
         );
-        let send_tx = if conn.udp_relay_mode == UdpRelayMode::Quic {
-            let (send_tx, send_rx) = tokio::sync::mpsc::channel::<UdpPacket>(32);
+        let (send_tx, cancel, outbound_lease) = if conn.udp_relay_mode == UdpRelayMode::Quic {
+            let (send_tx, send_rx) = mpsc::channel::<UdpPacket>(32);
+            let cancel = CancellationToken::new();
+            let task_cancel = cancel.clone();
             let conn = conn.clone();
+            // Move the stream lease into the background sender task so the QUIC
+            // connection stays alive until every queued UDP packet, all
+            // in-flight uni-streams, and the trailing dissociate frame complete
+            // (bounded by a single shared `drain_timeout()` started as soon as
+            // the outbound closes or drops).
             tokio::spawn(async move {
-                // capture vars
-                let mut send_rx = send_rx;
-                while let Some(next_send) = send_rx.recv().await {
-                    let res = conn
-                        .send_stream_packet(
-                            next_send.data,
-                            next_send.dst_addr.into_tuic(),
-                            assoc_id,
-                        )
-                        .await;
-                    if res.is_err() {
-                        break;
-                    }
+                async fn wait_stopped(send: quinn::SendStream) {
+                    let _ = send.stopped().await;
                 }
-                // TuicDatagramOutbound dropped or outgoing_udp occurs error
+
+                let _lease = lease;
+                let mut send_rx = send_rx;
+                let mut in_flight = FuturesUnordered::new();
+                let mut drain_deadline: Option<Instant> = None;
+
+                'send_loop: loop {
+                    let next_send = if let Some(deadline) = drain_deadline {
+                        if Instant::now() >= deadline {
+                            break;
+                        }
+                        match send_rx.try_recv() {
+                            Ok(pkt) => Some(pkt),
+                            Err(
+                                TryRecvError::Empty
+                                | TryRecvError::Disconnected,
+                            ) => None,
+                        }
+                    } else {
+                        tokio::select! {
+                            biased;
+                            Some(()) = in_flight.next(), if !in_flight.is_empty() => continue,
+                            pkt = send_rx.recv() => pkt,
+                            _ = task_cancel.cancelled() => {
+                                conn.remove_udp_session(assoc_id);
+                                drain_deadline = Some(
+                                    Instant::now() + conn.drain_timeout(),
+                                );
+                                continue;
+                            }
+                        }
+                    };
+
+                    let Some(next_send) = next_send else {
+                        break;
+                    };
+
+                    let send_fut = conn.send_stream_packet(
+                        next_send.data,
+                        next_send.dst_addr.into_tuic(),
+                        assoc_id,
+                    );
+                    tokio::pin!(send_fut);
+
+                    let send = loop {
+                        if let Some(deadline) = drain_deadline {
+                            tokio::select! {
+                                res = &mut send_fut => match res {
+                                    Ok(send) => break send,
+                                    Err(_) => break 'send_loop,
+                                },
+                                Some(()) = in_flight.next(), if !in_flight.is_empty() => {}
+                                _ = sleep_until(deadline) => break 'send_loop,
+                            }
+                        } else {
+                            tokio::select! {
+                                res = &mut send_fut => match res {
+                                    Ok(send) => break send,
+                                    Err(_) => break 'send_loop,
+                                },
+                                Some(()) = in_flight.next(), if !in_flight.is_empty() => {}
+                                _ = task_cancel.cancelled() => {
+                                    conn.remove_udp_session(assoc_id);
+                                    drain_deadline = Some(
+                                        Instant::now() + conn.drain_timeout(),
+                                    );
+                                }
+                            }
+                        }
+                    };
+
+                    in_flight.push(wait_stopped(send));
+                }
+
+                // TuicDatagramOutbound dropped or outgoing_udp occurs error.
+                // Remove the session immediately even if `open_uni()` blocks,
+                // and always wait for in-flight ACKs + grace window so a
+                // concurrent `set_keep_idle(false)` cannot truncate writes.
                 tracing::info!(
                     "[udp] [dissociate] closing UDP session [{assoc_id:#06x}]"
                 );
-                _ = conn.dissociate(assoc_id).await;
+                conn.remove_udp_session(assoc_id);
+                let deadline = drain_deadline.unwrap_or_else(|| {
+                    Instant::now() + conn.drain_timeout()
+                });
+                let _ = timeout_at(deadline, async {
+                    if conn.conn.close_reason().is_none()
+                        && let Ok(send) = conn.send_dissociate(assoc_id).await
+                    {
+                        in_flight.push(wait_stopped(send));
+                    }
+                    while in_flight.next().await.is_some() {}
+                    if conn.conn.close_reason().is_none() {
+                        tokio::select! {
+                            _ = sleep(TUIC_HALF_CLOSED_DRAIN_GRACE) => {}
+                            _ = conn.conn.closed() => {}
+                        }
+                    }
+                })
+                .await;
                 anyhow::Ok(())
             });
 
-            Some(tokio_util::sync::PollSender::new(send_tx))
-        } else { None };
+            (
+                Some(PollSender::new(send_tx)),
+                Some(cancel),
+                None,
+            )
+        } else {
+            (None, None, lease)
+        };
 
         Self {
-            send_tx, conn, runtime: Handle::current(),
-            assoc_id, closed: false, recv_rx,
+            send_tx,
+            cancel,
+            conn,
+            runtime: Handle::current(),
+            assoc_id,
+            closed: false,
+            recv_rx,
+            _lease: outbound_lease,
         }
     }
 }

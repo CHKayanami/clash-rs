@@ -17,7 +17,7 @@ use crate::{
 };
 
 use super::{
-    HysteriaConnection,
+    HystStreamLease, HysteriaConnection,
     codec::{Defragger, HysUdpPacket},
 };
 
@@ -39,13 +39,25 @@ pub struct HysteriaDatagramOutbound {
     next_pkt_id: u16,
     closed: bool,
     recv_rx: tokio::sync::mpsc::Receiver<UdpPacket>,
+    _lease: Option<HystStreamLease>,
 }
 
 impl HysteriaDatagramOutbound {
+    #[cfg(test)]
     pub fn new(
         session_id: u32,
         conn: Arc<HysteriaConnection>,
         local_addr: SocksAddr,
+    ) -> Self {
+        let lease = conn.try_acquire_lease();
+        Self::new_with_lease(session_id, conn, local_addr, lease)
+    }
+
+    pub fn new_with_lease(
+        session_id: u32,
+        conn: Arc<HysteriaConnection>,
+        local_addr: SocksAddr,
+        lease: Option<HystStreamLease>,
     ) -> Self {
         tracing::trace!(
             "HysteriaDatagramOutbound::new: session_id={}, local_addr={:?}",
@@ -67,7 +79,14 @@ impl HysteriaDatagramOutbound {
             session_id
         );
 
-        Self { conn, session_id, next_pkt_id: 0, closed: false, recv_rx }
+        Self {
+            conn,
+            session_id,
+            next_pkt_id: 0,
+            closed: false,
+            recv_rx,
+            _lease: lease,
+        }
     }
 }
 
@@ -84,6 +103,7 @@ impl HysteriaDatagramOutbound {
             self.closed = true;
             self.conn.udp_sessions.lock().remove(&self.session_id);
             self.recv_rx.close();
+            self._lease.take();
         }
     }
 

@@ -3,7 +3,7 @@ use std::{future::Future, pin::Pin};
 use futures::{Sink, Stream};
 use tokio::sync::mpsc::{OwnedPermit, error::SendError};
 
-use crate::proxy::datagram::UdpPacket;
+use crate::proxy::{datagram::UdpPacket, wg::StreamLease};
 
 pub const MAX_PACKET: usize = 65536;
 
@@ -21,6 +21,7 @@ pub struct UdpPair {
 
     permit: Option<OwnedPermit<UdpPacket>>,
     reserving: Option<ReservingFuture>,
+    _lease: Option<StreamLease>,
 }
 
 impl UdpPair {
@@ -33,7 +34,13 @@ impl UdpPair {
             recv,
             permit: None,
             reserving: None,
+            _lease: None,
         }
+    }
+
+    pub(crate) fn with_lease(mut self, lease: StreamLease) -> Self {
+        self._lease = Some(lease);
+        self
     }
 }
 

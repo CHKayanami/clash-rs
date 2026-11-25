@@ -6,6 +6,7 @@ pub(crate) use platform::must_bind_socket_on_interface;
 
 pub mod provider_helper;
 mod proxy_connector;
+pub(crate) mod quic_stream;
 mod dialer_proxy;
 pub(crate) mod dialer_route;
 pub use dialer_proxy::DialerProxyConnector;

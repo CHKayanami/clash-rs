@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use std::collections::HashSet;
 use std::net::IpAddr;
 use std::sync::Arc;
 
@@ -90,6 +91,13 @@ pub trait ClashResolver: Sync + Send {
     fn set_ipv6(&self, enable: bool);
 
     fn kind(&self) -> ResolverKind;
+
+    /// Returns outbound proxy / group names explicitly configured on DNS
+    /// upstreams so idle-connection tracking keeps them warm even when routing
+    /// rules do not reference them (e.g. Direct mode or DNS-only proxies).
+    fn referenced_outbounds(&self) -> HashSet<String> {
+        HashSet::new()
+    }
 
     fn list_upstreams(&self) -> Vec<DnsUpstreamInfo> {
         Vec::new()

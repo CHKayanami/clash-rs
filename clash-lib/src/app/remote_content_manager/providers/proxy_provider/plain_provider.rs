@@ -100,6 +100,11 @@ impl ProxyProvider for PlainProvider {
         self.hc.touch();
     }
 
+    fn healthcheck_url(&self) -> Option<&str> {
+        let url = self.hc.url();
+        (!url.is_empty()).then_some(url)
+    }
+
     async fn healthcheck(&self) {
         self.hc.check().await;
     }

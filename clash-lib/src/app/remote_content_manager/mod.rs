@@ -9,27 +9,45 @@ use crate::{
         tls::GLOBAL_ROOT_STORE,
         utils::serialize_duration,
     },
-    proxy::OutboundNode,
+    proxy::{OutboundNode, WeakOutboundNode},
     session::Session,
 };
 use anyhow::Context;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
-use dashmap::DashMap;
-use futures::{FutureExt, StreamExt, stream::FuturesOrdered};
+use dashmap::{DashMap, DashSet};
+use futures::{FutureExt, StreamExt, stream};
 use http_body_util::Empty;
 use hyper::Request;
 use hyper_util::rt::TokioIo;
+use moka::sync::Cache;
+use parking_lot::{
+    Mutex as SyncMutex, MutexGuard as SyncMutexGuard, RwLock as SyncRwLock,
+};
 use serde::Serialize;
 use std::{
-    collections::VecDeque,
+    array::from_fn,
+    collections::{HashMap, VecDeque},
+    hash::{DefaultHasher, Hash, Hasher},
+    io,
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Duration,
 };
+use tokio::{
+    spawn,
+    sync::Semaphore,
+    task::AbortHandle,
+    time::timeout,
+};
 use tracing::{debug, instrument, trace, warn};
+
+pub const DEFAULT_URL_TEST_CONCURRENCY: usize = 10;
+const MAX_EPHEMERAL_TARGET_STATES: u64 = 256;
+const EPHEMERAL_TARGET_STATE_TTL: Duration = Duration::from_secs(300);
+const TARGET_STATE_LOCK_STRIPES: usize = 64;
 
 pub mod healthcheck;
 pub mod providers;
@@ -95,7 +113,7 @@ struct ProxyState {
     alive: AtomicBool,
     alive_changes: RouteChange,
     delay_changes: RouteChange,
-    delay_history: parking_lot::RwLock<VecDeque<DelayHistory>>,
+    delay_history: SyncRwLock<VecDeque<DelayHistory>>,
 }
 
 impl ProxyState {
@@ -104,16 +122,118 @@ impl ProxyState {
             alive: AtomicBool::new(true),
             alive_changes: RouteChange::default(),
             delay_changes: RouteChange::default(),
-            delay_history: parking_lot::RwLock::new(VecDeque::new()),
+            delay_history: SyncRwLock::new(VecDeque::new()),
         }
+    }
+}
+
+struct TargetProxyState {
+    owner: WeakOutboundNode,
+    state: ProxyState,
+}
+
+type ProbeTargetKey = (usize, String);
+
+struct FlightBucket {
+    committed_gen: u64,
+    active: Vec<u64>,
+}
+
+type ProbeFlightMap = SyncMutex<HashMap<ProbeTargetKey, FlightBucket>>;
+
+struct ProbeFlightGuard {
+    flights: Arc<ProbeFlightMap>,
+    key: ProbeTargetKey,
+    generation: u64,
+    finished: bool,
+}
+
+impl ProbeFlightGuard {
+    /// Marks this probe finished and returns `true` if no newer probe for the
+    /// same `(node_identity, url)` has already committed a result.
+    /// Cancelled probes only remove themselves from `active` without advancing
+    /// `committed_gen`, so cancelling a queued/newer probe never invalidates
+    /// an earlier valid in-flight probe.
+    fn finish_and_check_current(&mut self) -> bool {
+        if self.finished {
+            return false;
+        }
+        self.finished = true;
+        let mut map = self.flights.lock();
+        let Some(bucket) = map.get_mut(&self.key) else {
+            return false;
+        };
+        if let Some(pos) = bucket.active.iter().position(|&g| g == self.generation) {
+            bucket.active.swap_remove(pos);
+        }
+        let is_current = self.generation > bucket.committed_gen;
+        if is_current {
+            bucket.committed_gen = self.generation;
+        }
+        if bucket.active.is_empty() {
+            map.remove(&self.key);
+        }
+        is_current
+    }
+}
+
+impl Drop for ProbeFlightGuard {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.finished = true;
+            let mut map = self.flights.lock();
+            if let Some(bucket) = map.get_mut(&self.key) {
+                if let Some(pos) =
+                    bucket.active.iter().position(|&g| g == self.generation)
+                {
+                    bucket.active.swap_remove(pos);
+                }
+                if bucket.active.is_empty() {
+                    map.remove(&self.key);
+                }
+            }
+        }
+    }
+}
+
+struct AbortTaskOnDrop(AbortHandle);
+
+impl Drop for AbortTaskOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
     }
 }
 
 /// ProxyManager is the latency registry.
 #[derive(Clone)]
 pub struct ProxyManager {
+    /// Aggregated state keyed by proxy display name, retained for API
+    /// reporting and name-based manual overrides/tests.
     proxy_state: Arc<DashMap<String, Arc<ProxyState>>>,
+    /// Probe URLs referenced by configured healthchecks or routing groups.
+    /// Only configured (or subscribed) targets are retained persistently in
+    /// `target_state`.
+    configured_urls: Arc<DashSet<String>>,
+    /// Per-instance and per-probe-URL state used by routing groups so distinct
+    /// providers with same-named nodes or groups probing different URLs never
+    /// cross-contaminate selection decisions.
+    target_state: Arc<DashMap<ProbeTargetKey, Arc<TargetProxyState>>>,
+    /// Bounded, expiring state for ad-hoc/manual probe URLs so arbitrary API
+    /// latency checks cannot grow memory unboundedly on long-lived nodes.
+    ephemeral_target_state: Cache<ProbeTargetKey, Arc<TargetProxyState>>,
+    /// Per-key striped locks serializing creation and ephemeral->persistent
+    /// promotion so reads, probe writes, and subscriptions always converge on
+    /// the exact same `TargetProxyState` instance without dropping history.
+    target_state_locks: Arc<[SyncMutex<()>; TARGET_STATE_LOCK_STRIPES]>,
     dns_resolver: ThreadSafeDNSResolver,
+    /// Runtime-wide concurrency budget shared across all concurrent probe batches.
+    probe_semaphore: Arc<Semaphore>,
+    /// Tracks active probe generations keyed by `(node_identity, url)` so
+    /// probes targeting different URLs or distinct proxy instances never
+    /// suppress one another, while stale probes for the same `(node, url)`
+    /// cannot overwrite newer committed results.
+    probe_flights: Arc<ProbeFlightMap>,
+    next_probe_gen: Arc<AtomicU64>,
     /// Firewall Mark for url test
     fw_mark: Option<u32>,
 }
@@ -128,54 +248,329 @@ pub struct SiteTuning {
 
 impl ProxyManager {
     pub fn new(dns_resolver: ThreadSafeDNSResolver, fw_mark: Option<u32>) -> Self {
+        Self::with_concurrency(dns_resolver, fw_mark, DEFAULT_URL_TEST_CONCURRENCY)
+    }
+
+    pub fn with_concurrency(
+        dns_resolver: ThreadSafeDNSResolver,
+        fw_mark: Option<u32>,
+        max_concurrency: usize,
+    ) -> Self {
+        let ephemeral_target_state = Cache::builder()
+            .max_capacity(MAX_EPHEMERAL_TARGET_STATES)
+            .time_to_idle(EPHEMERAL_TARGET_STATE_TTL)
+            .build();
         Self {
             dns_resolver,
             proxy_state: Arc::new(DashMap::new()),
+            configured_urls: Arc::new(DashSet::new()),
+            target_state: Arc::new(DashMap::new()),
+            ephemeral_target_state,
+            target_state_locks: Arc::new(from_fn(|_| SyncMutex::new(()))),
+            probe_semaphore: Arc::new(Semaphore::new(max_concurrency.max(1))),
+            probe_flights: Arc::new(SyncMutex::new(HashMap::new())),
+            next_probe_gen: Arc::new(AtomicU64::new(0)),
             fw_mark,
         }
     }
 
-    /// Handy wrapper of `url_test` that checks multiple proxies
+    #[cfg(test)]
+    pub(crate) fn with_ephemeral_limits(
+        mut self,
+        max_capacity: u64,
+        ttl: Duration,
+    ) -> Self {
+        self.ephemeral_target_state = Cache::builder()
+            .max_capacity(max_capacity)
+            .time_to_idle(ttl)
+            .build();
+        self
+    }
+
+    pub(crate) fn register_probe_url(&self, url: &str) {
+        if !url.is_empty() {
+            self.configured_urls.insert(url.to_owned());
+        }
+    }
+
+    /// Handy wrapper of `url_test` that checks multiple proxies with bounded
+    /// concurrency and per-batch deduplication.
     #[instrument(skip(self))]
     pub async fn check(
         &self,
         outbounds: &Vec<OutboundNode>,
         url: &str,
-        timeout: Option<Duration>,
-    ) -> Vec<std::io::Result<(Duration, Duration)>> {
-        let mut futs = vec![];
-        for outbound in outbounds {
-            let outbound = outbound.clone();
-            let url = url.to_owned();
-            let manager = self.clone();
-            futs.push(tokio::spawn(async move {
-                let proxy_name = outbound.name().to_owned();
-                manager
-                    .url_test(outbound, url.as_str(), timeout)
-                    .await
-                    .inspect_err(|e| {
-                        warn!("healthcheck {} -> {} failed: {}", proxy_name, url, e)
-                    })
-            }));
+        timeout_dur: Option<Duration>,
+    ) -> Vec<io::Result<(Duration, Duration)>> {
+        self.check_with_concurrency(
+            outbounds,
+            url,
+            timeout_dur,
+            DEFAULT_URL_TEST_CONCURRENCY,
+        )
+        .await
+    }
+
+    pub async fn check_with_concurrency(
+        &self,
+        outbounds: &[OutboundNode],
+        url: &str,
+        timeout_dur: Option<Duration>,
+        concurrency: usize,
+    ) -> Vec<io::Result<(Duration, Duration)>> {
+        if outbounds.is_empty() {
+            return Vec::new();
         }
 
-        let futs: FuturesOrdered<_> = futs.into_iter().collect();
-        let r: Vec<_> = futs.collect().await;
+        // Deduplicate by node instance identity so distinct providers with
+        // same-named nodes are both probed, while repeated references to the
+        // same node in one batch only probe once.
+        let mut unique_indices: HashMap<usize, usize> =
+            HashMap::with_capacity(outbounds.len());
+        let mut unique_outbounds: Vec<OutboundNode> =
+            Vec::with_capacity(outbounds.len());
+        let mut index_map: Vec<usize> = Vec::with_capacity(outbounds.len());
 
-        let mut results = vec![];
-        for res in r {
-            match res {
-                Ok(r) => results.push(r),
-                Err(e) => results.push(Err(new_io_error(e.to_string()))),
+        for outbound in outbounds {
+            let id = outbound.identity();
+            let idx = if let Some(&existing) = unique_indices.get(&id) {
+                existing
+            } else {
+                let next = unique_outbounds.len();
+                unique_indices.insert(id, next);
+                unique_outbounds.push(outbound.clone());
+                next
+            };
+            index_map.push(idx);
+        }
+
+        let unique_count = unique_outbounds.len();
+        let batch_limit = concurrency.max(1);
+        let mut unique_results: Vec<Option<io::Result<(Duration, Duration)>>> =
+            (0..unique_count).map(|_| None).collect();
+
+        let mut completed = stream::iter(unique_outbounds.into_iter().enumerate())
+            .map(|(idx, outbound)| {
+                let manager = self.clone();
+                let url = url.to_owned();
+                async move {
+                    // Acquire the runtime concurrency permit BEFORE registering
+                    // a probe generation so cancelling a batch while queued on
+                    // the semaphore cannot interfere with active probes.
+                    let Ok(_permit) = manager.probe_semaphore.acquire().await else {
+                        return (idx, Err(new_io_error("url test semaphore closed")));
+                    };
+                    let flight = manager.begin_probe(outbound.identity(), &url);
+                    let proxy_name = outbound.name().to_owned();
+                    let res = manager
+                        .url_test_inner(
+                            outbound,
+                            url.as_str(),
+                            timeout_dur,
+                            Some(flight),
+                        )
+                        .await
+                        .inspect_err(|e| {
+                            warn!("healthcheck {} -> {} failed: {}", proxy_name, url, e)
+                        });
+                    (idx, res)
+                }
+            })
+            .buffer_unordered(batch_limit);
+
+        while let Some((idx, res)) = completed.next().await {
+            unique_results[idx] = Some(res);
+        }
+
+        let mut results = Vec::with_capacity(index_map.len());
+        for idx in index_map {
+            match unique_results[idx]
+                .as_ref()
+                .expect("every unique outbound produced a probe result")
+            {
+                Ok(d) => results.push(Ok(*d)),
+                Err(e) => results.push(Err(io::Error::new(
+                    e.kind(),
+                    e.to_string(),
+                ))),
             }
         }
         results
+    }
+
+    fn begin_probe(&self, node_identity: usize, url: &str) -> ProbeFlightGuard {
+        let generation = self.next_probe_gen.fetch_add(1, Ordering::SeqCst) + 1;
+        let key = (node_identity, url.to_owned());
+        {
+            let mut map = self.probe_flights.lock();
+            map.entry(key.clone())
+                .and_modify(|bucket| bucket.active.push(generation))
+                .or_insert_with(|| FlightBucket {
+                    committed_gen: 0,
+                    active: vec![generation],
+                });
+        }
+        ProbeFlightGuard {
+            flights: Arc::clone(&self.probe_flights),
+            key,
+            generation,
+            finished: false,
+        }
+    }
+
+    pub(crate) fn prune_dead_targets(&self) {
+        self.target_state
+            .retain(|_, entry| entry.owner.upgrade().is_some());
+        self.ephemeral_target_state.run_pending_tasks();
+    }
+
+    fn lock_target_key(&self, key: &ProbeTargetKey) -> SyncMutexGuard<'_, ()> {
+        let mut hasher = DefaultHasher::new();
+        key.hash(&mut hasher);
+        let stripe = (hasher.finish() as usize) % TARGET_STATE_LOCK_STRIPES;
+        self.target_state_locks[stripe].lock()
+    }
+
+    fn get_target_state(
+        &self,
+        node: &OutboundNode,
+        url: &str,
+    ) -> Option<Arc<TargetProxyState>> {
+        let key = (node.identity(), url.to_owned());
+        if let Some(entry) = self.target_state.get(&key) {
+            return Some(entry.value().clone());
+        }
+        if let Some(entry) = self.ephemeral_target_state.get(&key) {
+            return Some(entry);
+        }
+        // Promotion always inserts into `target_state` before invalidating
+        // `ephemeral_target_state`, so a single re-check closes the handoff
+        // gap for lock-free readers.
+        self.target_state
+            .get(&key)
+            .map(|entry| entry.value().clone())
+    }
+
+    fn get_or_create_target_state(
+        &self,
+        node: &OutboundNode,
+        url: &str,
+        pin: bool,
+    ) -> Arc<TargetProxyState> {
+        let key = (node.identity(), url.to_owned());
+        if let Some(entry) = self.target_state.get(&key) {
+            return entry.value().clone();
+        }
+        // Fast path for already-present ad-hoc entries: safe even under
+        // concurrent promotion because promotion moves the same `Arc` into
+        // `target_state` before invalidating the ephemeral entry.
+        if !pin
+            && !self.configured_urls.contains(url)
+            && let Some(entry) = self.ephemeral_target_state.get(&key)
+        {
+            return entry;
+        }
+
+        let _guard = self.lock_target_key(&key);
+        if let Some(entry) = self.target_state.get(&key) {
+            return entry.value().clone();
+        }
+
+        if pin || self.configured_urls.contains(url) {
+            let entry = self.ephemeral_target_state.get(&key).unwrap_or_else(|| {
+                Arc::new(TargetProxyState {
+                    owner: node.downgrade(),
+                    state: ProxyState::new(),
+                })
+            });
+            // Publish into `target_state` BEFORE removing from the ephemeral
+            // cache so concurrent readers and writers always observe the same
+            // `TargetProxyState` without losing prior samples.
+            self.target_state.insert(key.clone(), entry.clone());
+            self.ephemeral_target_state.invalidate(&key);
+            entry
+        } else {
+            self.ephemeral_target_state.get_with(key, || {
+                Arc::new(TargetProxyState {
+                    owner: node.downgrade(),
+                    state: ProxyState::new(),
+                })
+            })
+        }
+    }
+
+    fn apply_state_update(
+        state: &ProxyState,
+        alive: bool,
+        history: Option<DelayHistory>,
+    ) {
+        let (alive_changed, delay_changed) = {
+            let mut history_lock = state.delay_history.write();
+            let alive_changed = state.alive.swap(alive, Ordering::Relaxed) != alive;
+            let mut delay_changed = false;
+            if let Some(ins) = history {
+                delay_changed = history_lock.back().map(|previous| previous.delay)
+                    != Some(ins.delay);
+                history_lock.push_back(ins);
+                if history_lock.len() > 10 {
+                    history_lock.pop_front();
+                }
+            }
+            (alive_changed, delay_changed)
+        };
+        if alive_changed {
+            state.alive_changes.notify();
+        }
+        if alive_changed || delay_changed {
+            state.delay_changes.notify();
+        }
+    }
+
+    fn read_alive_and_last_delay(state: &ProxyState) -> (bool, Option<Duration>) {
+        let alive = state.alive.load(Ordering::Relaxed);
+        let delay = state
+            .delay_history
+            .read()
+            .back()
+            .map(|history| history.delay);
+        (alive, delay)
+    }
+
+    fn read_delay_metrics(state: &ProxyState) -> Option<(f64, f64)> {
+        let history = state.delay_history.read();
+        if history.is_empty() {
+            return None;
+        }
+        let failed = history.iter().filter(|sample| sample.delay.is_zero()).count();
+        let rtt = history
+            .iter()
+            .map(|sample| sample.delay.as_millis_f64())
+            .sum::<f64>()
+            / history.len() as f64;
+        Some((failed as f64 / history.len() as f64, rtt))
     }
 
     pub(crate) fn route_changes(&self, name: &str, delay: bool) -> RouteChange {
         let state = self.proxy_state.entry(name.to_owned())
             .or_insert_with(|| Arc::new(ProxyState::new()));
         if delay { state.delay_changes.clone() } else { state.alive_changes.clone() }
+    }
+
+    pub(crate) fn route_changes_for(
+        &self,
+        node: &OutboundNode,
+        url: Option<&str>,
+        delay: bool,
+    ) -> RouteChange {
+        let Some(url) = url else {
+            return self.route_changes(node.name(), delay);
+        };
+        let entry = self.get_or_create_target_state(node, url, true);
+        if delay {
+            entry.state.delay_changes.clone()
+        } else {
+            entry.state.alive_changes.clone()
+        }
     }
 
     pub fn alive(&self, name: &str) -> bool {
@@ -185,19 +580,36 @@ impl ProxyManager {
             .unwrap_or(true) // if not found, assume it's alive
     }
 
+    pub(crate) fn alive_for(&self, node: &OutboundNode, url: Option<&str>) -> bool {
+        let Some(url) = url else {
+            return self.alive(node.name());
+        };
+        self.get_target_state(node, url)
+            .map(|x| x.state.alive.load(Ordering::Relaxed))
+            .unwrap_or(true)
+    }
+
     pub(crate) fn alive_and_last_delay(
         &self,
         name: &str,
     ) -> (bool, Option<Duration>) {
-        self.proxy_state.get(name).map_or((true, None), |state| {
-            let alive = state.alive.load(Ordering::Relaxed);
-            let delay = state
-                .delay_history
-                .read()
-                .back()
-                .map(|history| history.delay);
-            (alive, delay)
-        })
+        self.proxy_state
+            .get(name)
+            .map_or((true, None), |state| Self::read_alive_and_last_delay(&state))
+    }
+
+    pub(crate) fn alive_and_last_delay_for(
+        &self,
+        node: &OutboundNode,
+        url: Option<&str>,
+    ) -> (bool, Option<Duration>) {
+        let Some(url) = url else {
+            return self.alive_and_last_delay(node.name());
+        };
+        self.get_target_state(node, url)
+            .map_or((true, None), |entry| {
+                Self::read_alive_and_last_delay(&entry.state)
+            })
     }
 
     pub async fn report_alive(
@@ -210,19 +622,51 @@ impl ProxyManager {
             .proxy_state
             .entry(name.to_owned())
             .or_insert_with(|| Arc::new(ProxyState::new()));
-        let state = entry.value();
-        let alive_changed = state.alive.swap(alive, Ordering::Relaxed) != alive;
-        let mut delay_changed = false;
-        if let Some(ins) = history {
-            let mut history_lock = state.delay_history.write();
-            delay_changed = history_lock.back().map(|previous| previous.delay) != Some(ins.delay);
-            history_lock.push_back(ins);
-            if history_lock.len() > 10 {
-                history_lock.pop_front();
+        Self::apply_state_update(entry.value(), alive, history);
+    }
+
+    async fn report_probe_result(
+        &self,
+        node: &OutboundNode,
+        url: &str,
+        mut flight: Option<ProbeFlightGuard>,
+        alive: bool,
+        history: Option<DelayHistory>,
+    ) {
+        let target_entry = self.get_or_create_target_state(node, url, false);
+
+        let (alive_changed, delay_changed) = {
+            let mut history_lock = target_entry.state.delay_history.write();
+            if let Some(guard) = flight.as_mut()
+                && !guard.finish_and_check_current()
+            {
+                return;
             }
+            let alive_changed =
+                target_entry.state.alive.swap(alive, Ordering::Relaxed) != alive;
+            let mut delay_changed = false;
+            if let Some(ins) = history.clone() {
+                delay_changed =
+                    history_lock.back().map(|previous| previous.delay)
+                        != Some(ins.delay);
+                history_lock.push_back(ins);
+                if history_lock.len() > 10 {
+                    history_lock.pop_front();
+                }
+            }
+            (alive_changed, delay_changed)
+        };
+        if alive_changed {
+            target_entry.state.alive_changes.notify();
         }
-        if alive_changed { state.alive_changes.notify(); }
-        if alive_changed || delay_changed { state.delay_changes.notify(); }
+        if alive_changed || delay_changed {
+            target_entry.state.delay_changes.notify();
+        }
+
+        // Also update the name-aggregated state for REST API / dashboard display;
+        // routing groups read per-(node_identity, url) target state so ad-hoc URLs
+        // cannot affect group selection.
+        self.report_alive(node.name(), alive, history).await;
     }
 
     #[cfg(test)]
@@ -258,14 +702,19 @@ impl ProxyManager {
     /// Packet loss fraction and average RTT in milliseconds from one snapshot.
     pub fn delay_metrics(&self, name: &str) -> Option<(f64, f64)> {
         let state = self.proxy_state.get(name)?;
-        let history = state.delay_history.read();
-        if history.is_empty() {
-            return None;
-        }
-        let failed = history.iter().filter(|sample| sample.delay.is_zero()).count();
-        let rtt = history.iter().map(|sample| sample.delay.as_millis_f64())
-            .sum::<f64>() / history.len() as f64;
-        Some((failed as f64 / history.len() as f64, rtt))
+        Self::read_delay_metrics(&state)
+    }
+
+    pub(crate) fn delay_metrics_for(
+        &self,
+        node: &OutboundNode,
+        url: Option<&str>,
+    ) -> Option<(f64, f64)> {
+        let Some(url) = url else {
+            return self.delay_metrics(node.name());
+        };
+        let entry = self.get_target_state(node, url)?;
+        Self::read_delay_metrics(&entry.state)
     }
 
     /// This method analyzes traffic characteristics using multiple detection
@@ -738,14 +1187,27 @@ impl ProxyManager {
         &self,
         outbound: OutboundNode,
         url: &str,
-        timeout: Option<Duration>,
-    ) -> std::io::Result<(Duration, Duration)> {
+        timeout_dur: Option<Duration>,
+    ) -> io::Result<(Duration, Duration)> {
+        let flight = self.begin_probe(outbound.identity(), url);
+        self.url_test_inner(outbound, url, timeout_dur, Some(flight))
+            .await
+    }
+
+    async fn url_test_inner(
+        &self,
+        outbound: OutboundNode,
+        url: &str,
+        timeout_dur: Option<Duration>,
+        flight: Option<ProbeFlightGuard>,
+    ) -> io::Result<(Duration, Duration)> {
         trace!("started");
         let name = outbound.name().to_owned();
         let name_clone = name.clone();
         let default_timeout = Duration::from_secs(5);
-        let timeout = timeout.unwrap_or(default_timeout);
+        let probe_timeout = timeout_dur.unwrap_or(default_timeout);
 
+        let outbound_ref = outbound.clone();
         let dns_resolver = self.dns_resolver.clone();
         let tester = async move {
             let name = name_clone;
@@ -780,8 +1242,8 @@ impl ProxyManager {
                 ..Default::default()
             };
 
-            let (stream, connect_delay) = tokio::time::timeout(
-                timeout,
+            let (stream, connect_delay) = timeout(
+                probe_timeout,
                 TimedFuture::new(pin!(outbound.connect_stream(&sess, dns_resolver))),
             )
             .await
@@ -797,11 +1259,11 @@ impl ProxyManager {
                 .unwrap();
 
             let mut tls_handshake_delay = None;
-            let resp = match uri.scheme() {
+            let (_conn_guard, resp) = match uri.scheme() {
                 Some(scheme) if scheme == &http::uri::Scheme::HTTP => {
                     let io = TokioIo::new(stream);
-                    let (mut sender, conn) = tokio::time::timeout(
-                        timeout,
+                    let (mut sender, conn) = timeout(
+                        probe_timeout,
                         hyper::client::conn::http1::handshake(io),
                     )
                     .await
@@ -811,14 +1273,17 @@ impl ProxyManager {
                     })?;
 
                     let connection_name = name.clone();
-                    tokio::task::spawn(async move {
+                    let conn_handle = spawn(async move {
                         if let Err(err) = conn.await {
                             warn!(outbound = %connection_name, error = ?err,
                                 "HTTP connection error");
                         }
                     });
 
-                    TimedFuture::new(sender.send_request(req).boxed())
+                    (
+                        AbortTaskOnDrop(conn_handle.abort_handle()),
+                        TimedFuture::new(sender.send_request(req).boxed()),
+                    )
                 }
                 Some(scheme) if scheme == &http::uri::Scheme::HTTPS => {
                     let mut tls_config = rustls::ClientConfig::builder()
@@ -833,8 +1298,8 @@ impl ProxyManager {
                     let connector =
                         tokio_rustls::TlsConnector::from(Arc::new(tls_config));
 
-                    let (stream, delay) = tokio::time::timeout(
-                        timeout,
+                    let (stream, delay) = timeout(
+                        probe_timeout,
                         TimedFuture::new(connector.connect(
                             host.try_into().expect("must be valid SNI"),
                             stream,
@@ -846,8 +1311,8 @@ impl ProxyManager {
 
                     let io = TokioIo::new(stream);
 
-                    let (mut sender, conn) = tokio::time::timeout(
-                        timeout,
+                    let (mut sender, conn) = timeout(
+                        probe_timeout,
                         hyper::client::conn::http1::handshake(io),
                     )
                     .await
@@ -857,7 +1322,7 @@ impl ProxyManager {
                     })?;
 
                     let connection_name = name.clone();
-                    tokio::task::spawn(async move {
+                    let conn_handle = spawn(async move {
                         if let Err(err) = conn.await {
                             warn!(outbound = %connection_name, error = ?err,
                                 "HTTP connection error");
@@ -866,7 +1331,10 @@ impl ProxyManager {
 
                     tls_handshake_delay = Some(delay);
 
-                    TimedFuture::new(sender.send_request(req).boxed())
+                    (
+                        AbortTaskOnDrop(conn_handle.abort_handle()),
+                        TimedFuture::new(sender.send_request(req).boxed()),
+                    )
                 }
                 _ => {
                     return Err(new_io_error(format!(
@@ -875,7 +1343,7 @@ impl ProxyManager {
                 }
             };
 
-            let delay = match tokio::time::timeout(timeout, resp).await {
+            let delay = match timeout(probe_timeout, resp).await {
                 Ok((res, delay)) => match res {
                     Ok(res) => {
                         trace!(
@@ -909,8 +1377,10 @@ impl ProxyManager {
 
         let result = tester.await;
 
-        self.report_alive(
-            &name,
+        self.report_probe_result(
+            &outbound_ref,
+            url,
+            flight,
             result.is_ok(),
             Some(DelayHistory {
                 time: Utc::now(),
@@ -1204,6 +1674,645 @@ mod tests {
         manager.report_alive("a", false, None).await;
         assert!(!alive.has_changed().unwrap());
         assert!(!delay.has_changed().unwrap());
+    }
+
+    #[tokio::test]
+    async fn check_with_concurrency_bounds_parallelism_and_deduplicates() {
+        use crate::proxy::utils::test_utils::noop::NoopResolver;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
+
+        let manager = remote_content_manager::ProxyManager::new(
+            Arc::new(NoopResolver),
+            None,
+        );
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let max_seen = Arc::new(AtomicUsize::new(0));
+        let total_calls = Arc::new(AtomicUsize::new(0));
+
+        let make_node = |name: &str| {
+            let mut mock = MockDummyOutboundHandler::new();
+            let name_owned = name.to_owned();
+            mock.expect_name().return_const(name_owned);
+            let in_flight = in_flight.clone();
+            let max_seen = max_seen.clone();
+            let total_calls = total_calls.clone();
+            mock.expect_connect_stream().returning(move |_, _| {
+                total_calls.fetch_add(1, Ordering::SeqCst);
+                let cur = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                max_seen.fetch_max(cur, Ordering::SeqCst);
+                let in_flight_drop = in_flight.clone();
+                let (client, mut server) = duplex(1024);
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 512];
+                    let _ = server.read(&mut buf).await;
+                    tokio::time::sleep(Duration::from_millis(30)).await;
+                    let _ = server
+                        .write_all(
+                            b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        )
+                        .await;
+                    let _ = server.shutdown().await;
+                    in_flight_drop.fetch_sub(1, Ordering::SeqCst);
+                });
+                Ok(AnyStream::new(client))
+            });
+            OutboundNode::protocol(Arc::new(mock))
+        };
+
+        let n1 = make_node("p1");
+        let n2 = make_node("p2");
+        let n3 = make_node("p3");
+        let n4 = make_node("p4");
+        let n5 = make_node("p5");
+        // Include a duplicate of p1 to verify per-batch deduplication.
+        let list = vec![n1.clone(), n2, n3, n4, n5, n1];
+
+        let results = manager
+            .check_with_concurrency(
+                &list,
+                "http://example.com/generate_204",
+                Some(Duration::from_secs(2)),
+                2,
+            )
+            .await;
+
+        assert_eq!(results.len(), 6);
+        assert!(results.iter().all(|r| r.is_ok()));
+        assert_eq!(total_calls.load(Ordering::SeqCst), 5);
+        assert!(
+            max_seen.load(Ordering::SeqCst) <= 2,
+            "expected max concurrency <= 2, saw {}",
+            max_seen.load(Ordering::SeqCst)
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_probe_result_does_not_overwrite_newer_generation() {
+        use crate::proxy::utils::test_utils::noop::NoopResolver;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::{
+            io::{AsyncReadExt, AsyncWriteExt, duplex},
+            sync::Notify,
+        };
+
+        let manager = remote_content_manager::ProxyManager::new(
+            Arc::new(NoopResolver),
+            None,
+        );
+        let old_started = Arc::new(Notify::new());
+        let release_old = Arc::new(Notify::new());
+        let attempt = Arc::new(AtomicUsize::new(0));
+
+        let mut mock = MockDummyOutboundHandler::new();
+        mock.expect_name().return_const("same-name".to_owned());
+        {
+            let old_started = old_started.clone();
+            let release_old = release_old.clone();
+            let attempt = attempt.clone();
+            mock.expect_connect_stream().returning(move |_, _| {
+                let n = attempt.fetch_add(1, Ordering::SeqCst);
+                let (client, mut server) = duplex(1024);
+                if n == 0 {
+                    let old_started = old_started.clone();
+                    let release_old = release_old.clone();
+                    tokio::spawn(async move {
+                        let mut buf = [0u8; 512];
+                        let _ = server.read(&mut buf).await;
+                        old_started.notify_one();
+                        release_old.notified().await;
+                        // Close without writing HTTP response so old probe fails.
+                        drop(server);
+                    });
+                } else {
+                    tokio::spawn(async move {
+                        let mut buf = [0u8; 512];
+                        let _ = server.read(&mut buf).await;
+                        let _ = server
+                            .write_all(
+                                b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                            )
+                            .await;
+                        let _ = server.shutdown().await;
+                    });
+                }
+                Ok(AnyStream::new(client))
+            });
+        }
+
+        let node = OutboundNode::protocol(Arc::new(mock));
+        let old_mgr = manager.clone();
+        let old_node = node.clone();
+        let old_task = tokio::spawn(async move {
+            old_mgr
+                .url_test(
+                    old_node,
+                    "http://example.com/generate_204",
+                    Some(Duration::from_secs(2)),
+                )
+                .await
+        });
+        old_started.notified().await;
+
+        // Newer probe for the same node instance and URL succeeds first.
+        let new_res = manager
+            .url_test(
+                node,
+                "http://example.com/generate_204",
+                Some(Duration::from_secs(2)),
+            )
+            .await;
+        assert!(new_res.is_ok());
+        assert!(manager.alive("same-name"));
+        let newer_delay = manager.last_delay("same-name");
+        assert!(newer_delay.is_some());
+
+        // Now let the older probe finish with failure; it must NOT overwrite
+        // the newer alive/delay state.
+        release_old.notify_one();
+        let old_res = old_task.await.unwrap();
+        assert!(old_res.is_err());
+        assert!(manager.alive("same-name"));
+        assert_eq!(manager.last_delay("same-name"), newer_delay);
+        assert_eq!(manager.delay_history("same-name").await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn concurrent_probes_with_distinct_urls_or_instances_do_not_suppress_each_other() {
+        use crate::proxy::utils::test_utils::noop::NoopResolver;
+        use tokio::{
+            io::{AsyncReadExt, AsyncWriteExt, duplex},
+            sync::Notify,
+        };
+
+        let manager = remote_content_manager::ProxyManager::new(
+            Arc::new(NoopResolver),
+            None,
+        );
+        let first_started = Arc::new(Notify::new());
+        let release_first = Arc::new(Notify::new());
+
+        let mut mock_a = MockDummyOutboundHandler::new();
+        mock_a.expect_name().return_const("shared-name".to_owned());
+        {
+            let first_started = first_started.clone();
+            let release_first = release_first.clone();
+            mock_a.expect_connect_stream().returning(move |_, _| {
+                let (client, mut server) = duplex(1024);
+                let first_started = first_started.clone();
+                let release_first = release_first.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 512];
+                    let _ = server.read(&mut buf).await;
+                    first_started.notify_one();
+                    release_first.notified().await;
+                    let _ = server
+                        .write_all(
+                            b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        )
+                        .await;
+                    let _ = server.shutdown().await;
+                });
+                Ok(AnyStream::new(client))
+            });
+        }
+
+        let mut mock_b = MockDummyOutboundHandler::new();
+        mock_b.expect_name().return_const("shared-name".to_owned());
+        mock_b.expect_connect_stream().returning(|_, _| {
+            let (client, mut server) = duplex(1024);
+            tokio::spawn(async move {
+                let mut buf = [0u8; 512];
+                let _ = server.read(&mut buf).await;
+                let _ = server
+                    .write_all(
+                        b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .await;
+                let _ = server.shutdown().await;
+            });
+            Ok(AnyStream::new(client))
+        });
+
+        let node_a = OutboundNode::protocol(Arc::new(mock_a));
+        let node_b = OutboundNode::protocol(Arc::new(mock_b));
+
+        // Start probe for (node_a, url-1) and pause it mid-flight.
+        let mgr_a = manager.clone();
+        let task_a = tokio::spawn(async move {
+            mgr_a
+                .url_test(
+                    node_a,
+                    "http://one.example/generate_204",
+                    Some(Duration::from_secs(2)),
+                )
+                .await
+        });
+        first_started.notified().await;
+
+        // Distinct instance with the same name probes another URL and finishes first.
+        manager
+            .url_test(
+                node_b,
+                "http://two.example/generate_204",
+                Some(Duration::from_secs(2)),
+            )
+            .await
+            .unwrap();
+        assert_eq!(manager.delay_history("shared-name").await.len(), 1);
+
+        // Release the first probe: because its (instance, url) key differs,
+        // its result must NOT be suppressed.
+        release_first.notify_one();
+        task_a.await.unwrap().unwrap();
+        assert_eq!(manager.delay_history("shared-name").await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn runtime_probe_budget_caps_parallelism_across_concurrent_batches() {
+        use crate::proxy::utils::test_utils::noop::NoopResolver;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
+
+        let manager = remote_content_manager::ProxyManager::with_concurrency(
+            Arc::new(NoopResolver),
+            None,
+            2,
+        );
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let max_seen = Arc::new(AtomicUsize::new(0));
+
+        let make_node = |name: &str| {
+            let mut mock = MockDummyOutboundHandler::new();
+            mock.expect_name().return_const(name.to_owned());
+            let in_flight = in_flight.clone();
+            let max_seen = max_seen.clone();
+            mock.expect_connect_stream().returning(move |_, _| {
+                let cur = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                max_seen.fetch_max(cur, Ordering::SeqCst);
+                let in_flight_drop = in_flight.clone();
+                let (client, mut server) = duplex(1024);
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 512];
+                    let _ = server.read(&mut buf).await;
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                    let _ = server
+                        .write_all(
+                            b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        )
+                        .await;
+                    let _ = server.shutdown().await;
+                    in_flight_drop.fetch_sub(1, Ordering::SeqCst);
+                });
+                Ok(AnyStream::new(client))
+            });
+            OutboundNode::protocol(Arc::new(mock))
+        };
+
+        let batch1: Vec<OutboundNode> = (0..4).map(|i| make_node(&format!("b1-{i}"))).collect();
+        let batch2: Vec<OutboundNode> = (0..4).map(|i| make_node(&format!("b2-{i}"))).collect();
+
+        let (r1, r2) = tokio::join!(
+            manager.check_with_concurrency(
+                &batch1,
+                "http://one.example/generate_204",
+                Some(Duration::from_secs(2)),
+                4,
+            ),
+            manager.check_with_concurrency(
+                &batch2,
+                "http://two.example/generate_204",
+                Some(Duration::from_secs(2)),
+                4,
+            ),
+        );
+        assert!(r1.iter().all(|r| r.is_ok()));
+        assert!(r2.iter().all(|r| r.is_ok()));
+        assert!(
+            max_seen.load(Ordering::SeqCst) <= 2,
+            "runtime budget must bound total in-flight probes across concurrent batches, saw {}",
+            max_seen.load(Ordering::SeqCst)
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelling_queued_probe_does_not_invalidate_active_probe() {
+        use crate::proxy::utils::test_utils::noop::NoopResolver;
+        use tokio::{
+            io::{AsyncReadExt, AsyncWriteExt, duplex},
+            sync::Notify,
+        };
+
+        // Concurrency budget of 1 forces the second batch to queue on the
+        // runtime semaphore while the first probe is active.
+        let manager = remote_content_manager::ProxyManager::with_concurrency(
+            Arc::new(NoopResolver),
+            None,
+            1,
+        );
+        let started = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+
+        let mut mock = MockDummyOutboundHandler::new();
+        mock.expect_name().return_const("queued-cancel".to_owned());
+        {
+            let started = started.clone();
+            let release = release.clone();
+            mock.expect_connect_stream().returning(move |_, _| {
+                let (client, mut server) = duplex(1024);
+                let started = started.clone();
+                let release = release.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 512];
+                    let _ = server.read(&mut buf).await;
+                    started.notify_one();
+                    release.notified().await;
+                    let _ = server
+                        .write_all(
+                            b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        )
+                        .await;
+                    let _ = server.shutdown().await;
+                });
+                Ok(AnyStream::new(client))
+            });
+        }
+        let node = OutboundNode::protocol(Arc::new(mock));
+        let url = "http://example.com/generate_204";
+
+        let mgr1 = manager.clone();
+        let node1 = node.clone();
+        let active_batch = tokio::spawn(async move {
+            mgr1.check_with_concurrency(
+                &[node1],
+                url,
+                Some(Duration::from_secs(2)),
+                1,
+            )
+            .await
+        });
+        started.notified().await;
+
+        // Start a second batch for the same (node, url), let it queue on the
+        // semaphore, and then cancel it before it can acquire a permit.
+        let mgr2 = manager.clone();
+        let node2 = node.clone();
+        let queued_batch = tokio::spawn(async move {
+            mgr2.check_with_concurrency(
+                &[node2],
+                url,
+                Some(Duration::from_secs(2)),
+                1,
+            )
+            .await
+        });
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        queued_batch.abort();
+        let _ = queued_batch.await;
+
+        // Release the active probe: its result must still commit.
+        release.notify_one();
+        let results = active_batch.await.unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(results[0].is_ok());
+
+        let (alive, delay) = manager.alive_and_last_delay_for(&node, Some(url));
+        assert!(alive);
+        assert!(
+            delay.is_some(),
+            "cancelling a queued probe must not discard the active probe's result"
+        );
+        assert_eq!(manager.delay_history("queued-cancel").await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn adhoc_probe_urls_are_bounded_and_expire_without_evicting_configured_targets() {
+        use crate::proxy::utils::test_utils::noop::NoopResolver;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
+
+        let manager = remote_content_manager::ProxyManager::new(
+            Arc::new(NoopResolver),
+            None,
+        )
+        .with_ephemeral_limits(4, Duration::from_millis(80));
+
+        let mut mock = MockDummyOutboundHandler::new();
+        mock.expect_name().return_const("long-lived".to_owned());
+        mock.expect_connect_stream().returning(|sess, _| {
+            if sess.destination.host().starts_with("fail-") {
+                return Err(std::io::Error::other("simulated probe failure"));
+            }
+            let (client, mut server) = duplex(1024);
+            tokio::spawn(async move {
+                let mut buf = [0u8; 512];
+                let _ = server.read(&mut buf).await;
+                let _ = server
+                    .write_all(
+                        b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .await;
+                let _ = server.shutdown().await;
+            });
+            Ok(AnyStream::new(client))
+        });
+        let node = OutboundNode::protocol(Arc::new(mock));
+
+        let configured_url = "http://configured.example/generate_204";
+        manager.register_probe_url(configured_url);
+        manager
+            .url_test(node.clone(), configured_url, Some(Duration::from_secs(2)))
+            .await
+            .unwrap();
+        assert_eq!(manager.target_state.len(), 1);
+
+        // Flood 20 distinct ad-hoc URLs (both succeeding and failing).
+        for i in 0..20 {
+            let url = if i % 2 == 0 {
+                format!("http://adhoc-{i}.example/generate_204")
+            } else {
+                format!("http://fail-{i}.example/generate_204")
+            };
+            let _ = manager
+                .url_test(node.clone(), &url, Some(Duration::from_secs(2)))
+                .await;
+        }
+        manager.prune_dead_targets();
+
+        assert_eq!(
+            manager.target_state.len(),
+            1,
+            "ad-hoc request URLs must not accumulate in persistent target_state"
+        );
+        assert!(
+            manager.ephemeral_target_state.entry_count() <= 4,
+            "ephemeral ad-hoc URL cache must remain bounded by max_capacity, got {}",
+            manager.ephemeral_target_state.entry_count()
+        );
+        let (alive, delay) =
+            manager.alive_and_last_delay_for(&node, Some(configured_url));
+        assert!(alive);
+        assert!(delay.is_some());
+
+        // After TTL elapses, ad-hoc URL entries expire while configured target remains.
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        manager.prune_dead_targets();
+        assert_eq!(
+            manager.ephemeral_target_state.entry_count(),
+            0,
+            "expired ad-hoc URL entries must be reclaimed"
+        );
+        assert_eq!(manager.target_state.len(), 1);
+        let (alive, delay) =
+            manager.alive_and_last_delay_for(&node, Some(configured_url));
+        assert!(alive);
+        assert!(delay.is_some());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_promotion_and_probing_share_single_state_without_losing_history() {
+        use super::DelayHistory;
+        use crate::proxy::utils::test_utils::noop::NoopResolver;
+        use chrono::Utc;
+        use tokio::sync::Barrier;
+
+        let manager = remote_content_manager::ProxyManager::new(
+            Arc::new(NoopResolver),
+            None,
+        );
+        let mut mock = MockDummyOutboundHandler::new();
+        mock.expect_name().return_const("promote-race".to_owned());
+        let node = OutboundNode::protocol(Arc::new(mock));
+
+        for iter in 0..32 {
+            let url = format!("http://promote-{iter}.example/generate_204");
+            let initial_delay = Duration::from_millis(42);
+            // Seed an ephemeral entry with a known sample (alive=false, 42ms)
+            // so any accidental replacement with an empty ProxyState (alive=true,
+            // delay=None) is immediately detected.
+            manager
+                .report_probe_result(
+                    &node,
+                    &url,
+                    None,
+                    false,
+                    Some(DelayHistory {
+                        time: Utc::now(),
+                        delay: initial_delay,
+                    }),
+                )
+                .await;
+            assert!(
+                manager
+                    .target_state
+                    .get(&(node.identity(), url.clone()))
+                    .is_none()
+            );
+
+            let barrier = Arc::new(Barrier::new(16));
+            let mut promoters = Vec::new();
+            let mut writers = Vec::new();
+            let mut readers = Vec::new();
+
+            for _ in 0..8 {
+                let manager = manager.clone();
+                let node = node.clone();
+                let url = url.clone();
+                let barrier = barrier.clone();
+                promoters.push(tokio::spawn(async move {
+                    barrier.wait().await;
+                    manager
+                        .route_changes_for(&node, Some(&url), true)
+                        .identity()
+                }));
+            }
+
+            for _ in 0..4 {
+                let manager = manager.clone();
+                let node = node.clone();
+                let url = url.clone();
+                let barrier = barrier.clone();
+                writers.push(tokio::spawn(async move {
+                    barrier.wait().await;
+                    let entry = manager.get_or_create_target_state(&node, &url, false);
+                    Arc::as_ptr(&entry) as usize
+                }));
+            }
+
+            for _ in 0..4 {
+                let manager = manager.clone();
+                let node = node.clone();
+                let url = url.clone();
+                let barrier = barrier.clone();
+                readers.push(tokio::spawn(async move {
+                    barrier.wait().await;
+                    manager.alive_and_last_delay_for(&node, Some(&url))
+                }));
+            }
+
+            let mut change_ids = Vec::with_capacity(8);
+            for task in promoters {
+                change_ids.push(task.await.unwrap());
+            }
+            let first_change_id = change_ids[0];
+            assert!(
+                change_ids.iter().all(|&id| id == first_change_id),
+                "all concurrent promotions must return the same RouteChange object"
+            );
+
+            let persistent_entry = manager
+                .target_state
+                .get(&(node.identity(), url.clone()))
+                .expect("promoted target must exist in persistent target_state")
+                .value()
+                .clone();
+            let persistent_ptr = Arc::as_ptr(&persistent_entry) as usize;
+            assert_eq!(
+                persistent_entry.state.delay_changes.identity(),
+                first_change_id
+            );
+
+            for task in writers {
+                assert_eq!(
+                    task.await.unwrap(),
+                    persistent_ptr,
+                    "concurrent probe writes must share the exact same TargetProxyState"
+                );
+            }
+
+            for task in readers {
+                assert_eq!(
+                    task.await.unwrap(),
+                    (false, Some(initial_delay)),
+                    "concurrent readers must never observe a missing or reset state during promotion"
+                );
+            }
+
+            assert_eq!(
+                manager.alive_and_last_delay_for(&node, Some(&url)),
+                (false, Some(initial_delay)),
+                "promoted persistent state must preserve pre-existing alive status and delay history"
+            );
+            assert!(
+                manager
+                    .ephemeral_target_state
+                    .get(&(node.identity(), url))
+                    .is_none(),
+                "ephemeral entry must be invalidated after promotion"
+            );
+        }
+
+        // Verify warm ephemeral hits bypass the striped lock completely:
+        // holding the stripe mutex on the same thread would deadlock if the
+        // non-pinned fast path attempted to acquire it.
+        let warm_url = "http://warm-ephemeral.example/generate_204";
+        let initial = manager.get_or_create_target_state(&node, warm_url, false);
+        let stripe_guard =
+            manager.lock_target_key(&(node.identity(), warm_url.to_owned()));
+        let fast_hit = manager.get_or_create_target_state(&node, warm_url, false);
+        drop(stripe_guard);
+        assert!(Arc::ptr_eq(&initial, &fast_hit));
     }
 
 }
