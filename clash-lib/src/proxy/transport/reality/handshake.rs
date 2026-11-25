@@ -19,11 +19,10 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_boring::{SslStream, SslStreamBuilder};
 
 use crate::common::tls::boring::{
-    add_chrome_alps, configure_client_server_identity, get_reality_context,
+    add_chrome_alps, configure_client_server_identity, get_reality_context, set_chrome_key_shares,
 };
 use super::RealityConfig;
 
-const SSL_GROUP_X25519: u16 = 29;
 const HKDF_INFO: &[u8] = b"REALITY";
 const SESSION_ID_OFFSET: usize = 39;
 const SESSION_ID_LEN: usize = 32;
@@ -59,7 +58,7 @@ where
         }
     }
 
-    setup_reality_ssl(&ssl, config)
+    setup_reality_ssl(&mut ssl, config)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
 
     let tls = SslStreamBuilder::new(ssl, stream)
@@ -202,7 +201,7 @@ extern "C" fn reality_fixup_cb(ssl: *mut boring_sys::SSL, msg: *mut u8, msg_len:
     }
 }
 
-fn setup_reality_ssl(ssl: &SslRef, config: &RealityConfig) -> anyhow::Result<()> {
+fn setup_reality_ssl(ssl: &mut SslRef, config: &RealityConfig) -> anyhow::Result<()> {
     let sigalgs = c"ed25519:ecdsa_secp256r1_sha256:rsa_pss_rsae_sha256:rsa_pkcs1_sha256:\
 ecdsa_secp384r1_sha384:rsa_pss_rsae_sha384:rsa_pkcs1_sha384:rsa_pss_rsae_sha512:rsa_pkcs1_sha512";
     let ok = unsafe { boring_sys::SSL_set1_sigalgs_list(ssl.as_ptr(), sigalgs.as_ptr()) };
@@ -225,18 +224,12 @@ ecdsa_secp384r1_sha384:rsa_pss_rsae_sha384:rsa_pkcs1_sha384:rsa_pss_rsae_sha512:
     if ok != 1 {
         return Err(ErrorStack::get()).context("SSL_set1_client_x25519_private_key");
     }
-    let groups = c"X25519";
+    let groups = c"X25519MLKEM768:X25519";
     let ok = unsafe { boring_sys::SSL_set1_groups_list(ssl.as_ptr(), groups.as_ptr()) };
     if ok != 1 {
         return Err(ErrorStack::get()).context("SSL_set1_groups_list");
     }
-    let shares = [SSL_GROUP_X25519];
-    let ok = unsafe {
-        boring_sys::SSL_set1_client_key_shares(ssl.as_ptr(), shares.as_ptr(), shares.len())
-    };
-    if ok != 1 {
-        return Err(ErrorStack::get()).context("SSL_set1_client_key_shares");
-    }
+    set_chrome_key_shares(ssl)?;
     let raw_state = Box::into_raw(state);
     let ok = unsafe {
         boring_sys::SSL_set_ex_data(

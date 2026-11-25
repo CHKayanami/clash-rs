@@ -178,16 +178,74 @@ fn session_id_binds_full_client_hello() {
 #[test]
 fn extract_auth_key_rejects_missing_state_and_underived_key() {
     let context = get_reality_context(false).unwrap();
-    let ssl = Ssl::new(context).unwrap();
+    let mut ssl = Ssl::new(context).unwrap();
 
     let missing_err = extract_auth_key(&ssl).unwrap_err();
     assert_eq!(missing_err.kind(), io::ErrorKind::InvalidData);
     assert!(missing_err.to_string().contains("state missing"));
 
     let client = Client::new("localhost".into(), [7; 32], [0; 8], false, None).unwrap();
-    setup_reality_ssl(&ssl, &client.0.config).unwrap();
+    setup_reality_ssl(&mut ssl, &client.0.config).unwrap();
 
     let underived_err = extract_auth_key(&ssl).unwrap_err();
     assert_eq!(underived_err.kind(), io::ErrorKind::InvalidData);
     assert!(underived_err.to_string().contains("not derived"));
+}
+
+#[tokio::test]
+async fn reality_client_hello_sends_mlkem768_then_x25519_key_shares() {
+    const EXT_KEY_SHARE: u16 = 51;
+    const GROUP_X25519_MLKEM768: u16 = 0x11ec;
+    const GROUP_X25519: u16 = 29;
+
+    for chrome in [false, true] {
+        let client_cfg = Client::new("localhost".to_owned(), [7; 32], [0; 8], chrome, None).unwrap();
+        let (client, mut server) = tokio::io::duplex(8192);
+        let capture = async move {
+            let mut header = [0; 5];
+            server.read_exact(&mut header).await.unwrap();
+            assert_eq!(header[0], 22);
+            let mut hello = vec![0; u16::from_be_bytes([header[3], header[4]]) as usize];
+            server.read_exact(&mut hello).await.unwrap();
+            assert_eq!(hello[0], 1);
+            let mut offset = 39 + hello[38] as usize;
+            offset += 2 + u16::from_be_bytes([hello[offset], hello[offset + 1]]) as usize;
+            offset += 1 + hello[offset] as usize;
+            let end = offset + 2 + u16::from_be_bytes([hello[offset], hello[offset + 1]]) as usize;
+            offset += 2;
+            while offset < end {
+                let kind = u16::from_be_bytes([hello[offset], hello[offset + 1]]);
+                let size = u16::from_be_bytes([hello[offset + 2], hello[offset + 3]]) as usize;
+                offset += 4;
+                if kind == EXT_KEY_SHARE {
+                    let list_len = u16::from_be_bytes([hello[offset], hello[offset + 1]]) as usize;
+                    let mut pos = offset + 2;
+                    let list_end = pos + list_len;
+                    let mut shares = Vec::new();
+                    while pos < list_end {
+                        let group = u16::from_be_bytes([hello[pos], hello[pos + 1]]);
+                        let key_len = u16::from_be_bytes([hello[pos + 2], hello[pos + 3]]) as usize;
+                        pos += 4 + key_len;
+                        let is_grease = (group & 0x0f0f) == 0x0a0a && (group >> 8) == (group & 0xff);
+                        if !is_grease {
+                            shares.push((group, key_len));
+                        }
+                    }
+                    return shares;
+                }
+                offset += size;
+            }
+            Vec::new()
+        };
+        let (result, shares) = timeout(Duration::from_secs(5), async {
+            tokio::join!(reality_connect(client, &client_cfg.0.config, chrome), capture)
+        })
+        .await
+        .unwrap();
+        assert!(result.is_err());
+        assert_eq!(
+            shares,
+            vec![(GROUP_X25519_MLKEM768, 1216), (GROUP_X25519, 32)]
+        );
+    }
 }

@@ -89,8 +89,8 @@ fn build_root_store() -> Result<X509Store, ErrorStack> {
     Ok(builder.build())
 }
 
-/// Chrome sends two key shares: X25519MLKEM768 and X25519, in that order.
-fn set_chrome_key_shares(ssl: &mut SslRef) -> anyhow::Result<()> {
+/// Sends two TLS 1.3 key shares: X25519MLKEM768 and X25519, in that order.
+pub(crate) fn set_chrome_key_shares(ssl: &mut SslRef) -> anyhow::Result<()> {
     let shares = [SSL_GROUP_X25519_MLKEM768, SSL_GROUP_X25519];
     let ok = unsafe {
         boring_sys::SSL_set1_client_key_shares(ssl.as_ptr(), shares.as_ptr(), shares.len())
