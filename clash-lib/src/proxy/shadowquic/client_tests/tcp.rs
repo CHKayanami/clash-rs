@@ -20,7 +20,7 @@ async fn tcp_dns_and_concurrent_connection_reuse() {
             )
         }, async { server.accept().await.unwrap().await.unwrap() });
         let (first, second) = connections;
-        assert_eq!(first.unwrap().connection().stable_id(), second.unwrap().connection().stable_id());
+        assert_eq!(first.unwrap().0.connection().stable_id(), second.unwrap().0.connection().stable_id());
         assert_eq!(server.open_connections(), 1);
         let mut stream = handler.connect_stream(&session, dns).await.unwrap();
         stream.write_all(b"request").await.unwrap();
@@ -55,13 +55,13 @@ async fn closed_connection_is_replaced_and_server_dns_is_refreshed() {
         let (first, peer) = tokio::join!(handler.prepare_conn(&session, dns.clone()), async {
             server.accept().await.unwrap().await.unwrap()
         });
-        let first = first.unwrap();
+        let (first, _) = first.unwrap();
         peer.close(0u8.into(), b"test reconnect");
         first.connection().closed().await;
         let (second, _peer) = tokio::join!(handler.prepare_conn(&session, dns.clone()), async {
             server.accept().await.unwrap().await.unwrap()
         });
-        assert_ne!(first.connection().stable_id(), second.unwrap().connection().stable_id());
+        assert_ne!(first.connection().stable_id(), second.unwrap().0.connection().stable_id());
     }).await.unwrap();
 }
 

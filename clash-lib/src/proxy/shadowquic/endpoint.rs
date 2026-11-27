@@ -1,8 +1,13 @@
-use std::{io, net::{Ipv4Addr, Ipv6Addr, SocketAddr}, sync::Arc, time::Duration};
+use std::{
+    io,
+    net::{Ipv4Addr, Ipv6Addr, SocketAddr},
+    sync::Arc,
+    time::Duration,
+};
 
 use quinn_jls::{
-    ClientConfig, Connection, Endpoint, EndpointConfig, MtuDiscoveryConfig,
-    TokioRuntime, TransportConfig,
+    ClientConfig, Connection, Endpoint, EndpointConfig,
+    MtuDiscoveryConfig, TokioRuntime, TransportConfig,
     congestion::{BbrConfig, CubicConfig, NewRenoConfig},
     crypto::rustls::QuicClientConfig,
     rustls::{ClientConfig as TlsClientConfig, RootCertStore, jls::JlsClientConfig, version::TLS13},
@@ -22,14 +27,20 @@ use super::{brutal::BrutalConfig, config::{CongestionControl, HandlerOptions}};
 
 pub(super) struct ClientEndpoint {
     endpoint: Endpoint,
-    ipv4: bool,
 }
 
 impl ClientEndpoint {
+    #[cfg(test)]
     pub async fn new(
         opts: &HandlerOptions, addr: SocketAddr, sess: &Session,
     ) -> io::Result<Self> {
         let config = client_config(opts)?;
+        Self::new_with_config(config, addr, sess).await
+    }
+
+    pub async fn new_with_config(
+        config: ClientConfig, addr: SocketAddr, sess: &Session,
+    ) -> io::Result<Self> {
         let bind_addr = if addr.is_ipv4() {
             SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))
         } else {
@@ -46,11 +57,16 @@ impl ClientEndpoint {
             EndpointConfig::default(), None, socket.into_std()?, Arc::new(TokioRuntime),
         )?;
         endpoint.set_default_client_config(config);
-        Ok(Self { endpoint, ipv4: addr.is_ipv4() })
+        Ok(Self { endpoint })
     }
 
-    pub fn is_ipv4(&self) -> bool {
-        self.ipv4
+    #[cfg(test)]
+    pub(super) fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.endpoint.local_addr()
+    }
+
+    pub(super) fn close(&self, reason: &'static [u8]) {
+        self.endpoint.close(0u8.into(), reason);
     }
 
     pub async fn connect(
@@ -75,22 +91,25 @@ impl ClientEndpoint {
             .map_err(new_io_error)?;
         let conn = if opts.zero_rtt {
             match connecting.into_0rtt() {
-                Ok((conn, accepted)) => {
+                Ok(conn) => {
                     if conn.is_jls() == Some(false) {
                         check_jls(&conn)?;
                     }
                     let check = conn.clone();
                     tokio::spawn(async move {
-                        let accepted = match timeout(deadline, accepted).await {
-                            Ok(accepted) => accepted,
+                        match timeout(deadline, check.authenticated()).await {
+                            Ok(Ok(())) => {
+                                tracing::debug!("shadowquic 0-RTT handshake completed");
+                                if let Err(err) = check_jls(&check) {
+                                    tracing::warn!("shadowquic handshake failed: {err}");
+                                }
+                            }
+                            Ok(Err(err)) => {
+                                tracing::warn!("shadowquic 0-RTT handshake failed: {err}");
+                            }
                             Err(_) => {
                                 check.close(0u8.into(), b"JLS handshake timed out");
-                                return;
                             }
-                        };
-                        tracing::debug!("shadowquic 0-RTT accepted: {accepted}");
-                        if let Err(err) = check_jls(&check) {
-                            tracing::warn!("shadowquic handshake failed: {err}");
                         }
                     });
                     return Ok(conn);

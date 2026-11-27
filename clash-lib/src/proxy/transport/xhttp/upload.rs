@@ -5,6 +5,7 @@ use super::{
     body::BodyChunk,
     connection::{REQUEST_TIMEOUT, HttpTransport, drain, response},
     options::Options,
+    pool::TaskLease,
     stream::Shared,
 };
 
@@ -36,11 +37,17 @@ pub(super) struct Packets {
     sequence: u64,
     next_post: Instant,
     pending: JoinSet<io::Result<()>>,
+    _lease: TaskLease,
 }
 impl Packets {
-    pub(super) fn new(transport: Arc<HttpTransport>, options: Arc<Options>, session: String) -> Self {
+    pub(super) fn new(
+        transport: Arc<HttpTransport>,
+        options: Arc<Options>,
+        session: String,
+        lease: TaskLease,
+    ) -> Self {
         Self { transport, options, session: session.into(), sequence: 0,
-            next_post: Instant::now(), pending: JoinSet::new() }
+            next_post: Instant::now(), pending: JoinSet::new(), _lease: lease }
     }
 
     async fn completed(&mut self) -> io::Result<()> {
@@ -59,7 +66,9 @@ impl Packets {
             let transport = self.transport.clone();
             let options = self.options.clone();
             let session = self.session.clone();
+            let task_lease = self._lease.clone();
             self.pending.spawn(async move {
+                let _lease = task_lease;
                 timeout(REQUEST_TIMEOUT, async {
                     let reply = transport.start(|version| options.packet_request(&session, sequence, payload, version)).await?;
                     drain(response(reply).await?).await

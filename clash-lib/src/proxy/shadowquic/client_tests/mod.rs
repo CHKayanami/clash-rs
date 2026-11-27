@@ -27,6 +27,10 @@ use super::{Handler, HandlerOptions, endpoint::ClientEndpoint, protocol, udp::Cl
 const DEADLINE: Duration = Duration::from_secs(5);
 
 fn server(jls: bool) -> Endpoint {
+    server_with_uni_limit(jls, 500)
+}
+
+fn server_with_uni_limit(jls: bool, max_uni_streams: u32) -> Endpoint {
     crate::setup_default_crypto_provider();
     let CertifiedKey { cert, signing_key } =
         generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
@@ -50,7 +54,7 @@ fn server(jls: bool) -> Endpoint {
         QuicServerConfig::try_from(crypto).unwrap(),
     ));
     let mut transport = TransportConfig::default();
-    transport.max_concurrent_uni_streams(500u32.into());
+    transport.max_concurrent_uni_streams(max_uni_streams.into());
     config.transport_config(Arc::new(transport));
     Endpoint::server(config, "127.0.0.1:0".parse().unwrap()).unwrap()
 }
@@ -82,5 +86,6 @@ async fn connect(server: &Endpoint) -> (ClientEndpoint, Connection, Connection) 
 
 mod batch;
 mod config;
+mod idle;
 mod tcp;
 mod udp;

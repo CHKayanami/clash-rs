@@ -12,7 +12,13 @@ mod upload;
 #[cfg(test)]
 mod tests;
 
-use std::{io, sync::Arc};
+use std::{
+    io,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 use tokio::{sync::{mpsc, oneshot}, time::timeout};
 use crate::{config::internal::proxy::XHttpOpt, proxy::AnyStream};
 use super::{Transport, TransportDialer, dial::TransportSecurity};
@@ -41,6 +47,7 @@ pub struct Client {
     pool: Pool,
     download: Option<Download>,
     needs_download: bool,
+    keep_idle: AtomicBool,
 }
 impl Client {
     pub fn new(
@@ -48,7 +55,8 @@ impl Client {
     ) -> io::Result<Self> {
         Ok(Self { options: Arc::new(Options::new(opts, host, secure, reality, alpn)?),
             pool: Pool::new(opts.reuse_settings.as_ref())?, download: None,
-            needs_download: opts.download_settings.is_some() })
+            needs_download: opts.download_settings.is_some(),
+            keep_idle: AtomicBool::new(true) })
     }
 
     pub(crate) fn configure_download(
@@ -57,9 +65,26 @@ impl Client {
     ) -> io::Result<()> {
         let secure = security.is_some();
         let reality = matches!(security, Some(TransportSecurity::Reality(_)));
+        let pool = Pool::new(opts.reuse_settings.as_ref())?;
+        pool.set_keep_idle(self.keep_idle.load(Ordering::SeqCst));
         self.download = Some(Download { options: Arc::new(Options::new(opts, &server, secure, reality, alpn)?),
-            pool: Pool::new(opts.reuse_settings.as_ref())?, server, port, security });
+            pool, server, port, security });
         Ok(())
+    }
+
+    pub fn set_keep_idle(&self, keep: bool) {
+        self.keep_idle.store(keep, Ordering::SeqCst);
+        self.pool.set_keep_idle(keep);
+        if let Some(download) = &self.download {
+            download.pool.set_keep_idle(keep);
+        }
+    }
+
+    pub fn close_idle_connections(&self) {
+        self.pool.close_idle_connections();
+        if let Some(download) = &self.download {
+            download.pool.close_idle_connections();
+        }
     }
 
     pub(crate) async fn dial(&self, dialer: &TransportDialer<'_>) -> io::Result<AnyStream> {
@@ -86,15 +111,17 @@ impl Client {
         let mut tasks = Tasks::new();
         let upload_lease = self.pool.acquire(self.options.clone(), upload).await;
         let upload_transport = upload_lease.transport();
+        let upload_task_lease = upload_lease.task_lease();
         let mut leases = vec![upload_lease];
-        let (download_transport, download_options) = match (&self.download, download) {
+        let (download_transport, download_options, download_task_lease) = match (&self.download, download) {
             (Some(settings), Some(factory)) => {
                 let lease = settings.pool.acquire(settings.options.clone(), factory).await;
                 let transport = lease.transport();
+                let task_lease = lease.task_lease();
                 leases.push(lease);
-                (transport, settings.options.clone())
+                (transport, settings.options.clone(), task_lease)
             }
-            (None, None) => (upload_transport.clone(), self.options.clone()),
+            (None, None) => (upload_transport.clone(), self.options.clone(), leases[0].task_lease()),
             _ => return Err(invalid("XHTTP download connection factory is missing")),
         };
         let session = if self.options.mode == Mode::StreamOne { String::new() } else { self.options.session() };
@@ -112,22 +139,33 @@ impl Client {
                     let reply = upload_transport.start(|version| self.options.request(&session, None,
                         Some(RequestBody::Stream(body_receiver)), version)).await?;
                     let shared = shared.clone();
+                    let reply_lease = leases[0].task_lease();
                     tasks.push(tokio::spawn(async move {
+                        let _lease = reply_lease;
                         // HTTP/1.1 can withhold upload headers until request EOF.
                         if let Err(error) = async { drain(reply.body().await?).await }.await { shared.fail(error); }
                     }));
                     Upload::Stream(body_sender)
                 }
-                Mode::PacketUp => Upload::Packets(Packets::new(upload_transport, self.options.clone(), session)),
+                Mode::PacketUp => Upload::Packets(Packets::new(
+                    upload_transport,
+                    self.options.clone(),
+                    session,
+                    leases[0].task_lease(),
+                )),
                 Mode::StreamOne => unreachable!(),
             };
             (uploader, download)
         };
         let upload_shared = shared.clone();
-        tasks.push(tokio::spawn(async move { uploader.run(&mut receiver, &upload_shared).await; }));
+        tasks.push(tokio::spawn(async move {
+            let _lease = upload_task_lease;
+            uploader.run(&mut receiver, &upload_shared).await;
+        }));
         let (body_sender, body_receiver) = oneshot::channel();
         let download_shared = shared.clone();
         tasks.push(tokio::spawn(async move {
+            let _lease = download_task_lease;
             match response(download).await {
                 Ok(body) => { let _ = body_sender.send(body); }
                 Err(error) => { download_shared.fail(error); }

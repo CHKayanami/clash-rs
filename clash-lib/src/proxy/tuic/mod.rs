@@ -107,11 +107,37 @@ pub struct HandlerOptions {
 
 pub struct Handler {
     opts: HandlerOptions,
-    ep: OnceCell<TuicEndpoint>,
+    client_config: OnceCell<QuinnConfig>,
     conn: Arc<ArcSwapOption<TuicConnection>>,
     keep_idle: Arc<AtomicBool>,
     reconnect: AsyncMutex<()>,
     next_assoc_id: AtomicU16,
+}
+
+struct DialEndpointGuard {
+    ep: Option<Arc<TuicEndpoint>>,
+}
+
+impl DialEndpointGuard {
+    fn new(ep: Arc<TuicEndpoint>) -> Self {
+        Self { ep: Some(ep) }
+    }
+
+    fn as_arc(&self) -> &Arc<TuicEndpoint> {
+        self.ep.as_ref().expect("tuic dial endpoint present")
+    }
+
+    fn disarm(&mut self) -> Arc<TuicEndpoint> {
+        self.ep.take().expect("tuic dial endpoint already taken")
+    }
+}
+
+impl Drop for DialEndpointGuard {
+    fn drop(&mut self) {
+        if let Some(ep) = self.ep.take() {
+            ep.ep.close(0u32.into(), b"dial aborted");
+        }
+    }
 }
 
 impl std::fmt::Debug for Handler {
@@ -222,7 +248,7 @@ impl Handler {
     pub fn new(opts: HandlerOptions) -> Self {
         Self {
             opts,
-            ep: OnceCell::new(),
+            client_config: OnceCell::new(),
             conn: Arc::new(ArcSwapOption::empty()),
             keep_idle: Arc::new(AtomicBool::new(true)),
             reconnect: AsyncMutex::new(()),
@@ -230,13 +256,11 @@ impl Handler {
         }
     }
 
-    async fn init_endpoint(
-        opts: HandlerOptions,
-        resolver: ThreadSafeDNSResolver,
-        sess: &Session,
-    ) -> Result<TuicEndpoint> {
-        let verifier =
-            Arc::new(DefaultTlsVerifier::new(opts.fingerprint.clone(), opts.skip_cert_verify));
+    fn build_client_config(opts: &HandlerOptions) -> Result<QuinnConfig> {
+        let verifier = Arc::new(DefaultTlsVerifier::new(
+            opts.fingerprint.clone(),
+            opts.skip_cert_verify,
+        ));
         let mut crypto = build_tls_client_config(
             verifier,
             opts.tls_cert.as_deref(),
@@ -276,28 +300,33 @@ impl Handler {
         };
 
         quinn_config.transport_config(Arc::new(transport_config));
+        Ok(quinn_config)
+    }
 
-        // TODO: we should try to resolve the server address once?
-        let socket = {
-            if resolver.ipv6() {
-                new_udp_socket(
-                    Some((Ipv6Addr::UNSPECIFIED, 0).into()),
-                    sess.iface.as_deref(),
-                    #[cfg(target_os = "linux")]
-                    sess.so_mark,
-                    None,
-                )
-                .await?
-            } else {
-                new_udp_socket(
-                    Some((Ipv4Addr::UNSPECIFIED, 0).into()),
-                    None,
-                    #[cfg(target_os = "linux")]
-                    sess.so_mark,
-                    None,
-                )
-                .await?
-            }
+    async fn init_endpoint(
+        &self,
+        quinn_config: QuinnConfig,
+        resolver: &ThreadSafeDNSResolver,
+        sess: &Session,
+    ) -> Result<Arc<TuicEndpoint>> {
+        let socket = if resolver.ipv6() {
+            new_udp_socket(
+                Some((Ipv6Addr::UNSPECIFIED, 0).into()),
+                sess.iface.as_deref(),
+                #[cfg(target_os = "linux")]
+                sess.so_mark,
+                None,
+            )
+            .await?
+        } else {
+            new_udp_socket(
+                Some((Ipv4Addr::UNSPECIFIED, 0).into()),
+                sess.iface.as_deref(),
+                #[cfg(target_os = "linux")]
+                sess.so_mark,
+                None,
+            )
+            .await?
         };
 
         debug!("binding socket to: {:?}", socket.local_addr()?);
@@ -311,26 +340,29 @@ impl Handler {
 
         endpoint.set_default_client_config(quinn_config);
 
-        // Parse ip field if provided, or fallback to parsing server as IP literal
-        let ip_addr = opts
+        let ip_addr = self
+            .opts
             .ip
             .as_ref()
             .and_then(|ip_str| ip_str.parse().ok())
-            .or_else(|| opts.server.parse().ok());
+            .or_else(|| self.opts.server.parse().ok());
 
-        let endpoint = TuicEndpoint {
+        Ok(Arc::new(TuicEndpoint {
             ep: endpoint,
-            server: ServerAddr::new(opts.server, opts.port, ip_addr, opts.sni),
-            uuid: opts.uuid,
-            password: Arc::from(opts.password.into_bytes().into_boxed_slice()),
-            udp_relay_mode: opts.udp_relay_mode,
-            zero_rtt_handshake: opts.reduce_rtt,
-            heartbeat: opts.heartbeat_interval,
-            gc_interval: opts.gc_interval,
-            gc_lifetime: opts.gc_lifetime,
-        };
-
-        Ok(endpoint)
+            server: ServerAddr::new(
+                self.opts.server.clone(),
+                self.opts.port,
+                ip_addr,
+                self.opts.sni.clone(),
+            ),
+            uuid: self.opts.uuid,
+            password: Arc::from(self.opts.password.as_bytes()),
+            udp_relay_mode: self.opts.udp_relay_mode,
+            zero_rtt_handshake: self.opts.reduce_rtt,
+            heartbeat: self.opts.heartbeat_interval,
+            gc_interval: self.opts.gc_interval,
+            gc_lifetime: self.opts.gc_lifetime,
+        }))
     }
 
     async fn get_conn(
@@ -338,16 +370,9 @@ impl Handler {
         resolver: &ThreadSafeDNSResolver,
         sess: &Session,
     ) -> Result<(Arc<TuicConnection>, TuicStreamLease)> {
-        let endpoint = self
-            .ep
-            .get_or_try_init(|| {
-                Self::init_endpoint(self.opts.clone(), resolver.clone(), sess)
-            })
-            .await?;
-
         let fut = async {
             if let Some(conn) = self.conn.load().as_ref()
-                && conn.check_open().is_ok()
+                && conn.is_alive()
                 && let Some(lease) = conn.try_acquire_lease()
             {
                 return Ok((conn.clone(), lease));
@@ -355,29 +380,76 @@ impl Handler {
             let _reconnect = self.reconnect.lock().await;
             let existing = self.conn.load_full();
             if let Some(conn) = &existing
-                && conn.check_open().is_ok()
+                && conn.is_alive()
                 && let Some(lease) = conn.try_acquire_lease()
             {
                 return Ok((conn.clone(), lease));
             }
-            let conn = endpoint
+            if let Some(old) = existing.as_ref() {
+                old.evict_from_cache();
+            }
+
+            let quinn_config = self
+                .client_config
+                .get_or_try_init(|| async { Self::build_client_config(&self.opts) })
+                .await?
+                .clone();
+
+            let mut ep_guard = DialEndpointGuard::new(
+                self.init_endpoint(quinn_config, resolver, sess).await?,
+            );
+            let conn = ep_guard
+                .as_arc()
                 .connect(
                     resolver,
-                    existing.is_some(),
                     self.keep_idle.clone(),
                     Arc::downgrade(&self.conn),
                 )
                 .await?;
+            let _endpoint = ep_guard.disarm();
             let lease = conn
                 .try_acquire_lease()
                 .expect("fresh tuic connection must accept initial lease");
-            if let Some(old) = self.conn.swap(Some(conn.clone())) {
-                old.mark_evicted();
-            }
+
+            self.publish_conn(&conn);
             Ok((conn, lease))
         };
 
         tokio::time::timeout(self.opts.request_timeout, fut).await?
+    }
+
+    pub(crate) fn publish_conn(&self, conn: &Arc<TuicConnection>) {
+        if conn.is_alive() {
+            if let Some(old) = self.conn.swap(Some(conn.clone())) {
+                old.mark_evicted();
+            }
+            // Re-check liveness after publishing so an immediate close callback
+            // that ran before caching cannot leave a dead connection cached, and
+            // reclaim immediately if `keep_idle` is false and no leases remain.
+            if !conn.is_alive() {
+                conn.evict_from_cache();
+                conn.mark_evicted();
+            } else if !self.keep_idle.load(Ordering::SeqCst) {
+                conn.close_if_idle();
+            }
+        } else {
+            conn.mark_evicted();
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cached_endpoint_for_test(&self) -> Option<Arc<TuicEndpoint>> {
+        self.conn.load_full().and_then(|c| c.endpoint_for_test())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cached_conn_for_test(&self) -> Option<Arc<TuicConnection>> {
+        self.conn.load_full()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_client_config_for_test(&self) -> bool {
+        self.client_config.get().is_some()
     }
 
     async fn do_connect_stream(

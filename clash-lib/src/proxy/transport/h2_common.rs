@@ -104,7 +104,9 @@ impl ConnectionDriver {
     }
 
     pub(crate) fn state(&self) -> Arc<ConnectionState> { self.state.clone() }
+    #[cfg(test)]
     pub(crate) fn closed(&self) -> bool { self.state.closed() }
+    pub(crate) async fn wait(&mut self) { let _ = (&mut self.task).await; }
     pub(crate) fn abort(&self) { self.state.close(); self.task.abort(); }
 }
 

@@ -1,7 +1,7 @@
 use super::*;
 use futures::{SinkExt, future::poll_fn};
 use tokio::sync::mpsc;
-use tokio_util::sync::PollSender;
+use tokio_util::sync::{CancellationToken, PollSender};
 
 use crate::proxy::{
     AnyOutboundDatagram,
@@ -16,6 +16,7 @@ async fn batch_submission_keeps_prefix_and_payload_ownership() {
     let mut wrapper = UdpSessionWrapper {
         s: PollSender::new(sender), r: receiver,
         src_addr: "127.0.0.1:1000".parse().unwrap(),
+        close_upload: CancellationToken::new(),
     };
     let mut batch = PacketBatch::default();
     let data = Bytes::from_static(b"payload");
@@ -49,6 +50,7 @@ async fn invalid_packet_fails_without_closing_a_valid_association() {
     let mut wrapper = UdpSessionWrapper {
         s: PollSender::new(sender), r: receiver,
         src_addr: "127.0.0.1:1000".parse().unwrap(),
+        close_upload: CancellationToken::new(),
     };
     for packet in [
         UdpPacket { data: Bytes::from(vec![0; 65536]), ..Default::default() },

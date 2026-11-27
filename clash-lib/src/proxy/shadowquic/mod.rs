@@ -1,10 +1,23 @@
 #[cfg(all(test, docker_test))]
 use crate::proxy::OutboundNode;
 
+#[cfg(test)]
+use parking_lot::Mutex;
+use arc_swap::ArcSwapOption;
 use erased_serde::Serialize as ErasedSerialize;
-use std::{collections::HashMap, fmt::Debug, io, net::SocketAddr, str::FromStr};
-use tokio::{io::join, sync::RwLock};
-use tokio_util::sync::PollSender;
+use std::{
+    collections::HashMap,
+    fmt::Debug,
+    io,
+    net::SocketAddr,
+    str::FromStr,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
+use tokio::sync::{Mutex as AsyncMutex, OnceCell};
+use tokio_util::sync::{CancellationToken, PollSender};
 
 pub mod config;
 mod brutal;
@@ -20,8 +33,9 @@ mod client_tests;
 
 pub use config::HandlerOptions;
 pub(crate) use compat::UdpSessionWrapper;
-use endpoint::ClientEndpoint;
-use udp::ClientConnection;
+use endpoint::{ClientEndpoint, client_config};
+use stream::ShadowQuicStream;
+use udp::{ClientConnection, ConnectionState, ShadowQuicLease};
 
 use crate::{
     app::dns::ThreadSafeDNSResolver,
@@ -37,25 +51,66 @@ use super::{
 pub struct Handler {
     name: String,
     opts: HandlerOptions,
-    state: RwLock<ClientState>,
+    client_config: OnceCell<quinn_jls::ClientConfig>,
+    conn: Arc<ArcSwapOption<ConnectionState>>,
+    keep_idle: Arc<AtomicBool>,
+    reconnect: AsyncMutex<()>,
+    #[cfg(test)]
+    last_dial_local_addr: Mutex<Option<SocketAddr>>,
 }
 
-#[derive(Default)]
-struct ClientState {
-    endpoint: Option<ClientEndpoint>,
-    connection: Option<ClientConnection>,
+struct DialEndpointGuard {
+    ep: Option<Arc<ClientEndpoint>>,
 }
+
+impl DialEndpointGuard {
+    fn new(ep: Arc<ClientEndpoint>) -> Self {
+        Self { ep: Some(ep) }
+    }
+
+    fn as_arc(&self) -> &Arc<ClientEndpoint> {
+        self.ep.as_ref().expect("shadowquic dial endpoint present")
+    }
+
+    fn disarm(&mut self) -> Arc<ClientEndpoint> {
+        self.ep.take().expect("shadowquic dial endpoint already taken")
+    }
+}
+
+impl Drop for DialEndpointGuard {
+    fn drop(&mut self) {
+        if let Some(ep) = self.ep.take() {
+            ep.close(b"dial aborted");
+        }
+    }
+}
+
 impl Debug for Handler {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Handler").field("opts", &self.opts).finish()
     }
 }
+
+impl Drop for Handler {
+    fn drop(&mut self) {
+        self.keep_idle.store(false, Ordering::SeqCst);
+        if let Some(conn) = self.conn.swap(None) {
+            conn.mark_evicted();
+        }
+    }
+}
+
 impl Handler {
     pub fn new(name: String, opts: HandlerOptions) -> Self {
         Self {
             name,
             opts,
-            state: Default::default(),
+            client_config: OnceCell::new(),
+            conn: Arc::new(ArcSwapOption::empty()),
+            keep_idle: Arc::new(AtomicBool::new(true)),
+            reconnect: AsyncMutex::new(()),
+            #[cfg(test)]
+            last_dial_local_addr: Mutex::new(None),
         }
     }
 
@@ -81,28 +136,93 @@ impl Handler {
         &self,
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
-    ) -> io::Result<ClientConnection> {
-        if let Some(conn) = &self.state.read().await.connection
-            && conn.connection().close_reason().is_none()
+    ) -> io::Result<(ClientConnection, ShadowQuicLease)> {
+        if let Some(conn) = self.conn.load().as_ref()
+            && conn.is_alive()
+            && let Some(lease) = conn.try_acquire_lease()
         {
-            return Ok(conn.clone());
+            return Ok((ClientConnection::from_state(conn.clone()), lease));
         }
-        let mut state = self.state.write().await;
-        if let Some(conn) = &state.connection
-            && conn.connection().close_reason().is_none()
+        let _reconnect = self.reconnect.lock().await;
+        let existing = self.conn.load_full();
+        if let Some(conn) = &existing
+            && conn.is_alive()
+            && let Some(lease) = conn.try_acquire_lease()
         {
-            return Ok(conn.clone());
+            return Ok((ClientConnection::from_state(conn.clone()), lease));
         }
-        // Resolve again after disconnects, retaining TLS tickets when the socket
-        // family is unchanged. A changed family needs a new bound endpoint.
+        if let Some(old) = existing.as_ref() {
+            old.evict_from_cache();
+        }
+        // Resolve again after disconnects, retaining TLS/JLS tickets in
+        // `client_config` across endpoint rebuilds.
         let addr = self.resolve_server(resolver).await?;
-        if state.endpoint.as_ref().is_none_or(|ep| ep.is_ipv4() != addr.is_ipv4()) {
-            state.endpoint = Some(ClientEndpoint::new(&self.opts, addr, sess).await?);
+        let config = self
+            .client_config
+            .get_or_try_init(|| async { client_config(&self.opts) })
+            .await?
+            .clone();
+
+        let mut ep_guard = DialEndpointGuard::new(Arc::new(
+            ClientEndpoint::new_with_config(config, addr, sess).await?,
+        ));
+        #[cfg(test)]
+        {
+            *self.last_dial_local_addr.lock() = ep_guard.as_arc().local_addr().ok();
         }
-        let endpoint = state.endpoint.as_ref().unwrap();
-        let conn = ClientConnection::new(endpoint.connect(&self.opts, addr).await?);
-        state.connection = Some(conn.clone());
-        Ok(conn)
+        let quic_conn = ep_guard.as_arc().connect(&self.opts, addr).await?;
+        let endpoint = ep_guard.disarm();
+        let conn = ClientConnection::new_managed(
+            quic_conn,
+            Some(endpoint),
+            self.keep_idle.clone(),
+            Arc::downgrade(&self.conn),
+        );
+        let lease = conn
+            .try_acquire_lease()
+            .expect("fresh shadowquic connection must accept initial lease");
+
+        self.publish_conn(&conn);
+        Ok((conn, lease))
+    }
+
+    fn publish_conn(&self, conn: &ClientConnection) {
+        if conn.is_alive() {
+            if let Some(old) = self.conn.swap(Some(conn.state().clone())) {
+                old.mark_evicted();
+            }
+            // Re-check liveness after publishing so an immediate close callback
+            // that ran before caching cannot leave a dead connection cached, and
+            // reclaim immediately if `keep_idle` is false and no leases remain.
+            if !conn.is_alive() {
+                conn.evict_from_cache();
+                conn.mark_evicted();
+            } else if !self.keep_idle.load(Ordering::SeqCst) {
+                conn.close_if_idle();
+            }
+        } else {
+            conn.mark_evicted();
+        }
+    }
+
+    #[cfg(test)]
+    fn last_dial_local_addr_for_test(&self) -> Option<SocketAddr> {
+        *self.last_dial_local_addr.lock()
+    }
+
+    #[cfg(test)]
+    fn cached_endpoint_for_test(&self) -> Option<Arc<ClientEndpoint>> {
+        self.conn.load_full().and_then(|c| c.endpoint_for_test())
+    }
+
+    #[cfg(test)]
+    fn cached_conn_for_test(&self) -> Option<ClientConnection> {
+        self.conn.load_full().map(ClientConnection::from_state)
+    }
+
+    #[cfg(test)]
+    fn has_client_config_for_test(&self) -> bool {
+        self.client_config.get().is_some()
     }
 }
 
@@ -135,13 +255,13 @@ impl OutboundHandler for Handler {
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
     ) -> io::Result<AnyStream> {
-        let conn = self.prepare_conn(sess, resolver).await?;
+        let (conn, lease) = self.prepare_conn(sess, resolver).await?;
         let (mut send, recv) = conn.connection().open_bi().await
             .map_err(new_io_error)?;
         protocol::write_request(&mut send, protocol::CONNECT, &sess.destination).await?;
-        let conn = join(recv, send);
+        let stream = ShadowQuicStream::new(send, recv, lease);
         sess.push_chain(self.name());
-        Ok(AnyStream::new(conn))
+        Ok(AnyStream::new(stream))
     }
 
     /// connect to remote target via UDP
@@ -150,7 +270,7 @@ impl OutboundHandler for Handler {
         sess: &Session,
         resolver: ThreadSafeDNSResolver,
     ) -> io::Result<AnyOutboundDatagram> {
-        let conn = self.prepare_conn(sess, resolver).await?;
+        let (conn, lease) = self.prepare_conn(sess, resolver).await?;
         // clash-rs didn't expose udp associate address, so set to unspecified
         // address
         let addr = if sess.source.is_ipv4() {
@@ -158,16 +278,34 @@ impl OutboundHandler for Handler {
         } else {
             "[::]:0"
         };
-        let socket = conn.associate(
-            addr.parse::<SocketAddr>().unwrap().into(), self.opts.over_stream,
+        let close_upload = CancellationToken::new();
+        let socket = conn.associate_with_lease(
+            addr.parse::<SocketAddr>().unwrap().into(),
+            self.opts.over_stream,
+            Some(lease),
+            close_upload.clone(),
         ).await?;
         let chain = UdpSessionWrapper {
             s: PollSender::new(socket.0),
             r: socket.1,
             src_addr: sess.source.into(),
+            close_upload,
         };
         sess.push_chain(self.name());
         Ok(AnyOutboundDatagram::new(chain))
+    }
+
+    fn set_keep_idle(&self, keep: bool) {
+        self.keep_idle.store(keep, Ordering::SeqCst);
+        if !keep {
+            self.close_idle_connections();
+        }
+    }
+
+    fn close_idle_connections(&self) {
+        if let Some(conn) = self.conn.load_full() {
+            conn.close_if_idle();
+        }
     }
 }
 

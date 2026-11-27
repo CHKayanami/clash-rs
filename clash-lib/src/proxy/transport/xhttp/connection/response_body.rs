@@ -29,8 +29,8 @@ impl IncomingBody {
 
 pub(in super::super) struct ResponseBody {
     pub(super) body: IncomingBody,
-    pub(super) _lease: ConnectionLease,
     pub(super) _upload: Option<UploadTask>,
+    pub(super) _lease: ConnectionLease,
 }
 
 impl ResponseBody {

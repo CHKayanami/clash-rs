@@ -1,11 +1,8 @@
 use crate::{
-    app::{dns::ThreadSafeDNSResolver, net::get_default_outbound_interface},
-    proxy::utils::{
-        new_udp_socket,
-        quic_stream::{
-            QUIC_HALF_CLOSED_DRAIN_GRACE, QUIC_STREAM_DRAIN_TIMEOUT,
-            QuicStreamLease, QuicUploadGrace, UdpSessionTable, close_after_grace,
-        },
+    app::dns::ThreadSafeDNSResolver,
+    proxy::utils::quic_stream::{
+        QUIC_HALF_CLOSED_DRAIN_GRACE, QUIC_STREAM_DRAIN_TIMEOUT, QuicStreamLease,
+        QuicUploadGrace, UdpSessionTable, close_after_grace,
     },
 };
 use anyhow::{Result, anyhow};
@@ -20,7 +17,6 @@ use std::{
     time::Duration,
 };
 use tokio::{runtime::Handle, sync::mpsc::Sender};
-use tracing::debug;
 use uuid::Uuid;
 
 use super::proto::{Address, ParsedPacket};
@@ -39,57 +35,30 @@ pub struct TuicEndpoint {
 
 impl TuicEndpoint {
     pub async fn connect(
-        &self,
+        self: &Arc<Self>,
         resolver: &ThreadSafeDNSResolver,
-        rebind: bool,
         keep_idle: Arc<AtomicBool>,
         cache_slot: Weak<ArcSwapOption<TuicConnection>>,
     ) -> Result<Arc<TuicConnection>> {
         let remote_addr = self.server.resolve(resolver).await?;
-        let connect_to = async {
-            if rebind {
-                debug!("rebinding endpoint UDP socket");
 
-                let socket = {
-                    let iface = get_default_outbound_interface();
-                    new_udp_socket(
-                        None,
-                        iface.as_deref(),
-                        #[cfg(target_os = "linux")]
-                        None,
-                        Some(remote_addr),
-                    )
-                    .await?
-                };
+        tracing::trace!(
+            "connecting to {} {} from {}",
+            remote_addr,
+            self.server.server_name(),
+            self.ep.local_addr().unwrap()
+        );
 
-                debug!("rebound endpoint UDP socket to {}", socket.local_addr()?);
-
-                self.ep.rebind(socket.into_std()?).map_err(|err| {
-                    anyhow!("failed to rebind endpoint UDP socket {}", err)
-                })?;
+        let conn = self.ep.connect(remote_addr, self.server.server_name())?;
+        let (conn, zero_rtt_accepted) = if self.zero_rtt_handshake {
+            match conn.into_0rtt() {
+                Ok((conn, zero_rtt_accepted)) => (conn, Some(zero_rtt_accepted)),
+                Err(conn) => (conn.await?, None),
             }
-
-            tracing::trace!(
-                "connecting to {} {} from {}",
-                remote_addr,
-                self.server.server_name(),
-                self.ep.local_addr().unwrap()
-            );
-
-            let conn = self.ep.connect(remote_addr, self.server.server_name())?;
-            let (conn, zero_rtt_accepted) = if self.zero_rtt_handshake {
-                match conn.into_0rtt() {
-                    Ok((conn, zero_rtt_accepted)) => (conn, Some(zero_rtt_accepted)),
-                    Err(conn) => (conn.await?, None),
-                }
-            } else {
-                (conn.await?, None)
-            };
-
-            anyhow::Ok((conn, zero_rtt_accepted))
+        } else {
+            (conn.await?, None)
         };
 
-        let (conn, zero_rtt_accepted) = connect_to.await?;
         Ok(TuicConnection::new(
             conn,
             zero_rtt_accepted,
@@ -100,6 +69,7 @@ impl TuicEndpoint {
             self.gc_interval,
             self.gc_lifetime,
             keep_idle,
+            Some(self.clone()),
             cache_slot,
         ))
     }
@@ -142,9 +112,11 @@ pub struct TuicConnection {
     /// Set once evicted or retired (e.g. handler dropped on provider refresh or
     /// config reload) so the connection closes as soon as active streams finish.
     evicted: AtomicBool,
+    init_exited: AtomicBool,
     upload_grace: QuicUploadGrace,
     runtime: Handle,
     drain_timeout_ms: AtomicU64,
+    endpoint: Option<Arc<TuicEndpoint>>,
     cache_slot: Weak<ArcSwapOption<TuicConnection>>,
 }
 
@@ -153,6 +125,10 @@ impl TuicConnection {
         self.conn
             .close_reason()
             .map_or(Ok(()), |err| Err(err.into()))
+    }
+
+    pub(super) fn is_alive(&self) -> bool {
+        self.check_open().is_ok() && !self.init_exited.load(Ordering::SeqCst)
     }
 
     pub(super) fn drain_timeout(&self) -> Duration {
@@ -172,7 +148,7 @@ impl TuicConnection {
             .map(|_| TuicStreamLease { conn: self.clone() })
     }
 
-    fn evict_from_cache(self: &Arc<Self>) {
+    pub(super) fn evict_from_cache(self: &Arc<Self>) {
         if let Some(cache_slot) = self.cache_slot.upgrade() {
             let _ = cache_slot.rcu(|current| match current {
                 Some(cached) if Arc::ptr_eq(cached, self) => None,
@@ -240,8 +216,13 @@ impl TuicConnection {
             &self.upload_grace,
             &self.conn,
             b"idle",
-            (),
+            self.endpoint.clone(),
         );
+    }
+
+    #[cfg(test)]
+    pub(super) fn endpoint_for_test(&self) -> Option<Arc<TuicEndpoint>> {
+        self.endpoint.clone()
     }
 
     #[cfg(test)]
@@ -260,6 +241,7 @@ impl TuicConnection {
         gc_interval: Duration,
         gc_lifetime: Duration,
         keep_idle: Arc<AtomicBool>,
+        endpoint: Option<Arc<TuicEndpoint>>,
         cache_slot: Weak<ArcSwapOption<TuicConnection>>,
     ) -> Arc<Self> {
         let conn = Self {
@@ -274,11 +256,13 @@ impl TuicConnection {
             active_streams: AtomicUsize::new(0),
             keep_idle,
             evicted: AtomicBool::new(false),
+            init_exited: AtomicBool::new(false),
             upload_grace: QuicUploadGrace::default(),
             runtime: Handle::current(),
             drain_timeout_ms: AtomicU64::new(
                 TUIC_STREAM_DRAIN_TIMEOUT.as_millis() as u64,
             ),
+            endpoint,
             cache_slot,
         };
         let conn = Arc::new(conn);
@@ -328,6 +312,8 @@ impl TuicConnection {
         };
 
         self.udp_sessions.write().close();
+        self.init_exited.store(true, Ordering::SeqCst);
+        self.evict_from_cache();
         tracing::warn!("connection error: {err:?}");
     }
 
@@ -371,11 +357,13 @@ impl TuicConnection {
             active_streams: AtomicUsize::new(0),
             keep_idle: Arc::new(AtomicBool::new(true)),
             evicted: AtomicBool::new(false),
+            init_exited: AtomicBool::new(false),
             upload_grace: QuicUploadGrace::default(),
             runtime: Handle::current(),
             drain_timeout_ms: AtomicU64::new(
                 TUIC_STREAM_DRAIN_TIMEOUT.as_millis() as u64,
             ),
+            endpoint: None,
             cache_slot: Weak::new(),
         })
     }

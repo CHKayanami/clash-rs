@@ -43,3 +43,14 @@ async fn udp_capability_respects_mux_enable_and_only_tcp() {
         assert!(!handler(protocol, false, false).support_udp().await);
     }
 }
+
+#[tokio::test]
+async fn outbound_handlers_forward_keep_idle_without_error() {
+    crate::tests::initialize();
+    for protocol in ["vless", "vmess", "trojan", #[cfg(feature = "shadowsocks")] "ss"] {
+        let node = handler(protocol, true, false);
+        node.set_keep_idle(false);
+        node.close_idle_connections();
+        node.set_keep_idle(true);
+    }
+}

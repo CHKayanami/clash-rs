@@ -34,6 +34,7 @@ pub(super) struct Server {
     pub(super) delay_headers: bool,
     pub(super) close_post: bool,
     pub(super) connections: AtomicUsize,
+    pub(super) active_connections: Arc<AtomicUsize>,
     pub(super) max_uploads: AtomicUsize,
     pub(super) h2_streams: u32,
     pub(super) h2_settings_delay: Duration,
@@ -47,7 +48,7 @@ impl Server {
             options: XHttpOpt { path: Some("/test".into()), ..Default::default() },
             expected, get_status: StatusCode::OK, post_status: StatusCode::OK,
             post_delay: Duration::ZERO, delay_first_packet: false, delay_headers: false, close_post: false,
-            connections: AtomicUsize::new(0), max_uploads: AtomicUsize::new(0), uploads: AtomicUsize::new(0),
+            connections: AtomicUsize::new(0), active_connections: Arc::new(AtomicUsize::new(0)), max_uploads: AtomicUsize::new(0), uploads: AtomicUsize::new(0),
             h2_streams: 100,
             h2_settings_delay: Duration::ZERO,
             tasks: Mutex::new(Tasks::new()),
@@ -121,11 +122,20 @@ impl Server {
             let state = state.clone();
             Box::pin(async move {
                 state.connections.fetch_add(1, Ordering::AcqRel);
+                let active = state.active_connections.clone();
+                active.fetch_add(1, Ordering::AcqRel);
+                struct ActiveGuard(Arc<AtomicUsize>);
+                impl Drop for ActiveGuard {
+                    fn drop(&mut self) {
+                        self.0.fetch_sub(1, Ordering::AcqRel);
+                    }
+                }
                 let (client, server) = duplex(4096);
                 let handler = state.clone();
                 let h2_streams = state.h2_streams;
                 let h2_settings_delay = state.h2_settings_delay;
                 state.tasks.lock().push(tokio::spawn(async move {
+                    let _guard = ActiveGuard(active);
                     let service = service_fn(move |request| handler.clone().request(request));
                     if h2 {
                         sleep(h2_settings_delay).await;

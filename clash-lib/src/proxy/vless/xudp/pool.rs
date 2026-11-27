@@ -1,7 +1,7 @@
 use crate::proxy::datagram::batch::{MAX_BATCH_PACKETS, MAX_BATCH_BYTES};
 mod batch;
 use bytes::{Bytes, BytesMut};
-use futures::{Sink, Stream};
+use futures::{Sink, Stream, ready};
 use parking_lot::{Mutex, RwLock};
 use std::{
     collections::HashMap,
@@ -9,19 +9,20 @@ use std::{
     io,
     pin::Pin,
     sync::{
-        Arc,
+        Arc, Weak,
         atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicUsize, Ordering},
     },
     task::{Context, Poll},
-    time::{SystemTime, UNIX_EPOCH},
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf},
     runtime::Handle,
     sync::{
         Notify,
-        mpsc::{self, error::TrySendError},
+        mpsc::{self, error::{TryRecvError, TrySendError}},
+        oneshot,
     },
+    time::{Duration, Instant, interval, timeout, timeout_at},
 };
 use tokio_util::sync::{CancellationToken, PollSender};
 use tracing::{debug, trace};
@@ -40,18 +41,23 @@ const UDP_BUFFER_CAPACITY: usize = 128;
 const WRITER_QUEUE_CAPACITY: usize = 256;
 const RECV_BUFFER_INITIAL_CAPACITY: usize = 64 * 1024;
 const IDLE_CARRIER_TIMEOUT_MS: u64 = 120 * 1000;
-
-#[inline]
-fn current_epoch_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
-}
+const IDLE_CLEANUP_INTERVAL_MS: u64 = 30 * 1000;
+const XUDP_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+const XUDP_CLOSING_BIT: usize = 1usize << (usize::BITS - 1);
 
 struct ChildSession {
     tx: mpsc::Sender<UdpPacket>,
     peer: SocksAddr,
+}
+
+struct XudpStreamLease {
+    carrier: Arc<XudpCarrier>,
+}
+
+impl Drop for XudpStreamLease {
+    fn drop(&mut self) {
+        self.carrier.release_lease();
+    }
 }
 
 pub struct XudpCarrier {
@@ -59,85 +65,202 @@ pub struct XudpCarrier {
     sessions: Arc<RwLock<HashMap<u16, ChildSession>>>,
     writer_tx: mpsc::Sender<Bytes>,
     active_streams: Arc<AtomicUsize>,
-    closed: Arc<AtomicBool>,
-    last_active_ms: Arc<AtomicU64>,
+    clock_origin: Instant,
+    idle_since_ms: Arc<AtomicU64>,
     next_session_id: AtomicU16,
     max_streams: usize,
+    keep_idle: Arc<AtomicBool>,
+    pool: Weak<XudpPoolInner>,
+    drain_tx: Mutex<Option<oneshot::Sender<()>>>,
+    drain_timeout_ms: Arc<AtomicU64>,
+    idle_timeout_ms: u64,
+    runtime: Handle,
+    #[cfg(test)]
+    before_remove_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 impl XudpCarrier {
+    #[cfg(test)]
     pub fn new(stream: AnyStream, carrier_id: u64, max_streams: usize) -> Arc<Self> {
+        Self::new_managed(
+            stream,
+            carrier_id,
+            max_streams,
+            Arc::new(AtomicBool::new(true)),
+            Weak::new(),
+            IDLE_CARRIER_TIMEOUT_MS,
+        )
+    }
+
+    fn new_managed(
+        stream: AnyStream,
+        carrier_id: u64,
+        max_streams: usize,
+        keep_idle: Arc<AtomicBool>,
+        pool: Weak<XudpPoolInner>,
+        idle_timeout_ms: u64,
+    ) -> Arc<Self> {
         let (read_half, write_half) = tokio::io::split(stream);
         let (writer_tx, writer_rx) = mpsc::channel(WRITER_QUEUE_CAPACITY);
 
         let sessions = Arc::new(RwLock::new(HashMap::new()));
         let active_streams = Arc::new(AtomicUsize::new(0));
-        let closed = Arc::new(AtomicBool::new(false));
-        let last_active_ms = Arc::new(AtomicU64::new(current_epoch_ms()));
+        let clock_origin = Instant::now();
+        let idle_since_ms = Arc::new(AtomicU64::new(0));
+        let (drain_tx, drain_rx) = oneshot::channel();
+
+        let drain_timeout_ms =
+            Arc::new(AtomicU64::new(XUDP_DRAIN_TIMEOUT.as_millis() as u64));
 
         let carrier = Arc::new(Self {
             carrier_id,
             sessions: sessions.clone(),
             writer_tx,
             active_streams: active_streams.clone(),
-            closed: closed.clone(),
-            last_active_ms: last_active_ms.clone(),
+            clock_origin,
+            idle_since_ms: idle_since_ms.clone(),
             next_session_id: AtomicU16::new(1),
             max_streams,
+            keep_idle,
+            pool: pool.clone(),
+            drain_tx: Mutex::new(Some(drain_tx)),
+            drain_timeout_ms: drain_timeout_ms.clone(),
+            idle_timeout_ms,
+            runtime: Handle::current(),
+            #[cfg(test)]
+            before_remove_hook: Mutex::new(None),
         });
 
         // Spawn coalescing writer task
         let cancel = CancellationToken::new();
         let cancel_w = cancel.clone();
-        let closed_w = closed.clone();
         let sessions_w = sessions.clone();
+        let active_w = active_streams.clone();
+        let pool_w = pool.clone();
         tokio::spawn(async move {
             tokio::select! {
                 _ = cancel_w.cancelled() => {}
-                result = Self::writer_loop(write_half, writer_rx) => {
+                result = Self::writer_loop(
+                    write_half,
+                    writer_rx,
+                    drain_rx,
+                    drain_timeout_ms,
+                ) => {
                     if let Err(e) = result {
                         debug!("XUDP carrier [{}] writer error: {}", carrier_id, e);
                     }
                 }
             }
-            closed_w.store(true, Ordering::SeqCst);
+            active_w.fetch_or(XUDP_CLOSING_BIT, Ordering::SeqCst);
             sessions_w.write().clear();
             cancel_w.cancel();
+            if let Some(pool) = pool_w.upgrade() {
+                pool.remove_carrier(carrier_id);
+            }
         });
 
         // Spawn zero-allocation reader task
-        let closed_r = closed.clone();
         let sessions_r = sessions.clone();
-        let last_active_ms_r = last_active_ms.clone();
+        let active_r = active_streams;
+        let pool_r = pool;
         tokio::spawn(async move {
             tokio::select! {
                 _ = cancel.cancelled() => {}
-                result = Self::reader_loop(carrier_id, read_half, sessions_r.clone(), last_active_ms_r) => {
+                result = Self::reader_loop(carrier_id, read_half, sessions_r.clone()) => {
                     if let Err(e) = result {
                         debug!("XUDP carrier [{}] reader error/EOF: {}", carrier_id, e);
                     }
                 }
             }
-            closed_r.store(true, Ordering::SeqCst);
+            active_r.fetch_or(XUDP_CLOSING_BIT, Ordering::SeqCst);
             // Drop all senders to notify active child datagrams of stream closure
             sessions_r.write().clear();
             cancel.cancel();
+            if let Some(pool) = pool_r.upgrade() {
+                pool.remove_carrier(carrier_id);
+            }
         });
 
         carrier
     }
 
+    fn drain_timeout(&self) -> Duration {
+        Duration::from_millis(self.drain_timeout_ms.load(Ordering::Relaxed))
+    }
+
+    #[cfg(test)]
+    fn set_drain_timeout_for_test(&self, timeout: Duration) {
+        self.drain_timeout_ms
+            .store(timeout.as_millis().max(1) as u64, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    fn set_before_remove_hook_for_test<F: FnOnce() + Send + 'static>(&self, hook: F) {
+        *self.before_remove_hook.lock() = Some(Box::new(hook));
+    }
+
+    #[cfg(test)]
+    fn run_before_remove_hook_for_test(&self) {
+        let hook = self.before_remove_hook.lock().take();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    async fn write_batch(
+        writer: &mut WriteHalf<AnyStream>,
+        data: &[u8],
+    ) -> io::Result<()> {
+        writer.write_all(data).await?;
+        writer.flush().await
+    }
+
     async fn writer_loop(
         mut writer: WriteHalf<AnyStream>,
         mut rx: mpsc::Receiver<Bytes>,
+        mut drain_rx: oneshot::Receiver<()>,
+        drain_timeout_ms: Arc<AtomicU64>,
     ) -> io::Result<()> {
         let mut buffer = BytesMut::new();
         let mut deferred = None;
+        let mut drain_deadline: Option<Instant> = None;
+        let current_drain_timeout =
+            || Duration::from_millis(drain_timeout_ms.load(Ordering::Relaxed));
+
         loop {
             let frame = match deferred.take() {
-                Some(frame) => frame,
-                None => match rx.recv().await { Some(frame) => frame, None => break },
+                Some(frame) => Some(frame),
+                None => match drain_deadline {
+                    Some(_) => match rx.try_recv() {
+                        Ok(frame) => Some(frame),
+                        Err(TryRecvError::Empty | TryRecvError::Disconnected) => None,
+                    },
+                    None => {
+                        tokio::select! {
+                            biased;
+                            _ = &mut drain_rx => {
+                                drain_deadline = Some(Instant::now() + current_drain_timeout());
+                                continue;
+                            }
+                            frame = rx.recv() => match frame {
+                                Some(frame) => Some(frame),
+                                None => {
+                                    drain_deadline = Some(Instant::now() + current_drain_timeout());
+                                    None
+                                }
+                            },
+                        }
+                    }
+                },
             };
+
+            let Some(frame) = frame else {
+                let deadline =
+                    drain_deadline.unwrap_or_else(|| Instant::now() + current_drain_timeout());
+                let _ = timeout_at(deadline, writer.shutdown()).await;
+                break;
+            };
+
             buffer.clear();
             for _ in 1..MAX_BATCH_PACKETS {
                 let size = if buffer.is_empty() { frame.len() } else { buffer.len() };
@@ -152,10 +275,26 @@ impl XudpCarrier {
             }
             // Avoid a copy and buffer allocation on an idle carrier.
             let data = if buffer.is_empty() { &frame[..] } else { &buffer[..] };
-            writer.write_all(data).await?;
-            writer.flush().await?;
+            let write_fut = Self::write_batch(&mut writer, data);
+            if let Some(deadline) = drain_deadline {
+                timeout_at(deadline, write_fut)
+                    .await
+                    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "XUDP drain timed out"))??;
+            } else {
+                tokio::pin!(write_fut);
+                tokio::select! {
+                    biased;
+                    _ = &mut drain_rx => {
+                        let deadline = Instant::now() + current_drain_timeout();
+                        drain_deadline = Some(deadline);
+                        timeout_at(deadline, &mut write_fut)
+                            .await
+                            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "XUDP drain timed out"))??;
+                    }
+                    res = &mut write_fut => res?,
+                }
+            }
         }
-        let _ = writer.shutdown().await;
         Ok(())
     }
 
@@ -163,7 +302,6 @@ impl XudpCarrier {
         carrier_id: u64,
         mut reader: ReadHalf<AnyStream>,
         sessions: Arc<RwLock<HashMap<u16, ChildSession>>>,
-        last_active_ms: Arc<AtomicU64>,
     ) -> io::Result<()> {
         let mut recv_buf = BytesMut::with_capacity(RECV_BUFFER_INITIAL_CAPACITY);
 
@@ -172,7 +310,6 @@ impl XudpCarrier {
             loop {
                 match decode_xudp_frame_from_buf(&mut recv_buf) {
                     Ok(Some(frame)) => {
-                        last_active_ms.store(current_epoch_ms(), Ordering::Relaxed);
                         let session_id = frame.session_id;
 
                         if let Some(payload) = frame.payload {
@@ -217,29 +354,87 @@ impl XudpCarrier {
         }
     }
 
-    pub fn is_closed(&self) -> bool {
-        self.closed.load(Ordering::SeqCst)
+    pub fn is_closing(&self) -> bool {
+        (self.active_streams.load(Ordering::Acquire) & XUDP_CLOSING_BIT) != 0
     }
 
+    pub fn is_closed(&self) -> bool {
+        self.is_closing()
+    }
+
+    #[cfg(test)]
     pub fn active_streams(&self) -> usize {
-        self.active_streams.load(Ordering::SeqCst)
+        self.active_streams.load(Ordering::SeqCst) & !XUDP_CLOSING_BIT
     }
 
     pub fn is_idle_expired(&self) -> bool {
-        if self.active_streams() == 0 {
-            let last = self.last_active_ms.load(Ordering::Relaxed);
-            current_epoch_ms().saturating_sub(last) >= IDLE_CARRIER_TIMEOUT_MS
+        if self.active_streams.load(Ordering::Acquire) == 0 {
+            let last = self.idle_since_ms.load(Ordering::Relaxed);
+            let now = self.clock_origin.elapsed().as_millis() as u64;
+            now.saturating_sub(last) >= self.idle_timeout_ms
         } else {
             false
         }
     }
 
-    pub fn is_available(&self) -> bool {
-        if self.is_closed() || self.is_idle_expired() {
-            return false;
+    fn should_keep_idle(&self) -> bool {
+        self.keep_idle.load(Ordering::SeqCst)
+    }
+
+    fn try_claim_idle_close(&self) -> bool {
+        self.active_streams
+            .compare_exchange(0, XUDP_CLOSING_BIT, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+    }
+
+    fn begin_graceful_close(&self) {
+        self.active_streams.fetch_or(XUDP_CLOSING_BIT, Ordering::SeqCst);
+        if let Some(tx) = self.drain_tx.lock().take() {
+            let _ = tx.send(());
         }
-        let active = self.active_streams();
-        active < self.max_streams
+    }
+
+    fn release_lease(&self) {
+        let keep_idle = self.should_keep_idle();
+        let mut closed_now = false;
+        let mut became_zero = false;
+        let _ = self.active_streams.try_update(
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+            |val| {
+                let closing = (val & XUDP_CLOSING_BIT) != 0;
+                let count = (val & !XUDP_CLOSING_BIT).saturating_sub(1);
+                if count == 0 {
+                    let elapsed = self.clock_origin.elapsed().as_millis() as u64;
+                    self.idle_since_ms.store(elapsed, Ordering::Relaxed);
+                }
+                let next_closing = closing || (!keep_idle && count == 0);
+                closed_now = !closing && next_closing;
+                became_zero = !next_closing && count == 0;
+                Some(if next_closing {
+                    XUDP_CLOSING_BIT | count
+                } else {
+                    count
+                })
+            },
+        );
+        if closed_now {
+            #[cfg(test)]
+            self.run_before_remove_hook_for_test();
+            if let Some(pool) = self.pool.upgrade() {
+                pool.remove_carrier(self.carrier_id);
+            }
+            self.begin_graceful_close();
+        } else if became_zero && !self.should_keep_idle() && self.try_claim_idle_close() {
+            // Re-check `keep_idle` / `evicted` after publishing zero (SeqCst)
+            // so a concurrent `set_keep_idle(false)` or eviction cannot miss.
+            #[cfg(test)]
+            self.run_before_remove_hook_for_test();
+            if let Some(pool) = self.pool.upgrade() {
+                pool.remove_carrier(self.carrier_id);
+            }
+            self.begin_graceful_close();
+        }
     }
 
     fn allocate_session_id(&self) -> io::Result<u16> {
@@ -267,8 +462,13 @@ impl XudpCarrier {
             ));
         }
 
+        let mut closing = false;
         self.active_streams
             .try_update(Ordering::SeqCst, Ordering::SeqCst, |active| {
+                if (active & XUDP_CLOSING_BIT) != 0 {
+                    closing = true;
+                    return None;
+                }
                 if active < self.max_streams {
                     Some(active + 1)
                 } else {
@@ -276,25 +476,26 @@ impl XudpCarrier {
                 }
             })
             .map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::WouldBlock,
-                    "XUDP carrier stream limit reached",
-                )
+                if closing {
+                    io::Error::new(
+                        io::ErrorKind::NotConnected,
+                        "XUDP carrier is closing",
+                    )
+                } else {
+                    io::Error::new(
+                        io::ErrorKind::WouldBlock,
+                        "XUDP carrier stream limit reached",
+                    )
+                }
             })?;
+        let lease = XudpStreamLease { carrier: self.clone() };
 
-        let session_id = match self.allocate_session_id() {
-            Ok(id) => id,
-            Err(e) => {
-                self.active_streams.fetch_sub(1, Ordering::SeqCst);
-                return Err(e);
-            }
-        };
+        let session_id = self.allocate_session_id()?;
         let (tx, rx) = mpsc::channel(UDP_BUFFER_CAPACITY);
 
         {
             let mut sessions = self.sessions.write();
             if self.is_closed() {
-                self.active_streams.fetch_sub(1, Ordering::SeqCst);
                 return Err(io::Error::new(
                     io::ErrorKind::NotConnected,
                     "XUDP carrier is closed",
@@ -303,11 +504,10 @@ impl XudpCarrier {
             sessions.insert(session_id, ChildSession { tx, peer: target });
         }
 
-        self.last_active_ms.store(current_epoch_ms(), Ordering::Relaxed);
-
         Ok(XudpChildDatagram {
             session_id,
             carrier: self.clone(),
+            lease: Some(lease),
             writer_tx: PollSender::new(self.writer_tx.clone()),
             rx,
             first_packet: true,
@@ -324,6 +524,7 @@ impl XudpCarrier {
 pub struct XudpChildDatagram {
     session_id: u16,
     carrier: Arc<XudpCarrier>,
+    lease: Option<XudpStreamLease>,
     writer_tx: PollSender<Bytes>,
     rx: mpsc::Receiver<UdpPacket>,
     first_packet: bool,
@@ -419,19 +620,24 @@ impl Sink<UdpPacket> for XudpChildDatagram {
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Result<(), Self::Error>> {
-        futures::ready!(self.as_mut().poll_flush(cx))?;
+        if let Err(err) = ready!(self.as_mut().poll_flush(cx)) {
+            self.lease.take();
+            return Poll::Ready(Err(err));
+        }
 
         if !self.ended {
             let end_frame = XudpFrame::encode_end_frame(self.session_id);
             self.pending_frame = Some(end_frame);
             self.ended = true;
             self.carrier.remove_child(self.session_id);
-            self.carrier
-                .active_streams
-                .fetch_sub(1, Ordering::SeqCst);
-            futures::ready!(self.as_mut().poll_flush(cx))?;
         }
 
+        if let Err(err) = ready!(self.as_mut().poll_flush(cx)) {
+            self.lease.take();
+            return Poll::Ready(Err(err));
+        }
+
+        self.lease.take();
         Poll::Ready(Ok(()))
     }
 }
@@ -441,9 +647,6 @@ impl Drop for XudpChildDatagram {
         let (pending_data, end_frame) = if !self.ended {
             self.ended = true;
             self.carrier.remove_child(self.session_id);
-            self.carrier
-                .active_streams
-                .fetch_sub(1, Ordering::SeqCst);
             (
                 self.pending_frame.take(),
                 Some(XudpFrame::encode_end_frame(self.session_id)),
@@ -451,9 +654,11 @@ impl Drop for XudpChildDatagram {
         } else {
             (None, self.pending_frame.take())
         };
+        let lease = self.lease.take();
 
         let frames_to_send: Vec<Bytes> = pending_data.into_iter().chain(end_frame).collect();
         if frames_to_send.is_empty() {
+            drop(lease);
             return;
         }
 
@@ -468,35 +673,153 @@ impl Drop for XudpChildDatagram {
                         remaining.extend(it);
                         break;
                     }
-                    Err(TrySendError::Closed(_)) => return,
+                    Err(TrySendError::Closed(_)) => {
+                        drop(lease);
+                        return;
+                    }
                 }
             }
             if !remaining.is_empty() {
-                if let Ok(handle) = Handle::try_current() {
-                    handle.spawn(async move {
+                let drain_timeout = self.carrier.drain_timeout();
+                let runtime = self.carrier.runtime.clone();
+                let handle = Handle::try_current().unwrap_or(runtime);
+                handle.spawn(async move {
+                    let _lease = lease;
+                    let _ = timeout(drain_timeout, async move {
                         for frame in remaining {
                             if tx.send(frame).await.is_err() {
                                 break;
                             }
                         }
-                    });
-                }
+                    })
+                    .await;
+                });
+            } else {
+                drop(lease);
             }
+        } else {
+            drop(lease);
         }
     }
 }
 
-pub struct XudpPool {
+struct XudpPoolInner {
     carriers: Mutex<Vec<Arc<XudpCarrier>>>,
     max_carriers: usize,
     max_streams_per_carrier: usize,
     next_carrier_id: AtomicU64,
     dialing_carriers: AtomicUsize,
     dial_notify: Arc<Notify>,
+    keep_idle: Arc<AtomicBool>,
+    cleanup_running: AtomicBool,
+    idle_timeout_ms: AtomicU64,
+    cleanup_interval_ms: AtomicU64,
+    #[cfg(test)]
+    after_scan_gate: Mutex<Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>>,
+}
+
+enum AcquireAction {
+    Reuse(Arc<XudpCarrier>),
+    Dial,
+    Wait,
+    Full,
+}
+
+impl XudpPoolInner {
+    fn remove_carrier(&self, carrier_id: u64) {
+        let mut carriers = self.carriers.lock();
+        carriers.retain(|c| c.carrier_id != carrier_id && !c.is_closed());
+    }
+
+    fn collect_prunable_carriers_locked(
+        &self,
+        carriers: &mut Vec<Arc<XudpCarrier>>,
+    ) -> Vec<Arc<XudpCarrier>> {
+        let keep_idle = self.keep_idle.load(Ordering::SeqCst);
+        let mut to_close = Vec::new();
+        let mut i = 0;
+        while i < carriers.len() {
+            let c = &carriers[i];
+            if c.is_closed() {
+                carriers.swap_remove(i);
+            } else if (!keep_idle || c.is_idle_expired()) && c.try_claim_idle_close() {
+                to_close.push(carriers.swap_remove(i));
+            } else {
+                i += 1;
+            }
+        }
+        to_close
+    }
+
+    fn prune_carriers(&self) {
+        let to_close = {
+            let mut carriers = self.carriers.lock();
+            self.collect_prunable_carriers_locked(&mut carriers)
+        };
+        for carrier in to_close {
+            carrier.begin_graceful_close();
+        }
+    }
+
+    fn publish_carrier(&self, carrier: Arc<XudpCarrier>) {
+        let to_close = {
+            let mut carriers = self.carriers.lock();
+            let to_close = self.collect_prunable_carriers_locked(&mut carriers);
+            carriers.push(carrier);
+            to_close
+        };
+        for old in to_close {
+            old.begin_graceful_close();
+        }
+    }
+
+    fn close_idle_connections(&self) {
+        let mut to_close = Vec::new();
+        {
+            let mut carriers = self.carriers.lock();
+            let mut i = 0;
+            while i < carriers.len() {
+                let c = &carriers[i];
+                if c.is_closed() {
+                    carriers.swap_remove(i);
+                } else if c.try_claim_idle_close() {
+                    to_close.push(carriers.swap_remove(i));
+                } else {
+                    i += 1;
+                }
+            }
+        }
+        for carrier in to_close {
+            carrier.begin_graceful_close();
+        }
+    }
+}
+
+impl Drop for XudpPoolInner {
+    fn drop(&mut self) {
+        self.keep_idle.store(false, Ordering::SeqCst);
+        let carriers = std::mem::take(self.carriers.get_mut());
+        for carrier in carriers {
+            if carrier.try_claim_idle_close() {
+                carrier.begin_graceful_close();
+            }
+        }
+    }
+}
+
+pub struct XudpPool {
+    inner: Arc<XudpPoolInner>,
+}
+
+impl Drop for XudpPool {
+    fn drop(&mut self) {
+        self.inner.keep_idle.store(false, Ordering::SeqCst);
+        self.inner.close_idle_connections();
+    }
 }
 
 struct DialGuard<'a> {
-    pool: &'a XudpPool,
+    pool: &'a XudpPoolInner,
 }
 
 impl<'a> Drop for DialGuard<'a> {
@@ -509,21 +832,102 @@ impl<'a> Drop for DialGuard<'a> {
 impl XudpPool {
     pub fn new(max_carriers: usize, max_streams_per_carrier: usize) -> Arc<Self> {
         Arc::new(Self {
-            carriers: Mutex::new(Vec::new()),
-            max_carriers: if max_carriers == 0 {
-                DEFAULT_MAX_CARRIERS
-            } else {
-                max_carriers
-            },
-            max_streams_per_carrier: if max_streams_per_carrier == 0 {
-                DEFAULT_MAX_STREAMS_PER_CARRIER
-            } else {
-                max_streams_per_carrier
-            },
-            next_carrier_id: AtomicU64::new(1),
-            dialing_carriers: AtomicUsize::new(0),
-            dial_notify: Arc::new(Notify::new()),
+            inner: Arc::new(XudpPoolInner {
+                carriers: Mutex::new(Vec::new()),
+                max_carriers: if max_carriers == 0 {
+                    DEFAULT_MAX_CARRIERS
+                } else {
+                    max_carriers
+                },
+                max_streams_per_carrier: if max_streams_per_carrier == 0 {
+                    DEFAULT_MAX_STREAMS_PER_CARRIER
+                } else {
+                    max_streams_per_carrier
+                },
+                next_carrier_id: AtomicU64::new(1),
+                dialing_carriers: AtomicUsize::new(0),
+                dial_notify: Arc::new(Notify::new()),
+                keep_idle: Arc::new(AtomicBool::new(true)),
+                cleanup_running: AtomicBool::new(false),
+                idle_timeout_ms: AtomicU64::new(IDLE_CARRIER_TIMEOUT_MS),
+                cleanup_interval_ms: AtomicU64::new(IDLE_CLEANUP_INTERVAL_MS),
+                #[cfg(test)]
+                after_scan_gate: Mutex::new(None),
+            }),
         })
+    }
+
+    pub fn set_keep_idle(&self, keep: bool) {
+        self.inner.keep_idle.store(keep, Ordering::SeqCst);
+        if !keep {
+            self.close_idle_connections();
+        }
+    }
+
+    pub fn close_idle_connections(&self) {
+        self.inner.close_idle_connections();
+    }
+
+    #[cfg(test)]
+    fn carrier_count_for_test(&self) -> usize {
+        self.inner.carriers.lock().len()
+    }
+
+    #[cfg(test)]
+    fn carriers_for_test(&self) -> Vec<Arc<XudpCarrier>> {
+        self.inner.carriers.lock().clone()
+    }
+
+    #[cfg(test)]
+    fn set_idle_policy_for_test(&self, idle_timeout: Duration, check_interval: Duration) {
+        self.inner
+            .idle_timeout_ms
+            .store(idle_timeout.as_millis().max(1) as u64, Ordering::Relaxed);
+        self.inner
+            .cleanup_interval_ms
+            .store(check_interval.as_millis().max(1) as u64, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    fn set_after_scan_gate_for_test(
+        &self,
+        entered_tx: oneshot::Sender<()>,
+        resume_rx: oneshot::Receiver<()>,
+    ) {
+        *self.inner.after_scan_gate.lock() = Some((entered_tx, resume_rx));
+    }
+
+    fn ensure_cleanup_task(&self) {
+        if self
+            .inner
+            .cleanup_running
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+
+        let inner_weak = Arc::downgrade(&self.inner);
+        let check_interval = Duration::from_millis(
+            self.inner.cleanup_interval_ms.load(Ordering::Relaxed),
+        );
+        tokio::spawn(async move {
+            let mut ticker = interval(check_interval);
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                let Some(inner) = inner_weak.upgrade() else {
+                    break;
+                };
+                inner.prune_carriers();
+                let carriers = inner.carriers.lock();
+                if carriers.is_empty() && inner.dialing_carriers.load(Ordering::SeqCst) == 0 {
+                    inner.cleanup_running.store(false, Ordering::Release);
+                    drop(carriers);
+                    break;
+                }
+            }
+        });
     }
 
     pub async fn open_stream<F, Fut>(
@@ -536,41 +940,74 @@ impl XudpPool {
         Fut: Future<Output = io::Result<AnyStream>> + Send,
     {
         loop {
-            let notified = self.dial_notify.notified();
-            let (carrier_candidate, can_dial) = {
-                let mut carriers = self.carriers.lock();
-                // Retain active, non-expired carriers
-                carriers.retain(|c| !c.is_closed() && !c.is_idle_expired());
+            let notified = self.inner.dial_notify.notified();
 
-                // Find candidate with lowest active streams
-                let mut best_idx = None;
+            let (action, to_close) = {
+                let mut carriers = self.inner.carriers.lock();
+                let keep_idle = self.inner.keep_idle.load(Ordering::SeqCst);
+                let mut to_close = Vec::new();
+                let mut best: Option<Arc<XudpCarrier>> = None;
                 let mut min_active = usize::MAX;
+                let mut live_carriers = 0usize;
 
-                for (i, c) in carriers.iter().enumerate() {
-                    if c.is_available() {
-                        let active = c.active_streams();
-                        if active < min_active {
-                            min_active = active;
-                            best_idx = Some(i);
+                // Prune closed/expired carriers, pick the least-loaded live
+                // carrier, and decide reuse/dial/wait/full under a single lock pass
+                // so neither a closing carrier nor a dial that finishes right after
+                // unlocking can trigger a false full error.
+                let mut i = 0;
+                while i < carriers.len() {
+                    let c = &carriers[i];
+                    let raw = c.active_streams.load(Ordering::SeqCst);
+                    if (raw & XUDP_CLOSING_BIT) != 0 {
+                        carriers.swap_remove(i);
+                        continue;
+                    }
+                    let active = raw;
+                    if active == 0 && (!keep_idle || c.is_idle_expired()) {
+                        if c.try_claim_idle_close() {
+                            to_close.push(carriers.swap_remove(i));
                         }
+                        // Re-check index `i` whether swapped or concurrently mutated.
+                        continue;
                     }
+                    live_carriers += 1;
+                    if active < c.max_streams && active < min_active {
+                        min_active = active;
+                        best = Some(c.clone());
+                    }
+                    i += 1;
                 }
 
-                if let Some(i) = best_idx {
-                    (Some(carriers[i].clone()), false)
+                let action = if let Some(carrier) = best {
+                    AcquireAction::Reuse(carrier)
                 } else {
-                    let total = carriers.len() + self.dialing_carriers.load(Ordering::SeqCst);
-                    if total < self.max_carriers {
-                        self.dialing_carriers.fetch_add(1, Ordering::SeqCst);
-                        (None, true)
+                    let dialing = self.inner.dialing_carriers.load(Ordering::SeqCst);
+                    if live_carriers + dialing < self.inner.max_carriers {
+                        self.inner.dialing_carriers.fetch_add(1, Ordering::SeqCst);
+                        AcquireAction::Dial
+                    } else if dialing > 0 {
+                        AcquireAction::Wait
                     } else {
-                        (None, false)
+                        AcquireAction::Full
                     }
-                }
+                };
+                (action, to_close)
             };
+            for carrier in to_close {
+                carrier.begin_graceful_close();
+            }
 
-            if let Some(carrier) = carrier_candidate {
-                match carrier.open_child(destination.clone()) {
+            #[cfg(test)]
+            {
+                let gate = self.inner.after_scan_gate.lock().take();
+                if let Some((entered_tx, resume_rx)) = gate {
+                    let _ = entered_tx.send(());
+                    let _ = resume_rx.await;
+                }
+            }
+
+            match action {
+                AcquireAction::Reuse(carrier) => match carrier.open_child(destination.clone()) {
                     Ok(datagram) => return Ok(datagram),
                     Err(e) => {
                         debug!(
@@ -579,37 +1016,44 @@ impl XudpPool {
                         );
                         continue;
                     }
+                },
+                AcquireAction::Dial => {
+                    let _guard = DialGuard { pool: &self.inner };
+                    debug!("dialing new carrier connection for XUDP pool");
+                    let stream = dial_carrier().await?;
+                    let cid = self.inner.next_carrier_id.fetch_add(1, Ordering::SeqCst);
+                    let idle_timeout_ms = self.inner.idle_timeout_ms.load(Ordering::Relaxed);
+                    let new_carrier = XudpCarrier::new_managed(
+                        stream,
+                        cid,
+                        self.inner.max_streams_per_carrier,
+                        self.inner.keep_idle.clone(),
+                        Arc::downgrade(&self.inner),
+                        idle_timeout_ms,
+                    );
+                    let datagram = match new_carrier.open_child(destination.clone()) {
+                        Ok(datagram) => datagram,
+                        Err(e) => {
+                            new_carrier.begin_graceful_close();
+                            return Err(e);
+                        }
+                    };
+
+                    self.inner.publish_carrier(new_carrier.clone());
+                    self.ensure_cleanup_task();
+
+                    return Ok(datagram);
                 }
-            }
-
-            if can_dial {
-                let _guard = DialGuard { pool: self };
-                debug!("dialing new carrier connection for XUDP pool");
-                let stream = dial_carrier().await?;
-                let cid = self.next_carrier_id.fetch_add(1, Ordering::SeqCst);
-                let new_carrier =
-                    XudpCarrier::new(stream, cid, self.max_streams_per_carrier);
-                let datagram = new_carrier.open_child(destination.clone())?;
-
-                {
-                    let mut carriers = self.carriers.lock();
-                    carriers.retain(|c| !c.is_closed() && !c.is_idle_expired());
-                    carriers.push(new_carrier);
+                AcquireAction::Wait => {
+                    notified.await;
+                    continue;
                 }
-
-                return Ok(datagram);
-            }
-
-            // Both carrier acquisition and dial capacity are unavailable.
-            // If another task is currently dialing, wait for it to finish.
-            if self.dialing_carriers.load(Ordering::SeqCst) > 0 {
-                notified.await;
-                continue;
-            } else {
-                return Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    "XUDP carrier limit reached and all carriers are full",
-                ));
+                AcquireAction::Full => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Other,
+                        "XUDP carrier limit reached and all carriers are full",
+                    ));
+                }
             }
         }
     }
@@ -619,7 +1063,12 @@ impl XudpPool {
 mod tests {
     use super::*;
     use futures::{SinkExt, StreamExt};
-    use tokio::io::{AsyncRead, AsyncWrite, ReadBuf, duplex};
+    use std::collections::VecDeque;
+    use tokio::{
+        io::{AsyncRead, AsyncWrite, ReadBuf, duplex},
+        task::yield_now,
+        time::advance,
+    };
     use tokio::time::{Duration, timeout};
     use crate::proxy::ProxyStream;
 
@@ -1110,5 +1559,919 @@ mod tests {
         let send_res = Pin::new(&mut dgram).start_send(pkt);
         assert!(send_res.is_err());
         assert_eq!(send_res.unwrap_err().kind(), io::ErrorKind::BrokenPipe);
+    }
+
+    struct NotifyDropStream {
+        inner: tokio::io::DuplexStream,
+        dropped: Option<tokio::sync::oneshot::Sender<()>>,
+    }
+
+    impl ProxyStream for NotifyDropStream {}
+
+    impl tokio::io::AsyncRead for NotifyDropStream {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.inner).poll_read(cx, buf)
+        }
+    }
+
+    impl tokio::io::AsyncWrite for NotifyDropStream {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Pin::new(&mut self.inner).poll_write(cx, buf)
+        }
+
+        fn poll_flush(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
+
+    impl Drop for NotifyDropStream {
+        fn drop(&mut self) {
+            if let Some(tx) = self.dropped.take() {
+                let _ = tx.send(());
+            }
+        }
+    }
+
+    struct StalledWriter(Option<tokio::sync::oneshot::Sender<()>>);
+
+    impl ProxyStream for StalledWriter {}
+
+    impl AsyncRead for StalledWriter {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    impl AsyncWrite for StalledWriter {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Pending
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+
+        fn poll_shutdown(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    impl Drop for StalledWriter {
+        fn drop(&mut self) {
+            if let Some(tx) = self.0.take() {
+                let _ = tx.send(());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_xudp_keep_idle_false_health_check_and_ordered_drain_on_drop() {
+        let target: SocksAddr = "1.1.1.1:53".parse().unwrap();
+        let pool = XudpPool::new(2, 16);
+
+        // 1. Health check only (keep_idle = false): drains & closes carrier on drop.
+        pool.set_keep_idle(false);
+        let (client1, mut server1) = duplex(64 * 1024);
+        let (drop_tx1, drop_rx1) = tokio::sync::oneshot::channel();
+        let stream1 = Arc::new(Mutex::new(Some(AnyStream::Dynamic(Box::new(
+            NotifyDropStream { inner: client1, dropped: Some(drop_tx1) },
+        )))));
+        let mut probe = pool
+            .open_stream(&target, || {
+                let stream1 = stream1.clone();
+                async move { Ok(stream1.lock().take().unwrap()) }
+            })
+            .await
+            .unwrap();
+        assert_eq!(pool.carrier_count_for_test(), 1);
+        probe.send(UdpPacket {
+            data: Bytes::from_static(b"probe"),
+            dst_addr: target.clone(),
+            ..Default::default()
+        }).await.unwrap();
+        drop(probe);
+
+        let mut buf = BytesMut::new();
+        let mut got = Vec::new();
+        let mut tmp = [0u8; 1024];
+        loop {
+            let n = timeout(Duration::from_secs(2), server1.read(&mut tmp))
+                .await
+                .unwrap()
+                .unwrap();
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&tmp[..n]);
+            while let Some(frame) = decode_xudp_frame_from_buf(&mut buf).unwrap() {
+                got.push((frame.status, frame.payload));
+            }
+        }
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].0, SessionStatus::New);
+        assert_eq!(got[0].1.as_deref(), Some(&b"probe"[..]));
+        assert_eq!(got[1].0, SessionStatus::End);
+        timeout(Duration::from_secs(2), drop_rx1).await.unwrap().unwrap();
+
+        // 2. Active session with pending data + channel pressure: switching away
+        // keeps session alive until last child drops, then flushes data & End in order.
+        pool.set_keep_idle(true);
+        let (client2, mut server2) = duplex(64 * 1024);
+        let (drop_tx2, drop_rx2) = tokio::sync::oneshot::channel();
+        let stream2 = Arc::new(Mutex::new(Some(AnyStream::Dynamic(Box::new(
+            NotifyDropStream { inner: client2, dropped: Some(drop_tx2) },
+        )))));
+        let mut child = pool
+            .open_stream(&target, || {
+                let stream2 = stream2.clone();
+                async move { Ok(stream2.lock().take().unwrap()) }
+            })
+            .await
+            .unwrap();
+        assert_eq!(pool.carrier_count_for_test(), 1);
+        let sid = child.session_id;
+
+        pool.set_keep_idle(false);
+        assert_eq!(pool.carrier_count_for_test(), 1);
+        Pin::new(&mut child).start_send(UdpPacket {
+            data: Bytes::from_static(b"last-word"),
+            dst_addr: target.clone(),
+            ..Default::default()
+        }).unwrap();
+        drop(child);
+
+        let mut buf2 = BytesMut::new();
+        let mut got2 = Vec::new();
+        loop {
+            let n = timeout(Duration::from_secs(2), server2.read(&mut tmp))
+                .await
+                .unwrap()
+                .unwrap();
+            if n == 0 {
+                break;
+            }
+            buf2.extend_from_slice(&tmp[..n]);
+            while let Some(frame) = decode_xudp_frame_from_buf(&mut buf2).unwrap() {
+                if frame.session_id == sid {
+                    got2.push((frame.status, frame.payload));
+                }
+            }
+        }
+        assert_eq!(got2.len(), 2);
+        assert_eq!(got2[0].0, SessionStatus::New);
+        assert_eq!(got2[0].1.as_deref(), Some(&b"last-word"[..]));
+        assert_eq!(got2[1].0, SessionStatus::End);
+        timeout(Duration::from_secs(2), drop_rx2).await.unwrap().unwrap();
+        assert_eq!(pool.carrier_count_for_test(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_xudp_idle_eviction_reselect_concurrent_dial_and_bounded_drain() {
+        let target: SocksAddr = "1.1.1.1:53".parse().unwrap();
+        let pool = XudpPool::new(2, 16);
+
+        // 1. Idle carrier evicted immediately on set_keep_idle(false) and rebuilt on reselect.
+        let (client1, mut server1) = duplex(64 * 1024);
+        let (drop_tx1, drop_rx1) = tokio::sync::oneshot::channel();
+        let stream1 = Arc::new(Mutex::new(Some(AnyStream::Dynamic(Box::new(
+            NotifyDropStream { inner: client1, dropped: Some(drop_tx1) },
+        )))));
+        let c1 = pool
+            .open_stream(&target, || {
+                let stream1 = stream1.clone();
+                async move { Ok(stream1.lock().take().unwrap()) }
+            })
+            .await
+            .unwrap();
+        drop(c1);
+        assert_eq!(pool.carrier_count_for_test(), 1);
+        pool.set_keep_idle(false);
+        assert_eq!(pool.carrier_count_for_test(), 0);
+        let mut tmp = [0u8; 64];
+        while timeout(Duration::from_secs(2), server1.read(&mut tmp)).await.unwrap().unwrap() > 0 {}
+        timeout(Duration::from_secs(2), drop_rx1).await.unwrap().unwrap();
+
+        // 2. Concurrent dial while keep_idle flips to false: must not retain carrier.
+        pool.set_keep_idle(true);
+        let started = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let (client2, mut server2) = duplex(64 * 1024);
+        let (drop_tx2, drop_rx2) = tokio::sync::oneshot::channel();
+        let stream2 = Arc::new(Mutex::new(Some(AnyStream::Dynamic(Box::new(
+            NotifyDropStream { inner: client2, dropped: Some(drop_tx2) },
+        )))));
+        let pool_dial = pool.clone();
+        let target_dial = target.clone();
+        let started_tx = started.clone();
+        let release_rx = release.clone();
+        let dial = tokio::spawn(async move {
+            pool_dial
+                .open_stream(&target_dial, || {
+                    let started = started_tx.clone();
+                    let release = release_rx.clone();
+                    let stream2 = stream2.clone();
+                    async move {
+                        started.notify_one();
+                        release.notified().await;
+                        Ok(stream2.lock().take().unwrap())
+                    }
+                })
+                .await
+        });
+        started.notified().await;
+        pool.set_keep_idle(false);
+        release.notify_one();
+        let c2 = dial.await.unwrap().unwrap();
+        assert_eq!(pool.carrier_count_for_test(), 1);
+        drop(c2);
+        while timeout(Duration::from_secs(2), server2.read(&mut tmp)).await.unwrap().unwrap() > 0 {}
+        timeout(Duration::from_secs(2), drop_rx2).await.unwrap().unwrap();
+        assert_eq!(pool.carrier_count_for_test(), 0);
+
+        // 3. Stalled writer is bounded by drain_timeout and releases stream.
+        pool.set_keep_idle(true);
+        let (drop_tx3, drop_rx3) = tokio::sync::oneshot::channel();
+        let stream3 = Arc::new(Mutex::new(Some(AnyStream::Dynamic(Box::new(
+            StalledWriter(Some(drop_tx3)),
+        )))));
+        let mut c3 = pool
+            .open_stream(&target, || {
+                let stream3 = stream3.clone();
+                async move { Ok(stream3.lock().take().unwrap()) }
+            })
+            .await
+            .unwrap();
+        pool.carriers_for_test()[0].set_drain_timeout_for_test(Duration::from_millis(50));
+        c3.send(UdpPacket {
+            data: Bytes::from_static(b"blocked"),
+            dst_addr: target,
+            ..Default::default()
+        }).await.unwrap();
+        pool.set_keep_idle(false);
+        drop(c3);
+        timeout(Duration::from_secs(2), drop_rx3)
+            .await
+            .expect("stalled XUDP carrier must close within drain timeout")
+            .unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_xudp_120s_idle_policy_actively_reclaims_when_selected() {
+        let pool = XudpPool::new(2, 16);
+        pool.set_idle_policy_for_test(
+            Duration::from_secs(IDLE_CARRIER_TIMEOUT_MS / 1000),
+            Duration::from_secs(10),
+        );
+        let target: SocksAddr = "1.1.1.1:53".parse().unwrap();
+        let (client, mut server) = duplex(4096);
+        let (drop_tx, drop_rx) = tokio::sync::oneshot::channel();
+        let stream = Arc::new(Mutex::new(Some(AnyStream::Dynamic(Box::new(
+            NotifyDropStream { inner: client, dropped: Some(drop_tx) },
+        )))));
+        let child = pool
+            .open_stream(&target, || {
+                let stream = stream.clone();
+                async move { Ok(stream.lock().take().unwrap()) }
+            })
+            .await
+            .unwrap();
+        drop(child);
+        assert_eq!(pool.carrier_count_for_test(), 1);
+
+        // Before 120s, carrier remains kept alive.
+        tokio::time::advance(Duration::from_secs(110)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(pool.carrier_count_for_test(), 1);
+
+        // Past 120s + cleanup interval tick, background cleanup closes idle carrier.
+        tokio::time::advance(Duration::from_secs(25)).await;
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(pool.carrier_count_for_test(), 0);
+        let mut tmp = [0u8; 64];
+        while timeout(Duration::from_secs(1), server.read(&mut tmp)).await.unwrap().unwrap() > 0 {}
+        timeout(Duration::from_secs(1), drop_rx).await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_xudp_keep_idle_false_respects_carrier_and_stream_limits() {
+        let target: SocksAddr = "1.1.1.1:53".parse().unwrap();
+        let pool = XudpPool::new(1, 2);
+        pool.set_keep_idle(false);
+
+        let dial_count = Arc::new(AtomicUsize::new(0));
+        let (client, mut server) = duplex(64 * 1024);
+        let (drop_tx, drop_rx) = tokio::sync::oneshot::channel();
+        let holder = Arc::new(Mutex::new(Some(AnyStream::Dynamic(Box::new(
+            NotifyDropStream { inner: client, dropped: Some(drop_tx) },
+        )))));
+
+        let dial = || {
+            let dial_count = dial_count.clone();
+            let holder = holder.clone();
+            async move {
+                dial_count.fetch_add(1, Ordering::SeqCst);
+                Ok(holder.lock().take().expect("must not dial past max_carriers"))
+            }
+        };
+
+        let c1 = pool.open_stream(&target, dial).await.unwrap();
+        let c2 = pool.open_stream(&target, dial).await.unwrap();
+        assert_eq!(dial_count.load(Ordering::SeqCst), 1);
+        assert_eq!(pool.carrier_count_for_test(), 1);
+
+        // Third overlapping child must fail capacity check instead of bypassing max_carriers=1.
+        assert!(pool.open_stream(&target, dial).await.is_err());
+        assert_eq!(dial_count.load(Ordering::SeqCst), 1);
+
+        drop(c1);
+        tokio::task::yield_now().await;
+        assert_eq!(pool.carrier_count_for_test(), 1);
+
+        drop(c2);
+        let mut tmp = [0u8; 64];
+        while timeout(Duration::from_secs(2), server.read(&mut tmp)).await.unwrap().unwrap() > 0 {}
+        timeout(Duration::from_secs(2), drop_rx).await.unwrap().unwrap();
+        assert_eq!(pool.carrier_count_for_test(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_xudp_publish_new_carrier_gracefully_closes_expired_stalled_carrier() {
+        let target: SocksAddr = "1.1.1.1:53".parse().unwrap();
+        let pool = XudpPool::new(2, 1);
+        // Short idle timeout with long cleanup interval so expiration is handled
+        // specifically when publishing the newly dialed carrier.
+        pool.set_idle_policy_for_test(
+            Duration::from_millis(30),
+            Duration::from_secs(60),
+        );
+
+        let (drop_tx1, drop_rx1) = tokio::sync::oneshot::channel();
+        let stream1 = Arc::new(Mutex::new(Some(AnyStream::Dynamic(Box::new(
+            StalledWriter(Some(drop_tx1)),
+        )))));
+        let mut c1 = pool
+            .open_stream(&target, || {
+                let stream1 = stream1.clone();
+                async move { Ok(stream1.lock().take().unwrap()) }
+            })
+            .await
+            .unwrap();
+        let carrier1 = pool.carriers_for_test()[0].clone();
+        carrier1.set_drain_timeout_for_test(Duration::from_millis(50));
+        c1.send(UdpPacket {
+            data: Bytes::from_static(b"stalled-last-batch"),
+            dst_addr: target.clone(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        // Let writer_loop pick up the batch and block in `write_batch`.
+        tokio::task::yield_now().await;
+
+        // Start dialing a second carrier while carrier1 is full (max_streams=1).
+        let started = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let (client2, _server2) = duplex(4096);
+        let stream2 = Arc::new(Mutex::new(Some(AnyStream::new(client2))));
+        let dial_pool = pool.clone();
+        let dial_target = target.clone();
+        let started_tx = started.clone();
+        let release_rx = release.clone();
+        let dial_task = tokio::spawn(async move {
+            dial_pool
+                .open_stream(&dial_target, || {
+                    let started = started_tx.clone();
+                    let release = release_rx.clone();
+                    let stream2 = stream2.clone();
+                    async move {
+                        started.notify_one();
+                        release.notified().await;
+                        Ok(stream2.lock().take().unwrap())
+                    }
+                })
+                .await
+        });
+        started.notified().await;
+
+        // While carrier2 is dialing, carrier1 becomes idle and exceeds idle_timeout
+        // while its writer is still blocked in `write_batch`.
+        drop(c1);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(carrier1.is_idle_expired());
+        drop(carrier1);
+
+        // Publishing carrier2 must put expired carrier1 through bounded graceful close.
+        release.notify_one();
+        let _c2 = dial_task.await.unwrap().unwrap();
+        assert_eq!(pool.carrier_count_for_test(), 1);
+        timeout(Duration::from_secs(2), drop_rx1)
+            .await
+            .expect("expired stalled carrier must enter bounded close when publishing new carrier")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_xudp_closing_carrier_not_yet_removed_does_not_reject_new_stream() {
+        use std::{collections::VecDeque, sync::mpsc as std_mpsc, thread};
+        use tokio::sync::oneshot;
+
+        let target: SocksAddr = "1.1.1.1:53".parse().unwrap();
+        let pool = XudpPool::new(1, 2);
+        pool.set_keep_idle(false);
+
+        let dial_count = Arc::new(AtomicUsize::new(0));
+        let (client1, mut server1) = duplex(64 * 1024);
+        let (drop_tx1, drop_rx1) = oneshot::channel();
+        let (client2, mut server2) = duplex(64 * 1024);
+        let (drop_tx2, drop_rx2) = oneshot::channel();
+        let streams = Arc::new(Mutex::new(VecDeque::from([
+            AnyStream::Dynamic(Box::new(NotifyDropStream {
+                inner: client1,
+                dropped: Some(drop_tx1),
+            })),
+            AnyStream::Dynamic(Box::new(NotifyDropStream {
+                inner: client2,
+                dropped: Some(drop_tx2),
+            })),
+        ])));
+
+        let dial = || {
+            let dial_count = dial_count.clone();
+            let streams = streams.clone();
+            async move {
+                dial_count.fetch_add(1, Ordering::SeqCst);
+                Ok(streams
+                    .lock()
+                    .pop_front()
+                    .expect("test stream available for dial"))
+            }
+        };
+
+        let c1 = pool.open_stream(&target, dial).await.unwrap();
+        assert_eq!(dial_count.load(Ordering::SeqCst), 1);
+        assert_eq!(pool.carrier_count_for_test(), 1);
+
+        // Pause `release_lease` after setting XUDP_CLOSING_BIT and before calling
+        // `pool.remove_carrier`, freezing the exact race window.
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let (resume_tx, resume_rx) = std_mpsc::channel();
+        let carrier1 = pool.carriers_for_test()[0].clone();
+        carrier1.set_before_remove_hook_for_test(move || {
+            let _ = entered_tx.send(());
+            let _ = resume_rx.recv();
+        });
+
+        let drop_thread = thread::spawn(move || drop(c1));
+        timeout(Duration::from_secs(2), entered_rx)
+            .await
+            .expect("release_lease must reach before-remove synchronization point")
+            .unwrap();
+
+        // Carrier1 is now marked CLOSING while still present in `pool.carriers`.
+        assert!(carrier1.is_closing());
+        assert_eq!(pool.carrier_count_for_test(), 1);
+
+        // A new stream request with max_carriers=1 must NOT falsely fail as full;
+        // it must evict the closing carrier and dial a replacement.
+        let c2 = pool
+            .open_stream(&target, dial)
+            .await
+            .expect("closing carrier still in pool must not block replacement dial");
+        assert_eq!(dial_count.load(Ordering::SeqCst), 2);
+        assert_eq!(pool.carrier_count_for_test(), 1);
+
+        // Release the paused old lease drop and verify both carriers clean up.
+        let _ = resume_tx.send(());
+        drop_thread.join().unwrap();
+        drop(carrier1);
+        let mut tmp = [0u8; 64];
+        while timeout(Duration::from_secs(2), server1.read(&mut tmp))
+            .await
+            .unwrap()
+            .unwrap()
+            > 0
+        {}
+        timeout(Duration::from_secs(2), drop_rx1).await.unwrap().unwrap();
+
+        drop(c2);
+        while timeout(Duration::from_secs(2), server2.read(&mut tmp))
+            .await
+            .unwrap()
+            .unwrap()
+            > 0
+        {}
+        timeout(Duration::from_secs(2), drop_rx2).await.unwrap().unwrap();
+        assert_eq!(pool.carrier_count_for_test(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_xudp_concurrent_dial_finish_after_scan_does_not_falsely_report_full() {
+        let target: SocksAddr = "1.1.1.1:53".parse().unwrap();
+        let pool = XudpPool::new(1, 4);
+        let dial_count = Arc::new(AtomicUsize::new(0));
+        let dial_started = Arc::new(Notify::new());
+        let dial_release = Arc::new(Notify::new());
+        let servers = Arc::new(Mutex::new(Vec::new()));
+
+        let pool1 = pool.clone();
+        let target1 = target.clone();
+        let dial_count1 = dial_count.clone();
+        let dial_started1 = dial_started.clone();
+        let dial_release1 = dial_release.clone();
+        let servers1 = servers.clone();
+        let task1 = tokio::spawn(async move {
+            pool1
+                .open_stream(&target1, || {
+                    let dial_count = dial_count1.clone();
+                    let dial_started = dial_started1.clone();
+                    let dial_release = dial_release1.clone();
+                    let servers = servers1.clone();
+                    async move {
+                        dial_count.fetch_add(1, Ordering::SeqCst);
+                        dial_started.notify_one();
+                        dial_release.notified().await;
+                        let (client, server) = duplex(64 * 1024);
+                        servers.lock().push(server);
+                        Ok(AnyStream::new(client))
+                    }
+                })
+                .await
+        });
+
+        dial_started.notified().await;
+
+        // Pause task2 right after it releases the pool lock having observed
+        // `dialing == 1`, before it acts on the decision.
+        let (scan_done_tx, scan_done_rx) = oneshot::channel();
+        let (resume_task2_tx, resume_task2_rx) = oneshot::channel();
+        pool.set_after_scan_gate_for_test(scan_done_tx, resume_task2_rx);
+
+        let pool2 = pool.clone();
+        let target2 = target.clone();
+        let task2 = tokio::spawn(async move {
+            pool2
+                .open_stream(&target2, || async {
+                    panic!("task2 must reuse the carrier published by task1");
+                })
+                .await
+        });
+
+        timeout(Duration::from_secs(2), scan_done_rx)
+            .await
+            .expect("task2 must complete lock scan")
+            .unwrap();
+
+        // Let task1 finish dialing, publish the carrier with spare stream capacity,
+        // decrement `dialing_carriers` to 0, and fire `dial_notify.notify_waiters()`.
+        dial_release.notify_one();
+        let c1 = timeout(Duration::from_secs(2), task1)
+            .await
+            .expect("task1 must finish dialing")
+            .unwrap()
+            .unwrap();
+
+        // Now resume task2: it must neither falsely fail with pool-full nor miss
+        // the wakeup, and must reuse the newly published carrier.
+        let _ = resume_task2_tx.send(());
+        let c2 = timeout(Duration::from_secs(2), task2)
+            .await
+            .expect("task2 must wake and reuse carrier instead of hanging")
+            .unwrap()
+            .expect("task2 must not falsely report pool full after dial finishes");
+
+        assert_eq!(dial_count.load(Ordering::SeqCst), 1);
+        assert_eq!(pool.carrier_count_for_test(), 1);
+        drop((c1, c2));
+    }
+
+    enum WriteStep {
+        Ready {
+            on_write: Option<Box<dyn FnOnce() + Send + Sync>>,
+        },
+        Gated {
+            entered: Option<oneshot::Sender<()>>,
+            release: oneshot::Receiver<()>,
+            on_write: Option<Box<dyn FnOnce() + Send + Sync>>,
+            on_flush: Option<Box<dyn FnOnce() + Send + Sync>>,
+        },
+        Stall {
+            entered: Option<oneshot::Sender<()>>,
+        },
+    }
+
+    struct ScriptedDrainWriter {
+        steps: VecDeque<WriteStep>,
+        pending_flush_hook: Option<Box<dyn FnOnce() + Send + Sync>>,
+        writes_completed: Arc<AtomicUsize>,
+        dropped: Option<oneshot::Sender<()>>,
+    }
+
+    impl ProxyStream for ScriptedDrainWriter {}
+
+    impl AsyncRead for ScriptedDrainWriter {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    impl AsyncWrite for ScriptedDrainWriter {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            let Some(step) = self.steps.front_mut() else {
+                return Poll::Pending;
+            };
+            match step {
+                WriteStep::Ready { on_write } => {
+                    if let Some(hook) = on_write.take() {
+                        hook();
+                    }
+                    self.steps.pop_front();
+                    self.writes_completed.fetch_add(1, Ordering::SeqCst);
+                    Poll::Ready(Ok(buf.len()))
+                }
+                WriteStep::Gated { entered, release, on_write, on_flush } => {
+                    if let Some(tx) = entered.take() {
+                        let _ = tx.send(());
+                    }
+                    match Pin::new(release).poll(cx) {
+                        Poll::Ready(_) => {
+                            if let Some(hook) = on_write.take() {
+                                hook();
+                            }
+                            self.pending_flush_hook = on_flush.take();
+                            self.steps.pop_front();
+                            self.writes_completed.fetch_add(1, Ordering::SeqCst);
+                            Poll::Ready(Ok(buf.len()))
+                        }
+                        Poll::Pending => Poll::Pending,
+                    }
+                }
+                WriteStep::Stall { entered } => {
+                    if let Some(tx) = entered.take() {
+                        let _ = tx.send(());
+                    }
+                    Poll::Pending
+                }
+            }
+        }
+
+        fn poll_flush(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<io::Result<()>> {
+            if let Some(hook) = self.pending_flush_hook.take() {
+                hook();
+            }
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    impl Drop for ScriptedDrainWriter {
+        fn drop(&mut self) {
+            if let Some(tx) = self.dropped.take() {
+                let _ = tx.send(());
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_xudp_drain_deadline_starts_on_signal_during_ready_backlog() {
+        let target: SocksAddr = "1.1.1.1:53".parse().unwrap();
+        let batch_frame = Bytes::from(vec![0u8; MAX_BATCH_BYTES]);
+
+        // Case 1: drain arrives while the write select! is ready to resume.
+        // The write select! must poll drain_rx before write_fut, capturing the
+        // 100ms timeout before step 0 bumps drain_timeout_ms to 10s, and share
+        // that single deadline across the remaining backlog and final stall.
+        {
+            let pool = XudpPool::new(1, 4);
+            let (entered0_tx, entered0_rx) = oneshot::channel();
+            let (gate0_tx, gate0_rx) = oneshot::channel();
+            let (entered2_tx, entered2_rx) = oneshot::channel();
+            let (gate2_tx, gate2_rx) = oneshot::channel();
+            let (entered3_tx, entered3_rx) = oneshot::channel();
+            let (drop_tx, mut drop_rx) = oneshot::channel();
+            let writes_completed = Arc::new(AtomicUsize::new(0));
+            let timeout_slot: Arc<Mutex<Option<Arc<AtomicU64>>>> = Arc::new(Mutex::new(None));
+            let bump_timeout = timeout_slot.clone();
+
+            let stream = Arc::new(Mutex::new(Some(AnyStream::Dynamic(Box::new(
+                ScriptedDrainWriter {
+                    steps: VecDeque::from([
+                        WriteStep::Gated {
+                            entered: Some(entered0_tx),
+                            release: gate0_rx,
+                            on_write: Some(Box::new(move || {
+                                if let Some(ms) = bump_timeout.lock().as_ref() {
+                                    ms.store(10_000, Ordering::Relaxed);
+                                }
+                            })),
+                            on_flush: None,
+                        },
+                        WriteStep::Ready { on_write: None },
+                        WriteStep::Gated {
+                            entered: Some(entered2_tx),
+                            release: gate2_rx,
+                            on_write: None,
+                            on_flush: None,
+                        },
+                        WriteStep::Stall { entered: Some(entered3_tx) },
+                    ]),
+                    pending_flush_hook: None,
+                    writes_completed: writes_completed.clone(),
+                    dropped: Some(drop_tx),
+                },
+            )))));
+
+            let child = pool
+                .open_stream(&target, || {
+                    let stream = stream.clone();
+                    async move { Ok(stream.lock().take().unwrap()) }
+                })
+                .await
+                .unwrap();
+            let carrier = pool.carriers_for_test()[0].clone();
+            carrier.set_drain_timeout_for_test(Duration::from_millis(100));
+            *timeout_slot.lock() = Some(carrier.drain_timeout_ms.clone());
+
+            carrier.writer_tx.send(batch_frame.clone()).await.unwrap();
+            entered0_rx.await.unwrap();
+
+            for _ in 0..3 {
+                carrier.writer_tx.try_send(batch_frame.clone()).unwrap();
+            }
+            drop(carrier);
+
+            let t0 = Instant::now();
+            pool.set_keep_idle(false);
+            drop(child);
+            let _ = gate0_tx.send(());
+
+            entered2_rx.await.unwrap();
+            assert_eq!(Instant::now(), t0);
+
+            advance(Duration::from_millis(60)).await;
+            yield_now().await;
+            assert!(drop_rx.try_recv().is_err(), "carrier must not time out at 60ms");
+
+            let _ = gate2_tx.send(());
+            entered3_rx.await.unwrap();
+
+            advance(Duration::from_millis(35)).await;
+            yield_now().await;
+            assert!(drop_rx.try_recv().is_err(), "carrier must still respect 100ms deadline at 95ms");
+
+            advance(Duration::from_millis(10)).await;
+            timeout(Duration::from_millis(1), &mut drop_rx)
+                .await
+                .expect("write-branch drain must expire at the original 100ms deadline")
+                .unwrap();
+            assert_eq!(writes_completed.load(Ordering::SeqCst), 3);
+        }
+
+        // Case 2: drain arrives during step 0 flush while a ready backlog is
+        // already queued, so the next select! is the recv branch. The recv
+        // select! must poll drain_rx before rx.recv(), locking the 100ms
+        // deadline before step 1 bumps drain_timeout_ms to 10s.
+        {
+            let pool = XudpPool::new(1, 4);
+            let (entered0_tx, entered0_rx) = oneshot::channel();
+            let (gate0_tx, gate0_rx) = oneshot::channel();
+            let (entered2_tx, entered2_rx) = oneshot::channel();
+            let (gate2_tx, gate2_rx) = oneshot::channel();
+            let (entered3_tx, entered3_rx) = oneshot::channel();
+            let (drop_tx, mut drop_rx) = oneshot::channel();
+            let writes_completed = Arc::new(AtomicUsize::new(0));
+            let timeout_slot: Arc<Mutex<Option<Arc<AtomicU64>>>> = Arc::new(Mutex::new(None));
+            let bump_timeout = timeout_slot.clone();
+            let child_slot: Arc<Mutex<Option<XudpChildDatagram>>> = Arc::new(Mutex::new(None));
+            let drop_child = child_slot.clone();
+            let pool_for_flush = pool.clone();
+
+            let stream = Arc::new(Mutex::new(Some(AnyStream::Dynamic(Box::new(
+                ScriptedDrainWriter {
+                    steps: VecDeque::from([
+                        WriteStep::Gated {
+                            entered: Some(entered0_tx),
+                            release: gate0_rx,
+                            on_write: None,
+                            on_flush: Some(Box::new(move || {
+                                pool_for_flush.set_keep_idle(false);
+                                drop(drop_child.lock().take());
+                            })),
+                        },
+                        WriteStep::Ready {
+                            on_write: Some(Box::new(move || {
+                                if let Some(ms) = bump_timeout.lock().as_ref() {
+                                    ms.store(10_000, Ordering::Relaxed);
+                                }
+                            })),
+                        },
+                        WriteStep::Gated {
+                            entered: Some(entered2_tx),
+                            release: gate2_rx,
+                            on_write: None,
+                            on_flush: None,
+                        },
+                        WriteStep::Stall { entered: Some(entered3_tx) },
+                    ]),
+                    pending_flush_hook: None,
+                    writes_completed: writes_completed.clone(),
+                    dropped: Some(drop_tx),
+                },
+            )))));
+
+            let child = pool
+                .open_stream(&target, || {
+                    let stream = stream.clone();
+                    async move { Ok(stream.lock().take().unwrap()) }
+                })
+                .await
+                .unwrap();
+            let carrier = pool.carriers_for_test()[0].clone();
+            carrier.set_drain_timeout_for_test(Duration::from_millis(100));
+            *timeout_slot.lock() = Some(carrier.drain_timeout_ms.clone());
+
+            carrier.writer_tx.send(batch_frame.clone()).await.unwrap();
+            entered0_rx.await.unwrap();
+
+            for _ in 0..3 {
+                carrier.writer_tx.try_send(batch_frame.clone()).unwrap();
+            }
+            drop(carrier);
+            *child_slot.lock() = Some(child);
+
+            let t0 = Instant::now();
+            let _ = gate0_tx.send(());
+
+            entered2_rx.await.unwrap();
+            assert_eq!(Instant::now(), t0);
+
+            advance(Duration::from_millis(60)).await;
+            yield_now().await;
+            assert!(drop_rx.try_recv().is_err(), "carrier must not time out at 60ms");
+
+            let _ = gate2_tx.send(());
+            entered3_rx.await.unwrap();
+
+            advance(Duration::from_millis(35)).await;
+            yield_now().await;
+            assert!(drop_rx.try_recv().is_err(), "carrier must still respect 100ms deadline at 95ms");
+
+            advance(Duration::from_millis(10)).await;
+            timeout(Duration::from_millis(1), &mut drop_rx)
+                .await
+                .expect("recv-branch drain must expire at the original 100ms deadline")
+                .unwrap();
+            assert_eq!(writes_completed.load(Ordering::SeqCst), 3);
+        }
     }
 }

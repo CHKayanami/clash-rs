@@ -319,6 +319,26 @@ impl OutboundHandler for Handler {
         Ok(AnyOutboundDatagram::new(child_dgram))
     }
 
+    fn set_keep_idle(&self, keep: bool) {
+        if let Some(mux) = &self.mux_pool {
+            mux.set_keep_idle(keep);
+        }
+        self.xudp_pool.set_keep_idle(keep);
+        if let Some(transport) = &self.opts.transport {
+            transport.set_keep_idle(keep);
+        }
+    }
+
+    fn close_idle_connections(&self) {
+        if let Some(mux) = &self.mux_pool {
+            mux.close_idle_connections();
+        }
+        self.xudp_pool.close_idle_connections();
+        if let Some(transport) = &self.opts.transport {
+            transport.close_idle_connections();
+        }
+    }
+
 }
 
 impl PlainProxyAPIResponse for Handler {

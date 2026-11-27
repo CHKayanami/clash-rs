@@ -2,7 +2,7 @@ use std::{io, pin::Pin, task::{Context, Poll}};
 
 use futures::{Sink, SinkExt, Stream};
 use tokio::sync::mpsc::Receiver;
-use tokio_util::sync::PollSender;
+use tokio_util::sync::{CancellationToken, PollSender};
 
 use crate::{
     common::errors::new_io_error,
@@ -21,6 +21,7 @@ pub struct UdpSessionWrapper {
     pub src_addr: SocksAddr, /* source address of local socket, bound during
                               * associate task
                               * started */
+    pub close_upload: CancellationToken,
 }
 impl Sink<UdpPacket> for UdpSessionWrapper {
     type Error = io::Error;
@@ -51,7 +52,9 @@ impl Sink<UdpPacket> for UdpSessionWrapper {
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Result<(), Self::Error>> {
-        self.get_mut().s.poll_close_unpin(cx).map_err(new_io_error)
+        let this = self.get_mut();
+        this.close_upload.cancel();
+        this.s.poll_close_unpin(cx).map_err(new_io_error)
     }
 }
 

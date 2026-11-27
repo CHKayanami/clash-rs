@@ -82,8 +82,8 @@ impl Drop for ConnectionLease {
 
 pub(super) struct Reply {
     future: ResponseFuture,
-    lease: ConnectionLease,
     upload: Option<UploadTask>,
+    lease: ConnectionLease,
 }
 
 impl Reply {
@@ -102,7 +102,7 @@ impl Reply {
             return Err(io::Error::new(io::ErrorKind::ConnectionRefused,
                 format!("XHTTP server returned {}", response.status())));
         }
-        Ok(ResponseBody { body: response.into_body(), _lease: self.lease, _upload: self.upload })
+        Ok(ResponseBody { body: response.into_body(), _upload: self.upload, _lease: self.lease })
     }
 }
 
@@ -213,7 +213,7 @@ impl HttpTransport {
             }
             let (future, upload) = sender.send(request.take().expect("undispatched XHTTP request")(lease.connection.version)?)?;
             drop(sender);
-            return Ok(Reply { future, lease, upload });
+            return Ok(Reply { future, upload, lease });
         }
         unreachable!()
     }

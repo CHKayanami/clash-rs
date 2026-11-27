@@ -118,4 +118,16 @@ impl TransportLayer {
             other => Ok((other.wrap(stream).await?, None)),
         }
     }
+
+    pub fn set_keep_idle(&self, keep: bool) {
+        if let Self::XHttp(client) = self {
+            client.set_keep_idle(keep);
+        }
+    }
+
+    pub fn close_idle_connections(&self) {
+        if let Self::XHttp(client) = self {
+            client.close_idle_connections();
+        }
+    }
 }

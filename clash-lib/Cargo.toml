@@ -214,8 +214,8 @@ dirs = { version = "7.0", optional = true }
 totp-rs = { version = "6.0", features = ["serde"], optional = true }
 
 # shadowquic
-quinn-jls = { version = "0.3.8", optional = true, default-features = false, features = ["runtime-tokio"] }
-quinn-proto-jls = { version = "0.3.8", optional = true, default-features = false }
+quinn-jls = { version = "0.4.0", optional = true, default-features = false, features = ["runtime-tokio"] }
+quinn-proto-jls = { version = "0.4.0", optional = true, default-features = false }
 brutal-core = { version = "0.1", optional = true }
 
 # experimental
