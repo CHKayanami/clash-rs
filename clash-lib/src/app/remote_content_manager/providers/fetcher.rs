@@ -1,5 +1,5 @@
 use std::{
-    fs::{self, metadata},
+    fs::{self, FileTimes, metadata},
     path::Path,
     sync::{Arc, atomic::{AtomicBool, Ordering}},
     time::{Duration, SystemTime},
@@ -207,7 +207,10 @@ where
 
         if hash == this.hash {
             this.updated_at = now;
-            filetime::set_file_times(vehicle.path(), now.into(), now.into())?;
+            fs::File::options()
+                .write(true)
+                .open(vehicle.path())?
+                .set_times(FileTimes::new().set_accessed(now).set_modified(now))?;
             return Ok((proxies, true));
         }
 
@@ -330,6 +333,7 @@ where
 #[cfg(test)]
 mod tests {
     use std::{
+        fs::{File, FileTimes},
         path::Path,
         sync::Arc,
         time::{Duration, SystemTime},
@@ -585,7 +589,15 @@ mod tests {
 
         // Set modification time 1 hour into the future
         let future_time = SystemTime::now() + Duration::from_secs(3600);
-        filetime::set_file_times(&mock_file, future_time.into(), future_time.into())
+        File::options()
+            .write(true)
+            .open(&mock_file)
+            .unwrap()
+            .set_times(
+                FileTimes::new()
+                    .set_accessed(future_time)
+                    .set_modified(future_time),
+            )
             .unwrap();
 
         mock_vehicle.expect_path().return_const(mock_path_str.clone());

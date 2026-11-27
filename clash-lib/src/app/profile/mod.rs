@@ -6,7 +6,9 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
+use redb::{
+    CompactionMode, Database, ReadableDatabase, ReadableTable, TableDefinition,
+};
 use tracing::{debug, info, warn};
 
 const TABLE_SELECTED: TableDefinition<&str, &str> = TableDefinition::new("selected");
@@ -70,7 +72,7 @@ impl ThreadSafeCacheFile {
 
         // 启动时整理压缩数据库以回收碎片和空闲空间
         let size_before = fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-        match db.compact() {
+        match db.compact(CompactionMode::Balanced) {
             Ok(true) => {
                 let size_after = fs::metadata(path).map(|m| m.len()).unwrap_or(0);
                 info!(
