@@ -1,21 +1,17 @@
 use crate::{
     app::{dns::ThreadSafeDNSResolver, net::get_default_outbound_interface},
-    proxy::{
-        datagram::UdpPacket,
-        utils::{
-            new_udp_socket,
-            quic_stream::{
-                QUIC_HALF_CLOSED_DRAIN_GRACE, QUIC_STREAM_DRAIN_TIMEOUT,
-                QuicStreamLease, QuicUploadGrace, close_after_grace,
-            },
+    proxy::utils::{
+        new_udp_socket,
+        quic_stream::{
+            QUIC_HALF_CLOSED_DRAIN_GRACE, QUIC_STREAM_DRAIN_TIMEOUT,
+            QuicStreamLease, QuicUploadGrace, UdpSessionTable, close_after_grace,
         },
     },
-    session::SocksAddr as ClashSocksAddr,
 };
 use anyhow::{Result, anyhow};
 use arc_swap::ArcSwapOption;
+use parking_lot::RwLock;
 use std::{
-    collections::HashMap,
     net::{IpAddr, SocketAddr},
     sync::{
         Arc, Weak,
@@ -23,12 +19,11 @@ use std::{
     },
     time::Duration,
 };
-use tokio::runtime::Handle;
+use tokio::{runtime::Handle, sync::mpsc::Sender};
 use tracing::debug;
 use uuid::Uuid;
 
-use super::proto::Address;
-use super::proto::fragment::FragmentReassembler;
+use super::proto::{Address, ParsedPacket};
 
 pub struct TuicEndpoint {
     pub ep: quinn::Endpoint,
@@ -138,9 +133,10 @@ pub struct TuicConnection {
     pub uuid: Uuid,
     pub password: Arc<[u8]>,
     pub udp_relay_mode: UdpRelayMode,
-    pub udp_sessions: Arc<parking_lot::RwLock<HashMap<u16, UdpSession>>>,
+    pub(crate) udp_sessions: Arc<RwLock<UdpSessionTable<u16, ParsedPacket>>>,
     pub next_pkt_id: AtomicU16,
-    pub fragments: parking_lot::Mutex<FragmentReassembler>,
+    pub gc_interval: Duration,
+    pub gc_lifetime: Duration,
     active_streams: AtomicUsize,
     keep_idle: Arc<AtomicBool>,
     /// Set once evicted or retired (e.g. handler dropped on provider refresh or
@@ -150,11 +146,6 @@ pub struct TuicConnection {
     runtime: Handle,
     drain_timeout_ms: AtomicU64,
     cache_slot: Weak<ArcSwapOption<TuicConnection>>,
-}
-
-pub struct UdpSession {
-    pub incoming: tokio::sync::mpsc::Sender<UdpPacket>,
-    pub local_addr: ClashSocksAddr,
 }
 
 impl TuicConnection {
@@ -276,9 +267,10 @@ impl TuicConnection {
             uuid,
             password,
             udp_relay_mode,
-            udp_sessions: Arc::new(parking_lot::RwLock::new(HashMap::new())),
+            udp_sessions: Arc::new(RwLock::new(UdpSessionTable::default())),
             next_pkt_id: AtomicU16::new(0),
-            fragments: parking_lot::Mutex::new(FragmentReassembler::default()),
+            gc_interval,
+            gc_lifetime,
             active_streams: AtomicUsize::new(0),
             keep_idle,
             evicted: AtomicBool::new(false),
@@ -290,31 +282,33 @@ impl TuicConnection {
             cache_slot,
         };
         let conn = Arc::new(conn);
-        tokio::spawn(conn.clone().init(
-            zero_rtt_accepted,
-            heartbeat,
-            gc_interval,
-            gc_lifetime,
-        ));
+        tokio::spawn(conn.clone().init(zero_rtt_accepted, heartbeat));
 
         conn
+    }
+
+    pub(super) fn register_udp_session(
+        &self,
+        assoc_id: u16,
+        tx: Sender<ParsedPacket>,
+    ) -> bool {
+        let mut sessions = self.udp_sessions.write();
+        if self.conn.close_reason().is_some() {
+            sessions.close();
+            return false;
+        }
+        sessions.insert(assoc_id, tx)
     }
 
     async fn init(
         self: Arc<Self>,
         zero_rtt_accepted: Option<quinn::ZeroRttAccepted>,
         heartbeat: Duration,
-        gc_interval: Duration,
-        gc_lifetime: Duration,
     ) {
         tracing::info!("connection established");
 
         tokio::spawn(self.clone().tuic_auth(zero_rtt_accepted));
-        tokio::spawn(self.clone().cyclical_tasks(
-            heartbeat,
-            gc_interval,
-            gc_lifetime,
-        ));
+        tokio::spawn(self.clone().cyclical_tasks(heartbeat));
 
         let err = loop {
             tokio::select! {
@@ -327,12 +321,13 @@ impl TuicConnection {
                     Err(err) => break err,
                 },
                 res = self.accept_datagram() => match res {
-                    Ok(dg) => self.handle_datagram(dg).await,
+                    Ok(dg) => self.handle_datagram(dg),
                     Err(err) => break err,
                 },
             };
         };
 
+        self.udp_sessions.write().close();
         tracing::warn!("connection error: {err:?}");
     }
 
@@ -347,14 +342,32 @@ impl TuicConnection {
         udp_relay_mode: UdpRelayMode,
         next_pkt_id: u16,
     ) -> Arc<Self> {
+        Self::new_for_test_with_gc(
+            conn,
+            udp_relay_mode,
+            next_pkt_id,
+            Duration::from_secs(10),
+            Duration::from_secs(10),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_for_test_with_gc(
+        conn: quinn::Connection,
+        udp_relay_mode: UdpRelayMode,
+        next_pkt_id: u16,
+        gc_interval: Duration,
+        gc_lifetime: Duration,
+    ) -> Arc<Self> {
         Arc::new(Self {
             conn,
             uuid: Uuid::nil(),
             password: Arc::from([]),
             udp_relay_mode,
-            udp_sessions: Arc::new(parking_lot::RwLock::new(HashMap::new())),
+            udp_sessions: Arc::new(RwLock::new(UdpSessionTable::default())),
             next_pkt_id: AtomicU16::new(next_pkt_id),
-            fragments: parking_lot::Mutex::new(FragmentReassembler::default()),
+            gc_interval,
+            gc_lifetime,
             active_streams: AtomicUsize::new(0),
             keep_idle: Arc::new(AtomicBool::new(true)),
             evicted: AtomicBool::new(false),

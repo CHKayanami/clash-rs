@@ -178,3 +178,81 @@ async fn keep_idle_switch_after_upload_ack_respects_grace_window() {
     remote.close(0_u32.into(), b"done");
     server.close(0_u32.into(), b"done");
 }
+
+#[tokio::test]
+async fn connection_close_clears_udp_sessions_and_wakes_receiver() {
+    use futures::StreamExt;
+    use crate::session::SocksAddr;
+    use super::TuicDatagramOutbound;
+
+    let (server, _) = quic_test_support::server(b"tuic");
+    let handler = Handler::new(options(server.local_addr().unwrap().port()));
+    let resolver: ThreadSafeDNSResolver = Arc::new(NoopResolver);
+    let session = Session::default();
+
+    let (conn_res, remote) = tokio::join!(
+        handler.get_conn(&resolver, &session),
+        async { server.accept().await.unwrap().await.unwrap() },
+    );
+    let (conn, lease) = conn_res.unwrap();
+    let mut udp = TuicDatagramOutbound::new_with_lease(
+        42,
+        conn.clone(),
+        SocksAddr::any_ipv4(),
+        Some(lease),
+    );
+    assert!(conn.udp_sessions.read().contains_key(&42));
+
+    // Closing the peer ends `TuicConnection::init`, which must clear
+    // `udp_sessions` so waiting receivers observe `None` immediately.
+    remote.close(0_u32.into(), b"peer closed");
+    let next = tokio::time::timeout(Duration::from_secs(2), udp.next())
+        .await
+        .expect("TUIC UDP receiver must wake promptly when connection closes");
+    assert!(next.is_none());
+    assert!(conn.udp_sessions.read().is_empty());
+
+    server.close(0_u32.into(), b"done");
+}
+
+#[tokio::test]
+async fn register_udp_after_connection_close_wakes_with_none() {
+    use futures::StreamExt;
+    use crate::session::SocksAddr;
+    use super::TuicDatagramOutbound;
+
+    let (server, _) = quic_test_support::server(b"tuic");
+    let handler = Handler::new(options(server.local_addr().unwrap().port()));
+    let resolver: ThreadSafeDNSResolver = Arc::new(NoopResolver);
+    let session = Session::default();
+
+    let (conn_res, remote) = tokio::join!(
+        handler.get_conn(&resolver, &session),
+        async { server.accept().await.unwrap().await.unwrap() },
+    );
+    let (conn, lease) = conn_res.unwrap();
+
+    // Connection closes and `TuicConnection::init` exits BEFORE registering UDP.
+    remote.close(0_u32.into(), b"peer closed");
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !conn.udp_sessions.read().is_closed() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("TuicConnection::init must close udp_sessions after peer close");
+
+    let mut udp = TuicDatagramOutbound::new_with_lease(
+        43,
+        conn.clone(),
+        SocksAddr::any_ipv4(),
+        Some(lease),
+    );
+    let next = tokio::time::timeout(Duration::from_secs(2), udp.next())
+        .await
+        .expect("TUIC UDP registered after close must return None immediately");
+    assert!(next.is_none());
+    assert!(conn.udp_sessions.read().is_empty());
+
+    server.close(0_u32.into(), b"done");
+}

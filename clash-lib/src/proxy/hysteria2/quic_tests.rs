@@ -7,7 +7,7 @@ use std::{
     time::Duration,
 };
 
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use futures::{SinkExt, StreamExt, future::poll_fn};
 use parking_lot::Mutex;
 use quinn::{Connection, Endpoint};
@@ -22,7 +22,7 @@ use crate::{
             codec::{Defragger, HysUdpPacket},
             datagram::HysteriaDatagramOutbound,
         },
-        utils::quic_stream::QuicUploadGrace,
+        utils::quic_stream::{QuicUploadGrace, UdpSessionTable},
     },
     session::SocksAddr,
 };
@@ -67,7 +67,7 @@ async fn hysteria_native_batch_roundtrip_and_close() {
         while received.len() < MAX_BATCH_PACKETS {
             let wire = peer.read_datagram().await.unwrap();
             peer.send_datagram(wire.clone()).unwrap();
-            let packet = HysUdpPacket::decode(&mut BytesMut::from(wire.as_ref())).unwrap();
+            let packet = HysUdpPacket::decode(wire).unwrap();
             assert_eq!(packet.session_id, 7);
             if let Some(packet) = defragger.feed(packet) {
                 received.insert(packet.pkt_id, packet);
@@ -100,7 +100,7 @@ async fn hysteria_native_batch_validation_preserves_prefix_and_suffix() {
     let conn = Arc::new(HysteriaConnection {
         conn: Arc::new(raw),
         _preface: None,
-        udp_sessions: Arc::new(Mutex::new(HashMap::new())),
+        udp_sessions: Arc::new(Mutex::new(UdpSessionTable::default())),
         active_streams: AtomicUsize::new(0),
         keep_idle: Arc::new(AtomicBool::new(true)),
         evicted: AtomicBool::new(false),
@@ -128,7 +128,7 @@ async fn hysteria_native_batch_validation_preserves_prefix_and_suffix() {
     assert_eq!(batch.len(), 3);
     assert!(conn.udp_sessions.lock().contains_key(&10));
     let wire = timeout(Duration::from_secs(5), peer.read_datagram()).await.unwrap().unwrap();
-    let sent = HysUdpPacket::decode(&mut BytesMut::from(wire.as_ref())).unwrap();
+    let sent = HysUdpPacket::decode(wire).unwrap();
     assert_eq!(sent.addr, packet.dst_addr);
     assert!(sent.data.is_empty());
     batch.complete(); // Successful prefix.
@@ -137,7 +137,7 @@ async fn hysteria_native_batch_validation_preserves_prefix_and_suffix() {
     assert_eq!(result.sent, 1);
     assert!(!result.fatal && result.error.is_none());
     let wire = timeout(Duration::from_secs(5), peer.read_datagram()).await.unwrap().unwrap();
-    let sent = HysUdpPacket::decode(&mut BytesMut::from(wire.as_ref())).unwrap();
+    let sent = HysUdpPacket::decode(wire).unwrap();
     assert_eq!(sent.addr, packet.dst_addr);
 }
 
@@ -147,7 +147,7 @@ async fn hysteria_native_send_failure_removes_session() {
     let conn = Arc::new(HysteriaConnection {
         conn: Arc::new(raw),
         _preface: None,
-        udp_sessions: Arc::new(Mutex::new(HashMap::new())),
+        udp_sessions: Arc::new(Mutex::new(UdpSessionTable::default())),
         active_streams: AtomicUsize::new(0),
         keep_idle: Arc::new(AtomicBool::new(true)),
         evicted: AtomicBool::new(false),
@@ -164,6 +164,174 @@ async fn hysteria_native_send_failure_removes_session() {
     assert!(result.fatal && result.error.is_some());
     assert!(!conn.udp_sessions.lock().contains_key(&9));
     assert_eq!(batch.len(), MAX_BATCH_PACKETS);
+}
+
+#[tokio::test]
+async fn hysteria_connection_close_clears_udp_sessions_and_wakes_receiver() {
+    let (_client, _server, raw, peer) = pair().await;
+    let conn = HysteriaConnection::new_with_task_loop(Arc::new(raw), Some(1200));
+    let mut udp = HysteriaDatagramOutbound::new(21, conn.clone(), SocksAddr::any_ipv4());
+    assert!(conn.udp_sessions.lock().contains_key(&21));
+
+    // Closing the peer terminates `spawn_tasks`, which must clear `udp_sessions`
+    // so an idle receiver wakes immediately with `None` instead of hanging.
+    peer.close(0u32.into(), b"peer gone");
+    let next = timeout(Duration::from_secs(2), udp.next())
+        .await
+        .expect("UDP receiver must wake promptly when QUIC connection closes");
+    assert!(next.is_none());
+    assert!(conn.udp_sessions.lock().is_empty());
+}
+
+#[tokio::test]
+async fn hysteria_register_udp_after_connection_close_wakes_with_none() {
+    let (_client, _server, raw, peer) = pair().await;
+    let conn = HysteriaConnection::new_with_task_loop(Arc::new(raw), Some(1200));
+    let lease = conn.try_acquire_lease().unwrap();
+
+    // Connection closes and receive loop exits BEFORE the UDP session registers.
+    peer.close(0u32.into(), b"peer gone");
+    timeout(Duration::from_secs(2), async {
+        while !conn.udp_sessions.lock().is_closed() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("spawn_tasks must mark udp_sessions closed after peer close");
+
+    let mut udp = HysteriaDatagramOutbound::new_with_lease(
+        22,
+        conn.clone(),
+        SocksAddr::any_ipv4(),
+        Some(lease),
+    );
+    let next = timeout(Duration::from_secs(2), udp.next())
+        .await
+        .expect("UDP registered after connection close must return None immediately");
+    assert!(next.is_none());
+    assert!(conn.udp_sessions.lock().is_empty());
+}
+
+#[tokio::test]
+async fn hysteria_defragger_evicts_oldest_partial_packet_after_queue_drain() {
+    use futures::FutureExt;
+    use crate::proxy::hysteria2::codec::Fragments;
+
+    let (_client, _server, raw, _peer) = pair().await;
+    let conn = Arc::new(HysteriaConnection {
+        conn: Arc::new(raw),
+        _preface: None,
+        udp_sessions: Arc::new(Mutex::new(UdpSessionTable::default())),
+        active_streams: AtomicUsize::new(0),
+        keep_idle: Arc::new(AtomicBool::new(true)),
+        evicted: AtomicBool::new(false),
+        upload_grace: QuicUploadGrace::default(),
+        runtime: Handle::current(),
+        cache_slot: Weak::new(),
+        udp_mtu: Some(1200),
+    });
+    let mut udp = HysteriaDatagramOutbound::new(25, conn.clone(), SocksAddr::any_ipv4());
+    let addr = SocksAddr::Domain("frag.test".into(), 443);
+    let partial_payload = vec![0x11u8; 1500];
+
+    // Enqueue 64 distinct first fragments whose trailing fragments were lost
+    // (e.g. during a queue overflow), then drain the receive queue so all 64
+    // defrag slots are occupied by incomplete packets.
+    for pkt_id in 0u16..64 {
+        let mut frags =
+            Fragments::new(25, pkt_id, &addr, 1200, &partial_payload).unwrap();
+        assert_eq!(frags.len(), 2);
+        conn.recv_packet(frags.next().unwrap());
+    }
+    assert!(udp.next().now_or_never().is_none());
+
+    // Immediately deliver a fresh 2-fragment packet whose fragments all arrive:
+    // the defragger must evict the oldest partial entry and reassemble at once
+    // without waiting 5s for DEFRAG_MAX_AGE.
+    let fresh_payload = vec![0x7au8; 1500];
+    let fresh_frags: Vec<Bytes> =
+        Fragments::new(25, 100, &addr, 1200, &fresh_payload)
+            .unwrap()
+            .collect();
+    assert_eq!(fresh_frags.len(), 2);
+    for frame in fresh_frags {
+        conn.recv_packet(frame);
+    }
+
+    let packet = timeout(Duration::from_secs(1), udp.next())
+        .await
+        .expect("fresh fragmented packet must reassemble immediately after drain")
+        .unwrap();
+    assert_eq!(packet.data.as_ref(), fresh_payload.as_slice());
+    assert_eq!(packet.src_addr, addr);
+}
+
+#[tokio::test]
+async fn hysteria_recv_packet_detaches_payload_from_shared_slab() {
+    use crate::proxy::hysteria2::codec::Fragments;
+    use tokio::sync::mpsc;
+
+    let (_client, _server, raw, _peer) = pair().await;
+    let conn = Arc::new(HysteriaConnection {
+        conn: Arc::new(raw),
+        _preface: None,
+        udp_sessions: Arc::new(Mutex::new(UdpSessionTable::default())),
+        active_streams: AtomicUsize::new(0),
+        keep_idle: Arc::new(AtomicBool::new(true)),
+        evicted: AtomicBool::new(false),
+        upload_grace: QuicUploadGrace::default(),
+        runtime: Handle::current(),
+        cache_slot: Weak::new(),
+        udp_mtu: None,
+    });
+
+    let (tx, mut rx) = mpsc::channel(1);
+    assert!(conn.udp_sessions.lock().insert(31, tx));
+
+    let addr = SocksAddr::Ip("127.0.0.1:5353".parse().unwrap());
+    let payload = b"gro-detached-payload-1";
+    let encoded = Fragments::new(31, 1, &addr, 1200, payload.as_slice())
+        .unwrap()
+        .next()
+        .unwrap();
+
+    // Simulate a Quinn GRO datagram sliced out of a larger shared receive slab.
+    let mut backing = Vec::with_capacity(encoded.len() + 4096);
+    backing.extend_from_slice(&encoded);
+    backing.resize(encoded.len() + 4096, 0xaa);
+    let slab = Bytes::from(backing);
+    let wire = slab.slice(..encoded.len());
+    assert!(!slab.is_unique());
+
+    conn.recv_packet(wire);
+    assert!(
+        slab.is_unique(),
+        "queued packet must not retain a reference to the shared receive slab"
+    );
+
+    // When the session queue is full, `recv_packet` drops the second packet
+    // while keeping the first queued packet and releasing the shared slab.
+    let payload2 = b"gro-dropped-payload-2";
+    let encoded2 = Fragments::new(31, 2, &addr, 1200, payload2.as_slice())
+        .unwrap()
+        .next()
+        .unwrap();
+    let mut backing2 = Vec::with_capacity(encoded2.len() + 4096);
+    backing2.extend_from_slice(&encoded2);
+    backing2.resize(encoded2.len() + 4096, 0xbb);
+    let slab2 = Bytes::from(backing2);
+    let wire2 = slab2.slice(..encoded2.len());
+    assert!(!slab2.is_unique());
+
+    conn.recv_packet(wire2);
+    assert!(slab2.is_unique());
+
+    let queued = rx.try_recv().unwrap();
+    assert_eq!(queued.session_id, 31);
+    assert_eq!(queued.pkt_id, 1);
+    assert_eq!(queued.addr, addr);
+    assert_eq!(queued.data.as_ref(), payload);
+    assert!(rx.try_recv().is_err());
 }
 
 #[cfg(feature = "tuic")]
@@ -202,7 +370,7 @@ mod tuic {
                 if let Some(complete) = fragments.accept(packet) {
                     received.insert(id, complete);
                 }
-                conn.handle_datagram(wire).await;
+                conn.handle_datagram(wire);
             }
             for (i, expected) in batch.packets().enumerate() {
                 let (addr, data) = &received[&u16::MAX.wrapping_add(i as u16)];
@@ -483,5 +651,153 @@ mod tuic {
         })
         .await
         .expect("teardown must drain even when keep_idle flips during cleanup");
+    }
+
+    #[tokio::test]
+    async fn native_handle_datagram_drops_when_full_without_blocking() {
+        use crate::proxy::tuic::proto::{Address, encode_single_packet};
+        use std::net::Ipv4Addr;
+
+        let (_client, _server, raw, _peer) = pair().await;
+        let conn = connection(raw, UdpRelayMode::Native);
+        let mut udp =
+            TuicDatagramOutbound::new(22, conn.clone(), SocksAddr::any_ipv4());
+
+        let addr = Address::IPv4(Ipv4Addr::LOCALHOST, 5353);
+        // Push more datagrams than the 256-slot session queue without reading;
+        // synchronous `handle_datagram` must never block and must preserve the
+        // first 256 queued packets.
+        for pkt_id in 0u16..300 {
+            let wire = encode_single_packet(
+                22,
+                pkt_id,
+                &addr,
+                &pkt_id.to_be_bytes(),
+            )
+            .unwrap();
+            conn.handle_datagram(wire);
+        }
+
+        for pkt_id in 0u16..256 {
+            let pkt = timeout(Duration::from_secs(2), udp.next())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(pkt.data.as_ref(), &pkt_id.to_be_bytes());
+        }
+        assert!(udp.next().now_or_never().is_none());
+    }
+
+    #[tokio::test]
+    async fn native_gc_interval_expires_stale_fragments_while_idle_and_stops_timer() {
+        use crate::proxy::tuic::proto::{
+            Address, encode_single_packet, packet_fragments,
+        };
+        use std::net::Ipv4Addr;
+
+        let (_client, _server, raw, _peer) = pair().await;
+        let conn = TuicConnection::new_for_test_with_gc(
+            raw,
+            UdpRelayMode::Native,
+            0,
+            Duration::from_millis(30),
+            Duration::from_millis(60),
+        );
+        let mut udp =
+            TuicDatagramOutbound::new(23, conn.clone(), SocksAddr::any_ipv4());
+        assert!(!udp.has_gc_timer_for_test());
+
+        // Single-fragment packets never start the GC timer.
+        let addr = Address::IPv4(Ipv4Addr::LOCALHOST, 5353);
+        let small = encode_single_packet(23, 1, &addr, b"small").unwrap();
+        conn.handle_datagram(small);
+        let got = timeout(Duration::from_secs(2), udp.next())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.data.as_ref(), b"small");
+        assert!(!udp.has_pending_fragments_for_test());
+        assert!(!udp.has_gc_timer_for_test());
+        assert_eq!(udp.gc_timer_allocs_for_test(), 0);
+
+        // When all fragments of a packet are already queued together,
+        // `poll_next` completes reassembly without allocating a GC timer.
+        let big_payload = vec![0x5a; 1500];
+        let ready_frames: Vec<_> =
+            packet_fragments(23, 2, &addr, &big_payload, 1200)
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+        assert_eq!(ready_frames.len(), 2);
+        conn.handle_datagram(ready_frames[0].clone());
+        conn.handle_datagram(ready_frames[1].clone());
+        let reassembled = timeout(Duration::from_secs(2), udp.next())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(reassembled.data.as_ref(), big_payload.as_slice());
+        assert!(!udp.has_pending_fragments_for_test());
+        assert!(!udp.has_gc_timer_for_test());
+        assert_eq!(
+            udp.gc_timer_allocs_for_test(),
+            0,
+            "already-complete queued fragments must not allocate a GC timer"
+        );
+
+        // Feed only fragment 0 of a 2-fragment packet: timer arms on demand.
+        let frames: Vec<_> =
+            packet_fragments(23, 10, &addr, &big_payload, 1200)
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+        assert_eq!(frames.len(), 2);
+        conn.handle_datagram(frames[0].clone());
+        assert!(udp.next().now_or_never().is_none());
+        assert!(udp.has_pending_fragments_for_test());
+        assert!(udp.has_gc_timer_for_test());
+        assert_eq!(udp.gc_timer_allocs_for_test(), 1);
+
+        // While idle waiting for the next packet, the on-demand GC timer fires
+        // on `gc_interval`, expires the stale fragment after `gc_lifetime`, and
+        // disarms itself once the table becomes empty.
+        let _ = timeout(Duration::from_millis(200), udp.next()).await;
+        assert!(
+            !udp.has_pending_fragments_for_test(),
+            "stale fragment must expire while idle receiver waits"
+        );
+        assert!(
+            !udp.has_gc_timer_for_test(),
+            "GC timer must stop once pending fragment table becomes empty"
+        );
+
+        // Sending fragment 1 afterwards must not complete with the expired
+        // fragment 0.
+        conn.handle_datagram(frames[1].clone());
+        assert!(udp.next().now_or_never().is_none());
+
+        // Also verify expiry during continuous small-packet traffic (where the
+        // receiver keeps returning `Poll::Ready(Some(_))` without idling).
+        let frames2: Vec<_> =
+            packet_fragments(23, 11, &addr, &big_payload, 1200)
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+        conn.handle_datagram(frames2[0].clone());
+        assert!(udp.next().now_or_never().is_none());
+        assert!(udp.has_pending_fragments_for_test());
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let small2 = encode_single_packet(23, 12, &addr, b"small-2").unwrap();
+        conn.handle_datagram(small2);
+        let got2 = timeout(Duration::from_secs(2), udp.next())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got2.data.as_ref(), b"small-2");
+        assert!(
+            !udp.has_pending_fragments_for_test(),
+            "stale fragment must also expire during continuous small-packet traffic"
+        );
+        assert!(!udp.has_gc_timer_for_test());
     }
 }

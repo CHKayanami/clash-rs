@@ -25,6 +25,7 @@ use erased_serde::Serialize as ErasedSerialize;
 use std::{
     collections::HashMap,
     net::{Ipv4Addr, Ipv6Addr},
+    pin::Pin,
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicU16, Ordering},
@@ -50,13 +51,16 @@ use tokio::{
         Mutex as AsyncMutex, OnceCell,
         mpsc::{self, Receiver as MpscReceiver, error::TryRecvError},
     },
-    time::{Instant, sleep, sleep_until, timeout_at},
+    time::{Instant, Sleep, sleep, sleep_until, timeout_at},
 };
 use tokio_util::sync::{CancellationToken, PollSender};
 
-use self::types::{
-    CongestionControl, TUIC_HALF_CLOSED_DRAIN_GRACE, TuicConnection,
-    TuicStreamLease, UdpRelayMode, UdpSession,
+use self::{
+    proto::{ParsedPacket, fragment::FragmentReassembler},
+    types::{
+        CongestionControl, TUIC_HALF_CLOSED_DRAIN_GRACE, TuicConnection,
+        TuicStreamLease, UdpRelayMode,
+    },
 };
 
 use super::{
@@ -406,14 +410,22 @@ impl Handler {
     }
 }
 
+const UDP_SESSION_QUEUE_CAP: usize = 256;
+
 pub struct TuicDatagramOutbound {
     send_tx: Option<PollSender<UdpPacket>>,
     cancel: Option<CancellationToken>,
     conn: Arc<TuicConnection>,
     runtime: Handle,
     assoc_id: u16,
+    local_addr: ClashSocksAddr,
     closed: bool,
-    recv_rx: MpscReceiver<UdpPacket>,
+    fragments: FragmentReassembler,
+    gc_interval: Duration,
+    gc_timer: Option<Pin<Box<Sleep>>>,
+    #[cfg(test)]
+    gc_timer_allocs: usize,
+    recv_rx: MpscReceiver<ParsedPacket>,
     _lease: Option<TuicStreamLease>,
 }
 
@@ -434,15 +446,12 @@ impl TuicDatagramOutbound {
         local_addr: ClashSocksAddr,
         lease: Option<TuicStreamLease>,
     ) -> Self {
-        let (recv_tx, recv_rx) = mpsc::channel::<UdpPacket>(32);
-        conn.udp_sessions.write().insert(
-            assoc_id,
-            UdpSession {
-                incoming: recv_tx,
-                local_addr,
-            },
-        );
-        let (send_tx, cancel, outbound_lease) = if conn.udp_relay_mode == UdpRelayMode::Quic {
+        let (recv_tx, recv_rx) =
+            mpsc::channel::<ParsedPacket>(UDP_SESSION_QUEUE_CAP);
+        let registered = conn.register_udp_session(assoc_id, recv_tx);
+        let (send_tx, cancel, outbound_lease) = if !registered {
+            (None, None, None)
+        } else if conn.udp_relay_mode == UdpRelayMode::Quic {
             let (send_tx, send_rx) = mpsc::channel::<UdpPacket>(32);
             let cancel = CancellationToken::new();
             let task_cancel = cancel.clone();
@@ -568,13 +577,21 @@ impl TuicDatagramOutbound {
             (None, None, lease)
         };
 
+        let gc_interval = conn.gc_interval;
+        let fragments = FragmentReassembler::new(conn.gc_lifetime);
         Self {
             send_tx,
             cancel,
             conn,
             runtime: Handle::current(),
             assoc_id,
-            closed: false,
+            local_addr,
+            closed: !registered,
+            fragments,
+            gc_interval,
+            gc_timer: None,
+            #[cfg(test)]
+            gc_timer_allocs: 0,
             recv_rx,
             _lease: outbound_lease,
         }

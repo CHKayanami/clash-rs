@@ -7,6 +7,7 @@ use std::{
 };
 
 use futures::{Sink, Stream};
+use tokio::sync::mpsc::{self, Receiver};
 
 use crate::{
     proxy::datagram::{
@@ -21,24 +22,16 @@ use super::{
     codec::{Defragger, HysUdpPacket},
 };
 
-pub struct UdpSession {
-    pub incoming: tokio::sync::mpsc::Sender<UdpPacket>,
-    pub local_addr: SocksAddr,
-    pub defragger: Defragger,
-}
-
-impl UdpSession {
-    pub fn feed(&mut self, pkt: HysUdpPacket) -> Option<HysUdpPacket> {
-        self.defragger.feed(pkt)
-    }
-}
+const UDP_SESSION_QUEUE_CAP: usize = 256;
 
 pub struct HysteriaDatagramOutbound {
     conn: Arc<HysteriaConnection>,
     session_id: u32,
+    local_addr: SocksAddr,
     next_pkt_id: u16,
     closed: bool,
-    recv_rx: tokio::sync::mpsc::Receiver<UdpPacket>,
+    defragger: Defragger,
+    recv_rx: Receiver<HysUdpPacket>,
     _lease: Option<HystStreamLease>,
 }
 
@@ -65,27 +58,23 @@ impl HysteriaDatagramOutbound {
             local_addr
         );
 
-        let (recv_tx, recv_rx) = tokio::sync::mpsc::channel::<UdpPacket>(32);
-        conn.udp_sessions.lock().insert(
-            session_id,
-            UdpSession {
-                incoming: recv_tx,
-                local_addr,
-                defragger: Defragger::default(),
-            },
-        );
+        let (recv_tx, recv_rx) = mpsc::channel::<HysUdpPacket>(UDP_SESSION_QUEUE_CAP);
+        let registered = conn.register_udp_session(session_id, recv_tx);
         tracing::trace!(
-            "HysteriaDatagramOutbound: UDP session {} registered",
-            session_id
+            "HysteriaDatagramOutbound: UDP session {} registered={}",
+            session_id,
+            registered
         );
 
         Self {
             conn,
             session_id,
+            local_addr,
             next_pkt_id: 0,
-            closed: false,
+            closed: !registered,
+            defragger: Defragger::default(),
             recv_rx,
-            _lease: lease,
+            _lease: registered.then_some(lease).flatten(),
         }
     }
 }
@@ -174,6 +163,22 @@ impl Stream for HysteriaDatagramOutbound {
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Self::Item>> {
-        self.recv_rx.poll_recv(cx)
+        let this = self.as_mut().get_mut();
+        loop {
+            match this.recv_rx.poll_recv(cx) {
+                Poll::Ready(Some(pkt)) => {
+                    if let Some(complete) = this.defragger.feed(pkt) {
+                        return Poll::Ready(Some(UdpPacket {
+                            data: complete.data,
+                            src_addr: complete.addr,
+                            dst_addr: this.local_addr.clone(),
+                            inbound_user: None,
+                        }));
+                    }
+                }
+                Poll::Ready(None) => return Poll::Ready(None),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
     }
 }

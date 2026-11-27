@@ -33,7 +33,7 @@ impl TuicConnection {
                 let bytes = Bytes::from(data);
                 match super::proto::decode_packet_frame(bytes) {
                     Ok(parsed) => {
-                        self.dispatch_packet(parsed, "quic").await;
+                        self.dispatch_stream_packet(parsed).await;
                     }
                     Err(err) => {
                         tracing::warn!(
@@ -60,7 +60,7 @@ impl TuicConnection {
         );
     }
 
-    pub async fn handle_datagram(&self, dg: Bytes) {
+    pub fn handle_datagram(&self, dg: Bytes) {
         tracing::debug!("[relay] incoming datagram");
 
         match decode_relay_datagram(dg) {
@@ -69,10 +69,12 @@ impl TuicConnection {
             }
             Ok(Some(parsed)) => {
                 if self.udp_relay_mode != UdpRelayMode::Native {
-                    tracing::warn!("[relay] received packet datagram in non-native relay mode");
+                    tracing::warn!(
+                        "[relay] received packet datagram in non-native relay mode"
+                    );
                     return;
                 }
-                self.dispatch_packet(parsed, "native").await;
+                self.dispatch_datagram_packet(parsed);
             }
             Err(err) => {
                 tracing::warn!("[relay] incoming datagram decode error: {err}");

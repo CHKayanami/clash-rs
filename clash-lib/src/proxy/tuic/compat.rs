@@ -1,11 +1,13 @@
 use std::{
     fmt::{Debug, Formatter, Result as FmtResult},
+    future::Future,
     io,
     pin::Pin,
     task::{Context, Poll},
 };
 
 use futures::{Sink, SinkExt, Stream};
+use tokio::time::{Instant, sleep};
 
 use crate::{
     common::errors::new_io_error,
@@ -13,9 +15,11 @@ use crate::{
         UdpPacket,
         batch::{BatchResult, DatagramBatch, PacketBatch, poll_send_ready, poll_send_stream},
     },
+    session::SocksAddr as ClashSocksAddr,
 };
 use super::{
     TuicDatagramOutbound,
+    proto::Address,
     types::{SocketAdderTrans, TUIC_HALF_CLOSED_DRAIN_GRACE},
 };
 
@@ -89,7 +93,44 @@ impl Stream for TuicDatagramOutbound {
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Self::Item>> {
-        self.recv_rx.poll_recv(cx)
+        let this = self.as_mut().get_mut();
+        this.poll_gc_timer(cx);
+        loop {
+            match this.recv_rx.poll_recv(cx) {
+                Poll::Ready(Some(parsed)) => {
+                    let complete = if parsed.frag_total == 1 {
+                        (parsed.frag_id == 0 && parsed.addr != Address::None)
+                            .then_some((parsed.addr, parsed.payload))
+                    } else {
+                        this.fragments.accept(parsed)
+                    };
+                    let Some((address, payload)) = complete else {
+                        continue;
+                    };
+                    match ClashSocksAddr::try_from(address) {
+                        Ok(remote_addr) => {
+                            this.sync_gc_timer(cx, false);
+                            return Poll::Ready(Some(UdpPacket::new(
+                                payload,
+                                remote_addr,
+                                this.local_addr.clone(),
+                            )));
+                        }
+                        Err(e) => {
+                            tracing::warn!("[udp] failed converting address: {e}");
+                        }
+                    }
+                }
+                Poll::Ready(None) => {
+                    this.gc_timer = None;
+                    return Poll::Ready(None);
+                }
+                Poll::Pending => {
+                    this.sync_gc_timer(cx, true);
+                    return Poll::Pending;
+                }
+            }
+        }
     }
 }
 
@@ -101,6 +142,50 @@ impl Debug for TuicDatagramOutbound {
 }
 
 impl TuicDatagramOutbound {
+    fn sync_gc_timer(&mut self, cx: &mut Context<'_>, register_waker: bool) {
+        if self.fragments.is_empty() || self.gc_interval.is_zero() {
+            self.gc_timer = None;
+        } else if self.gc_timer.is_none() {
+            #[cfg(test)]
+            {
+                self.gc_timer_allocs += 1;
+            }
+            self.gc_timer = Some(Box::pin(sleep(self.gc_interval)));
+            if register_waker {
+                self.poll_gc_timer(cx);
+            }
+        }
+    }
+
+    fn poll_gc_timer(&mut self, cx: &mut Context<'_>) {
+        if let Some(timer) = self.gc_timer.as_mut()
+            && timer.as_mut().poll(cx).is_ready()
+        {
+            self.fragments.expire_stale();
+            if self.fragments.is_empty() {
+                self.gc_timer = None;
+            } else {
+                timer.as_mut().reset(Instant::now() + self.gc_interval);
+                let _ = timer.as_mut().poll(cx);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_pending_fragments_for_test(&self) -> bool {
+        !self.fragments.is_empty()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_gc_timer_for_test(&self) -> bool {
+        self.gc_timer.is_some()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn gc_timer_allocs_for_test(&self) -> usize {
+        self.gc_timer_allocs
+    }
+
     fn max_datagram_size(&self) -> io::Result<usize> {
         if self.closed { return Err(new_io_error("UDP session closed")); }
         self.conn.conn.max_datagram_size()

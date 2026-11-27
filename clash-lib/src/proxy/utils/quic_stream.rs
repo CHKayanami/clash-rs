@@ -1,4 +1,6 @@
 use std::{
+    collections::HashMap,
+    hash::Hash,
     io,
     pin::Pin,
     task::{Context, Poll},
@@ -10,6 +12,7 @@ use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
     runtime::Handle,
     select,
+    sync::mpsc::Sender,
     time::{Instant, sleep, timeout},
 };
 
@@ -77,6 +80,62 @@ pub(crate) fn close_after_grace(
         return;
     }
     conn.close(0u32.into(), reason);
+}
+
+/// Per-connection UDP session map paired with a latched `closed` flag under
+/// the same lock. Once the connection's receive loop exits (or the connection
+/// is already closed), subsequent registrations fail and drop their sender
+/// immediately so receivers wake with `None` instead of waiting forever.
+pub(crate) struct UdpSessionTable<K, V> {
+    sessions: HashMap<K, Sender<V>>,
+    closed: bool,
+}
+
+impl<K: Eq + Hash, V> Default for UdpSessionTable<K, V> {
+    fn default() -> Self {
+        Self {
+            sessions: HashMap::new(),
+            closed: false,
+        }
+    }
+}
+
+impl<K: Eq + Hash, V> UdpSessionTable<K, V> {
+    pub(crate) fn insert(&mut self, id: K, tx: Sender<V>) -> bool {
+        if self.closed {
+            return false;
+        }
+        self.sessions.insert(id, tx);
+        true
+    }
+
+    pub(crate) fn get(&self, id: &K) -> Option<&Sender<V>> {
+        self.sessions.get(id)
+    }
+
+    pub(crate) fn remove(&mut self, id: &K) -> Option<Sender<V>> {
+        self.sessions.remove(id)
+    }
+
+    pub(crate) fn close(&mut self) {
+        self.closed = true;
+        self.sessions.clear();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn contains_key(&self, id: &K) -> bool {
+        self.sessions.contains_key(id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.sessions.is_empty()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_closed(&self) -> bool {
+        self.closed
+    }
 }
 
 /// Connection lease tracked by [`QuicBidiStream`].

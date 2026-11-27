@@ -1,4 +1,3 @@
-use crate::{proxy::datagram::UdpPacket, session::SocksAddr as ClashSocksAddr};
 use anyhow::{Result, anyhow};
 use bytes::Bytes;
 use std::{io, sync::Arc, time::Duration};
@@ -9,7 +8,7 @@ use super::{
         encode_dissociate, encode_heartbeat, encode_single_packet, packet_fragments,
     },
     stream::TuicStream,
-    types::{TuicConnection, TuicStreamLease, UdpRelayMode},
+    types::{TuicConnection, TuicStreamLease},
 };
 
 impl TuicConnection {
@@ -129,64 +128,63 @@ impl TuicConnection {
         Ok(())
     }
 
-    pub async fn dispatch_packet(&self, parsed: ParsedPacket, mode: &str) {
+    /// Non-blocking datagram delivery used on `TuicConnection::init`'s single
+    /// accept loop: never awaits a full session queue so one slow UDP consumer
+    /// cannot stall other streams or datagrams on the same QUIC connection.
+    pub fn dispatch_datagram_packet(&self, parsed: ParsedPacket) {
         let assoc_id = parsed.assoc_id;
         let pkt_id = parsed.pkt_id;
 
         tracing::debug!(
-            "[udp] [{assoc_id:#06x}] [from-{mode}] [{pkt_id:#06x}] from {addr}",
+            "[udp] [{assoc_id:#06x}] [from-native] [{pkt_id:#06x}] from {addr}",
             addr = parsed.addr
         );
 
-        let (session, local_addr) = match self.udp_sessions.read().get(&assoc_id) {
-            Some(v) => (v.incoming.clone(), v.local_addr.clone()),
-            None => {
-                tracing::debug!(
-                    "[udp] [{assoc_id:#06x}] [from-{mode}] [{pkt_id:#06x}] no active session"
-                );
-                return;
-            }
-        };
-
-        let complete = if parsed.frag_total == 1 {
-            (parsed.frag_id == 0 && parsed.addr != Address::None)
-                .then_some((parsed.addr, parsed.payload))
-        } else {
-            self.fragments.lock().accept(parsed)
-        };
-        let Some((address, payload)) = complete else {
+        let Some(session) = self.udp_sessions.read().get(&assoc_id).cloned() else {
+            tracing::debug!(
+                "[udp] [{assoc_id:#06x}] [from-native] [{pkt_id:#06x}] no active \
+                 session"
+            );
             return;
         };
-        let remote_addr = match ClashSocksAddr::try_from(address) {
-            Ok(addr) => addr,
-            Err(e) => {
-                tracing::warn!("[udp] failed converting address: {e}");
-                return;
-            }
+
+        if let Err(err) = session.try_send(parsed) {
+            tracing::debug!(
+                "[udp] [{assoc_id:#06x}] [from-native] [{pkt_id:#06x}] dropping \
+                 packet: {err}"
+            );
+        }
+    }
+
+    /// Async stream delivery used by per-uni-stream tasks so QUIC-mode packets
+    /// apply backpressure without blocking `TuicConnection::init`.
+    pub async fn dispatch_stream_packet(&self, parsed: ParsedPacket) {
+        let assoc_id = parsed.assoc_id;
+        let pkt_id = parsed.pkt_id;
+
+        tracing::debug!(
+            "[udp] [{assoc_id:#06x}] [from-quic] [{pkt_id:#06x}] from {addr}",
+            addr = parsed.addr
+        );
+
+        let Some(session) = self.udp_sessions.read().get(&assoc_id).cloned() else {
+            tracing::debug!(
+                "[udp] [{assoc_id:#06x}] [from-quic] [{pkt_id:#06x}] no active \
+                 session"
+            );
+            return;
         };
 
-        let packet = UdpPacket::new(payload, remote_addr, local_addr);
-        match self.udp_relay_mode {
-            UdpRelayMode::Native => {
-                if let Err(err) = session.try_send(packet) {
-                    tracing::debug!(
-                        "[udp] [{assoc_id:#06x}] [from-{mode}] [{pkt_id:#06x}] dropping packet: {err}"
-                    );
-                }
-            }
-            UdpRelayMode::Quic => {
-                if let Err(err) = session.send(packet).await {
-                    tracing::warn!(
-                        "[udp] [{assoc_id:#06x}] [from-{mode}] [{pkt_id:#06x}] failed sending packet: {err}"
-                    );
-                }
-            }
+        if let Err(err) = session.send(parsed).await {
+            tracing::warn!(
+                "[udp] [{assoc_id:#06x}] [from-quic] [{pkt_id:#06x}] failed \
+                 sending packet: {err}"
+            );
         }
     }
 
     pub fn remove_udp_session(&self, assoc_id: u16) {
         self.udp_sessions.write().remove(&assoc_id);
-        self.fragments.lock().remove_association(assoc_id);
     }
 
     pub async fn send_dissociate(&self, assoc_id: u16) -> Result<quinn::SendStream> {
@@ -209,14 +207,10 @@ impl TuicConnection {
     pub async fn cyclical_tasks(
         self: Arc<Self>,
         heartbeat_interval: Duration,
-        gc_interval: Duration,
-        gc_lifetime: Duration,
     ) -> anyhow::Error {
         let mut interval = tokio::time::interval(heartbeat_interval);
-        let mut gc = tokio::time::interval(gc_interval);
         // Consume immediate first tick to avoid racing authentication
         interval.tick().await;
-        gc.tick().await;
         loop {
             tokio::select! {
                 err = self.conn.closed() => return err.into(),
@@ -225,7 +219,6 @@ impl TuicConnection {
                         return err;
                     }
                 }
-                _ = gc.tick() => self.fragments.lock().expire(gc_lifetime),
             }
         }
     }

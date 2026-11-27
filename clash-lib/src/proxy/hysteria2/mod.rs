@@ -14,9 +14,8 @@ mod quic_tests;
 use quinn_proto::congestion::{BbrConfig, ControllerFactory};
 
 use self::{
-    codec::Hy2TcpCodec,
+    codec::{Hy2TcpCodec, HysUdpPacket},
     congestion::BrutalConfig,
-    datagram::UdpSession,
     h3::{
         H3_STREAM_QPACK_DECODER, H3_STREAM_QPACK_ENCODER, auth_request_frame, client_preface,
         read_h3_response_headers,
@@ -25,11 +24,11 @@ use self::{
 use super::{
     DialWithConnector, OutboundHandler, OutboundType,
     PlainProxyAPIResponse, converters::hysteria2::PortGenerator,
-    datagram::UdpPacket,
     utils::{
         new_udp_socket,
         quic_stream::{
-            QuicBidiStream, QuicStreamLease, QuicUploadGrace, close_after_grace,
+            QuicBidiStream, QuicStreamLease, QuicUploadGrace, UdpSessionTable,
+            close_after_grace,
         },
     },
 };
@@ -40,7 +39,7 @@ use crate::{
     session::{Session, SocksAddr},
 };
 use anyhow::{Context as _, anyhow};
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use codec::Fragments;
 use erased_serde::Serialize as ErasedSerialize;
 use futures::SinkExt;
@@ -69,7 +68,10 @@ use std::{
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
     runtime::Handle,
-    sync::{Mutex, mpsc::error::TrySendError},
+    sync::{
+        Mutex,
+        mpsc::{Sender, error::TrySendError},
+    },
 };
 
 #[derive(Clone)]
@@ -690,7 +692,7 @@ pub struct HysteriaConnection {
     /// a connection error.
     #[allow(dead_code)]
     _preface: Option<Arc<H3Preface>>,
-    pub udp_sessions: Arc<SyncMutex<HashMap<u32, UdpSession>>>,
+    pub(crate) udp_sessions: Arc<SyncMutex<UdpSessionTable<u32, HysUdpPacket>>>,
     active_streams: AtomicUsize,
     keep_idle: Arc<AtomicBool>,
     /// Set once evicted from the handler cache so the connection closes as
@@ -728,7 +730,7 @@ impl HysteriaConnection {
         let s = Arc::new(Self {
             conn,
             _preface: preface,
-            udp_sessions: Arc::new(SyncMutex::new(HashMap::new())),
+            udp_sessions: Arc::new(SyncMutex::new(UdpSessionTable::default())),
             active_streams: AtomicUsize::new(0),
             keep_idle,
             evicted: AtomicBool::new(false),
@@ -843,7 +845,7 @@ impl HysteriaConnection {
                         "hysteria2 received datagram: {} bytes",
                         pkt.len()
                     );
-                    self.clone().recv_packet(pkt).await
+                    self.recv_packet(pkt);
                 }
                 Err(e) => {
                     tracing::debug!("hysteria2 read datagram stopped: {}", e);
@@ -851,7 +853,21 @@ impl HysteriaConnection {
                 }
             }
         };
+        self.udp_sessions.lock().close();
         tracing::debug!("hysteria2 connection closed: {:?}", err);
+    }
+
+    pub(super) fn register_udp_session(
+        &self,
+        session_id: u32,
+        tx: Sender<HysUdpPacket>,
+    ) -> bool {
+        let mut sessions = self.udp_sessions.lock();
+        if self.conn.close_reason().is_some() {
+            sessions.close();
+            return false;
+        }
+        sessions.insert(session_id, tx)
     }
 
     pub async fn connect_tcp(
@@ -971,10 +987,9 @@ impl HysteriaConnection {
         Ok(())
     }
 
-    pub async fn recv_packet(self: Arc<Self>, pkt: Bytes) {
+    pub fn recv_packet(&self, pkt: Bytes) {
         tracing::trace!("hysteria2 recv_packet: {} bytes", pkt.len());
-        let mut buf: BytesMut = pkt.into();
-        let pkt = match codec::HysUdpPacket::decode(&mut buf) {
+        let mut pkt = match HysUdpPacket::decode(pkt) {
             Ok(p) => p,
             Err(e) => {
                 tracing::warn!("hysteria2 decode udp packet failed: {}", e);
@@ -982,59 +997,38 @@ impl HysteriaConnection {
             }
         };
         let session_id = pkt.session_id;
+        let incoming = self.udp_sessions.lock().get(&session_id).cloned();
+        let Some(incoming) = incoming else {
+            tracing::warn!("hysteria2 udp session not found: {}", session_id);
+            return;
+        };
 
-        let res = {
-            let mut udp_sessions = self.udp_sessions.lock();
-            if let Some(session) = udp_sessions.get_mut(&session_id) {
-                tracing::trace!(
-                    "hysteria2 found session {}, feeding packet",
+        // Every UDP session on this connection is served by the single
+        // `read_datagram` loop that calls us, so awaiting a full channel
+        // here stalled *all* of them behind one slow consumer. Dropping is
+        // the right answer for UDP.
+        let permit = match incoming.try_reserve() {
+            Ok(permit) => permit,
+            Err(TrySendError::Full(())) => {
+                tracing::debug!(
+                    "hysteria2 udp session {} queue full, dropping packet",
                     session_id
                 );
-                session.feed(pkt).map(|complete_pkt| {
-                    (
-                        session.incoming.clone(),
-                        session.local_addr.clone(),
-                        complete_pkt,
-                    )
-                })
-            } else {
-                tracing::warn!("hysteria2 udp session not found: {}", session_id);
-                None
+                return;
+            }
+            Err(TrySendError::Closed(())) => {
+                tracing::debug!(
+                    "hysteria2 udp session {} receiver gone, dropping packet",
+                    session_id
+                );
+                return;
             }
         };
 
-        if let Some((incoming, local_addr, pkt)) = res {
-            tracing::trace!(
-                "hysteria2 complete packet received for session {}: {} bytes to {:?}",
-                session_id,
-                pkt.data.len(),
-                local_addr
-            );
-            // Every UDP session on this connection is served by the single
-            // `read_datagram` loop that calls us, so awaiting a full channel
-            // here stalled *all* of them behind one slow consumer. Dropping is
-            // the right answer for UDP.
-            match incoming.try_send(UdpPacket {
-                data: pkt.data,
-                src_addr: pkt.addr,
-                dst_addr: local_addr,
-                inbound_user: None,
-            }) {
-                Ok(()) => {}
-                Err(TrySendError::Full(_)) => {
-                    tracing::debug!(
-                        "hysteria2 udp session {} queue full, dropping packet",
-                        session_id
-                    );
-                }
-                Err(TrySendError::Closed(_)) => {
-                    tracing::debug!(
-                        "hysteria2 udp session {} receiver gone, dropping packet",
-                        session_id
-                    );
-                }
-            }
-        }
+        // Detach the payload from Quinn's datagram buffer (which may share a
+        // larger GRO receive slab) only after a queue slot is reserved.
+        pkt.data = Bytes::copy_from_slice(&pkt.data);
+        permit.send(pkt);
     }
 }
 
@@ -1162,7 +1156,7 @@ mod unit_tests {
         let make_connection = |preface| Arc::new(HysteriaConnection {
             conn: connection.clone(),
             _preface: preface,
-            udp_sessions: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            udp_sessions: Arc::new(parking_lot::Mutex::new(UdpSessionTable::default())),
             active_streams: AtomicUsize::new(0),
             keep_idle: Arc::new(AtomicBool::new(true)),
             evicted: AtomicBool::new(false),
@@ -1251,7 +1245,7 @@ mod unit_tests {
         let managed = Arc::new(HysteriaConnection {
             conn: connection.clone(),
             _preface: Some(preface),
-            udp_sessions: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            udp_sessions: Arc::new(parking_lot::Mutex::new(UdpSessionTable::default())),
             active_streams: AtomicUsize::new(0),
             keep_idle: handler.keep_idle.clone(),
             evicted: AtomicBool::new(false),
@@ -1428,7 +1422,7 @@ mod unit_tests {
         let managed = Arc::new(HysteriaConnection {
             conn: connection.clone(),
             _preface: None,
-            udp_sessions: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            udp_sessions: Arc::new(parking_lot::Mutex::new(UdpSessionTable::default())),
             active_streams: AtomicUsize::new(0),
             keep_idle: handler.keep_idle.clone(),
             evicted: AtomicBool::new(false),
@@ -1531,7 +1525,7 @@ mod unit_tests {
         let managed = Arc::new(HysteriaConnection {
             conn: connection.clone(),
             _preface: None,
-            udp_sessions: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            udp_sessions: Arc::new(parking_lot::Mutex::new(UdpSessionTable::default())),
             active_streams: AtomicUsize::new(0),
             keep_idle: handler.keep_idle.clone(),
             evicted: AtomicBool::new(false),
@@ -1619,7 +1613,7 @@ mod unit_tests {
         let managed = Arc::new(HysteriaConnection {
             conn: connection.clone(),
             _preface: None,
-            udp_sessions: Arc::new(SyncMutex::new(HashMap::new())),
+            udp_sessions: Arc::new(SyncMutex::new(UdpSessionTable::default())),
             active_streams: AtomicUsize::new(0),
             keep_idle: handler.keep_idle.clone(),
             evicted: AtomicBool::new(false),
@@ -1730,7 +1724,7 @@ mod unit_tests {
         let managed = Arc::new(HysteriaConnection {
             conn: connection.clone(),
             _preface: Some(preface),
-            udp_sessions: Arc::new(SyncMutex::new(HashMap::new())),
+            udp_sessions: Arc::new(SyncMutex::new(UdpSessionTable::default())),
             active_streams: AtomicUsize::new(0),
             keep_idle: handler.keep_idle.clone(),
             evicted: AtomicBool::new(false),

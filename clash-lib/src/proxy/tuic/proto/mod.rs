@@ -179,16 +179,20 @@ pub struct ParsedPacket {
 
 /// Heartbeats use QUIC datagrams regardless of the UDP relay mode.
 /// `None` means a valid heartbeat; packet frames retain their full validation.
-pub fn decode_relay_datagram(buf: Bytes) -> Result<Option<ParsedPacket>, ProtoError> {
-    let mut prefix = buf.as_ref();
-    let header = Header::decode(&mut prefix)?;
-    if header.command == CmdType::Heartbeat {
-        if !prefix.is_empty() {
-            return Err(ProtoError::InvalidPayloadSize);
+pub fn decode_relay_datagram(
+    mut buf: Bytes,
+) -> Result<Option<ParsedPacket>, ProtoError> {
+    let header = Header::decode(&mut buf)?;
+    match header.command {
+        CmdType::Heartbeat => {
+            if !buf.is_empty() {
+                return Err(ProtoError::InvalidPayloadSize);
+            }
+            Ok(None)
         }
-        return Ok(None);
+        CmdType::Packet => decode_packet_body(buf).map(Some),
+        _ => Err(ProtoError::InvalidCommand),
     }
-    decode_packet_frame(buf).map(Some)
 }
 
 pub fn decode_packet_frame(mut buf: Bytes) -> Result<ParsedPacket, ProtoError> {
@@ -196,6 +200,10 @@ pub fn decode_packet_frame(mut buf: Bytes) -> Result<ParsedPacket, ProtoError> {
     if header.command != CmdType::Packet {
         return Err(ProtoError::InvalidCommand);
     }
+    decode_packet_body(buf)
+}
+
+fn decode_packet_body(mut buf: Bytes) -> Result<ParsedPacket, ProtoError> {
     let cmd = Command::decode(CmdType::Packet, &mut buf)?;
     let Command::Packet {
         assoc_id,
@@ -212,7 +220,6 @@ pub fn decode_packet_frame(mut buf: Bytes) -> Result<ParsedPacket, ProtoError> {
     if buf.len() != size as usize {
         return Err(ProtoError::InvalidPayloadSize);
     }
-    let payload = buf;
     Ok(ParsedPacket {
         assoc_id,
         pkt_id,
@@ -220,7 +227,7 @@ pub fn decode_packet_frame(mut buf: Bytes) -> Result<ParsedPacket, ProtoError> {
         frag_id,
         size,
         addr,
-        payload,
+        payload: buf,
     })
 }
 

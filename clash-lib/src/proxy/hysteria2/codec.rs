@@ -4,7 +4,7 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 use quinn_proto::{VarInt, coding::Codec};
 use rand::distr::Distribution;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, hash_map::Entry},
     io::{self, ErrorKind},
     str::FromStr,
     time::{Duration, Instant},
@@ -349,7 +349,7 @@ impl std::fmt::Debug for HysUdpPacket {
 
 impl HysUdpPacket {
     /// `decode` method, `encode` has been moved to Fragments
-    pub fn decode(buf: &mut BytesMut) -> anyhow::Result<Self> {
+    pub fn decode(mut buf: Bytes) -> anyhow::Result<Self> {
         if buf.len() < 4 + 2 + 1 + 1 {
             return Err(anyhow!("packet too short"));
         }
@@ -357,10 +357,10 @@ impl HysUdpPacket {
         let pkt_id = buf.get_u16();
         let frag_id = buf.get_u8();
         let frag_count = buf.get_u8();
-        let addr_len = VarInt::decode(buf)
+        let addr_len = VarInt::decode(&mut buf)
             .map_err(|_| anyhow!("malformed address length"))?
             .into_inner();
-        // `split_to` panics past the end, and the length is server-controlled.
+        // `advance` panics past the end, and the length is server-controlled.
         if addr_len > MAX_ADDR_LEN as u64 || addr_len > buf.remaining() as u64 {
             return Err(anyhow!(
                 "invalid address length {} (remaining {})",
@@ -371,14 +371,13 @@ impl HysUdpPacket {
         let addr_len = addr_len as usize;
         let addr = to_socksaddr(&buf[..addr_len])?;
         buf.advance(addr_len);
-        let data = buf.split().freeze();
         Ok(Self {
             session_id,
             pkt_id,
             frag_id,
             frag_count,
             addr,
-            data,
+            data: buf,
         })
     }
 }
@@ -591,39 +590,66 @@ impl Defragger {
         let pkt_id = pkt.pkt_id;
         let frag_id = pkt.frag_id as usize;
         let frag_count = pkt.frag_count as usize;
+        let now = Instant::now();
 
-        // 容量超出时淘汰过期条目
-        if self.pending.len() >= DEFRAG_MAX_PENDING && !self.pending.contains_key(&pkt_id) {
-            self.pending
-                .retain(|_, entry| entry.updated.elapsed() < DEFRAG_MAX_AGE);
-            if self.pending.len() >= DEFRAG_MAX_PENDING {
-                return None;
+        // 容量超出时先淘汰过期条目；仍满则淘汰最旧条目，避免残包占满后饿死新包
+        let is_full = self.pending.len() >= DEFRAG_MAX_PENDING;
+        let mut entry = match self.pending.entry(pkt_id) {
+            Entry::Occupied(occ) => occ,
+            Entry::Vacant(vac) => {
+                if !is_full {
+                    vac.insert_entry(DefragEntry {
+                        frags: vec![None; frag_count],
+                        count: 0,
+                        updated: now,
+                    })
+                } else {
+                    drop(vac);
+                    self.pending.retain(|_, entry| {
+                        now.saturating_duration_since(entry.updated)
+                            < DEFRAG_MAX_AGE
+                    });
+                    if self.pending.len() >= DEFRAG_MAX_PENDING
+                        && let Some(oldest) = self
+                            .pending
+                            .iter()
+                            .min_by_key(|(_, entry)| entry.updated)
+                            .map(|(key, _)| *key)
+                    {
+                        self.pending.remove(&oldest);
+                    }
+                    match self.pending.entry(pkt_id) {
+                        Entry::Vacant(vac) => vac.insert_entry(DefragEntry {
+                            frags: vec![None; frag_count],
+                            count: 0,
+                            updated: now,
+                        }),
+                        Entry::Occupied(occ) => occ,
+                    }
+                }
             }
-        }
+        };
 
-        let entry = self.pending.entry(pkt_id).or_insert_with(|| DefragEntry {
-            frags: vec![None; frag_count],
-            count: 0,
-            updated: Instant::now(),
-        });
-
+        let state = entry.get_mut();
         // 若旧分片已超时或分片总数不匹配，重置 entry
-        if entry.updated.elapsed() >= DEFRAG_MAX_AGE || entry.frags.len() != frag_count {
-            entry.frags = vec![None; frag_count];
-            entry.count = 0;
+        if now.saturating_duration_since(state.updated) >= DEFRAG_MAX_AGE
+            || state.frags.len() != frag_count
+        {
+            state.frags = vec![None; frag_count];
+            state.count = 0;
         }
 
-        if frag_id >= entry.frags.len() || entry.frags[frag_id].is_some() {
+        if frag_id >= state.frags.len() || state.frags[frag_id].is_some() {
             // 重复分片或非法索引
             return None;
         }
 
-        entry.frags[frag_id] = Some(pkt);
-        entry.count += 1;
-        entry.updated = Instant::now();
+        state.frags[frag_id] = Some(pkt);
+        state.count += 1;
+        state.updated = now;
 
-        if entry.count == entry.frags.len() {
-            let entry = self.pending.remove(&pkt_id).expect("entry exists");
+        if state.count == state.frags.len() {
+            let entry = entry.remove();
             let total_len: usize = entry
                 .frags
                 .iter()
@@ -692,8 +718,7 @@ fn test_udp_roundtrip() {
     let payload = Bytes::from_static(b"hello world hysteria2");
     let mut frags = Fragments::new(0x12345678, 42, &addr, 1500, payload.clone()).unwrap();
     let encoded = frags.next().unwrap();
-    let mut buf = BytesMut::from(encoded.as_ref());
-    let decoded = HysUdpPacket::decode(&mut buf).unwrap();
+    let decoded = HysUdpPacket::decode(encoded).unwrap();
     assert_eq!(decoded.session_id, 0x12345678);
     assert_eq!(decoded.pkt_id, 42);
     assert_eq!(decoded.frag_id, 0);
