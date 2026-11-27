@@ -1,17 +1,26 @@
-use crate::proxy::RouteChange;
-use super::UdpPolicy;
-use std::collections::HashSet;
-use super::GroupHandler;
-use std::{io, sync::Arc, time::Duration};
+use std::{
+    collections::HashSet,
+    io,
+    sync::{
+        Arc, Weak,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Duration,
+};
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 
+use arc_swap::ArcSwapOption;
+use parking_lot::RwLock;
 use tracing::trace;
 
+use super::{GroupHandler, UdpPolicy};
 use crate::{
     app::remote_content_manager::{
-        ProxyManager, providers::proxy_provider::ArcProxyProvider,
+        ProxyHealthHandle, ProxyManager, providers::proxy_provider::ArcProxyProvider,
     },
     proxy::{
-        HandlerCommonOptions, OutboundNode, OutboundType,
+        HandlerCommonOptions, OutboundNode, OutboundType, RouteChange,
         group::GroupProxyAPIResponse,
         utils::provider_helper::{MemberUrls, Providers},
     },
@@ -25,6 +34,47 @@ pub struct HandlerOptions {
     pub udp: bool,
 }
 
+struct StickySelection {
+    name: Option<String>,
+    version: u64,
+}
+
+struct CachedSelection {
+    health_version: u64,
+    sticky_version: u64,
+    selected_index: usize,
+    committed: bool,
+}
+
+struct CachedMemberSnapshot {
+    /// Weak ref ensures a stale cache never pins superseded provider snapshots
+    /// or retired protocol handlers.
+    snapshot: Weak<Vec<OutboundNode>>,
+    urls: MemberUrls,
+    handles: Vec<ProxyHealthHandle>,
+    /// Incremented only when one of `handles` changes its liveness or latest
+    /// delay, so probes on unrelated proxies/URLs never invalidate this group.
+    member_version: Arc<AtomicU64>,
+    selection: ArcSwapOption<CachedSelection>,
+}
+
+impl CachedMemberSnapshot {
+    fn matches(&self, proxies: &Arc<Vec<OutboundNode>>, urls: &MemberUrls) -> bool {
+        self.snapshot
+            .upgrade()
+            .is_some_and(|snap| Arc::ptr_eq(&snap, proxies))
+            && self.urls.ptr_eq(urls)
+    }
+
+    fn is_live(&self) -> bool {
+        self.snapshot.strong_count() > 0
+    }
+
+    fn health_version(&self) -> u64 {
+        self.member_version.load(Ordering::SeqCst)
+    }
+}
+
 pub struct Handler {
     opts: HandlerOptions,
     tolerance: u16,
@@ -34,8 +84,14 @@ pub struct Handler {
     /// Name of the proxy the tolerance hysteresis is currently sticky to.
     /// Tracking a list position instead silently retargeted the selection
     /// whenever a provider refresh reordered the members.
-    current_fastest: parking_lot::RwLock<Option<String>>,
+    sticky: RwLock<StickySelection>,
+    sticky_version: AtomicU64,
+    cached_snapshot: ArcSwapOption<CachedMemberSnapshot>,
     selection_changes: RouteChange,
+    #[cfg(test)]
+    scan_count: AtomicUsize,
+    #[cfg(test)]
+    snapshot_builds: AtomicUsize,
 }
 
 impl std::fmt::Debug for Handler {
@@ -47,38 +103,51 @@ impl std::fmt::Debug for Handler {
 }
 
 impl Handler {
-    pub(crate) fn select_cached(&self) -> Option<OutboundNode> { self.fastest(false, true) }
+    pub(crate) fn select_cached(&self) -> Option<OutboundNode> {
+        self.fastest(false, true)
+    }
 
     /// Read-only inspection of the current effective proxy without mutating
     /// sticky tolerance state.
     pub(crate) fn peek_selected_from(
         &self,
-        proxies: &[OutboundNode],
+        proxies: &Arc<Vec<OutboundNode>>,
         urls: &MemberUrls,
     ) -> Option<OutboundNode> {
-        self.fastest_in(proxies, urls, false)
+        self.fastest_in(proxies, urls, false, false)
     }
 
     pub(crate) fn providers(&self) -> &Providers {
         &self.providers
     }
 
+    pub(crate) fn invalidate_stale_cache(&self) {
+        self.providers.invalidate_stale_cache();
+        if self
+            .cached_snapshot
+            .load()
+            .as_deref()
+            .is_some_and(|cache| !cache.is_live())
+        {
+            self.cached_snapshot.store(None);
+        }
+    }
+
     pub(crate) fn route_changes_from(
         &self,
-        proxies: &[OutboundNode],
+        proxies: &Arc<Vec<OutboundNode>>,
         urls: &MemberUrls,
         sources: &mut Vec<RouteChange>,
     ) {
         sources.push(self.selection_changes.clone());
         self.providers.route_changes(sources);
-        let fallback_url = self.opts.common_opts.url.as_deref();
-        sources.extend(proxies.iter().enumerate().map(|(index, node)| {
-            self.proxy_manager.route_changes_for(
-                node,
-                urls.url_at(index, fallback_url),
-                true,
-            )
-        }));
+        let cache = self.get_or_build_snapshot(proxies, urls, false);
+        sources.extend(
+            cache
+                .handles
+                .iter()
+                .map(|handle| handle.route_changes(true)),
+        );
     }
 
     pub fn new(
@@ -95,8 +164,17 @@ impl Handler {
             tolerance,
             providers: Providers::new(providers),
             proxy_manager,
-            current_fastest: parking_lot::RwLock::new(None),
+            sticky: RwLock::new(StickySelection {
+                name: None,
+                version: 0,
+            }),
+            sticky_version: AtomicU64::new(0),
+            cached_snapshot: ArcSwapOption::new(None),
             selection_changes: RouteChange::default(),
+            #[cfg(test)]
+            scan_count: AtomicUsize::new(0),
+            #[cfg(test)]
+            snapshot_builds: AtomicUsize::new(0),
         }
     }
 
@@ -104,44 +182,86 @@ impl Handler {
         self.providers.get_proxies(touch)
     }
 
-    /// Pick the proxy to use.
-    ///
-    /// `commit` records the outcome as the new sticky choice. Read-only callers
-    /// (the API, capability probes) pass `false` — previously every one of them
-    /// rewrote the sticky state, so merely polling `/proxies` could change
-    /// which proxy the group routed through.
-    fn fastest(
+    fn get_or_build_snapshot(
         &self,
-        touch: bool,
-        commit: bool,
-    ) -> Option<OutboundNode> {
-        let (proxies, urls) = self.providers.get_members(touch);
-        self.fastest_in(&proxies, &urls, commit)
-    }
-
-    fn fastest_in(
-        &self,
-        proxies: &[OutboundNode],
+        proxies: &Arc<Vec<OutboundNode>>,
         urls: &MemberUrls,
-        commit: bool,
-    ) -> Option<OutboundNode> {
-        if proxies.is_empty() {
-            return None;
+        allow_replace_live: bool,
+    ) -> Arc<CachedMemberSnapshot> {
+        if let Some(cached) = self.cached_snapshot.load_full()
+            && cached.matches(proxies, urls)
+        {
+            return cached;
         }
 
-        let current_name = self.current_fastest.read().clone();
+        #[cfg(test)]
+        self.snapshot_builds.fetch_add(1, Ordering::Relaxed);
+
         let fallback_url = self.opts.common_opts.url.as_deref();
+        let member_version = Arc::new(AtomicU64::new(0));
+        let weak_version = Arc::downgrade(&member_version);
+        let handles: Vec<ProxyHealthHandle> = proxies
+            .iter()
+            .enumerate()
+            .map(|(index, proxy)| {
+                let handle = self
+                    .proxy_manager
+                    .health_handle_for(proxy, urls.url_at(index, fallback_url));
+                handle.register_version(weak_version.clone());
+                handle
+            })
+            .collect();
+        let built = Arc::new(CachedMemberSnapshot {
+            snapshot: Arc::downgrade(proxies),
+            urls: urls.clone(),
+            handles,
+            member_version,
+            selection: ArcSwapOption::new(None),
+        });
+
+        self.cached_snapshot.rcu(|current| {
+            if let Some(existing) = current
+                && existing.matches(proxies, urls)
+            {
+                return Some(existing.clone());
+            }
+            if !allow_replace_live
+                && let Some(existing) = current
+                && existing.is_live()
+            {
+                return Some(existing.clone());
+            }
+            Some(built.clone())
+        });
+
+        if let Some(current) = self.cached_snapshot.load_full()
+            && current.matches(proxies, urls)
+        {
+            current
+        } else {
+            built
+        }
+    }
+
+    fn evaluate_handles(
+        &self,
+        proxies: &[OutboundNode],
+        handles: &[ProxyHealthHandle],
+        current_name: Option<&str>,
+    ) -> (usize, Duration) {
+        #[cfg(test)]
+        self.scan_count.fetch_add(1, Ordering::Relaxed);
 
         let mut fastest: Option<(usize, Duration)> = None;
+        let mut current_index: Option<usize> = None;
         let mut current_alive = false;
         let mut current_delay = Duration::MAX;
-        for (index, proxy) in proxies.iter().enumerate() {
-            let is_current = current_name.as_deref() == Some(proxy.name());
-            let probe_url = urls.url_at(index, fallback_url);
-            let (alive, delay) = self
-                .proxy_manager
-                .alive_and_last_delay_for(proxy, probe_url);
-            if is_current {
+
+        for (index, (proxy, handle)) in proxies.iter().zip(handles).enumerate() {
+            let is_current = current_name == Some(proxy.name());
+            let (alive, delay) = handle.alive_and_last_delay();
+            if is_current && current_index.is_none() {
+                current_index = Some(index);
                 current_alive = alive;
             }
             if !alive {
@@ -149,7 +269,7 @@ impl Handler {
             }
 
             let delay = delay.unwrap_or(Duration::MAX);
-            if is_current {
+            if current_index == Some(index) {
                 current_delay = delay;
             }
             if match fastest {
@@ -169,10 +289,6 @@ impl Handler {
             .checked_add(tolerance)
             .unwrap_or(Duration::MAX);
 
-        let current_index = current_name
-            .as_deref()
-            .and_then(|name| proxies.iter().position(|p| p.name() == name));
-
         let selected_index = match current_index {
             // Stick with the current pick while it is alive and within
             // tolerance of the best.
@@ -182,30 +298,162 @@ impl Handler {
             _ => fastest_index,
         };
 
-        let selected = &proxies[selected_index];
-
-        if commit {
-            let mut current = self.current_fastest.write();
-            let next = selected.name();
-            if current.as_deref() != Some(next) {
-                *current = Some(next.to_owned());
-                drop(current);
-                self.selection_changes.notify();
-            }
-        }
-
         let selected_delay = if selected_index == fastest_index {
             fastest_delay
         } else {
             current_delay
         };
 
-        trace!(
-            fastest = %selected.name(),
-            delay = ?selected_delay,
-            "`{}` fastest",
-            self.name(),
-        );
+        (selected_index, selected_delay)
+    }
+
+    /// Pick the proxy to use.
+    ///
+    /// `commit` records the outcome as the new sticky choice. Read-only callers
+    /// (the API, capability probes) pass `false` — previously every one of them
+    /// rewrote the sticky state, so merely polling `/proxies` could change
+    /// which proxy the group routed through.
+    fn fastest(&self, touch: bool, commit: bool) -> Option<OutboundNode> {
+        let (proxies, urls) = self.providers.get_members(touch);
+        self.fastest_in(&proxies, &urls, commit, true)
+    }
+
+    fn fastest_in(
+        &self,
+        proxies: &Arc<Vec<OutboundNode>>,
+        urls: &MemberUrls,
+        commit: bool,
+        allow_replace_live: bool,
+    ) -> Option<OutboundNode> {
+        if proxies.is_empty() {
+            return None;
+        }
+
+        // O(1) lock-free fast path during stable periods.
+        let sticky_version = self.sticky_version.load(Ordering::Acquire);
+        if let Some(cache) = self.cached_snapshot.load().as_deref()
+            && cache.matches(proxies, urls)
+            && let Some(sel) = cache.selection.load().as_deref()
+            && sel.health_version == cache.health_version()
+            && sel.sticky_version == sticky_version
+            && (!commit || sel.committed)
+        {
+            return Some(proxies[sel.selected_index].clone());
+        }
+
+        let cache = self.get_or_build_snapshot(proxies, urls, allow_replace_live);
+
+        if !commit {
+            let health_version = cache.health_version();
+            let (current_name, sticky_version) = {
+                let sticky = self.sticky.read();
+                (sticky.name.clone(), sticky.version)
+            };
+            if let Some(sel) = cache.selection.load().as_deref()
+                && sel.health_version == health_version
+                && sel.sticky_version == sticky_version
+            {
+                return Some(proxies[sel.selected_index].clone());
+            }
+
+            let (selected_index, selected_delay) = self.evaluate_handles(
+                proxies,
+                &cache.handles,
+                current_name.as_deref(),
+            );
+            let selected = &proxies[selected_index];
+            let committed = current_name.as_deref() == Some(selected.name());
+
+            let next = Arc::new(CachedSelection {
+                health_version,
+                sticky_version,
+                selected_index,
+                committed,
+            });
+            cache.selection.rcu(|current| {
+                if let Some(existing) = current
+                    && ((existing.sticky_version, existing.health_version)
+                        > (sticky_version, health_version)
+                        || (existing.sticky_version == sticky_version
+                            && existing.health_version == health_version
+                            && existing.committed))
+                {
+                    return Some(existing.clone());
+                }
+                Some(next.clone())
+            });
+
+            trace!(
+                fastest = %selected.name(),
+                delay = ?selected_delay,
+                "`{}` fastest",
+                self.name(),
+            );
+
+            return Some(selected.clone());
+        }
+
+        let mut sticky = self.sticky.write();
+        let health_version = cache.health_version();
+        let cached_for_version = cache.selection.load().as_deref().and_then(|sel| {
+            if sel.health_version == health_version
+                && sel.sticky_version == sticky.version
+            {
+                Some((sel.selected_index, sel.committed))
+            } else {
+                None
+            }
+        });
+
+        if let Some((selected_index, true)) = cached_for_version {
+            drop(sticky);
+            return Some(proxies[selected_index].clone());
+        }
+
+        let (selected_index, evaluated_delay) = match cached_for_version {
+            Some((idx, false)) => (idx, None),
+            _ => {
+                let (idx, delay) = self.evaluate_handles(
+                    proxies,
+                    &cache.handles,
+                    sticky.name.as_deref(),
+                );
+                (idx, Some(delay))
+            }
+        };
+
+        let selected = &proxies[selected_index];
+        let mut selection_changed = false;
+        if sticky.name.as_deref() != Some(selected.name()) {
+            sticky.name = Some(selected.name().to_owned());
+            sticky.version += 1;
+            selection_changed = true;
+        }
+
+        let next_version = sticky.version;
+        cache.selection.store(Some(Arc::new(CachedSelection {
+            health_version,
+            sticky_version: next_version,
+            selected_index,
+            committed: true,
+        })));
+        if selection_changed {
+            self.sticky_version.store(next_version, Ordering::Release);
+        }
+        drop(sticky);
+
+        if selection_changed {
+            self.selection_changes.notify();
+        }
+
+        if let Some(selected_delay) = evaluated_delay {
+            trace!(
+                fastest = %selected.name(),
+                delay = ?selected_delay,
+                "`{}` fastest",
+                self.name(),
+            );
+        }
 
         Some(selected.clone())
     }
@@ -529,6 +777,334 @@ mod tests {
             group_url_fail.get_active_proxy().await.unwrap().identity(),
             backup_b.identity(),
             "group probing url_fail must observe shared node as failed"
+        );
+    }
+
+    #[tokio::test]
+    async fn cached_selection_avoids_rescan_and_preserves_order_tolerance_and_readonly() {
+        use std::sync::atomic::Ordering;
+        use arc_swap::ArcSwap;
+        use crate::proxy::utils::provider_helper::MemberUrls;
+
+        let make_node = |name: &str| -> OutboundNode {
+            OutboundNode::protocol(Arc::new(NoopOutboundHandler {
+                name: name.to_owned(),
+            }))
+        };
+
+        let a = make_node("a");
+        let b = make_node("b");
+        let c = make_node("c");
+        let a_weak = a.downgrade();
+        let slot = Arc::new(ArcSwap::from_pointee(vec![a.clone(), b.clone(), c.clone()]));
+
+        let mut provider = MockDummyProxyProvider::new();
+        provider.expect_proxies().returning({
+            let slot = slot.clone();
+            move || slot.load_full()
+        });
+
+        let pm = ProxyManager::new(Arc::new(NoopResolver), None);
+        // Equal delay on a and b: member order must keep earlier member `a`.
+        pm.report_delay("a", true, Duration::from_millis(50)).await;
+        pm.report_delay("b", true, Duration::from_millis(50)).await;
+        pm.report_delay("c", true, Duration::from_millis(120)).await;
+
+        let handler = super::Handler::new(
+            super::HandlerOptions {
+                name: "url-test-cache".to_owned(),
+                ..Default::default()
+            },
+            20,
+            vec![Arc::new(provider)],
+            pm.clone(),
+        );
+
+        // Read-only queries scan once, reuse cache on repeat, and do NOT commit sticky state.
+        assert_eq!(handler.get_active_proxy().await.unwrap().name(), "a");
+        assert_eq!(handler.scan_count.load(Ordering::Relaxed), 1);
+        assert_eq!(handler.get_active_proxy().await.unwrap().name(), "a");
+        assert_eq!(
+            handler
+                .peek_selected_from(&slot.load_full(), &MemberUrls::Uniform(None))
+                .unwrap()
+                .name(),
+            "a"
+        );
+        assert_eq!(handler.scan_count.load(Ordering::Relaxed), 1);
+        assert!(handler.sticky.read().name.is_none());
+
+        // Making `b` 40ms (within 20ms tolerance of 50ms) still switches to `b`
+        // because read-only queries never committed `a`.
+        pm.report_delay("b", true, Duration::from_millis(40)).await;
+        assert_eq!(handler.get_active_proxy().await.unwrap().name(), "b");
+        assert_eq!(handler.scan_count.load(Ordering::Relaxed), 2);
+        assert!(handler.sticky.read().name.is_none());
+
+        // Committing at the SAME health_version commits `b` without even rescanning.
+        assert_eq!(handler.select_cached().unwrap().name(), "b");
+        assert_eq!(handler.scan_count.load(Ordering::Relaxed), 2);
+        assert_eq!(handler.sticky.read().name.as_deref(), Some("b"));
+
+        // Repeated committed & read-only selections during stable period are O(1) (0 rescans).
+        for _ in 0..8 {
+            assert_eq!(handler.select_cached().unwrap().name(), "b");
+            assert_eq!(handler.get_active_proxy().await.unwrap().name(), "b");
+        }
+        assert_eq!(handler.scan_count.load(Ordering::Relaxed), 2);
+
+        // `a` improves to 25ms (within 20ms tolerance of b's 40ms): sticky stays on `b`.
+        pm.report_delay("a", true, Duration::from_millis(25)).await;
+        assert_eq!(handler.select_cached().unwrap().name(), "b");
+        assert_eq!(handler.scan_count.load(Ordering::Relaxed), 3);
+        assert_eq!(handler.select_cached().unwrap().name(), "b");
+        assert_eq!(handler.scan_count.load(Ordering::Relaxed), 3);
+
+        // `a` improves to 10ms (outside tolerance): switches to `a` and caches it.
+        pm.report_delay("a", true, Duration::from_millis(10)).await;
+        assert_eq!(handler.select_cached().unwrap().name(), "a");
+        assert_eq!(handler.scan_count.load(Ordering::Relaxed), 4);
+        assert_eq!(handler.select_cached().unwrap().name(), "a");
+        assert_eq!(handler.scan_count.load(Ordering::Relaxed), 4);
+
+        // Snapshot refresh must not pin superseded snapshot/handlers.
+        drop((a, b, c));
+        let fresh = make_node("fresh");
+        slot.store(Arc::new(vec![fresh]));
+        handler.invalidate_stale_cache();
+        assert!(
+            a_weak.upgrade().is_none(),
+            "url-test snapshot cache must not pin retired handlers"
+        );
+        assert_eq!(handler.select_cached().unwrap().name(), "fresh");
+        assert_eq!(handler.scan_count.load(Ordering::Relaxed), 5);
+        assert_eq!(handler.select_cached().unwrap().name(), "fresh");
+        assert_eq!(handler.scan_count.load(Ordering::Relaxed), 5);
+    }
+
+    #[tokio::test]
+    async fn unrelated_probes_do_not_invalidate_urltest_cache() {
+        use std::sync::atomic::Ordering;
+        use crate::{
+            app::remote_content_manager::{
+                healthcheck::HealthCheck,
+                providers::proxy_provider::PlainProvider,
+            },
+            proxy::{AnyStream, mocks::MockDummyOutboundHandler},
+        };
+        use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
+
+        let make_http_node = |name: &str, delay_ms: u64| {
+            let mut mock = MockDummyOutboundHandler::new();
+            mock.expect_name().return_const(name.to_owned());
+            mock.expect_connect_stream().returning(move |_, _| {
+                let (client, mut server) = duplex(1024);
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 512];
+                    let _ = server.read(&mut buf).await;
+                    if delay_ms > 0 {
+                        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                    }
+                    let _ = server
+                        .write_all(
+                            b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        )
+                        .await;
+                    let _ = server.shutdown().await;
+                });
+                Ok(AnyStream::new(client))
+            });
+            OutboundNode::protocol(Arc::new(mock))
+        };
+
+        let pm = ProxyManager::new(Arc::new(NoopResolver), None);
+        let a = make_http_node("a", 5);
+        let b = make_http_node("b", 40);
+        let other = make_http_node("other", 5);
+
+        let url_a = "http://group-a.example/generate_204";
+        let url_b = "http://group-b.example/generate_204";
+        let url_adhoc = "http://adhoc.example/generate_204";
+
+        let prov_a = Arc::new(
+            PlainProvider::new(
+                "prov-a".to_owned(),
+                vec![a.clone(), b.clone()],
+                HealthCheck::new(
+                    vec![a.clone(), b.clone()],
+                    url_a.to_owned(),
+                    0,
+                    true,
+                    pm.clone(),
+                ),
+            )
+            .unwrap(),
+        );
+        let group_a = super::Handler::new(
+            super::HandlerOptions {
+                name: "GROUP-A".to_owned(),
+                ..Default::default()
+            },
+            0,
+            vec![prov_a],
+            pm.clone(),
+        );
+
+        pm.check(&vec![a.clone(), b.clone()], url_a, Some(Duration::from_secs(2)))
+            .await;
+        assert_eq!(group_a.select_cached().unwrap().name(), "a");
+        assert_eq!(group_a.scan_count.load(Ordering::Relaxed), 1);
+
+        // Unrelated name-based delay report, unrelated node probe on another URL,
+        // and even probing `a` on a different ad-hoc URL must NOT invalidate group_a.
+        pm.report_delay("unrelated", true, Duration::from_millis(10))
+            .await;
+        pm.check(&vec![other], url_b, Some(Duration::from_secs(2)))
+            .await;
+        pm.check(&vec![a.clone()], url_adhoc, Some(Duration::from_secs(2)))
+            .await;
+
+        assert_eq!(group_a.select_cached().unwrap().name(), "a");
+        assert_eq!(group_a.get_active_proxy().await.unwrap().name(), "a");
+        assert_eq!(
+            group_a.scan_count.load(Ordering::Relaxed),
+            1,
+            "unrelated probes must not invalidate url-test cached selection"
+        );
+
+        // A real update on (a, url_a) MUST invalidate group_a and rescan once.
+        let _ = pm
+            .check(&vec![b.clone()], url_a, Some(Duration::from_secs(2)))
+            .await;
+        // Wait: b's delay may differ from its previous sample; force a definite
+        // state transition on (a, url_a) via a failing probe or delay change.
+        let mut failing = MockDummyOutboundHandler::new();
+        failing.expect_name().return_const("fail-check".to_owned());
+        let fail_node = OutboundNode::protocol(Arc::new(failing));
+        let prov_no_url = Arc::new(
+            PlainProvider::new(
+                "prov-no-url".to_owned(),
+                vec![fail_node.clone()],
+                HealthCheck::new(
+                    vec![fail_node.clone()],
+                    String::new(),
+                    0,
+                    true,
+                    pm.clone(),
+                ),
+            )
+            .unwrap(),
+        );
+        let group_no_url = super::Handler::new(
+            super::HandlerOptions {
+                name: "GROUP-NO-URL".to_owned(),
+                ..Default::default()
+            },
+            0,
+            vec![prov_no_url],
+            pm.clone(),
+        );
+        assert_eq!(group_no_url.select_cached().unwrap().name(), "fail-check");
+        assert_eq!(group_no_url.scan_count.load(Ordering::Relaxed), 1);
+        pm.report_delay("unrelated-2", true, Duration::from_millis(15))
+            .await;
+        assert_eq!(group_no_url.select_cached().unwrap().name(), "fail-check");
+        assert_eq!(
+            group_no_url.scan_count.load(Ordering::Relaxed),
+            1,
+            "unrelated name-based report must not invalidate no-URL url-test group"
+        );
+        pm.report_delay("fail-check", true, Duration::from_millis(25))
+            .await;
+        assert_eq!(group_no_url.select_cached().unwrap().name(), "fail-check");
+        assert_eq!(group_no_url.scan_count.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn multi_provider_refresh_shares_snapshot_and_handles_between_tracker_and_traffic() {
+        use std::{collections::HashMap, sync::atomic::Ordering};
+        use arc_swap::ArcSwap;
+        use fancy_regex::Regex;
+        use crate::app::remote_content_manager::providers::proxy_provider::{
+            ArcProxyProvider, FilteredProxyProvider, provider_identity,
+        };
+
+        let make_node = |name: &str| {
+            OutboundNode::protocol(Arc::new(NoopOutboundHandler {
+                name: name.to_owned(),
+            }))
+        };
+
+        let slot1 = Arc::new(ArcSwap::from_pointee(vec![make_node("HK-1")]));
+        let slot2 = Arc::new(ArcSwap::from_pointee(vec![make_node("US-1")]));
+
+        let mut p1_mock = MockDummyProxyProvider::new();
+        p1_mock.expect_proxies().returning({
+            let slot1 = slot1.clone();
+            move || slot1.load_full()
+        });
+        p1_mock.expect_route_changes().returning(|| None);
+        let p1: ArcProxyProvider = Arc::new(p1_mock);
+
+        let mut p2_mock = MockDummyProxyProvider::new();
+        p2_mock.expect_proxies().returning({
+            let slot2 = slot2.clone();
+            move || slot2.load_full()
+        });
+        p2_mock.expect_route_changes().returning(|| None);
+        let p2: ArcProxyProvider = Arc::new(p2_mock);
+
+        let filtered_p1: ArcProxyProvider = Arc::new(FilteredProxyProvider::new(
+            p1.clone(),
+            Arc::new(Regex::new(r"^HK-").unwrap()),
+            None,
+        ));
+
+        let pm = ProxyManager::new(Arc::new(NoopResolver), None);
+        let handler = super::Handler::new(
+            super::HandlerOptions {
+                name: "MULTI".to_owned(),
+                ..Default::default()
+            },
+            0,
+            vec![filtered_p1, p2.clone()],
+            pm.clone(),
+        );
+
+        // Simulate provider refresh + tracker running rebuild_topology BEFORE traffic.
+        slot1.store(Arc::new(vec![make_node("HK-2"), make_node("SG-skip")]));
+        handler.invalidate_stale_cache();
+
+        let mut provider_snaps = HashMap::new();
+        provider_snaps.insert(provider_identity(&p1), p1.proxies());
+        provider_snaps.insert(provider_identity(&p2), p2.proxies());
+
+        let inputs = handler.providers().input_snapshots_from(&provider_snaps);
+        let (tracker_members, tracker_urls) =
+            handler.providers().get_members_from_input_snapshots(&inputs);
+        let mut sources = Vec::new();
+        handler.route_changes_from(&tracker_members, &tracker_urls, &mut sources);
+        let _ = handler.peek_selected_from(&tracker_members, &tracker_urls);
+        assert_eq!(handler.snapshot_builds.load(Ordering::Relaxed), 1);
+
+        // Traffic now resolves live members and calls select_cached(): must reuse
+        // the exact same merged Arc and cached handles built by the tracker.
+        let (traffic_members, _) = handler.providers().get_members(false);
+        assert!(
+            Arc::ptr_eq(&tracker_members, &traffic_members),
+            "tracker and traffic must share the same merged snapshot Arc after refresh"
+        );
+        let _ = handler.select_cached();
+        assert_eq!(handler.snapshot_builds.load(Ordering::Relaxed), 1);
+
+        // Subsequent health updates + tracker peek_selected_from must NOT rebuild handles.
+        pm.report_delay("HK-2", true, Duration::from_millis(15)).await;
+        let _ = handler.peek_selected_from(&tracker_members, &tracker_urls);
+        let _ = handler.select_cached();
+        assert_eq!(
+            handler.snapshot_builds.load(Ordering::Relaxed),
+            1,
+            "tracker incremental recomputation must reuse cached handles without rebuilding"
         );
     }
 }

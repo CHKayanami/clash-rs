@@ -28,7 +28,9 @@ use super::{
     datagram::UdpPacket,
     utils::{
         new_udp_socket,
-        quic_stream::{QuicBidiStream, QuicStreamLease},
+        quic_stream::{
+            QuicBidiStream, QuicStreamLease, QuicUploadGrace, close_after_grace,
+        },
     },
 };
 use crate::{
@@ -62,9 +64,11 @@ use std::{
         atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
     },
     task::{Context, Poll},
+    time::Duration,
 };
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
+    runtime::Handle,
     sync::{Mutex, mpsc::error::TrySendError},
 };
 
@@ -673,12 +677,8 @@ impl Drop for HystStreamLease {
 }
 
 impl QuicStreamLease for HystStreamLease {
-    fn may_close_on_release(&self) -> bool {
-        !self.conn.should_keep_idle()
-    }
-
-    async fn wait_closed(&self) {
-        let _ = self.conn.conn.closed().await;
+    fn record_upload_ack_grace(&self, grace: Duration) {
+        self.conn.upload_grace.extend(grace);
     }
 }
 
@@ -696,6 +696,8 @@ pub struct HysteriaConnection {
     /// Set once evicted from the handler cache so the connection closes as
     /// soon as all active streams finish, even when `keep_idle` is enabled.
     evicted: AtomicBool,
+    upload_grace: QuicUploadGrace,
+    runtime: Handle,
     cache_slot: Weak<ArcSwapOption<HysteriaConnection>>,
 
     // config
@@ -730,6 +732,8 @@ impl HysteriaConnection {
             active_streams: AtomicUsize::new(0),
             keep_idle,
             evicted: AtomicBool::new(false),
+            upload_grace: QuicUploadGrace::default(),
+            runtime: Handle::current(),
             cache_slot,
             udp_mtu: udp_mtu.map(|x| x as usize),
         });
@@ -796,9 +800,7 @@ impl HysteriaConnection {
         );
         if closed_now {
             self.evict_from_cache();
-            if self.conn.close_reason().is_none() {
-                self.conn.close(0u32.into(), b"idle");
-            }
+            self.close_with_grace();
         } else if became_zero && !self.should_keep_idle() {
             // Re-check `keep_idle` / `evicted` after publishing zero (SeqCst)
             // so a concurrent `set_keep_idle(false)` or eviction cannot miss.
@@ -818,10 +820,18 @@ impl HysteriaConnection {
             .is_ok()
         {
             self.evict_from_cache();
-            if self.conn.close_reason().is_none() {
-                self.conn.close(0u32.into(), b"idle");
-            }
+            self.close_with_grace();
         }
+    }
+
+    fn close_with_grace(self: &Arc<Self>) {
+        close_after_grace(
+            &self.runtime,
+            &self.upload_grace,
+            &self.conn,
+            b"idle",
+            self._preface.clone(),
+        );
     }
 
     async fn spawn_tasks(self: Arc<Self>) {
@@ -1156,6 +1166,8 @@ mod unit_tests {
             active_streams: AtomicUsize::new(0),
             keep_idle: Arc::new(AtomicBool::new(true)),
             evicted: AtomicBool::new(false),
+            upload_grace: QuicUploadGrace::default(),
+            runtime: Handle::current(),
             cache_slot: Weak::new(),
             udp_mtu: None,
         });
@@ -1243,6 +1255,8 @@ mod unit_tests {
             active_streams: AtomicUsize::new(0),
             keep_idle: handler.keep_idle.clone(),
             evicted: AtomicBool::new(false),
+            upload_grace: QuicUploadGrace::default(),
+            runtime: Handle::current(),
             cache_slot: Arc::downgrade(&handler.conn),
             udp_mtu: None,
         });
@@ -1418,6 +1432,8 @@ mod unit_tests {
             active_streams: AtomicUsize::new(0),
             keep_idle: handler.keep_idle.clone(),
             evicted: AtomicBool::new(false),
+            upload_grace: QuicUploadGrace::default(),
+            runtime: Handle::current(),
             cache_slot: Arc::downgrade(&handler.conn),
             udp_mtu: None,
         });
@@ -1519,6 +1535,8 @@ mod unit_tests {
             active_streams: AtomicUsize::new(0),
             keep_idle: handler.keep_idle.clone(),
             evicted: AtomicBool::new(false),
+            upload_grace: QuicUploadGrace::default(),
+            runtime: Handle::current(),
             cache_slot: Arc::downgrade(&handler.conn),
             udp_mtu: None,
         });
@@ -1605,6 +1623,8 @@ mod unit_tests {
             active_streams: AtomicUsize::new(0),
             keep_idle: handler.keep_idle.clone(),
             evicted: AtomicBool::new(false),
+            upload_grace: QuicUploadGrace::default(),
+            runtime: Handle::current(),
             cache_slot: Arc::downgrade(&handler.conn),
             udp_mtu: None,
         });
@@ -1662,6 +1682,129 @@ mod unit_tests {
         assert!(connection.close_reason().is_none());
 
         connection.close(0u32.into(), b"test complete");
+        peer.close(0u32.into(), b"test complete");
+    }
+
+    #[tokio::test]
+    async fn test_keep_idle_switch_after_upload_ack_respects_grace_window() {
+        use tokio::io::AsyncWriteExt;
+
+        crate::setup_default_crypto_provider();
+        let CertifiedKey { cert, signing_key } =
+            generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
+        let server_config = ServerConfig::with_single_cert(
+            vec![cert.der().clone()],
+            signing_key.into(),
+        )
+        .unwrap();
+        let server =
+            Endpoint::server(server_config, "127.0.0.1:0".parse().unwrap()).unwrap();
+        let mut roots = RootCertStore::empty();
+        roots.add(cert.der().clone()).unwrap();
+        let mut client = Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        client.set_default_client_config(
+            ClientConfig::with_root_certificates(Arc::new(roots)).unwrap(),
+        );
+        let connecting =
+            client.connect(server.local_addr().unwrap(), "localhost").unwrap();
+        let (connection, peer) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(connecting, async {
+                server.accept().await.unwrap().await.unwrap()
+            })
+        })
+        .await
+        .unwrap();
+        let connection = Arc::new(connection.unwrap());
+
+        let options: OutboundHysteria2 = yaml_serde::from_str(
+            "name: grace-after-ack\nserver: localhost\nport: 443\npassword: test-only",
+        )
+        .unwrap();
+        let handler = Handler::try_from(options).unwrap();
+        let preface = Arc::new((
+            connection.open_uni().await.unwrap(),
+            connection.open_uni().await.unwrap(),
+            connection.open_uni().await.unwrap(),
+        ));
+        let weak_preface = Arc::downgrade(&preface);
+        let managed = Arc::new(HysteriaConnection {
+            conn: connection.clone(),
+            _preface: Some(preface),
+            udp_sessions: Arc::new(SyncMutex::new(HashMap::new())),
+            active_streams: AtomicUsize::new(0),
+            keep_idle: handler.keep_idle.clone(),
+            evicted: AtomicBool::new(false),
+            upload_grace: QuicUploadGrace::default(),
+            runtime: Handle::current(),
+            cache_slot: Arc::downgrade(&handler.conn),
+            udp_mtu: None,
+        });
+        handler.conn.store(Some(managed.clone()));
+
+        // keep_idle is enabled while client uploads and drops the stream.
+        let lease = managed.try_acquire_lease().unwrap();
+        let (tx, rx) = connection.open_bi().await.unwrap();
+        let mut stream = HystStream::new(tx, rx, lease);
+        let payload = b"acked-upload-before-node-switch";
+        stream.write_all(payload).await.unwrap();
+        drop(stream);
+
+        // Wait until QUIC ACKs the FIN and the stream lease is released.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while managed.active_streams.load(Ordering::Acquire) != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("upload ACK must release kept-idle stream lease");
+
+        // Immediately switch away from this node (disable keep_idle): the
+        // connection must honor the remaining grace period from the ACK.
+        handler.set_keep_idle(false);
+        assert!(managed.is_closing());
+        assert!(handler.conn.load().is_none());
+
+        // Drop the test's own `managed` handle so only the delayed close task
+        // can keep the H3 preface alive across the grace window.
+        drop(managed);
+
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(
+            connection.close_reason().is_none(),
+            "switching nodes right after upload ACK must not close connection \
+             before grace expires"
+        );
+        assert!(
+            weak_preface.upgrade().is_some(),
+            "delayed close task must keep H3 preface alive during grace window"
+        );
+
+        let (_peer_tx, mut peer_rx) =
+            tokio::time::timeout(Duration::from_secs(2), peer.accept_bi())
+                .await
+                .unwrap()
+                .unwrap();
+        let received = tokio::time::timeout(
+            Duration::from_secs(2),
+            peer_rx.read_to_end(1024),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(received, payload);
+
+        // Once the grace period from ACK expires, the connection closes cleanly
+        // and the delayed close task releases the H3 preface.
+        tokio::time::timeout(Duration::from_secs(3), connection.closed())
+            .await
+            .expect("connection must close after upload ACK grace expires");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while weak_preface.upgrade().is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("delayed close task must release H3 preface after close");
         peer.close(0u32.into(), b"test complete");
     }
 

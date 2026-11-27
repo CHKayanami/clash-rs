@@ -1,15 +1,16 @@
 use std::{
-    future::Future,
     io,
     pin::Pin,
     task::{Context, Poll},
     time::Duration,
 };
+use parking_lot::Mutex;
+use quinn::Connection;
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
     runtime::Handle,
     select,
-    time::{sleep, timeout},
+    time::{Instant, sleep, timeout},
 };
 
 /// Upper bound for waiting on QUIC stream drain so a dead peer cannot pin a
@@ -22,13 +23,66 @@ pub(crate) const QUIC_STREAM_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 /// our upload before a `CONNECTION_CLOSE` arrives.
 pub(crate) const QUIC_HALF_CLOSED_DRAIN_GRACE: Duration = Duration::from_secs(1);
 
+/// Connection-level deadline tracking the latest upload-FIN ACK grace window.
+/// Recording the deadline on the connection itself guarantees that disabling
+/// `keep_idle`, switching nodes, or retiring a handler shortly after an ACK
+/// still respects the remaining grace window measured from that ACK.
+#[derive(Default)]
+pub(crate) struct QuicUploadGrace {
+    deadline: Mutex<Option<Instant>>,
+}
+
+impl QuicUploadGrace {
+    pub(crate) fn extend(&self, grace: Duration) {
+        let candidate = Instant::now() + grace;
+        let mut guard = self.deadline.lock();
+        if guard.is_none_or(|prev| candidate > prev) {
+            *guard = Some(candidate);
+        }
+    }
+
+    pub(crate) fn remaining(&self) -> Option<Duration> {
+        let deadline = (*self.deadline.lock())?;
+        let now = Instant::now();
+        (deadline > now).then(|| deadline - now)
+    }
+}
+
+/// Closes `conn` once any remaining upload-FIN ACK grace window in `grace` has
+/// elapsed (or immediately if no grace window is active). `keep_alive` is held
+/// by the delayed close task until closing finishes so callers can pin
+/// auxiliary resources (such as H3 control streams) across the grace window.
+pub(crate) fn close_after_grace(
+    runtime: &Handle,
+    grace: &QuicUploadGrace,
+    conn: &Connection,
+    reason: &'static [u8],
+    keep_alive: impl Send + 'static,
+) {
+    if conn.close_reason().is_some() {
+        return;
+    }
+    if let Some(remaining) = grace.remaining() {
+        let conn = conn.clone();
+        runtime.spawn(async move {
+            select! {
+                _ = sleep(remaining) => {}
+                _ = conn.closed() => {}
+            }
+            if conn.close_reason().is_none() {
+                conn.close(0u32.into(), reason);
+            }
+            drop(keep_alive);
+        });
+        return;
+    }
+    conn.close(0u32.into(), reason);
+}
+
 /// Connection lease tracked by [`QuicBidiStream`].
 pub(crate) trait QuicStreamLease: Send + Sync + 'static {
-    /// Returns `true` if releasing this lease may close the underlying QUIC
-    /// connection (idle keep-alive is disabled or the connection is retired).
-    fn may_close_on_release(&self) -> bool;
-    /// Resolves once the underlying QUIC connection closes.
-    fn wait_closed(&self) -> impl Future<Output = ()> + Send;
+    /// Records an upload-FIN ACK grace period on the underlying connection.
+    fn record_upload_ack_grace(&self, grace: Duration);
 }
 
 /// Shared QUIC bidirectional stream wrapper with bounded graceful upload drain
@@ -135,12 +189,7 @@ impl<L: QuicStreamLease> Drop for QuicBidiStream<L> {
                 self.runtime.spawn(async move {
                     let _ = timeout(QUIC_STREAM_DRAIN_TIMEOUT, async {
                         let _ = send.stopped().await;
-                        if lease.may_close_on_release() {
-                            select! {
-                                _ = sleep(QUIC_HALF_CLOSED_DRAIN_GRACE) => {}
-                                _ = lease.wait_closed() => {}
-                            }
-                        }
+                        lease.record_upload_ack_grace(QUIC_HALF_CLOSED_DRAIN_GRACE);
                     })
                     .await;
                     drop(lease);

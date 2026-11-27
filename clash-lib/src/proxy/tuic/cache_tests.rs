@@ -114,3 +114,67 @@ async fn dropping_handler_retires_connection_and_stops_heartbeat() {
     remote.close(0_u32.into(), b"done");
     server.close(0_u32.into(), b"done");
 }
+
+#[tokio::test]
+async fn keep_idle_switch_after_upload_ack_respects_grace_window() {
+    use tokio::io::AsyncWriteExt;
+    use super::stream::TuicStream;
+
+    let (server, _) = quic_test_support::server(b"tuic");
+    let handler = Handler::new(options(server.local_addr().unwrap().port()));
+    let resolver: ThreadSafeDNSResolver = Arc::new(NoopResolver);
+    let session = Session::default();
+
+    let (conn_res, remote) = tokio::join!(
+        handler.get_conn(&resolver, &session),
+        async { server.accept().await.unwrap().await.unwrap() },
+    );
+    let (conn, lease) = conn_res.unwrap();
+    let quic_conn = conn.conn.clone();
+
+    // keep_idle is enabled while client uploads and drops the stream.
+    let (tx, rx) = quic_conn.open_bi().await.unwrap();
+    let mut stream = TuicStream::new(tx, rx, lease);
+    let payload = b"tuic-acked-upload-before-switch";
+    stream.write_all(payload).await.unwrap();
+    drop(stream);
+
+    // Wait until QUIC ACKs the FIN and the stream lease is released.
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while conn.active_streams_for_test() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("upload ACK must release kept-idle stream lease");
+
+    // Immediately switch away (disable keep_idle): connection must stay open
+    // for the remaining grace period computed from the ACK.
+    handler.set_keep_idle(false);
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert!(
+        quic_conn.close_reason().is_none(),
+        "switching TUIC node right after upload ACK must honor grace window"
+    );
+
+    let (_peer_tx, mut peer_rx) =
+        tokio::time::timeout(Duration::from_secs(2), remote.accept_bi())
+            .await
+            .unwrap()
+            .unwrap();
+    let received = tokio::time::timeout(
+        Duration::from_secs(2),
+        peer_rx.read_to_end(1024),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(received, payload);
+
+    tokio::time::timeout(Duration::from_secs(3), quic_conn.closed())
+        .await
+        .expect("TUIC connection must close after upload ACK grace expires");
+
+    remote.close(0_u32.into(), b"done");
+    server.close(0_u32.into(), b"done");
+}

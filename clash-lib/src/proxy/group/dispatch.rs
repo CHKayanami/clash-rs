@@ -33,7 +33,7 @@ impl ProxyGroup {
     }
     pub(crate) fn route_changes_from(
         &self,
-        proxies: &[OutboundNode],
+        proxies: &Arc<Vec<OutboundNode>>,
         urls: &MemberUrls,
         sources: &mut Vec<RouteChange>,
     ) {
@@ -54,6 +54,45 @@ impl ProxyGroup {
             Self::Retry(_) => {}
         }
     }
+    pub(crate) fn input_snapshots_from(
+        &self,
+        snapshots: &HashMap<usize, Arc<Vec<OutboundNode>>>,
+    ) -> Vec<Arc<Vec<OutboundNode>>> {
+        match self {
+            Self::Selector(h) => h.providers().input_snapshots_from(snapshots),
+            Self::Fallback(h) => h.providers().input_snapshots_from(snapshots),
+            Self::UrlTest(h) => h.providers().input_snapshots_from(snapshots),
+            Self::LoadBalance(h) => h.providers().input_snapshots_from(snapshots),
+            Self::Smart(h) => h.providers().input_snapshots_from(snapshots),
+            #[cfg(test)]
+            Self::Retry(_) => Vec::new(),
+        }
+    }
+    pub(crate) fn members_from_input_snapshots(
+        &self,
+        input_snapshots: &[Arc<Vec<OutboundNode>>],
+    ) -> (Arc<Vec<OutboundNode>>, MemberUrls) {
+        match self {
+            Self::Selector(h) => h
+                .providers()
+                .get_members_from_input_snapshots(input_snapshots),
+            Self::Fallback(h) => h
+                .providers()
+                .get_members_from_input_snapshots(input_snapshots),
+            Self::UrlTest(h) => h
+                .providers()
+                .get_members_from_input_snapshots(input_snapshots),
+            Self::LoadBalance(h) => h
+                .providers()
+                .get_members_from_input_snapshots(input_snapshots),
+            Self::Smart(h) => h
+                .providers()
+                .get_members_from_input_snapshots(input_snapshots),
+            #[cfg(test)]
+            Self::Retry(_) => (Arc::new(Vec::new()), MemberUrls::Uniform(None)),
+        }
+    }
+    #[cfg(test)]
     pub(crate) fn members_from_snapshots(
         &self,
         snapshots: &HashMap<usize, Arc<Vec<OutboundNode>>>,
@@ -72,8 +111,8 @@ impl ProxyGroup {
         match self {
             Self::Selector(h) => h.providers().invalidate_stale_cache(),
             Self::Fallback(h) => h.providers().invalidate_stale_cache(),
-            Self::UrlTest(h) => h.providers().invalidate_stale_cache(),
-            Self::LoadBalance(h) => h.providers().invalidate_stale_cache(),
+            Self::UrlTest(h) => h.invalidate_stale_cache(),
+            Self::LoadBalance(h) => h.invalidate_stale_cache(),
             Self::Smart(h) => h.providers().invalidate_stale_cache(),
             #[cfg(test)]
             Self::Retry(_) => {}
@@ -89,7 +128,7 @@ impl ProxyGroup {
     }
     pub(crate) fn peek_selected_from(
         &self,
-        proxies: &[OutboundNode],
+        proxies: &Arc<Vec<OutboundNode>>,
         urls: &MemberUrls,
     ) -> Option<OutboundNode> {
         match self {

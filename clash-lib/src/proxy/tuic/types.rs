@@ -6,7 +6,7 @@ use crate::{
             new_udp_socket,
             quic_stream::{
                 QUIC_HALF_CLOSED_DRAIN_GRACE, QUIC_STREAM_DRAIN_TIMEOUT,
-                QuicStreamLease,
+                QuicStreamLease, QuicUploadGrace, close_after_grace,
             },
         },
     },
@@ -23,6 +23,7 @@ use std::{
     },
     time::Duration,
 };
+use tokio::runtime::Handle;
 use tracing::debug;
 use uuid::Uuid;
 
@@ -127,12 +128,8 @@ impl Drop for TuicStreamLease {
 }
 
 impl QuicStreamLease for TuicStreamLease {
-    fn may_close_on_release(&self) -> bool {
-        !self.conn.should_keep_idle()
-    }
-
-    async fn wait_closed(&self) {
-        let _ = self.conn.conn.closed().await;
+    fn record_upload_ack_grace(&self, grace: Duration) {
+        self.conn.upload_grace.extend(grace);
     }
 }
 
@@ -149,6 +146,8 @@ pub struct TuicConnection {
     /// Set once evicted or retired (e.g. handler dropped on provider refresh or
     /// config reload) so the connection closes as soon as active streams finish.
     evicted: AtomicBool,
+    upload_grace: QuicUploadGrace,
+    runtime: Handle,
     drain_timeout_ms: AtomicU64,
     cache_slot: Weak<ArcSwapOption<TuicConnection>>,
 }
@@ -222,9 +221,7 @@ impl TuicConnection {
         );
         if closed_now {
             self.evict_from_cache();
-            if self.conn.close_reason().is_none() {
-                self.conn.close(0u32.into(), b"idle");
-            }
+            self.close_with_grace();
         } else if became_zero && !self.should_keep_idle() {
             self.close_if_idle();
         }
@@ -242,10 +239,23 @@ impl TuicConnection {
             .is_ok()
         {
             self.evict_from_cache();
-            if self.conn.close_reason().is_none() {
-                self.conn.close(0u32.into(), b"idle");
-            }
+            self.close_with_grace();
         }
+    }
+
+    fn close_with_grace(self: &Arc<Self>) {
+        close_after_grace(
+            &self.runtime,
+            &self.upload_grace,
+            &self.conn,
+            b"idle",
+            (),
+        );
+    }
+
+    #[cfg(test)]
+    pub(super) fn active_streams_for_test(&self) -> usize {
+        self.active_streams.load(Ordering::Acquire) & !TUIC_CLOSING_BIT
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -272,6 +282,8 @@ impl TuicConnection {
             active_streams: AtomicUsize::new(0),
             keep_idle,
             evicted: AtomicBool::new(false),
+            upload_grace: QuicUploadGrace::default(),
+            runtime: Handle::current(),
             drain_timeout_ms: AtomicU64::new(
                 TUIC_STREAM_DRAIN_TIMEOUT.as_millis() as u64,
             ),
@@ -346,6 +358,8 @@ impl TuicConnection {
             active_streams: AtomicUsize::new(0),
             keep_idle: Arc::new(AtomicBool::new(true)),
             evicted: AtomicBool::new(false),
+            upload_grace: QuicUploadGrace::default(),
+            runtime: Handle::current(),
             drain_timeout_ms: AtomicU64::new(
                 TUIC_STREAM_DRAIN_TIMEOUT.as_millis() as u64,
             ),

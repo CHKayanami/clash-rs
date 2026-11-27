@@ -432,10 +432,19 @@ impl OutboundManager {
         handlers: HashMap<String, OutboundNode>,
         proxy_manager: ProxyManager,
     ) -> Self {
+        Self::new_for_test_with_providers(handlers, HashMap::new(), proxy_manager)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_for_test_with_providers(
+        handlers: HashMap<String, OutboundNode>,
+        proxy_providers: HashMap<String, ArcProxyProvider>,
+        proxy_manager: ProxyManager,
+    ) -> Self {
         let registry = Arc::new(ArcSwap::from_pointee(handlers));
         Self {
             registry,
-            proxy_providers: HashMap::new(),
+            proxy_providers,
             proxy_manager,
             selector_control: HashMap::new(),
         }

@@ -94,6 +94,29 @@ impl Provider for FilteredProxyProvider {
 impl ProxyProvider for FilteredProxyProvider {
     fn proxies(&self) -> Arc<Vec<OutboundNode>> {
         let current = self.inner.proxies();
+        self.resolve_from_raw_snapshot(current)
+    }
+
+    fn route_changes(&self) -> Option<RouteChange> {
+        self.inner.route_changes()
+    }
+
+    fn healthcheck_url(&self) -> Option<&str> {
+        self.inner.healthcheck_url()
+    }
+
+    fn raw_snapshot_from_snapshots(
+        &self,
+        snapshots: &HashMap<usize, Arc<Vec<OutboundNode>>>,
+    ) -> Arc<Vec<OutboundNode>> {
+        self.inner.raw_snapshot_from_snapshots(snapshots)
+    }
+
+    fn resolve_from_raw_snapshot(
+        &self,
+        raw: Arc<Vec<OutboundNode>>,
+    ) -> Arc<Vec<OutboundNode>> {
+        let current = self.inner.resolve_from_raw_snapshot(raw);
         if let Some(cached) = self.cache.load().as_deref()
             && Arc::ptr_eq(&cached.raw_snapshot, &current)
         {
@@ -103,7 +126,8 @@ impl ProxyProvider for FilteredProxyProvider {
         let filtered_arc = self.filter_nodes(&current);
 
         // Validate under `publish_lock` so a concurrent provider refresh +
-        // cache invalidation can never be overwritten with a superseded snapshot.
+        // cache invalidation can never be overwritten with a superseded snapshot,
+        // while allowing tracker rebuilds and traffic lookups to share one Arc.
         let _guard = self.publish_lock.lock();
         if let Some(cached) = self.cache.load().as_deref()
             && Arc::ptr_eq(&cached.raw_snapshot, &current)
@@ -120,25 +144,12 @@ impl ProxyProvider for FilteredProxyProvider {
         filtered_arc
     }
 
-    fn route_changes(&self) -> Option<RouteChange> {
-        self.inner.route_changes()
-    }
-
-    fn healthcheck_url(&self) -> Option<&str> {
-        self.inner.healthcheck_url()
-    }
-
     fn proxies_from_snapshots(
         &self,
         snapshots: &HashMap<usize, Arc<Vec<OutboundNode>>>,
     ) -> Arc<Vec<OutboundNode>> {
-        let current = self.inner.proxies_from_snapshots(snapshots);
-        if let Some(cached) = self.cache.load().as_deref()
-            && Arc::ptr_eq(&cached.raw_snapshot, &current)
-        {
-            return cached.filtered_snapshot.clone();
-        }
-        self.filter_nodes(&current)
+        let raw = self.raw_snapshot_from_snapshots(snapshots);
+        self.resolve_from_raw_snapshot(raw)
     }
 
     fn is_snapshot_current(&self, snapshot: &Arc<Vec<OutboundNode>>) -> bool {

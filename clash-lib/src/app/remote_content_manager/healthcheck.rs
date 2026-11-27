@@ -7,9 +7,10 @@ use std::{
     time::Duration,
 };
 
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use tokio::{
     runtime::Handle,
+    sync::watch,
     task::JoinHandle,
     time::{Instant, interval},
 };
@@ -28,10 +29,45 @@ const STATE_RUNNING_PENDING: u8 = 2;
 /// skip a scheduled periodic probe.
 const PERIODIC_TIMER_JITTER: Duration = Duration::from_millis(50);
 
+struct PassCounts {
+    /// Total passes started (including the currently running pass).
+    started: u64,
+    /// Total passes completed.
+    completed: u64,
+}
+
+struct PassSync {
+    counts: Mutex<PassCounts>,
+    completed_tx: watch::Sender<u64>,
+}
+
+impl PassSync {
+    fn new() -> Self {
+        let (completed_tx, _) = watch::channel(0u64);
+        Self {
+            counts: Mutex::new(PassCounts {
+                started: 0,
+                completed: 0,
+            }),
+            completed_tx,
+        }
+    }
+}
+
+enum EnterOutcome {
+    Run,
+    WaitForPass {
+        target_pass: u64,
+        rx: watch::Receiver<u64>,
+    },
+    Skip,
+}
+
 struct CheckingGuard<'a> {
     proxy_manager: &'a ProxyManager,
     inner: &'a Arc<RwLock<HealthCheckInner>>,
     state: &'a Arc<AtomicU8>,
+    pass_sync: &'a Arc<PassSync>,
     url: &'a str,
     cancel: &'a CancellationToken,
     armed: bool,
@@ -48,26 +84,51 @@ impl Drop for CheckingGuard<'_> {
         if !self.armed {
             return;
         }
-        if self.cancel.is_cancelled() {
-            self.state.store(STATE_IDLE, Ordering::Release);
-            return;
-        }
-        if HealthCheck::finish_or_continue(self.state) {
+        let spawn_followup = {
+            let mut counts = self.pass_sync.counts.lock();
+            if self.cancel.is_cancelled() {
+                self.state.store(STATE_IDLE, Ordering::Release);
+                counts.completed = counts.started;
+                let _ = self.pass_sync.completed_tx.send_replace(counts.completed);
+                false
+            } else if HealthCheck::finish_or_continue(self.state) {
+                if Handle::try_current().is_ok() {
+                    // Mark the follow-up pass started before releasing the lock
+                    // so queued waiters keep waiting for this follow-up pass.
+                    counts.started += 1;
+                    true
+                } else {
+                    self.state.store(STATE_IDLE, Ordering::Release);
+                    counts.started += 1;
+                    counts.completed = counts.started;
+                    let _ =
+                        self.pass_sync.completed_tx.send_replace(counts.completed);
+                    false
+                }
+            } else {
+                counts.completed = counts.started;
+                let _ = self.pass_sync.completed_tx.send_replace(counts.completed);
+                false
+            }
+        };
+
+        if spawn_followup
+            && let Ok(handle) = Handle::try_current()
+        {
             // A forced/refresh check was queued while this future was cancelled.
             // Spawn a follow-up runner to probe the latest node set.
-            if let Ok(handle) = Handle::try_current() {
-                let pm = self.proxy_manager.clone();
-                let inner = self.inner.clone();
-                let state = self.state.clone();
-                let url = self.url.to_owned();
-                let cancel = self.cancel.clone();
-                handle.spawn(async move {
-                    HealthCheck::run_check_loop(&pm, &inner, &state, &url, &cancel, None)
-                        .await;
-                });
-            } else {
-                self.state.store(STATE_IDLE, Ordering::Release);
-            }
+            let pm = self.proxy_manager.clone();
+            let inner = self.inner.clone();
+            let state = self.state.clone();
+            let pass_sync = self.pass_sync.clone();
+            let url = self.url.to_owned();
+            let cancel = self.cancel.clone();
+            handle.spawn(async move {
+                HealthCheck::run_check_loop(
+                    &pm, &inner, &state, &pass_sync, &url, &cancel, None,
+                )
+                .await;
+            });
         }
     }
 }
@@ -97,6 +158,7 @@ pub struct HealthCheck {
     proxy_manager: ProxyManager,
     inner: Arc<RwLock<HealthCheckInner>>,
     state: Arc<AtomicU8>,
+    pass_sync: Arc<PassSync>,
     cancellation_token: CancellationToken,
 }
 
@@ -121,6 +183,7 @@ impl HealthCheck {
                 task_handle: None,
             })),
             state: Arc::new(AtomicU8::new(STATE_IDLE)),
+            pass_sync: Arc::new(PassSync::new()),
             cancellation_token: CancellationToken::new(),
         }
     }
@@ -215,23 +278,75 @@ impl HealthCheck {
         proxy_manager: &ProxyManager,
         inner: &Arc<RwLock<HealthCheckInner>>,
         state: &Arc<AtomicU8>,
+        pass_sync: &Arc<PassSync>,
         url: &str,
         cancel: &CancellationToken,
         periodic_interval: Option<u64>,
     ) -> bool {
-        if !Self::try_enter_or_queue(state, periodic_interval.is_none()) {
-            debug!("healthcheck already in progress for {}, deferring", url);
-            return false;
+        let force = periodic_interval.is_none();
+        let outcome = {
+            let mut counts = pass_sync.counts.lock();
+            if Self::try_enter_or_queue(state, force) {
+                counts.started += 1;
+                EnterOutcome::Run
+            } else if force {
+                let target_pass = counts.started + 1;
+                let rx = pass_sync.completed_tx.subscribe();
+                EnterOutcome::WaitForPass { target_pass, rx }
+            } else {
+                EnterOutcome::Skip
+            }
+        };
+
+        match outcome {
+            EnterOutcome::Run => {
+                Self::run_check_loop(
+                    proxy_manager,
+                    inner,
+                    state,
+                    pass_sync,
+                    url,
+                    cancel,
+                    periodic_interval,
+                )
+                .await;
+                true
+            }
+            EnterOutcome::WaitForPass {
+                target_pass,
+                mut rx,
+            } => {
+                debug!(
+                    "healthcheck already in progress for {}, waiting for queued pass #{}",
+                    url, target_pass
+                );
+                loop {
+                    if *rx.borrow_and_update() >= target_pass {
+                        break;
+                    }
+                    tokio::select! {
+                        _ = cancel.cancelled() => break,
+                        res = rx.changed() => {
+                            if res.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+                false
+            }
+            EnterOutcome::Skip => {
+                debug!("healthcheck already in progress for {}, deferring", url);
+                false
+            }
         }
-        Self::run_check_loop(proxy_manager, inner, state, url, cancel, periodic_interval)
-            .await;
-        true
     }
 
     async fn run_check_loop(
         proxy_manager: &ProxyManager,
         inner: &Arc<RwLock<HealthCheckInner>>,
         state: &Arc<AtomicU8>,
+        pass_sync: &Arc<PassSync>,
         url: &str,
         cancel: &CancellationToken,
         periodic_interval: Option<u64>,
@@ -240,6 +355,7 @@ impl HealthCheck {
             proxy_manager,
             inner,
             state,
+            pass_sync,
             url,
             cancel,
             armed: true,
@@ -292,13 +408,25 @@ impl HealthCheck {
                 proxy_manager.check(&targets, url, None).await;
             }
 
-            if cancel.is_cancelled() {
-                state.store(STATE_IDLE, Ordering::Release);
-                guard.disarm();
-                break;
-            }
+            let continue_next = {
+                let mut counts = pass_sync.counts.lock();
+                counts.completed = counts.started;
+                let completed_now = counts.completed;
+                if cancel.is_cancelled() {
+                    state.store(STATE_IDLE, Ordering::Release);
+                    let _ = pass_sync.completed_tx.send_replace(completed_now);
+                    false
+                } else if Self::finish_or_continue(state) {
+                    counts.started += 1;
+                    let _ = pass_sync.completed_tx.send_replace(completed_now);
+                    true
+                } else {
+                    let _ = pass_sync.completed_tx.send_replace(completed_now);
+                    false
+                }
+            };
 
-            if Self::finish_or_continue(state) {
+            if continue_next {
                 current_interval = None;
                 continue;
             }
@@ -320,9 +448,19 @@ impl HealthCheck {
         let pm = proxy_manager.clone();
         let inner = self.inner.clone();
         let state = self.state.clone();
+        let pass_sync = self.pass_sync.clone();
         let cancel_init = self.cancellation_token.clone();
         tokio::spawn(async move {
-            Self::run_check(&pm, &inner, &state, &url, &cancel_init, None).await;
+            Self::run_check(
+                &pm,
+                &inner,
+                &state,
+                &pass_sync,
+                &url,
+                &cancel_init,
+                None,
+            )
+            .await;
         });
 
         let weak_inner = Arc::downgrade(&self.inner);
@@ -330,6 +468,7 @@ impl HealthCheck {
         let url = self.url.clone();
         let cancel = self.cancellation_token.clone();
         let state = self.state.clone();
+        let pass_sync = self.pass_sync.clone();
         let task_handle = tokio::spawn(async move {
             let mut ticker = interval(Duration::from_secs(interval_secs));
             // Skip immediate first tick since initial check was already spawned above.
@@ -347,6 +486,7 @@ impl HealthCheck {
                                 &proxy_manager,
                                 &inner,
                                 &state,
+                                &pass_sync,
                                 &url,
                                 &cancel,
                                 Some(interval_secs),
@@ -377,6 +517,7 @@ impl HealthCheck {
             &self.proxy_manager,
             &self.inner,
             &self.state,
+            &self.pass_sync,
             &self.url,
             &self.cancellation_token,
             None,
@@ -501,6 +642,7 @@ mod tests {
             &hc_fast.proxy_manager,
             &hc_fast.inner,
             &hc_fast.state,
+            &hc_fast.pass_sync,
             &hc_fast.url,
             &hc_fast.cancellation_token,
             Some(30),
@@ -513,6 +655,7 @@ mod tests {
             &hc_slow.proxy_manager,
             &hc_slow.inner,
             &hc_slow.state,
+            &hc_slow.pass_sync,
             &hc_slow.url,
             &hc_slow.cancellation_token,
             Some(300),
@@ -615,11 +758,29 @@ mod tests {
         first_started.notified().await;
 
         // Provider refreshes with a new node while the first check is in flight.
+        // A forced `check()` queued during an active check must wait until the
+        // follow-up pass has actually completed rather than returning early.
         hc.update(vec![OutboundNode::protocol(Arc::new(new_mock))]).await;
-        hc.check().await;
+        let hc_second = hc.clone();
+        let second_task = tokio::spawn(async move { hc_second.check().await });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while hc.state.load(Ordering::Acquire) != STATE_RUNNING_PENDING {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("queued forced check must transition state to STATE_RUNNING_PENDING");
+        assert!(
+            !second_task.is_finished(),
+            "manual/refresh check must wait for its queued follow-up pass to complete"
+        );
 
         allow_first_finish.notify_one();
         first_task.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), second_task)
+            .await
+            .expect("queued check waiter must finish once follow-up pass completes")
+            .unwrap();
 
         assert_eq!(second_calls.load(Ordering::SeqCst), 1);
     }
@@ -704,16 +865,28 @@ mod tests {
 
         // Refresh updates nodes and queues STATE_RUNNING_PENDING.
         hc.update(vec![OutboundNode::protocol(Arc::new(new_mock))]).await;
-        hc.check().await;
-        assert_eq!(hc.state.load(Ordering::Acquire), STATE_RUNNING_PENDING);
+        let hc_second = hc.clone();
+        let second_task = tokio::spawn(async move { hc_second.check().await });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while hc.state.load(Ordering::Acquire) != STATE_RUNNING_PENDING {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("queued refresh must set STATE_RUNNING_PENDING");
 
-        // Cancel the in-flight check; CheckingGuard must spawn the queued refresh.
+        // Cancel the in-flight check; CheckingGuard must spawn the queued refresh,
+        // and the queued caller must not return until that follow-up completes.
         first_task.abort();
         let _ = first_task.await;
 
         tokio::time::timeout(Duration::from_secs(2), second_done.notified())
             .await
             .expect("queued refresh must run after active check is cancelled");
+        tokio::time::timeout(Duration::from_secs(2), second_task)
+            .await
+            .expect("queued check waiter must finish after spawned follow-up completes")
+            .unwrap();
         assert_eq!(second_calls.load(Ordering::SeqCst), 1);
     }
 
@@ -780,7 +953,15 @@ mod tests {
         old_started.notified().await;
 
         hc.update(vec![OutboundNode::protocol(Arc::new(new_mock))]).await;
-        hc.check().await;
+        let hc_second = hc.clone();
+        let second_task = tokio::spawn(async move { hc_second.check().await });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while hc.state.load(Ordering::Acquire) != STATE_RUNNING_PENDING {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("queued refresh must set STATE_RUNNING_PENDING");
 
         first_task.abort();
         let _ = first_task.await;
@@ -791,14 +972,11 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(2), new_done.notified())
             .await
             .expect("refresh check must complete for replacement node");
-        // Wait for refresh batch to finish reporting state.
-        tokio::time::timeout(Duration::from_secs(2), async {
-            while hc.state.load(Ordering::Acquire) != STATE_IDLE {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
+        // Waiting on `second_task` must itself wait until the replacement pass finishes.
+        tokio::time::timeout(Duration::from_secs(2), second_task)
+            .await
+            .expect("queued check waiter must finish after replacement pass completes")
+            .unwrap();
         assert!(pm.alive("shared-node"));
         assert!(pm.last_delay("shared-node").is_some());
     }
@@ -826,6 +1004,7 @@ mod tests {
             &pm,
             &hc_zero.inner,
             &hc_zero.state,
+            &hc_zero.pass_sync,
             &hc_zero.url,
             &hc_zero.cancellation_token,
             Some(30),

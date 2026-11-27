@@ -5,16 +5,21 @@
 use std::{
     collections::{HashMap, HashSet},
     future::{pending, poll_fn},
+    mem::take,
+    pin::Pin,
     sync::Arc,
     task::Poll,
     time::Duration,
 };
 
+use futures::{
+    Stream, StreamExt, future::BoxFuture, stream::FuturesUnordered,
+};
 use tokio::{
-    sync::watch::Receiver,
+    sync::{oneshot, watch::Receiver},
     time::{Instant, interval, sleep_until},
 };
-use tokio_util::sync::{CancellationToken, ReusableBoxFuture};
+use tokio_util::sync::CancellationToken;
 use tracing::debug;
 
 use crate::{
@@ -27,7 +32,7 @@ use crate::{
     config::{def::RunMode, internal::proxy::PROXY_GLOBAL},
     proxy::{
         OutboundNode, RouteChange, group::ProxyGroup,
-        utils::provider_helper::MemberUrls,
+        utils::provider_helper::{MemberUrls, Providers},
     },
 };
 
@@ -70,110 +75,183 @@ impl CachedRoots {
     }
 }
 
-struct SourceWait {
-    source: RouteChange,
-    wait: ReusableBoxFuture<'static, Receiver<()>>,
+enum WaitOutcome {
+    Changed {
+        id: usize,
+        generation: u64,
+        receiver: Receiver<()>,
+        cancel: oneshot::Receiver<()>,
+    },
+    Cancelled,
 }
 
-async fn wait_change(mut receiver: Receiver<()>) -> Receiver<()> {
-    // SourceWait retains the sender for the entire lifetime of this future.
-    receiver
-        .changed()
-        .await
-        .expect("subscription retains its notification source");
-    receiver
-}
-
-impl SourceWait {
-    fn new(source: RouteChange) -> Self {
-        let wait = ReusableBoxFuture::new(wait_change(source.subscribe()));
-        Self { source, wait }
+async fn wait_source(
+    id: usize,
+    generation: u64,
+    mut receiver: Receiver<()>,
+    mut cancel: oneshot::Receiver<()>,
+) -> WaitOutcome {
+    tokio::select! {
+        biased;
+        _ = &mut cancel => WaitOutcome::Cancelled,
+        res = receiver.changed() => match res {
+            Ok(()) => WaitOutcome::Changed {
+                id,
+                generation,
+                receiver,
+                cancel,
+            },
+            Err(_) => WaitOutcome::Cancelled,
+        },
     }
 }
 
-fn ensure_waits(waits: &mut Vec<SourceWait>, desired: Vec<RouteChange>) {
-    let mut existing: HashSet<usize> =
-        waits.iter().map(|w| w.source.identity()).collect();
-    for source in desired {
-        if existing.insert(source.identity()) {
-            waits.push(SourceWait::new(source));
-        }
-    }
+struct ActiveSource {
+    generation: u64,
+    _source: RouteChange,
+    _cancel: oneshot::Sender<()>,
 }
 
-fn sync_waits(waits: &mut Vec<SourceWait>, desired: Vec<RouteChange>) {
-    let mut wanted = HashSet::with_capacity(desired.len());
-    let mut existing: HashSet<usize> =
-        waits.iter().map(|w| w.source.identity()).collect();
-    for source in desired {
+/// Ready-queue driven watcher set backed by `FuturesUnordered` so notification
+/// work scales with woken sources rather than total watched sources.
+#[derive(Default)]
+struct SourceWaitSet {
+    active: HashMap<usize, ActiveSource>,
+    futures: FuturesUnordered<BoxFuture<'static, WaitOutcome>>,
+    next_gen: u64,
+}
+
+impl SourceWaitSet {
+    fn insert_if_missing(&mut self, source: RouteChange) {
         let id = source.identity();
-        wanted.insert(id);
-        if existing.insert(id) {
-            waits.push(SourceWait::new(source));
+        if self.active.contains_key(&id) {
+            return;
+        }
+        let generation = self.next_gen;
+        self.next_gen = self.next_gen.wrapping_add(1);
+        let receiver = source.subscribe();
+        let (cancel_tx, cancel_rx) = oneshot::channel();
+        self.active.insert(
+            id,
+            ActiveSource {
+                generation,
+                _source: source,
+                _cancel: cancel_tx,
+            },
+        );
+        self.futures
+            .push(Box::pin(wait_source(id, generation, receiver, cancel_rx)));
+    }
+
+    fn ensure(&mut self, desired: Vec<RouteChange>) {
+        for source in desired {
+            self.insert_if_missing(source);
         }
     }
-    waits.retain(|w| wanted.contains(&w.source.identity()));
-}
 
-/// Waits until at least one source changes and records the fired source
-/// identity into `fired_sources`.
-async fn wait_any_change(
-    waits: &mut [SourceWait],
-    fired_sources: &mut HashSet<usize>,
-) {
-    if waits.is_empty() {
+    fn sync(&mut self, desired: Vec<RouteChange>) {
+        let mut wanted = HashSet::with_capacity(desired.len());
+        for source in desired {
+            wanted.insert(source.identity());
+            self.insert_if_missing(source);
+        }
+        self.active.retain(|id, _| wanted.contains(id));
+    }
+
+    /// Waits until at least one active source changes and records the fired
+    /// source identity into `fired_sources`. Cancel-safe across `tokio::select!`.
+    async fn wait_any(&mut self, fired_sources: &mut HashSet<usize>) {
+        if self.active.is_empty() {
+            while let Some(WaitOutcome::Cancelled) = self.futures.next().await {}
+            pending::<()>().await;
+            return;
+        }
+        while let Some(outcome) = self.futures.next().await {
+            match outcome {
+                WaitOutcome::Cancelled => {}
+                WaitOutcome::Changed {
+                    id,
+                    generation,
+                    receiver,
+                    cancel,
+                } => {
+                    if self
+                        .active
+                        .get(&id)
+                        .is_some_and(|entry| entry.generation == generation)
+                    {
+                        fired_sources.insert(id);
+                        self.futures.push(Box::pin(wait_source(
+                            id, generation, receiver, cancel,
+                        )));
+                        return;
+                    }
+                }
+            }
+        }
         pending::<()>().await;
-        return;
     }
-    let fired_id = poll_fn(|cx| {
-        for entry in waits.iter_mut() {
-            if let Poll::Ready(receiver) = entry.wait.poll(cx) {
-                entry.wait.set(wait_change(receiver));
-                return Poll::Ready(entry.source.identity());
-            }
-        }
-        Poll::Pending
-    })
-    .await;
-    fired_sources.insert(fired_id);
-}
 
-/// Drains any already-pending notifications without blocking and records all
-/// fired source identities into `fired_sources`.
-async fn drain_ready_changes(
-    waits: &mut [SourceWait],
-    fired_sources: &mut HashSet<usize>,
-) {
-    poll_fn(|cx| {
-        for entry in waits.iter_mut() {
-            while let Poll::Ready(receiver) = entry.wait.poll(cx) {
-                fired_sources.insert(entry.source.identity());
-                entry.wait.set(wait_change(receiver));
+    /// Drains any already-ready notifications without blocking and records all
+    /// fired source identities into `fired_sources`.
+    async fn drain_ready(&mut self, fired_sources: &mut HashSet<usize>) {
+        let mut rearm = Vec::new();
+        poll_fn(|cx| {
+            while let Poll::Ready(Some(outcome)) =
+                Pin::new(&mut self.futures).poll_next(cx)
+            {
+                if let WaitOutcome::Changed {
+                    id,
+                    generation,
+                    receiver,
+                    cancel,
+                } = outcome
+                    && self
+                        .active
+                        .get(&id)
+                        .is_some_and(|entry| entry.generation == generation)
+                {
+                    fired_sources.insert(id);
+                    rearm.push((id, generation, receiver, cancel));
+                }
             }
+            Poll::Ready(())
+        })
+        .await;
+        for (id, generation, receiver, cancel) in rearm {
+            self.futures
+                .push(Box::pin(wait_source(id, generation, receiver, cancel)));
         }
-        Poll::Ready(())
-    })
-    .await;
+    }
 }
 
 struct GroupSnapshot {
     group: ProxyGroup,
+    input_snapshots: Vec<Arc<Vec<OutboundNode>>>,
     members: Arc<Vec<OutboundNode>>,
     urls: MemberUrls,
+    route_changes: Vec<RouteChange>,
     selected: Option<OutboundNode>,
 }
 
 #[derive(Default)]
 struct IdleTrackerCache {
     registry: Arc<HashMap<String, OutboundNode>>,
-    all_protocols: Vec<OutboundNode>,
+    protocols: HashMap<usize, OutboundNode>,
+    /// Active protocol nodes absent from the rebuilt topology (such as
+    /// out-of-topology `dialer_dependency` nodes or retired provider nodes
+    /// awaiting the immediately following reachability pass).
+    extra_protocols: HashMap<usize, OutboundNode>,
+    active_protocols: HashSet<usize>,
+    pending_init: HashMap<usize, OutboundNode>,
     groups: HashMap<usize, GroupSnapshot>,
     source_to_groups: HashMap<usize, Vec<usize>>,
     provider_ids: HashSet<usize>,
-    prev_state: HashMap<usize, bool>,
     last_mode: Option<RunMode>,
     #[cfg(test)]
     traversal_count: usize,
+    #[cfg(test)]
+    rebuilt_group_count: usize,
 }
 
 impl IdleTrackerCache {
@@ -183,12 +261,13 @@ impl IdleTrackerCache {
 
     /// Rebuilds the cached fixed-snapshot topology and updates `waits` before
     /// computing initial group selections so notifications cannot be lost
-    /// across startup or provider refreshes.
+    /// across startup or provider refreshes. Groups whose input provider
+    /// snapshots did not change reuse their cached member list and watchers.
     fn rebuild_topology(
         &mut self,
         outbound_manager: &OutboundManager,
         mode_changes: &RouteChange,
-        waits: &mut Vec<SourceWait>,
+        waits: &mut SourceWaitSet,
     ) {
         outbound_manager.invalidate_stale_provider_caches();
 
@@ -197,18 +276,17 @@ impl IdleTrackerCache {
         let provider_sources = outbound_manager.collect_provider_route_changes();
         let mut pre_sources = provider_sources.clone();
         pre_sources.push(mode_changes.clone());
-        ensure_waits(waits, pre_sources);
+        waits.ensure(pre_sources);
 
         let registry = outbound_manager.registry_snapshot();
         let provider_snapshots = outbound_manager.capture_provider_snapshots();
 
-        let mut seen_protocols = HashSet::new();
-        let mut all_protocols = Vec::new();
+        let mut new_protocols: HashMap<usize, OutboundNode> = HashMap::new();
         let mut record_protocol = |node: &OutboundNode| {
-            if node.as_protocol().is_some()
-                && seen_protocols.insert(node.identity())
-            {
-                all_protocols.push(node.clone());
+            if node.as_protocol().is_some() {
+                new_protocols
+                    .entry(node.identity())
+                    .or_insert_with(|| node.clone());
             }
         };
 
@@ -221,7 +299,8 @@ impl IdleTrackerCache {
             }
         }
 
-        let mut groups = HashMap::new();
+        let mut old_groups = take(&mut self.groups);
+        let mut groups = HashMap::with_capacity(old_groups.len());
         let mut source_to_groups: HashMap<usize, Vec<usize>> = HashMap::new();
         let mut desired_sources = Vec::new();
         let mut seen_sources = HashSet::new();
@@ -243,37 +322,60 @@ impl IdleTrackerCache {
                 continue;
             };
             let group_id = node.identity();
-            let (members, urls) =
-                group.members_from_snapshots(&provider_snapshots);
-            for member in members.iter() {
+            let input_snapshots = group.input_snapshots_from(&provider_snapshots);
+
+            let entry = match old_groups.remove(&group_id) {
+                Some(mut prev)
+                    if Providers::snapshots_match(
+                        &prev.input_snapshots,
+                        &input_snapshots,
+                    ) =>
+                {
+                    prev.group = group.clone();
+                    prev.input_snapshots = input_snapshots;
+                    prev
+                }
+                _ => {
+                    #[cfg(test)]
+                    {
+                        self.rebuilt_group_count += 1;
+                    }
+                    let (members, urls) =
+                        group.members_from_input_snapshots(&input_snapshots);
+                    let mut group_sources = Vec::new();
+                    group.route_changes_from(&members, &urls, &mut group_sources);
+                    let mut seen_for_group =
+                        HashSet::with_capacity(group_sources.len());
+                    group_sources.retain(|s| seen_for_group.insert(s.identity()));
+                    GroupSnapshot {
+                        group: group.clone(),
+                        input_snapshots,
+                        members,
+                        urls,
+                        route_changes: group_sources,
+                        selected: None,
+                    }
+                }
+            };
+
+            for member in entry.members.iter() {
                 record_protocol(member);
             }
 
-            let mut group_sources = Vec::new();
-            group.route_changes_from(&members, &urls, &mut group_sources);
-            let mut seen_for_group = HashSet::with_capacity(group_sources.len());
-            for source in group_sources {
-                let src_id = source.identity();
-                if seen_for_group.insert(src_id) {
-                    source_to_groups.entry(src_id).or_default().push(group_id);
-                }
-                push_source(source);
+            for source in &entry.route_changes {
+                source_to_groups
+                    .entry(source.identity())
+                    .or_default()
+                    .push(group_id);
+                push_source(source.clone());
             }
 
-            groups.insert(
-                group_id,
-                GroupSnapshot {
-                    group: group.clone(),
-                    members,
-                    urls,
-                    selected: None,
-                },
-            );
+            groups.insert(group_id, entry);
         }
 
         // Subscribe to all member/group notification sources before reading
         // initial selections so updates cannot fall between inspect and watch.
-        sync_waits(waits, desired_sources);
+        waits.sync(desired_sources);
 
         for entry in groups.values_mut() {
             if entry.group.stable_selection() {
@@ -282,8 +384,39 @@ impl IdleTrackerCache {
             }
         }
 
+        // Preserve currently active nodes that disappeared from the topology
+        // (including out-of-topology `dialer_dependency` nodes and retired
+        // provider nodes) in `extra_protocols` so the following
+        // `apply_reachability` either keeps them active without flapping or
+        // explicitly turns `keep_idle` off and drops them.
+        let old_protocols = take(&mut self.protocols);
+        let old_extra = take(&mut self.extra_protocols);
+        let mut extra_protocols = HashMap::new();
+        for &id in &self.active_protocols {
+            if !new_protocols.contains_key(&id)
+                && let Some(node) =
+                    old_protocols.get(&id).or_else(|| old_extra.get(&id))
+            {
+                extra_protocols.insert(id, node.clone());
+            }
+        }
+
+        // Explicitly initialize keep_idle for newly added protocol nodes while
+        // preserving diff-only updates for surviving nodes.
+        self.pending_init
+            .retain(|id, _| new_protocols.contains_key(id));
+        for (&id, node) in &new_protocols {
+            if !old_protocols.contains_key(&id) && !old_extra.contains_key(&id) {
+                self.pending_init.insert(id, node.clone());
+            }
+        }
+
         self.registry = registry;
-        self.all_protocols = all_protocols;
+        self.protocols = new_protocols;
+        self.extra_protocols = extra_protocols;
+        self.active_protocols.retain(|id| {
+            self.protocols.contains_key(id) || self.extra_protocols.contains_key(id)
+        });
         self.groups = groups;
         self.source_to_groups = source_to_groups;
         self.provider_ids = provider_ids;
@@ -301,7 +434,7 @@ impl IdleTrackerCache {
             .filter_map(|name| self.registry.get(name).cloned())
             .collect();
         let mut visited = HashSet::with_capacity(queue.len());
-        let mut active_protocols = HashSet::new();
+        let mut new_active = HashSet::new();
 
         while let Some(node) = queue.pop() {
             if !visited.insert(node.identity()) {
@@ -309,7 +442,14 @@ impl IdleTrackerCache {
             }
             match &node {
                 OutboundNode::Protocol(_) => {
-                    active_protocols.insert(node.identity());
+                    let id = node.identity();
+                    new_active.insert(id);
+                    if !self.protocols.contains_key(&id)
+                        && !self.extra_protocols.contains_key(&id)
+                    {
+                        self.extra_protocols.insert(id, node.clone());
+                        self.pending_init.insert(id, node.clone());
+                    }
                     if let Some(dep) = node.dialer_dependency().or_else(|| {
                         node.support_dialer()
                             .and_then(|name| self.registry.get(name).cloned())
@@ -334,22 +474,59 @@ impl IdleTrackerCache {
             }
         }
 
-        let mut live_ids = HashSet::with_capacity(self.all_protocols.len());
-        for node in &self.all_protocols {
-            let id = node.identity();
-            live_ids.insert(id);
-            let keep = active_protocols.contains(&id);
-            if self.prev_state.insert(id, keep) != Some(keep) {
+        let initialized_now = if self.pending_init.is_empty() {
+            None
+        } else {
+            let mut done = HashSet::with_capacity(self.pending_init.len());
+            for (id, node) in self.pending_init.drain() {
+                let keep = new_active.contains(&id);
                 debug!(
                     outbound = %node.name(),
                     keep_idle = keep,
                     "updating outbound idle connection policy"
                 );
                 node.set_keep_idle(keep);
+                done.insert(id);
+            }
+            Some(done)
+        };
+
+        for id in new_active.difference(&self.active_protocols) {
+            if initialized_now.as_ref().is_some_and(|done| done.contains(id)) {
+                continue;
+            }
+            if let Some(node) = self
+                .protocols
+                .get(id)
+                .or_else(|| self.extra_protocols.get(id))
+            {
+                debug!(
+                    outbound = %node.name(),
+                    keep_idle = true,
+                    "updating outbound idle connection policy"
+                );
+                node.set_keep_idle(true);
             }
         }
 
-        self.prev_state.retain(|id, _| live_ids.contains(id));
+        for id in self.active_protocols.difference(&new_active) {
+            if let Some(node) = self
+                .protocols
+                .get(id)
+                .or_else(|| self.extra_protocols.get(id))
+            {
+                debug!(
+                    outbound = %node.name(),
+                    keep_idle = false,
+                    "updating outbound idle connection policy"
+                );
+                node.set_keep_idle(false);
+            }
+        }
+
+        self.active_protocols = new_active;
+        self.extra_protocols
+            .retain(|id, _| self.active_protocols.contains(id));
     }
 
     /// Recomputes selections only for groups impacted by `fired_sources` using
@@ -433,7 +610,7 @@ pub(crate) async fn run_reference_tracker(
         CachedRoots::build(&router, dns_resolver.referenced_outbounds());
     let mode_changes = dispatcher.mode_changes();
 
-    let mut waits = Vec::new();
+    let mut waits = SourceWaitSet::default();
     let mut cache = IdleTrackerCache::default();
     cache.rebuild_topology(&outbound_manager, &mode_changes, &mut waits);
 
@@ -448,7 +625,7 @@ pub(crate) async fn run_reference_tracker(
         fired_sources.clear();
         tokio::select! {
             _ = cancel.cancelled() => break,
-            _ = wait_any_change(&mut waits, &mut fired_sources) => {
+            _ = waits.wait_any(&mut fired_sources) => {
                 // Coalesce burst notifications (e.g. batch healthchecks) before
                 // updating group selections or scanning the outbound graph.
                 let deadline = Instant::now() + NOTIFY_COALESCE_WINDOW;
@@ -456,13 +633,13 @@ pub(crate) async fn run_reference_tracker(
                     tokio::select! {
                         _ = cancel.cancelled() => return,
                         _ = sleep_until(deadline) => break,
-                        _ = wait_any_change(&mut waits, &mut fired_sources) => {}
+                        _ = waits.wait_any(&mut fired_sources) => {}
                     }
                 }
-                drain_ready_changes(&mut waits, &mut fired_sources).await;
+                waits.drain_ready(&mut fired_sources).await;
             }
             _ = fallback_tick.tick() => {
-                drain_ready_changes(&mut waits, &mut fired_sources).await;
+                waits.drain_ready(&mut fired_sources).await;
             }
         }
 
@@ -854,7 +1031,7 @@ mod tests {
 
         let manager = OutboundManager::new_for_test(handlers);
         let mode_changes = RouteChange::default();
-        let mut waits = Vec::new();
+        let mut waits = SourceWaitSet::default();
         let mut cache = IdleTrackerCache::default();
         let roots = vec!["AUTO".to_owned()];
 
@@ -871,7 +1048,7 @@ mod tests {
         pm.report_delay("node-b", true, Duration::from_millis(80))
             .await;
         let mut fired = HashSet::new();
-        drain_ready_changes(&mut waits, &mut fired).await;
+        waits.drain_ready(&mut fired).await;
         assert!(!fired.is_empty());
         let traversed =
             cache.handle_incremental_changes(&fired, &roots, RunMode::Rule);
@@ -892,7 +1069,7 @@ mod tests {
         pm.report_delay("node-b", true, Duration::from_millis(5))
             .await;
         fired.clear();
-        drain_ready_changes(&mut waits, &mut fired).await;
+        waits.drain_ready(&mut fired).await;
         let traversed =
             cache.handle_incremental_changes(&fired, &roots, RunMode::Rule);
         assert!(traversed);
@@ -994,7 +1171,7 @@ mod tests {
 
         let manager = OutboundManager::new_for_test(handlers);
         let mode_changes = RouteChange::default();
-        let mut waits = Vec::new();
+        let mut waits = SourceWaitSet::default();
         let mut cache = IdleTrackerCache::default();
         let roots = vec![
             "chained-to-leaf".to_owned(),
@@ -1017,9 +1194,327 @@ mod tests {
         // Switching the global dialer-proxy group updates keep_idle to the new member.
         SelectorControl::select(front_group.as_ref(), "front-group-b").unwrap();
         let mut fired = HashSet::new();
-        drain_ready_changes(&mut waits, &mut fired).await;
+        waits.drain_ready(&mut fired).await;
         cache.handle_incremental_changes(&fired, &roots, RunMode::Rule);
         assert!(!keep_group_a.load(Ordering::SeqCst));
         assert!(keep_group_b.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn source_wait_set_collects_batch_and_cancels_removed_sources() {
+        let sources: Vec<RouteChange> = (0..32).map(|_| RouteChange::default()).collect();
+        let mut waits = SourceWaitSet::default();
+        waits.sync(sources.clone());
+
+        // Arm all futures by draining once (none fired yet).
+        let mut fired = HashSet::new();
+        waits.drain_ready(&mut fired).await;
+        assert!(fired.is_empty());
+
+        // Fire a batch of 10 sources; wait_any + drain_ready must capture all 10.
+        let expected: HashSet<usize> = sources[0..10]
+            .iter()
+            .map(|s| {
+                s.notify();
+                s.identity()
+            })
+            .collect();
+        waits.wait_any(&mut fired).await;
+        waits.drain_ready(&mut fired).await;
+        assert_eq!(fired, expected);
+
+        // Re-firing one of the previously fired sources must still wake cleanly.
+        fired.clear();
+        sources[3].notify();
+        waits.wait_any(&mut fired).await;
+        assert!(fired.contains(&sources[3].identity()));
+
+        // Sync to keep only the second half; removed sources must not wake even
+        // if notified, and surviving sources keep working without losing events.
+        waits.sync(sources[16..32].to_vec());
+        sources[0].notify();
+        sources[20].notify();
+        fired.clear();
+        waits.wait_any(&mut fired).await;
+        waits.drain_ready(&mut fired).await;
+        assert!(!fired.contains(&sources[0].identity()));
+        assert!(fired.contains(&sources[20].identity()));
+
+        // Re-adding a previously removed source works cleanly.
+        waits.sync(vec![sources[0].clone(), sources[20].clone()]);
+        fired.clear();
+        waits.drain_ready(&mut fired).await;
+        sources[0].notify();
+        waits.wait_any(&mut fired).await;
+        assert!(fired.contains(&sources[0].identity()));
+    }
+
+    #[tokio::test]
+    async fn rebuild_reuses_unchanged_group_snapshots_and_updates_keep_idle_by_diff() {
+        use std::sync::atomic::AtomicUsize;
+        use arc_swap::ArcSwap;
+        use fancy_regex::Regex;
+        use crate::app::remote_content_manager::providers::proxy_provider::{
+            ArcProxyProvider, FilteredProxyProvider,
+        };
+
+        let make_counted_leaf = |name: &str, initial: bool| {
+            let keep = Arc::new(AtomicBool::new(initial));
+            let calls = Arc::new(AtomicUsize::new(0));
+            let mut mock = MockDummyOutboundHandler::new();
+            mock.expect_name().return_const(name.to_owned());
+            mock.expect_proto().return_const(OutboundType::Hysteria2);
+            mock.expect_support_udp().return_const(true);
+            {
+                let keep = keep.clone();
+                let calls = calls.clone();
+                mock.expect_set_keep_idle().returning(move |v| {
+                    keep.store(v, Ordering::SeqCst);
+                    calls.fetch_add(1, Ordering::SeqCst);
+                });
+            }
+            (OutboundNode::protocol(Arc::new(mock)), keep, calls)
+        };
+
+        let (a1, keep_a1, calls_a1) = make_counted_leaf("HK-a1", true);
+        let (a2, keep_a2, calls_a2) = make_counted_leaf("HK-a2", true);
+        let (b1, keep_b1, calls_b1) = make_counted_leaf("US-b1", true);
+        let (b2, keep_b2, calls_b2) = make_counted_leaf("US-b2", true);
+
+        let slot_a = Arc::new(ArcSwap::from_pointee(vec![a1.clone(), a2.clone()]));
+        let slot_b = Arc::new(ArcSwap::from_pointee(vec![b1.clone(), b2.clone()]));
+        let changes_a = RouteChange::default();
+        let changes_b = RouteChange::default();
+
+        let mut prov_a_mock = MockDummyProxyProvider::new();
+        prov_a_mock.expect_proxies().returning({
+            let slot_a = slot_a.clone();
+            move || slot_a.load_full()
+        });
+        prov_a_mock.expect_route_changes().returning({
+            let changes_a = changes_a.clone();
+            move || Some(changes_a.clone())
+        });
+        let prov_a: ArcProxyProvider = Arc::new(prov_a_mock);
+
+        let mut prov_b_mock = MockDummyProxyProvider::new();
+        prov_b_mock.expect_proxies().returning({
+            let slot_b = slot_b.clone();
+            move || slot_b.load_full()
+        });
+        prov_b_mock.expect_route_changes().returning({
+            let changes_b = changes_b.clone();
+            move || Some(changes_b.clone())
+        });
+        let prov_b: ArcProxyProvider = Arc::new(prov_b_mock);
+
+        let filtered_a: ArcProxyProvider = Arc::new(FilteredProxyProvider::new(
+            prov_a.clone(),
+            Arc::new(Regex::new(r"^HK-").unwrap()),
+            None,
+        ));
+        let filtered_b: ArcProxyProvider = Arc::new(FilteredProxyProvider::new(
+            prov_b.clone(),
+            Arc::new(Regex::new(r"^US-").unwrap()),
+            None,
+        ));
+
+        let group_a = Arc::new(
+            selector::Handler::new(
+                selector::HandlerOptions {
+                    name: "GROUP_A".to_owned(),
+                    ..Default::default()
+                },
+                vec![filtered_a],
+                Some("HK-a1".to_owned()),
+            )
+            .await,
+        );
+        let group_b = Arc::new(
+            selector::Handler::new(
+                selector::HandlerOptions {
+                    name: "GROUP_B".to_owned(),
+                    ..Default::default()
+                },
+                vec![filtered_b],
+                Some("US-b1".to_owned()),
+            )
+            .await,
+        );
+
+        let group_a_node = OutboundNode::group(group_a.clone());
+        let group_b_node = OutboundNode::group(group_b.clone());
+        let group_a_id = group_a_node.identity();
+        let group_b_id = group_b_node.identity();
+
+        let mut handlers = HashMap::new();
+        handlers.insert("GROUP_A".to_owned(), group_a_node);
+        handlers.insert("GROUP_B".to_owned(), group_b_node);
+
+        let mut providers_map = HashMap::new();
+        providers_map.insert("prov_a".to_owned(), prov_a);
+        providers_map.insert("prov_b".to_owned(), prov_b);
+
+        let pm = ProxyManager::new(Arc::new(NoopResolver), None);
+        let manager =
+            OutboundManager::new_for_test_with_providers(handlers, providers_map, pm);
+        let mode_changes = RouteChange::default();
+        let mut waits = SourceWaitSet::default();
+        let mut cache = IdleTrackerCache::default();
+        let roots = vec!["GROUP_A".to_owned(), "GROUP_B".to_owned()];
+
+        // Initial startup: every node (reachable and unreachable) is explicitly initialized once.
+        cache.rebuild_topology(&manager, &mode_changes, &mut waits);
+        cache.apply_reachability(&roots, RunMode::Rule);
+        assert_eq!(cache.rebuilt_group_count, 2);
+        assert!(keep_a1.load(Ordering::SeqCst));
+        assert!(!keep_a2.load(Ordering::SeqCst));
+        assert!(keep_b1.load(Ordering::SeqCst));
+        assert!(!keep_b2.load(Ordering::SeqCst));
+        assert_eq!(calls_a1.load(Ordering::SeqCst), 1);
+        assert_eq!(calls_a2.load(Ordering::SeqCst), 1);
+        assert_eq!(calls_b1.load(Ordering::SeqCst), 1);
+        assert_eq!(calls_b2.load(Ordering::SeqCst), 1);
+
+        let group_b_members_before = cache.groups[&group_b_id].members.clone();
+
+        // Incremental switch in GROUP_A (HK-a1 -> HK-a2): diff updates ONLY a1 and a2;
+        // b1 and b2 must NOT have set_keep_idle called again.
+        SelectorControl::select(group_a.as_ref(), "HK-a2").unwrap();
+        let mut fired = HashSet::new();
+        waits.drain_ready(&mut fired).await;
+        assert!(cache.handle_incremental_changes(&fired, &roots, RunMode::Rule));
+        assert!(!keep_a1.load(Ordering::SeqCst));
+        assert!(keep_a2.load(Ordering::SeqCst));
+        assert_eq!(calls_a1.load(Ordering::SeqCst), 2);
+        assert_eq!(calls_a2.load(Ordering::SeqCst), 2);
+        assert_eq!(calls_b1.load(Ordering::SeqCst), 1);
+        assert_eq!(calls_b2.load(Ordering::SeqCst), 1);
+
+        // Refresh ONLY prov_a with new nodes (HK-a2 active, HK-a3 inactive);
+        // prov_b is untouched.
+        let (a2_new, keep_a2_new, calls_a2_new) = make_counted_leaf("HK-a2", false);
+        let (a3_new, keep_a3_new, calls_a3_new) = make_counted_leaf("HK-a3", true);
+        slot_a.store(Arc::new(vec![a2_new, a3_new]));
+        changes_a.notify();
+
+        cache.rebuild_topology(&manager, &mode_changes, &mut waits);
+        cache.apply_reachability(&roots, RunMode::Rule);
+
+        // Only GROUP_A was rebuilt; GROUP_B reused its exact member snapshot Arc.
+        assert_eq!(cache.rebuilt_group_count, 3);
+        assert!(Arc::ptr_eq(
+            &group_b_members_before,
+            &cache.groups[&group_b_id].members
+        ));
+        assert_eq!(cache.groups[&group_a_id].members.len(), 2);
+
+        // Newly added nodes in prov_a are explicitly initialized
+        // (both active & inactive).
+        assert!(keep_a2_new.load(Ordering::SeqCst));
+        assert!(!keep_a3_new.load(Ordering::SeqCst));
+        assert_eq!(calls_a2_new.load(Ordering::SeqCst), 1);
+        assert_eq!(calls_a3_new.load(Ordering::SeqCst), 1);
+
+        // Surviving unchanged nodes in prov_b are NOT redundantly updated.
+        assert_eq!(calls_b1.load(Ordering::SeqCst), 1);
+        assert_eq!(calls_b2.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn dialer_dependency_outside_topology_turns_keep_idle_off_after_rebuild() {
+        use std::sync::atomic::AtomicUsize;
+
+        use arc_swap::ArcSwap;
+
+        use crate::{
+            config::internal::proxy::OutboundProxyProtocol,
+            proxy::utils::ProviderSnapshot,
+        };
+
+        let keep_entry = Arc::new(AtomicBool::new(false));
+        let calls_entry = Arc::new(AtomicUsize::new(0));
+        let mut entry_mock = MockDummyOutboundHandler::new();
+        entry_mock
+            .expect_name()
+            .return_const("local-entry".to_owned());
+        entry_mock.expect_proto().return_const(OutboundType::Hysteria2);
+        entry_mock.expect_support_udp().return_const(true);
+        {
+            let keep_entry = keep_entry.clone();
+            let calls_entry = calls_entry.clone();
+            entry_mock.expect_set_keep_idle().returning(move |v| {
+                keep_entry.store(v, Ordering::SeqCst);
+                calls_entry.fetch_add(1, Ordering::SeqCst);
+            });
+        }
+        let entry = OutboundNode::protocol(Arc::new(entry_mock));
+
+        let registry_swap = Arc::new(ArcSwap::from_pointee(HashMap::new()));
+        let local_snap = Arc::new(ArcSwap::from_pointee(ProviderSnapshot::new(
+            vec![entry.clone()],
+        )));
+        let cfg: OutboundProxyProtocol = yaml_serde::from_str(
+            "type: socks5\nname: exit\nserver: 127.0.0.1\nport: 1080\n\
+             dialer-proxy: local-entry\n",
+        )
+        .unwrap();
+        let exit = OutboundManager::load_provider_outbounds(
+            vec![cfg],
+            &registry_swap,
+            Some(&local_snap),
+        )
+        .unwrap()
+        .remove(0);
+        assert!(exit.dialer_dependency().unwrap().ptr_eq(&entry));
+
+        let plain = make_tracked_leaf("plain", Arc::new(AtomicBool::new(true)));
+        let members = Arc::new(vec![exit, plain]);
+        let mut provider = MockDummyProxyProvider::new();
+        provider.expect_proxies().returning(move || members.clone());
+        provider.expect_route_changes().returning(|| None);
+        let group = Arc::new(
+            selector::Handler::new(
+                selector::HandlerOptions {
+                    name: "PROXY".to_owned(),
+                    ..Default::default()
+                },
+                vec![Arc::new(provider)],
+                Some("exit".to_owned()),
+            )
+            .await,
+        );
+
+        let mut handlers = HashMap::new();
+        handlers.insert("PROXY".to_owned(), OutboundNode::group(group.clone()));
+        let manager = OutboundManager::new_for_test(handlers);
+        let mode_changes = RouteChange::default();
+        let mut waits = SourceWaitSet::default();
+        let mut cache = IdleTrackerCache::default();
+        let roots = vec!["PROXY".to_owned()];
+
+        // Initial pass reaches `local-entry` solely via `exit.dialer_dependency()`.
+        cache.rebuild_topology(&manager, &mode_changes, &mut waits);
+        cache.apply_reachability(&roots, RunMode::Rule);
+        assert!(keep_entry.load(Ordering::SeqCst));
+        assert_eq!(calls_entry.load(Ordering::SeqCst), 1);
+
+        // Rebuilding topology while `local-entry` remains reachable must not flap.
+        cache.rebuild_topology(&manager, &mode_changes, &mut waits);
+        cache.apply_reachability(&roots, RunMode::Rule);
+        assert!(keep_entry.load(Ordering::SeqCst));
+        assert_eq!(calls_entry.load(Ordering::SeqCst), 1);
+
+        // Switching away and rebuilding topology must explicitly turn
+        // `keep_idle` back off and release `local-entry` from `extra_protocols`.
+        SelectorControl::select(group.as_ref(), "plain").unwrap();
+        cache.rebuild_topology(&manager, &mode_changes, &mut waits);
+        cache.apply_reachability(&roots, RunMode::Rule);
+        assert!(
+            !keep_entry.load(Ordering::SeqCst),
+            "out-of-topology dialer dependency must reset keep_idle to false"
+        );
+        assert_eq!(calls_entry.load(Ordering::SeqCst), 2);
+        assert!(cache.extra_protocols.is_empty());
     }
 }

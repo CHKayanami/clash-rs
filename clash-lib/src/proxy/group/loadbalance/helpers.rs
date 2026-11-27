@@ -1,12 +1,14 @@
 use std::{
+    collections::HashMap,
     io::Cursor,
     sync::{
-        Arc,
+        Arc, Weak,
         atomic::{AtomicUsize, Ordering},
     },
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use arc_swap::ArcSwapOption;
 use murmur3::murmur3_32;
 use public_suffix::{DEFAULT_PROVIDER, EffectiveTLDProvider};
 
@@ -16,12 +18,46 @@ use crate::{
     session::Session,
 };
 
+pub(super) struct StickySnapshotIndex {
+    /// Weak reference ensures stale indexes never pin superseded provider
+    /// snapshots or retired protocol handlers.
+    snapshot: Weak<Vec<OutboundNode>>,
+    name_to_index: HashMap<String, usize>,
+}
+
+impl StickySnapshotIndex {
+    fn build(proxies: &Arc<Vec<OutboundNode>>) -> Self {
+        let mut name_to_index = HashMap::with_capacity(proxies.len());
+        for (index, proxy) in proxies.iter().enumerate() {
+            // Keep first occurrence to match `Iterator::position`.
+            name_to_index.entry(proxy.name().to_owned()).or_insert(index);
+        }
+        Self {
+            snapshot: Arc::downgrade(proxies),
+            name_to_index,
+        }
+    }
+
+    fn matches(&self, proxies: &Arc<Vec<OutboundNode>>) -> bool {
+        self.snapshot
+            .upgrade()
+            .is_some_and(|snap| Arc::ptr_eq(&snap, proxies))
+    }
+
+    fn is_live(&self) -> bool {
+        self.snapshot.strong_count() > 0
+    }
+}
+
 pub enum Strategy {
     RoundRobin(AtomicUsize),
     ConsistentHashing,
     StickySession {
         manager: ProxyManager,
         cache: moka::sync::Cache<u64, String>,
+        snapshot_index: ArcSwapOption<StickySnapshotIndex>,
+        #[cfg(test)]
+        index_builds: AtomicUsize,
     },
 }
 
@@ -74,10 +110,27 @@ pub fn strategy_sticky_session(manager: ProxyManager) -> Strategy {
         .max_capacity(1024)
         .time_to_live(std::time::Duration::from_secs(60 * 10))
         .build();
-    Strategy::StickySession { manager, cache }
+    Strategy::StickySession {
+        manager,
+        cache,
+        snapshot_index: ArcSwapOption::new(None),
+        #[cfg(test)]
+        index_builds: AtomicUsize::new(0),
+    }
 }
 
 impl Strategy {
+    pub(crate) fn invalidate_stale_cache(&self) {
+        if let Self::StickySession { snapshot_index, .. } = self
+            && snapshot_index
+                .load()
+                .as_deref()
+                .is_some_and(|idx| !idx.is_live())
+        {
+            snapshot_index.store(None);
+        }
+    }
+
     pub(crate) fn pick(
         &self,
         proxies: Arc<Vec<OutboundNode>>,
@@ -98,11 +151,55 @@ impl Strategy {
                 let key = murmur3_32(&mut Cursor::new(get_key(sess)), 0).unwrap() as u64;
                 Ok(proxies[jump_hash(key, proxies.len() as i32) as usize].clone())
             }
-            Self::StickySession { manager, cache } => {
+            Self::StickySession {
+                manager,
+                cache,
+                snapshot_index,
+                #[cfg(test)]
+                index_builds,
+            } => {
                 let key = murmur3_32(&mut Cursor::new(get_key_src_and_dst(sess)), 0).unwrap() as u64;
-                sticky_pick(proxies, urls, fallback_url, key, manager, cache)
+                let index = get_or_build_sticky_index(
+                    snapshot_index,
+                    &proxies,
+                    #[cfg(test)]
+                    index_builds,
+                );
+                sticky_pick(proxies, urls, fallback_url, key, manager, cache, &index)
             }
         }
+    }
+}
+
+fn get_or_build_sticky_index(
+    snapshot_index: &ArcSwapOption<StickySnapshotIndex>,
+    proxies: &Arc<Vec<OutboundNode>>,
+    #[cfg(test)] index_builds: &AtomicUsize,
+) -> Arc<StickySnapshotIndex> {
+    if let Some(existing) = snapshot_index.load_full()
+        && existing.matches(proxies)
+    {
+        return existing;
+    }
+
+    #[cfg(test)]
+    index_builds.fetch_add(1, Ordering::Relaxed);
+    let built = Arc::new(StickySnapshotIndex::build(proxies));
+    snapshot_index.rcu(|current| {
+        if let Some(existing) = current
+            && existing.matches(proxies)
+        {
+            return Some(existing.clone());
+        }
+        Some(built.clone())
+    });
+
+    if let Some(current) = snapshot_index.load_full()
+        && current.matches(proxies)
+    {
+        current
+    } else {
+        built
     }
 }
 
@@ -113,15 +210,16 @@ fn sticky_pick(
     key: u64,
     manager: &ProxyManager,
     cache: &moka::sync::Cache<u64, String>,
+    snapshot_index: &StickySnapshotIndex,
 ) -> std::io::Result<OutboundNode> {
     let timestamp = || SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64;
     if proxies.is_empty() {
         return Err(std::io::Error::other("no proxy found"));
     }
     let cached_name = cache.get(&key);
-    let cached_index = cached_name.as_deref().and_then(|name| {
-        proxies.iter().position(|proxy| proxy.name() == name)
-    });
+    let cached_index = cached_name
+        .as_deref()
+        .and_then(|name| snapshot_index.name_to_index.get(name).copied());
     let (start_index, hit) = match cached_index {
         Some(index) => {
             #[cfg(test)]
@@ -351,6 +449,89 @@ mod tests {
         assert_eq!(strategy.pick(small, &no_urls, None, &session).unwrap().name(), "1");
         assert!(strategy.pick(Arc::new(Vec::new()), &no_urls, None, &session).is_err());
         assert_eq!(strategy.pick(proxies, &no_urls, None, &session).unwrap().name(), "2");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn sticky_session_reuses_snapshot_index_handles_duplicates_and_does_not_pin_old_snapshot() {
+        let manager = ProxyManager::new(Arc::new(NoopResolver), None);
+        let strategy = strategy_sticky_session(manager.clone());
+        let no_urls = MemberUrls::Uniform(None);
+        let make_proxy = |name: &str| -> OutboundNode {
+            OutboundNode::protocol(Arc::new(NoopOutboundHandler {
+                name: name.to_owned(),
+            }))
+        };
+
+        let a1 = make_proxy("dup");
+        let a1_id = a1.identity();
+        let a1_weak = a1.downgrade();
+        let b = make_proxy("b");
+        let a2 = make_proxy("dup");
+        let snap1 = Arc::new(vec![a1, b.clone(), a2]);
+        let sess = Session::default();
+
+        // Seed cache with "dup" via a single-member snapshot first, then pick on snap1.
+        let seed_snap = Arc::new(vec![make_proxy("dup")]);
+        assert_eq!(
+            strategy.pick(seed_snap, &no_urls, None, &sess).unwrap().name(),
+            "dup"
+        );
+
+        let builds_after_seed = match &strategy {
+            Strategy::StickySession { index_builds, .. } => {
+                index_builds.load(Ordering::Relaxed)
+            }
+            _ => unreachable!(),
+        };
+        assert_eq!(builds_after_seed, 1);
+
+        // Repeated picks against snap1 must hit the FIRST "dup" (a1) and build index once.
+        for _ in 0..5 {
+            let picked = strategy.pick(snap1.clone(), &no_urls, None, &sess).unwrap();
+            assert_eq!(picked.identity(), a1_id);
+            assert_cache_state!(CACHE_HIT);
+        }
+        let builds_after_snap1 = match &strategy {
+            Strategy::StickySession { index_builds, .. } => {
+                index_builds.load(Ordering::Relaxed)
+            }
+            _ => unreachable!(),
+        };
+        assert_eq!(builds_after_snap1, 2);
+
+        // When "dup" becomes unhealthy on snap1, failover starts at index 0 and
+        // picks index 1 ("b"), preserving the exact existing lookup order.
+        manager.report_alive("dup", false, None).await;
+        let picked = strategy.pick(snap1.clone(), &no_urls, None, &sess).unwrap();
+        assert_eq!(picked.name(), "b");
+        assert_cache_state!(CACHE_UPDATE);
+
+        // Dropping snap1 and invalidating must not pin retired handlers.
+        drop(snap1);
+        strategy.invalidate_stale_cache();
+        assert!(
+            a1_weak.upgrade().is_none(),
+            "sticky snapshot index must not pin retired handlers"
+        );
+
+        // New snapshot rebuilds the index once and reuses it.
+        let snap2 = Arc::new(vec![make_proxy("x"), b]);
+        assert_eq!(
+            strategy.pick(snap2.clone(), &no_urls, None, &sess).unwrap().name(),
+            "b"
+        );
+        assert_eq!(
+            strategy.pick(snap2, &no_urls, None, &sess).unwrap().name(),
+            "b"
+        );
+        let builds_after_snap2 = match &strategy {
+            Strategy::StickySession { index_builds, .. } => {
+                index_builds.load(Ordering::Relaxed)
+            }
+            _ => unreachable!(),
+        };
+        assert_eq!(builds_after_snap2, 3);
     }
 
 }

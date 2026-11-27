@@ -11,15 +11,18 @@ use bytes::{Bytes, BytesMut};
 use futures::{SinkExt, StreamExt, future::poll_fn};
 use parking_lot::Mutex;
 use quinn::{Connection, Endpoint};
-use tokio::time::timeout;
+use tokio::{runtime::Handle, time::timeout};
 
 use crate::proxy::datagram::{UdpPacket, batch::{DatagramBatch, PacketBatch, MAX_BATCH_PACKETS}};
 use crate::{
     app::dns::transport::quic_test_support,
-    proxy::hysteria2::{
-        HysteriaConnection,
-        codec::{Defragger, HysUdpPacket},
-        datagram::HysteriaDatagramOutbound,
+    proxy::{
+        hysteria2::{
+            HysteriaConnection,
+            codec::{Defragger, HysUdpPacket},
+            datagram::HysteriaDatagramOutbound,
+        },
+        utils::quic_stream::QuicUploadGrace,
     },
     session::SocksAddr,
 };
@@ -101,6 +104,8 @@ async fn hysteria_native_batch_validation_preserves_prefix_and_suffix() {
         active_streams: AtomicUsize::new(0),
         keep_idle: Arc::new(AtomicBool::new(true)),
         evicted: AtomicBool::new(false),
+        upload_grace: QuicUploadGrace::default(),
+        runtime: Handle::current(),
         cache_slot: Weak::new(),
         udp_mtu: Some(40),
     });
@@ -146,6 +151,8 @@ async fn hysteria_native_send_failure_removes_session() {
         active_streams: AtomicUsize::new(0),
         keep_idle: Arc::new(AtomicBool::new(true)),
         evicted: AtomicBool::new(false),
+        upload_grace: QuicUploadGrace::default(),
+        runtime: Handle::current(),
         cache_slot: Weak::new(),
         udp_mtu: None,
     });

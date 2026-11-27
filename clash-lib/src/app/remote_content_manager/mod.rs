@@ -27,11 +27,11 @@ use parking_lot::{
 use serde::Serialize;
 use std::{
     array::from_fn,
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, VecDeque, hash_map::Entry},
     hash::{DefaultHasher, Hash, Hasher},
     io,
     sync::{
-        Arc,
+        Arc, Weak,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Duration,
@@ -109,11 +109,71 @@ pub struct DelayHistory {
     delay: Duration,
 }
 
+const DEPENDENT_PRUNE_MIN_THRESHOLD: usize = 32;
+
+struct DependentVersions {
+    entries: HashMap<usize, Weak<AtomicU64>>,
+    prune_threshold: usize,
+}
+
+impl DependentVersions {
+    fn new() -> Self {
+        Self {
+            entries: HashMap::new(),
+            prune_threshold: DEPENDENT_PRUNE_MIN_THRESHOLD,
+        }
+    }
+
+    fn register(&mut self, counter: Weak<AtomicU64>) {
+        // `Weak` retains the `ArcInner` allocation until removed, so its pointer
+        // address cannot be reused while an entry remains in `entries`.
+        let key = counter.as_ptr() as usize;
+        if let Entry::Vacant(slot) = self.entries.entry(key) {
+            slot.insert(counter);
+            if self.entries.len() >= self.prune_threshold {
+                self.entries.retain(|_, weak| weak.strong_count() > 0);
+                self.finish_prune();
+            }
+        }
+    }
+
+    fn bump_all(&mut self) {
+        if self.entries.is_empty() {
+            return;
+        }
+        self.entries.retain(|_, weak| {
+            if let Some(counter) = weak.upgrade() {
+                counter.fetch_add(1, Ordering::SeqCst);
+                true
+            } else {
+                false
+            }
+        });
+        self.finish_prune();
+    }
+
+    fn finish_prune(&mut self) {
+        self.prune_threshold = DEPENDENT_PRUNE_MIN_THRESHOLD
+            .max(self.entries.len().saturating_mul(2));
+        if self.entries.capacity() > self.prune_threshold.saturating_mul(2) {
+            let target = if self.entries.is_empty() {
+                0
+            } else {
+                self.prune_threshold
+            };
+            self.entries.shrink_to(target);
+        }
+    }
+}
+
 struct ProxyState {
     alive: AtomicBool,
     alive_changes: RouteChange,
     delay_changes: RouteChange,
     delay_history: SyncRwLock<VecDeque<DelayHistory>>,
+    /// Per-group version counters keyed by `Weak::as_ptr()` and notified only
+    /// when this specific `ProxyState` changes its liveness or latest delay.
+    dependents: SyncMutex<DependentVersions>,
 }
 
 impl ProxyState {
@@ -123,13 +183,47 @@ impl ProxyState {
             alive_changes: RouteChange::default(),
             delay_changes: RouteChange::default(),
             delay_history: SyncRwLock::new(VecDeque::new()),
+            dependents: SyncMutex::new(DependentVersions::new()),
         }
+    }
+
+    fn register_dependent(&self, counter: Weak<AtomicU64>) {
+        self.dependents.lock().register(counter);
+    }
+
+    fn bump_dependents(&self) {
+        self.dependents.lock().bump_all();
     }
 }
 
 struct TargetProxyState {
     owner: WeakOutboundNode,
-    state: ProxyState,
+    state: Arc<ProxyState>,
+}
+
+/// Direct handle to a proxy's health state, allowing routing groups to read
+/// liveness/latency without repeated map lookups or URL string cloning.
+#[derive(Clone)]
+pub(crate) struct ProxyHealthHandle {
+    state: Arc<ProxyState>,
+}
+
+impl ProxyHealthHandle {
+    pub(crate) fn alive_and_last_delay(&self) -> (bool, Option<Duration>) {
+        ProxyManager::read_alive_and_last_delay(&self.state)
+    }
+
+    pub(crate) fn route_changes(&self, delay: bool) -> RouteChange {
+        if delay {
+            self.state.delay_changes.clone()
+        } else {
+            self.state.alive_changes.clone()
+        }
+    }
+
+    pub(crate) fn register_version(&self, counter: Weak<AtomicU64>) {
+        self.state.register_dependent(counter);
+    }
 }
 
 type ProbeTargetKey = (usize, String);
@@ -225,6 +319,11 @@ pub struct ProxyManager {
     /// promotion so reads, probe writes, and subscriptions always converge on
     /// the exact same `TargetProxyState` instance without dropping history.
     target_state_locks: Arc<[SyncMutex<()>; TARGET_STATE_LOCK_STRIPES]>,
+    /// Key-scoped striped locks serializing `(node_identity, url)` probe result
+    /// commits across both target state and name-aggregated dashboard state,
+    /// preserving commit order even if an ephemeral target entry is evicted and
+    /// recreated between concurrent probe completions.
+    probe_commit_locks: Arc<[SyncMutex<()>; TARGET_STATE_LOCK_STRIPES]>,
     dns_resolver: ThreadSafeDNSResolver,
     /// Runtime-wide concurrency budget shared across all concurrent probe batches.
     probe_semaphore: Arc<Semaphore>,
@@ -267,6 +366,7 @@ impl ProxyManager {
             target_state: Arc::new(DashMap::new()),
             ephemeral_target_state,
             target_state_locks: Arc::new(from_fn(|_| SyncMutex::new(()))),
+            probe_commit_locks: Arc::new(from_fn(|_| SyncMutex::new(()))),
             probe_semaphore: Arc::new(Semaphore::new(max_concurrency.max(1))),
             probe_flights: Arc::new(SyncMutex::new(HashMap::new())),
             next_probe_gen: Arc::new(AtomicU64::new(0)),
@@ -431,6 +531,18 @@ impl ProxyManager {
         self.target_state_locks[stripe].lock()
     }
 
+    fn lock_probe_commit(
+        &self,
+        node_identity: usize,
+        url: &str,
+    ) -> SyncMutexGuard<'_, ()> {
+        let mut hasher = DefaultHasher::new();
+        node_identity.hash(&mut hasher);
+        url.hash(&mut hasher);
+        let stripe = (hasher.finish() as usize) % TARGET_STATE_LOCK_STRIPES;
+        self.probe_commit_locks[stripe].lock()
+    }
+
     fn get_target_state(
         &self,
         node: &OutboundNode,
@@ -480,7 +592,7 @@ impl ProxyManager {
             let entry = self.ephemeral_target_state.get(&key).unwrap_or_else(|| {
                 Arc::new(TargetProxyState {
                     owner: node.downgrade(),
-                    state: ProxyState::new(),
+                    state: Arc::new(ProxyState::new()),
                 })
             });
             // Publish into `target_state` BEFORE removing from the ephemeral
@@ -493,10 +605,60 @@ impl ProxyManager {
             self.ephemeral_target_state.get_with(key, || {
                 Arc::new(TargetProxyState {
                     owner: node.downgrade(),
-                    state: ProxyState::new(),
+                    state: Arc::new(ProxyState::new()),
                 })
             })
         }
+    }
+
+    /// Returns a direct health handle for `(node, url)`.
+    ///
+    /// When `url` is `Some`, this pins the entry in `target_state` so cached
+    /// group handles cannot be silently evicted from the ephemeral cache.
+    /// Callers must only pass configured group/provider probe URLs, never
+    /// ad-hoc user-supplied URLs.
+    pub(crate) fn health_handle_for(
+        &self,
+        node: &OutboundNode,
+        url: Option<&str>,
+    ) -> ProxyHealthHandle {
+        let state = match url {
+            Some(url) => self
+                .get_or_create_target_state(node, url, true)
+                .state
+                .clone(),
+            None => self
+                .proxy_state
+                .get(node.name())
+                .map(|entry| entry.value().clone())
+                .unwrap_or_else(|| {
+                    self.proxy_state
+                        .entry(node.name().to_owned())
+                        .or_insert_with(|| Arc::new(ProxyState::new()))
+                        .value()
+                        .clone()
+                }),
+        };
+        ProxyHealthHandle { state }
+    }
+
+    fn update_proxy_state_locked(
+        state: &ProxyState,
+        alive: bool,
+        history: Option<DelayHistory>,
+    ) -> (bool, bool) {
+        let mut history_lock = state.delay_history.write();
+        let alive_changed = state.alive.swap(alive, Ordering::Relaxed) != alive;
+        let mut delay_changed = false;
+        if let Some(ins) = history {
+            delay_changed = history_lock.back().map(|previous| previous.delay)
+                != Some(ins.delay);
+            history_lock.push_back(ins);
+            if history_lock.len() > 10 {
+                history_lock.pop_front();
+            }
+        }
+        (alive_changed, delay_changed)
     }
 
     fn apply_state_update(
@@ -504,20 +666,11 @@ impl ProxyManager {
         alive: bool,
         history: Option<DelayHistory>,
     ) {
-        let (alive_changed, delay_changed) = {
-            let mut history_lock = state.delay_history.write();
-            let alive_changed = state.alive.swap(alive, Ordering::Relaxed) != alive;
-            let mut delay_changed = false;
-            if let Some(ins) = history {
-                delay_changed = history_lock.back().map(|previous| previous.delay)
-                    != Some(ins.delay);
-                history_lock.push_back(ins);
-                if history_lock.len() > 10 {
-                    history_lock.pop_front();
-                }
-            }
-            (alive_changed, delay_changed)
-        };
+        let (alive_changed, delay_changed) =
+            Self::update_proxy_state_locked(state, alive, history);
+        if alive_changed || delay_changed {
+            state.bump_dependents();
+        }
         if alive_changed {
             state.alive_changes.notify();
         }
@@ -633,40 +786,72 @@ impl ProxyManager {
         alive: bool,
         history: Option<DelayHistory>,
     ) {
-        let target_entry = self.get_or_create_target_state(node, url, false);
-
-        let (alive_changed, delay_changed) = {
-            let mut history_lock = target_entry.state.delay_history.write();
+        // Serialize commits by `(node_identity, url)` key so target state and
+        // name-aggregated dashboard state always commit in the same generation
+        // order, even if an ephemeral target cache entry is evicted and
+        // recreated between concurrent probe completions.
+        let (
+            target_entry,
+            name_entry,
+            target_alive_changed,
+            target_delay_changed,
+            name_alive_changed,
+            name_delay_changed,
+        ) = {
+            let _commit_guard = self.lock_probe_commit(node.identity(), url);
             if let Some(guard) = flight.as_mut()
                 && !guard.finish_and_check_current()
             {
                 return;
             }
-            let alive_changed =
-                target_entry.state.alive.swap(alive, Ordering::Relaxed) != alive;
-            let mut delay_changed = false;
-            if let Some(ins) = history.clone() {
-                delay_changed =
-                    history_lock.back().map(|previous| previous.delay)
-                        != Some(ins.delay);
-                history_lock.push_back(ins);
-                if history_lock.len() > 10 {
-                    history_lock.pop_front();
-                }
-            }
-            (alive_changed, delay_changed)
+            let target_entry = self.get_or_create_target_state(node, url, false);
+            let name_entry = self
+                .proxy_state
+                .get(node.name())
+                .map(|entry| entry.value().clone())
+                .unwrap_or_else(|| {
+                    self.proxy_state
+                        .entry(node.name().to_owned())
+                        .or_insert_with(|| Arc::new(ProxyState::new()))
+                        .value()
+                        .clone()
+                });
+            let (target_alive_changed, target_delay_changed) =
+                Self::update_proxy_state_locked(
+                    &target_entry.state,
+                    alive,
+                    history.clone(),
+                );
+            let (name_alive_changed, name_delay_changed) =
+                Self::update_proxy_state_locked(&name_entry, alive, history);
+            (
+                target_entry,
+                name_entry,
+                target_alive_changed,
+                target_delay_changed,
+                name_alive_changed,
+                name_delay_changed,
+            )
         };
-        if alive_changed {
+
+        if target_alive_changed || target_delay_changed {
+            target_entry.state.bump_dependents();
+        }
+        if name_alive_changed || name_delay_changed {
+            name_entry.bump_dependents();
+        }
+        if target_alive_changed {
             target_entry.state.alive_changes.notify();
         }
-        if alive_changed || delay_changed {
+        if target_alive_changed || target_delay_changed {
             target_entry.state.delay_changes.notify();
         }
-
-        // Also update the name-aggregated state for REST API / dashboard display;
-        // routing groups read per-(node_identity, url) target state so ad-hoc URLs
-        // cannot affect group selection.
-        self.report_alive(node.name(), alive, history).await;
+        if name_alive_changed {
+            name_entry.alive_changes.notify();
+        }
+        if name_alive_changed || name_delay_changed {
+            name_entry.delay_changes.notify();
+        }
     }
 
     #[cfg(test)]
@@ -2313,6 +2498,260 @@ mod tests {
         let fast_hit = manager.get_or_create_target_state(&node, warm_url, false);
         drop(stripe_guard);
         assert!(Arc::ptr_eq(&initial, &fast_hit));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_probe_results_commit_target_and_dashboard_state_in_same_order() {
+        use super::DelayHistory;
+        use crate::proxy::utils::test_utils::noop::NoopResolver;
+        use chrono::Utc;
+        use tokio::sync::Barrier;
+
+        let manager = remote_content_manager::ProxyManager::new(
+            Arc::new(NoopResolver),
+            None,
+        );
+        let mut mock = MockDummyOutboundHandler::new();
+        mock.expect_name().return_const("order-node".to_owned());
+        let node = OutboundNode::protocol(Arc::new(mock));
+        let url = "http://order.example/generate_204";
+        manager.register_probe_url(url);
+
+        for _ in 0..64 {
+            let older_flight = manager.begin_probe(node.identity(), url);
+            let newer_flight = manager.begin_probe(node.identity(), url);
+            let barrier = Arc::new(Barrier::new(2));
+
+            let m1 = manager.clone();
+            let n1 = node.clone();
+            let b1 = barrier.clone();
+            let t1 = tokio::spawn(async move {
+                b1.wait().await;
+                m1.report_probe_result(
+                    &n1,
+                    url,
+                    Some(older_flight),
+                    false,
+                    Some(DelayHistory {
+                        time: Utc::now(),
+                        delay: Duration::from_millis(500),
+                    }),
+                )
+                .await;
+            });
+
+            let m2 = manager.clone();
+            let n2 = node.clone();
+            let b2 = barrier.clone();
+            let t2 = tokio::spawn(async move {
+                b2.wait().await;
+                m2.report_probe_result(
+                    &n2,
+                    url,
+                    Some(newer_flight),
+                    true,
+                    Some(DelayHistory {
+                        time: Utc::now(),
+                        delay: Duration::from_millis(12),
+                    }),
+                )
+                .await;
+            });
+
+            t1.await.unwrap();
+            t2.await.unwrap();
+
+            // Regardless of thread scheduling, target state and dashboard
+            // name-aggregated state must both reflect the newer probe result.
+            assert_eq!(
+                manager.alive_and_last_delay_for(&node, Some(url)),
+                (true, Some(Duration::from_millis(12)))
+            );
+            assert_eq!(
+                manager.alive_and_last_delay(node.name()),
+                (true, Some(Duration::from_millis(12)))
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn ephemeral_eviction_between_concurrent_commits_preserves_dashboard_order() {
+        use super::DelayHistory;
+        use crate::proxy::utils::test_utils::noop::NoopResolver;
+        use chrono::Utc;
+        use tokio::sync::Barrier;
+
+        // Capacity 1 forces frequent eviction & recreation of ephemeral entries.
+        let manager = remote_content_manager::ProxyManager::new(
+            Arc::new(NoopResolver),
+            None,
+        )
+        .with_ephemeral_limits(1, Duration::from_secs(60));
+        let mut mock = MockDummyOutboundHandler::new();
+        mock.expect_name().return_const("evict-order-node".to_owned());
+        let node = OutboundNode::protocol(Arc::new(mock));
+
+        for iter in 0..32 {
+            let url = format!("http://adhoc-order-{iter}.example/generate_204");
+            let other_url = format!("http://adhoc-evict-{iter}.example/generate_204");
+            let older_flight = manager.begin_probe(node.identity(), &url);
+            let newer_flight = manager.begin_probe(node.identity(), &url);
+            let barrier = Arc::new(Barrier::new(3));
+
+            let m1 = manager.clone();
+            let n1 = node.clone();
+            let u1 = url.clone();
+            let b1 = barrier.clone();
+            let t1 = tokio::spawn(async move {
+                b1.wait().await;
+                m1.report_probe_result(
+                    &n1,
+                    &u1,
+                    Some(older_flight),
+                    false,
+                    Some(DelayHistory {
+                        time: Utc::now(),
+                        delay: Duration::from_millis(500),
+                    }),
+                )
+                .await;
+            });
+
+            let m2 = manager.clone();
+            let n2 = node.clone();
+            let u2 = url.clone();
+            let b2 = barrier.clone();
+            let t2 = tokio::spawn(async move {
+                b2.wait().await;
+                m2.report_probe_result(
+                    &n2,
+                    &u2,
+                    Some(newer_flight),
+                    true,
+                    Some(DelayHistory {
+                        time: Utc::now(),
+                        delay: Duration::from_millis(15),
+                    }),
+                )
+                .await;
+            });
+
+            let m3 = manager.clone();
+            let n3 = node.clone();
+            let b3 = barrier.clone();
+            let evictor = tokio::spawn(async move {
+                b3.wait().await;
+                let _ = m3.get_or_create_target_state(&n3, &other_url, false);
+                m3.ephemeral_target_state.run_pending_tasks();
+            });
+
+            t1.await.unwrap();
+            t2.await.unwrap();
+            evictor.await.unwrap();
+
+            assert_eq!(
+                manager.alive_and_last_delay(node.name()),
+                (true, Some(Duration::from_millis(15))),
+                "evicting and recreating ephemeral target state must not let older probe overwrite dashboard state"
+            );
+        }
+    }
+
+    #[test]
+    fn dependent_versions_deduplicate_and_prune_by_threshold_and_bump() {
+        use super::{DEPENDENT_PRUNE_MIN_THRESHOLD, DependentVersions};
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let mut deps = DependentVersions::new();
+        let live_a = Arc::new(AtomicU64::new(0));
+        let live_b = Arc::new(AtomicU64::new(0));
+
+        // Duplicate registration deduplicates in place.
+        deps.register(Arc::downgrade(&live_a));
+        deps.register(Arc::downgrade(&live_a));
+        deps.register(Arc::downgrade(&live_b));
+        assert_eq!(deps.entries.len(), 2);
+
+        // Insert dead weak refs up to the prune threshold without probing:
+        // hitting the threshold sweeps dead entries and sets next threshold.
+        for _ in 0..(DEPENDENT_PRUNE_MIN_THRESHOLD - 2) {
+            let transient = Arc::new(AtomicU64::new(0));
+            let weak = Arc::downgrade(&transient);
+            drop(transient);
+            deps.register(weak);
+        }
+        assert_eq!(deps.entries.len(), 2);
+        assert_eq!(deps.prune_threshold, DEPENDENT_PRUNE_MIN_THRESHOLD);
+
+        // With 20 live entries + enough dead entries to cross threshold,
+        // prune keeps all live entries and raises threshold to live * 2.
+        let extra_live: Vec<_> =
+            (0..20).map(|_| Arc::new(AtomicU64::new(0))).collect();
+        for c in &extra_live {
+            deps.register(Arc::downgrade(c));
+        }
+        for _ in 0..10 {
+            let transient = Arc::new(AtomicU64::new(0));
+            let weak = Arc::downgrade(&transient);
+            drop(transient);
+            deps.register(weak);
+        }
+        assert_eq!(deps.entries.len(), 22);
+        assert_eq!(deps.prune_threshold, 44);
+
+        // Drop extra_live and bump: increments remaining live counters,
+        // prunes expired entries, and lowers prune_threshold back to minimum.
+        drop(extra_live);
+        deps.bump_all();
+        assert_eq!(live_a.load(Ordering::SeqCst), 1);
+        assert_eq!(live_b.load(Ordering::SeqCst), 1);
+        assert_eq!(deps.entries.len(), 2);
+        assert_eq!(deps.prune_threshold, DEPENDENT_PRUNE_MIN_THRESHOLD);
+    }
+
+    #[test]
+    fn dependent_versions_shrinks_oversized_capacity_after_pruning() {
+        use super::{DEPENDENT_PRUNE_MIN_THRESHOLD, DependentVersions};
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let mut deps = DependentVersions::new();
+        let survivor = Arc::new(AtomicU64::new(0));
+        deps.register(Arc::downgrade(&survivor));
+
+        let transient: Vec<_> =
+            (0..4096).map(|_| Arc::new(AtomicU64::new(0))).collect();
+        for c in &transient {
+            deps.register(Arc::downgrade(c));
+        }
+        assert_eq!(deps.entries.len(), 4097);
+        let peak_capacity = deps.entries.capacity();
+        assert!(peak_capacity >= 4097);
+
+        // Drop 4096 dependents and notify: surviving counter increments and
+        // table capacity shrinks well below the historical peak.
+        drop(transient);
+        deps.bump_all();
+        assert_eq!(survivor.load(Ordering::SeqCst), 1);
+        assert_eq!(deps.entries.len(), 1);
+        assert_eq!(deps.prune_threshold, DEPENDENT_PRUNE_MIN_THRESHOLD);
+        assert!(
+            deps.entries.capacity() <= DEPENDENT_PRUNE_MIN_THRESHOLD * 2,
+            "expected capacity to shrink near threshold after pruning from {peak_capacity}, got {}",
+            deps.entries.capacity()
+        );
+
+        // Repeat and drop all entries: empty oversized table shrinks to 0.
+        let transient: Vec<_> =
+            (0..256).map(|_| Arc::new(AtomicU64::new(0))).collect();
+        for c in &transient {
+            deps.register(Arc::downgrade(c));
+        }
+        assert!(deps.entries.capacity() >= 257);
+        drop(transient);
+        drop(survivor);
+        deps.bump_all();
+        assert!(deps.entries.is_empty());
+        assert_eq!(deps.entries.capacity(), 0);
     }
 
 }

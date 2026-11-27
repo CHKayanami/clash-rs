@@ -72,6 +72,11 @@ impl Handler {
         &self.providers
     }
 
+    pub(crate) fn invalidate_stale_cache(&self) {
+        self.providers.invalidate_stale_cache();
+        self.strategy_fn.invalidate_stale_cache();
+    }
+
     fn get_proxies(&self, touch: bool) -> Arc<Vec<OutboundNode>> {
         self.providers.get_proxies(touch)
     }

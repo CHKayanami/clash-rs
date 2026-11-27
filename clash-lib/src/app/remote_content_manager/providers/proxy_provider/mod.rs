@@ -30,9 +30,10 @@ pub trait ProxyProvider: Provider {
     /// The healthcheck URL actually used to probe members of this provider,
     /// when applicable.
     fn healthcheck_url(&self) -> Option<&str> { None }
-    /// Resolve this provider's member list against a pre-captured snapshot
-    /// generation keyed by `provider_identity`, falling back to `proxies()`.
-    fn proxies_from_snapshots(
+    /// Resolve this provider's raw upstream snapshot from a pre-captured
+    /// snapshot table without applying filters, so callers can detect whether
+    /// inputs changed via `Arc::ptr_eq` before rebuilding derived lists.
+    fn raw_snapshot_from_snapshots(
         &self,
         snapshots: &HashMap<usize, Arc<Vec<OutboundNode>>>,
     ) -> Arc<Vec<OutboundNode>> {
@@ -41,6 +42,23 @@ pub trait ProxyProvider: Provider {
             .get(&key)
             .cloned()
             .unwrap_or_else(|| self.proxies())
+    }
+    /// Derive this provider's member list from an already-resolved raw
+    /// upstream snapshot.
+    fn resolve_from_raw_snapshot(
+        &self,
+        raw: Arc<Vec<OutboundNode>>,
+    ) -> Arc<Vec<OutboundNode>> {
+        raw
+    }
+    /// Resolve this provider's member list against a pre-captured snapshot
+    /// generation keyed by `provider_identity`, falling back to `proxies()`.
+    fn proxies_from_snapshots(
+        &self,
+        snapshots: &HashMap<usize, Arc<Vec<OutboundNode>>>,
+    ) -> Arc<Vec<OutboundNode>> {
+        let raw = self.raw_snapshot_from_snapshots(snapshots);
+        self.resolve_from_raw_snapshot(raw)
     }
     /// Returns whether `snapshot` is still this provider's current live
     /// snapshot without rebuilding or populating derived caches.

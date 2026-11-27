@@ -19,6 +19,14 @@ pub(crate) enum MemberUrls {
 }
 
 impl MemberUrls {
+    pub(crate) fn ptr_eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Uniform(a), Self::Uniform(b)) => a.as_deref() == b.as_deref(),
+            (Self::PerMember(a), Self::PerMember(b)) => Arc::ptr_eq(a, b),
+            _ => false,
+        }
+    }
+
     pub(crate) fn url_at<'a>(
         &'a self,
         index: usize,
@@ -82,7 +90,7 @@ impl Providers {
         for provider in &self.providers { provider.touch(); }
     }
 
-    fn snapshots_match(
+    pub(crate) fn snapshots_match(
         a: &[Arc<Vec<OutboundNode>>],
         b: &[Arc<Vec<OutboundNode>>],
     ) -> bool {
@@ -140,39 +148,46 @@ impl Providers {
         (Arc::new(proxies), urls)
     }
 
-    fn get_merged_members(&self) -> (Arc<Vec<OutboundNode>>, MemberUrls) {
-        let current_sub_snapshots: Vec<Arc<Vec<OutboundNode>>> =
-            self.providers.iter().map(|p| p.proxies()).collect();
-
+    fn publish_or_reuse_merged(
+        &self,
+        sub_snapshots: Vec<Arc<Vec<OutboundNode>>>,
+    ) -> (Arc<Vec<OutboundNode>>, MemberUrls) {
         if let Some(cached) = self.cached_merged.load().as_deref()
-            && Self::snapshots_match(&cached.sub_snapshots, &current_sub_snapshots)
+            && Self::snapshots_match(&cached.sub_snapshots, &sub_snapshots)
         {
             return (cached.merged.clone(), cached.urls.clone());
         }
 
-        let (merged, urls) = self.merge_snapshots(&current_sub_snapshots);
+        let (merged, urls) = self.merge_snapshots(&sub_snapshots);
 
         // Validate under `publish_lock` so a concurrent provider refresh +
-        // invalidation cannot be overwritten by a stale merged snapshot.
+        // invalidation cannot be overwritten by a stale merged snapshot, while
+        // letting tracker rebuilds and traffic lookups share the same `Arc`.
         let _guard = self.publish_lock.lock();
         if let Some(cached) = self.cached_merged.load().as_deref()
-            && Self::snapshots_match(&cached.sub_snapshots, &current_sub_snapshots)
+            && Self::snapshots_match(&cached.sub_snapshots, &sub_snapshots)
         {
             return (cached.merged.clone(), cached.urls.clone());
         }
-        let still_current = current_sub_snapshots
+        let still_current = sub_snapshots
             .iter()
             .zip(&self.providers)
             .all(|(snap, p)| p.is_snapshot_current(snap));
         if still_current {
             self.cached_merged.store(Some(Arc::new(AggregatedSnapshot {
-                sub_snapshots: current_sub_snapshots,
+                sub_snapshots,
                 merged: merged.clone(),
                 urls: urls.clone(),
             })));
         }
 
         (merged, urls)
+    }
+
+    fn get_merged_members(&self) -> (Arc<Vec<OutboundNode>>, MemberUrls) {
+        let current_sub_snapshots: Vec<Arc<Vec<OutboundNode>>> =
+            self.providers.iter().map(|p| p.proxies()).collect();
+        self.publish_or_reuse_merged(current_sub_snapshots)
     }
 
     pub(crate) fn get_members(
@@ -193,11 +208,25 @@ impl Providers {
         self.get_merged_members()
     }
 
-    /// Resolves members directly from a fixed provider snapshot table without
-    /// re-reading live providers or mutating group caches.
-    pub(crate) fn get_members_from_snapshots(
+    /// Captures the raw upstream snapshot for each provider in this group
+    /// without invoking filters or merging, so callers can skip rebuilding
+    /// unchanged groups when only another provider refreshed.
+    pub(crate) fn input_snapshots_from(
         &self,
         snapshots: &HashMap<usize, Arc<Vec<OutboundNode>>>,
+    ) -> Vec<Arc<Vec<OutboundNode>>> {
+        self.providers
+            .iter()
+            .map(|p| p.raw_snapshot_from_snapshots(snapshots))
+            .collect()
+    }
+
+    /// Resolves members from previously captured raw upstream snapshots,
+    /// reusing or publishing the shared merged snapshot when still current so
+    /// the tracker and traffic path observe the same `Arc<Vec<OutboundNode>>`.
+    pub(crate) fn get_members_from_input_snapshots(
+        &self,
+        input_snapshots: &[Arc<Vec<OutboundNode>>],
     ) -> (Arc<Vec<OutboundNode>>, MemberUrls) {
         if self.providers.is_empty() {
             return (Arc::new(Vec::new()), MemberUrls::Uniform(None));
@@ -206,16 +235,31 @@ impl Providers {
             let p = &self.providers[0];
             let url = self.provider_urls.first().cloned().flatten();
             return (
-                p.proxies_from_snapshots(snapshots),
+                p.resolve_from_raw_snapshot(input_snapshots[0].clone()),
                 MemberUrls::Uniform(url),
             );
         }
         let sub_snapshots: Vec<Arc<Vec<OutboundNode>>> = self
             .providers
             .iter()
-            .map(|p| p.proxies_from_snapshots(snapshots))
+            .zip(input_snapshots)
+            .map(|(p, raw)| p.resolve_from_raw_snapshot(raw.clone()))
             .collect();
-        self.merge_snapshots(&sub_snapshots)
+        self.publish_or_reuse_merged(sub_snapshots)
+    }
+
+    /// Resolves members directly from a fixed provider snapshot table without
+    /// re-reading live providers or mutating group caches.
+    #[cfg(test)]
+    pub(crate) fn get_members_from_snapshots(
+        &self,
+        snapshots: &HashMap<usize, Arc<Vec<OutboundNode>>>,
+    ) -> (Arc<Vec<OutboundNode>>, MemberUrls) {
+        if self.providers.is_empty() {
+            return (Arc::new(Vec::new()), MemberUrls::Uniform(None));
+        }
+        let input_snapshots = self.input_snapshots_from(snapshots);
+        self.get_members_from_input_snapshots(&input_snapshots)
     }
 
     pub fn get_proxies(&self, touch: bool) -> Arc<Vec<OutboundNode>> {
